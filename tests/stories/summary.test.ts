@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { checkSeed, MAX_SEED_BYTES } from "../bugbash/sandbox/cacheSeed";
-import { nextSeed, summarize } from "./summary";
+import { nextSeed, summarize, upstreamFault } from "./summary";
 
 let root = "";
 beforeEach(() => {
@@ -222,4 +222,64 @@ test("the next seed merges both story jobs' caches, less what either deleted", (
 
   expect(nextSeed(root, seed)).toBe(3);
   expect(fs.readdirSync(seed).sort()).toEqual([entry(1), entry(10), entry(20)]);
+});
+
+/** A job with an e2e report of `status` and a proxy record of calls with these HTTP statuses. */
+type Json = Record<string, unknown>;
+const job = (output: string, status: string | null, calls: Json[]) => {
+  if (status != null) write(`${output}/report.json`, { run: { status, results: [] } });
+  write(
+    `${output}.proxy.jsonl`,
+    calls.map((c) => JSON.stringify({ outcome: "kept", model: "m", ms: 1, ...c })).join("\n")
+  );
+};
+const web = "tests/stories/.e2e/stories-20261019T100000Z-1";
+const repros = "tests/bugbash/.e2e/agent-repros-20261019T100500Z-2";
+const electron = "tests/stories/.e2e/stories-electron-20261019T101000Z-3";
+
+test("a failed job with a provider 5xx gets the retry, a probe failure without a folder too", () => {
+  job(web, "failed", [{ outcome: "settled", status: 200 }, { status: 529 }]);
+  job(repros, "passed", [{ status: 200 }]);
+  expect(upstreamFault(root).retry).toBe(true);
+
+  // The probe's 503 refused the job before its folder existed: only the record is there.
+  fs.rmSync(path.join(root, web), { recursive: true });
+  job(web, null, [{ status: 503 }]);
+  expect(upstreamFault(root).retry).toBe(true);
+});
+
+test("a 4xx, a refusal or a proxy-made 502 is no provider fault: no retry", () => {
+  job(web, "failed", [{ status: 429 }]);
+  expect(upstreamFault(root).retry).toBe(false);
+  job(web, "failed", [{ outcome: "refused", status: 402, reason: "budget: call does not fit" }]);
+  expect(upstreamFault(root).retry).toBe(false);
+  // The job's deadline or a client that went away aborts a call, which the proxy records as 502.
+  job(web, "failed", [{ status: 502, reason: "aborted: deadline, client or close" }]);
+  expect(upstreamFault(root).retry).toBe(false);
+});
+
+test("a test failure with no 5xx, or a failed job with no proxy record, gets no retry", () => {
+  job(web, "failed", [{ outcome: "settled", status: 200 }]);
+  expect(upstreamFault(root).retry).toBe(false);
+  fs.rmSync(path.join(root, `${web}.proxy.jsonl`));
+  expect(upstreamFault(root).retry).toBe(false);
+});
+
+test("one failed job without a 5xx blocks the retry that another failed job's 5xx asks for", () => {
+  job(web, "passed", [{ status: 529 }]);
+  job(repros, "failed", [{ status: 500 }]);
+  job(electron, "failed", [{ outcome: "settled", status: 200 }]);
+  fs.appendFileSync(path.join(root, `${electron}.proxy.jsonl`), '\n{"status": 5'); // cut off
+  expect(upstreamFault(root).retry).toBe(false);
+  job(electron, "failed", [{ status: 502, reason: "upstream: unreachable" }]);
+  expect(upstreamFault(root).retry).toBe(true);
+});
+
+test("no failed job gets no retry, whatever 5xx a passed job's record holds", () => {
+  job(web, "passed", [{ status: 529 }, { status: 200 }]);
+  job(repros, "passed", [{ status: 500 }]);
+  expect(upstreamFault(root).retry).toBe(false);
+  // No output at all: make stopped before the first job (a preflight or the build).
+  fs.rmSync(path.join(root, "tests"), { recursive: true });
+  expect(upstreamFault(root).retry).toBe(false);
 });

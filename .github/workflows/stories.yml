@@ -1,15 +1,20 @@
 name: Stories
 
 # The agentic story lane (`make test-stories`): the story tests, the Electron stories and the
-# agent-tagged repros, each as a model-driven job in the bug-bash sandbox. A workflow of its own, apart from pr.yml, so
-# that the Required job never waits on it: a failure here shows on the PR but blocks no merge.
+# agent-tagged repros, each as a model-driven job in the bug-bash sandbox. pr.yml calls it in the
+# merge queue (its `stories` job), and Required counts its result only when the repo variable
+# STORIES_MODE is "block". Unset is warn mode: a failure shows in the queue but blocks no merge.
 #
 # Triggers: change only this block to pick when it runs. The job below works unchanged under
-# pull_request, merge_group, schedule and workflow_dispatch.
+# pull_request, merge_group (called from pr.yml), schedule and workflow_dispatch.
 on:
-  # Once for each PR in the merge queue, the user's pick over every PR push (about $500 against
-  # $1,700 a month at Phase 2 prices). Not required yet, so the queue does not wait for it.
-  merge_group:
+  # From pr.yml's merge_group run, once for each PR in the merge queue: the user's pick over every
+  # PR push (about $500 against $1,700 a month at Phase 2 prices). No merge_group trigger of its
+  # own, else each queue entry runs it twice. The caller passes the key by name.
+  workflow_call:
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
   # One run a night on main: it keeps main's replay cache warm (GitHub evicts a cache that no
   # run reads for 7 days). A merge-queue run saves under its own queue ref, which no run
   # restores, so this run is the one that every other run restores first.
@@ -19,9 +24,11 @@ on:
   workflow_dispatch: {}
 
 # One run per PR (or per ref for the other events: a merge-queue entry has its own ref), and a
-# new push cancels the old run, so its model calls stop too.
+# new push cancels the old run, so its model calls stop too. A fixed prefix, not
+# github.workflow: a called workflow sees the caller's name ("PR"), and a group equal to
+# pr.yml's would cancel the caller's run or be cancelled with it.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: stories-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -29,14 +36,15 @@ permissions:
 
 jobs:
   stories:
-    name: Test / Stories
+    # pr.yml's caller job is "Test / Stories", so the queue shows "Test / Stories / make test-stories".
+    name: make test-stories
     # Only for pull_request (off now, see on:): fork and Dependabot PRs get no Actions secrets.
     if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
     runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
-    # Three jobs of at most 30 minutes each (launch.ts DEADLINE_MS) after a build of up to about
-    # 10 minutes, plus the setup, the image pull and the cache steps: 110. A warm run takes a few
-    # minutes; the cap only bounds a hung run.
-    timeout-minutes: 110
+    # Under the merge queue ruleset's 60 minutes for checks, so a hung run fails here before the
+    # queue drops the entry. A warm run takes 4-5 minutes, so the one retry (below) fits. A cold
+    # run that needs each job's full 30 minutes (launch.ts DEADLINE_MS) does not.
+    timeout-minutes: 50
     env:
       # The cache key's ref: the PR branch on pull_request, else the ref name (a branch, or
       # gh-readonly-queue/main/pr-<n>-<sha> in the merge queue). In env, not inline in run:.
@@ -66,15 +74,27 @@ jobs:
       # make test-stories refuses a stale sandbox image key (a PR that changes the Dockerfile):
       # BUGBASH_SANDBOX_BUILD_STALE does not apply to model-driven jobs (launch.ts), so such a PR
       # fails here until main publishes the image and image.json pins it.
+      # One more run only when every failed job got a provider 5xx (summary.ts --upstream-fault):
+      # the user's rule, so that an overloaded provider does not fail a queue entry. A test
+      # failure, a 4xx or a refusal fails at once. Before that run, the first run's outputs move
+      # to .e2e-first-try, so the Summary and seed steps read the second run's jobs only (each
+      # run adds new timestamped job folders to .e2e).
       - name: make test-stories
-        run: make test-stories
+        run: |
+          set -o pipefail
+          make test-stories && exit 0
+          bun tests/stories/summary.ts --upstream-fault | tee -a "$GITHUB_STEP_SUMMARY"
+          for dir in tests/stories/.e2e tests/bugbash/.e2e; do
+            if [[ -d "$dir" ]]; then mv "$dir" "$dir-first-try"; fi
+          done
+          make test-stories
         env:
           # Only this step gets the key. The launcher keeps it on the host and gives each job a
           # proxy that caps its spend at list price.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_BASE_URL: https://api.anthropic.com
           BUGBASH_AI: mock
-          # The cap per job, so one run spends at most three times this.
+          # The cap per job, so one run spends at most three times this, six with the retry.
           BUGBASH_BUDGET_USD: "3"
       - name: Summary
         if: always()

@@ -788,6 +788,23 @@ jobs:
       - if: always()
         run: docker rm -f mux-test || true
 
+  stories:
+    name: Test / Stories
+    # The agentic story lane (stories.yml), once for each merge-queue entry. The repo variable
+    # STORIES_MODE picks the mode. Unset or anything but "block" is warn mode: the check shows its
+    # result, but Required drops it (the results step). With "block", a failure fails Required.
+    # The user's bar for "block": 50 queue runs with less than 5% failures. The lane runs
+    # make test-stories once more only on a provider 5xx (stories.yml).
+    # ROLLBACK: set the STORIES_MODE repo variable back to "warn" (Settings -> Secrets and
+    # variables -> Actions -> Variables). No code change.
+    if: github.event_name == 'merge_group'
+    uses: ./.github/workflows/stories.yml
+    permissions:
+      contents: read
+    # By name, not `secrets: inherit`: the lane gets this one key only.
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
   build-linux:
     name: Build / Linux
     needs: [changes]
@@ -966,6 +983,8 @@ jobs:
       - codex-comments
       # Counts only in CRAP block mode (vars.CRAP_MODE == 'block'); see the crap job.
       - crap
+      # Counts only in stories block mode (vars.STORIES_MODE == 'block'); see the stories job.
+      - stories
     runs-on: ubuntu-latest
     # superseded: read this workflow's runs/jobs and check out the decision script.
     permissions:
@@ -974,15 +993,17 @@ jobs:
     steps:
       # The job results Required judges. In CRAP warn mode (vars.CRAP_MODE is
       # not "block") Quality / CRAP never decides Required, so its result is
-      # dropped here, and every later step reads this list.
+      # dropped here, and every later step reads this list. The same for
+      # Test / Stories in stories warn mode (vars.STORIES_MODE is not "block").
       - id: results
         env:
           CRAP_MODE: ${{ vars.CRAP_MODE }}
+          STORIES_MODE: ${{ vars.STORIES_MODE }}
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          # shellcheck disable=SC2016 # $mode is a jq variable, not a shell one.
-          filter='to_entries[] | select(.key != "crap" or $mode == "block") | .value.result'
-          echo "list=$(jq -r --arg mode "$CRAP_MODE" "$filter" <<<"$NEEDS_JSON" | paste -sd ' ' -)" >>"$GITHUB_OUTPUT"
+          # shellcheck disable=SC2016 # $mode and $stories are jq variables, not shell ones.
+          filter='to_entries[] | select(.key != "crap" or $mode == "block") | select(.key != "stories" or $stories == "block") | .value.result'
+          echo "list=$(jq -r --arg mode "$CRAP_MODE" --arg stories "$STORIES_MODE" "$filter" <<<"$NEEDS_JSON" | paste -sd ' ' -)" >>"$GITHUB_OUTPUT"
       # A cancelled duplicate run must not leave a red Required when another run for
       # this PR will publish one (#4547). The script stands down only with proof and
       # fails closed otherwise; see its header for the rules.

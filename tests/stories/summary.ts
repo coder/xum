@@ -14,6 +14,9 @@
  *   an entry that replayed into a failure). Only names that checkSeed accepts are copied: the
  *   newest by `createdAt`, at most MAX_SEED_ENTRIES and MAX_SEED_BYTES in all, so the next launch
  *   never refuses the seed. Without such a job, `<dir>` stays as it is.
+ * - `--upstream-fault` decides the lane's one retry: exit 0 only when a job failed and every
+ *   failed job's proxy record (`<job>.proxy.jsonl`, launch.ts) holds a provider 5xx, else exit 1.
+ *   It prints one line that says why.
  *
  * No import beyond node and the repo: CI runs it with plain bun.
  */
@@ -26,6 +29,7 @@ import {
   MAX_SEED_BYTES,
   MAX_SEED_ENTRIES,
 } from "../bugbash/sandbox/cacheSeed";
+import { UNREACHABLE } from "../bugbash/sandbox/proxy";
 
 /** Where make test-stories puts each job's output folder; the story kinds record a cache. */
 const JOB_KINDS = [
@@ -42,20 +46,29 @@ const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 const num = (v: unknown): number | undefined =>
   typeof v === "number" && Number.isFinite(v) ? v : undefined;
 
+const PROXY_LOG = ".proxy.jsonl";
+
 /**
  * The job output folders of one kind, oldest first. The names carry the UTC start time
- * (Makefile), so name order is start order. The preflight's name is not a job.
+ * (Makefile), so name order is start order. The preflight's name is not a job. With
+ * `logOnly`, also the outputs that have only a proxy record: a job whose probe call failed
+ * (launch.ts) never made its folder.
  */
-function jobFolders(root: string, kind: JobKind): string[] {
+function jobFolders(root: string, kind: JobKind, logOnly = false): string[] {
   const base = path.join(root, kind.dir);
   if (!fs.existsSync(base)) return [];
   const not = "not" in kind ? kind.not : undefined;
-  return fs
-    .readdirSync(base, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && e.name.startsWith(kind.prefix))
-    .filter((e) => not == null || !e.name.startsWith(not))
-    .filter((e) => !e.name.endsWith("-preflight"))
-    .map((e) => path.join(base, e.name))
+  const names = fs.readdirSync(base, { withFileTypes: true }).flatMap((e) => {
+    if (e.isDirectory()) return [e.name];
+    if (logOnly && e.isFile() && e.name.endsWith(PROXY_LOG))
+      return [e.name.slice(0, -PROXY_LOG.length)];
+    return [];
+  });
+  return [...new Set(names)]
+    .filter((name) => name.startsWith(kind.prefix))
+    .filter((name) => not == null || !name.startsWith(not))
+    .filter((name) => !name.endsWith("-preflight"))
+    .map((name) => path.join(base, name))
     .sort();
 }
 
@@ -153,6 +166,51 @@ export function summarize(root: string): string {
       lines.push(`| ${[`\`${path.basename(folder)}\``, ...row].map(cell).join(" | ")} |`);
   lines.push("", ...folders.map(jobLine));
   return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Whether a proxy record line is a provider fault: a 5xx from the provider itself (no reason),
+ * or a call the proxy could not get to it or through it. Not the proxy's own 502s (a deadline,
+ * a client that went away, a redirect): those are no provider 5xx. Its refusals are all 4xx.
+ */
+function providerFault(line: string): boolean {
+  let record: Json | undefined;
+  try {
+    record = obj(JSON.parse(line));
+  } catch {
+    return false; // a cut-off last line
+  }
+  const status = num(record?.status);
+  if (status == null || status < 500) return false;
+  const reason = record?.reason;
+  return reason == null || reason === UNREACHABLE || reason === "upstream: failed";
+}
+
+/**
+ * Whether `make test-stories` gets its one more run (header): every job that failed, and at
+ * least one did, has a provider 5xx in its proxy record. A job failed when its report is not
+ * an e2e pass (or is missing). Make stops at the first failed job, so the jobs after it left no
+ * output and do not count.
+ */
+export function upstreamFault(root: string): { retry: boolean; reason: string } {
+  const failed = JOB_KINDS.flatMap((kind) => jobFolders(root, kind, true)).filter((folder) => {
+    const report = readJson(path.join(folder, "report.json"));
+    const run = "value" in report ? obj(obj(report.value)?.run) : undefined;
+    return run?.status !== "passed";
+  });
+  if (failed.length === 0) return { retry: false, reason: "no job failed" };
+  for (const folder of failed) {
+    let text: string;
+    try {
+      text = fs.readFileSync(`${folder}${PROXY_LOG}`, "utf8");
+    } catch {
+      return { retry: false, reason: `\`${path.basename(folder)}\` failed with no proxy record` };
+    }
+    if (!text.split("\n").some(providerFault))
+      return { retry: false, reason: `\`${path.basename(folder)}\` failed with no provider 5xx` };
+  }
+  const names = failed.map((folder) => `\`${path.basename(folder)}\``).join(", ");
+  return { retry: true, reason: `every failed job got a provider 5xx: ${names}` };
 }
 
 /** When e2e recorded the entry (its `createdAt`, e2e cache/store.js), or null if unreadable. */
@@ -260,8 +318,12 @@ if (import.meta.main) {
         ? "next seed: no story job recorded a cache entry; the seed stays as it was"
         : `next seed: ${count} entries`
     );
+  } else if (args.length === 1 && args[0] === "--upstream-fault") {
+    const { retry, reason } = upstreamFault(root);
+    console.log(`${retry ? "Retrying make test-stories once" : "No retry"}: ${reason}.`);
+    process.exit(retry ? 0 : 1);
   } else {
-    console.error("usage: bun tests/stories/summary.ts [--next-seed <dir>]");
+    console.error("usage: bun tests/stories/summary.ts [--next-seed <dir> | --upstream-fault]");
     process.exit(2);
   }
 }
