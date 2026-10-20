@@ -488,6 +488,11 @@ describe("RetryManager", () => {
     ["api", (failure: number) => `gateway error ${failure % 2}`],
     ["api", () => "The server had an error processing your request."],
     ["api", () => "Model is overloaded, please try again later"],
+    ["api", () => "socket hang up"],
+    ["api", () => "read ECONNRESET"],
+    ["api", () => "upstream connect error or disconnect/reset before headers"],
+    ["api", () => "Bad Gateway"],
+    ["api", () => "Please retry later"],
   ] as const)("keeps retrying %s failures past 10 attempts", async (type, messageFor) => {
     const { manager, onRetry, events } = createRetryManager();
 

@@ -46,11 +46,12 @@ const MAX_REASON_ERROR_CHARS = 300;
 /**
  * Text of an "api"-class error that still reads as an outage: a provider without a mapped
  * status (an OpenAI mid-stream server_error, a non-Anthropic overload) falls back to "api" with
- * constant text. Those keep unbounded retry like 5xx (#4228). Broad on purpose: a miss here only
- * keeps today's behavior.
+ * constant text, and so do transport failures whose text names no "network" or "fetch"
+ * ("socket hang up", "read ECONNRESET", "Bad Gateway"). Those keep unbounded retry like 5xx
+ * (#4228). Broad on purpose: a miss here only keeps today's behavior.
  */
 const TRANSIENT_ERROR_TEXT =
-  /overload|server|unavailable|try again|timed? ?out|capacity|busy|internal/iu;
+  /overload|server|unavailable|try again|retry|timed? ?out|capacity|busy|internal|socket|hang up|econn|etimedout|eai_again|reset|connection|bad gateway/iu;
 
 function truncateReason(message: string): string {
   return message.length > MAX_REASON_ERROR_CHARS
