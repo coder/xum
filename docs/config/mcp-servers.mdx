@@ -126,7 +126,7 @@ Xum has no built-in GitHub tools. To let agents search code, read files, and wor
 3. Set `GITHUB_PERSONAL_ACCESS_TOKEN` where the server starts:
    - **Local and worktree workspaces:** the server inherits the environment of the Xum process. Export the variable in a terminal and start Xum from that terminal, for example with `xum server`. A desktop app opened from the Dock, Finder, or an app menu does not read your shell profile, so it does not get the variable.
    - **SSH, Docker, devcontainer, and Coder workspaces:** the server runs in the workspace, and Xum does not pass its own environment there. Set the variable in that workspace.
-4. Use **Test** in **Settings → MCP** to check that the server starts.
+4. Check that the server starts. For a local workspace, use **Test** in **Settings → MCP**. **Test** always runs the server on the Xum host, so for a remote workspace run the `docker run` command in that workspace's terminal instead.
 
 Do not put the token in `mcp.jsonc`. The GitHub MCP server's README lists its other install forms, including a remote server hosted by GitHub, and its toolset options.
 
