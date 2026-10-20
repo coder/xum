@@ -17,8 +17,9 @@ describe("describePluginHookHandler", () => {
   test("names a hook's status message, so a change there is visible in the review", () => {
     // Codex PRRT_kwDOPxxmWM6rQdyp: the status message is part of the hash.
     const handler = { type: "mcp_tool" as const, server: "s", tool: "t", input: {} };
-    expect(describePluginHookHandler({ ...handler, statusMessage: "Scanning…" })).toContain(
-      'status "Scanning…"'
+    // Two descriptions, not the label's wording: a rewording keeps the review's behavior.
+    expect(describePluginHookHandler({ ...handler, statusMessage: "Scanning…" })).not.toBe(
+      describePluginHookHandler({ ...handler, statusMessage: "Checking…" })
     );
   });
 
