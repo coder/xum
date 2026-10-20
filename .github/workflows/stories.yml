@@ -41,10 +41,12 @@ jobs:
     # Only for pull_request (off now, see on:): fork and Dependabot PRs get no Actions secrets.
     if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
     runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
-    # Under the merge queue ruleset's 60 minutes for checks, so a hung run fails here before the
-    # queue drops the entry. A warm run takes 4-5 minutes, so the one retry (below) fits. A cold
-    # run that needs each job's full 30 minutes (launch.ts DEADLINE_MS) does not.
-    timeout-minutes: 50
+    # In the merge queue: under the ruleset's 60 minutes for checks, so a hung run fails here
+    # before the queue drops the entry. A warm run takes 4-5 minutes, so the one retry (below)
+    # fits. A cold run that needs each job's full 30 minutes (launch.ts DEADLINE_MS) does not.
+    # The nightly and on-demand runs have no such limit: three jobs of at most 30 minutes after a
+    # build of up to about 10 minutes, plus setup and the cache steps, so 110 there.
+    timeout-minutes: ${{ github.event_name == 'merge_group' && 50 || 110 }}
     env:
       # The cache key's ref: the PR branch on pull_request, else the ref name (a branch, or
       # gh-readonly-queue/main/pr-<n>-<sha> in the merge queue). In env, not inline in run:.
@@ -77,15 +79,17 @@ jobs:
       # One more run only when every failed job got a provider 5xx (summary.ts --upstream-fault):
       # the user's rule, so that an overloaded provider does not fail a queue entry. A test
       # failure, a 4xx or a refusal fails at once. Before that run, the first run's outputs move
-      # to .e2e-first-try, so the Summary and seed steps read the second run's jobs only (each
-      # run adds new timestamped job folders to .e2e).
+      # out of the checkout to $RUNNER_TEMP, so the Summary and seed steps read the second run's
+      # jobs only (each run adds new timestamped job folders to .e2e), and stage() does not copy
+      # them into the second run's sandboxes (it stages untracked, unignored files of the tree).
       - name: make test-stories
         run: |
           set -o pipefail
           make test-stories && exit 0
           bun tests/stories/summary.ts --upstream-fault | tee -a "$GITHUB_STEP_SUMMARY"
           for dir in tests/stories/.e2e tests/bugbash/.e2e; do
-            if [[ -d "$dir" ]]; then mv "$dir" "$dir-first-try"; fi
+            dest="$RUNNER_TEMP/first-try/$dir"
+            if [[ -d "$dir" ]]; then mkdir -p "$(dirname "$dest")" && mv "$dir" "$dest"; fi
           done
           make test-stories
         env:
