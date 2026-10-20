@@ -3,6 +3,7 @@ import assert from "@/common/utils/assert";
 import {
   calculateRetryDelay,
   createFailedRetryState,
+  MAX_IDENTICAL_API_ERROR_FAILURES,
   createFreshRetryState,
   type RetryState,
 } from "@/common/utils/messages/retryState";
@@ -39,6 +40,14 @@ export type RetryStatusEvent =
   | AutoRetryStartingEvent
   | AutoRetryAbandonedEvent;
 
+const MAX_REASON_ERROR_CHARS = 300;
+
+function truncateReason(message: string): string {
+  return message.length > MAX_REASON_ERROR_CHARS
+    ? `${message.slice(0, MAX_REASON_ERROR_CHARS)}…`
+    : message;
+}
+
 export class RetryManager {
   private state: RetryState<RetryFailureError>;
   /**
@@ -63,6 +72,8 @@ export class RetryManager {
   private retryGeneration = 0;
   private pendingScheduledEvent: AutoRetryScheduledEvent | null = null;
   private retryOwnership?: Disposable;
+  /** Consecutive "api" failures with the text of state.lastError; reset with the state. */
+  private identicalApiErrorFailures = 0;
 
   constructor(
     private readonly workspaceId: string,
@@ -108,6 +119,16 @@ export class RetryManager {
     // a timer, but a later non-retryable error supersedes it.
     if (isNonRetryableSendError(error) || isNonRetryableStreamError(error)) {
       this.onStatusChange({ type: "auto-retry-abandoned", reason: error.type });
+      return;
+    }
+
+    if (this.countIdenticalApiErrorFailure(error) >= MAX_IDENTICAL_API_ERROR_FAILURES) {
+      this.cancel();
+      this.onStatusChange({
+        type: "auto-retry-abandoned",
+        // The stream error card shows the full text; keep the status line readable.
+        reason: `the same error repeated ${MAX_IDENTICAL_API_ERROR_FAILURES} times: ${truncateReason(error.message ?? "")}`,
+      });
       return;
     }
 
@@ -211,6 +232,19 @@ export class RetryManager {
     );
   }
 
+  /** Counts `error` into the run of identical unrecognized ("api") failures (#4228). */
+  private countIdenticalApiErrorFailure(error: RetryFailureError): number {
+    const previous = this.state.lastError;
+    const isApiError = error.type === "api" && error.message !== undefined;
+    const repeats = isApiError && previous?.type === "api" && previous.message === error.message;
+    this.identicalApiErrorFailures = repeats
+      ? this.identicalApiErrorFailures + 1
+      : isApiError
+        ? 1
+        : 0;
+    return this.identicalApiErrorFailures;
+  }
+
   /** Capture before an await so cancellation/supersession also fences original Promise work. */
   captureGeneration(): () => boolean {
     const generation = this.retryGeneration;
@@ -253,6 +287,7 @@ export class RetryManager {
   cancel(): void {
     this.retryGeneration += 1;
     this.state = createFreshRetryState<RetryFailureError>();
+    this.identicalApiErrorFailures = 0;
     this.interruptRetryFiber();
   }
 
