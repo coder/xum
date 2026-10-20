@@ -168,7 +168,9 @@ function boundSkillReadResult(
   const location = retainSkillLocationFields(result);
   const withLocation = boundSkillReadPackage(skill, { ...fields, ...location });
   if (withLocation !== undefined) return withLocation;
-  if (location.skillDir !== undefined && location.skillDirUnavailable === undefined) {
+  // The raw marker, not the retained one: an oversized reason is dropped from
+  // `location` but still marks the record as corrupted.
+  if (location.skillDir !== undefined && result.skillDirUnavailable === undefined) {
     const withSkillDir = boundSkillReadPackage(skill, { ...fields, skillDir: location.skillDir });
     if (withSkillDir !== undefined) return withSkillDir;
   }

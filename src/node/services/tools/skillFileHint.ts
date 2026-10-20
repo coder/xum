@@ -73,7 +73,11 @@ export async function skillFileBashHint(
 ): Promise<string> {
   // Shell words: adjacent quoted, escaped and plain fragments form one word
   // ('/a b'/SKILL.md), so a path with spaces stays whole.
-  const words = script.match(SHELL_WORD_RE) ?? [];
+  // Quoted `$`, `*` and `?` are literal path characters, so those words stay
+  // (#6738). The shell expands an unquoted one (and `$` in double quotes), so
+  // such a word is not the path bash read, and naming it would point
+  // agent_skill_read_file at a file that does not exist.
+  const words = (script.match(SHELL_WORD_RE) ?? []).filter((word) => !expandsInShell(word));
   const operands = words.map((word) =>
     word.replace(
       SHELL_FRAGMENT_RE,
@@ -81,15 +85,24 @@ export async function skillFileBashHint(
         single ?? double?.replace(/\\(.)/g, "$1") ?? fragment.slice(1)
     )
   );
-  // Quoted `$`, `*` and `?` are literal path characters, so they stay (#6738).
-  // An unquoted one makes a path that stat does not find: no hint, and the
-  // `skills/` prefilter plus MAX_BASH_PATH_TOKENS bound the lookups anyway.
   const tokens = new Set(operands.filter((token) => SKILLS_SEGMENT_RE.test(token)));
   for (const token of [...tokens].slice(0, MAX_BASH_PATH_TOKENS)) {
     const location = await findSkillFileForPath(config, token);
     if (location != null) return `${formatSkillFileHint(location)}\n\n`;
   }
   return "";
+}
+
+/** True when the shell would expand a `$`, `*` or `?` in this word. */
+function expandsInShell(word: string): boolean {
+  // Drop what the shell keeps literal: single-quoted text, backslash escapes,
+  // and everything but unescaped `$` inside double quotes.
+  const expandable = word.replace(
+    SHELL_FRAGMENT_RE,
+    (_fragment: string, single?: string, double?: string) =>
+      single !== undefined ? "" : (double?.replace(/\\./g, "").replace(/[^$]/g, "") ?? "")
+  );
+  return /[$*?]/.test(expandable);
 }
 
 /**

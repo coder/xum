@@ -174,6 +174,20 @@ describe("skill file hint", () => {
     await fs.writeFile(path.join(skillDir, "playbooks", "cost$1*.md"), LONG_LINE);
     const viaLiteral = await bashNote(config, `head -c 6000 '${skillDir}/playbooks/cost$1*.md'`);
     expect(viaLiteral).toContain('(name: "demo", filePath: "playbooks/cost$1*.md")');
+    const viaEscapes = await bashNote(config, `head -c 6000 ${escaped}/playbooks/cost\\$1\\*.md`);
+    expect(viaEscapes).toContain('(name: "demo", filePath: "playbooks/cost$1*.md")');
+    // The shell expands these, so the word is not the path bash read: here bash
+    // reads playbooks/long.md, and the literal file must not be named.
+    await fs.writeFile(path.join(skillDir, "playbooks", "long$V.md"), LONG_LINE);
+    await fs.writeFile(path.join(skillDir, "playbooks", "lo*.md"), LONG_LINE);
+    for (const script of [
+      `head -c 6000 "${skillDir}/playbooks/long$V.md"`,
+      `head -c 6000 ${escaped}/playbooks/lo*.md`,
+    ]) {
+      const expanded = await bashNote(config, script);
+      expect(expanded).toContain("per-line limit");
+      expect(expanded).not.toContain("agent_skill_read_file");
+    }
 
     const outside = await bashNote(config, `head -c 6000 "${tmp.path}/plain.md"`);
     expect(outside).toContain("per-line limit");
