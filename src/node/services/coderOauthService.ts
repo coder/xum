@@ -40,7 +40,7 @@ import type { WindowService } from "@/node/services/windowService";
 import { log } from "@/node/services/log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import {
-  describeCatalogFailures,
+  catalogRefreshFailureMessage,
   probeCoderGatewayProviders,
   readPriorCoderCatalog,
   reconcileProviderCatalog,
@@ -2671,13 +2671,8 @@ export class CoderOauthService {
         );
         // Name each failing provider and its status, so a user can tell a deployment problem
         // (for example a gateway that answers 502) from a Xum problem (#5659).
-        const failures = describeCatalogFailures(results);
         return yield* Effect.fail(
-          new CoderOauthError({
-            reason: everyFetchFailed
-              ? `Model discovery failed for every AI Gateway provider: ${failures}`
-              : `Model discovery failed for AI Gateway providers: ${failures}; try refreshing again`,
-          })
+          new CoderOauthError({ reason: catalogRefreshFailureMessage(results, everyFetchFailed) })
         );
       }
       if (!setResult.data.applied) {

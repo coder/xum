@@ -75,9 +75,9 @@ export function formatModelDisplayName(modelName: string): string {
       return `${tier} ${version}`;
     }
 
-    // Format: claude-{major}-{minor}-{tier} (older naming like claude-3-5-sonnet)
-    // e.g., "claude-3-5-sonnet" -> "Sonnet 3.5"
-    if (parts.length >= 3) {
+    // Format: claude-{major}[-{minor}]-{tier} (older naming like claude-3-5-sonnet)
+    // e.g., "claude-3-5-sonnet" -> "Sonnet 3.5", "claude-3-haiku-20240307" -> "Haiku 3"
+    if (parts.length >= 2) {
       const tierIdx = parts.findIndex((p) => tiers.includes(p));
       if (tierIdx > 0) {
         const tier = capitalize(parts[tierIdx]);

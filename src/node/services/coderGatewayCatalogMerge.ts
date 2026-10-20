@@ -188,15 +188,24 @@ export function reconcileProviderCatalog(
 }
 
 /**
- * The failing providers of a catalog refresh, with each one's last failure, for the user-facing
- * error: "anthropic (HTTP 502), openai (request failed)" (#5659).
+ * The user-facing error of an inconclusive catalog refresh. It names each provider whose fetch
+ * failed, with its last failure: "anthropic (HTTP 502)" (#5659). A refresh can also be
+ * inconclusive with no failed fetch (a probed provider's 404 without a known catalog): then the
+ * message stays generic.
  */
-export function describeCatalogFailures(
-  results: ReadonlyArray<{ provider: CoderGatewayProvider; result: CoderProviderCatalogResult }>
+export function catalogRefreshFailureMessage(
+  results: ReadonlyArray<{ provider: CoderGatewayProvider; result: CoderProviderCatalogResult }>,
+  everyFetchFailed: boolean
 ): string {
-  return results
+  const failures = results
     .flatMap(({ provider, result }) =>
       result.kind === "error" ? [`${provider.name} (${result.reason})`] : []
     )
     .join(", ");
+  if (everyFetchFailed) {
+    return `Model discovery failed for every AI Gateway provider: ${failures}`;
+  }
+  return failures.length > 0
+    ? `Model discovery failed for AI Gateway providers: ${failures}; try refreshing again`
+    : "Model discovery failed for at least one AI Gateway provider; try refreshing again";
 }

@@ -3,6 +3,7 @@ import { describe, expect, it } from "bun:test";
 import { CODER_GATEWAY_DEFAULT_PROVIDER_NAMES } from "@/common/constants/coderOAuth";
 import type { CoderGatewayProvider } from "@/common/constants/coderOAuth";
 import {
+  catalogRefreshFailureMessage,
   probeCoderGatewayProviders,
   readPriorCoderCatalog,
   reconcileProviderCatalog,
@@ -228,5 +229,26 @@ describe("reconcileProviderCatalog", () => {
         )
       ).toEqual({ ids: ["corp/s"], providers: [custom], inconclusive: true });
     });
+  });
+});
+
+describe("catalogRefreshFailureMessage", () => {
+  // #5659: name each failing provider and its last failure.
+  it("names the failing providers and their status", () => {
+    const results = [
+      { provider: anthropic, result: { kind: "error", reason: "HTTP 502" } as const },
+      { provider: custom, result: { kind: "ok", ids: [] } as const },
+    ];
+    expect(catalogRefreshFailureMessage(results, false)).toBe(
+      "Model discovery failed for AI Gateway providers: anthropic (HTTP 502); try refreshing again"
+    );
+  });
+
+  // A refresh can be inconclusive without a failed fetch: no empty list in the message.
+  it("keeps the generic message when no fetch failed", () => {
+    const results = [{ provider: custom, result: { kind: "unavailable" } as const }];
+    expect(catalogRefreshFailureMessage(results, false)).toBe(
+      "Model discovery failed for at least one AI Gateway provider; try refreshing again"
+    );
   });
 });

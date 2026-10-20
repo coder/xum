@@ -30,6 +30,10 @@ describe("formatModelDisplayName", () => {
     );
     expect(formatModelDisplayName("anthropic/claude-haiku-4-5-20251001")).toBe("Haiku 4.5");
     expect(formatModelDisplayName("claude-haiku-4-5-20251001")).toBe("Haiku 4.5");
+    // Older tier-last ids keep their tier once the date is gone.
+    expect(formatModelDisplayName("claude-3-haiku-20240307")).toBe("Haiku 3");
+    expect(formatModelDisplayName("claude-3-opus-20240229")).toBe("Opus 3");
+    expect(formatModelDisplayName("claude-3-5-sonnet-20241022")).toBe("Sonnet 3.5");
   });
 
   describe("Claude models", () => {
