@@ -50,6 +50,9 @@ export function createDaytonaArchiveHook(options: DaytonaArchiveHookOptions): Be
 
 /** Only sandboxes Xum created for this workspace; attached and shared ones are never touched. */
 function dedicatedSandboxId(workspaceMetadata: WorkspaceMetadata): string | undefined {
+  // A shared-checkout sub-agent copies its parent's runtime config, sandbox ID included,
+  // without marking it shared: the sandbox belongs to the parent.
+  if (workspaceMetadata.taskIsolation === "none") return undefined;
   const runtimeConfig = workspaceMetadata.runtimeConfig;
   if (!isDedicatedDaytonaSandbox(runtimeConfig) || !isSSHRuntime(runtimeConfig)) return undefined;
   return runtimeConfig.daytona?.sandboxId;

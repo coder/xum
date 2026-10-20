@@ -77,6 +77,27 @@ describe("createDaytonaArchiveHook", () => {
     expect(rig.plane.find("sb-users")?.state).toBe("started");
   });
 
+  it("leaves the parent's sandbox alone when a shared-checkout sub-agent is archived", async () => {
+    rig.plane.addSandbox({ id: "sb-parent" });
+    const hook = createDaytonaArchiveHook({
+      daytonaService: rig.service,
+      getArchiveBehavior: () => "delete",
+      checkSandboxDeletable: cleanCheck,
+    });
+
+    // An isolation:none child copies the parent's runtime config, sandbox ID included.
+    const result = await hook({
+      workspaceId: "child",
+      workspaceMetadata: {
+        ...metadata({ sandboxId: "sb-parent", shared: false }),
+        taskIsolation: "none",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    expect(rig.plane.find("sb-parent")?.state).toBe("started");
+  });
+
   it("keeps a dirty sandbox on archive delete: starts it for the check, then stops it and warns", async () => {
     rig.plane.addSandbox({ id: "sb-dirty", state: "stopped" });
     const sshCheck = spyOn(
