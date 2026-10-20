@@ -17,8 +17,8 @@
  * RosettaBannerClearsToggle: with the sidebar collapsed, the fixed toggle bar sits over the top of
  * the main column, where platform warning banners render; the warning must start after it.
  *
- * CollapsedTitleBarDrags: on desktop the collapsed root page still has a full-width window drag
- * region: the fixed toggle bar is shrink-wrapped and its button is no-drag.
+ * CollapsedTitleBarDrags: on desktop the collapsed root page still drags the window across the
+ * top strip, while the fixed toggle bar's button, which the page strip covers, stays clickable.
  */
 
 import { expect, userEvent, waitFor, within } from "storybook/test";
@@ -31,6 +31,7 @@ import { textContrast } from "@/browser/stories/helpers/contrast";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { collapseLeftSidebar } from "./helpers/uiState";
+import { windowDragsAt, withDesktopApi } from "./helpers/windowDrag";
 import { createMockORPCClient } from "./mocks/orpc";
 
 export default {
@@ -160,15 +161,6 @@ export const ToggleClearsWindowControls: AppStory = {
   },
 };
 
-// Electron's preload bridge, as the banner and isDesktopMode() read it.
-const withDesktopApi = (api: Partial<NonNullable<typeof window.api>>) => () => {
-  const previousApi = window.api;
-  window.api = { platform: "darwin", versions: {}, ...previousApi, ...api };
-  return () => {
-    window.api = previousApi;
-  };
-};
-
 // Collapsed before the app renders, so no hover or focus leaves the toggle's tooltip on screen.
 const setupCollapsed = () => {
   collapseLeftSidebar();
@@ -212,9 +204,14 @@ export const CollapsedTitleBarDrags: AppStory = {
     // Points across the top strip, from past the bar to the main column's right edge.
     const y = barRect.top + barRect.height / 2;
     for (const x of [barRect.right + 8, (barRect.right + mainRect.right) / 2, mainRect.right - 8]) {
-      const hit = document.elementFromPoint(x, y);
-      await expect(hit?.closest(".titlebar-drag"), `drag region at x=${x}`).not.toBeNull();
-      await expect(hit?.closest(".titlebar-no-drag"), `no-drag at x=${x}`).toBeNull();
+      await expect(windowDragsAt(x, y), `drag region at x=${x}`).toBe(true);
     }
+    const toggle = within(bar)
+      .getByRole("button", { name: "Open sidebar menu" })
+      .getBoundingClientRect();
+    await expect(
+      windowDragsAt(toggle.left + toggle.width / 2, toggle.top + toggle.height / 2),
+      "Open sidebar menu button drags the window"
+    ).toBe(false);
   },
 };

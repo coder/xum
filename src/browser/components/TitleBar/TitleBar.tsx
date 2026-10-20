@@ -208,9 +208,11 @@ export function TitleBar(props: TitleBarProps) {
       <div
         // Desktop titlebar: this wrapper is `flex-1` (for version ellipsis) so it fills the gap.
         // Keep it draggable; apply `titlebar-no-drag` only to the interactive controls inside.
+        // `items-start` on macOS: the column's default stretch widened the no-drag version button
+        // over the whole gap, so the window did not drag from it.
         className={cn(
           "mr-4 ml-2 flex min-w-0 flex-1",
-          leftInset > 0 ? "flex-col" : "items-center gap-2"
+          leftInset > 0 ? "flex-col items-start" : "items-center gap-2"
         )}
       >
         <Tooltip open={versionTooltipOpen} onOpenChange={setVersionTooltipOpen}>
