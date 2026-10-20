@@ -89,6 +89,42 @@ describe("subagentReportArtifacts", () => {
     expect(artifact?.structuredOutput).toEqual(structuredOutput);
   });
 
+  // #7003: the attempt id is read from the body, which holds the report markdown it labels; the
+  // index is a separate write and may still name the previous report's attempt (a reader between
+  // the two writes, or a failed index write).
+  test("readSubagentReportArtifactStrict labels the report with its body's attempt", async () => {
+    const workspaceId = "parent-1";
+    const childTaskId = "child-1";
+    const base = {
+      workspaceId,
+      workspaceSessionDir: testDir,
+      childTaskId,
+      parentWorkspaceId: workspaceId,
+      ancestorWorkspaceIds: [workspaceId],
+    };
+    await upsertSubagentReportArtifact({
+      ...base,
+      reportMarkdown: "Report A.",
+      taskAttemptId: "att_00000000000000a1",
+    });
+    const indexBeforeB = await fsPromises.readFile(
+      path.join(testDir, "subagent-reports.json"),
+      "utf-8"
+    );
+    await upsertSubagentReportArtifact({
+      ...base,
+      reportMarkdown: "Report B.",
+      taskAttemptId: "att_00000000000000b2",
+    });
+    // The index as a reader between B's body write and its index write sees it.
+    await fsPromises.writeFile(path.join(testDir, "subagent-reports.json"), indexBeforeB);
+
+    const read = await readSubagentReportArtifact(testDir, childTaskId);
+
+    expect(read?.reportMarkdown).toBe("Report B.");
+    expect(read?.taskAttemptId).toBe("att_00000000000000b2");
+  });
+
   describe("readSubagentReportArtifactStrict", () => {
     test("distinguishes a positively absent report from a persisted one", async () => {
       const childTaskId = "child-strict";

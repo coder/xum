@@ -213,8 +213,9 @@ export async function readSubagentReportArtifactStrict(
           title: title ?? meta.title,
           structuredOutput: obj.structuredOutput,
           planFilePath: planFilePath ?? meta.planFilePath,
-          // The body and the index are written together; an older Xum's rewrite drops both.
-          taskAttemptId: coerceAttemptId(meta.taskAttemptId),
+          // From the body, which holds the markdown it labels: the index is a separate, later
+          // write that a reader can see stale (or that failed). An older Xum's rewrite drops both.
+          taskAttemptId: coerceAttemptId(obj.taskAttemptId),
           reportMarkdown,
         },
       };
