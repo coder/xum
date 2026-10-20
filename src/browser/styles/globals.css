@@ -1474,8 +1474,6 @@ html[data-renderer-inactive] *::after {
 /* Desktop titlebar drag regions (Electron only)
  * -webkit-app-region: drag marks areas that can be used to drag the window
  * -webkit-app-region: no-drag marks interactive elements inside drag regions
- * -webkit-app-region: none makes an element, and (app-region inherits in Electron 44) its
- *   descendants, report no region, so the rects around them decide
  * These styles only apply in Electron; in browser mode they have no effect */
 .titlebar-drag {
   -webkit-app-region: drag;
@@ -1485,10 +1483,6 @@ html[data-renderer-inactive] *::after {
 
 .titlebar-no-drag {
   -webkit-app-region: no-drag;
-}
-
-.titlebar-no-region {
-  -webkit-app-region: none;
 }
 
 /* Titlebar-safe inset classes — consume the CSS custom properties set by

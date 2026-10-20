@@ -155,7 +155,8 @@ const config: TestRunnerConfig = {
       // the controls must size themselves to the 24px minimum. Plays cannot emulate the pointer.
       const client = await page.context().newCDPSession(page);
       const viewport = page.viewportSize();
-      const strip = page.getByRole("tablist").locator("..");
+      // The row sits in a wrapper that holds its desktop no-drag region.
+      const strip = page.getByRole("tablist").locator("../..");
       try {
         await page.setViewportSize({ width: 1200, height: 900 });
         const desktop = await strip.boundingBox();

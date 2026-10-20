@@ -154,6 +154,10 @@ function rect(element: Element) {
   const { x, y, width, height } = element.getBoundingClientRect();
   return { x, y, width, height };
 }
+/** The strip around a tab row (the row sits in a wrapper that holds its desktop no-drag region). */
+function stripOf(tablist: HTMLElement): HTMLElement {
+  return tablist.parentElement!.parentElement!;
+}
 async function frame() {
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 }
@@ -225,7 +229,7 @@ async function checkAllTabsButton(canvasElement: HTMLElement, overflowing: boole
   const rowRect = row.getBoundingClientRect();
   await expect(row.scrollWidth > row.clientWidth).toBe(overflowing);
   await expect(menu.left - rowRect.right).toBeGreaterThanOrEqual(0);
-  await expect(menu.right).toBeLessThanOrEqual(row.parentElement!.getBoundingClientRect().right);
+  await expect(menu.right).toBeLessThanOrEqual(stripOf(row).getBoundingClientRect().right);
   const hit = document.elementFromPoint(menu.left + menu.width / 2, menu.top + menu.height / 2);
   await expect(hit != null && menuButton.contains(hit)).toBe(true);
   if (!overflowing) {
@@ -335,7 +339,7 @@ export const Wide: Story = {
     // the tabs. They are its only buttons outside the tabs: New tab lives in the All tabs menu.
     const canvas = within(canvasElement);
     const tablist = canvas.getByRole("tablist");
-    const stripButtons = within(tablist.parentElement!)
+    const stripButtons = within(stripOf(tablist))
       .getAllByRole("button")
       .filter((button) => !tablist.contains(button))
       .map((button) => button.getAttribute("aria-label"));
@@ -345,7 +349,7 @@ export const Wide: Story = {
     const collapse = canvas
       .getByRole("button", { name: "Collapse sidebar" })
       .getBoundingClientRect();
-    const strip = tablist.parentElement!.getBoundingClientRect();
+    const strip = stripOf(tablist).getBoundingClientRect();
     await expect(allTabs.left - row.right).toBeGreaterThan(8);
     await expect(collapse.left - allTabs.right).toBeGreaterThanOrEqual(0);
     await expect(collapse.left - allTabs.right).toBeLessThanOrEqual(8);
@@ -360,7 +364,7 @@ export const Cramped: Story = {
     const collapse = canvas
       .getByRole("button", { name: "Collapse sidebar" })
       .getBoundingClientRect();
-    const strip = canvas.getByRole("tablist").parentElement!.getBoundingClientRect();
+    const strip = stripOf(canvas.getByRole("tablist")).getBoundingClientRect();
     await expect(collapse.left).toBeGreaterThanOrEqual(strip.left);
     await expect(collapse.right).toBeLessThanOrEqual(strip.right);
   },
@@ -380,7 +384,7 @@ function contains(rect: DOMRect, x: number, y: number) {
 async function checkStripDragRegions(canvasElement: HTMLElement) {
   const canvas = within(canvasElement);
   const row = canvas.getByRole("tablist").getBoundingClientRect();
-  const strip = canvas.getByRole("tablist").parentElement!.getBoundingClientRect();
+  const strip = stripOf(canvas.getByRole("tablist")).getBoundingClientRect();
   const standIn = canvas.getByTestId("header-stand-in").getBoundingClientRect();
   const buttons = [
     canvas.getByRole("button", { name: "All tabs" }).getBoundingClientRect(),

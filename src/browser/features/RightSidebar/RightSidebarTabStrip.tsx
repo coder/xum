@@ -64,8 +64,7 @@ const SortableTab: React.FC<{
   item: RightSidebarTabStripItem;
   index: number;
   tabsetId: string;
-  isDesktop: boolean;
-}> = ({ item, index, tabsetId, isDesktop }) => {
+}> = ({ item, index, tabsetId }) => {
   // Create a unique sortable ID that encodes tabset + tab
   const sortableId = `${tabsetId}:${item.tab}`;
 
@@ -86,7 +85,7 @@ const SortableTab: React.FC<{
   const sortableOnKeyDown = listeners?.onKeyDown;
 
   return (
-    <div className={cn("relative shrink-0", isDesktop && "titlebar-no-region")} style={style}>
+    <div className="relative shrink-0" style={style}>
       <Tooltip>
         <TooltipTrigger asChild>
           <div
@@ -468,41 +467,43 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
       className={cn(
         // Capped inset: the tabs live in one scrolling row, so the full overlay inset on a
         // narrow pane would shrink that row to zero and hide every tab.
-        "border-border-light titlebar-safe-right-capped titlebar-safe-right-gutter-2 flex min-w-0 items-center gap-1 border-b px-2 py-1.5 transition-colors",
+        "border-border-light titlebar-safe-right-capped titlebar-safe-right-gutter-2 relative flex min-w-0 items-center gap-1 border-b px-2 py-1.5 transition-colors",
         // With the collapse button, a pane at its minimum width cannot fit all buttons: overflow
         // on the left (the Panel clips it) so the collapse button stays visible. With room to
         // spare, the right-end group's ml-auto takes the free space and this has no effect.
         "has-[[data-sidebar-control]]:justify-end",
-        // In desktop mode, match the title bar height and make header draggable for window movement
-        isDesktop && [DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS, "titlebar-drag"],
+        // In desktop mode, match the title bar height
+        isDesktop && DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
         showDropHighlight && "bg-accent/30",
         isDraggingFromHere && "bg-accent/10"
       )}
     >
-      {/* One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges)
-          while the controls after it stay in view. The row, not each tab, is the no-drag
-          region: Chromium does not clip region rects to this scrolling row and Electron lets the
-          later rect win, so a scrolled-out tab's own rect would cover the workspace header and
-          the strip's empty space. */}
-      <div
-        ref={scrollRowRef}
-        data-tab-scroll-row
-        role="tablist"
-        aria-label={ariaLabel}
-        className={cn(
-          "scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto",
-          isDesktop && "titlebar-no-drag"
+      {/* Desktop drag regions. Chromium does not clip region rects to the scrolling row, Electron
+          lets the later rect win, and app-region inherits (even `none` below a drag or no-drag
+          element computes to that mode). So no ancestor of the tabs may set a region, or a
+          scrolled-out tab's own rect would cover the workspace header and the strip's empty
+          space. Instead, a drag backdrop fills the strip, and a no-drag sibling of the row covers
+          exactly the row's visible box, which keeps the visible tabs clickable. */}
+      {isDesktop && (
+        <div aria-hidden className="titlebar-drag pointer-events-none absolute inset-0" />
+      )}
+      <div className="relative flex min-w-0">
+        {isDesktop && (
+          <div aria-hidden className="titlebar-no-drag pointer-events-none absolute inset-0" />
         )}
-      >
-        {items.map((item, index) => (
-          <SortableTab
-            key={item.id}
-            item={item}
-            index={index}
-            tabsetId={tabsetId}
-            isDesktop={isDesktop}
-          />
-        ))}
+        {/* One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges)
+            while the controls after it stay in view. */}
+        <div
+          ref={scrollRowRef}
+          data-tab-scroll-row
+          role="tablist"
+          aria-label={ariaLabel}
+          className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
+        >
+          {items.map((item, index) => (
+            <SortableTab key={item.id} item={item} index={index} tabsetId={tabsetId} />
+          ))}
+        </div>
       </div>
       <StripEndControls
         items={items}
