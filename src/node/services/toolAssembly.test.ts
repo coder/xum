@@ -19,6 +19,7 @@ import { listRefinements } from "@/node/services/refinement/refinementRollback";
 import { createFileEditInsertTool } from "./tools/file_edit_insert";
 import { createFileEditReplaceStringTool } from "./tools/file_edit_replace_string";
 import { getTestDeps } from "./tools/testHelpers";
+import type { KernelFileLoader } from "./tools/kernelFileLoad";
 
 function executableTool(description: string): Tool {
   return {
@@ -406,7 +407,7 @@ describe("one tool set across agent-mode switches (#5253)", () => {
 });
 
 describe("turn-end todo nudge execution gate", () => {
-  test("keeps the advertised tools and refuses every call but todo_write, nested ones too", async () => {
+  test("keeps the advertised tools and refuses every call but todo_write, code_execution too", async () => {
     const calls: string[] = [];
     const recordingTool = (name: string): Tool =>
       ({
@@ -439,16 +440,53 @@ describe("turn-end todo nudge execution gate", () => {
     expect(Object.keys(nudge).sort()).toEqual(["code_execution", "native_search", "todo_write"]);
 
     const callOptions = { toolCallId: "test-call-id", messages: [], context: undefined };
-    const nested = (await nudge.code_execution.execute!(
-      { code: "return mux.mutate({});" },
-      callOptions
-    )) as { result?: unknown };
-    expect(nested.result).toEqual({
+    expect(
+      await nudge.code_execution.execute!({ code: "return mux.mutate({});" }, callOptions)
+    ).toEqual({
       success: false,
-      error: TODO_TURN_END_NUDGE_EXECUTION_GATE.refusal("mutate"),
+      error: TODO_TURN_END_NUDGE_EXECUTION_GATE.refusal("code_execution"),
     });
     expect(await nudge.todo_write.execute!({}, callOptions)).toEqual({ success: true });
     expect(calls).toEqual(["todo_write"]);
+  });
+
+  // mux.load reads through the kernel loader, not file_read's execute: refusing the bridged
+  // tool alone left the sandbox able to read workspace files during the nudge.
+  test("refuses the RLM kernel's mux.load file read", async () => {
+    using tmp = new DisposableTempDir("tool-assembly-nudge-kernel-load");
+    const scopeKey = "ws-tool-assembly-nudge-kernel-load";
+    const loads: string[] = [];
+    const kernelFileLoader: KernelFileLoader = ({ path: filePath }) => {
+      loads.push(filePath);
+      return Promise.resolve({ content: "secret", bytes: 6, lines: 1, preview: "secret" });
+    };
+    try {
+      const nudge = await applyToolPolicyAndExperiments({
+        allTools: {
+          file_read: executableTool("Read a file"),
+          todo_write: executableTool("Update the list"),
+        },
+        effectiveToolPolicy: undefined,
+        experiments: { programmaticToolCalling: true, rlm: true },
+        emitNestedToolEvent: () => undefined,
+        sandbox: { workspaceId: scopeKey, sessionDir: tmp.path, kernelFileLoader },
+        executionGate: TODO_TURN_END_NUDGE_EXECUTION_GATE,
+      });
+      const callOptions = { toolCallId: "test-call-id", messages: [], context: undefined };
+      expect(
+        await nudge.code_execution.execute!(
+          { code: 'return mux.load({ path: "secret.txt", key: "secret" });' },
+          callOptions
+        )
+      ).toEqual({
+        success: false,
+        error: TODO_TURN_END_NUDGE_EXECUTION_GATE.refusal("code_execution"),
+      });
+      expect(loads).toEqual([]);
+      expect(await nudge.todo_write.execute!({}, callOptions)).toEqual({ success: true });
+    } finally {
+      await sandboxHostService.disposeScope(scopeKey);
+    }
   });
 });
 

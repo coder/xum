@@ -213,6 +213,22 @@ function applySwitchableAgentPolicies(
   );
 }
 
+/**
+ * code_execution on a gated turn: refused whole, like any tool the gate denies. Refusing each
+ * bridged tool is not enough: kernel methods reach the host directly (mux.load reads files
+ * through the kernel loader whenever file_read is bridged), so the sandbox itself must not
+ * run. It stays advertised, so the tools block is unchanged. todo_write never needs it: it is
+ * PTC-excluded, so it stays a direct tool.
+ */
+function gateCodeExecution(
+  tool: Tool,
+  gate: ApplyToolPolicyAndExperimentsOptions["executionGate"]
+): Tool {
+  return gate === undefined
+    ? tool
+    : applyExecutionGate({ code_execution: tool }, gate).code_execution;
+}
+
 /** The policy step: the advertised tools, then the execution gate's refusals. */
 function applyPolicyStep(
   tools: Record<string, Tool>,
@@ -397,7 +413,7 @@ export async function applyToolPolicyAndExperiments(
         ...nonBridgeable,
         ...requiredTools,
         ...(promptGet !== undefined ? { mcp_prompt_get: promptGet } : {}),
-        code_execution: codeExecutionTool,
+        code_execution: gateCodeExecution(codeExecutionTool, opts.executionGate),
       };
 
       // RLM-only model surface: ID-addressed rollback of journaled harness
