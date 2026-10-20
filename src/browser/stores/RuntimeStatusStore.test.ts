@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient } from "@/browser/testUtils";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { RuntimeStatusStore } from "./RuntimeStatusStore";
+import { RuntimeStatusStore, type RuntimeStatus } from "./RuntimeStatusStore";
 
 const DEVCONTAINER_RUNTIME = {
   type: "devcontainer" as const,
@@ -30,9 +30,11 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 describe("RuntimeStatusStore refresh triggers (#5573)", () => {
   let store: RuntimeStatusStore;
   const getRuntimeStatuses = mock((input: { workspaceIds: string[] }) =>
-    Promise.resolve(Object.fromEntries(input.workspaceIds.map((id) => [id, "running"])))
+    Promise.resolve(
+      Object.fromEntries(input.workspaceIds.map((id): [string, RuntimeStatus] => [id, "running"]))
+    )
   );
-  const client = { workspace: { getRuntimeStatuses } } as unknown as APIClient;
+  const client = createTestApiClient({ workspace: { getRuntimeStatuses } });
 
   /** A connected store that displays devcontainer workspace ws-1, after its first status fetch. */
   async function setupDisplayed(metadata = new Map([["ws-1", createMetadata("ws-1")]])) {
