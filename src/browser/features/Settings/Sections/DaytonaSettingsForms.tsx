@@ -21,7 +21,11 @@ type TestState =
   | { status: "ok" }
   | { status: "error"; message: string };
 
-type DaytonaAccessInput = { apiKey?: string; apiUrl?: string; target?: string };
+interface DaytonaAccessInput {
+  apiKey?: string;
+  apiUrl?: string;
+  target?: string;
+}
 
 function describeKey(config: DaytonaPublicConfig | null): string {
   if (!config) return "Loading...";

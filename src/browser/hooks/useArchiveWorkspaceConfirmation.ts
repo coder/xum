@@ -31,10 +31,10 @@ export interface UseArchiveWorkspaceConfirmationOptions {
   showWarning: (workspaceId: string, warning: string, anchorEl?: HTMLElement) => void;
 }
 
-type ArchiveCallResult = {
+interface ArchiveCallResult {
   success: boolean;
   data?: ArchivePreflightResult | ArchiveWorkspaceResult;
-};
+}
 
 /** The untracked paths a successful preflight or archive asks the user to confirm losing. */
 function lossyUntrackedPaths(result: ArchiveCallResult): string[] | undefined {
