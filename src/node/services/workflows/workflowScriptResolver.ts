@@ -6,7 +6,7 @@ import type { AgentSkillScope, SkillName } from "@/common/types/agentSkill";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import type { Runtime } from "@/node/runtime/Runtime";
+import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
 import {
   discoverAgentPlugins,
   readPluginFileWithinRootCapped,
@@ -492,7 +492,16 @@ async function assertStoredSkillWorkflowReviewed(
   }
 ): Promise<void> {
   const parsed = parseSkillWorkflowScriptPath(input.scriptPath);
-  const skill = await readWorkflowSkill(input, parsed.skillName).catch(() => undefined);
+  const skill = await readWorkflowSkill(input, parsed.skillName).catch((error: unknown) => {
+    // A transport failure (an SSH host down) says nothing about the skill: refuse as retryable,
+    // never as "no longer available" (#6826). Any other read failure reads as a missing skill.
+    if (isRuntimeTransportError(error)) {
+      throw new Error(
+        `Skill '${parsed.skillName}' could not be read (${getErrorMessage(error)}), so its workflow run cannot resume now. Try again once the workspace is reachable.`
+      );
+    }
+    return undefined;
+  });
   if (skill?.package.scope !== input.scope) {
     throw new Error(
       `Skill '${parsed.skillName}' is no longer available in its ${input.scope} scope, so its workflow run cannot resume.`
