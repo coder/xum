@@ -139,6 +139,27 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Pro
   });
 }
 
+type DeleteResult = { success: true; deletedPath: string } | { success: false; error: string };
+
+type StatusEmitter = (phase: RuntimeStatusEvent["phase"], detail?: string) => void;
+
+function makeStatusEmitter(statusSink: EnsureReadyOptions["statusSink"]): StatusEmitter {
+  return (phase, detail) => statusSink?.({ phase, runtimeType: "ssh", detail });
+}
+
+function growsDisk(sandbox: DaytonaSandbox, preset: DaytonaSizePreset): boolean {
+  return sandbox.disk === undefined || sandbox.disk < preset.diskGiB;
+}
+
+/** A running sandbox can only grow cpu and memory. */
+function shrinksCompute(sandbox: DaytonaSandbox, preset: DaytonaSizePreset): boolean {
+  return (sandbox.cpu ?? 0) > preset.cpu || (sandbox.memory ?? 0) > preset.memoryGiB;
+}
+
+function changesCompute(sandbox: DaytonaSandbox, preset: DaytonaSizePreset): boolean {
+  return sandbox.cpu !== preset.cpu || sandbox.memory !== preset.memoryGiB;
+}
+
 /**
  * IMPORTANT: extends SSHRuntime (rather than delegating) so code that checks
  * `runtime instanceof SSHRuntime` (PTY, tools, MCP, bash AI proxy) treats Daytona as SSH.
@@ -224,23 +245,38 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       return { ready: true };
     }
 
-    const emitStatus = (phase: RuntimeStatusEvent["phase"], detail?: string) => {
-      options?.statusSink?.({ phase, runtimeType: "ssh", detail });
-    };
+    const emitStatus = makeStatusEmitter(options?.statusSink);
     emitStatus("checking");
+    const failure = await this.bringSandboxUp(sandboxId, emitStatus, options?.signal);
+    if (failure) return failure;
+    return this.markReadyIfRepoPresent(sandboxId, options, emitStatus);
+  }
 
+  /** Start the sandbox if needed and refresh ssh access; a failure result, or undefined. */
+  private async bringSandboxUp(
+    sandboxId: string,
+    emitStatus: StatusEmitter,
+    signal: AbortSignal | undefined
+  ): Promise<EnsureReadyResult | undefined> {
     try {
       await raceAbort(
         this.daytonaService.ensureSandboxReady(sandboxId, {
           onStarting: () => emitStatus("starting", "Starting sandbox..."),
         }),
-        options?.signal
+        signal
       );
+      return undefined;
     } catch (error) {
       emitStatus("error");
-      return this.ensureReadyFailure(sandboxId, error, options?.signal);
+      return this.ensureReadyFailure(sandboxId, error, signal);
     }
+  }
 
+  private async markReadyIfRepoPresent(
+    sandboxId: string,
+    options: EnsureReadyOptions | undefined,
+    emitStatus: StatusEmitter
+  ): Promise<EnsureReadyResult> {
     const repoCheck = await this.checkWorkspaceRepo(options);
     if (repoCheck && !repoCheck.ready) {
       emitStatus("error", repoCheck.error);
@@ -338,23 +374,30 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     if (!sandboxId) {
       return Err("Daytona sandbox id is required (should be set by finalizeConfig)");
     }
-    if (daytona.shared !== true && !findDaytonaSizePreset(daytona)) {
+    const attaching = daytona.shared === true;
+    if (!attaching && !findDaytonaSizePreset(daytona)) {
       return Err(invalidSizeError());
     }
+    return this.checkSandboxIdentity(sandboxId, attaching);
+  }
 
-    let state;
+  /** The sandbox to attach must exist; the name for a new one must be free. */
+  private async checkSandboxIdentity(
+    sandboxId: string,
+    attaching: boolean
+  ): Promise<Result<void, string>> {
+    let exists: boolean;
     try {
-      ({ state } = await this.daytonaService.getSandboxState(sandboxId));
+      exists = (await this.daytonaService.getSandboxState(sandboxId)).state !== "missing";
     } catch (error) {
       return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
     }
-    if (daytona.shared === true && state === "missing") {
-      return Err(`Daytona sandbox "${sandboxId}" was not found`);
-    }
-    if (daytona.shared !== true && state !== "missing") {
-      return Err(`A Daytona sandbox named "${sandboxId}" already exists`);
-    }
-    return Ok(undefined);
+    if (attaching === exists) return Ok(undefined);
+    return Err(
+      attaching
+        ? `Daytona sandbox "${sandboxId}" was not found`
+        : `A Daytona sandbox named "${sandboxId}" already exists`
+    );
   }
 
   /** The sandbox may not exist yet, so only compute the path (as Coder does). */
@@ -371,7 +414,6 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * sent, the sandbox this call created is deleted again so it cannot linger and bill.
    */
   async postCreateSetup(params: WorkspaceInitParams): Promise<void> {
-    const { initLogger, abortSignal } = params;
     const sandboxId = this.daytonaConfig.sandboxId;
     if (!sandboxId) {
       throw new Error("Daytona sandbox id is required (should be set by finalizeConfig)");
@@ -381,49 +423,60 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     let createRequested = false;
     try {
       if (creates) {
-        initLogger.logStep(`Creating Daytona sandbox "${sandboxId}"...`);
+        params.initLogger.logStep(`Creating Daytona sandbox "${sandboxId}"...`);
         createRequested = true;
         await this.createSandbox(sandboxId, params);
-        initLogger.logStep("Daytona sandbox created");
+        params.initLogger.logStep("Daytona sandbox created");
       }
-
-      initLogger.logStep("Waiting for the sandbox to start and configuring SSH...");
-      await raceAbort(
-        this.daytonaService.ensureSandboxReady(sandboxId, {
-          onStarting: () => initLogger.logStep("Starting sandbox..."),
-        }),
-        abortSignal
-      );
-
-      if (creates) {
-        initLogger.logStep("Copying agent hooks and global skills into the sandbox...");
-        const count = await seedAgentHome(
-          this,
-          this.agentHomeSeedSources ?? { xumHome: getXumHome(), home: os.homedir() },
-          abortSignal
-        );
-        initLogger.logStep(`Copied ${count} agent file(s)`);
-      }
-
-      initLogger.logStep("Preparing workspace directory...");
-      const parentDir = path.posix.dirname(params.workspacePath);
-      const mkdirResult = await execBuffered(this, `mkdir -p ${expandTildeForSSH(parentDir)}`, {
-        cwd: "/tmp",
-        timeout: 10,
-        abortSignal,
-      });
-      if (mkdirResult.exitCode !== 0) {
-        const errorMsg = mkdirResult.stderr || mkdirResult.stdout || "Unknown error";
-        throw new Error(`Failed to prepare workspace directory: ${errorMsg}`);
-      }
+      await this.connectAndSeed(sandboxId, creates, params);
+      await this.prepareWorkspaceDirectory(params);
     } catch (error) {
       const errorMsg = getErrorMessage(error);
       log.error("Daytona sandbox setup failed", { sandboxId, error: errorMsg });
-      initLogger.logStderr(`Daytona sandbox setup failed: ${errorMsg}`);
+      params.initLogger.logStderr(`Daytona sandbox setup failed: ${errorMsg}`);
       if (createRequested) {
-        await this.deleteCreatedSandbox(sandboxId, initLogger);
+        await this.deleteCreatedSandbox(sandboxId, params.initLogger);
       }
       throw new Error(`Daytona sandbox setup failed: ${errorMsg}`);
+    }
+  }
+
+  /** Wait until the sandbox runs, write ssh access, and seed the home of a box Xum created. */
+  private async connectAndSeed(
+    sandboxId: string,
+    seed: boolean,
+    params: WorkspaceInitParams
+  ): Promise<void> {
+    const { initLogger, abortSignal } = params;
+    initLogger.logStep("Waiting for the sandbox to start and configuring SSH...");
+    await raceAbort(
+      this.daytonaService.ensureSandboxReady(sandboxId, {
+        onStarting: () => initLogger.logStep("Starting sandbox..."),
+      }),
+      abortSignal
+    );
+    if (!seed) return;
+    initLogger.logStep("Copying agent hooks and global skills into the sandbox...");
+    const count = await seedAgentHome(
+      this,
+      this.agentHomeSeedSources ?? { xumHome: getXumHome(), home: os.homedir() },
+      abortSignal
+    );
+    initLogger.logStep(`Copied ${count} agent file(s)`);
+  }
+
+  /** git clone does not create the parent directory of the workspace. */
+  private async prepareWorkspaceDirectory(params: WorkspaceInitParams): Promise<void> {
+    params.initLogger.logStep("Preparing workspace directory...");
+    const parentDir = path.posix.dirname(params.workspacePath);
+    const mkdirResult = await execBuffered(this, `mkdir -p ${expandTildeForSSH(parentDir)}`, {
+      cwd: "/tmp",
+      timeout: 10,
+      abortSignal: params.abortSignal,
+    });
+    if (mkdirResult.exitCode !== 0) {
+      const errorMsg = mkdirResult.stderr || mkdirResult.stdout || "Unknown error";
+      throw new Error(`Failed to prepare workspace directory: ${errorMsg}`);
     }
   }
 
@@ -494,18 +547,17 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    */
   private async resizeToPreset(sandboxId: string, preset: DaytonaSizePreset): Promise<void> {
     const deadline = () => Date.now() + DAYTONA_START_TIMEOUT_MS;
-    const sandbox: DaytonaSandbox = await this.daytonaService.startAndWait(sandboxId, deadline());
-    const growsDisk = sandbox.disk === undefined || sandbox.disk < preset.diskGiB;
-    const shrinks = (sandbox.cpu ?? 0) > preset.cpu || (sandbox.memory ?? 0) > preset.memoryGiB;
+    const sandbox = await this.daytonaService.startAndWait(sandboxId, deadline());
+    const disk = growsDisk(sandbox, preset);
     const request = {
       cpu: preset.cpu,
       memory: preset.memoryGiB,
-      ...(growsDisk ? { disk: preset.diskGiB } : {}),
+      ...(disk ? { disk: preset.diskGiB } : {}),
     };
-    if (growsDisk || shrinks) {
+    if (disk || shrinksCompute(sandbox, preset)) {
       await this.daytonaService.stopAndWait(sandboxId, deadline());
       await this.daytonaService.resizeSandbox(sandboxId, request);
-    } else if (sandbox.cpu !== preset.cpu || sandbox.memory !== preset.memoryGiB) {
+    } else if (changesCompute(sandbox, preset)) {
       await this.daytonaService.resizeSandbox(sandboxId, request);
     }
     await this.daytonaService.startAndWait(sandboxId, deadline());
@@ -547,7 +599,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     abortSignal?: AbortSignal,
     trusted?: boolean,
     options?: { keepBranch?: boolean }
-  ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
+  ): Promise<DeleteResult> {
     const sandboxId = this.daytonaConfig.sandboxId;
     const shared = this.daytonaConfig.shared === true;
     const deletedPath = this.getWorkspacePath(projectPath, workspaceName);
@@ -565,38 +617,64 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       return this.deleteOwnedSandbox(sandboxId, deletedPath, undefined);
     }
 
+    const prepared = await this.startForDeleteChecks(sandboxId, abortSignal);
+    if (prepared === "missing") {
+      return this.forgetMissingSandbox(sandboxId, deletedPath, shared);
+    }
+    // A forced delete still tries the SSH cleanup; a normal one never skips the checks.
+    if (prepared !== "ready" && !force) {
+      return { success: false, error: prepared.error };
+    }
+    return this.deleteAfterChecks(sandboxId, await sshDelete(), shared);
+  }
+
+  private forgetMissingSandbox(
+    sandboxId: string,
+    deletedPath: string,
+    shared: boolean
+  ): Promise<DeleteResult> {
+    log.debug("Daytona sandbox already gone, skipping SSH cleanup", { sandboxId });
+    // Still drop the token and include block of a sandbox this workspace owned.
+    return shared
+      ? Promise.resolve({ success: true, deletedPath })
+      : this.deleteOwnedSandbox(sandboxId, deletedPath, undefined);
+  }
+
+  /** A failed check (dirty or unpushed work) keeps the workspace and its sandbox. */
+  private deleteAfterChecks(
+    sandboxId: string,
+    sshResult: DeleteResult,
+    shared: boolean
+  ): Promise<DeleteResult> {
+    if (!sshResult.success || shared) {
+      return Promise.resolve(sshResult);
+    }
+    return this.deleteOwnedSandbox(sandboxId, sshResult.deletedPath, "SSH delete succeeded, but ");
+  }
+
+  /** Start the sandbox (if stopped or archived) so the dirty and unpushed checks can run. */
+  private async startForDeleteChecks(
+    sandboxId: string,
+    abortSignal: AbortSignal | undefined
+  ): Promise<"ready" | "missing" | { error: string }> {
     try {
       await raceAbort(this.daytonaService.ensureSandboxReady(sandboxId), abortSignal);
+      return "ready";
     } catch (error) {
-      if (error instanceof DaytonaApiError && error.kind === "not_found") {
-        log.debug("Daytona sandbox already gone, skipping SSH cleanup", { sandboxId });
-        // Still drop the token and include block of a sandbox this workspace owned.
-        return shared
-          ? { success: true, deletedPath }
-          : this.deleteOwnedSandbox(sandboxId, deletedPath, undefined);
-      }
-      if (force) return sshDelete();
+      if (error instanceof DaytonaApiError && error.kind === "not_found") return "missing";
       return {
-        success: false,
         error:
           `Could not start Daytona sandbox "${sandboxId}" to check for uncommitted work: ` +
           `${getErrorMessage(error)}`,
       };
     }
-
-    const sshResult = await sshDelete();
-    // A failed check (dirty or unpushed work) keeps the workspace and its sandbox.
-    if (!sshResult.success || shared) {
-      return sshResult;
-    }
-    return this.deleteOwnedSandbox(sandboxId, sshResult.deletedPath, "SSH delete succeeded, but ");
   }
 
   private async deleteOwnedSandbox(
     sandboxId: string,
     deletedPath: string,
     errorPrefix: string | undefined
-  ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
+  ): Promise<DeleteResult> {
     try {
       await this.daytonaService.deleteSandbox(sandboxId);
       return { success: true, deletedPath };

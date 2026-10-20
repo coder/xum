@@ -76,6 +76,21 @@ function addFile(
   files.push({ remotePath, content: file.content, executable: (file.mode & 0o111) !== 0 });
 }
 
+/** Directory entries, sorted; null when the directory is missing or unreadable. */
+async function readDirectory(hostDir: string): Promise<string[] | null> {
+  try {
+    return (await fs.readdir(hostDir)).sort();
+  } catch (error) {
+    if (!isErrnoWithCode(error, "ENOENT") && !isErrnoWithCode(error, "ENOTDIR")) {
+      log.warn("Skipping an unreadable directory while seeding a Daytona sandbox", {
+        hostDir,
+        error: getErrorMessage(error),
+      });
+    }
+    return null;
+  }
+}
+
 async function collectDirectory(
   files: AgentHomeSeedFile[],
   budget: SeedBudget,
@@ -84,39 +99,43 @@ async function collectDirectory(
   depth: number
 ): Promise<void> {
   if (depth > MAX_SKILL_DIR_DEPTH || budget.exhausted) return;
-  let entries: string[];
+  const entries = await readDirectory(hostDir);
+  if (!entries) return;
+  for (const entry of entries) {
+    await collectEntry(
+      files,
+      budget,
+      path.join(hostDir, entry),
+      path.posix.join(remoteDir, entry),
+      depth
+    );
+  }
+}
+
+async function collectEntry(
+  files: AgentHomeSeedFile[],
+  budget: SeedBudget,
+  hostPath: string,
+  remotePath: string,
+  depth: number
+): Promise<void> {
+  let stat: Awaited<ReturnType<typeof fs.stat>>;
   try {
-    entries = await fs.readdir(hostDir);
+    stat = await fs.stat(hostPath);
   } catch (error) {
-    if (!isErrnoWithCode(error, "ENOENT") && !isErrnoWithCode(error, "ENOTDIR")) {
-      log.warn("Skipping an unreadable directory while seeding a Daytona sandbox", {
-        hostDir,
-        error: getErrorMessage(error),
-      });
-    }
+    // Broken symlinks are common in skill directories; skip them.
+    log.debug("Skipping a missing path while seeding a Daytona sandbox", {
+      hostPath,
+      error: getErrorMessage(error),
+    });
     return;
   }
-  for (const entry of entries.sort()) {
-    const hostPath = path.join(hostDir, entry);
-    const remotePath = path.posix.join(remoteDir, entry);
-    let stat: Awaited<ReturnType<typeof fs.stat>>;
-    try {
-      stat = await fs.stat(hostPath);
-    } catch (error) {
-      // Broken symlinks are common in skill directories; skip them.
-      log.debug("Skipping a missing path while seeding a Daytona sandbox", {
-        hostPath,
-        error: getErrorMessage(error),
-      });
-      continue;
-    }
-    if (stat.isDirectory()) {
-      await collectDirectory(files, budget, hostPath, remotePath, depth + 1);
-    } else if (stat.isFile()) {
-      const file = await readRegularFile(hostPath);
-      if (file) addFile(files, budget, remotePath, file);
-    }
+  if (stat.isDirectory()) {
+    await collectDirectory(files, budget, hostPath, remotePath, depth + 1);
+    return;
   }
+  const file = stat.isFile() ? await readRegularFile(hostPath) : null;
+  if (file) addFile(files, budget, remotePath, file);
 }
 
 /** The host files to copy; missing files and directories are skipped. */
