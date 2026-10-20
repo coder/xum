@@ -17,7 +17,7 @@ import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { textContrast } from "@/browser/stories/helpers/contrast";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
-import type { MCPServerInfo } from "@/common/types/mcp";
+import type { MCPConfigProblem, MCPServerInfo } from "@/common/types/mcp";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { Secret } from "@/common/types/secrets";
 
@@ -62,6 +62,7 @@ interface MCPSectionStoryOptions {
   preCacheTools?: boolean;
   experiments?: Partial<Record<ExperimentId, boolean>>;
   mcpAppViewDomainsListError?: string;
+  configProblems?: MCPConfigProblem[] | (() => MCPConfigProblem[]);
 }
 
 function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): APIClient {
@@ -102,6 +103,7 @@ function setupMCPSettingsSectionStory(options: MCPSectionStoryOptions = {}): API
     mcpOauthAuthStatus: options.mcpOauthAuthStatus,
     experiments: options.experiments,
     mcpAppViewDomainsListError: options.mcpAppViewDomainsListError,
+    mcpConfigProblems: options.configProblems,
   });
 }
 
@@ -771,6 +773,112 @@ export const ViewDomainsLoadErrorPhone: Story = {
     const row = error.parentElement!;
     await expect(within(row).getByRole("button", { name: "Retry" })).toBeVisible();
     await expect(row.getBoundingClientRect().right).toBeLessThanOrEqual(375);
+  },
+};
+
+// A syntax error and an invalid entry in mcp.jsonc: Xum skips those servers and says so, and the
+// valid server still shows (#2060).
+const CONFIG_PROBLEMS: MCPConfigProblem[] = [
+  { line: 4, column: 21, server: "github", message: "colon expected" },
+  {
+    line: 6,
+    column: 5,
+    server: "extremely-long-server-name-without-breaks-0123456789",
+    message: "has no command or url",
+  },
+];
+// As the backend lists them: each skipped entry stays as a disabled placeholder (fail closed).
+const CONFIG_PROBLEM_SERVERS: Record<string, MCPServerInfo> = {
+  memory: {
+    transport: "stdio",
+    command: "npx -y @modelcontextprotocol/server-memory",
+    disabled: false,
+  },
+  ...Object.fromEntries(
+    CONFIG_PROBLEMS.map((problem) => [
+      problem.server,
+      { transport: "stdio", command: "", disabled: true } satisfies MCPServerInfo,
+    ])
+  ),
+};
+const setupConfigProblemsStory = () =>
+  setupMCPSettingsSectionStory({
+    servers: CONFIG_PROBLEM_SERVERS,
+    configProblems: CONFIG_PROBLEMS,
+  });
+
+async function expectConfigProblemsNotice(canvasElement: HTMLElement): Promise<HTMLElement> {
+  const canvas = within(canvasElement);
+  const notice = await canvas.findByRole("alert");
+  await expect(notice).toHaveTextContent("Xum skipped part of /home/user/.xum/mcp.jsonc");
+  await expect(within(notice).getAllByRole("listitem")).toHaveLength(2);
+  await expect(notice).toHaveTextContent('Line 4, column 21: server "github": colon expected');
+  await expect(canvas.findByText("memory")).resolves.toBeInTheDocument();
+  return notice;
+}
+
+export const ConfigProblems: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <MCPSettingsSectionStoryShell setup={setupConfigProblemsStory}>
+      <MCPSettingsSection />
+    </MCPSettingsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    await expectConfigProblemsNotice(canvasElement);
+  },
+};
+
+// The user fixes mcp.jsonc outside Xum, then a toggle saves: the notice goes away (Codex review
+// of #7091). The mock reports the problems until the first save.
+export const ConfigProblemsClearAfterSave: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => {
+    let fixed = false;
+    const api = setupMCPSettingsSectionStory({
+      servers: {
+        memory: {
+          transport: "stdio",
+          command: "npx -y @modelcontextprotocol/server-memory",
+          disabled: false,
+        },
+      },
+      configProblems: () => (fixed ? [] : CONFIG_PROBLEMS),
+    });
+    const setEnabled = api.mcp.setEnabled.bind(api.mcp);
+    api.mcp.setEnabled = (input) => {
+      fixed = true;
+      return setEnabled(input);
+    };
+    return (
+      <MCPSettingsSectionStoryShell setup={() => api}>
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    );
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expectConfigProblemsNotice(canvasElement);
+    await userEvent.click(await canvas.findByRole("switch", { name: "Toggle memory enabled" }));
+    await waitFor(() => expect(canvas.queryByRole("alert")).toBeNull());
+  },
+};
+
+export const ConfigProblemsPhone: Story = {
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+  // The test-runner ignores viewport globals; the wrapper enforces the width there too.
+  render: () => (
+    <div style={{ width: 375, maxWidth: "100%" }}>
+      <MCPSettingsSectionStoryShell setup={setupConfigProblemsStory}>
+        <MCPSettingsSection />
+      </MCPSettingsSectionStoryShell>
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const notice = await expectConfigProblemsNotice(canvasElement);
+    await expect(notice.getBoundingClientRect().right).toBeLessThanOrEqual(375);
+    await expect(notice.scrollWidth).toBeLessThanOrEqual(notice.clientWidth);
   },
 };
 

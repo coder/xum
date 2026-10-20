@@ -346,6 +346,11 @@ export const MCPConfigProblemSchema = z.object({
   message: z.string(),
 });
 
+export const MCPConfigProblemsSchema = z.object({
+  path: z.string(),
+  problems: z.array(MCPConfigProblemSchema),
+});
+
 export const MCPTestResultSchema = z.discriminatedUnion("success", [
   z.object({
     success: z.literal(true),
