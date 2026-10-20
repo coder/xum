@@ -45,9 +45,9 @@ const SHELL_FRAGMENT_RE = /'([^']*)'|"((?:\\.|[^"\\])*)"|\\./g;
 function formatSkillFileHint(location: SkillFileLocation): string {
   const name = JSON.stringify(location.skillName);
   const filePath = JSON.stringify(location.filePath);
-  // No page-cap number here: agent_skill_read_file states its own limits when
-  // a page is too big, and a copied number goes stale (#6738).
-  return `${filePath} is a file of skill ${name}. agent_skill_read_file (name: ${name}, filePath: ${filePath}) returns its lines whole.`;
+  // agent_skill_read_file cannot return a single line over its 16 KB page cap
+  // either (it says so), so the hint does not promise more.
+  return `${filePath} is a file of skill ${name}. agent_skill_read_file (name: ${name}, filePath: ${filePath}) returns its lines whole, up to 16 KB per page.`;
 }
 
 /**
@@ -73,11 +73,7 @@ export async function skillFileBashHint(
 ): Promise<string> {
   // Shell words: adjacent quoted, escaped and plain fragments form one word
   // ('/a b'/SKILL.md), so a path with spaces stays whole.
-  // Quoted `$`, `*` and `?` are literal path characters, so those words stay
-  // (#6738). The shell expands an unquoted one (and `$` in double quotes), so
-  // such a word is not the path bash read, and naming it would point
-  // agent_skill_read_file at a file that does not exist.
-  const words = (script.match(SHELL_WORD_RE) ?? []).filter((word) => !expandsInShell(word));
+  const words = script.match(SHELL_WORD_RE) ?? [];
   const operands = words.map((word) =>
     word.replace(
       SHELL_FRAGMENT_RE,
@@ -85,24 +81,14 @@ export async function skillFileBashHint(
         single ?? double?.replace(/\\(.)/g, "$1") ?? fragment.slice(1)
     )
   );
-  const tokens = new Set(operands.filter((token) => SKILLS_SEGMENT_RE.test(token)));
+  const tokens = new Set(
+    operands.filter((token) => SKILLS_SEGMENT_RE.test(token) && !/[$*?]/.test(token))
+  );
   for (const token of [...tokens].slice(0, MAX_BASH_PATH_TOKENS)) {
     const location = await findSkillFileForPath(config, token);
     if (location != null) return `${formatSkillFileHint(location)}\n\n`;
   }
   return "";
-}
-
-/** True when the shell would expand a `$`, `*` or `?` in this word. */
-function expandsInShell(word: string): boolean {
-  // Drop what the shell keeps literal: single-quoted text, backslash escapes,
-  // and everything but unescaped `$` inside double quotes.
-  const expandable = word.replace(
-    SHELL_FRAGMENT_RE,
-    (_fragment: string, single?: string, double?: string) =>
-      single !== undefined ? "" : (double?.replace(/\\./g, "").replace(/[^$]/g, "") ?? "")
-  );
-  return /[$*?]/.test(expandable);
 }
 
 /**
