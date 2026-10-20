@@ -68,7 +68,14 @@ async function tokenizeWithMockModel(text: string, context: string): Promise<num
   if (slowTokenizeInFlight !== null) {
     return approximateTokens;
   }
+  return raceMockTokenizer(text, context, approximateTokens);
+}
 
+async function raceMockTokenizer(
+  text: string,
+  context: string,
+  approximateTokens: number
+): Promise<number> {
   let fallbackUsed = false;
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   let tokenizerErrorMessage: string | undefined;
@@ -110,15 +117,14 @@ async function tokenizeWithMockModel(text: string, context: string): Promise<num
       if (slowTokenizeInFlight === inFlight) slowTokenizeInFlight = null;
     });
     slowTokenizeInFlight = inFlight;
-  }
-
-  if (fallbackUsed && !tokenizerFallbackLogged) {
-    tokenizerFallbackLogged = true;
-    void actualPromise.then((resolvedTokens) => {
-      log.debug(
-        `[MockAiStreamPlayer] Tokenizer fallback used for ${context}; emitted ${approximateTokens}, background tokenizer returned ${resolvedTokens}`
-      );
-    });
+    if (!tokenizerFallbackLogged) {
+      tokenizerFallbackLogged = true;
+      void actualPromise.then((resolvedTokens) => {
+        log.debug(
+          `[MockAiStreamPlayer] Tokenizer fallback used for ${context}; emitted ${approximateTokens}, background tokenizer returned ${resolvedTokens}`
+        );
+      });
+    }
   }
 
   if (tokenizerErrorMessage && !tokenizerUnavailableLogged) {
