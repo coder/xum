@@ -1224,6 +1224,14 @@ function wrappedAnthropicErrorType(error: StreamProviderError): string | undefin
   }
 }
 
+/**
+ * A 5xx, or 408 Request Timeout: transient, so it stays out of the generic "api" class, whose
+ * identical repeats stop auto-retry (#4228).
+ */
+function isTransientHttpStatus(statusCode: number | undefined): boolean {
+  return statusCode === 408 || (statusCode !== undefined && statusCode >= 500);
+}
+
 function isOverloadedApiCallError(error: APICallError): boolean {
   return (
     error.statusCode === 529 ||
@@ -6383,7 +6391,7 @@ export class StreamManager {
           responseBody: error.responseBody,
         });
       }
-      if (error.statusCode && error.statusCode >= 500) return "server_error";
+      if (isTransientHttpStatus(error.statusCode)) return "server_error";
 
       // Check for model_not_found errors (OpenAI and Anthropic)
       // Type guard for error data structure

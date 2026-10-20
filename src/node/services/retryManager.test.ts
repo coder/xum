@@ -500,6 +500,35 @@ describe("RetryManager", () => {
     expect(events.some((event) => event.type === "auto-retry-abandoned")).toBe(false);
   });
 
+  it("a non-retryable failure in between restarts the count of identical unrecognized errors", async () => {
+    const { manager, events } = createRetryManager();
+
+    for (let failure = 1; failure <= 9; failure++) {
+      manager.handleStreamFailure({ type: "api", message: "same text" });
+      await adjustPastAnyBackoff();
+    }
+    manager.handleStreamFailure({ type: "authentication", message: "bad key" });
+    manager.handleStreamFailure({ type: "api", message: "same text" });
+
+    expect(events.at(-1)?.type).toBe("auto-retry-scheduled");
+  });
+
+  it("the force-all-retryable debug flag lifts the identical-error cap", async () => {
+    const runtime = globalThis as { __MUX_FORCE_ALL_RETRYABLE?: boolean };
+    runtime.__MUX_FORCE_ALL_RETRYABLE = true;
+    try {
+      const { manager, onRetry, events } = createRetryManager();
+      for (let failure = 1; failure <= 12; failure++) {
+        manager.handleStreamFailure({ type: "api", message: "same text" });
+        await adjustPastAnyBackoff();
+      }
+      expect(onRetry).toHaveBeenCalledTimes(12);
+      expect(events.some((event) => event.type === "auto-retry-abandoned")).toBe(false);
+    } finally {
+      delete runtime.__MUX_FORCE_ALL_RETRYABLE;
+    }
+  });
+
   it("a successful stream restarts the count of identical unrecognized errors", async () => {
     const { manager, onRetry, events } = createRetryManager();
 

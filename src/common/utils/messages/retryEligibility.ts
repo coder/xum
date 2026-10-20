@@ -23,7 +23,7 @@ export const PENDING_STREAM_START_GRACE_PERIOD_MS = 15000; // 15 seconds
  *
  * Uses globalThis instead of window so this utility stays safe for backend usage.
  */
-function isForceAllRetryableEnabled(): boolean {
+export function isForceAllRetryableEnabled(): boolean {
   const runtime = globalThis as typeof globalThis & {
     __MUX_FORCE_ALL_RETRYABLE?: boolean;
   };

@@ -617,6 +617,7 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
 
   for (const [statusCode, errorType] of [
     [503, "server_error"],
+    [408, "server_error"],
     [401, "authentication"],
     [429, "rate_limit"],
   ] as const) {

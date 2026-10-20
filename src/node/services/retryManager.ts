@@ -3,11 +3,12 @@ import assert from "@/common/utils/assert";
 import {
   calculateRetryDelay,
   createFailedRetryState,
-  MAX_IDENTICAL_API_ERROR_FAILURES,
   createFreshRetryState,
   type RetryState,
 } from "@/common/utils/messages/retryState";
+import { MAX_IDENTICAL_API_ERROR_FAILURES } from "@/constants/retry";
 import {
+  isForceAllRetryableEnabled,
   isNonRetryableSendError,
   isNonRetryableStreamError,
 } from "@/common/utils/messages/retryEligibility";
@@ -127,19 +128,13 @@ export class RetryManager {
     // Cancel any pending retry first — a retryable error may have scheduled
     // a timer, but a later non-retryable error supersedes it.
     if (isNonRetryableSendError(error) || isNonRetryableStreamError(error)) {
+      // Another class breaks the run of identical "api" failures.
+      this.identicalApiErrorFailures = 0;
       this.onStatusChange({ type: "auto-retry-abandoned", reason: error.type });
       return;
     }
 
-    if (this.countIdenticalApiErrorFailure(error) >= MAX_IDENTICAL_API_ERROR_FAILURES) {
-      this.cancel();
-      this.onStatusChange({
-        type: "auto-retry-abandoned",
-        // The stream error card shows the full text; keep the status line readable.
-        reason: `the same error repeated ${MAX_IDENTICAL_API_ERROR_FAILURES} times: ${truncateReason(error.message ?? "")}`,
-      });
-      return;
-    }
+    if (this.abandonIdenticalApiErrorRun(error)) return;
 
     // If a retry is already pending, cancel it and reschedule with updated backoff.
     // This can happen when multiple error events arrive before the timer fires.
@@ -239,6 +234,23 @@ export class RetryManager {
         }).pipe(Effect.catch((retryError) => Effect.sync(() => abandon(retryError))));
       }).pipe(Effect.ensuring(Effect.sync(() => self.releaseRetryOwnership(ownership))))
     );
+  }
+
+  /**
+   * Stops auto-retry at the MAX_IDENTICAL_API_ERROR_FAILURES-th identical unrecognized ("api")
+   * failure (#4228). Returns true when it abandoned.
+   */
+  private abandonIdenticalApiErrorRun(error: RetryFailureError): boolean {
+    // The debug override that makes every error retryable lifts this cap too.
+    if (this.countIdenticalApiErrorFailure(error) < MAX_IDENTICAL_API_ERROR_FAILURES) return false;
+    if (isForceAllRetryableEnabled()) return false;
+    this.cancel();
+    this.onStatusChange({
+      type: "auto-retry-abandoned",
+      // The stream error card shows the full text; keep the status line readable.
+      reason: `the same error repeated ${MAX_IDENTICAL_API_ERROR_FAILURES} times: ${truncateReason(error.message ?? "")}`,
+    });
+    return true;
   }
 
   /** Counts `error` into the run of identical unrecognized ("api") failures (#4228). */
