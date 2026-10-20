@@ -10,6 +10,7 @@ import {
   type WorkspaceMetadataContextValue,
 } from "@/browser/contexts/WorkspaceContext";
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
+import { windowDragsAt, withDesktopApi } from "@/browser/stories/helpers/windowDrag";
 import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import type { TabType } from "@/browser/types/rightSidebar";
 import {
@@ -362,5 +363,82 @@ export const Cramped: Story = {
     const strip = canvas.getByRole("tablist").parentElement!.getBoundingClientRect();
     await expect(collapse.left).toBeGreaterThanOrEqual(strip.left);
     await expect(collapse.right).toBeLessThanOrEqual(strip.right);
+  },
+};
+
+function center(rect: DOMRect) {
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+function contains(rect: DOMRect, x: number, y: number) {
+  return x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
+}
+
+/**
+ * Along the strip's center line, from the header stand-in to the strip's right end, every point
+ * outside the tab row and the strip buttons moves the window, and the controls do not.
+ */
+async function checkStripDragRegions(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  const row = canvas.getByRole("tablist").getBoundingClientRect();
+  const strip = canvas.getByRole("tablist").parentElement!.getBoundingClientRect();
+  const standIn = canvas.getByTestId("header-stand-in").getBoundingClientRect();
+  const buttons = [
+    canvas.getByRole("button", { name: "All tabs" }).getBoundingClientRect(),
+    canvas.getByRole("button", { name: "Collapse sidebar" }).getBoundingClientRect(),
+  ];
+  const y = strip.top + strip.height / 2;
+  const dead: number[] = [];
+  for (let x = Math.ceil(standIn.left); x < strip.right; x += 2) {
+    // The fixture's border between the stand-in and the strip is not part of the title bar.
+    if (!contains(standIn, x, y) && !contains(strip, x, y)) continue;
+    if ([row, ...buttons].some((rect) => contains(rect, x, y))) continue;
+    if (!windowDragsAt(x, y)) dead.push(x);
+  }
+  await expect(`points that do not drag: ${dead.join(",")}`).toBe("points that do not drag: ");
+  const visibleTabs = canvas
+    .getAllByRole("tab")
+    .map((tab) => center(tab.getBoundingClientRect()))
+    .filter((point) => contains(row, point.x, point.y));
+  await expect(visibleTabs.length).toBeGreaterThan(0);
+  for (const point of [...visibleTabs, ...buttons.map(center)]) {
+    await expect(windowDragsAt(point.x, point.y)).toBe(false);
+  }
+}
+
+export const DesktopDragRegions: Story = {
+  // In Electron the strip sits after the workspace header in DOM order, and Electron lets the
+  // later region rect win, so a tab scrolled out of the row must not block dragging the header.
+  args: { width: 300, collapsible: true },
+  beforeEach: withDesktopApi({ isRosetta: false, getIsRosetta: () => Promise.resolve(false) }),
+  render: (args) => (
+    <div className="flex">
+      <div data-testid="header-stand-in" className="titlebar-drag flex-1" />
+      <StripFixture {...args} />
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const row = canvas.getByRole("tablist");
+    const tabs = within(row).getAllByRole("tab");
+    const standIn = canvas.getByTestId("header-stand-in");
+
+    await userEvent.click(tabs[tabs.length - 1]);
+    await waitFor(() =>
+      expect(tabs[0].getBoundingClientRect().right).toBeLessThanOrEqual(
+        row.getBoundingClientRect().left
+      )
+    );
+    const scrolledOut = tabs[0].getBoundingClientRect();
+    await expect(scrolledOut.left).toBeLessThan(standIn.getBoundingClientRect().right);
+    await expect(scrolledOut.right).toBeGreaterThan(standIn.getBoundingClientRect().left);
+    await checkStripDragRegions(canvasElement);
+
+    await userEvent.click(tabs[0]);
+    await waitFor(() =>
+      expect(tabs[tabs.length - 1].getBoundingClientRect().right).toBeGreaterThan(
+        row.getBoundingClientRect().right
+      )
+    );
+    await checkStripDragRegions(canvasElement);
   },
 };

@@ -12,7 +12,7 @@ const REPLACED_ELEMENTS = new Set([
   "iframe",
 ]);
 
-const APP_REGION_SELECTOR = ".titlebar-drag, .titlebar-no-drag";
+const APP_REGION_SELECTOR = ".titlebar-drag, .titlebar-no-drag, .titlebar-no-region";
 
 /**
  * Whether Electron would drag the window from this viewport point. `document.elementFromPoint`
@@ -23,8 +23,9 @@ const APP_REGION_SELECTOR = ".titlebar-drag, .titlebar-no-drag";
  * and objects that are not boxes (inline spans, text, SVG shapes). Since Electron 44 `app-region`
  * inherits, so each descendant box reports its own rect. Electron (`shell/browser/ui/drag_util.cc`)
  * then lets the later rect win where rects overlap. The app sets `app-region` only through the
- * `titlebar-drag` and `titlebar-no-drag` classes, so this reads the classes, not the property,
- * and does not depend on the Storybook browser's Chromium version.
+ * `titlebar-drag`, `titlebar-no-drag` and `titlebar-no-region` classes (the nearest one gives the
+ * inherited mode; `none` reports no rect), so this reads the classes, not the property, and does
+ * not depend on the Storybook browser's Chromium version.
  */
 export function windowDragsAt(x: number, y: number): boolean {
   let drags = false;
@@ -34,7 +35,8 @@ export function windowDragsAt(x: number, y: number): boolean {
     if (style.display !== "contents") {
       const mode = element.closest(APP_REGION_SELECTOR);
       const isBox = style.display !== "inline" || REPLACED_ELEMENTS.has(element.localName);
-      if (mode && isBox && style.visibility === "visible") {
+      const reports = mode != null && !mode.classList.contains("titlebar-no-region");
+      if (reports && isBox && style.visibility === "visible") {
         const rect = element.getBoundingClientRect();
         if (x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom) {
           drags = mode.classList.contains("titlebar-drag");

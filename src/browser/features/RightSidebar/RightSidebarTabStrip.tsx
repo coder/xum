@@ -86,7 +86,7 @@ const SortableTab: React.FC<{
   const sortableOnKeyDown = listeners?.onKeyDown;
 
   return (
-    <div className={cn("relative shrink-0", isDesktop && "titlebar-no-drag")} style={style}>
+    <div className={cn("relative shrink-0", isDesktop && "titlebar-no-region")} style={style}>
       <Tooltip>
         <TooltipTrigger asChild>
           <div
@@ -481,13 +481,19 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
       )}
     >
       {/* One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges)
-          while the controls after it stay in view. */}
+          while the controls after it stay in view. The row, not each tab, is the no-drag
+          region: Chromium does not clip region rects to this scrolling row and Electron lets the
+          later rect win, so a scrolled-out tab's own rect would cover the workspace header and
+          the strip's empty space. */}
       <div
         ref={scrollRowRef}
         data-tab-scroll-row
         role="tablist"
         aria-label={ariaLabel}
-        className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
+        className={cn(
+          "scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto",
+          isDesktop && "titlebar-no-drag"
+        )}
       >
         {items.map((item, index) => (
           <SortableTab
