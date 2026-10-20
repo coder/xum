@@ -81,7 +81,7 @@ function propertyName(property: jsonc.Node): string | null {
  */
 function lastServersValue(root: jsonc.Node, problems: PlacedProblem[]): jsonc.Node | undefined {
   const blocks = (root.children ?? []).filter((property) => propertyName(property) === "servers");
-  for (const duplicate of blocks.slice(1)) {
+  for (const duplicate of blocks.slice(0, -1)) {
     problems.push({
       offset: duplicate.offset,
       server: null,

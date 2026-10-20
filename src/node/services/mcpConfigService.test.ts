@@ -1315,7 +1315,7 @@ describe("MCPConfigService config problems", () => {
     expect(Object.keys(await service.listServers())).toEqual(["new"]);
     const { problems } = await service.getConfigProblems();
     expect(problems).toEqual([
-      { line: 2, column: 1, server: null, message: '"servers" appears more than once' },
+      { line: 1, column: 2, server: null, message: '"servers" appears more than once' },
     ]);
     expect((await service.addServer("c", { command: "echo c" })).success).toBe(false);
     expect(await fs.readFile(configPath, "utf-8")).toBe(raw);
