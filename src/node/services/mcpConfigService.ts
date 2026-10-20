@@ -178,7 +178,7 @@ export class MCPConfigService {
     url?: string;
     headers?: Record<string, MCPHeaderValue>;
   }): Promise<Result<void>> {
-    const existingServer = (await this.listServers())[input.name];
+    const existingServer = getOwn(await this.listServers(), input.name);
     if (existingServer?.transport !== "stdio" && existingServer?.managed)
       return Err("Claude Design is managed in its settings card");
     const transport = input.transport ?? "stdio";

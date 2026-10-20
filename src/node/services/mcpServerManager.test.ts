@@ -1446,6 +1446,50 @@ describe("MCPServerManager", () => {
     expect(runs).toEqual([]);
   });
 
+  // #6821: a read ID is bound to its workspace and server, and a forgotten read is refused
+  // with its own text (not "restarted or replaced").
+  test("settings tool actions refuse a foreign or forgotten read as out of date", async () => {
+    const runs: string[] = [];
+    configService.listServers.mockResolvedValue({
+      cad: stdioConfig("settings-scope-cad"),
+      cam: stdioConfig("settings-scope-cam"),
+    });
+    servers.serve(
+      "settings-scope-cad",
+      layoutServer(() => ["reset"], runs)
+    );
+    servers.serve(
+      "settings-scope-cam",
+      layoutServer(() => ["reset"], runs)
+    );
+    const [first, second] = ["settings-scope-ws-1", "settings-scope-ws-2"];
+    await manager.getToolsForWorkspace(workspaceRequest(first));
+    await manager.getToolsForWorkspace(workspaceRequest(second));
+    const read = await manager.readSettings(first, "cad");
+    if (read === null) throw new Error("expected settings");
+    const run = (workspaceId: string, serverName: string, named = read) =>
+      manager
+        .runSettingsTool(workspaceId, serverName, "reset", named, { confirmed: true })
+        .then(() => "ran")
+        .catch((error: unknown) => String(error));
+    const outOfDate = "This dialog's settings are out of date. Reopen the dialog.";
+    expect(await run(second, "cad")).toContain(outOfDate);
+    expect(await run(first, "cam")).toContain(outOfDate);
+    expect(runs).toEqual([]);
+    // Xum remembers a bounded number of reads: the oldest is forgotten first.
+    let latest = read;
+    for (let i = 0; i < 256; i++) {
+      const next = await manager.readSettings(first, "cad");
+      if (next === null) throw new Error("expected settings");
+      latest = next;
+    }
+    const forgotten = await run(first, "cad");
+    expect(forgotten).toContain(outOfDate);
+    expect(forgotten).not.toContain("restarted or replaced");
+    expect(await run(first, "cad", latest)).toBe("ran");
+    expect(runs).toEqual(["reset"]);
+  });
+
   test("settings tool actions: a restart is checked against the action's own read", async () => {
     const runs: string[] = [];
     let offered = ["library"];
@@ -8002,6 +8046,25 @@ describe("MCPServerManager", () => {
     expect(Object.keys(toolsResult.tools)).not.toContain("serverb_tool");
   });
 
+  // #5755: `enabledServers["constructor"]` reads Object.prototype.constructor.
+  test("a server named after an Object.prototype key, disabled while leased, is not served", async () => {
+    const workspaceId = "ws-disable-proto-key-while-leased";
+    configService.listServers = mock(() =>
+      Promise.resolve({ serverA: stdioConfig("cmd-a"), constructor: stdioConfig("cmd-c") })
+    );
+    servers.serve("cmd-a", { tools: { tool: testTool() } });
+    servers.serve("cmd-c", { tools: { tool: testTool() } });
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    manager.acquireLease(workspaceId);
+
+    const served = await manager.getToolsForWorkspace(
+      workspaceRequest(workspaceId, { overrides: { disabledServers: ["constructor"] } })
+    );
+    expect(Object.keys(served.tools)).toEqual(["servera_tool"]);
+    expect(served.stats.startedServerCount).toBe(1);
+    manager.releaseLease(workspaceId);
+  });
+
   test("the leased deferred-restart path serves without waiting on a hung tool refresh", async () => {
     const workspaceId = "ws-leased-hung-tool-refresh";
     configService.listServers = mock(() =>
@@ -9816,6 +9879,36 @@ describe("MCPServerManager", () => {
     ).rejects.toThrow("aborted");
     expect(executeTool).not.toHaveBeenCalled();
     void stalled2;
+  });
+
+  // #5755: `"constructor" in {}` is true, so the gate's early revoke check must use an own key.
+  test("a pending save that disables a server named constructor refuses its call at once", async () => {
+    const workspaceId = "ws-proto-key-pending-revoke";
+    configService.listServers = mock(() =>
+      Promise.resolve({ constructor: stdioConfig("cmd-proto") })
+    );
+    const executeTool = mock(() => Promise.resolve({ content: [{ type: "text", text: "ok" }] }));
+    const dummyTool = {
+      description: "test",
+      inputSchema: { type: "object", properties: {} },
+      execute: executeTool,
+    } as unknown as Tool;
+    servers.serve("cmd-proto", { tools: { ping: dummyTool } });
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const serverTool = result.tools.constructor_ping;
+    if (!serverTool?.execute) throw new Error("Expected served tool to include execute");
+    // The save's repair never finishes (its config read stalls).
+    configService.listServers = mock(() => new Promise(() => undefined));
+    const pending = manager.applyWorkspaceOverrides(workspaceId, {
+      disabledServers: ["constructor"],
+    });
+    // Without the early check the call waits for the repair until this abort.
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      serverTool.execute({}, { abortSignal: AbortSignal.timeout(1_000) } as never)
+    ).rejects.toThrow("server 'constructor'");
+    expect(executeTool).not.toHaveBeenCalled();
+    void pending;
   });
 
   test("a publication whose repair fails invalidates the workspace instead of leaving stale enablement", async () => {

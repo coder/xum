@@ -35,7 +35,7 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport } from "./shellEnv";
-import { hostChildEnv, sanitizeXumChildEnv } from "./childProcessEnv";
+import { hostChildEnv, mergeChildEnv, sanitizeXumChildEnv } from "./childProcessEnv";
 import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
 import { agentCgroupEnrollmentLine } from "./agentCgroupEnrollment";
 
@@ -258,10 +258,10 @@ export abstract class LocalBaseRuntime implements Runtime {
 
     const defaultPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
     const callerEnv = options.env ?? {};
-    const mergedEnv = sanitizeXumChildEnv(
-      { ...hostChildEnv(options.hostEnv), ...callerEnv },
-      { ...process.env, ...callerEnv }
-    );
+    const mergedEnv = sanitizeXumChildEnv(mergeChildEnv(hostChildEnv(options.hostEnv), callerEnv), {
+      ...process.env,
+      ...callerEnv,
+    });
     const basePath =
       (options.env?.PATH && options.env.PATH.length > 0
         ? mergedEnv.PATH

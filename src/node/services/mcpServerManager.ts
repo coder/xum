@@ -2951,7 +2951,7 @@ export class MCPServerManager {
     const now = Date.now();
     return entry.timedOutServerNames.filter((serverName) => {
       if (
-        enabledServers[serverName] === undefined ||
+        !Object.hasOwn(enabledServers, serverName) ||
         entry.instances.has(serverName) ||
         entry.retryingTimedOutServerNames.has(serverName)
       ) {
@@ -2998,7 +2998,7 @@ export class MCPServerManager {
     const waiting = new Set<string>();
     const now = Date.now();
     for (const [serverName, backoff] of entry.timedOutRetryBackoff ?? []) {
-      if (enabledServers[serverName] === undefined || entry.instances.has(serverName)) continue;
+      if (!Object.hasOwn(enabledServers, serverName) || entry.instances.has(serverName)) continue;
       records.set(serverName, backoff);
       if (this.timedOutRetryWaitMs(entry, serverName, now) > 0) waiting.add(serverName);
     }
@@ -3592,7 +3592,7 @@ export class MCPServerManager {
       // of a server this serve enables: join it rather than returning without
       // that server's tools (#4539). Captured before this serve marks its own.
       const joinedRetries = [...existing.retryingTimedOutServerNames]
-        .filter(([name]) => enabledServers[name] !== undefined && !existing.instances.has(name))
+        .filter(([name]) => Object.hasOwn(enabledServers, name) && !existing.instances.has(name))
         .flatMap(([, retry]) => (retry === undefined ? [] : [retry]));
       const timedOutServerNamesToRetry = this.getTimedOutServerNamesToRetry(
         existing,
@@ -3606,7 +3606,7 @@ export class MCPServerManager {
 
         const serversToRetry: MCPServerMap = {};
         for (const serverName of timedOutServerNamesToRetry) {
-          const info = enabledServers[serverName];
+          const info = getOwn(enabledServers, serverName);
           if (info) {
             serversToRetry[serverName] = info;
           }
@@ -3842,7 +3842,7 @@ export class MCPServerManager {
 
         const serversToRestart: MCPServerMap = {};
         for (const serverName of closedServerNames) {
-          const info = enabledServers[serverName];
+          const info = getOwn(enabledServers, serverName);
           if (info) {
             serversToRestart[serverName] = info;
           }
@@ -3970,7 +3970,7 @@ export class MCPServerManager {
       // stay connected but fail at call time once their server is disabled (see
       // gateServedToolsOnEnablement); this keeps them out of the next stream entirely.
       const instancesForTools = new Map(
-        [...existing.instances].filter(([serverName]) => enabledServers[serverName] !== undefined)
+        [...existing.instances].filter(([serverName]) => Object.hasOwn(enabledServers, serverName))
       );
       const failedServerNames = existing.stats.failedServerNames.filter((serverName) =>
         enabledServerNames.has(serverName)
@@ -5538,9 +5538,12 @@ export class MCPServerManager {
     read: SettingsActionRead
   ): Error | null {
     const offered = this.settingsReadTools.get(read.readId);
-    // A forgotten (bounded), foreign or mismatched read: the dialog must read again.
+    // A forgotten (bounded) read, or one of another workspace or server: the dialog must read
+    // again. It gets its own text, since no restart happened (#6821).
+    if (offered?.key !== settingsSaveKey(workspaceId, serverName))
+      return new Error("This dialog's settings are out of date. Reopen the dialog.");
+    // A mismatched read, or an instance that no longer shows this read's schema.
     if (
-      offered?.key !== settingsSaveKey(workspaceId, serverName) ||
       offered.instanceToken !== read.instanceToken ||
       !this.isSettingsReadCurrent(workspaceId, serverName, instance, offered)
     )
@@ -7190,14 +7193,17 @@ export class MCPServerManager {
         // The server's CURRENT validated info comes from the live entry's
         // inventory (refreshed by every serve and repair), never from the
         // serve that produced this tool object.
-        const currentInfo = (): MCPServerInfo | undefined =>
-          this.workspaceServers.get(workspaceId)?.enabledServers[serverName];
+        const currentInfo = (): MCPServerInfo | undefined => {
+          const entry = this.workspaceServers.get(workspaceId);
+          return entry === undefined ? undefined : getOwn(entry.enabledServers, serverName);
+        };
         const enabledBy = (
           info: MCPServerInfo | undefined,
           overrides: WorkspaceMCPOverrides | undefined
         ): boolean =>
           info !== undefined &&
-          serverName in this.applyServerOverrides({ [serverName]: info }, overrides);
+          // Own key, not `in`: "constructor" is in every object (#5755).
+          Object.hasOwn(this.applyServerOverrides({ [serverName]: info }, overrides), serverName);
         for (let attempt = 0; attempt < CALL_GATE_MAX_ATTEMPTS; attempt++) {
           const recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
           if (recorded === undefined) {
@@ -7341,7 +7347,7 @@ export class MCPServerManager {
               return "retry";
             }
             const overrides = recorded.overrides;
-            const info = entry.enabledServers[serverName];
+            const info = getOwn(entry.enabledServers, serverName);
             if (
               info === undefined ||
               !enabledBy(info, overrides) ||

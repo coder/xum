@@ -173,6 +173,22 @@ export function pickMinimalChildEnv(
   return picked;
 }
 
+/**
+ * `env` over the host base `base`. On Windows names match without case (the env block is
+ * case-insensitive), so a base name that matches an `env` key is dropped: otherwise "Path" from
+ * the host stays next to the caller's "PATH", and the child gets either one (#6821).
+ */
+export function mergeChildEnv(
+  base: NodeJS.ProcessEnv,
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform
+): NodeJS.ProcessEnv {
+  if (platform !== "win32") return { ...base, ...env };
+  const overridden = new Set(Object.keys(env).map((name) => name.toUpperCase()));
+  const kept = Object.entries(base).filter(([name]) => !overridden.has(name.toUpperCase()));
+  return { ...Object.fromEntries(kept), ...env };
+}
+
 /** The host environment a child starts from, per ExecOptions.hostEnv (#6509). */
 export function hostChildEnv(mode: "inherit" | "minimal" | undefined): NodeJS.ProcessEnv {
   return mode === "minimal" ? pickMinimalChildEnv(process.env) : process.env;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { pickMinimalChildEnv } from "./childProcessEnv";
+import { mergeChildEnv, pickMinimalChildEnv } from "./childProcessEnv";
 
 describe("pickMinimalChildEnv", () => {
   it("keeps allowlisted and CA variables and drops everything else", () => {
@@ -41,5 +41,26 @@ describe("pickMinimalChildEnv", () => {
       "linux"
     );
     expect(picked).toEqual({ USER: "u" });
+  });
+});
+
+// #6821: on Windows "Path" and "PATH" name one variable, so a caller's env key replaces every
+// case variant of the host base instead of sitting next to it.
+describe("mergeChildEnv", () => {
+  it("drops host names that match a caller key without case on Windows", () => {
+    const merged = mergeChildEnv(
+      { Path: "C:\\host", Temp: "C:\\t", SystemRoot: "C:\\Windows" },
+      { PATH: "C:\\mine", TEMP: "C:\\other" },
+      "win32"
+    );
+    expect(merged).toEqual({ SystemRoot: "C:\\Windows", PATH: "C:\\mine", TEMP: "C:\\other" });
+  });
+
+  it("keeps case variants on POSIX, where they are distinct variables", () => {
+    expect(mergeChildEnv({ path: "/a", HOME: "/h" }, { PATH: "/b" }, "linux")).toEqual({
+      path: "/a",
+      HOME: "/h",
+      PATH: "/b",
+    });
   });
 });

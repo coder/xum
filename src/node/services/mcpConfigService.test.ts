@@ -301,6 +301,15 @@ describe("MCPConfigService", () => {
       expect.objectContaining({ event: "mcp_server_config_changed" })
     );
   });
+  // #5755: the existing-server lookup must not read Object.prototype.constructor.
+  test("adding a server named after an Object.prototype key records an add", async () => {
+    const capture = mock(() => undefined);
+    const apiService = new MCPConfigService(config, { telemetryService: { capture } });
+    await apiService.addForApi({ name: "constructor", command: "node server.js" });
+    expect(capture).toHaveBeenCalledWith(
+      expect.objectContaining({ properties: expect.objectContaining({ action: "add" }) })
+    );
+  });
 });
 
 describe("MCP server disable filtering", () => {
