@@ -35,16 +35,14 @@ test(
 );
 
 test(
-  "The right sidebar's collapse button shows a focus ring",
+  "The right sidebar's toggle shows a focus ring",
   { tags: ["bugbash", "5688"] },
   async ({ app, screen, browser }) => {
     await browser.setViewport({ width: 1440, height: 900 });
     await openPlayground(app, screen, browser);
     // This test exercises the expanded sidebar; fresh profiles start collapsed.
-    await screen.getByRole("button", /^Expand (right )?sidebar$/).tap();
-    const collapse = screen
-      .getByRole("complementary", "Workspace insights")
-      .getByRole("button", "Collapse sidebar");
+    await screen.getByRole("button", "Expand right sidebar").tap();
+    const collapse = screen.getByRole("button", "Collapse right sidebar");
     await expect(collapse).toBeVisible();
     // A key press first, so the browser treats the next focus as keyboard focus (:focus-visible).
     await browser.keyboard.press("Shift");

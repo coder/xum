@@ -157,7 +157,7 @@ test.describe("sidebar drag and drop", () => {
   }) => {
     await ui.projects.openFirstWorkspace();
     // Tabs start collapsed; explicitly open them before exercising the tabstrip.
-    await page.getByRole("button", { name: /^Expand (right )?sidebar$/ }).click();
+    await page.getByRole("button", { name: "Expand right sidebar", exact: true }).click();
 
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
     await expect(sidebar).toBeVisible();

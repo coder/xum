@@ -41,7 +41,7 @@ const METADATA: WorkspaceMetadataContextValue = {
   loadError: null,
 };
 
-function StripFixture(props: { width: number; collapsible: boolean; tabs?: TabType[] }) {
+function StripFixture(props: { width: number; reservesToggle: boolean; tabs?: TabType[] }) {
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
   const [selected, setSelected] = useState<TabType>(props.tabs?.[0] ?? "new");
   const [closed, setClosed] = useState<TabType[]>([]);
@@ -128,7 +128,7 @@ function StripFixture(props: { width: number; collapsible: boolean; tabs?: TabTy
                   setClosed((prev) => prev.filter((tab) => tab !== "new"));
                   setSelected("new");
                 }}
-                onCollapseSidebar={props.collapsible ? () => undefined : undefined}
+                reservesSidebarToggle={props.reservesToggle}
               />
             </SortableContext>
           </DndContext>
@@ -297,9 +297,9 @@ async function checkTabListMenu(canvasElement: HTMLElement) {
 }
 
 export const Narrow: Story = {
-  // No collapse button, like the phone full-screen strip (the test-runner swipes this one at
-  // phone width, see .storybook/test-runner.ts).
-  args: { width: 300, collapsible: false },
+  // No room for the sidebar toggle, like the phone full-screen strip (the test-runner swipes this
+  // one at phone width, see .storybook/test-runner.ts).
+  args: { width: 300, reservesToggle: false },
   play: async ({ canvasElement }) => {
     await checkStableControls(canvasElement);
     await checkAllTabsButton(canvasElement, true);
@@ -308,11 +308,10 @@ export const Narrow: Story = {
 };
 export const SingleTab: Story = {
   // All tabs stays with one tab: its menu holds the New tab.
-  args: { width: 300, collapsible: true, tabs: ["instructions"] },
+  args: { width: 300, reservesToggle: true, tabs: ["instructions"] },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(canvas.getAllByRole("tab")).toHaveLength(1);
-    await expect(canvas.getByRole("button", { name: "Collapse sidebar" })).toBeVisible();
     const menu = await openTabListMenu(canvasElement);
     await expect(within(menu).getAllByRole("button")).toHaveLength(2);
     await userEvent.click(within(menu).getByRole("button", { name: "New tab" }));
@@ -324,43 +323,45 @@ export const SingleTab: Story = {
     );
   },
 };
+/** The inert room the strip keeps under WorkspaceShell's right sidebar toggle. */
+function toggleRoom(canvasElement: HTMLElement): HTMLElement {
+  const strip = within(canvasElement).getByRole("tablist").parentElement!;
+  return strip.querySelector<HTMLElement>('button[aria-hidden="true"]')!;
+}
+
 export const Wide: Story = {
-  // Wide enough for every tab beside All tabs and the collapse button.
-  args: { width: 1000, collapsible: true },
+  // Wide enough for every tab beside All tabs and the toggle's room.
+  args: { width: 1000, reservesToggle: true },
   play: async ({ canvasElement }) => {
     await checkStableControls(canvasElement);
     await checkAllTabsButton(canvasElement, false);
-    // All tabs and the collapse button hold the strip's right end, past the free space after
-    // the tabs. They are its only buttons outside the tabs: New tab lives in the All tabs menu.
+    // All tabs and the toggle's room hold the strip's right end, past the free space after the
+    // tabs. All tabs is its only button outside the tabs: New tab lives in the All tabs menu.
     const canvas = within(canvasElement);
     const tablist = canvas.getByRole("tablist");
     const stripButtons = within(tablist.parentElement!)
       .getAllByRole("button")
       .filter((button) => !tablist.contains(button))
       .map((button) => button.getAttribute("aria-label"));
-    await expect(stripButtons).toEqual(["All tabs", "Collapse sidebar"]);
+    await expect(stripButtons).toEqual(["All tabs"]);
     const row = tablist.getBoundingClientRect();
     const allTabs = canvas.getByRole("button", { name: "All tabs" }).getBoundingClientRect();
-    const collapse = canvas
-      .getByRole("button", { name: "Collapse sidebar" })
-      .getBoundingClientRect();
+    const room = toggleRoom(canvasElement).getBoundingClientRect();
     const strip = tablist.parentElement!.getBoundingClientRect();
     await expect(allTabs.left - row.right).toBeGreaterThan(8);
-    await expect(collapse.left - allTabs.right).toBeGreaterThanOrEqual(0);
-    await expect(collapse.left - allTabs.right).toBeLessThanOrEqual(8);
-    await expect(strip.right - collapse.right).toBeLessThanOrEqual(9);
+    await expect(room.left - allTabs.right).toBeGreaterThanOrEqual(0);
+    await expect(room.left - allTabs.right).toBeLessThanOrEqual(8);
+    await expect(strip.right - room.right).toBeLessThanOrEqual(9);
   },
 };
 export const Cramped: Story = {
-  // A split pane at its minimum width (15% of a 300 px sidebar) has no room for all buttons.
-  args: { width: 45, collapsible: true },
+  // A split pane at its minimum width (15% of a 300 px sidebar) has no room for all controls:
+  // the toggle's room stays at the end, under the toggle.
+  args: { width: 45, reservesToggle: true },
   play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    const collapse = canvas
-      .getByRole("button", { name: "Collapse sidebar" })
-      .getBoundingClientRect();
-    const strip = canvas.getByRole("tablist").parentElement!.getBoundingClientRect();
-    await expect(collapse.left).toBeGreaterThanOrEqual(strip.left);
-    await expect(collapse.right).toBeLessThanOrEqual(strip.right);
+    const room = toggleRoom(canvasElement).getBoundingClientRect();
+    const strip = within(canvasElement).getByRole("tablist").parentElement!.getBoundingClientRect();
+    await expect(room.left).toBeGreaterThanOrEqual(strip.left);
+    await expect(room.right).toBeLessThanOrEqual(strip.right);
   },
 };

@@ -5,13 +5,14 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/To
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { useDroppable, useDndContext } from "@dnd-kit/core";
-import { Check, ChevronDown, PanelRightClose, X } from "lucide-react";
+import { Check, ChevronDown, X } from "lucide-react";
 import { isNewTab, type TabType } from "@/browser/types/rightSidebar";
 import { formatKeybind, formatKeybindForAria, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   isDesktopMode,
   DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
 } from "@/browser/hooks/useDesktopTitlebar";
+import { RightSidebarToggleSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { NewTabLabel } from "./Tabs/TabLabels";
 
 // Re-export for consumers that import from this file
@@ -52,8 +53,11 @@ interface RightSidebarTabStripProps {
   tabsetId: string;
   /** The All tabs menu's New tab row: open (or show) this tabset's New tab */
   onAddNewTab: () => void;
-  /** Collapses the sidebar. Only the strip at the sidebar's top-right corner gets it. */
-  onCollapseSidebar?: () => void;
+  /**
+   * Ends with room for WorkspaceShell's right sidebar toggle, which sits over the sidebar's
+   * top-right corner. Only the strip in that corner reserves it.
+   */
+  reservesSidebarToggle?: boolean;
 }
 
 /**
@@ -197,14 +201,9 @@ const TabCloseButton: React.FC<{
   </button>
 );
 
-/** True inside a strip control that acts on the whole sidebar: using it must not focus its pane. */
-export function isSidebarControlTarget(target: EventTarget): boolean {
-  return target instanceof Element && target.closest("[data-sidebar-control]") != null;
-}
-
 /**
- * Icon buttons after the tabs (All tabs, collapse). Coarse pointers get a 24px target:
- * tablets have no global touch floor (phones get 44px from it).
+ * Icon buttons after the tabs (All tabs). Coarse pointers get a 24px target: tablets have no
+ * global touch floor (phones get 44px from it).
  */
 function stripIconButtonClassName(isDesktop: boolean): string {
   return cn(
@@ -212,29 +211,6 @@ function stripIconButtonClassName(isDesktop: boolean): string {
     isDesktop && "titlebar-no-drag"
   );
 }
-
-const StripIconButton: React.FC<{
-  label: string;
-  isDesktop: boolean;
-  sidebarControl?: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}> = (props) => (
-  <Tooltip>
-    <TooltipTrigger asChild>
-      <button
-        type="button"
-        data-sidebar-control={props.sidebarControl ? "" : undefined}
-        className={stripIconButtonClassName(props.isDesktop)}
-        onClick={props.onClick}
-        aria-label={props.label}
-      >
-        {props.children}
-      </button>
-    </TooltipTrigger>
-    <TooltipContent side="bottom">{props.label}</TooltipContent>
-  </Tooltip>
-);
 
 const TAB_LIST_LABEL = "All tabs";
 
@@ -362,25 +338,16 @@ const TabListMenu: React.FC<{
   );
 };
 
-/** The strip's right end, past the free space after the tabs: All tabs and the collapse button. */
+/** The strip's right end, past the free space after the tabs: All tabs and the toggle's room. */
 const StripEndControls: React.FC<{
   items: RightSidebarTabStripItem[];
   isDesktop: boolean;
   onAddNewTab: () => void;
-  onCollapseSidebar?: () => void;
+  reservesSidebarToggle: boolean;
 }> = (props) => (
   <div className="ml-auto flex shrink-0 items-center gap-1">
     <TabListMenu items={props.items} isDesktop={props.isDesktop} onAddNewTab={props.onAddNewTab} />
-    {props.onCollapseSidebar && (
-      <StripIconButton
-        label="Collapse sidebar"
-        isDesktop={props.isDesktop}
-        sidebarControl
-        onClick={props.onCollapseSidebar}
-      >
-        <PanelRightClose className="h-3.5 w-3.5" />
-      </StripIconButton>
-    )}
+    {props.reservesSidebarToggle && <RightSidebarToggleSpacer />}
   </div>
 );
 
@@ -422,7 +389,7 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
   ariaLabel = "Sidebar views",
   tabsetId,
   onAddNewTab,
-  onCollapseSidebar,
+  reservesSidebarToggle = false,
 }) => {
   const { active } = useDndContext();
   const activeData = active?.data.current as TabDragData | undefined;
@@ -468,12 +435,16 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
       className={cn(
         // Capped inset: the tabs live in one scrolling row, so the full overlay inset on a
         // narrow pane would shrink that row to zero and hide every tab.
-        "border-border-light titlebar-safe-right-capped titlebar-safe-right-gutter-2 flex min-w-0 items-center gap-1 border-b px-2 py-1.5 transition-colors",
-        // With the collapse button, a pane at its minimum width cannot fit all buttons: overflow
-        // on the left (the Panel clips it) so the collapse button stays visible. With room to
-        // spare, the right-end group's ml-auto takes the free space and this has no effect.
-        "has-[[data-sidebar-control]]:justify-end",
-        isDesktop && DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
+        "border-border-light titlebar-safe-right-capped titlebar-safe-right-gutter-2 flex min-w-0 items-center gap-1 border-b px-2 transition-colors",
+        // As tall as the workspace header, so the right sidebar toggle over this strip's end and
+        // over the header's end sit on one line in both states. Phones keep their taller rows
+        // (44px touch tabs); only the full-screen sidebar shows the strip there.
+        "[@media(max-width:768px)_and_(pointer:coarse)]:py-1.5",
+        isDesktop ? DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS : "min-h-8",
+        // With the toggle's room, a pane at its minimum width cannot fit all controls: overflow on
+        // the left (the Panel clips it) so the room under the toggle stays at the end. With room
+        // to spare, the right-end group's ml-auto takes the free space and this has no effect.
+        reservesSidebarToggle && "justify-end",
         showDropHighlight && "bg-accent/30",
         isDraggingFromHere && "bg-accent/10",
         // In desktop mode, make header draggable for window movement
@@ -503,7 +474,7 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
         items={items}
         isDesktop={isDesktop}
         onAddNewTab={onAddNewTab}
-        onCollapseSidebar={onCollapseSidebar}
+        reservesSidebarToggle={reservesSidebarToggle}
       />
     </div>
   );

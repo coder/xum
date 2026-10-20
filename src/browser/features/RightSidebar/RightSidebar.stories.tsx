@@ -1865,11 +1865,16 @@ export const CollapsedOverview: Story = {
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    const card = await canvas.findByRole(
+    const sidebar = await canvas.findByRole(
       "complementary",
       { name: "Workspace insights" },
       { timeout: 15_000 }
     );
+    const card = await waitFor(() => {
+      const element = sidebar.querySelector<HTMLElement>(".right-sidebar-overview-card");
+      if (!element) throw new Error("Overview card not mounted yet");
+      return element;
+    });
     const sideChats = await within(card).findByRole("region", { name: "Side chats" });
     await within(sideChats).findByText("How real-time is the hedger?");
     await waitFor(() =>
@@ -1877,8 +1882,8 @@ export const CollapsedOverview: Story = {
     );
     // The session's cost leads the card.
     await within(card).findByRole("button", { name: /\$7\.99/ });
-    // The header's stand-in shows only where the card cannot.
-    await expect(canvas.queryByRole("button", { name: "Expand right sidebar" })).toBeNull();
+    // The toggle shows beside the card: the card has no expand control of its own.
+    await expect(canvas.getByRole("button", { name: "Expand right sidebar" })).toBeVisible();
 
     // Bounded: the card is a fraction of the workspace's height, and the chat is not narrowed
     // by a collapsed rail: it reaches the workspace's right edge.
@@ -1904,7 +1909,7 @@ export const CollapsedOverview: Story = {
 
 /**
  * Where the transcript column would lose width to the card (a 1000px workspace here), the card
- * stays hidden and the header's expand button stands in for it.
+ * stays hidden; the toggle still expands the sidebar.
  */
 export const CollapsedOverviewYieldsToTranscript: Story = {
   ...CollapsedOverview,
@@ -1921,8 +1926,8 @@ export const CollapsedOverviewYieldsToTranscript: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await canvas.findByRole("button", { name: "Expand right sidebar" }, { timeout: 15_000 });
-    // The header's button can show before the card: WorkspaceShell loads the sidebar lazily
-    // (#6206), so wait for the card to mount. It is hidden, so no role query can find it.
+    // The toggle shows before the card: WorkspaceShell loads the sidebar lazily (#6206), so
+    // wait for the card to mount. It is hidden, so no role query can find it.
     const card = await waitFor(
       () => {
         const element = canvasElement.querySelector<HTMLElement>(".right-sidebar-overview-card");
@@ -1931,9 +1936,107 @@ export const CollapsedOverviewYieldsToTranscript: Story = {
       },
       { timeout: 15_000 }
     );
-    // Hidden by visibility, not display: the layout still shows the sidebar, so its shortcuts
-    // keep expanding it rather than taking the narrow-layout fallbacks.
     await expect(getComputedStyle(card).visibility).toBe("hidden");
-    await expect(getComputedStyle(card).display).not.toBe("none");
+    // The layout still shows the (zero-width) sidebar, so its shortcuts keep expanding it
+    // rather than taking the narrow-layout fallbacks.
+    const sidebar = canvas.getByRole("complementary", { name: "Workspace insights" });
+    await expect(getComputedStyle(sidebar).display).not.toBe("none");
+  },
+};
+
+interface ToggleFrame {
+  toggle: DOMRect;
+  sidebarWidth: number;
+  card: boolean;
+  panel: boolean;
+}
+
+/** Samples the toggle and the sidebar on every animation frame while `act` runs, and after. */
+async function sampleToggleFrames(
+  canvasElement: HTMLElement,
+  act: () => Promise<unknown>
+): Promise<ToggleFrame[]> {
+  const canvas = within(canvasElement);
+  const toggle = canvas.getByTestId("right-sidebar-toggle-bar").querySelector("button")!;
+  const sidebar = canvas.getByRole("complementary", { name: "Workspace insights" });
+  const frames: ToggleFrame[] = [];
+  let sampling = true;
+  const sample = () => {
+    frames.push({
+      toggle: toggle.getBoundingClientRect(),
+      sidebarWidth: sidebar.getBoundingClientRect().width,
+      card: sidebar.querySelector(".right-sidebar-overview-card") != null,
+      panel: sidebar.querySelector('[role="tablist"]') != null,
+    });
+    if (sampling) requestAnimationFrame(sample);
+  };
+  sample();
+  await act();
+  // The slide takes 200ms; sample well past it.
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  sampling = false;
+  return frames;
+}
+
+async function expectSameRect(actual: DOMRect, expected: DOMRect) {
+  for (const key of ["left", "top", "width", "height"] as const) {
+    await expect(Math.abs(actual[key] - expected[key])).toBeLessThanOrEqual(0.1);
+  }
+}
+
+/**
+ * The right sidebar's toggle (like the left one) is one element in both states: it keeps its
+ * size, place and focus while the docked width slides, and the header (collapsed) and the tab
+ * strip (expanded) reserve its room on their own line.
+ */
+export const ToggleStaysPutWhileSliding: Story = {
+  ...CollapsedOverview,
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const sidebar = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    await waitFor(() =>
+      expect(sidebar.querySelector(".right-sidebar-overview-card")).not.toBeNull()
+    );
+    const toggle = canvas.getByRole("button", { name: "Expand right sidebar" });
+    const header = canvas.getByTestId("workspace-menu-bar");
+    const headerRoom = header.querySelector<HTMLElement>("button.right-sidebar-toggle")!;
+    // Focus first: focus() may scroll the 1600px frame into the test runner's narrower window.
+    toggle.focus();
+    const rest = toggle.getBoundingClientRect();
+    await expectSameRect(headerRoom.getBoundingClientRect(), rest);
+
+    const opening = await sampleToggleFrames(canvasElement, () => userEvent.keyboard("{Enter}"));
+    await expect(toggle).toHaveAccessibleName("Collapse right sidebar");
+    await expect(toggle).toHaveFocus();
+    for (const frame of opening) await expectSameRect(frame.toggle, rest);
+    const openWidth = opening[opening.length - 1].sidebarWidth;
+    await expect(openWidth).toBeGreaterThan(200);
+    await expect(
+      opening.some((frame) => frame.sidebarWidth > 1 && frame.sidebarWidth < openWidth - 1)
+    ).toBe(true);
+    // Expanding drops the card at once; the panel slides in.
+    await expect(opening.some((frame) => frame.card && frame.panel)).toBe(false);
+
+    const strip = canvas.getByRole("tablist", { name: "Sidebar views" }).parentElement!;
+    const stripRoom = strip.querySelector<HTMLElement>('button[aria-hidden="true"]')!;
+    await expectSameRect(stripRoom.getBoundingClientRect(), rest);
+    await expect(strip.getBoundingClientRect().height).toBe(header.getBoundingClientRect().height);
+
+    const closing = await sampleToggleFrames(canvasElement, () => userEvent.keyboard("{Enter}"));
+    await expect(toggle).toHaveAccessibleName("Expand right sidebar");
+    await expect(toggle).toHaveFocus();
+    for (const frame of closing) await expectSameRect(frame.toggle, rest);
+    await expect(closing[closing.length - 1].sidebarWidth).toBe(0);
+    await expect(
+      closing.some((frame) => frame.sidebarWidth > 1 && frame.sidebarWidth < openWidth - 1)
+    ).toBe(true);
+    // The card is revealed under the panel as it slides out.
+    await expect(closing.some((frame) => frame.card && frame.panel)).toBe(true);
+    await expect(closing[closing.length - 1].panel).toBe(false);
   },
 };

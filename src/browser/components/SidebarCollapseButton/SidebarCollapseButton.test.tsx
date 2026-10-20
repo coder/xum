@@ -6,7 +6,7 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { TooltipProvider } from "../Tooltip/Tooltip";
-import { LeftSidebarToggleBar } from "./SidebarCollapseButton";
+import { LeftSidebarToggleBar, RightSidebarToggle } from "./SidebarCollapseButton";
 
 let cleanupDom: (() => void) | null = null;
 
@@ -19,6 +19,15 @@ function ToggleBar(props: { hasNewChatTarget: boolean }) {
         showNewChat={collapsed && props.hasNewChatTarget}
         onToggle={() => setCollapsed((prev) => !prev)}
       />
+    </TooltipProvider>
+  );
+}
+
+function RightToggle() {
+  const [collapsed, setCollapsed] = useState(true);
+  return (
+    <TooltipProvider>
+      <RightSidebarToggle collapsed={collapsed} onToggle={() => setCollapsed((prev) => !prev)} />
     </TooltipProvider>
   );
 }
@@ -62,5 +71,32 @@ describe("LeftSidebarToggleBar", () => {
       window.removeEventListener(CUSTOM_EVENTS.NEW_CHAT_REQUESTED, onNewChat);
     }
     expect(onNewChat).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("RightSidebarToggle", () => {
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  // Like the left toggle: one element for both states, so it keeps focus (and its place).
+  test("the focused toggle survives expand and collapse", () => {
+    const view = render(<RightToggle />);
+
+    const toggle = view.getByRole("button", { name: "Expand right sidebar" });
+    act(() => toggle.focus());
+    fireEvent.click(toggle);
+    expect(view.getByRole("button", { name: "Collapse right sidebar" })).toBe(toggle);
+    expect(document.activeElement).toBe(toggle);
+
+    fireEvent.click(toggle);
+    expect(view.getByRole("button", { name: "Expand right sidebar" })).toBe(toggle);
+    expect(document.activeElement).toBe(toggle);
   });
 });

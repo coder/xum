@@ -131,7 +131,6 @@ function renderOverview(
   } = {}
 ) {
   const opened: TabType[] = [];
-  let expanded = 0;
   let terminalOpens = 0;
   let newSideChats = 0;
   const value: WorkspaceMetadataContextValue = {
@@ -145,9 +144,6 @@ function renderOverview(
       <TooltipProvider>
         <RightSidebarOverview
           workspaceId={options.workspaceId ?? WORKSPACE_ID}
-          onExpand={() => {
-            expanded += 1;
-          }}
           onOpenTab={(tab) => opened.push(tab)}
           onOpenTerminals={() => {
             terminalOpens += 1;
@@ -176,7 +172,6 @@ function renderOverview(
     rerender: (flags: { artifactsEnabled: boolean; mcpAppsEnabled: boolean }) =>
       view.rerender(wrap(cardFor(flags))),
     opened,
-    expandCount: () => expanded,
     terminalOpenCount: () => terminalOpens,
     newSideChatCount: () => newSideChats,
   };
@@ -246,8 +241,17 @@ describe("RightSidebarOverview", () => {
 
   test("shows no stats before the session has usage", () => {
     const { view } = renderOverview([workspace({ id: WORKSPACE_ID })]);
-    expect(view.queryByRole("button", { name: /\$/ })).toBeNull();
-    expect(view.getByRole("button", { name: "Expand sidebar" })).toBeTruthy();
+    expect(view.queryByRole("button", { name: /\$|tokens/ })).toBeNull();
+    expect(view.getByRole("region", { name: "Side chats" })).toBeTruthy();
+  });
+
+  // globals.css hides a card whose content is empty, so a workspace with nothing to summarize
+  // shows no empty bordered box over the chat.
+  test("renders no content when the workspace has nothing to summarize", () => {
+    const { view } = renderOverview([workspace({ id: WORKSPACE_ID, kind: "scratch" })], {
+      canStartSideChat: false,
+    });
+    expect(view.container.firstElementChild?.childElementCount).toBe(0);
   });
 
   test("lists this workspace's side chats newest first, capped, and opens the picked one", () => {
@@ -262,7 +266,7 @@ describe("RightSidebarOverview", () => {
       title: "Someone else's side chat",
       sideChatParentWorkspaceId: "ws-other",
     });
-    const { view, opened, expandCount } = renderOverview([
+    const { view, opened } = renderOverview([
       workspace({ id: WORKSPACE_ID }),
       ...chats,
       otherParentChat,
@@ -287,7 +291,7 @@ describe("RightSidebarOverview", () => {
     // A hidden side chat may have no open tab, so "more" lists every chat in the card and hands
     // focus to the first one it revealed, instead of expanding the sidebar.
     fireEvent.click(rows[3]);
-    expect(expandCount()).toBe(0);
+    expect(opened).toEqual(["side:side-new"]);
     const revealed = section.getByRole("button", { name: "Oldest question" });
     expect(document.activeElement).toBe(revealed);
     expect(section.queryByRole("button", { name: /more$/ })).toBeNull();
@@ -776,7 +780,7 @@ describe("RightSidebarOverview", () => {
       const callsBefore = listCalls;
       const off = renderOverview([workspace({ id: WORKSPACE_ID })], { client });
       await waitFor(() =>
-        expect(off.view.getByRole("button", { name: "Expand sidebar" })).toBeTruthy()
+        expect(off.view.getByRole("region", { name: "Side chats" })).toBeTruthy()
       );
       expect(off.view.queryByRole("region", { name: "Outputs" })).toBeNull();
       expect(listCalls).toBe(callsBefore);

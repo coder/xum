@@ -516,8 +516,8 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
    */
   async function openFromNewTab(toolName: string): Promise<void> {
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
-    // Tools are opt-in now: wait for either the collapsed expand action or the open strip.
-    const expandButton = page.getByRole("button", { name: /^Expand (right )?sidebar$/ });
+    // Tools are opt-in now: wait for either the collapsed sidebar's toggle or the open strip.
+    const expandButton = page.getByRole("button", { name: "Expand right sidebar", exact: true });
     const menuButton = sidebar.getByRole("button", { name: "All tabs", exact: true }).first();
     await expect(expandButton.or(menuButton)).toBeVisible();
     if (await expandButton.isVisible()) await expandButton.click();

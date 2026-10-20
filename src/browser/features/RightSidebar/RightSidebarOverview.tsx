@@ -3,7 +3,6 @@ import {
   FileText,
   HeartPulse,
   MessageCircle,
-  PanelRightOpen,
   Plus,
   Sparkles,
   SquareTerminal,
@@ -53,8 +52,6 @@ export const OVERVIEW_MAX_LIST_ROWS = 3;
 
 interface RightSidebarOverviewProps {
   workspaceId: string;
-  /** Reopen the full sidebar without changing its tabs. */
-  onExpand: () => void;
   /** Reopen the full sidebar on this tab (added to the focused pane when it is not open). */
   onOpenTab: (tab: TabType) => void;
   /** Reopen the full sidebar on a terminal tab; absent until the layout has one. */
@@ -194,23 +191,8 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
 
   return (
     <div className="divide-border-light flex flex-col divide-y px-3 pb-1.5 text-xs">
-      {/* Stats lead the card (the Stats tab's session totals) and share a row with Expand. */}
-      <div className="flex items-center gap-2 py-1.5">
-        <OverviewStats workspaceId={props.workspaceId} onOpen={() => props.onOpenTab("costs")} />
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              aria-label="Expand sidebar"
-              onClick={props.onExpand}
-              className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent -mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-md focus-visible:ring-1"
-            >
-              <PanelRightOpen className="h-3.5 w-3.5" aria-hidden="true" />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent align="center">Expand sidebar</TooltipContent>
-        </Tooltip>
-      </div>
+      {/* Stats lead the card (the Stats tab's session totals). */}
+      <OverviewStats workspaceId={props.workspaceId} onOpen={() => props.onOpenTab("costs")} />
 
       {goal != null && goalStatus != null && (
         <OverviewSection title="Goal">
@@ -347,40 +329,42 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
 };
 
 /**
- * The stats row. It owns the usage subscription, so live stream telemetry rerenders only this
- * row, not the whole card.
+ * The stats row, only once the session has stats. It owns the usage subscription, so live stream
+ * telemetry rerenders only this row, not the whole card.
  */
 const OverviewStats: React.FC<{ workspaceId: string; onOpen: () => void }> = (props) => {
   const stats = useSessionStats(props.workspaceId);
-  if (stats == null) return <span className="flex-1" />;
+  if (stats == null) return null;
   return (
-    <OverviewRow
-      Icon={TAB_ICONS.costs}
-      numeric
-      label={
-        stats.cost != null
-          ? formatCostWithDollar(stats.cost)
-          : `${formatTokens(stats.tokens)} tokens`
-      }
-      labelAdornment={
-        stats.cost != null &&
-        stats.costIncomplete && (
-          // Same cue as the Stats tab: an unpriced model makes the total a lower bound.
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span className="text-warning" aria-label="Cost may be incomplete">
-                ?
-              </span>
-            </TooltipTrigger>
-            <TooltipContent align="center">
-              Cost may be incomplete — some models in this session have unknown pricing
-            </TooltipContent>
-          </Tooltip>
-        )
-      }
-      detail={stats.cost != null && `${formatTokens(stats.tokens)} tokens`}
-      onClick={props.onOpen}
-    />
+    <div className="flex items-center py-1.5">
+      <OverviewRow
+        Icon={TAB_ICONS.costs}
+        numeric
+        label={
+          stats.cost != null
+            ? formatCostWithDollar(stats.cost)
+            : `${formatTokens(stats.tokens)} tokens`
+        }
+        labelAdornment={
+          stats.cost != null &&
+          stats.costIncomplete && (
+            // Same cue as the Stats tab: an unpriced model makes the total a lower bound.
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="text-warning" aria-label="Cost may be incomplete">
+                  ?
+                </span>
+              </TooltipTrigger>
+              <TooltipContent align="center">
+                Cost may be incomplete — some models in this session have unknown pricing
+              </TooltipContent>
+            </Tooltip>
+          )
+        }
+        detail={stats.cost != null && `${formatTokens(stats.tokens)} tokens`}
+        onClick={props.onOpen}
+      />
+    </div>
   );
 };
 

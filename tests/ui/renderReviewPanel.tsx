@@ -87,9 +87,7 @@ export function renderApp(props: RenderReviewPanelParams): RenderedApp {
         () => {
           // Selecting a tool is an explicit open action even when chats start collapsed.
           result.container
-            .querySelector<HTMLElement>(
-              '[aria-label="Workspace insights"] button[aria-label="Expand sidebar"]'
-            )
+            .querySelector<HTMLElement>('button[aria-label="Expand right sidebar"]')
             ?.click();
           // Find tab button by role and name
           const tabButton = result.container.querySelector<HTMLElement>(

@@ -43,6 +43,7 @@ import {
   RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
 } from "@/constants/layout";
 import { ChatPane } from "../ChatPane/ChatPane";
+import { RightSidebarToggle } from "../SidebarCollapseButton/SidebarCollapseButton";
 
 // ChatPane uses tailwind `min-w-96`.
 const CHAT_PANE_MIN_WIDTH_PX = 384;
@@ -208,9 +209,10 @@ function LazyRightSidebar(
     RIGHT_SIDEBAR_DEFAULT_COLLAPSED
   );
   // The failure state takes the expanded width even when collapsed: it needs room for its Reload
-  // button, and the card's expand control is part of the sidebar that failed to load. The empty
-  // loading box keeps its element (not display:none), so shortcut routing still sees a sidebar
-  // the layout shows (isWorkspaceRightSidebarHidden).
+  // button, and the card is part of the sidebar that failed to load (globals.css hides the toggle
+  // then, since there is no sidebar to toggle). The empty loading box keeps its element (not
+  // display:none), so shortcut routing still sees a sidebar the layout shows
+  // (isWorkspaceRightSidebarHidden).
   const frame = (state: React.ReactNode, kind: "loading" | "failed") => {
     const empty = collapsed && kind === "loading";
     return (
@@ -492,7 +494,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
       // owns the right-sidebar container query without prop-drilling layout state.
       data-workspace-shell=""
       // A full-width transcript has no centered column for the collapsed right sidebar's overview
-      // card to sit beside, so globals.css keeps the card hidden (the header button stands in).
+      // card to sit beside, so globals.css keeps the card hidden.
       data-transcript-full-width={chatTranscriptFullWidth || undefined}
       data-right-sidebar-collapsed={rightSidebarCollapsed || undefined}
       className={cn(
@@ -519,6 +521,17 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         onOpenSidebar={openSidebarFullscreen}
         sidebarFullscreen={sidebarFullscreen}
       />
+
+      {/* Between the chat and the sidebar, for Tab order. Outside the lazy sidebar, so it works
+          while the sidebar chunk loads (RightSidebar listens to the same persisted key). */}
+      {!isReviewImmersive && (
+        <RightSidebarToggle
+          collapsed={rightSidebarCollapsed}
+          onToggle={() =>
+            updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, !rightSidebarCollapsed)
+          }
+        />
+      )}
 
       <LazyRightSidebar
         held={heldSidebarInput}

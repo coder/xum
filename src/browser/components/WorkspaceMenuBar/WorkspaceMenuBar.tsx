@@ -1,15 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { flushSync } from "react-dom";
-import {
-  AppWindow,
-  BarChart3,
-  Bell,
-  BellOff,
-  Ellipsis,
-  Info,
-  PanelRightOpen,
-  Pencil,
-} from "lucide-react";
+import { AppWindow, BarChart3, Bell, BellOff, Ellipsis, Info, Pencil } from "lucide-react";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { cn } from "@/common/lib/utils";
@@ -65,7 +56,10 @@ import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
 import { BranchSelector } from "../BranchSelector/BranchSelector";
-import { LeftSidebarToggleBarSpacer } from "../SidebarCollapseButton/SidebarCollapseButton";
+import {
+  LeftSidebarToggleBarSpacer,
+  RightSidebarToggleSpacer,
+} from "../SidebarCollapseButton/SidebarCollapseButton";
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
 import { useLiveAPI } from "@/browser/contexts/API";
 
@@ -744,8 +738,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       className={cn(
         "bg-sidebar border-border-light flex items-center justify-between border-b px-2",
         isDesktop ? DESKTOP_TITLEBAR_HEIGHT_CLASS : "h-8",
-        // A collapsed right sidebar floats below the header, so the header reaches the window's
-        // right edge and must clear the titlebar overlay controls itself.
+        // A collapsed right sidebar takes no width, so the header reaches the window's right edge
+        // and must clear the titlebar overlay controls itself (as the right sidebar toggle over
+        // its end does).
         rightSidebarCollapsed && "titlebar-safe-right titlebar-safe-right-gutter-2",
         // The collapsed left sidebar is zero-width, so the header reaches the window's left edge,
         // under the app shell's fixed toggle bar: its spacer starts at the edge.
@@ -1025,31 +1020,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       </div>
       {!isPhoneHeader && moreActionsMenu}
       {rightSidebarCollapsed && !isPhoneHeader && (
-        // Stands in for the collapsed sidebar's overview card where the card does not fit beside
-        // the transcript: globals.css shows exactly one of the two.
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() =>
-                window.dispatchEvent(
-                  createCustomEvent(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, { workspaceId })
-                )
-              }
-              aria-label="Expand right sidebar"
-              className={cn(
-                "right-sidebar-overview-expand text-muted hover:text-foreground ml-1 h-6 w-6 shrink-0",
-                isDesktop && "titlebar-no-drag"
-              )}
-            >
-              <PanelRightOpen className="h-3.5 w-3.5" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" align="end">
-            Expand right sidebar
-          </TooltipContent>
-        </Tooltip>
+        // The collapsed sidebar takes no width, so WorkspaceShell's right sidebar toggle sits over
+        // this header's right end.
+        <RightSidebarToggleSpacer className="right-sidebar-toggle ml-1" />
       )}
       <LazySettingsModal
         name="Heartbeat settings"

@@ -43,6 +43,7 @@ import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { showFeedbackToast } from "@/browser/utils/feedbackToast";
 import { openSideChat } from "@/browser/utils/chatCommands";
 
@@ -120,7 +121,6 @@ import {
 import {
   RightSidebarTabStrip,
   getTabName,
-  isSidebarControlTarget,
   type TabDragData,
 } from "@/browser/features/RightSidebar/RightSidebarTabStrip";
 import {
@@ -177,6 +177,8 @@ interface SidebarContainerProps {
   collapsed: boolean;
   /** Custom width from drag-resize (unified across all tabs) */
   customWidth?: number;
+  /** A drag resize is under way: width changes follow the pointer, so they never animate. */
+  isResizing: boolean;
   /** Whether running in Electron desktop mode (taller header, so the collapsed card sits lower) */
   isDesktop?: boolean;
   /** Hide + inactivate sidebar while immersive review overlay is active. */
@@ -185,35 +187,103 @@ interface SidebarContainerProps {
   fullscreen?: boolean;
   /** The container element, for shortcut handlers that must know whether it is visible. */
   containerRef: React.RefObject<HTMLDivElement>;
-  children: React.ReactNode;
+  /** The full-screen view's header, before everything else. */
+  header?: React.ReactNode;
+  /** The docked panel's content (resize handle and tab layout). */
+  renderPanel: () => React.ReactNode;
+  /** The collapsed sidebar's overview card content. */
+  renderCard: () => React.ReactNode;
   role: string;
   "aria-label": string;
 }
 
 /**
+ * Collapsing and expanding animate the docked width. While the width slides, the panel keeps
+ * its content mounted (and its width fixed); the card mounts as the panel starts sliding out,
+ * revealed under it, and unmounts as soon as the panel starts sliding back in.
+ */
+type SidebarSlidePhase = "open" | "closing" | "closed" | "opening";
+
+/** The container's running width transition, if the browser runs one (none in happy-dom). */
+function findWidthTransition(element: HTMLElement | null): CSSTransition | undefined {
+  if (
+    element == null ||
+    typeof element.getAnimations !== "function" ||
+    typeof CSSTransition === "undefined"
+  ) {
+    return undefined;
+  }
+  return element
+    .getAnimations()
+    .find(
+      (animation): animation is CSSTransition =>
+        animation instanceof CSSTransition && animation.transitionProperty === "width"
+    );
+}
+
+/**
  * SidebarContainer - Main sidebar wrapper with dynamic width
  *
- * Width priority (first match wins):
- * 1. collapsed - A bounded floating overview card (fixed width, content height) over the chat's
- *    top-right corner instead of a full-height rail, so the chat keeps the whole width
+ * Always the docked flex item, so shortcut handlers and visibility checks see one element
+ * (landmark, container ref, responsive-hide class) in both states. Width priority:
+ * 1. collapsed - 0: the chat keeps the whole width, and the overview card floats over its
+ *    top-right corner (positioned against WorkspaceShell, so this element's clip spares it)
  * 2. customWidth - From drag-resize (unified width from AIView)
  * 3. default (400px) - Fallback when no custom width set
- *
- * The collapsed card stays this same element (landmark, container ref, responsive-hide class) so
- * shortcut handlers and visibility checks treat both forms alike.
  */
 const SidebarContainer: React.FC<SidebarContainerProps> = ({
   collapsed,
   customWidth,
+  isResizing,
   isDesktop,
   immersiveHidden = false,
   fullscreen = false,
   containerRef,
-  children,
+  header,
+  renderPanel,
+  renderCard,
   role,
   "aria-label": ariaLabel,
 }) => {
   const width = customWidth ? `${customWidth}px` : "400px";
+
+  // Adjusted during render when `collapsed` flips (react-effects: state derived from a prop
+  // change), so the first frame of a slide already renders both the panel and the card.
+  const [phase, setPhase] = React.useState<SidebarSlidePhase>(collapsed ? "closed" : "open");
+  const [phaseCollapsed, setPhaseCollapsed] = React.useState(collapsed);
+  if (phaseCollapsed !== collapsed) {
+    setPhaseCollapsed(collapsed);
+    setPhase(collapsed ? "closing" : "opening");
+  }
+  const sliding = phase === "closing" || phase === "opening";
+
+  // Settle once the width transition ends. No transition runs while drag-resizing (the drag
+  // collapses and reopens the sidebar), where the browser skips it (display:none, reduced or
+  // disabled transitions) or has none (happy-dom): settle before the frame paints.
+  React.useLayoutEffect(() => {
+    if (phase !== "closing" && phase !== "opening") return;
+    const settled = phase === "closing" ? "closed" : "open";
+    // getAnimations() flushes styles, so it sees the transition this commit just started.
+    const transition = findWidthTransition(containerRef.current);
+    if (transition == null) {
+      setPhase(settled);
+      return;
+    }
+    let current = true;
+    transition.finished.then(
+      () => {
+        if (current) setPhase(settled);
+      },
+      (error: unknown) => {
+        // A newer phase (the cleanup below ran) or a layout change (display:none) canceled it.
+        if (!isAbortError(error)) throw error;
+        if (current) setPhase(settled);
+      }
+    );
+    return () => {
+      current = false;
+    };
+  }, [containerRef, phase]);
 
   React.useEffect(() => {
     const container = containerRef.current;
@@ -237,44 +307,63 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
       ref={containerRef}
       aria-hidden={immersiveHidden || undefined}
       className={cn(
-        "border-border-light flex flex-col",
+        "bg-surface-primary flex flex-shrink-0 flex-col",
+        // clip, not hidden, while sliding: the panel is wider than this box then, and focus() or
+        // scrollIntoView inside it must not scroll this box.
+        sliding ? "overflow-clip" : "overflow-hidden",
+        // Drag resizes and window-resize clamps follow the pointer or the window at once.
+        sliding && !isResizing && "transition-[width] duration-200",
         // Hide on mobile touch devices - too narrow for useful interaction
         "mobile-hide-right-sidebar",
         // globals.css shows the hidden sidebar full-screen, only while the narrow layout hides it.
         fullscreen && "right-sidebar-fullscreen",
         // Immersive review renders its own full-screen overlay, so hiding the underlying
         // sidebar container cuts layout/paint cost without discarding its React state.
-        immersiveHidden && "hidden",
-        collapsed
-          ? [
-              // Positioned against WorkspaceShell. The height cap keeps the card clear of the
-              // composer on short windows; overflowing content scrolls inside the card.
-              "bg-surface-secondary absolute z-10 overflow-x-hidden overflow-y-auto rounded-lg border shadow-lg",
-              // globals.css owns the card's width and right inset (the chat reserves exactly that
-              // room beside it) and shows it only where it fits beside the transcript; the
-              // header's expand button (WorkspaceMenuBar) stands in for it elsewhere.
-              "right-sidebar-overview-card",
-              // The 7rem floor keeps the stats/Expand row and a section reachable even in a
-              // window too short for the composer clearance.
-              "max-h-[max(7rem,min(32rem,calc(100%-12rem)))]",
-              // Below the header (h-9 on desktop, h-8 otherwise) by the card's right inset
-              // (0.75rem), so it sits evenly in the corner.
-              isDesktop ? "top-12" : "top-11",
-            ]
-          : [
-              // No width transition: expanding swaps the floating card for the docked panel, and
-              // animating the width between those two layouts reads as the card stretching.
-              "bg-surface-primary flex-shrink-0 overflow-hidden border-l",
-              // On coarse pointers the resize handle is a wider strip that draws the divider line
-              // on its right edge, where the tab strip's bottom border meets it.
-              "[@media(pointer:coarse)]:has-[[data-sidebar-resize-handle]]:border-l-0",
-            ]
+        immersiveHidden && "hidden"
       )}
-      style={collapsed ? undefined : { width, maxWidth: "100%" }}
+      style={{ width: collapsed ? 0 : width, maxWidth: "100%" }}
       role={role}
       aria-label={ariaLabel}
     >
-      {children}
+      {header}
+      {(phase === "closing" || phase === "closed") && (
+        <div
+          className={cn(
+            // Positioned against WorkspaceShell. The height cap keeps the card clear of the
+            // composer on short windows; overflowing content scrolls inside the card.
+            "bg-surface-secondary border-border-light absolute z-10 flex flex-col overflow-x-hidden overflow-y-auto rounded-lg border shadow-lg",
+            // globals.css owns the card's width and right inset (the chat reserves exactly that
+            // room beside it) and shows it only where it fits beside the transcript.
+            "right-sidebar-overview-card",
+            // The 7rem floor keeps the stats row and a section reachable even in a window too
+            // short for the composer clearance.
+            "max-h-[max(7rem,min(32rem,calc(100%-12rem)))]",
+            // Below the header (h-9 on desktop, h-8 otherwise) by the card's right inset
+            // (0.75rem), so it sits evenly in the corner.
+            isDesktop ? "top-12" : "top-11"
+          )}
+        >
+          {renderCard()}
+        </div>
+      )}
+      {phase !== "closed" && (
+        <div
+          className={cn(
+            "bg-surface-primary flex min-h-0 min-w-0 flex-1 flex-row",
+            !fullscreen && "border-border-light border-l",
+            // On coarse pointers the resize handle is a wider strip that draws the divider line
+            // on its right edge, where the tab strip's bottom border meets it.
+            "[@media(pointer:coarse)]:has-[[data-sidebar-resize-handle]]:border-l-0",
+            // After the card in the DOM, so it paints over the card it slides off.
+            phase === "closing" && "relative z-10"
+          )}
+          // A fixed width while the container's width slides: the panel moves with the
+          // container's left edge instead of reflowing (terminals, review) on every frame.
+          style={sliding ? { width } : undefined}
+        >
+          {renderPanel()}
+        </div>
+      )}
     </div>
   );
 };
@@ -389,8 +478,8 @@ interface RightSidebarTabsetNodeProps {
   onPopOutTerminal: (tab: TabType) => void;
   /** The strip's New tab row (All tabs menu): open (or show) this tabset's New tab */
   onAddNewTab: (tabsetId: string) => void;
-  /** Set only for the tabset whose strip shows the sidebar's collapse button */
-  onCollapseSidebar?: () => void;
+  /** Only the tabset at the sidebar's top-right corner, where the shell's toggle sits over its strip */
+  reservesSidebarToggle: boolean;
   /** Open a tool from this tabset's New tab launcher (replaces the New tab) */
   onOpenToolFromNewTab: (tabsetId: string, tool: BaseTabType) => void;
   /** Create a terminal from this tabset's New tab launcher (replaces the New tab) */
@@ -461,10 +550,7 @@ const TabsetPaneRoot: React.FC<{
   setLayout: RightSidebarTabsetNodeProps["setLayout"];
   children: React.ReactNode;
 }> = (props) => {
-  const setFocused = (event: React.SyntheticEvent) => {
-    // The collapse button sits in one pane's strip but acts on the whole sidebar, so Expand
-    // later returns to the pane the user was in.
-    if (isSidebarControlTarget(event.target)) return;
+  const setFocused = () => {
     props.setLayout((prev) => setFocusedTabset(prev, props.tabsetId));
   };
   return (
@@ -702,7 +788,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           items={items}
           tabsetId={props.node.id}
           onAddNewTab={() => props.onAddNewTab(props.node.id)}
-          onCollapseSidebar={props.onCollapseSidebar}
+          reservesSidebarToggle={props.reservesSidebarToggle}
         />
       </SortableContext>
       <div
@@ -2111,7 +2197,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       });
   };
 
-  // Rows of the collapsed overview card reopen the sidebar on the tab they summarize.
+  // Rows of the collapsed overview card reopen the sidebar on the tab they summarize. Each lands
+  // keyboard focus in the sidebar: the activated row unmounts with the card, and focus would
+  // otherwise fall back to the page body.
   const handleOpenTabFromOverview = (tab: TabType) => {
     setCollapsed(false);
     if (tab === "review") {
@@ -2133,28 +2221,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     setTabToFocus(tab);
   };
 
-  // Every way out of the card lands keyboard focus in the sidebar: the activated row unmounts
-  // with the card, and focus would otherwise fall back to the page body.
-  // Reads the rendered layout, which drops tabs this workspace cannot show (Review without a
-  // repository), so Expand always lands on a tab that renders.
-  const handleExpandFromOverview = () => {
-    handleOpenTabFromOverview(getFocusedActiveTab(layout, NEW_TAB));
-  };
-  // The header's stand-in for the card (where the card would cover the transcript). The ref keeps
-  // the listener subscribed once per workspace while it still calls the latest handler.
-  const expandFromOverviewRef = React.useRef(handleExpandFromOverview);
-  React.useEffect(() => {
-    expandFromOverviewRef.current = handleExpandFromOverview;
-  });
-  React.useEffect(() => {
-    const handler = (event: Event) => {
-      const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR>).detail;
-      if (detail?.workspaceId !== workspaceId) return;
-      expandFromOverviewRef.current();
-    };
-    window.addEventListener(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, handler);
-    return () => window.removeEventListener(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, handler);
-  }, [workspaceId]);
   // The card's terminal count and the layout's terminal tabs sync separately (restored sessions
   // reach the layout after the count), so the Terminals row opens only once a tab exists for it.
   const overviewTerminalTab = collectAllTabs(layout.root).find(isTerminalTab);
@@ -2480,8 +2546,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   );
 
   const isDraggingTab = activeDragData !== null;
-  // Full-screen mode closes from its header instead.
-  const collapseTabsetId = fullscreen ? null : findTopRightTabsetId(layout.root);
+  // Full-screen mode has no toggle: it closes from its header.
+  const toggleTabsetId = fullscreen ? null : findTopRightTabsetId(layout.root);
 
   const renderLayoutNode = (node: RightSidebarLayoutNode): React.ReactNode => {
     if (node.type === "split") {
@@ -2534,7 +2600,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         setLayout={setLayout}
         onPopOutTerminal={handlePopOutTerminal}
         onAddNewTab={handleAddNewTab}
-        onCollapseSidebar={node.id === collapseTabsetId ? () => setCollapsed(true) : undefined}
+        reservesSidebarToggle={node.id === toggleTabsetId}
         onOpenToolFromNewTab={handleOpenToolFromNewTab}
         onOpenTerminalFromNewTab={handleOpenTerminalFromNewTab}
         onOpenSideChatFromNewTab={canStartSideChat ? handleStartSideChat : undefined}
@@ -2585,6 +2651,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       />
       <SidebarContainer
         collapsed={collapsed}
+        isResizing={isResizing}
         isDesktop={isDesktopMode()}
         immersiveHidden={immersiveHidden}
         fullscreen={fullscreen}
@@ -2592,38 +2659,39 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         customWidth={width} // Unified width from AIView (applies to all tabs)
         role="complementary"
         aria-label="Workspace insights"
-      >
-        {fullscreen && (
-          // Shown only by the full-screen CSS (globals.css); also the probe for "layout widened".
-          <div
-            ref={fullscreenHeaderRef}
-            className={cn(
-              // It covers the window's top edge, so on Windows/Linux and macOS desktop it must
-              // keep clear of the native window controls and stay a drag region, like the
-              // workspace header.
-              "right-sidebar-fullscreen-header border-border-light titlebar-safe-left titlebar-safe-left-gutter-4 titlebar-safe-right titlebar-safe-right-gutter-2 shrink-0 items-center justify-between gap-2 border-b py-1",
-              isDesktopMode() && cn(DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS, "titlebar-drag")
-            )}
-          >
-            <span className="text-foreground min-w-0 truncate text-sm font-medium">
-              {workspaceDisplayTitle}
-            </span>
-            <Button
-              variant="ghost"
-              size="icon"
+        header={
+          fullscreen && (
+            // Shown only by the full-screen CSS (globals.css); also the probe for "layout widened".
+            <div
+              ref={fullscreenHeaderRef}
               className={cn(
-                "text-muted hover:text-foreground h-8 w-8 shrink-0",
-                isDesktopMode() && "titlebar-no-drag"
+                // It covers the window's top edge, so on Windows/Linux and macOS desktop it must
+                // keep clear of the native window controls and stay a drag region, like the
+                // workspace header.
+                "right-sidebar-fullscreen-header border-border-light titlebar-safe-left titlebar-safe-left-gutter-4 titlebar-safe-right titlebar-safe-right-gutter-2 shrink-0 items-center justify-between gap-2 border-b py-1",
+                isDesktopMode() && cn(DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS, "titlebar-drag")
               )}
-              aria-label="Close sidebar"
-              onClick={onCloseFullscreen}
             >
-              <X className="h-4 w-4" />
-            </Button>
-          </div>
-        )}
-        {!collapsed ? (
-          <div className="flex min-h-0 min-w-0 flex-1 flex-row">
+              <span className="text-foreground min-w-0 truncate text-sm font-medium">
+                {workspaceDisplayTitle}
+              </span>
+              <Button
+                variant="ghost"
+                size="icon"
+                className={cn(
+                  "text-muted hover:text-foreground h-8 w-8 shrink-0",
+                  isDesktopMode() && "titlebar-no-drag"
+                )}
+                aria-label="Close sidebar"
+                onClick={onCloseFullscreen}
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+          )
+        }
+        renderPanel={() => (
+          <>
             {/* Resize handle (left edge); full-screen mode has nothing to resize. */}
             {onStartResize && !fullscreen && (
               <div
@@ -2633,8 +2701,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
                   "group/resize z-10 flex w-0.5 flex-shrink-0 cursor-col-resize touch-none justify-center",
                   // A 2px line is too thin to grab with a finger, and iPads report a coarse
                   // pointer even with a trackpad: coarse pointers get a wider strip with a grip.
-                  // The sidebar's divider line moves to the strip's right edge (SidebarContainer
-                  // drops its own), so the tab strip's bottom border still meets it.
+                  // The sidebar's divider line moves to the strip's right edge (the panel drops
+                  // its own), so the tab strip's bottom border still meets it.
                   "[@media(pointer:coarse)]:border-border-light [@media(pointer:coarse)]:w-3 [@media(pointer:coarse)]:border-r"
                 )}
                 onPointerDown={onStartResize}
@@ -2655,11 +2723,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             <div className="flex min-h-0 min-w-0 flex-1 flex-col">
               {renderLayoutNode(layout.root)}
             </div>
-          </div>
-        ) : (
+          </>
+        )}
+        renderCard={() => (
           <RightSidebarOverview
             workspaceId={workspaceId}
-            onExpand={handleExpandFromOverview}
             onOpenTab={handleOpenTabFromOverview}
             onOpenTerminals={
               overviewTerminalTab != null
@@ -2673,7 +2741,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             unreadAssisted={unreadAssisted}
           />
         )}
-      </SidebarContainer>
+      />
 
       {/* Drag overlay - shows tab being dragged at cursor position */}
       <DragOverlay>

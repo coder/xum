@@ -1,11 +1,12 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render as renderUnwrapped } from "@testing-library/react";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getReviewImmersiveKey, RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { useEffect, useSyncExternalStore, type MutableRefObject } from "react";
+import { useEffect, useSyncExternalStore, type MutableRefObject, type ReactElement } from "react";
+import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { installDom } from "../../../../tests/ui/dom";
 import * as RealLottieModule from "lottie-react";
 import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
@@ -71,7 +72,6 @@ const SIDEBAR_EVENT_TYPES = [
   CUSTOM_EVENTS.OPEN_GOAL_TAB,
   CUSTOM_EVENTS.OPEN_ARTIFACT,
   CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
-  CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR,
 ];
 
 // Snapshot the real exports at file scope, before any test mocks the module. Do not load a second
@@ -208,6 +208,9 @@ void mock.module("@/browser/components/ConnectionStatusToast/ConnectionStatusToa
 }));
 
 import { WorkspaceShell, estimateWorkspaceShellFallbackWidthPx } from "./WorkspaceShell";
+
+// The app renders the shell inside its TooltipProvider (the right sidebar toggle has a tooltip).
+const render = (ui: ReactElement) => renderUnwrapped(ui, { wrapper: TooltipProvider });
 
 /** Inert itself or under an inert ancestor (makeOthersInert marks the covered siblings). */
 function isInert(element: HTMLElement): boolean {
@@ -587,10 +590,6 @@ describe("WorkspaceShell loading placeholders", () => {
       window.dispatchEvent(
         createCustomEvent(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, { workspaceId: "w" })
       );
-      // The header's stand-in for the collapsed overview card.
-      window.dispatchEvent(
-        createCustomEvent(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, { workspaceId: "w" })
-      );
       fireEvent.click(view.getByRole("button", { name: "New terminal" }));
       expect(typed).toBe(true); // Shift+I in a text field stays a typed letter
       expect([otherListener, addTerminalMock.mock.calls.length]).toEqual([[], 0]);
@@ -606,7 +605,6 @@ describe("WorkspaceShell loading placeholders", () => {
         CUSTOM_EVENTS.OPEN_GOAL_TAB,
         CUSTOM_EVENTS.OPEN_ARTIFACT,
         CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
-        CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR,
       ]);
       expect([otherListener, addTerminalMock.mock.calls.length]).toEqual([["artifact"], 1]);
       expect(sideChatSeen).toBe(1); // and not replayed

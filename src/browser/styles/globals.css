@@ -1133,9 +1133,13 @@ body,
 }
 
 /* -----------------------------------------------------------------------------
- * Collapsed right sidebar: overview card vs. header stand-in
+ * Right sidebar toggle and the collapsed sidebar's overview card
  *
- * The collapsed right sidebar is a card floating in the chat's top-right corner (RightSidebar).
+ * The toggle (RightSidebarToggle, mounted by WorkspaceShell) and the header spacer that reserves
+ * its room show wherever the docked sidebar can show, in both states: the narrow layouts hide the
+ * sidebar itself (the workspace menu opens it there).
+ *
+ * The collapsed right sidebar shows a card floating in the chat's top-right corner (RightSidebar).
  * It never covers the transcript: where it shows, the chat reserves its width
  * (--chat-reserved-inline-end, read by ChatPane's scrollport), so the transcript column, and
  * the composer under it, center in the space left of the card, as far from the card as from the
@@ -1146,12 +1150,6 @@ body,
  *
  * Container queries take no var(), so that sum is spelled out below; keep it in step with the
  * tokens. A full-width transcript has no column to make room beside, so it never shows the card.
- * Everywhere else the header's expand button (WorkspaceMenuBar) stands in for it, except in the
- * narrow layouts, which hide the sidebar itself (the workspace menu opens it there).
- *
- * visibility, not display: the card's display tells shortcuts whether the layout hides the sidebar
- * (isRightSidebarResponsivelyHidden), and a collapsed sidebar is not hidden by the layout: its
- * shortcuts still expand it.
  * --------------------------------------------------------------------------- */
 
 [data-workspace-shell] {
@@ -1165,40 +1163,44 @@ body,
   visibility: hidden;
 }
 
-.right-sidebar-overview-expand {
+/* A workspace with nothing to summarize shows no empty card. */
+.right-sidebar-overview-card:has(> :empty) {
+  display: none;
+}
+
+.right-sidebar-toggle {
   display: none;
 }
 
 @media (min-width: 769px) {
   @container workspace-shell (width > 684px) {
-    .right-sidebar-overview-expand {
-      display: inline-flex;
+    .right-sidebar-toggle {
+      display: flex;
     }
   }
 }
 
-/* At any width: a sidebar whose chunk failed to load shows docked with its Reload button and never
-   listens for the stand-in's event, so the stand-in would do nothing. */
-[data-workspace-shell]:has(> [data-right-sidebar-load-failed]) .right-sidebar-overview-expand {
+/* At any width: a sidebar whose chunk failed to load shows docked with its Reload button, and
+   there is no sidebar to toggle. */
+[data-workspace-shell]:has(> [data-right-sidebar-load-failed]) .right-sidebar-toggle {
   display: none;
 }
 
 @container workspace-shell (width >= 66.625rem) {
-  [data-workspace-shell]:not([data-transcript-full-width]) > .right-sidebar-overview-card {
+  [data-workspace-shell]:not([data-transcript-full-width])
+    > .mobile-hide-right-sidebar
+    > .right-sidebar-overview-card {
     visibility: visible;
-  }
-
-  [data-workspace-shell]:not([data-transcript-full-width]) .right-sidebar-overview-expand {
-    display: none;
   }
 
   /* Keyed on the collapsed state (WorkspaceShell), not on the card element, which mounts only
      once the lazy sidebar chunk loads: the transcript must not shift when it does. A chunk that
-     failed to load shows docked instead, with no card, so nothing is reserved then. */
+     failed to load shows docked instead, with no card, so nothing is reserved then. Not on the
+     sidebar itself: a side chat's transcript in its sliding panel must not inherit it. */
   [data-workspace-shell][data-right-sidebar-collapsed]:not([data-transcript-full-width]):not(
       :has(> [data-right-sidebar-load-failed])
     )
-    > :not(.right-sidebar-overview-card) {
+    > :not(.mobile-hide-right-sidebar) {
     --chat-reserved-inline-end: calc(var(--overview-card-width) + var(--overview-card-inset));
   }
 }

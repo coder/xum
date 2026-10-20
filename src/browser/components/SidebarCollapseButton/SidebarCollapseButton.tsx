@@ -1,4 +1,4 @@
-import { PanelLeft, SquarePen } from "lucide-react";
+import { PanelLeft, PanelRight, SquarePen } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
@@ -113,5 +113,76 @@ export function LeftSidebarToggleBarSpacer(props: { showNewChat: boolean }) {
         </>
       )}
     </div>
+  );
+}
+
+// Shared by the right toggle bar and its spacers. `right-sidebar-toggle` (globals.css) shows them
+// only where the docked right sidebar can show; the inset matches the header's collapsed padding
+// and the tab strip's, so the spacers under the bar line up with it.
+const RIGHT_BAR_LAYOUT_CLASS =
+  "right-sidebar-toggle titlebar-safe-right titlebar-safe-right-gutter-2 items-center";
+
+interface RightSidebarToggleProps {
+  collapsed: boolean;
+  onToggle: () => void;
+}
+
+/**
+ * The right sidebar's toggle, like {@link LeftSidebarToggleBar}: WorkspaceShell mounts it once at
+ * the shell's top-right corner, outside the sidebar, so it keeps its size, place and focus in both
+ * states while the sidebar's width animates. The header under it reserves its width with
+ * {@link RightSidebarToggleSpacer} while the sidebar is collapsed, and the sidebar's top-right tab
+ * strip does while it is expanded.
+ *
+ * pb-px: the header and the strip draw a 1px bottom border inside their height, so their content
+ * centers 0.5px higher than the bar's full height would.
+ * z-20: above the overview card (z-10) and the sliding panel, below immersive review (z-50).
+ */
+export function RightSidebarToggle(props: RightSidebarToggleProps) {
+  const isDesktop = isDesktopMode();
+  const label = props.collapsed ? "Expand right sidebar" : "Collapse right sidebar";
+  return (
+    <div
+      data-testid="right-sidebar-toggle-bar"
+      className={cn(
+        RIGHT_BAR_LAYOUT_CLASS,
+        "absolute top-0 right-0 z-20 pb-px",
+        isDesktop ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
+      )}
+    >
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={props.onToggle}
+            aria-label={label}
+            className={cn(ICON_BUTTON_CLASS, isDesktop && "titlebar-no-drag")}
+          >
+            <PanelRight className="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom" align="end">
+          {label}
+        </TooltipContent>
+      </Tooltip>
+    </div>
+  );
+}
+
+/**
+ * An invisible, inert copy of {@link RightSidebarToggle}'s button for the row the bar covers (the
+ * workspace header while the sidebar is collapsed, the top-right tab strip while it is expanded),
+ * so that row's own controls end before the bar.
+ */
+export function RightSidebarToggleSpacer(props: { className?: string }) {
+  return (
+    <Button
+      aria-hidden
+      variant="ghost"
+      size="icon"
+      tabIndex={-1}
+      className={cn(ICON_BUTTON_CLASS, "invisible", props.className)}
+    />
   );
 }
