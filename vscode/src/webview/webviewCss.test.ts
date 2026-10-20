@@ -163,6 +163,9 @@ const DESKTOP_ONLY_CLASSES = new Set([
   // shell nor the right sidebar.
   "right-sidebar-overview-card",
   "right-sidebar-toggle",
+  // The chat scrollport eases its room for that card only while the right sidebar slides in the
+  // desktop workspace shell.
+  "chat-reserved-inline-end-scrollport",
   // Project sidebar only: the webview shows one workspace and no project sidebar.
   "react-colorful",
   "section-color-picker",
