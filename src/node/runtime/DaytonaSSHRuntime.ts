@@ -628,6 +628,30 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     return this.deleteAfterChecks(sandboxId, await sshDelete(), shared);
   }
 
+  /**
+   * The same dirty and unpushed checks deleteWorkspace runs, without deleting: archive with
+   * the "delete" behavior uses it to decide between deleting and stopping the sandbox. A
+   * stopped or archived sandbox is started for the check; a missing one has nothing to lose.
+   */
+  async checkSandboxDeletable(
+    projectPath: string,
+    workspaceName: string,
+    trusted: boolean | undefined
+  ): Promise<Result<void, string>> {
+    const sandboxId = this.daytonaConfig.sandboxId;
+    if (!sandboxId) return Err("Daytona sandbox id is not set");
+    const prepared = await this.startForDeleteChecks(sandboxId, undefined);
+    if (prepared === "missing") return Ok(undefined);
+    if (prepared !== "ready") return Err(prepared.error);
+    try {
+      const deletedPath = this.getWorkspacePath(projectPath, workspaceName);
+      const check = await this.checkWorkspaceDeletable(deletedPath, false, trusted);
+      return check === "ok" || check === "missing" ? Ok(undefined) : Err(check.error);
+    } catch (error) {
+      return Err(`Failed to check workspace state: ${getErrorMessage(error)}`);
+    }
+  }
+
   private forgetMissingSandbox(
     sandboxId: string,
     deletedPath: string,

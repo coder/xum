@@ -24,6 +24,11 @@ export interface BeforeArchiveHookArgs {
    * hatch for over-refusals.
    */
   refuseStopUnderUnverifiedRemoteJobs?: boolean;
+  /**
+   * For an outcome the user should hear about that does not fail the archive (e.g. a Daytona
+   * sandbox kept and stopped instead of deleted); returned with the archive result.
+   */
+  reportWarning?: (warning: string) => void;
 }
 
 export type BeforeArchiveHook = (args: BeforeArchiveHookArgs) => Promise<Result<void>>;

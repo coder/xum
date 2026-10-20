@@ -112,12 +112,15 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
   createRuntime,
+  getGlobalDaytonaService,
   IncompatibleRuntimeError,
   runBackgroundInit,
   withInitUseLease,
   runFullInit,
 } from "@/node/runtime/runtimeFactory";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
+import type { DaytonaSandboxState } from "@/common/orpc/schemas/daytona";
+import type { WorkspaceRuntimeStatus } from "@/common/orpc/schemas/runtime";
 import { DockerRuntime, getContainerName } from "@/node/runtime/DockerRuntime";
 import {
   createRuntimeContextForWorkspace,
@@ -1049,7 +1052,31 @@ function withEffectiveHeartbeatInterval(
   return { ...settings, intervalMs: settings.intervalMs ?? defaultIntervalMs };
 }
 
-type WorkspaceRuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
+const DAYTONA_RUNTIME_STATUS: Record<DaytonaSandboxState, WorkspaceRuntimeStatus> = {
+  started: "running",
+  stopped: "stopped",
+  starting: "starting",
+  archived: "archived",
+  error: "error",
+  // Deleted outside Xum: ensureReady refuses it, so show it as an error, not unknown.
+  missing: "error",
+};
+
+/** Passive Daytona probe: reads the sandbox state, never starts it. */
+async function probeDaytonaRuntimeStatus(sandboxId: string): Promise<WorkspaceRuntimeStatus> {
+  const service = getGlobalDaytonaService();
+  if (!service) return "unknown";
+  try {
+    const { state } = await service.getSandboxState(sandboxId);
+    return DAYTONA_RUNTIME_STATUS[state];
+  } catch (error) {
+    log.debug("Failed to read Daytona sandbox state for runtime status", {
+      sandboxId,
+      error: getErrorMessage(error),
+    });
+    return "unknown";
+  }
+}
 
 /** Narrow DevTools cleanup surface used on archive/remove and by the startup sweep. */
 type WorkspaceDevToolsCleanup = Pick<DevToolsService, "hasWorkspaceData" | "removeWorkspaceData">;
@@ -1080,6 +1107,13 @@ const ARCHIVE_OWN_ACTIVITY_POLICY = {
  * A remote box Xum created for this workspace (not an existing one it connected to): a Coder
  * workspace, or a Daytona sandbox, which reuses the Coder archive behavior (keep, stop, delete).
  */
+/** What archive refusals call the dedicated remote box, so Daytona users are not told "Coder". */
+function dedicatedRemoteBoxLabel(runtimeConfig: RuntimeConfig | undefined): string {
+  return isSSHRuntime(runtimeConfig) && runtimeConfig.daytona != null
+    ? "Daytona sandbox"
+    : "Coder workspace";
+}
+
 function isDedicatedCoderRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
   if (isDedicatedDaytonaSandbox(runtimeConfig)) return true;
   return (
@@ -13007,8 +13041,9 @@ export class WorkspaceService
       );
       if (options?.forbidCoderWorkspaceDeletion === true) {
         if (isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior === "delete") {
+          const boxLabel = dedicatedRemoteBoxLabel(beforeArchiveMetadata?.runtimeConfig);
           return Err(
-            'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior.'
+            `${boxLabel} archive behavior is set to "Delete", which would permanently delete the dedicated remote ${boxLabel} without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the ${boxLabel} archive behavior.`
           );
         }
       }
@@ -13039,7 +13074,7 @@ export class WorkspaceService
         (await this.hasUntrackableExternalAppOpen(workspaceId))
       ) {
         return Err(
-          "A native terminal or external editor was opened for this workspace and its lifetime cannot be tracked; the archive policy would remove the checkout or stop the dedicated remote Coder workspace under it. Ask the user to archive this workspace manually."
+          `A native terminal or external editor was opened for this workspace and its lifetime cannot be tracked; the archive policy would remove the checkout or stop the dedicated remote ${dedicatedRemoteBoxLabel(beforeArchiveMetadata?.runtimeConfig)} under it. Ask the user to archive this workspace manually.`
         );
       }
 
@@ -13125,6 +13160,7 @@ export class WorkspaceService
       //
       // NOTE: Archiving is typically a quick UI action, but it can fail if a hook needs to perform
       // cleanup (e.g., stopping a dedicated mux-created Coder workspace) and that cleanup fails.
+      const archiveWarnings: string[] = [];
       if (this.workspaceLifecycleHooks && beforeArchiveMetadata) {
         const hookResult = await this.workspaceLifecycleHooks.runBeforeArchive({
           workspaceId,
@@ -13133,6 +13169,7 @@ export class WorkspaceService
           // Model-facing archives (refuseLiveUserActivity) must not stop a running remote
           // workspace under a surviving detached job the host-local orphan scans cannot see.
           refuseStopUnderUnverifiedRemoteJobs: options?.refuseLiveUserActivity === true,
+          reportWarning: (warning) => archiveWarnings.push(warning),
         });
         if (!hookResult.success) {
           return Err(hookResult.error);
@@ -13327,7 +13364,10 @@ export class WorkspaceService
         subProjectPath: beforeArchiveMetadata?.subProjectPath,
       });
       eventSpine.emit("workspace.archived", { workspaceId });
-      return Ok({ kind: "archived" as const });
+      return Ok({
+        kind: "archived" as const,
+        ...(archiveWarnings.length > 0 ? { warnings: archiveWarnings } : {}),
+      });
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to archive workspace: ${message}`);
@@ -13765,6 +13805,7 @@ export class WorkspaceService
 
     const metadataById = new Map(allMetadata.map((metadata) => [metadata.id, metadata]));
     const devcontainerWorkspaces: Array<{ workspaceId: string; hostWorkspacePath: string }> = [];
+    const daytonaWorkspaces: Array<{ workspaceId: string; sandboxId: string }> = [];
 
     for (const workspaceId of workspaceIds) {
       const metadata = metadataById.get(workspaceId);
@@ -13772,6 +13813,13 @@ export class WorkspaceService
         continue;
       }
 
+      const daytonaSandboxId = isSSHRuntime(metadata.runtimeConfig)
+        ? metadata.runtimeConfig.daytona?.sandboxId
+        : undefined;
+      if (daytonaSandboxId) {
+        daytonaWorkspaces.push({ workspaceId, sandboxId: daytonaSandboxId });
+        continue;
+      }
       if (metadata.runtimeConfig.type !== "devcontainer") {
         statuses[workspaceId] = "unsupported";
         continue;
@@ -13789,6 +13837,12 @@ export class WorkspaceService
         });
       }
     }
+
+    await Promise.all(
+      daytonaWorkspaces.map(async (workspace) => {
+        statuses[workspace.workspaceId] = await probeDaytonaRuntimeStatus(workspace.sandboxId);
+      })
+    );
 
     // Passive status probes must not call ensureReady(); Docker labels are enough to tell
     // whether devcontainers are already running. Probe all requested paths with one docker ps.

@@ -1,9 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
+import { Ok, type Result } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import { DaytonaSSHRuntime } from "@/node/runtime/DaytonaSSHRuntime";
+import { SSHRuntime } from "@/node/runtime/SSHRuntime";
+import { createSSHTransport } from "@/node/runtime/transports";
 import { createDaytonaTestRig, type DaytonaTestRig } from "./daytona.testHarness";
-import { createDaytonaArchiveHook } from "./daytonaLifecycleHooks";
+import { createDaytonaArchiveHook, type DaytonaArchiveHookOptions } from "./daytonaLifecycleHooks";
 
 let rig: DaytonaTestRig;
 
@@ -25,12 +29,28 @@ function metadata(daytona: DaytonaSandboxConfig): WorkspaceMetadata {
   };
 }
 
-function archive(daytona: DaytonaSandboxConfig, behavior: CoderWorkspaceArchiveBehavior) {
+const cleanCheck = (): Promise<Result<void, string>> => Promise.resolve(Ok(undefined));
+
+function archive(
+  daytona: DaytonaSandboxConfig,
+  behavior: CoderWorkspaceArchiveBehavior,
+  checkSandboxDeletable: DaytonaArchiveHookOptions["checkSandboxDeletable"] = cleanCheck,
+  reportWarning?: (warning: string) => void
+) {
   const hook = createDaytonaArchiveHook({
     daytonaService: rig.service,
     getArchiveBehavior: () => behavior,
+    checkSandboxDeletable,
   });
-  return hook({ workspaceId: "ws", workspaceMetadata: metadata(daytona) });
+  return hook({ workspaceId: "ws", workspaceMetadata: metadata(daytona), reportWarning });
+}
+
+/** The production checker: the runtime's own dirty and unpushed check, as serviceContainer wires it. */
+function runtimeCheck(daytona: DaytonaSandboxConfig) {
+  const config = { host: "x.xum--daytona", srcBaseDir: "~/src", daytona };
+  const runtime = new DaytonaSSHRuntime(config, createSSHTransport(config, false), rig.service);
+  return (workspaceMetadata: WorkspaceMetadata) =>
+    runtime.checkSandboxDeletable(workspaceMetadata.projectPath, workspaceMetadata.name, true);
 }
 
 describe("createDaytonaArchiveHook", () => {
@@ -55,5 +75,31 @@ describe("createDaytonaArchiveHook", () => {
     expect((await archive({ sandboxId: "sb-users", shared: true }, "stop")).success).toBe(true);
 
     expect(rig.plane.find("sb-users")?.state).toBe("started");
+  });
+
+  it("keeps a dirty sandbox on archive delete: starts it for the check, then stops it and warns", async () => {
+    rig.plane.addSandbox({ id: "sb-dirty", state: "stopped" });
+    const sshCheck = spyOn(
+      SSHRuntime.prototype as unknown as {
+        checkWorkspaceDeletable: () => Promise<"ok" | "missing" | { error: string }>;
+      },
+      "checkWorkspaceDeletable"
+    ).mockResolvedValue({ error: "Workspace contains uncommitted changes." });
+    const warnings: string[] = [];
+    try {
+      const daytona = { sandboxId: "sb-dirty", shared: false };
+      const result = await archive(daytona, "delete", runtimeCheck(daytona), (warning) =>
+        warnings.push(warning)
+      );
+
+      expect(result.success).toBe(true);
+      expect(rig.plane.countCalls("POST /sandbox/sb-dirty/start")).toBe(1);
+      expect(sshCheck).toHaveBeenCalledTimes(1);
+      expect(rig.plane.find("sb-dirty")?.state).toBe("stopped");
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("uncommitted changes");
+    } finally {
+      sshCheck.mockRestore();
+    }
   });
 });

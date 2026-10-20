@@ -26,6 +26,8 @@ export interface UseArchiveWorkspaceConfirmationOptions {
   getDisplayTitle: (workspaceId: string) => string | undefined;
   /** `anchorEl` is the control that started the archive, when there is one. */
   showError: (workspaceId: string, error: string, anchorEl?: HTMLElement) => void;
+  /** An archive that succeeded with something the user should know (e.g. a sandbox kept). */
+  showWarning?: (workspaceId: string, warning: string, anchorEl?: HTMLElement) => void;
 }
 
 function didUntrackedPathSetChange(acknowledged: string[], latest: string[]): boolean {
@@ -66,6 +68,8 @@ export function useArchiveWorkspaceConfirmation(options: UseArchiveWorkspaceConf
       return;
     }
     if (result.success) {
+      const warnings = result.data?.kind === "archived" ? (result.data.warnings ?? []) : [];
+      if (warnings.length > 0) options.showWarning?.(workspaceId, warnings.join("\n"), anchorEl);
       return;
     }
 

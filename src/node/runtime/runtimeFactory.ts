@@ -44,6 +44,11 @@ export function setGlobalDaytonaService(service: DaytonaRuntimeService): void {
   globalDaytonaService = service;
 }
 
+/** For passive sandbox status probes; undefined before the service container wires it. */
+export function getGlobalDaytonaService(): DaytonaRuntimeService | undefined {
+  return globalDaytonaService;
+}
+
 /**
  * Run the full init sequence: postCreateSetup (if present) then initWorkspace.
  * Use this everywhere instead of calling initWorkspace directly to ensure

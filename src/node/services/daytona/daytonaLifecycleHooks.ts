@@ -21,6 +21,11 @@ export interface DaytonaArchiveHookOptions {
   hasUnsettledRemoteBackgroundJobs?: (
     workspaceMetadata: WorkspaceMetadata
   ) => Promise<Result<boolean>>;
+  /**
+   * The dirty and unpushed checks deleteWorkspace runs (starting a stopped sandbox for them).
+   * Archive "delete" deletes only when they pass; without this check it stops instead.
+   */
+  checkSandboxDeletable?: (workspaceMetadata: WorkspaceMetadata) => Promise<Result<void, string>>;
   now?: () => number;
 }
 
@@ -34,8 +39,7 @@ export function createDaytonaArchiveHook(options: DaytonaArchiveHookOptions): Be
     if (behavior === "keep") return Ok(undefined);
     try {
       if (behavior === "delete") {
-        await options.daytonaService.deleteSandbox(sandboxId);
-        return Ok(undefined);
+        return await deleteForArchive(options, args, sandboxId);
       }
       return await stopForArchive(options, args, sandboxId);
     } catch (error) {
@@ -51,13 +55,50 @@ function dedicatedSandboxId(workspaceMetadata: WorkspaceMetadata): string | unde
   return runtimeConfig.daytona?.sandboxId;
 }
 
+/**
+ * Unlike Coder, never delete unchecked work: a dirty or unpushed worktree (or a check that
+ * cannot run) keeps the sandbox, stopped, and the archive goes on with a warning.
+ */
+async function deleteForArchive(
+  options: DaytonaArchiveHookOptions,
+  args: Parameters<BeforeArchiveHook>[0],
+  sandboxId: string
+): Promise<Result<void>> {
+  const check = options.checkSandboxDeletable
+    ? await options.checkSandboxDeletable(args.workspaceMetadata)
+    : Err("its worktree could not be checked for uncommitted work");
+  if (check.success) {
+    await options.daytonaService.deleteSandbox(sandboxId);
+    return Ok(undefined);
+  }
+  log.warn("Daytona sandbox kept on archive: the delete checks failed", {
+    sandboxId,
+    error: check.error,
+  });
+  const { state } = await options.daytonaService.getSandboxState(sandboxId);
+  if (isRunning(state)) await stopSandbox(options, sandboxId);
+  args.reportWarning?.(
+    `Daytona sandbox "${sandboxId}" was stopped, not deleted: ${check.error.trim()}`
+  );
+  return Ok(undefined);
+}
+
+function isRunning(state: string): boolean {
+  return state !== "stopped" && state !== "archived" && state !== "missing";
+}
+
+async function stopSandbox(options: DaytonaArchiveHookOptions, sandboxId: string): Promise<void> {
+  const now = options.now ?? Date.now;
+  await options.daytonaService.stopAndWait(sandboxId, now() + DAYTONA_STOP_TIMEOUT_MS);
+}
+
 async function stopForArchive(
   options: DaytonaArchiveHookOptions,
   args: Parameters<BeforeArchiveHook>[0],
   sandboxId: string
 ): Promise<Result<void>> {
   const { state } = await options.daytonaService.getSandboxState(sandboxId);
-  if (state === "stopped" || state === "archived" || state === "missing") {
+  if (!isRunning(state)) {
     return Ok(undefined);
   }
   if (args.refuseStopUnderUnverifiedRemoteJobs === true) {
@@ -65,8 +106,7 @@ async function stopForArchive(
     if (refusal) return Err(refusal);
   }
   log.debug("Stopping Daytona sandbox before archive", { sandboxId, state });
-  const now = options.now ?? Date.now;
-  await options.daytonaService.stopAndWait(sandboxId, now() + DAYTONA_STOP_TIMEOUT_MS);
+  await stopSandbox(options, sandboxId);
   return Ok(undefined);
 }
 

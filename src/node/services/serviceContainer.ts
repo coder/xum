@@ -69,6 +69,9 @@ import { createDaytonaArchiveHook } from "@/node/services/daytona/daytonaLifecyc
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import { setGlobalDaytonaService } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
+import { DaytonaSSHRuntime } from "@/node/runtime/DaytonaSSHRuntime";
+import { Err } from "@/common/types/result";
+import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { PerfReportService } from "@/node/services/perf/perfReportService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
@@ -454,6 +457,20 @@ export class ServiceContainer {
             createRuntimeForWorkspace(workspaceMetadata),
             workspaceMetadata.id
           ),
+        checkSandboxDeletable: (workspaceMetadata) => {
+          const runtime = createRuntimeForWorkspace(workspaceMetadata);
+          if (!(runtime instanceof DaytonaSSHRuntime)) {
+            return Promise.resolve(Err("the workspace is not on a Daytona sandbox"));
+          }
+          const trusted = this.config
+            .loadConfigOrDefault()
+            .projects.get(stripTrailingSlashes(workspaceMetadata.projectPath))?.trusted;
+          return runtime.checkSandboxDeletable(
+            workspaceMetadata.projectPath,
+            workspaceMetadata.name,
+            trusted
+          );
+        },
       })
     );
     return new DaytonaReconciler({

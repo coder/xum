@@ -58,6 +58,21 @@ export const RuntimeAvailabilitySchema = z.object({
   // Daytona is `ssh` + a sub-config, not a RuntimeMode; optional so mode-keyed maps still fit.
   daytona: RuntimeAvailabilityStatusSchema.optional(),
 });
+/**
+ * Passive runtime status for the UI (never starts anything): devcontainers report running or
+ * stopped; Daytona sandboxes add starting, archived and error.
+ */
+export const WorkspaceRuntimeStatusSchema = z.enum([
+  "running",
+  "stopped",
+  "starting",
+  "archived",
+  "error",
+  "unknown",
+  "unsupported",
+]);
+export type WorkspaceRuntimeStatus = z.infer<typeof WorkspaceRuntimeStatusSchema>;
+
 export const RuntimeConfigSchema = z.union([
   // Legacy local with srcBaseDir (treated as worktree)
   z.object({

@@ -1150,10 +1150,11 @@ export function GeneralSection() {
         <div className="space-y-4">
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1">
-              <div className="text-foreground text-sm">Coder workspace on archive</div>
+              <div className="text-foreground text-sm">Remote box on archive</div>
               <div className="text-muted text-xs">
-                Action to take on dedicated Coder workspaces when archiving a chat. Delete is
-                permanent.
+                Action to take on dedicated Coder workspaces and Daytona sandboxes when archiving a
+                chat. Delete is permanent; a Daytona sandbox with uncommitted or unpushed work is
+                stopped instead.
               </div>
             </div>
             <Select

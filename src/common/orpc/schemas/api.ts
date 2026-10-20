@@ -94,6 +94,7 @@ import {
   RuntimeConfigSchema,
   RuntimeAvailabilitySchema,
   RuntimeEnablementIdSchema,
+  WorkspaceRuntimeStatusSchema,
 } from "./runtime";
 import { SecretSchema } from "./secrets";
 import {
@@ -1498,7 +1499,11 @@ const ArchivePreflightResultSchema = z.discriminatedUnion("kind", [
 ]);
 
 const ArchiveWorkspaceResultSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("archived") }),
+  z.object({
+    kind: z.literal("archived"),
+    /** Outcomes that did not fail the archive, e.g. a Daytona sandbox kept instead of deleted. */
+    warnings: z.array(z.string()).optional(),
+  }),
   ArchiveLossyUntrackedFilesConfirmationSchema,
 ]);
 
@@ -2108,7 +2113,7 @@ export const workspace = {
   },
   getRuntimeStatuses: {
     input: z.object({ workspaceIds: z.array(z.string()) }),
-    output: z.record(z.string(), z.enum(["running", "stopped", "unknown", "unsupported"])),
+    output: z.record(z.string(), WorkspaceRuntimeStatusSchema),
   },
   getProjectGitStatuses: {
     input: z.object({
