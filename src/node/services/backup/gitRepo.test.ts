@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -161,10 +162,21 @@ describe("BackupRepoCache", () => {
     await fs.writeFile(path.join(seed, "mux", "AGENTS.md"), "managed\n", "utf-8");
     await fs.writeFile(path.join(seed, "outside", "history.txt"), "0\n", "utf-8");
     await commitAll(seed, "seed");
+    // One fast-import process writes the 200 commits. Two git processes per commit (add + commit)
+    // took ~8 s on a busy host, past the default 5 s test timeout (#6091).
+    const branch = await runGit(["-C", seed, "symbolic-ref", "HEAD"]);
+    const data = (text: string) => `data ${Buffer.byteLength(text)}\n${text}\n`;
+    let stream = "";
     for (let index = 1; index <= 200; index++) {
-      await fs.writeFile(path.join(seed, "outside", "history.txt"), `${index}\n`, "utf-8");
-      await commitAll(seed, `outside history ${index}`);
+      stream += `commit ${branch}\ncommitter Xum <mux@example.com> ${1_700_000_000 + index} +0000\n`;
+      stream += data(`outside history ${index}`);
+      if (index === 1) stream += `from ${branch}^0\n`;
+      stream += `M 100644 inline outside/history.txt\n${data(`${index}\n`)}`;
     }
+    const fastImport = spawnSync("git", ["-C", seed, "fast-import", "--quiet"], { input: stream });
+    expect(fastImport.stderr.toString()).toBe("");
+    expect(fastImport.status).toBe(0);
+    expect(await runGit(["-C", seed, "rev-list", "--count", "HEAD"])).toBe("201");
     await runGit(["-C", seed, "push", "origin", "HEAD:main"]);
 
     const repo = createRepo();

@@ -4,6 +4,7 @@ import { type FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isDevcontainerRuntime } from "@/common/types/runtime";
 import { MapStore } from "./MapStore";
 import { RefreshController } from "@/browser/utils/RefreshController";
+import { getStatusInputChanges } from "@/browser/utils/statusRefreshInputs";
 
 export type RuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
 
@@ -28,6 +29,11 @@ export class RuntimeStatusStore {
   }
 
   setClient(client: APIClient | null): void {
+    // AppLoader re-applies the same client on every workspace metadata event (#5573); only a new
+    // client (first connect or reconnect) warrants a refresh.
+    if (client === this.client) {
+      return;
+    }
     this.client = client;
 
     if (!client) {
@@ -66,10 +72,20 @@ export class RuntimeStatusStore {
   }
 
   syncWorkspaces(metadata: Map<string, FrontendWorkspaceMetadata>): void {
-    if (!this.isActive && metadata.size > 0) {
+    const reactivated = !this.isActive && metadata.size > 0;
+    if (reactivated) {
       this.isActive = true;
     }
 
+    // Every workspace metadata event (title, tag, AI settings, ...) delivers a new Map, and
+    // requestImmediate bypasses the debounce and the hidden-window check (#5573). Refresh only when
+    // a displayed devcontainer workspace appeared or its runtime inputs changed. Subscriptions,
+    // focus and invalidation still refresh.
+    const isSubscribed = (workspaceId: string) => this.statuses.hasKeySubscribers(workspaceId);
+    const needsRefresh = getStatusInputChanges(this.workspaceMetadata, metadata, isSubscribed).some(
+      (workspaceId) =>
+        isSubscribed(workspaceId) && isDevcontainerRuntime(metadata.get(workspaceId)?.runtimeConfig)
+    );
     this.workspaceMetadata = metadata;
 
     for (const workspaceId of Array.from(this.statusCache.keys())) {
@@ -81,7 +97,9 @@ export class RuntimeStatusStore {
     }
 
     this.refreshController.bindListeners();
-    this.refreshController.requestImmediate();
+    if (reactivated || needsRefresh) {
+      this.refreshController.requestImmediate();
+    }
   }
 
   invalidateWorkspace(workspaceId: string): void {
