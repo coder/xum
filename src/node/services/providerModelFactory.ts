@@ -677,10 +677,12 @@ function createOpenAIModelWithPreservedOptions(
 // on /api/chat and on the OpenAI-compatible /v1 (both decode the same Go structs), so one `type`
 // array fails the whole request. zod >= 4.5 emits nullable fields as `type: [X, "null"]` (MCP
 // schemas can too), so these routes send the equivalent `anyOf`. Recurse only into subschemas:
-// const, enum, default and examples hold data.
+// const, enum, default and examples hold data. Draft-07 `dependencies` is a map whose values are
+// schemas or property-name lists; a list holds only strings, which the rewrite leaves alone.
 const TOOL_SUBSCHEMA_KEY =
   /^(items|prefixItems|additionalItems|contains|additionalProperties|propertyNames|not|if|then|else|anyOf|allOf|oneOf|unevaluatedItems|unevaluatedProperties)$/;
-const TOOL_SCHEMA_MAP_KEY = /^(properties|patternProperties|\$defs|definitions|dependentSchemas)$/;
+const TOOL_SCHEMA_MAP_KEY =
+  /^(properties|patternProperties|\$defs|definitions|dependentSchemas|dependencies)$/;
 function toolTypeArraysToAnyOf(node: unknown, depth: "schema" | "map" = "schema"): unknown {
   if (Array.isArray(node)) return node.map((item) => toolTypeArraysToAnyOf(item));
   if (node === null || typeof node !== "object") return node;
@@ -701,6 +703,11 @@ function toolTypeArraysToAnyOf(node: unknown, depth: "schema" | "map" = "schema"
   };
 }
 
+/**
+ * The wrapped model reports specificationVersion "v4" (ollama-ai-provider-v2 reports "v3"), so
+ * DevTools records these requests when it is on, as on the Copilot route. That is intended
+ * (#6083): recording does not change the request.
+ */
 function withToolTypeArraysAsAnyOf(model: Parameters<typeof wrapLanguageModel>[0]["model"]) {
   return wrapLanguageModel({
     model,

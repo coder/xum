@@ -87,7 +87,8 @@ function pinnedOptionsFor(
   modelString: string,
   model: LanguageModel,
   _opts?: { thinkingLevel?: ThinkingLevel; agentInitiated?: boolean },
-  muxProviderOptions: MuxProviderOptions = {}
+  muxProviderOptions: MuxProviderOptions = {},
+  optionsRouteProvider?: "bedrock" | "openrouter"
 ) {
   return Ok({
     model,
@@ -97,6 +98,7 @@ function pinnedOptionsFor(
     optionsModelString: modelString,
     optionsProvidersConfig: {},
     optionsMuxProviderOptions: muxProviderOptions,
+    ...(optionsRouteProvider && { optionsRouteProvider }),
   });
 }
 
@@ -483,10 +485,7 @@ describe("generateWorkspaceIdentity candidate settings", () => {
       const model = "anthropic:claude-haiku-5-5";
       const aiService = titleAIService((modelString) =>
         Promise.resolve(
-          Ok({
-            ...pinnedOptionsFor(modelString, createTitleModel(modelString)).data,
-            optionsRouteProvider: route,
-          })
+          pinnedOptionsFor(modelString, createTitleModel(modelString), undefined, {}, route)
         )
       );
       const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);

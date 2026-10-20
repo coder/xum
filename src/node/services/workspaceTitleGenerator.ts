@@ -409,6 +409,8 @@ function anthropicThinkingBudget(
  * Whether the serialized request leaves thinking off. An omitted Anthropic
  * `thinking` is off because the policy keeps "off" away from models whose API
  * defaults to adaptive; an omitted OpenAI effort runs the model's default reasoning.
+ * Bedrock and OpenRouter count only their explicit "off" (#5954): an empty namespace
+ * there runs the model's default, which can reason.
  */
 function serializesThinkingOff(providerOptions: ReturnType<typeof buildProviderOptions>): boolean {
   if ("anthropic" in providerOptions) {
@@ -417,6 +419,18 @@ function serializesThinkingOff(providerOptions: ReturnType<typeof buildProviderO
   }
   if ("openai" in providerOptions) {
     return providerOptions.openai.reasoningEffort === "none";
+  }
+  if ("bedrock" in providerOptions) {
+    const thinking = providerOptions.bedrock.additionalModelRequestFields?.thinking;
+    return (
+      typeof thinking === "object" &&
+      thinking !== null &&
+      !Array.isArray(thinking) &&
+      (thinking as { type?: unknown }).type === "disabled"
+    );
+  }
+  if ("openrouter" in providerOptions) {
+    return providerOptions.openrouter.reasoning?.effort === "none";
   }
   return false;
 }

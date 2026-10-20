@@ -16,7 +16,7 @@
  */
 import * as crypto from "crypto";
 import type http from "node:http";
-import { Duration, Effect, Schema } from "effect";
+import { Duration, Effect, Fiber, Schema } from "effect";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import {
@@ -317,6 +317,9 @@ export class CoderOauthError extends Schema.TaggedError<CoderOauthError>()("Code
 
 export class CoderOauthService {
   private readonly desktopFlows = new OAuthFlowManager();
+  // Desktop-flow pipeline fibers. A committed login keeps running provider discovery (with
+  // retries) after its flow ends, so dispose() interrupts these too (#5762).
+  private readonly pipelineFibers = new Set<Fiber.Fiber<void>>();
   private readonly refreshMutex = new AsyncMutex();
   // Serializes whole catalog refresh runs (fetch + locked commit). Automatic
   // post-login discovery and the Settings/command-palette refresh are
@@ -842,7 +845,7 @@ export class CoderOauthService {
       // tokens, then commit the login. Races against resultDeferred (which
       // resolves on cancel/timeout) so the fiber exits cleanly if the flow is
       // cancelled.
-      Effect.runFork(
+      const pipelineFiber = Effect.runFork(
         self.desktopCallbackPipeline({
           flowId,
           flowStartPersistedGeneration,
@@ -855,6 +858,8 @@ export class CoderOauthService {
           flowAbortSignal: flowAbort.signal,
         })
       );
+      self.pipelineFibers.add(pipelineFiber);
+      pipelineFiber.addObserver(() => self.pipelineFibers.delete(pipelineFiber));
 
       log.debug(`[Coder OAuth] Desktop flow started (flowId=${flowId})`);
 
@@ -1131,6 +1136,9 @@ export class CoderOauthService {
   async dispose(): Promise<void> {
     this.unsubscribeConfigChanged();
     await this.desktopFlows.shutdownAll();
+    // The login commit is uninterruptible, so this waits for a commit in progress and stops
+    // the discovery after it.
+    await Effect.runPromise(Fiber.interruptAll([...this.pipelineFibers]));
   }
 
   // -------------------------------------------------------------------------
