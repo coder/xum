@@ -42,8 +42,8 @@ export async function todoNudgeToolPolicies(app: {
     throw new Error(`expected one '${WORKSPACE_TITLE}' workspace, found ${playground.length}`);
   }
   const replay = await client.workspace.getFullReplay({ workspaceId: playground[0].id });
-  const rows = replay.flatMap((row) => (row.type === "message-batch" ? row.messages : [row]));
-  return rows.flatMap((row) => {
+  // getFullReplay sends single rows only: `message-batch` is onChat-only (#5102).
+  return replay.flatMap((row) => {
     if (row.type !== "message" || row.role !== "user") return [];
     const text = row.parts.map((part) => (part.type === "text" ? part.text : "")).join("");
     if (text.trim() !== TODO_TURN_END_NUDGE.trim()) return [];
