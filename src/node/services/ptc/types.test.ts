@@ -263,17 +263,22 @@ describe("retainExemptKernelRecordResult", () => {
       expect(AgentSkillPackageSchema.safeParse(corrupted?.skill).success).toBe(true);
       expect(corrupted?.skillDir).toBeUndefined();
 
-      // Also when the reason is too long to retain: it still marks the record.
-      const oversizedReason = retainExemptKernelRecordResult("agent_skill_read", {
-        success: true,
-        skill: { ...skill, body: "B".repeat(MAX_FILE_CONTENT_SIZE), pad },
-        skillDir,
-        pluginRoot: `/home/user/${"r".repeat(3000)}`,
-        skillDirUnavailable: "u".repeat(KERNEL_RETAINED_PATH_MAX_BYTES),
-      }) as { skillDir?: string; skillDirUnavailable?: string; skill?: unknown };
-      expect(AgentSkillPackageSchema.safeParse(oversizedReason?.skill).success).toBe(true);
-      expect(oversizedReason?.skillDirUnavailable).toBeUndefined();
-      expect(oversizedReason?.skillDir).toBeUndefined();
+      // Also when the reason is too long to retain: it still marks the record,
+      // with or without a budget squeeze.
+      const squeezed = { pluginRoot: `/home/user/${"r".repeat(3000)}`, skillPad: { pad } };
+      for (const extra of [squeezed, { skillPad: {} }]) {
+        const { skillPad, ...topLevel } = extra;
+        const oversizedReason = retainExemptKernelRecordResult("agent_skill_read", {
+          success: true,
+          skill: { ...skill, body: "B".repeat(MAX_FILE_CONTENT_SIZE), ...skillPad },
+          ...topLevel,
+          skillDir,
+          skillDirUnavailable: "u".repeat(KERNEL_RETAINED_PATH_MAX_BYTES),
+        }) as { skillDir?: string; skillDirUnavailable?: string; skill?: unknown };
+        expect(AgentSkillPackageSchema.safeParse(oversizedReason?.skill).success).toBe(true);
+        expect(oversizedReason?.skillDirUnavailable).toBeUndefined();
+        expect(oversizedReason?.skillDir).toBeUndefined();
+      }
     });
 
     it("keeps the skill without its location when the location leaves no body budget", () => {

@@ -166,11 +166,13 @@ function boundSkillReadResult(
 ): unknown {
   const skill = result.skill;
   const location = retainSkillLocationFields(result);
+  // The raw marker, not the retained one: an oversized reason is dropped from
+  // `location` but still marks the record as corrupted, so the path goes in
+  // every attempt below.
+  if (typeof result.skillDirUnavailable === "string") delete location.skillDir;
   const withLocation = boundSkillReadPackage(skill, { ...fields, ...location });
   if (withLocation !== undefined) return withLocation;
-  // The raw marker, not the retained one: an oversized reason is dropped from
-  // `location` but still marks the record as corrupted.
-  if (location.skillDir !== undefined && result.skillDirUnavailable === undefined) {
+  if (location.skillDir !== undefined) {
     const withSkillDir = boundSkillReadPackage(skill, { ...fields, skillDir: location.skillDir });
     if (withSkillDir !== undefined) return withSkillDir;
   }
