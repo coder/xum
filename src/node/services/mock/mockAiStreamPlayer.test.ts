@@ -1056,7 +1056,9 @@ describe("MockAiStreamPlayer", () => {
     // queue for 150 ms. The throttled partial write queued behind that backlog, and partial.json
     // first appeared ~1.9 s into a mock stream that the row already showed as streaming.
     const tokenizerLoad = Promise.withResolvers<never>();
-    spyOn(tokenizerModule, "getTokenizerForModel").mockImplementation(() => tokenizerLoad.promise);
+    const tokenizerSpy = spyOn(tokenizerModule, "getTokenizerForModel").mockImplementation(
+      () => tokenizerLoad.promise
+    );
     const aiServiceStub = new EventEmitter();
     aiServiceStub.on("error", () => undefined);
     const player = new MockAiStreamPlayer({
@@ -1084,6 +1086,8 @@ describe("MockAiStreamPlayer", () => {
       );
     } finally {
       await player.stop(workspaceId);
+      // Later tests in this file must keep the real tokenizer.
+      tokenizerSpy.mockRestore();
       tokenizerLoad.reject(new Error("test done"));
     }
   });
