@@ -202,18 +202,7 @@ function coderCatalogListsModel(discoveredModels: string[], modelId: string): bo
   if (discoveredModels.includes(modelId)) {
     return true;
   }
-  // Anthropic-type gateways list only dated snapshots (`claude-haiku-4-5-20251001`) while
-  // built-in models send the undated id (#5660), which the gateway accepts. A dated entry
-  // satisfies its undated id. Tombstones stay exact, as for the Gemini alias below. Only the
-  // undated id's own removal (checked by the caller) hides it.
-  if (
-    discoveredModels.some(
-      (id) =>
-        id.length === modelId.length + 9 &&
-        id.startsWith(`${modelId}-`) &&
-        /^\d{8}$/.test(id.slice(modelId.length + 1))
-    )
-  ) {
+  if (claudeSnapshotListed(discoveredModels, modelId)) {
     return true;
   }
   // Google catalogs list `models/<id>` while native selections and the
@@ -229,4 +218,21 @@ function coderCatalogListsModel(discoveredModels: string[], modelId: string): bo
     return true;
   }
   return false;
+}
+
+/**
+ * Anthropic-type gateways list only dated Claude snapshots (`claude-haiku-4-5-20251001`) while
+ * built-in models send the undated id (#5660), which Anthropic serves as an alias. So a dated
+ * Claude entry satisfies its undated id. Other model families get no such alias: an
+ * OpenAI-compatible upstream need not serve an undated id it never listed. Tombstones stay exact,
+ * as for the Gemini alias: only the undated id's own removal (checked by the caller) hides it.
+ */
+function claudeSnapshotListed(discoveredModels: string[], modelId: string): boolean {
+  if (!modelId.slice(modelId.indexOf("/") + 1).startsWith("claude-")) return false;
+  return discoveredModels.some(
+    (id) =>
+      id.length === modelId.length + 9 &&
+      id.startsWith(`${modelId}-`) &&
+      /^\d{8}$/.test(id.slice(modelId.length + 1))
+  );
 }

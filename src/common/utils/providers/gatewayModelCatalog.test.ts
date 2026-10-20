@@ -291,6 +291,21 @@ describe("gatewayModelCatalog", () => {
     expect(check("anthropic/claude-haiku-4")).toBe(false);
     expect(check("anthropic/claude-haiku-4-5-2025")).toBe(false);
     expect(check("other/claude-haiku-4-5")).toBe(false);
+    // Only Claude ids: another family's upstream need not serve an undated alias.
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog("coder", "corp/gpt-6.1-sol", undefined, [
+        "corp/gpt-6.1-sol-20260930",
+      ])
+    ).toBe(false);
+    // A custom gateway provider name before the Claude id.
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog(
+        "coder",
+        "claude-aws-us-east-2/claude-haiku-4-5",
+        undefined,
+        ["claude-aws-us-east-2/claude-haiku-4-5-20251001"]
+      )
+    ).toBe(true);
     expect(check("anthropic/claude-haiku-4-5", ["anthropic/claude-haiku-4-5"])).toBe(false);
     expect(check("anthropic/claude-haiku-4-5", ["anthropic/claude-haiku-4-5-20251001"])).toBe(true);
   });
