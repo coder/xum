@@ -21,12 +21,12 @@ const APP_REGION_SELECTOR = ".titlebar-drag, .titlebar-no-drag";
  * Chromium (`LocalFrameView::CollectDraggableRegions`) reports the border box of every element
  * box with an `app-region`, in DOM pre-order, skipping boxes that are not `visibility: visible`
  * and objects that are not boxes (inline spans, text, SVG shapes). Since Electron 44 `app-region`
- * inherits, so each descendant box reports its own rect (even `app-region: none` under such an
- * ancestor computes to the ancestor's mode, so only a box with no such ancestor reports none).
+ * inherits, so each descendant box reports its own rect. An explicit `app-region: none` still
+ * reports a no-drag rect, so only a box with no region set on it or any ancestor reports nothing.
  * Electron (`shell/browser/ui/drag_util.cc`) then lets the later rect win where rects overlap.
- * The app sets `app-region` only through the
- * `titlebar-drag` and `titlebar-no-drag` classes, so this reads the classes, not the property,
- * and does not depend on the Storybook browser's Chromium version.
+ * The app sets `app-region` only through the `titlebar-drag` and `titlebar-no-drag` classes, so
+ * this reads the classes, not the property, and does not depend on the Storybook browser's
+ * Chromium version.
  */
 export function windowDragsAt(x: number, y: number): boolean {
   let drags = false;

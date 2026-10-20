@@ -502,18 +502,18 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
         // on the left (the Panel clips it) so the collapse button stays visible. With room to
         // spare, the right-end group's ml-auto takes the free space and this has no effect.
         "has-[[data-sidebar-control]]:justify-end",
-        // In desktop mode, match the title bar height
-        isDesktop && DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
+        // Desktop title bar: its height, and no text selection, as `.titlebar-drag` areas have.
+        isDesktop && [DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS, "select-none"],
         showDropHighlight && "bg-accent/30",
         isDraggingFromHere && "bg-accent/10"
       )}
     >
       {/* Desktop drag regions. Chromium does not clip region rects to the scrolling row, Electron
-          lets the later rect win, and app-region inherits (even `none` below a drag or no-drag
-          element computes to that mode). So no ancestor of the tabs may set a region, or a
-          scrolled-out tab's own rect would cover the workspace header and the strip's empty
-          space. Instead, a drag backdrop fills the strip, and a no-drag sibling of the row covers
-          exactly the row's visible box, which keeps the visible tabs clickable. */}
+          lets the later rect win, and app-region inherits (an explicit `none` still reports a
+          no-drag rect). So no ancestor of the tabs may set a region, or a scrolled-out tab's own
+          rect would cover the workspace header and the strip's empty space. Instead, a drag
+          backdrop fills the strip, and a no-drag sibling of the row covers exactly the row's
+          visible box, which keeps the visible tabs clickable. */}
       {isDesktop && (
         <div aria-hidden className="titlebar-drag pointer-events-none absolute inset-0" />
       )}
