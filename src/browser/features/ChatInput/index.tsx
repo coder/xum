@@ -168,7 +168,6 @@ import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderConfigChangeHandler } from "./useCoderConfigChangeHandler";
 import { useCreationProjectChangeHandler } from "./useCreationProjectChangeHandler";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
-import { useDaytonaResources } from "@/browser/hooks/useDaytonaResources";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
 import { usePowerMode } from "@/browser/contexts/PowerModeContext";
@@ -914,13 +913,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     coderInfoRefreshPolicy: variant === "creation" ? "mount-and-focus" : "mount-only",
   });
 
-  // Daytona lists are account API calls, so they load only while Daytona is the pick.
-  const daytonaResources = useDaytonaResources({
-    enabled:
-      variant === "creation" && currentRuntime.mode === "ssh" && currentRuntime.daytona != null,
-    loadSandboxes: true,
-  });
-
   const creationRuntimeError =
     variant === "creation" && props.kind !== "scratch"
       ? validateCreationRuntime(creationState.selectedRuntime, coderState.presets.length)
@@ -940,7 +932,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           coderConfigFallback: creationState.coderConfigFallback,
           sshHostFallback: creationState.sshHostFallback,
           daytonaConfigFallback: creationState.daytonaConfigFallback,
-          daytonaResources,
           defaultRuntimeMode: creationState.defaultRuntimeMode,
           onSelectedRuntimeChange: creationState.setSelectedRuntime,
           disabled: isSendInFlight,

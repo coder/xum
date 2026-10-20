@@ -13,7 +13,7 @@ import {
   type DaytonaSizePresetId,
 } from "@/common/constants/daytona";
 import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
-import type { DaytonaResources } from "@/browser/hooks/useDaytonaResources";
+import { useDaytonaResources, type DaytonaResources } from "@/browser/hooks/useDaytonaResources";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import {
   Select,
@@ -256,15 +256,40 @@ export interface DaytonaSandboxFormProps {
   className?: string;
 }
 
-export function DaytonaSandboxForm(props: DaytonaSandboxFormProps) {
-  const mode = props.allowExisting ? getMode(props.config) : "new";
-  const ready = props.resources.config?.apiKeySet === true;
-
+function DaytonaModeToggle(props: {
+  config: DaytonaSandboxConfig;
+  onConfigChange: (config: DaytonaSandboxConfig) => void;
+  disabled?: boolean;
+}) {
+  const mode = getMode(props.config);
   const handleModeChange = (next: DaytonaMode) => {
     if (next === mode) return;
     // Existing starts unselected; New keeps nothing from the attached sandbox.
     props.onConfigChange(next === "existing" ? { shared: true } : {});
   };
+  return (
+    <div className="flex gap-1" role="group" aria-label="Daytona sandbox mode">
+      <ModeButton
+        mode="new"
+        active={mode === "new"}
+        disabled={props.disabled}
+        tooltip="Create a new Daytona sandbox for this workspace"
+        onSelect={handleModeChange}
+      />
+      <ModeButton
+        mode="existing"
+        active={mode === "existing"}
+        disabled={props.disabled}
+        tooltip="Use an existing Daytona sandbox (Xum never deletes it)"
+        onSelect={handleModeChange}
+      />
+    </div>
+  );
+}
+
+export function DaytonaSandboxForm(props: DaytonaSandboxFormProps) {
+  const mode = props.allowExisting ? getMode(props.config) : "new";
+  const ready = props.resources.config?.apiKeySet === true;
 
   return (
     <div
@@ -280,22 +305,11 @@ export function DaytonaSandboxForm(props: DaytonaSandboxFormProps) {
       ) : (
         <>
           {props.allowExisting && (
-            <div className="flex gap-1" role="group" aria-label="Daytona sandbox mode">
-              <ModeButton
-                mode="new"
-                active={mode === "new"}
-                disabled={props.disabled}
-                tooltip="Create a new Daytona sandbox for this workspace"
-                onSelect={handleModeChange}
-              />
-              <ModeButton
-                mode="existing"
-                active={mode === "existing"}
-                disabled={props.disabled}
-                tooltip="Use an existing Daytona sandbox (Xum never deletes it)"
-                onSelect={handleModeChange}
-              />
-            </div>
+            <DaytonaModeToggle
+              config={props.config}
+              onConfigChange={props.onConfigChange}
+              disabled={props.disabled}
+            />
           )}
           {mode === "new" ? (
             <>
@@ -323,4 +337,15 @@ export function DaytonaSandboxForm(props: DaytonaSandboxFormProps) {
       )}
     </div>
   );
+}
+
+/**
+ * The workspace-creation form. Mounted only while Daytona is the picked runtime, so the
+ * snapshot and sandbox lists (account API calls) load only then.
+ */
+export function DaytonaCreationForm(
+  props: Omit<DaytonaSandboxFormProps, "resources" | "allowExisting">
+) {
+  const resources = useDaytonaResources({ enabled: true, loadSandboxes: true });
+  return <DaytonaSandboxForm {...props} resources={resources} allowExisting />;
 }

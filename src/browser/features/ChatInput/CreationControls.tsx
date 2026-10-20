@@ -11,8 +11,7 @@ import {
   isManagedSshPlaceholder,
 } from "@/common/types/runtime";
 import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
-import type { DaytonaResources } from "@/browser/hooks/useDaytonaResources";
-import { DaytonaSandboxForm } from "../Runtime/DaytonaControls";
+import { DaytonaCreationForm } from "../Runtime/DaytonaControls";
 import type { RuntimeAvailabilityMap, RuntimeAvailabilityState } from "./useCreationWorkspace";
 import {
   resolveDevcontainerSelection,
@@ -149,8 +148,6 @@ interface CreationControlsProps {
   coderInfo?: CoderInfo | null;
   /** Coder workspace controls props (optional - only rendered when provided) */
   coderProps?: Omit<CoderControlsProps, "disabled">;
-  /** Daytona snapshots, sandboxes and access state (loaded while Daytona is selected). */
-  daytonaResources?: DaytonaResources;
 }
 
 /** Runtime type button group with icons and colors */
@@ -510,50 +507,59 @@ interface RuntimeChoiceContext {
   runtimeAvailabilityState: RuntimeAvailabilityState;
 }
 
-/** The runtime a workspace-type pick switches to, keeping what was entered for that type. */
+/** The runtime each workspace-type pick switches to, keeping what was entered for that type. */
+const RUNTIME_FOR_CHOICE: Record<RuntimeChoice, (context: RuntimeChoiceContext) => ParsedRuntime> =
+  {
+    // Switch to SSH mode with the last known Coder config so prior selections restore.
+    coder: (context) => ({
+      mode: "ssh",
+      host: CODER_RUNTIME_PLACEHOLDER,
+      coder: context.coderConfigFallback,
+    }),
+    daytona: (context) => ({
+      mode: "ssh",
+      host: DAYTONA_RUNTIME_PLACEHOLDER,
+      daytona: context.daytonaConfigFallback,
+    }),
+    [RUNTIME_MODE.SSH]: ({ selectedRuntime: current, sshHostFallback }) => ({
+      mode: "ssh",
+      host:
+        current.mode === "ssh" && !isManagedSshPlaceholder(current.host)
+          ? current.host
+          : sshHostFallback,
+    }),
+    [RUNTIME_MODE.DOCKER]: ({ selectedRuntime: current }) => ({
+      mode: "docker",
+      image: current.mode === "docker" ? current.image : "",
+    }),
+    [RUNTIME_MODE.DEVCONTAINER]: ({ selectedRuntime: current, runtimeAvailabilityState }) => {
+      if (current.mode === "devcontainer") {
+        return {
+          mode: "devcontainer",
+          configPath: current.configPath,
+          shareCredentials: current.shareCredentials,
+        };
+      }
+      // Use resolver to get initial config path (prefers first available config)
+      const initialSelection = resolveDevcontainerSelection({
+        selectedRuntime: { mode: "devcontainer", configPath: "" },
+        availabilityState: runtimeAvailabilityState,
+      });
+      return {
+        mode: "devcontainer",
+        configPath: initialSelection.configPath,
+        shareCredentials: false,
+      };
+    },
+    [RUNTIME_MODE.LOCAL]: () => ({ mode: "local" }),
+    [RUNTIME_MODE.WORKTREE]: () => ({ mode: "worktree" }),
+  };
+
 function buildRuntimeForChoice(
   choice: RuntimeChoice,
   context: RuntimeChoiceContext
 ): ParsedRuntime {
-  const current = context.selectedRuntime;
-  switch (choice) {
-    case "coder":
-      // Switch to SSH mode with the last known Coder config so prior selections restore.
-      return { mode: "ssh", host: CODER_RUNTIME_PLACEHOLDER, coder: context.coderConfigFallback };
-    case "daytona":
-      return {
-        mode: "ssh",
-        host: DAYTONA_RUNTIME_PLACEHOLDER,
-        daytona: context.daytonaConfigFallback,
-      };
-    case RUNTIME_MODE.SSH:
-      return {
-        mode: "ssh",
-        host:
-          current.mode === "ssh" && !isManagedSshPlaceholder(current.host)
-            ? current.host
-            : context.sshHostFallback,
-      };
-    case RUNTIME_MODE.DOCKER:
-      return { mode: "docker", image: current.mode === "docker" ? current.image : "" };
-    case RUNTIME_MODE.DEVCONTAINER: {
-      // Use resolver to get initial config path (prefers first available config)
-      const initialSelection = resolveDevcontainerSelection({
-        selectedRuntime: { mode: "devcontainer", configPath: "" },
-        availabilityState: context.runtimeAvailabilityState,
-      });
-      return {
-        mode: "devcontainer",
-        configPath:
-          current.mode === "devcontainer" ? current.configPath : initialSelection.configPath,
-        shareCredentials: current.mode === "devcontainer" ? current.shareCredentials : false,
-      };
-    }
-    case RUNTIME_MODE.LOCAL:
-      return { mode: "local" };
-    case RUNTIME_MODE.WORKTREE:
-      return { mode: "worktree" };
-  }
+  return RUNTIME_FOR_CHOICE[choice](context);
 }
 
 function CreationControlsContent(props: CreationControlsProps) {
@@ -1009,22 +1015,18 @@ function CreationControlsContent(props: CreationControlsProps) {
             {availabilityMap?.daytona?.available === false && (
               <p className="text-xs text-yellow-500">{availabilityMap.daytona.reason}</p>
             )}
-            {props.daytonaResources && (
-              <DaytonaSandboxForm
-                config={selectedRuntime.daytona ?? {}}
-                onConfigChange={(daytona) =>
-                  onSelectedRuntimeChange({
-                    mode: "ssh",
-                    host: DAYTONA_RUNTIME_PLACEHOLDER,
-                    daytona,
-                  })
-                }
-                resources={props.daytonaResources}
-                allowExisting
-                disabled={props.disabled}
-                hasError={props.runtimeFieldError === "ssh"}
-              />
-            )}
+            <DaytonaCreationForm
+              config={selectedRuntime.daytona ?? {}}
+              onConfigChange={(daytona) =>
+                onSelectedRuntimeChange({
+                  mode: "ssh",
+                  host: DAYTONA_RUNTIME_PLACEHOLDER,
+                  daytona,
+                })
+              }
+              disabled={props.disabled}
+              hasError={props.runtimeFieldError === "ssh"}
+            />
           </div>
         )}
 
@@ -1156,7 +1158,6 @@ export function CreationControls(props: CreationControlsProps) {
       runtimeFieldError={props.runtimeFieldError}
       coderInfo={props.coderInfo}
       coderProps={coderProps}
-      daytonaResources={props.daytonaResources}
     />
   );
 }

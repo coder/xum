@@ -509,6 +509,39 @@ async function fastReadGitHeadsRefs(projectPath: string): Promise<string | null>
 /** Trunk-like names SSH cleanups never `branch -D`, even when they look orphaned. */
 const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
 
+/** Maps the exit code of checkWorkspaceDeletable's script; stderr is read only when needed. */
+async function interpretDeletableCheck(
+  checkExitCode: number,
+  readStderr: () => Promise<string>
+): Promise<"ok" | "missing" | { error: string }> {
+  if (checkExitCode === 3) {
+    return "missing";
+  }
+
+  if (checkExitCode === 1) {
+    return { error: "Workspace contains uncommitted changes. Use force flag to delete anyway." };
+  }
+
+  if (checkExitCode === 2) {
+    // stderr holds the unpushed commits output
+    const commitList = (await readStderr()).trim();
+    const errorMsg = commitList
+      ? `Workspace contains unpushed commits:\n\n${commitList}`
+      : "Workspace contains unpushed commits. Use force flag to delete anyway.";
+
+    return { error: errorMsg };
+  }
+
+  if (checkExitCode !== 0) {
+    // Unexpected error
+    const stderr = await readStderr();
+    return {
+      error: `Failed to check workspace state: ${stderr.trim() || `exit code ${checkExitCode}`}`,
+    };
+  }
+  return "ok";
+}
+
 export class SSHRuntime extends RemoteRuntime {
   private readonly config: SSHRuntimeConfig;
   private readonly transport: SSHTransport;
@@ -3316,36 +3349,9 @@ export class SSHRuntime extends RemoteRuntime {
 
     // Command doesn't use stdin - abort to close immediately without waiting
     await checkStream.stdin.abort();
-    const checkExitCode = await checkStream.exitCode;
-
-    // Handle check results
-    if (checkExitCode === 3) {
-      return "missing";
-    }
-
-    if (checkExitCode === 1) {
-      return { error: "Workspace contains uncommitted changes. Use force flag to delete anyway." };
-    }
-
-    if (checkExitCode === 2) {
-      // Read stderr which contains the unpushed commits output
-      const stderr = await streamToString(checkStream.stderr);
-      const commitList = stderr.trim();
-      const errorMsg = commitList
-        ? `Workspace contains unpushed commits:\n\n${commitList}`
-        : "Workspace contains unpushed commits. Use force flag to delete anyway.";
-
-      return { error: errorMsg };
-    }
-
-    if (checkExitCode !== 0) {
-      // Unexpected error
-      const stderr = await streamToString(checkStream.stderr);
-      return {
-        error: `Failed to check workspace state: ${stderr.trim() || `exit code ${checkExitCode}`}`,
-      };
-    }
-    return "ok";
+    return interpretDeletableCheck(await checkStream.exitCode, () =>
+      streamToString(checkStream.stderr)
+    );
   }
 
   async deleteWorkspace(
