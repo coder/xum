@@ -32,6 +32,11 @@ export interface SubagentReportArtifactIndexEntry {
   planFilePath?: string;
   /** Estimated token count of delivered report markdown (~4 chars/token). */
   reportTokenEstimate?: number;
+  /**
+   * The child's taskAttemptId whose report this is (#7003). Absent on legacy artifacts and on
+   * entries an older Xum rewrote: those are unbound, so readers never settle an attempt from them.
+   */
+  taskAttemptId?: string;
 }
 
 export interface SubagentReportArtifact extends SubagentReportArtifactIndexEntry {
@@ -166,6 +171,7 @@ export async function readSubagentReportArtifactStrict(
       structuredOutput?: unknown;
       planFilePath?: unknown;
       reportMarkdown?: unknown;
+      taskAttemptId?: unknown;
     };
 
     const reportMarkdown = typeof obj.reportMarkdown === "string" ? obj.reportMarkdown : null;
@@ -187,6 +193,10 @@ export async function readSubagentReportArtifactStrict(
     const workflowOwnedAncestorWorkspaceIds = isStringArray(obj.workflowOwnedAncestorWorkspaceIds)
       ? obj.workflowOwnedAncestorWorkspaceIds
       : undefined;
+    const taskAttemptId =
+      typeof obj.taskAttemptId === "string" && obj.taskAttemptId.length > 0
+        ? obj.taskAttemptId
+        : undefined;
 
     if (meta) {
       // Trust the index file for metadata (versioned), but allow per-task file to override title.
@@ -202,6 +212,11 @@ export async function readSubagentReportArtifactStrict(
           title: title ?? meta.title,
           structuredOutput: obj.structuredOutput,
           planFilePath: planFilePath ?? meta.planFilePath,
+          // The body and the index are written together; an older Xum's rewrite drops both.
+          taskAttemptId:
+            typeof meta.taskAttemptId === "string" && meta.taskAttemptId.length > 0
+              ? meta.taskAttemptId
+              : taskAttemptId,
           reportMarkdown,
         },
       };
@@ -234,6 +249,7 @@ export async function readSubagentReportArtifactStrict(
         workflowOwnedAncestorWorkspaceIds,
         structuredOutput: obj.structuredOutput,
         planFilePath,
+        taskAttemptId,
         reportMarkdown,
       },
     };
@@ -285,6 +301,8 @@ export async function upsertSubagentReportArtifact(params: {
   structuredOutput?: unknown;
   title?: string;
   nowMs?: number;
+  /** The reporting attempt (see SubagentReportArtifactIndexEntry.taskAttemptId). */
+  taskAttemptId?: string;
 }): Promise<SubagentReportArtifactIndexEntry> {
   let updated: SubagentReportArtifactIndexEntry | null = null;
 
@@ -328,6 +346,7 @@ export async function upsertSubagentReportArtifact(params: {
             workflowOwnedAncestorWorkspaceIds: params.workflowOwnedAncestorWorkspaceIds,
             planFilePath,
             structuredOutput: params.structuredOutput,
+            taskAttemptId: params.taskAttemptId,
             reportMarkdown: params.reportMarkdown,
           },
           null,
@@ -355,6 +374,7 @@ export async function upsertSubagentReportArtifact(params: {
       planFilePath,
       structuredOutput: params.structuredOutput,
       ancestorWorkspaceIds: params.ancestorWorkspaceIds,
+      ...(params.taskAttemptId != null ? { taskAttemptId: params.taskAttemptId } : {}),
     };
     updated.reportTokenEstimate = Math.ceil(
       params.reportMarkdown.length / CHARS_PER_TOKEN_ESTIMATE

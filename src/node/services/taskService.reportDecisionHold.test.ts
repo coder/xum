@@ -983,7 +983,6 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
             return cfg;
           });
         }
-        // A variable (not a literal) so the binding field type-checks before it exists.
         const otherBackendReport = {
           workspaceId: rootId,
           workspaceSessionDir: path.join(config.sessionsDir, rootId),
@@ -1004,6 +1003,8 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           "decision settled"
         );
         await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
+        // The refusal hands the entry back to the session as held input.
+        await until(() => stack.heldTexts().length > 0, "held input");
         await yieldMacrotasks(10);
 
         expect(completions).toHaveLength(1);

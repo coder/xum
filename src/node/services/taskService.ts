@@ -3715,9 +3715,10 @@ export class TaskService implements AgentTaskIntegration {
         !this.attemptAdmissionOpen(taskId, attemptId) ||
         taskOrigin.stopEpoch !== this.getWorkspaceStopEpoch(taskId) ||
         taskOrigin.executionId !== this.getAgentTaskExecutionId(taskId) ||
-        // arbitrateChildGoalAtStreamEnd's first gate: a row that no longer reads running (a
-        // report adopted from disk, an archive) can never take a goal turn, so the accounting
-        // decides nothing and the re-run takes the same branch now as after it (#6994).
+        // arbitrateChildGoalAtStreamEnd's status gate (its owed-pause gate needs no mirror: the
+        // pause marker is written only with a terminal status): a row that no longer reads
+        // running (a report adopted from disk, an archive) can never take a goal turn, so the
+        // accounting decides nothing and the re-run takes the same branch now as after it (#6994).
         findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace.taskStatus !==
           "running"
       ) {
@@ -3737,7 +3738,22 @@ export class TaskService implements AgentTaskIntegration {
       cancelled.promise,
     ])
       .finally(() => this.removeAttemptSettlementListener(taskId, listener))
-      .then(() => this.runStreamEndHandler(event, queueCutSnapshot, taskOrigin, decision))
+      .then(() => {
+        // #7003: this stream deferred while its row read running, and nothing moves a running row
+        // to a completed report under the same attempt but a publication (ours resolved the
+        // decision already) or another backend's. So that attempt reported: the re-run's
+        // `reported` branch must not leave the decision `nonreport`, or a held follow-up would
+        // start a new turn of a reported attempt.
+        const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
+        if (
+          attemptId != null &&
+          workspace?.taskAttemptId === attemptId &&
+          hasCompletedAgentReport(workspace)
+        ) {
+          this.resolveStreamEndDecision(taskId, decision, "indeterminate");
+        }
+        this.runStreamEndHandler(event, queueCutSnapshot, taskOrigin, decision);
+      })
       .catch((error: unknown) => {
         log.error("TaskService: deferred child stream end failed", { taskId, error });
         this.resolveStreamEndDecision(taskId, decision, "indeterminate");
@@ -14782,6 +14798,45 @@ export class TaskService implements AgentTaskIntegration {
         return null;
       }
 
+      // #7003: publication writes `reported` before any artifact, so an artifact beside a row that
+      // has not reported is another attempt's (a resumed child keeps its earlier report on disk),
+      // unless it is bound to the row's own attempt (another backend's report, mid-publication).
+      // Compared BEFORE the cache below, so an ignored artifact is never served from it later.
+      const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+      const rowAttemptId = entry?.workspace.taskAttemptId;
+      const boundToRowAttempt =
+        artifact.taskAttemptId != null && artifact.taskAttemptId === rowAttemptId;
+      const adopt = entry != null && !hasCompletedAgentReport(entry.workspace);
+      if (
+        adopt &&
+        // Equal also when both are unbound: a row that never had an attempt id was never rotated
+        // past this artifact (a pre-identity task's stale `running` still self-heals).
+        artifact.taskAttemptId !== rowAttemptId &&
+        // An unbound (legacy) artifact still self-heals an interrupted row, as before #7003.
+        !(artifact.taskAttemptId == null && entry.workspace.taskStatus === "interrupted")
+      ) {
+        return null;
+      }
+      if (adopt) {
+        let rowMoved = false;
+        await this.editWorkspaceEntry(
+          taskId,
+          (workspace) => {
+            // A CAS on the attempt compared above: a row rotated during the read is not ours.
+            if (workspace.taskAttemptId !== rowAttemptId) {
+              rowMoved = true;
+              return;
+            }
+            workspace.taskStatus = "reported";
+            workspace.reportedAt = getIsoNow();
+            markChildGoalPauseOwed(workspace);
+            delete workspace.taskRecoveryAttempts;
+          },
+          { allowMissing: true }
+        );
+        if (rowMoved) return null;
+      }
+
       // Cache for the current process (best-effort). Disk is the source of truth.
       this.completedReportsByTaskId.set(taskId, {
         reportMarkdown: artifact.reportMarkdown,
@@ -14795,18 +14850,10 @@ export class TaskService implements AgentTaskIntegration {
       });
       this.enforceCompletedReportCacheLimit();
 
-      const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
-      if (entry != null && !hasCompletedAgentReport(entry.workspace)) {
-        await this.editWorkspaceEntry(
-          taskId,
-          (workspace) => {
-            workspace.taskStatus = "reported";
-            workspace.reportedAt = getIsoNow();
-            markChildGoalPauseOwed(workspace);
-            delete workspace.taskRecoveryAttempts;
-          },
-          { allowMissing: true }
-        );
+      // After the committed `reported` (ours above, or the other backend's): a report bound to the
+      // row's attempt settles that attempt's stream-end decision (#7003).
+      if (boundToRowAttempt) this.settleDecisionForReadReport(taskId, artifact.taskAttemptId);
+      if (adopt) {
         // After the write resolves, so listeners read the committed `reported`: a deferred child
         // stream end settles now instead of waiting for its accounting (#6994).
         this.notifyAttemptSettlementListeners(taskId);
@@ -17755,6 +17802,8 @@ export class TaskService implements AgentTaskIntegration {
         // and the row moved under this decision (another writer's resume, a stop, a claim).
         return lost(TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE);
       }
+      // The row names a new attempt now: the earlier attempt's cached report is not its (#7003).
+      this.completedReportsByTaskId.delete(workspaceId);
       // Writers outside this mutex (a reactivation under its own locks, another backend) may have
       // rotated the row again during the commit's own awaits: never publish or own an identity
       // the durable row no longer names — the successor's ownership and closures stay untouched.
@@ -21222,6 +21271,9 @@ export class TaskService implements AgentTaskIntegration {
         : undefined;
     let superseded = false;
     let retired = false;
+    // The attempt the `reported` write below lands on: every artifact of this report is bound to it
+    // (#7003), so a reader can tell it from an earlier attempt's report.
+    let reportedAttemptId: string | undefined;
     // A report ends the attempt, never the goal: the child's goal pause is owed in the same write
     // that publishes the report (never completed), and settled below.
     // Notify clients immediately even if we can't delete the workspace yet.
@@ -21234,6 +21286,7 @@ export class TaskService implements AgentTaskIntegration {
         retired = ws.taskAttemptRetiredBy != null;
         superseded = retired || rowSupersedes(ws, expectedAttemptId);
         if (superseded) return;
+        reportedAttemptId = ws.taskAttemptId;
         ws.taskStatus = "reported";
         ws.reportedAt = getIsoNow();
         markChildGoalPauseOwed(ws);
@@ -21375,6 +21428,7 @@ export class TaskService implements AgentTaskIntegration {
           planFilePath: reportArgs.planFilePath,
           structuredOutput: reportArgs.structuredOutput,
           nowMs: persistedAtMs,
+          taskAttemptId: reportedAttemptId,
         });
       } catch (error: unknown) {
         persistedInEveryAncestor = false;
@@ -21413,6 +21467,25 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     return { parentWorkspaceId, latestChildEntry, isWorkflowOwnedChildReport };
+  }
+
+  /**
+   * A report artifact bound to the attempt the row names, read while the row reads reported for
+   * it (#7003): that attempt reported, possibly on another backend. Its pending stream-end decision
+   * (a deferred child stream end) resolves `indeterminate`, as publication's not-durable branch
+   * does: held follow-ups are refused and handed back, never run as a new turn of a reported
+   * attempt. The notification then re-runs the deferral (its row no longer reads running).
+   */
+  private settleDecisionForReadReport(taskId: string, attemptId: string | undefined): void {
+    if (attemptId == null) return;
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
+    if (workspace?.taskAttemptId !== attemptId || !hasCompletedAgentReport(workspace)) return;
+    this.resolveStreamEndDecision(
+      taskId,
+      this.findStreamEndDecision(taskId, attemptId),
+      "indeterminate"
+    );
+    this.notifyAttemptSettlementListeners(taskId);
   }
 
   private enforceCompletedReportCacheLimit(): void {
