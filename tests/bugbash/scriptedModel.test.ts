@@ -39,7 +39,7 @@ async function ask(origin: string, body: Json): Promise<{ tools: string[]; text:
   const deltas = events.filter((e) => e.type === "content_block_delta").map((e) => e.delta as Json);
   return {
     tools: blocks.filter((b) => b.type === "tool_use").map((b) => String(b.name)),
-    text: deltas.map((d) => String(d.text ?? "")).join(""),
+    text: deltas.map((d) => (typeof d.text === "string" ? d.text : "")).join(""),
   };
 }
 

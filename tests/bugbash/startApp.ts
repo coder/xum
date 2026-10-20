@@ -180,6 +180,30 @@ export function modelDrivenGuard(
 export const SCENARIOS = ["", "bash-ai-proxy", "scripted-tools"] as const;
 export type Scenario = (typeof SCENARIOS)[number];
 
+/**
+ * Why BUGBASH_SCENARIO=`scenario` must not start here, or null. Both scenarios turn a kill switch
+ * off (bash-ai-proxy needs project automation, scripted-tools agent tools), so neither runs in a
+ * model-driven job. scripted-tools also runs only inside the sandbox, and the env marker alone
+ * could be dropped: a mounted proxy socket refuses it too. `root` is for tests.
+ */
+export function scenarioRefusal(
+  scenario: string,
+  mode: "mock" | "real",
+  env: NodeJS.ProcessEnv = process.env,
+  root = "/"
+): string | null {
+  if (!(SCENARIOS as readonly string[]).includes(scenario))
+    return `BUGBASH_SCENARIO must be empty, bash-ai-proxy or scripted-tools, got "${scenario}"`;
+  if (scenario === "") return null;
+  if (mode !== "mock")
+    return `BUGBASH_SCENARIO=${scenario} replaces the mock: run it with BUGBASH_AI=mock`;
+  if (env.BUGBASH_MODEL_DRIVEN === "1")
+    return `BUGBASH_SCENARIO=${scenario} turns a kill switch off: not in a model-driven job`;
+  if (scenario === "scripted-tools" && (!inSandbox(env, root) || proxySocketMounted(root)))
+    return "BUGBASH_SCENARIO=scripted-tools runs only in an exact-step job of the bug-bash sandbox (make test-bugbash-repros-sandbox)";
+  return null;
+}
+
 /** The mode and kill-switch env of the app server. */
 export function appSwitches(
   mode: "mock" | "real",
@@ -291,6 +315,8 @@ async function seed(
   child: ChildProcess,
   ai: AiMode,
   fakeProviderOrigin: string | undefined,
+  /** False for scripted-tools: with agent tools on, the trusted PreToolUse hook would register. */
+  pluginHooks: boolean,
   pluginSources: Map<string, string>,
   gitEnv: NodeJS.ProcessEnv,
   electron: boolean
@@ -401,12 +427,13 @@ async function seed(
   );
   fs.writeFileSync(path.join(artifactsDir, "notes.txt"), "Plain text artifact.\n");
   // Codex-format plugin hooks: installable sources and a few installed plugins to review.
-  await seedPluginHooks(
-    (route, body) => api(base, route, body),
-    pluginSources,
-    gitEnv,
-    artifactsDir
-  );
+  if (pluginHooks)
+    await seedPluginHooks(
+      (route, body) => api(base, route, body),
+      pluginSources,
+      gitEnv,
+      artifactsDir
+    );
   // An HTML artifact with in-page "#" links (repros/artifactsInPageLinks.e2e.ts). Dated an hour
   // back so it lists last and the newest artifact stays the one the tab opens by default.
   const guide = path.join(artifactsDir, "guide.html");
@@ -683,25 +710,11 @@ async function main(): Promise<void> {
   // network, no provider proxy and no explorer model, so no model output reaches the app or the
   // test, and the script's two tool calls are the only ones that run.
   const scenario = (process.env.BUGBASH_SCENARIO ?? "") as Scenario;
-  if (!SCENARIOS.includes(scenario)) {
-    fail(`BUGBASH_SCENARIO must be empty, bash-ai-proxy or scripted-tools, got "${scenario}"`);
-  }
-  if (scenario !== "" && ai.mode !== "mock") {
-    fail(`BUGBASH_SCENARIO=${scenario} replaces the mock: run it with BUGBASH_AI=mock`);
-  }
+  const refused = scenarioRefusal(scenario, ai.mode);
+  if (refused != null) fail(refused);
   // A model-driven job (the sandbox launcher sets this): a model reads every reply and page, so
-  // the app gets all three switches in both AI modes. bash-ai-proxy needs project automation, and
-  // scripted-tools needs agent tools.
+  // the app gets all three switches in both AI modes.
   const modelDriven = process.env.BUGBASH_MODEL_DRIVEN === "1";
-  if (modelDriven && scenario !== "") {
-    fail(`BUGBASH_SCENARIO=${scenario} turns a kill switch off: not in a model-driven job`);
-  }
-  // The env marker alone could be dropped: also refuse when the filesystem shows a proxy socket.
-  if (scenario === "scripted-tools" && (!inSandbox() || proxySocketMounted())) {
-    fail(
-      "BUGBASH_SCENARIO=scripted-tools runs only in an exact-step job of the bug-bash sandbox (make test-bugbash-repros-sandbox)"
-    );
-  }
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-"));
   const xumRoot = path.join(tempRoot, "xum");
   const fakeProvider =
@@ -753,6 +766,7 @@ async function main(): Promise<void> {
         seedServer,
         ai,
         fakeProvider?.origin,
+        scenario !== "scripted-tools",
         pluginSources,
         env,
         electron

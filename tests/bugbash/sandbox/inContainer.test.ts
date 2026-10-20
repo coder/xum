@@ -13,7 +13,7 @@ import {
 import { e2eCommandRefusal } from "../hostPause";
 import { explorerModel } from "./explorerModel";
 import { AiModeError, resolveAiMode } from "../aiMode";
-import { modelDrivenGuard } from "../startApp";
+import { modelDrivenGuard, scenarioRefusal } from "../startApp";
 
 const cleanups: (() => unknown)[] = [];
 afterEach(async () => {
@@ -231,4 +231,26 @@ test("D2: no capabilities needs all five sets zero, not only CapEff", () => {
     "CapBnd missing",
     "CapAmb missing",
   ]);
+});
+
+test("scripted-tools (agent tools on) starts only in a sandbox job without a model", async () => {
+  const exactStep = { BUGBASH_CONTAINER: "1" };
+  // The exact-step sandbox job: the container shape, no proxy socket, no model-driven marker.
+  const job = await fakeRoot({ socket: false });
+  expect(scenarioRefusal("scripted-tools", "mock", exactStep, job)).toBeNull();
+  // Refused with a real app model, in a model-driven job, or with the proxy socket mounted even
+  // when the marker was dropped.
+  expect(scenarioRefusal("scripted-tools", "real", exactStep, job)).toContain("BUGBASH_AI=mock");
+  expect(scenarioRefusal("scripted-tools", "mock", SANDBOX_ENV, job)).toContain("model-driven");
+  const withProxy = await fakeRoot();
+  expect(scenarioRefusal("scripted-tools", "mock", exactStep, withProxy)).toContain("sandbox");
+  // Refused on a host: without the container marker, or without the container shape.
+  expect(scenarioRefusal("scripted-tools", "mock", {}, job)).toContain("sandbox");
+  const host = await fakeRoot({ init: "/sbin/init\0", devices: ["lo", "eth0"], socket: false });
+  expect(scenarioRefusal("scripted-tools", "mock", exactStep, host)).toContain("sandbox");
+  // The other scenarios keep their rules, and an unknown name never starts.
+  expect(scenarioRefusal("bash-ai-proxy", "mock", {}, host)).toBeNull();
+  expect(scenarioRefusal("bash-ai-proxy", "mock", SANDBOX_ENV, job)).toContain("model-driven");
+  expect(scenarioRefusal("", "real", SANDBOX_ENV, withProxy)).toBeNull();
+  expect(scenarioRefusal("tools", "mock", exactStep, job)).toContain("must be empty");
 });
