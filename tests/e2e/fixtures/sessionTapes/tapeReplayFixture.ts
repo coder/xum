@@ -9,8 +9,8 @@
  * proves the renderer egress block cancels both. The tool call's command is a marker that is not
  * a shell builtin, so a process trace would show it if replay ever executed a tool.
  */
-import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import { OnChatEventSchema } from "@/common/orpc/schemas";
+import type { OnChatEvent } from "@/common/orpc/types";
 import { buildSyntheticSessionTape } from "@/node/services/sessionTapes/sessionTapes.testFixtures";
 
 /** Stable-format (10 hex) id the scenario registers its workspace under. */
@@ -34,7 +34,7 @@ export const TAPE_REPLAY_TEXTS = {
 /** Recorded offset of event `index`: 40 ms apart, like a brisk live stream. */
 const EVENT_SPACING_MS = 40;
 
-function buildTapeReplayFixtureEvents(): WorkspaceChatMessage[] {
+function buildTapeReplayFixtureEvents(): OnChatEvent[] {
   const workspaceId = TAPE_REPLAY_FIXTURE_WORKSPACE_ID;
   const createdAt = new Date("2026-10-01T00:00:00.000Z");
   const model = "anthropic:claude-opus-5-5";
@@ -140,7 +140,7 @@ function buildTapeReplayFixtureEvents(): WorkspaceChatMessage[] {
       ],
     },
   ];
-  return raw.map((event) => WorkspaceChatMessageSchema.parse(event));
+  return raw.map((event) => OnChatEventSchema.parse(event));
 }
 
 /** The committed fixture's exact text. */
