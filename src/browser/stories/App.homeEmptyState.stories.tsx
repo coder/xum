@@ -31,7 +31,7 @@ import { textContrast } from "@/browser/stories/helpers/contrast";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { collapseLeftSidebar } from "./helpers/uiState";
-import { windowDragsAt, withDesktopApi } from "./helpers/windowDrag";
+import { windowDragsAt, withDesktopApi, withDesktopTitlebar } from "./helpers/windowDrag";
 import { createMockORPCClient } from "./mocks/orpc";
 
 export default {
@@ -194,7 +194,7 @@ export const RosettaBannerClearsToggle: AppStory = {
 
 export const CollapsedTitleBarDrags: AppStory = {
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
-  beforeEach: withDesktopApi({ isRosetta: false, getIsRosetta: () => Promise.resolve(false) }),
+  beforeEach: withDesktopTitlebar,
   render: () => <AppWithMocks setup={setupCollapsed} />,
   play: async ({ canvasElement }) => {
     const bar = await findCollapsedBar(canvasElement);

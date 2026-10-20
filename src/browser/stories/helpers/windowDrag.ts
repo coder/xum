@@ -14,6 +14,10 @@ const REPLACED_ELEMENTS = new Set([
 
 const APP_REGION_SELECTOR = ".titlebar-drag, .titlebar-no-drag";
 
+export function rectContains(rect: DOMRect, x: number, y: number): boolean {
+  return x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
+}
+
 /**
  * Whether Electron would drag the window from this viewport point. `document.elementFromPoint`
  * cannot tell: z-index and paint order do not count.
@@ -37,8 +41,7 @@ export function windowDragsAt(x: number, y: number): boolean {
       const mode = element.closest(APP_REGION_SELECTOR);
       const isBox = style.display !== "inline" || REPLACED_ELEMENTS.has(element.localName);
       if (mode && isBox && style.visibility === "visible") {
-        const rect = element.getBoundingClientRect();
-        if (x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom) {
+        if (rectContains(element.getBoundingClientRect(), x, y)) {
           drags = mode.classList.contains("titlebar-drag");
         }
       }
@@ -60,3 +63,9 @@ export const withDesktopApi = (api: Partial<NonNullable<typeof window.api>>) => 
     window.api = previousApi;
   };
 };
+
+// isDesktopMode() keys on getIsRosetta; the default darwin platform gives the macOS title bar.
+export const withDesktopTitlebar = withDesktopApi({
+  isRosetta: false,
+  getIsRosetta: () => Promise.resolve(false),
+});

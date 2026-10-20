@@ -757,13 +757,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       )}
     >
       <div
-        className={cn(
-          // flex-1 (zero basis) lets a long title truncate instead of pushing the actions
-          // onto a second row on touch phones, where the header wraps. That makes the group
-          // span the gap up to the actions, so on desktop it stays draggable and only its
-          // controls are no-drag: the window moves from the whole empty stretch.
-          "text-foreground flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden"
-        )}
+        // flex-1 (zero basis) lets a long title truncate instead of pushing the actions
+        // onto a second row on touch phones, where the header wraps. That makes the group
+        // span the gap up to the actions, so on desktop it stays draggable and only its
+        // controls are no-drag: the window moves from the whole empty stretch.
+        className="text-foreground flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden"
       >
         {leftSidebarCollapsed && <LeftSidebarToggleBarSpacer showNewChat />}
         <WorkspaceHeaderTitle

@@ -10,7 +10,11 @@ import {
   type WorkspaceMetadataContextValue,
 } from "@/browser/contexts/WorkspaceContext";
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
-import { windowDragsAt, withDesktopApi } from "@/browser/stories/helpers/windowDrag";
+import {
+  rectContains,
+  windowDragsAt,
+  withDesktopTitlebar,
+} from "@/browser/stories/helpers/windowDrag";
 import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import type { TabType } from "@/browser/types/rightSidebar";
 import {
@@ -373,9 +377,6 @@ export const Cramped: Story = {
 function center(rect: DOMRect) {
   return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
 }
-function contains(rect: DOMRect, x: number, y: number) {
-  return x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
-}
 
 /**
  * Along the strip's center line, from the header stand-in to the strip's right end, every point
@@ -394,15 +395,15 @@ async function checkStripDragRegions(canvasElement: HTMLElement) {
   const dead: number[] = [];
   for (let x = Math.ceil(standIn.left); x < strip.right; x += 2) {
     // The fixture's border between the stand-in and the strip is not part of the title bar.
-    if (!contains(standIn, x, y) && !contains(strip, x, y)) continue;
-    if ([row, ...buttons].some((rect) => contains(rect, x, y))) continue;
+    if (!rectContains(standIn, x, y) && !rectContains(strip, x, y)) continue;
+    if ([row, ...buttons].some((rect) => rectContains(rect, x, y))) continue;
     if (!windowDragsAt(x, y)) dead.push(x);
   }
-  await expect(`points that do not drag: ${dead.join(",")}`).toBe("points that do not drag: ");
+  await expect(dead, "points that do not drag").toEqual([]);
   const visibleTabs = canvas
     .getAllByRole("tab")
     .map((tab) => center(tab.getBoundingClientRect()))
-    .filter((point) => contains(row, point.x, point.y));
+    .filter((point) => rectContains(row, point.x, point.y));
   await expect(visibleTabs.length).toBeGreaterThan(0);
   for (const point of [...visibleTabs, ...buttons.map(center)]) {
     await expect(windowDragsAt(point.x, point.y)).toBe(false);
@@ -413,7 +414,7 @@ export const DesktopDragRegions: Story = {
   // In Electron the strip sits after the workspace header in DOM order, and Electron lets the
   // later region rect win, so a tab scrolled out of the row must not block dragging the header.
   args: { width: 300, collapsible: true },
-  beforeEach: withDesktopApi({ isRosetta: false, getIsRosetta: () => Promise.resolve(false) }),
+  beforeEach: withDesktopTitlebar,
   render: (args) => (
     <div className="flex">
       <div data-testid="header-stand-in" className="titlebar-drag flex-1" />

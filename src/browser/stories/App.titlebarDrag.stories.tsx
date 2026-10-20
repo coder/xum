@@ -16,7 +16,7 @@ import { expect, within } from "storybook/test";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar, expandLeftSidebar } from "./helpers/uiState";
-import { windowDragsAt, withDesktopApi } from "./helpers/windowDrag";
+import { windowDragsAt, withDesktopTitlebar } from "./helpers/windowDrag";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
 
@@ -69,11 +69,10 @@ async function expectWorkspaceHeaderGapDrags(canvasElement: HTMLElement) {
   await expectDrags(bell, "Notifications button", false);
 }
 
-// isDesktopMode() keys on getIsRosetta; the default darwin platform gives the macOS title bar.
 const desktopStory = (story: Pick<AppStory, "render" | "play">): AppStory => ({
   ...story,
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
-  beforeEach: withDesktopApi({ isRosetta: false, getIsRosetta: () => Promise.resolve(false) }),
+  beforeEach: withDesktopTitlebar,
 });
 
 export const WorkspaceExpanded = desktopStory({
