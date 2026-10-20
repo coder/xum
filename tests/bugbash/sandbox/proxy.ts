@@ -47,6 +47,15 @@ const LOGGED_REFUSALS = 20;
 const CLOSE_MS = 5_000;
 const RESPONSE_HEADERS = /^(content-type|request-id|retry-after|anthropic-ratelimit-[a-z0-9-]+)$/;
 
+/**
+ * A refusal's category for `stats().refusedBy`: the reason up to its first quoted
+ * (container-chosen) name, so the keys come from the fixed reason texts of this file and
+ * proxyPolicy.ts and stay few.
+ */
+export function refusalCategory(entry: CallRecord): string {
+  return (entry.reason ?? "").split('"')[0].trim();
+}
+
 /** One line per call for the launcher log. */
 export interface CallRecord {
   /** released: the upstream could not be reached, so the call never left the host ($0). */
@@ -131,15 +140,12 @@ export async function startProxy(options: ProxyOptions) {
   const deadlineMs = options.deadlineMs ?? DEADLINE_MS;
   const calls = new Set<{ abort: AbortController; done: Promise<void> }>();
   const counts = { refused: 0, settled: 0, kept: 0, released: 0, boundExceeded: 0 };
-  /**
-   * Refusals per category: the reason up to its first quoted (container-chosen) name, so the
-   * keys come from the fixed reason texts of this file and proxyPolicy.ts and stay few.
-   */
+  /** Refusals per category (refusalCategory). */
   const refusedBy: Record<string, number> = {};
   const record = (entry: CallRecord) => {
     counts[entry.outcome] += 1;
     if (entry.outcome === "refused") {
-      const category = (entry.reason ?? "").split('"')[0].trim();
+      const category = refusalCategory(entry);
       refusedBy[category] = (refusedBy[category] ?? 0) + 1;
       if (counts.refused > LOGGED_REFUSALS) return;
     }

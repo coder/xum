@@ -42,7 +42,7 @@ import * as path from "node:path";
 import type { Readable } from "node:stream";
 import { receiveExport } from "./exportStream";
 import { PROXY_DIR } from "./inContainer";
-import { startProxy, UNREACHABLE } from "./proxy";
+import { refusalCategory, startProxy, UNREACHABLE, type CallRecord } from "./proxy";
 import { Ledger, priced } from "./proxyPolicy";
 // prettier-ignore
 import { checkMountSource, containerEnv, exactStepRefusal, exploreRefusal, jobEnv, outputDir, plainFolders, stage } from "./inputs";
@@ -189,10 +189,12 @@ export async function probeApp(
   model: string,
   ledger: Ledger,
   stop: AbortSignal,
-  deadlineMs = PROBE_MS
+  deadlineMs = PROBE_MS,
+  /** Each call record as the proxy logs it: also when close() rejects and nothing returns. */
+  onRecord?: (entry: CallRecord) => void
 ) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-probe-"));
-  const records: object[] = [];
+  const records: CallRecord[] = [];
   try {
     fs.chmodSync(dir, 0o700);
     const proxy = await startProxy({
@@ -204,7 +206,10 @@ export async function probeApp(
       // aiMode.ts's probe timeout, not the 10-minute call deadline: a silent upstream counts as
       // unavailable (502) after this.
       deadlineMs,
-      log: (entry) => records.push(entry),
+      log: (entry) => {
+        records.push(entry);
+        onRecord?.(entry);
+      },
     });
     let status: number;
     // A stop (SIGINT, SIGTERM) closes the proxy, which aborts the probe call at once.
@@ -541,6 +546,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   let probeFault: string | undefined;
   /** The probe's call outcomes: it charges the job's ledger through a proxy of its own. */
   const probeCounts = { settled: 0, kept: 0, refused: 0, released: 0 };
+  const probeRefusedBy: Record<string, number> = {};
   // The first proxy fault stops this job at once (its proxy closes with the lifeline), so no
   // more paid calls go out on a wrong cost model or without a record.
   let faulted = false;
@@ -634,17 +640,28 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     if (drivenRun && driven) {
       ledger = o.ledger ?? new Ledger(driven.budgetUsd);
       // A bound miss in the probe is a proxy fault like any other: exit 5, and run-wide halt.
-      const probe = await probeApp(driven, driven.model, ledger, o.stop).catch((error: Error) => {
+      // Each probe record as it comes: a probe whose proxy close() rejects returns none, but its
+      // call is in the ledger, so it belongs in the proxy record and the spend file too.
+      const onProbeRecord = (entry: CallRecord) => {
+        record(entry);
+        probeCounts[entry.outcome] += 1;
+        if (entry.outcome === "refused") {
+          const category = refusalCategory(entry);
+          probeRefusedBy[category] = (probeRefusedBy[category] ?? 0) + 1;
+        }
+      };
+      const probe = await probeApp(
+        driven,
+        driven.model,
+        ledger,
+        o.stop,
+        undefined,
+        onProbeRecord
+      ).catch((error: Error) => {
         probeFault = error.message;
         fault(probeFault);
         throw error;
       });
-      for (const entry of probe.records) {
-        record(entry);
-        const outcome = "outcome" in entry ? entry.outcome : undefined;
-        if (typeof outcome === "string" && outcome in probeCounts)
-          probeCounts[outcome as keyof typeof probeCounts] += 1;
-      }
       if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
       if (probe.status !== 200)
         throw new Refusal(
@@ -763,6 +780,9 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
   // The counts add the probe's calls, as spentUsd does (both are in the proxy record).
   if (ledger && !o.ledger) {
     const { spentNanoUsd, capNanoUsd } = ledger.totals();
+    const allRefusedBy = { ...refusedBy };
+    for (const [category, n] of Object.entries(probeRefusedBy))
+      allRefusedBy[category] = (allRefusedBy[category] ?? 0) + n;
     const spend = {
       spentUsd: spentNanoUsd / 1e9,
       capUsd: capNanoUsd / 1e9,
@@ -770,7 +790,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
       kept: kept + probeCounts.kept,
       refused: refused + probeCounts.refused,
       released: released + probeCounts.released,
-      refusedBy,
+      refusedBy: allRefusedBy,
     };
     try {
       fs.writeFileSync(spendFile, `${JSON.stringify(spend, null, 2)}\n`, {

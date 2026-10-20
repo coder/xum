@@ -1294,13 +1294,42 @@ test("U2: a bound miss in the MCP Apps probe is a proxy fault (exit 5), before t
     };
   });
   try {
-    const { code, logged } = await mcpLaunch({ RUN: "proxycall" });
+    const { code, logged, records } = await mcpLaunch({ RUN: "proxycall" });
     expect(code).toBe(5);
     expect(logged.join("\n")).toContain("cost more than their reserved bound: the job stops");
     expect(calls()).not.toMatch(/^run /m);
+    // The probe's call is still in the proxy record and the spend file, though its proxy's
+    // close() rejected (Codex review of #7051).
+    const outcomes = fs
+      .readFileSync(records, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => (JSON.parse(line) as { outcome: string }).outcome);
+    expect(outcomes).toEqual(["settled"]);
+    const spendFile = records.replace(/\.proxy\.jsonl$/, ".spend.json");
+    const spend = JSON.parse(fs.readFileSync(spendFile, "utf8")) as Record<string, unknown>;
+    expect(spend).toMatchObject({ settled: 1, kept: 0, refused: 0, released: 0 });
   } finally {
     start.mockRestore();
   }
+  expectNothingLeft();
+});
+
+test("#7023: a probe that the budget refuses names its refusal in the spend file", async () => {
+  // Positive, but too small to reserve even the probe call: the probe's proxy answers 402.
+  const { code, records } = await mcpLaunch({ RUN: "proxycall" }, { BUGBASH_BUDGET_USD: "0.0001" });
+  expect(code).toBeInstanceOf(Refusal);
+  expect(calls()).not.toMatch(/^run /m);
+  const spendFile = records.replace(/\.proxy\.jsonl$/, ".spend.json");
+  const spend = JSON.parse(fs.readFileSync(spendFile, "utf8")) as Record<string, unknown>;
+  expect(spend).toMatchObject({
+    spentUsd: 0,
+    settled: 0,
+    kept: 0,
+    refused: 1,
+    released: 0,
+    refusedBy: { "budget: call does not fit the remaining budget": 1 },
+  });
   expectNothingLeft();
 });
 
