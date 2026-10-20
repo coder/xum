@@ -173,7 +173,7 @@ export function summarize(root: string): string {
  * or a call the proxy could not get to it or through it. Not the proxy's own 502s (a deadline,
  * a client that went away, a redirect): those are no provider 5xx. Its refusals are all 4xx.
  */
-function providerFault(line: string): boolean {
+function providerFault(line: string, started: boolean): boolean {
   let record: Json | undefined;
   try {
     record = obj(JSON.parse(line));
@@ -183,7 +183,11 @@ function providerFault(line: string): boolean {
   const status = num(record?.status);
   if (status == null || status < 500) return false;
   const reason = record?.reason;
-  return reason == null || reason === UNREACHABLE || reason === "upstream: failed";
+  if (reason == null || reason === UNREACHABLE || reason === "upstream: failed") return true;
+  // A job with no folder never started: the launcher refused it after its model probe. A
+  // deadline abort there means the provider did not answer the probe in time (a silent
+  // upstream, seen in local runs), not a test that timed out mid-call (#7070 item 1).
+  return !started && typeof reason === "string" && reason.startsWith("aborted:");
 }
 
 /**
@@ -193,23 +197,25 @@ function providerFault(line: string): boolean {
  * output and do not count.
  */
 export function upstreamFault(root: string): { retry: boolean; reason: string } {
-  const failed = JOB_KINDS.flatMap((kind) => jobFolders(root, kind, true)).filter((folder) => {
+  const jobs = JOB_KINDS.flatMap((kind) => jobFolders(root, kind, true)).map((folder) => {
     const report = readJson(path.join(folder, "report.json"));
     const run = "value" in report ? obj(obj(report.value)?.run) : undefined;
-    return run?.status !== "passed";
+    // The launcher creates the job folder only once the job starts, after its model probe.
+    return { folder, started: fs.existsSync(folder), passed: run?.status === "passed" };
   });
+  const failed = jobs.filter((job) => !job.passed);
   if (failed.length === 0) return { retry: false, reason: "no job failed" };
-  for (const folder of failed) {
+  for (const { folder, started } of failed) {
     let text: string;
     try {
       text = fs.readFileSync(`${folder}${PROXY_LOG}`, "utf8");
     } catch {
       return { retry: false, reason: `\`${path.basename(folder)}\` failed with no proxy record` };
     }
-    if (!text.split("\n").some(providerFault))
+    if (!text.split("\n").some((line) => providerFault(line, started)))
       return { retry: false, reason: `\`${path.basename(folder)}\` failed with no provider 5xx` };
   }
-  const names = failed.map((folder) => `\`${path.basename(folder)}\``).join(", ");
+  const names = failed.map(({ folder }) => `\`${path.basename(folder)}\``).join(", ");
   return { retry: true, reason: `every failed job got a provider 5xx: ${names}` };
 }
 

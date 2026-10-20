@@ -258,6 +258,15 @@ test("a 4xx, a refusal or a proxy-made 502 is no provider fault: no retry", () =
   expect(upstreamFault(root).retry).toBe(false);
 });
 
+test("a probe that the provider did not answer in time gets the retry, a started job's abort not", () => {
+  // The launcher refused the job after the probe's deadline: only the record is there.
+  job(repros, null, [{ status: 502, reason: "aborted: deadline, client or close" }]);
+  expect(upstreamFault(root).retry).toBe(true);
+  // The same abort in a job that started is a call cut by the job's deadline: maybe a test.
+  write(`${repros}/log.txt`, "");
+  expect(upstreamFault(root).retry).toBe(false);
+});
+
 test("a test failure with no 5xx, or a failed job with no proxy record, gets no retry", () => {
   job(web, "failed", [{ outcome: "settled", status: 200 }]);
   expect(upstreamFault(root).retry).toBe(false);
