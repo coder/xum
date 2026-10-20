@@ -4,8 +4,9 @@
  * jsonc.parse is fault tolerant: without an error list, a syntax error inside one entry
  * silently dropped that entry's fields, so the server stayed listed with an empty command
  * and could never start, and nothing was logged. Here every syntax error and every entry
- * that is not a server becomes a problem with its line and column. The broken entry is
- * skipped and the valid entries stay usable.
+ * that is not a server becomes a problem with its line and column. The valid entries stay
+ * usable, and a broken entry stays fail closed: a disabled placeholder, as before for an entry
+ * that was not an object.
  */
 import * as jsonc from "jsonc-parser";
 import type { MCPConfigProblem } from "@/common/types/mcp";
@@ -20,11 +21,15 @@ interface PlacedProblem {
   message: string;
 }
 
+/** A usable entry's raw value, or a skipped entry, which a caller must keep fail closed. */
+export type ParsedMcpEntry = { name: string; value: unknown } | { name: string; skipped: true };
+
 export interface ParsedMcpServers {
-  /** Name and raw value of each usable entry, in file order (a later duplicate wins). */
-  entries: Array<[string, unknown]>;
-  /** Names of the entries Xum skipped: a higher layer must still shadow these names. */
-  skipped: string[];
+  /**
+   * Every entry in file order, so a later duplicate still wins as with jsonc.parse. A skipped
+   * entry keeps its name: it must still shadow a lower layer and an earlier duplicate.
+   */
+  entries: ParsedMcpEntry[];
   problems: MCPConfigProblem[];
 }
 
@@ -112,15 +117,37 @@ function entriesBrokenBy(
   problems: PlacedProblem[]
 ): Set<jsonc.Node> {
   const broken = new Set<jsonc.Node>();
-  for (const error of errors) {
-    const property = properties.find(
-      (node) => error.offset >= node.offset && error.offset < node.offset + node.length
-    );
-    if (property !== undefined) broken.add(property);
-    const server = property === undefined ? null : propertyName(property);
+  // One sweep: errors and properties are both in offset order.
+  let index = 0;
+  for (const error of [...errors].sort((a, b) => a.offset - b.offset)) {
+    while (index < properties.length && endOf(properties[index]) <= error.offset) index += 1;
+    const candidate = properties.at(index);
+    const property = candidate !== undefined && error.offset >= candidate.offset ? candidate : null;
+    if (property !== null) broken.add(property);
+    const server = property === null ? null : propertyName(property);
     problems.push({ offset: error.offset, server, message: describeParseError(error.error) });
   }
   return broken;
+}
+
+const endOf = (node: jsonc.Node) => node.offset + node.length;
+
+/** The entry of one `servers` property, or null for a property without a name. */
+function parseEntry(
+  property: jsonc.Node,
+  broken: Set<jsonc.Node>,
+  problems: PlacedProblem[]
+): ParsedMcpEntry | null {
+  const name = propertyName(property);
+  const valueNode = property.children?.[1];
+  if (name === null) return null;
+  // A syntax error (reported above) or a key without a value: nothing usable.
+  if (broken.has(property) || valueNode === undefined) return { name, skipped: true };
+  const value: unknown = jsonc.getNodeValue(valueNode);
+  const problem = entryProblem(value);
+  if (problem === null) return { name, value };
+  problems.push({ offset: property.offset, server: name, message: problem });
+  return { name, skipped: true };
 }
 
 export function parseMcpConfigServers(raw: string): ParsedMcpServers {
@@ -131,29 +158,8 @@ export function parseMcpConfigServers(raw: string): ParsedMcpServers {
   const root = jsonc.parseTree(text, errors, PARSE_OPTIONS);
   const problems: PlacedProblem[] = [];
   const properties = serverProperties(root, problems);
-  // A syntax error inside an entry breaks that entry only: skip it and name it.
+  // A syntax error inside an entry breaks that entry only, and the problem names it.
   const broken = entriesBrokenBy(errors, properties, problems);
-
-  const entries: Array<[string, unknown]> = [];
-  const skipped: string[] = [];
-  for (const property of properties) {
-    const name = propertyName(property);
-    const valueNode = property.children?.[1];
-    if (name === null) continue;
-    // A syntax error (reported above) or a key without a value: nothing usable.
-    if (broken.has(property) || valueNode === undefined) {
-      skipped.push(name);
-      continue;
-    }
-    const value: unknown = jsonc.getNodeValue(valueNode);
-    const problem = entryProblem(value);
-    if (problem === null) {
-      entries.push([name, value]);
-      continue;
-    }
-    problems.push({ offset: property.offset, server: name, message: problem });
-    skipped.push(name);
-  }
-
-  return { entries, skipped, problems: withPositions(text, problems) };
+  const entries = properties.flatMap((property) => parseEntry(property, broken, problems) ?? []);
+  return { entries, problems: withPositions(text, problems) };
 }

@@ -966,10 +966,24 @@ function useInsufficientScopeTicks(
  * so without this a typo made a server vanish with no message. Saves are refused until the
  * file is fixed, because a save rewrites the whole file.
  */
-function MCPConfigProblemsNotice(props: {
-  configProblems: { path: string; problems: MCPConfigProblem[] } | null;
-}) {
-  if (props.configProblems === null || props.configProblems.problems.length === 0) return null;
+type ConfigProblemsState = { path: string; problems: MCPConfigProblem[] } | null;
+
+const hasConfigProblems = (state: ConfigProblemsState) =>
+  state !== null && state.problems.length > 0;
+
+/**
+ * After a save while the notice shows: the save proves the file is fixed, so reload it. Servers
+ * it skipped then appear and the notice goes away. Otherwise skip the reload's loading state.
+ */
+async function refreshIfProblemsShown(
+  state: ConfigProblemsState,
+  refresh: () => Promise<void>
+): Promise<void> {
+  if (hasConfigProblems(state)) await refresh();
+}
+
+function MCPConfigProblemsNotice(props: { configProblems: ConfigProblemsState }) {
+  if (props.configProblems === null || !hasConfigProblems(props.configProblems)) return null;
   const { path, problems } = props.configProblems;
   return (
     <div
@@ -1143,9 +1157,9 @@ export const MCPSettingsSection: React.FC = () => {
           setError(result.error ?? "Failed to update server");
         } else {
           publishGlobalMcpEnablementChanged();
-          // A save succeeds only once mcp.jsonc is fixed: drop a stale error and notice.
-          setError(null);
-          setConfigProblems(await api.mcp.configProblems().catch(() => null));
+          // A save succeeds only once mcp.jsonc is fixed: reload it, so servers it skipped
+          // appear and the notice and a stale error go away.
+          await refreshIfProblemsShown(configProblems, refresh);
         }
       } catch (err) {
         // Revert on error
@@ -1156,7 +1170,7 @@ export const MCPSettingsSection: React.FC = () => {
         setError(err instanceof Error ? err.message : "Failed to update server");
       }
     },
-    [api]
+    [api, configProblems, refresh]
   );
 
   const handleTest = useCallback(

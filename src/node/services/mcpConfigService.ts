@@ -112,7 +112,7 @@ export function acquireGlobalMcpConfigLock(
 }
 
 /** A config file as read, with what Xum skipped in it (#2060). */
-type ReadMCPConfig = MCPConfig & { problems: MCPConfigProblem[]; skipped: string[] };
+type ReadMCPConfig = MCPConfig & { problems: MCPConfigProblem[] };
 
 /**
  * A save rewrites the whole file from the parsed servers, so a skipped entry would be lost: the
@@ -126,28 +126,14 @@ function refuseSaveWithProblems(filePath: string, problems: MCPConfigProblem[]):
 }
 
 /** A fresh value: callers edit the servers they get. */
-const noConfig = (): ReadMCPConfig => ({
-  servers: {},
-  enabledPluginServers: [],
-  problems: [],
-  skipped: [],
-});
+const noConfig = (): ReadMCPConfig => ({ servers: {}, enabledPluginServers: [], problems: [] });
 
 /**
- * A skipped repo-override entry still shadows the global server of the same name, fail closed:
- * a typo in the higher layer must not start a different command (#2060).
+ * A skipped entry stays as a disabled server, so it still shadows a lower layer (a global server,
+ * Claude Design) and an earlier duplicate, as when jsonc.parse normalized it: a typo must never
+ * start another command (#2060). The problem list says why it is there.
  */
-function withSkippedTombstones(
-  servers: Record<string, MCPServerInfo>,
-  skipped: string[]
-): Record<string, MCPServerInfo> {
-  const result = { ...servers };
-  for (const name of skipped) {
-    if (!Object.hasOwn(result, name))
-      result[name] = { transport: "stdio", command: "", disabled: true };
-  }
-  return result;
-}
+const skippedServer = (): MCPServerInfo => ({ transport: "stdio", command: "", disabled: true });
 
 export class MCPConfigService {
   private readonly config: Config;
@@ -461,18 +447,18 @@ export class MCPConfigService {
       }
 
       // A field-only plugin toggle need not create a servers property. A broken entry is
-      // skipped and reported, never kept as a server without a command (#2060).
+      // reported and kept disabled (skippedServer), never as a usable server without a command (#2060).
       const parsed = parseMcpConfigServers(raw);
       const servers: Record<string, MCPServerInfo> = {};
-      for (const [name, entry] of parsed.entries) {
-        servers[name] = this.normalizeEntry(entry);
+      for (const entry of parsed.entries) {
+        servers[entry.name] =
+          "skipped" in entry ? skippedServer() : this.normalizeEntry(entry.value);
       }
       this.warnConfigProblems(filePath, parsed.problems);
       return {
         servers,
         enabledPluginServers,
         problems: parsed.problems,
-        skipped: parsed.skipped,
       };
     } catch (error) {
       // Defensive: never crash on startup due to corrupt config.
@@ -803,10 +789,7 @@ export class MCPConfigService {
     return {
       plugin: pluginServers,
       global: globalServers,
-      project: omitReservedPluginKeys(
-        withSkippedTombstones(repoCfg.servers, repoCfg.skipped),
-        "project"
-      ),
+      project: omitReservedPluginKeys(repoCfg.servers, "project"),
     };
   }
 

@@ -787,15 +787,23 @@ const CONFIG_PROBLEMS: MCPConfigProblem[] = [
     message: "has no command or url",
   },
 ];
+// As the backend lists them: each skipped entry stays as a disabled placeholder (fail closed).
+const CONFIG_PROBLEM_SERVERS: Record<string, MCPServerInfo> = {
+  memory: {
+    transport: "stdio",
+    command: "npx -y @modelcontextprotocol/server-memory",
+    disabled: false,
+  },
+  ...Object.fromEntries(
+    CONFIG_PROBLEMS.map((problem) => [
+      problem.server,
+      { transport: "stdio", command: "", disabled: true } satisfies MCPServerInfo,
+    ])
+  ),
+};
 const setupConfigProblemsStory = () =>
   setupMCPSettingsSectionStory({
-    servers: {
-      memory: {
-        transport: "stdio",
-        command: "npx -y @modelcontextprotocol/server-memory",
-        disabled: false,
-      },
-    },
+    servers: CONFIG_PROBLEM_SERVERS,
     configProblems: CONFIG_PROBLEMS,
   });
 

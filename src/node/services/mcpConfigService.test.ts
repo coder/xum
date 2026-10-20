@@ -1271,6 +1271,8 @@ describe("MCPConfigService config problems", () => {
     );
     expect(await service.listServers()).toEqual({
       a: { transport: "stdio", command: "echo a", disabled: false },
+      // Fail closed: kept disabled, so it still shadows other layers (#2060).
+      b: { transport: "stdio", command: "", disabled: true },
     });
     expect(await service.getConfigProblems()).toEqual({
       path: configPath,
@@ -1285,7 +1287,9 @@ describe("MCPConfigService config problems", () => {
         servers: { ok: "echo ok", num: 42, empty: "", nothing: { disabled: true } },
       })
     );
-    expect(Object.keys(await service.listServers())).toEqual(["ok"]);
+    const listed = await service.listServers();
+    expect(listed.ok.disabled).toBe(false);
+    for (const name of ["num", "empty", "nothing"]) expect(listed[name].disabled).toBe(true);
     const { problems } = await service.getConfigProblems();
     expect(problems.map((problem) => problem.server)).toEqual(["num", "empty", "nothing"]);
     for (const problem of problems) expect(problem.line).toBe(1);
@@ -1315,6 +1319,15 @@ describe("MCPConfigService config problems", () => {
     ]);
     expect((await service.addServer("c", { command: "echo c" })).success).toBe(false);
     expect(await fs.readFile(configPath, "utf-8")).toBe(raw);
+  });
+
+  test("an invalid last duplicate still wins, so the earlier command does not start", async () => {
+    await fs.writeFile(configPath, '{"servers":{"a":"echo old","a":42}}');
+    expect((await service.listServers()).a).toEqual({
+      transport: "stdio",
+      command: "",
+      disabled: true,
+    });
   });
 
   test("a UTF-8 BOM is not a problem, as with jsonc.parse", async () => {
