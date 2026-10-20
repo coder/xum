@@ -69,14 +69,30 @@ test("a model-driven job gets every kill switch, also with the mock app AI", () 
     "XUM_DISABLE_TERMINALS",
   ];
   const keys = (env: Record<string, string>) => Object.keys(env).sort();
-  expect(keys(appSwitches("mock", false, true))).toEqual([...all, "XUM_MOCK_AI"]);
-  expect(keys(appSwitches("real", false, false))).toEqual(all);
+  expect(keys(appSwitches("mock", "", true))).toEqual([...all, "XUM_MOCK_AI"]);
+  expect(keys(appSwitches("real", "", false))).toEqual(all);
   // Exact-step repros keep today's app env.
-  expect(appSwitches("mock", false, false)).toEqual({ XUM_MOCK_AI: "1" });
-  expect(keys(appSwitches("mock", true, false))).toEqual([
+  expect(appSwitches("mock", "", false)).toEqual({ XUM_MOCK_AI: "1" });
+  expect(keys(appSwitches("mock", "bash-ai-proxy", false))).toEqual([
     "XUM_DISABLE_AGENT_TOOLS",
     "XUM_DISABLE_TERMINALS",
   ]);
+});
+
+test("only the scripted-tools scenario leaves agent tools on, and it keeps the other switches", () => {
+  // No mock either: Xum must build the real request, tool block included, for the fake to log.
+  expect(appSwitches("mock", "scripted-tools", false)).toEqual({
+    XUM_DISABLE_TERMINALS: "1",
+    XUM_DISABLE_PROJECT_AUTOMATION: "1",
+  });
+  for (const scenario of ["", "bash-ai-proxy"] as const)
+    for (const mode of ["mock", "real"] as const)
+      for (const modelDriven of [false, true]) {
+        const env = appSwitches(mode, scenario, modelDriven);
+        // Exact-step mock repros have no model at all, so their tool block is empty either way.
+        if (mode === "mock" && scenario === "" && !modelDriven) expect(env.XUM_MOCK_AI).toBe("1");
+        else expect(env.XUM_DISABLE_AGENT_TOOLS).toBe("1");
+      }
 });
 
 // A stand-in for `xum server`: /health answers with its pid and the marker file in its XUM_ROOT.

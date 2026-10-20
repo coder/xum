@@ -47,6 +47,52 @@ export function readAppControl(port: number): AppControl | null {
   return control;
 }
 
+/** The scripted model's reply that ends the user turn with the TODO item open, so Xum nudges. */
+export const SCRIPTED_STARTED_TEXT = "Started the task. One TODO item is still open.";
+/** The scripted model's reply that ends the nudged turn. */
+export const SCRIPTED_DONE_TEXT = "Read README.md. The TODO list is complete.";
+
+/** The step a scripted-tools request got (scriptedModel.ts nextStep), in script order. */
+export const SCRIPTED_STEPS = [
+  "write-open-todo",
+  "end-with-open-todo",
+  "read-file",
+  "complete-todo",
+  "finish",
+] as const;
+export type ScriptedStep = (typeof SCRIPTED_STEPS)[number];
+
+/** One agent request that the scripted model (BUGBASH_SCENARIO=scripted-tools) answered. */
+export interface ScriptedModelRequest {
+  step: ScriptedStep;
+  /** The advertised tool names, sorted. */
+  toolNames: string[];
+  /** sha256 of the request's `tools` array as sent: equal hashes mean a byte-identical block. */
+  toolsSha256: string;
+  /** The text of the request's last tool_result, or null when it ends with a user text. */
+  toolResult: string | null;
+}
+
+/** The scripted model's request log of the app on `port`: one JSON line per agent request. */
+export function scriptedModelLogPath(port: number): string {
+  return path.join(os.tmpdir(), `xum-bugbash-scripted-${port}.jsonl`);
+}
+
+/** The logged requests, oldest first; empty while the log is missing. */
+export function readScriptedModelRequests(port: number): ScriptedModelRequest[] {
+  let text: string;
+  try {
+    text = fs.readFileSync(scriptedModelLogPath(port), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  return text
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => JSON.parse(line) as ScriptedModelRequest);
+}
+
 /**
  * The Electron story target's control file (tests/stories/e2e.electron.config.ts): `startApp.ts
  * --electron` seeds XUM_ROOT, writes this file, then serves the built renderer on its port. The

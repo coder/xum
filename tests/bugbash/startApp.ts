@@ -29,6 +29,8 @@
  * sets XUM_DISABLE_TERMINALS and XUM_DISABLE_PROJECT_AUTOMATION: AI replies are untrusted input
  * for the explorer, so the terminal and project init hooks are closed.
  * Mock mode sets XUM_MOCK_AI=1 and points the provider at a dead loopback port.
+ * BUGBASH_SCENARIO=scripted-tools is the one app with agent tools on: its only model is a fixed
+ * loopback script (scriptedModel.ts), and it starts only in an exact-step sandbox job (main()).
  *
  * Safety: the server process gets only PATH, HOME (the temp one), the temp-dir variables and the
  * XUM_* values set here. In real mode the provider key reaches the app only through the temp
@@ -52,8 +54,10 @@ import {
   writeAppControl,
   writeElectronControl,
 } from "./appControl";
-import { proxySocketMounted, sandboxShaped } from "./sandbox/inContainer";
+import { inSandbox, proxySocketMounted, sandboxShaped } from "./sandbox/inContainer";
 import { startFakeProvider } from "./fakeProvider";
+import { startScriptedModel } from "./scriptedModel";
+import { scriptedModelLogPath } from "./appControl";
 import { seedMcpChat, writeMcpConfig } from "./mcpapps/seed";
 import { seedPluginHooks, writePluginSources } from "./pluginHookFixtures";
 
@@ -173,16 +177,25 @@ export function modelDrivenGuard(
   return null;
 }
 
+export const SCENARIOS = ["", "bash-ai-proxy", "scripted-tools"] as const;
+export type Scenario = (typeof SCENARIOS)[number];
+
 /** The mode and kill-switch env of the app server. */
 export function appSwitches(
   mode: "mock" | "real",
-  fakeProvider: boolean,
+  scenario: Scenario,
   modelDriven: boolean
 ): Record<string, string> {
   // No agent tools and no terminal (AGENTS.md: not until the app runs in a sandbox). Project
   // automation stays on: its kill switch also makes the bash AI proxy refuse every call, the
   // fake's replies are fixed text, and the seeded demo repo has no hooks.
-  if (fakeProvider) return { XUM_DISABLE_AGENT_TOOLS: "1", XUM_DISABLE_TERMINALS: "1" };
+  if (scenario === "bash-ai-proxy")
+    return { XUM_DISABLE_AGENT_TOOLS: "1", XUM_DISABLE_TERMINALS: "1" };
+  // The one app with agent tools on (#7027, #7029): its only model is scriptedModel.ts, whose
+  // fixed script calls todo_write and file_read of README.md, and main() starts it only in an
+  // exact-step sandbox job. No mock either: Xum must build real requests for the fake to log.
+  if (scenario === "scripted-tools")
+    return { XUM_DISABLE_TERMINALS: "1", XUM_DISABLE_PROJECT_AUTOMATION: "1" };
   const all = {
     XUM_DISABLE_AGENT_TOOLS: "1",
     XUM_DISABLE_TERMINALS: "1",
@@ -315,7 +328,7 @@ async function seed(
   } else {
     // The composer refuses to send without a configured provider. Mock AI never calls it, and
     // the dead loopback port keeps any stray background call from leaving the machine. The
-    // bash-ai-proxy scenario points both providers at the loopback fake instead.
+    // bash-ai-proxy and scripted-tools scenarios point both providers at their loopback fake.
     const providerBase = fakeProviderOrigin ?? "http://127.0.0.1:9";
     await api(base, "providers/setProviderConfig", {
       provider: "anthropic",
@@ -664,22 +677,39 @@ async function main(): Promise<void> {
   // the proxy itself with that workspace's key, so the proxy, the Cost tab and Analytics see
   // real traffic while agent tools stay off. Nothing leaves the machine. It replaces the mock,
   // so the explorer context (e2e.config.ts) must not describe a real model.
-  const scenario = process.env.BUGBASH_SCENARIO ?? "";
-  if (scenario !== "" && scenario !== "bash-ai-proxy") {
-    fail(`BUGBASH_SCENARIO must be empty or bash-ai-proxy, got "${scenario}"`);
+  // BUGBASH_SCENARIO=scripted-tools: the app runs with agent tools on, and its only model is the
+  // loopback scripted model (scriptedModel.ts), which logs each request's tool block for
+  // repros/toolBlockAcrossNudge.e2e.ts. Only in an exact-step job of the bug-bash sandbox: no
+  // network, no provider proxy and no explorer model, so no model output reaches the app or the
+  // test, and the script's two tool calls are the only ones that run.
+  const scenario = (process.env.BUGBASH_SCENARIO ?? "") as Scenario;
+  if (!SCENARIOS.includes(scenario)) {
+    fail(`BUGBASH_SCENARIO must be empty, bash-ai-proxy or scripted-tools, got "${scenario}"`);
   }
   if (scenario !== "" && ai.mode !== "mock") {
-    fail("BUGBASH_SCENARIO=bash-ai-proxy replaces the mock: run it with BUGBASH_AI=mock");
+    fail(`BUGBASH_SCENARIO=${scenario} replaces the mock: run it with BUGBASH_AI=mock`);
   }
   // A model-driven job (the sandbox launcher sets this): a model reads every reply and page, so
-  // the app gets all three switches in both AI modes. bash-ai-proxy needs project automation.
+  // the app gets all three switches in both AI modes. bash-ai-proxy needs project automation, and
+  // scripted-tools needs agent tools.
   const modelDriven = process.env.BUGBASH_MODEL_DRIVEN === "1";
   if (modelDriven && scenario !== "") {
-    fail("BUGBASH_SCENARIO=bash-ai-proxy needs project automation: not in a model-driven job");
+    fail(`BUGBASH_SCENARIO=${scenario} turns a kill switch off: not in a model-driven job`);
+  }
+  // The env marker alone could be dropped: also refuse when the filesystem shows a proxy socket.
+  if (scenario === "scripted-tools" && (!inSandbox() || proxySocketMounted())) {
+    fail(
+      "BUGBASH_SCENARIO=scripted-tools runs only in an exact-step job of the bug-bash sandbox (make test-bugbash-repros-sandbox)"
+    );
   }
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xum-bugbash-"));
   const xumRoot = path.join(tempRoot, "xum");
-  const fakeProvider = scenario === "bash-ai-proxy" ? await startFakeProvider(xumRoot) : undefined;
+  const fakeProvider =
+    scenario === "bash-ai-proxy"
+      ? await startFakeProvider(xumRoot)
+      : scenario === "scripted-tools"
+        ? await startScriptedModel(scriptedModelLogPath(port))
+        : undefined;
   const home = path.join(tempRoot, "home");
   const projectPath = path.join(tempRoot, PROJECT_NAME);
   const env: NodeJS.ProcessEnv = {
@@ -690,7 +720,7 @@ async function main(): Promise<void> {
     // Real mode: a real model answers in the app on this host. It gets no tools, and the explorer
     // gets no terminal or project init hooks, so injected text in a reply that the explorer
     // follows cannot run host commands through them (see the header).
-    ...appSwitches(ai.mode, fakeProvider != null, modelDriven),
+    ...appSwitches(ai.mode, scenario, modelDriven),
     // Bug-bash clicks are not product usage.
     XUM_DISABLE_TELEMETRY: "1",
     // Git inside the app must not read or write the user's real ~/.gitconfig.

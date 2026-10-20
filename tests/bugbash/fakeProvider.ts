@@ -192,7 +192,7 @@ function isProbe(body: Json): boolean {
   return messages.length === 1 && messages[0]?.content === PROBE_MARKER;
 }
 
-function sse(res: http.ServerResponse, events: [string | null, Json | string][]): void {
+export function sse(res: http.ServerResponse, events: [string | null, Json | string][]): void {
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
   for (const [type, data] of events) {
     const payload =
@@ -202,13 +202,13 @@ function sse(res: http.ServerResponse, events: [string | null, Json | string][])
   res.end();
 }
 
-function json(res: http.ServerResponse, status: number, body: Json): void {
+export function json(res: http.ServerResponse, status: number, body: Json): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
 }
 
 let seq = 0;
-function messageStart(model: string, usage: Json): [string, Json] {
+export function messageStart(model: string, usage: Json): [string, Json] {
   return [
     "message_start",
     {
