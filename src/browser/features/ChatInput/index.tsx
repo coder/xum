@@ -2500,7 +2500,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const refusal = sendRefusalToast({
       parsed,
       workspaceVariant: variant === "workspace",
-      transcriptAllowed: isTranscriptMutationAllowed(props.workspaceId),
+      // Only a workspace composer has a transcript (and a workspaceId) to wait for.
+      transcriptAllowed: variant !== "workspace" || isTranscriptMutationAllowed(props.workspaceId),
       offline: liveApiRef.current == null,
       attachmentCount: attachments.length,
       skillRefs: combinedSkillRefs,
