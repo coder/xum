@@ -10,12 +10,17 @@ import { useOptionalWorkspaceSidebarState } from "@/browser/stores/WorkspaceStor
 import { showFeedbackToast } from "@/browser/utils/feedbackToast";
 import { NO_RUNNABLE_PLAN_MESSAGE, runLatestPlanAction } from "@/browser/utils/latestPlanAction";
 import { openInEditor } from "@/browser/utils/openInEditor";
+import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { getPlanTabScrollTopKey } from "@/common/constants/storage";
+import { getErrorMessage } from "@/common/utils/errors";
 import { TAB_ICONS } from "./Tabs/tabIcons";
 import { usePlanFile } from "./usePlanFile";
 
 interface PlanTabProps {
   workspaceId: string;
+  /** Set when a shortcut opened the tab: the panel takes focus so its single-key shortcuts work. */
+  autoFocus?: boolean;
+  onAutoFocusConsumed?: () => void;
 }
 
 /**
@@ -24,7 +29,12 @@ interface PlanTabProps {
  * from an empty body instead of showing the previous plan while its own loads.
  */
 export const PlanTab: React.FC<PlanTabProps> = (props) => (
-  <PlanTabBody key={props.workspaceId} workspaceId={props.workspaceId} />
+  <PlanTabBody
+    key={props.workspaceId}
+    workspaceId={props.workspaceId}
+    autoFocus={props.autoFocus}
+    onAutoFocusConsumed={props.onAutoFocusConsumed}
+  />
 );
 
 /** The plan reader's wording for a workspace without a plan (getWorkspacePlanContent). */
@@ -37,7 +47,7 @@ function normalizeScrollTop(value: unknown): number {
 const ACTION_CLASS =
   "text-subtle hover:text-foreground inline-flex items-center gap-1 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-50";
 
-function PlanTabBody(props: { workspaceId: string }) {
+function PlanTabBody(props: PlanTabProps) {
   const { workspaceId } = props;
   const api = useLiveAPI();
   const runtimeConfig =
@@ -90,20 +100,59 @@ function PlanTabBody(props: { workspaceId: string }) {
 
   const handleOpenInEditor = async () => {
     if (path === null) return;
-    const result = await openInEditor({
-      api,
-      workspaceId,
-      targetPath: path,
-      runtimeConfig,
-      isFile: true,
-    });
-    if (!result.success) {
-      showFeedbackToast({ type: "error", message: result.error ?? "Failed to open editor" });
+    try {
+      const result = await openInEditor({
+        api,
+        workspaceId,
+        targetPath: path,
+        runtimeConfig,
+        isFile: true,
+      });
+      if (!result.success) {
+        showFeedbackToast({ type: "error", message: result.error ?? "Failed to open editor" });
+      }
+    } catch (error) {
+      // Editor discovery for a remote or devcontainer workspace rejects when the connection
+      // drops mid-call; the user still needs to hear why nothing opened.
+      showFeedbackToast({ type: "error", message: getErrorMessage(error) });
+    }
+  };
+
+  const handleCopy = () => {
+    if (hasPlan) void copyToClipboard(content ?? "");
+  };
+
+  // Opened by its shortcut: take focus so the single-key shortcuts below work at once.
+  const panelRef = useRef<HTMLDivElement>(null);
+  const { autoFocus, onAutoFocusConsumed } = props;
+  useEffect(() => {
+    if (autoFocus !== true) return;
+    panelRef.current?.focus();
+    onAutoFocusConsumed?.();
+  }, [autoFocus, onAutoFocusConsumed]);
+
+  // Single-key shortcuts while focus is inside the tab, never from a text field.
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (isEditableElement(event.target)) return;
+    if (matchesKeybind(event, KEYBINDS.PLAN_TAB_EDIT)) {
+      if (path === null) return;
+      event.preventDefault();
+      void handleOpenInEditor();
+    } else if (matchesKeybind(event, KEYBINDS.PLAN_TAB_COPY)) {
+      if (!hasPlan) return;
+      event.preventDefault();
+      handleCopy();
     }
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div
+      ref={panelRef}
+      tabIndex={0}
+      onKeyDown={handleKeyDown}
+      className="flex h-full min-h-0 flex-col"
+      data-testid="plan-tab"
+    >
       <div className="border-border-primary flex flex-col gap-1 border-b px-3 py-2">
         <div className="flex items-center justify-between gap-2">
           <span className="text-foreground inline-flex items-center gap-1.5 text-xs font-medium">
@@ -129,12 +178,7 @@ function PlanTabBody(props: { workspaceId: string }) {
               <ExternalLink className="h-3 w-3" />
               Edit
             </button>
-            <button
-              type="button"
-              className={ACTION_CLASS}
-              onClick={() => void copyToClipboard(content ?? "")}
-              disabled={!hasPlan}
-            >
+            <button type="button" className={ACTION_CLASS} onClick={handleCopy} disabled={!hasPlan}>
               {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
               {copied ? "Copied" : "Copy"}
             </button>

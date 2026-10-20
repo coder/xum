@@ -1,5 +1,6 @@
 import * as RealMarkdownCore from "../Messages/MarkdownCore";
 import * as RealMarkdownRenderer from "../Messages/MarkdownRenderer";
+import * as RealClipboard from "@/browser/utils/clipboard";
 import { APIContext, APIProvider } from "@/browser/contexts/API";
 import type { ReactElement, ReactNode } from "react";
 import { PlanTab } from "./PlanTab";
@@ -22,7 +23,11 @@ let mockApi: TestApiOverrides<APIClient> | null = null;
 const realModules: Array<[string, Record<string, unknown>]> = [
   ["@/browser/features/Messages/MarkdownCore", { ...RealMarkdownCore }],
   ["@/browser/features/Messages/MarkdownRenderer", { ...RealMarkdownRenderer }],
+  ["@/browser/utils/clipboard", { ...RealClipboard }],
 ];
+
+/** What the mocked clipboard received. */
+let clipboardWrites: string[] = [];
 
 async function installModuleMocks() {
   await mock.module("@/browser/features/Messages/MarkdownCore", () => ({
@@ -35,6 +40,14 @@ async function installModuleMocks() {
     PlanMarkdownContainer: (props: { children: ReactNode }) => (
       <div data-testid="plan-markdown-container">{props.children}</div>
     ),
+  }));
+
+  await mock.module("@/browser/utils/clipboard", () => ({
+    ...RealClipboard,
+    copyToClipboard: (text: string) => {
+      clipboardWrites.push(text);
+      return Promise.resolve();
+    },
   }));
 }
 
@@ -82,6 +95,7 @@ describe("PlanTab", () => {
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     mockApi = null;
+    clipboardWrites = [];
   });
 
   afterEach(async () => {
@@ -228,6 +242,36 @@ describe("PlanTab", () => {
     expect(view.getByRole("button", { name: "Implement" }).hasAttribute("disabled")).toBe(true);
     expect(view.getByRole("button", { name: "Edit" }).hasAttribute("disabled")).toBe(true);
     expect(view.getByRole("button", { name: "Copy" }).hasAttribute("disabled")).toBe(true);
+  });
+
+  test("single-key shortcuts act while the tab has focus, not from a text field", async () => {
+    mockApi = { workspace: { getPlanContent: mock(() => Promise.resolve(planResult("# Plan"))) } };
+    const view = renderWithApi(<PlanTab workspaceId="workspace-1" />);
+    await waitFor(() => {
+      expect(view.getByTestId("plan-markdown-core").textContent).toContain("# Plan");
+    });
+
+    const panel = view.getByTestId("plan-tab");
+    fireEvent.keyDown(panel, { key: "y" });
+    expect(clipboardWrites).toEqual(["# Plan"]);
+
+    // A text field inside the tab keeps its letters.
+    const field = document.createElement("input");
+    panel.appendChild(field);
+    fireEvent.keyDown(field, { key: "y" });
+    expect(clipboardWrites).toEqual(["# Plan"]);
+  });
+
+  test("takes focus when opened by its shortcut, once", async () => {
+    mockApi = { workspace: { getPlanContent: mock(() => Promise.resolve(planResult("# Plan"))) } };
+    const consumed = mock(() => undefined);
+    const view = renderWithApi(
+      <PlanTab workspaceId="workspace-1" autoFocus onAutoFocusConsumed={consumed} />
+    );
+    await waitFor(() => {
+      expect(document.activeElement).toBe(view.getByTestId("plan-tab"));
+    });
+    expect(consumed).toHaveBeenCalledTimes(1);
   });
 
   test("renders API-unavailable state when not connected", async () => {
