@@ -113,6 +113,7 @@ import {
   isHeartbeatTrigger,
   isHeartbeatWhenBusy,
   isValidHeartbeatScheduleUpdatedAt,
+  resolveHeartbeatSchedulePolicy,
 } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
 import {
@@ -3810,8 +3811,29 @@ export class Config {
 
   async updateHeartbeatDefaultIntervalMs(intervalMs: number | null | undefined): Promise<void> {
     await this.editConfig((config) => {
+      const resolveDefault = (value: unknown) =>
+        isValidHeartbeatIntervalMs(value) ? value : HEARTBEAT_DEFAULT_INTERVAL_MS;
+      const before = resolveDefault(config.heartbeatDefaultIntervalMs);
       if (intervalMs != null) config.heartbeatDefaultIntervalMs = intervalMs;
       else delete config.heartbeatDefaultIntervalMs;
+      // A fixed-interval heartbeat that follows the default anchors its first deadline
+      // after a restart on max(last firing, scheduleUpdatedAt), so a default change must
+      // stamp it like a cadence edit does (#5741). In this same edit: no extra read or write.
+      if (resolveDefault(config.heartbeatDefaultIntervalMs) !== before) {
+        const now = Date.now();
+        for (const project of config.projects.values()) {
+          for (const workspace of project.workspaces) {
+            const heartbeat = workspace.heartbeat;
+            if (
+              heartbeat?.enabled === true &&
+              !isValidHeartbeatIntervalMs(heartbeat.intervalMs) &&
+              resolveHeartbeatSchedulePolicy(heartbeat).trigger === "interval"
+            ) {
+              heartbeat.scheduleUpdatedAt = now;
+            }
+          }
+        }
+      }
       return config;
     });
   }

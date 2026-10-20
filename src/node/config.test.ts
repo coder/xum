@@ -6408,6 +6408,53 @@ describe("Config", () => {
       });
     });
 
+    it("stamps fixed-interval heartbeats that follow the default when the default changes (#5741)", async () => {
+      // Restart anchoring uses max(last firing, scheduleUpdatedAt): without a stamp, a heartbeat
+      // that fired under the old default could bypass the new one once.
+      const projectPath = "/fake/project";
+      const oldStamp = 1_700_000_000_000;
+      const heartbeats = {
+        follows: { enabled: true, trigger: "interval" },
+        ownInterval: { enabled: true, trigger: "interval", intervalMs: 30 * 60_000 },
+        idle: { enabled: true, trigger: "idle" },
+        disabled: { enabled: false, trigger: "interval" },
+      } as const;
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: Object.entries(heartbeats).map(([name, heartbeat]) => ({
+            path: path.join(config.srcDir, "project", name),
+            id: `workspace-${name}`,
+            name,
+            createdAt: "2025-01-01T00:00:00.000Z",
+            runtimeConfig: { type: "local" as const },
+            heartbeat: { ...heartbeat, scheduleUpdatedAt: oldStamp },
+          })),
+        });
+        return cfg;
+      });
+      const stamps = () =>
+        Object.fromEntries(
+          (
+            new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces ?? []
+          ).map((workspace) => [workspace.name, workspace.heartbeat?.scheduleUpdatedAt])
+        );
+
+      const before = Date.now();
+      await config.updateHeartbeatDefaultIntervalMs(45 * 60_000);
+      const afterChange = stamps();
+      expect(afterChange.follows).toBeGreaterThanOrEqual(before);
+      expect({ ...afterChange, follows: oldStamp }).toEqual({
+        follows: oldStamp,
+        ownInterval: oldStamp,
+        idle: oldStamp,
+        disabled: oldStamp,
+      });
+
+      // The same value again is no schedule change, so nothing is stamped.
+      await config.updateHeartbeatDefaultIntervalMs(45 * 60_000);
+      expect(stamps()).toEqual(afterChange);
+    });
+
     it("defaults sparse persisted heartbeat intervals in workspace metadata", async () => {
       const projectPath = "/fake/project";
       const workspacePath = path.join(config.srcDir, "project", "heartbeat-sparse");
