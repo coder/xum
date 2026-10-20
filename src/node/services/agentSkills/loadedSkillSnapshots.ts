@@ -118,15 +118,17 @@ function getToolResultSkillDirectory(toolResult: {
   pluginRoot?: unknown;
   skillDirUnavailable?: unknown;
 }): SkillDirectory | undefined {
+  // The tool writes one or the other, so both means corrupted history: the
+  // unavailable reason wins, because the path then cannot be trusted (#6854).
+  if (typeof toolResult.skillDirUnavailable === "string") {
+    return { available: false, reason: toolResult.skillDirUnavailable };
+  }
   if (typeof toolResult.skillDir === "string" && toolResult.skillDir.length > 0) {
     return {
       available: true,
       skillDir: toolResult.skillDir,
       ...(typeof toolResult.pluginRoot === "string" ? { pluginRoot: toolResult.pluginRoot } : {}),
     };
-  }
-  if (typeof toolResult.skillDirUnavailable === "string") {
-    return { available: false, reason: toolResult.skillDirUnavailable };
   }
   return undefined;
 }

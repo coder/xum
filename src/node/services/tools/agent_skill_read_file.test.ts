@@ -435,6 +435,31 @@ describe("agent_skill_read_file", () => {
       expect(rows.map((row) => row.slice(row.indexOf("\t") + 1))).toEqual(lines);
     });
 
+    it("caps a page at 1000 lines and lets offset/limit page past it (#6388)", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-file-line-cap");
+      // 1001 short lines stay far below the 16 KB byte cap, so only the line cap applies.
+      const lines = Array.from({ length: 1001 }, (_, i) => `l${i + 1}`);
+      const tool = await createLongLineTool(tempDir, lines.join("\n"));
+
+      const whole = await executeReadFile(tool, { name: "long-lines", filePath: "playbook.md" });
+      expect(whole.success).toBe(false);
+      if (!whole.success) {
+        expect(whole.error).toContain("1000 lines");
+      }
+
+      const page = await executeReadFile(tool, {
+        name: "long-lines",
+        filePath: "playbook.md",
+        offset: 1,
+        limit: 1000,
+      });
+      expect(page.success).toBe(true);
+      if (page.success) {
+        expect(page.lines_read).toBe(1000);
+        expect(page.content.split("\n").at(-1)).toBe("1000\tl1000");
+      }
+    });
+
     it("fails loudly, naming the line, when one line alone exceeds a page", async () => {
       using tempDir = new TestTempDir("test-agent-skill-read-file-huge-line");
       const tool = await createLongLineTool(tempDir, `short\n${"y".repeat(20_000)}\nlast`);

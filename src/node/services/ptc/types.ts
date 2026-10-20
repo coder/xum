@@ -141,10 +141,16 @@ function boundPersistenceCriticalResult(toolName: string, result: unknown): unkn
     // The re-injected snapshot names the skill directory from these fields
     // (#6704); without them kernel-mode reads lose it after compaction. They
     // are optional: when they leave no body budget, keep the skill
-    // instructions without them rather than lose the whole package.
+    // instructions without them rather than lose the whole package. skillDir
+    // alone is tried first: it is the line the snapshot needs most (#6854).
+    // Not when skillDirUnavailable is set too (corrupted input): the snapshot
+    // then trusts the reason over the path, so the path alone must not survive.
     const location = retainSkillLocationFields(result);
     return (
       boundSkillReadPackage(skill, { ...success, ...error, ...location }) ??
+      (location.skillDir !== undefined && location.skillDirUnavailable === undefined
+        ? boundSkillReadPackage(skill, { ...success, ...error, skillDir: location.skillDir })
+        : undefined) ??
       boundSkillReadPackage(skill, { ...success, ...error })
     );
   }

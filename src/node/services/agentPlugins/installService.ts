@@ -542,7 +542,7 @@ function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void
   );
   if (size > MAX_REVIEW_TEXT_CHARS) {
     throw new Error(
-      "This plugin's review is too large to show, so Xum cannot apply it. Reinstall the plugin or contact its publisher."
+      "This plugin's review is too large to show, so Xum cannot install or change it. Contact its publisher."
     );
   }
 }
@@ -3354,6 +3354,9 @@ export class AgentPluginInstallService {
         const { plugin } = await this.validateStagedClone(stagedDir, args.source.subpath);
         const name = plugin.name;
         const inventory = await this.collectComponents(plugin, this.targetPathFor(name));
+        // Install records consent for every directive command, so it bounds them like the
+        // preview does. A direct API call without the preview's digest would skip that (#6816).
+        assertDirectivesFit(inventory.skills);
         assertInventoryMatchesPreview(
           args.expectedConsentDigest,
           inventory.fingerprints,

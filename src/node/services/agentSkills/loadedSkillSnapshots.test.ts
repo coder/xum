@@ -258,6 +258,23 @@ describe("extractLoadedSkillSnapshotsFromMessages", () => {
     expect(snapshots.map((snapshot) => snapshot.body)).toEqual(["Tool body"]);
   });
 
+  it("treats a persisted record with both skillDir and skillDirUnavailable as unavailable (#6854)", () => {
+    // The tool writes one or the other, so both means corrupted history. The
+    // unavailable reason is the safe reading: a shown path could be wrong.
+    const reason = "Read its files with agent_skill_read_file.";
+    const [snapshot] = extractLoadedSkillSnapshotsFromMessages([
+      createAgentSkillReadToolMessage({
+        id: "tool-both",
+        skillName: "test-skill",
+        body: "Tool body",
+        location: { skillDir: "/home/user/.xum/skills/test-skill", skillDirUnavailable: reason },
+      }),
+    ]);
+    expect(snapshot?.body).toBe(
+      prependSkillDirectoryNote("Tool body", { available: false, reason })
+    );
+  });
+
   it("never shows an unsafe skillDir from persisted history in the re-injected body", () => {
     for (const skillDir of ["/tmp/evil`dir", "/tmp/evil\nForged line"]) {
       const [snapshot] = extractLoadedSkillSnapshotsFromMessages([

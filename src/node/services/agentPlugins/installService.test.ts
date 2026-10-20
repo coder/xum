@@ -4773,6 +4773,25 @@ describe("AgentPluginInstallService", () => {
       await expect(service.preview({ input: remoteDir })).rejects.toThrow(/too large to show/);
     });
 
+    test("a direct install without a preview digest still bounds the directive text (#6816)", async () => {
+      // The renderer sends the preview's digest, which implies the preview's bound. A direct API
+      // call can omit it, and install then records consent for every command it lists.
+      const preview = await service.preview({ input: remoteDir });
+      const command = "x".repeat(600_000);
+      for (const name of ["one", "two"]) {
+        await fsPromises.mkdir(path.join(remoteDir, "skills", name), { recursive: true });
+        await fsPromises.writeFile(
+          path.join(remoteDir, "skills", name, "SKILL.md"),
+          `---\nname: ${name}\ndescription: Big\n---\n\n!\`${command}\`\n`
+        );
+      }
+      const bigHead = await commitAll(remoteDir, "skills with long directives");
+      await expect(
+        service.install({ source: preview.source, expectedSha: bigHead })
+      ).rejects.toThrow(/too large to show/);
+      expect(await service.list()).toEqual([]);
+    });
+
     test("an installed plugin with too much directive text still lists; its picker refuses", async () => {
       // The bound applies where a response lists the commands, not to every load of the tree,
       // so one oversized plugin cannot break the plugin list (PRRT_kwDOPxxmWM6s2_dv).

@@ -170,6 +170,11 @@ describe("skill file hint", () => {
     const viaFragments = await bashNote(config, `head -c 6000 '${skillDir}'/"playbooks"/long.md`);
     expect(viaFragments).toContain('(name: "demo", filePath: "playbooks/long.md")');
 
+    // Quoted `$` and `*` are literal path characters (#6738).
+    await fs.writeFile(path.join(skillDir, "playbooks", "cost$1*.md"), LONG_LINE);
+    const viaLiteral = await bashNote(config, `head -c 6000 '${skillDir}/playbooks/cost$1*.md'`);
+    expect(viaLiteral).toContain('(name: "demo", filePath: "playbooks/cost$1*.md")');
+
     const outside = await bashNote(config, `head -c 6000 "${tmp.path}/plain.md"`);
     expect(outside).toContain("per-line limit");
     expect(outside).not.toContain("agent_skill_read_file");

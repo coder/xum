@@ -45,9 +45,9 @@ const SHELL_FRAGMENT_RE = /'([^']*)'|"((?:\\.|[^"\\])*)"|\\./g;
 function formatSkillFileHint(location: SkillFileLocation): string {
   const name = JSON.stringify(location.skillName);
   const filePath = JSON.stringify(location.filePath);
-  // agent_skill_read_file cannot return a single line over its 16 KB page cap
-  // either (it says so), so the hint does not promise more.
-  return `${filePath} is a file of skill ${name}. agent_skill_read_file (name: ${name}, filePath: ${filePath}) returns its lines whole, up to 16 KB per page.`;
+  // No page-cap number here: agent_skill_read_file states its own limits when
+  // a page is too big, and a copied number goes stale (#6738).
+  return `${filePath} is a file of skill ${name}. agent_skill_read_file (name: ${name}, filePath: ${filePath}) returns its lines whole.`;
 }
 
 /**
@@ -81,9 +81,10 @@ export async function skillFileBashHint(
         single ?? double?.replace(/\\(.)/g, "$1") ?? fragment.slice(1)
     )
   );
-  const tokens = new Set(
-    operands.filter((token) => SKILLS_SEGMENT_RE.test(token) && !/[$*?]/.test(token))
-  );
+  // Quoted `$`, `*` and `?` are literal path characters, so they stay (#6738).
+  // An unquoted one makes a path that stat does not find: no hint, and the
+  // `skills/` prefilter plus MAX_BASH_PATH_TOKENS bound the lookups anyway.
+  const tokens = new Set(operands.filter((token) => SKILLS_SEGMENT_RE.test(token)));
   for (const token of [...tokens].slice(0, MAX_BASH_PATH_TOKENS)) {
     const location = await findSkillFileForPath(config, token);
     if (location != null) return `${formatSkillFileHint(location)}\n\n`;

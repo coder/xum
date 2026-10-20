@@ -227,6 +227,32 @@ describe("retainExemptKernelRecordResult", () => {
       expect(retained?.skillDir).toBe(skillDir);
     });
 
+    it("keeps skillDir alone when all location fields leave no body budget (#6854)", () => {
+      // The skill directory is the field the re-injected snapshot needs most;
+      // pluginRoot only adds the plugin note.
+      const note = "\n\n[Skill body truncated at capture to fit the retained-record cap]";
+      const noteChars = JSON.stringify(note).length - 2;
+      const skillDir = "/home/user/.xum/plugins/p/skills/demo";
+      const emptyBodySkill = { ...skill, body: "", pad: "" };
+      const overheadWithDir = JSON.stringify({
+        success: true,
+        skillDir,
+        skill: emptyBodySkill,
+      }).length;
+      // Leaves 10 chars of body budget with skillDir alone, none with pluginRoot too.
+      const pad = "p".repeat(MAX_FILE_CONTENT_SIZE - overheadWithDir - noteChars - 10);
+      const retained = retainExemptKernelRecordResult("agent_skill_read", {
+        success: true,
+        skill: { ...skill, body: "B".repeat(MAX_FILE_CONTENT_SIZE), pad },
+        skillDir,
+        pluginRoot: `/home/user/${"r".repeat(3000)}`,
+      }) as { skillDir?: string; pluginRoot?: string; skill?: unknown };
+      expect(AgentSkillPackageSchema.safeParse(retained?.skill).success).toBe(true);
+      expect(retained?.skillDir).toBe(skillDir);
+      expect(retained?.pluginRoot).toBeUndefined();
+      expect(JSON.stringify(retained).length).toBeLessThanOrEqual(MAX_FILE_CONTENT_SIZE);
+    });
+
     it("keeps the skill without its location when the location leaves no body budget", () => {
       // Before the location fields were retained, this package fit (with a
       // truncated body). The fields are optional: losing them must not lose
