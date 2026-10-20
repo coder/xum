@@ -55,6 +55,19 @@ export function advanceAnchoredDeadline(firedAt: number, intervalMs: number, now
   return firedAt + (intervalsElapsed + 1) * intervalMs;
 }
 
+/**
+ * The no-firing fallback deadline, never before one interval after the last schedule edit.
+ * A global default change stamps scheduleUpdatedAt without touching activity recency (a
+ * per-workspace edit persists both), so recency alone could fire at once (#5741).
+ */
+function boundByEditAnchor(
+  recencyDeadline: number,
+  editAnchor: number | undefined,
+  intervalMs: number
+): number {
+  return editAnchor == null ? recencyDeadline : Math.max(recencyDeadline, editAnchor + intervalMs);
+}
+
 export class HeartbeatService {
   private readonly config: Config;
   private readonly extensionMetadata: ExtensionMetadataService;
@@ -456,11 +469,7 @@ export class HeartbeatService {
       trackingIntervalMs,
       activity
     );
-    // A global default change stamps scheduleUpdatedAt without touching activity recency
-    // (a per-workspace edit persists both), so the edit anchor bounds this fallback too (#5741).
-    return editAnchor != null
-      ? Math.max(recencyDeadline, editAnchor + trackingIntervalMs)
-      : recencyDeadline;
+    return boundByEditAnchor(recencyDeadline, editAnchor, trackingIntervalMs);
   }
 
   private deriveInitialNextEligibleAt(
