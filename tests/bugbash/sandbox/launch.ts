@@ -738,8 +738,16 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     result = { error };
   }
   const missed = await closeProxy();
+  // A refused probe throws before the job proxy starts: no job-proxy calls, but the probe's
+  // calls are in the job's ledger and its proxy record (#7023).
+  const { settled, kept, refused, released, refusedBy } = proxy?.stats() ?? {
+    settled: 0,
+    kept: 0,
+    refused: 0,
+    released: 0,
+    refusedBy: {},
+  };
   if (proxy && ledger) {
-    const { settled, kept, refused, released, refusedBy } = proxy.stats();
     if (released > 0)
       log(`${name} proxy: ${cannotReach(driven!)}: ${released} call(s) released at $0`);
     // A shared ledger's totals are the run's: run.ts reports them once.
@@ -749,28 +757,29 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
       `${name} proxy: ${settled} settled, ${kept} kept in full, ${refused} refused ` +
         `${JSON.stringify(refusedBy)}${spent}`
     );
-    // The job's spend as a file beside its proxy record, which holds only reservations. Only
-    // with the job's own ledger: a shared ledger's totals are the run's (run.ts). No key or URL.
-    // The counts add the probe's calls, as spentUsd does (both are in the proxy record).
-    if (!o.ledger) {
-      const spend = {
-        spentUsd: spentNanoUsd / 1e9,
-        capUsd: capNanoUsd / 1e9,
-        settled: settled + probeCounts.settled,
-        kept: kept + probeCounts.kept,
-        refused: refused + probeCounts.refused,
-        released: released + probeCounts.released,
-        refusedBy,
-      };
-      try {
-        fs.writeFileSync(spendFile, `${JSON.stringify(spend, null, 2)}\n`, {
-          mode: 0o600,
-          flag: "wx",
-        });
-      } catch (error) {
-        // The errno code only: the message can hold the path. Cleanup must still run.
-        log(`${name} spend: not written (${(error as NodeJS.ErrnoException).code ?? "error"})`);
-      }
+  }
+  // The job's spend as a file beside its proxy record, which holds only reservations. Only
+  // with the job's own ledger: a shared ledger's totals are the run's (run.ts). No key or URL.
+  // The counts add the probe's calls, as spentUsd does (both are in the proxy record).
+  if (ledger && !o.ledger) {
+    const { spentNanoUsd, capNanoUsd } = ledger.totals();
+    const spend = {
+      spentUsd: spentNanoUsd / 1e9,
+      capUsd: capNanoUsd / 1e9,
+      settled: settled + probeCounts.settled,
+      kept: kept + probeCounts.kept,
+      refused: refused + probeCounts.refused,
+      released: released + probeCounts.released,
+      refusedBy,
+    };
+    try {
+      fs.writeFileSync(spendFile, `${JSON.stringify(spend, null, 2)}\n`, {
+        mode: 0o600,
+        flag: "wx",
+      });
+    } catch (error) {
+      // The errno code only: the message can hold the path. Cleanup must still run.
+      log(`${name} spend: not written (${(error as NodeJS.ErrnoException).code ?? "error"})`);
     }
   }
   const cleanup = await session.cleanup();

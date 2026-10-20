@@ -663,7 +663,14 @@ async function exerciseServerSettings(
   }
   const modal = within(dialog);
   const section = within(await modal.findByTestId("mcp-server-settings"));
-  await expect(modal.getByRole("button", { name: "Fetch Tools" })).toBeInTheDocument();
+  const fetchTools = modal.getByRole("button", { name: "Fetch Tools" });
+  await expect(fetchTools).toBeInTheDocument();
+  if (narrowWidthPx !== undefined) {
+    // iOS Safari lets a flex-item button shrink below its nowrap label (#5813). Chromium never
+    // does, so the computed flex-shrink is what guards the fix here (#5814).
+    await expect(getComputedStyle(fetchTools).flexShrink).toBe("0");
+    await expect(fetchTools.scrollWidth).toBeLessThanOrEqual(fetchTools.clientWidth);
+  }
   await expect(
     section.findByRole("button", { name: "Open Payment method" })
   ).resolves.toBeInTheDocument();

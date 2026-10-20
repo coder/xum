@@ -154,8 +154,11 @@ The first run, with one smoke story and no agent repro, spent $0.09 at list pric
 `.spend.json` (the job's spend at list price, its cap and its proxy call counts).
 Replay cache (`tests/bugbash/sandbox/cacheSeed.ts`): each story job records its verified
 `agent.act` steps (e2e read-write mode) into `<output>/cache/`, which comes back with the output.
-To replay them on the next run without model calls, copy those files of both story jobs into
-`tests/stories/.e2e-cache-seed/`: `mkdir -p tests/stories/.e2e-cache-seed && cp tests/stories/.e2e/stories-<time>-<pid>/cache/*.json tests/stories/.e2e-cache-seed/` (and the same for `stories-electron-<time>-<pid>`).
+To replay them on the next run, make them the seed: `bun tests/stories/summary.ts --next-seed
+tests/stories/.e2e-cache-seed` replaces that folder with the caches of the newest web and Electron
+story jobs, as CI does. Do not copy new entries into an old seed: it only grows until the launcher
+refuses it. A replayed `agent.act` step makes no model call. Each model-driven job still makes one
+probe call before its container starts, and `agent.assert` and `agent.extract` always call the model.
 The folder is git-ignored so that no `git add -A` commits it. The launcher stages it into the
 job (a story job only) and refuses any entry that is not a regular `<sha256>.json` file of 1 MiB
 or less, more than 1000 entries, or more than 128 MiB in all. Each run

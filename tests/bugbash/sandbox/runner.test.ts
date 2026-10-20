@@ -1335,6 +1335,14 @@ test.each(["401", "401html"])(
     expect(message).not.toMatch(/\/v1|sk-host/);
     expect(calls()).not.toMatch(/^run /m);
     expect(fs.existsSync(records)).toBe(true); // the probe's record stays
+    // The probe charged the job's own ledger, so its spend file is written too, with no job
+    // proxy (#7023).
+    const spendFile = records.replace(/\.proxy\.jsonl$/, ".spend.json");
+    expect(fs.statSync(spendFile).mode & 0o777).toBe(0o600);
+    const spend = JSON.parse(fs.readFileSync(spendFile, "utf8")) as Record<string, unknown>;
+    // The probe's one call, kept in full: the 401 answer carries no usage to settle it with.
+    expect(spend).toMatchObject({ capUsd: 1, settled: 0, kept: 1, refused: 0, released: 0 });
+    expect(spend.spentUsd).toBeGreaterThan(0);
     expectNothingLeft();
   }
 );
