@@ -421,18 +421,21 @@ function serializesThinkingOff(providerOptions: ReturnType<typeof buildProviderO
     return providerOptions.openai.reasoningEffort === "none";
   }
   if ("bedrock" in providerOptions) {
-    const thinking = providerOptions.bedrock.additionalModelRequestFields?.thinking;
-    return (
-      typeof thinking === "object" &&
-      thinking !== null &&
-      !Array.isArray(thinking) &&
-      (thinking as { type?: unknown }).type === "disabled"
-    );
+    return bedrockThinkingDisabled(providerOptions.bedrock.additionalModelRequestFields?.thinking);
   }
   if ("openrouter" in providerOptions) {
     return providerOptions.openrouter.reasoning?.effort === "none";
   }
   return false;
+}
+
+/** Whether Bedrock's verbatim `thinking` request field turns thinking off. */
+function bedrockThinkingDisabled(thinking: unknown): boolean {
+  return (
+    typeof thinking === "object" &&
+    thinking !== null &&
+    (thinking as { type?: unknown }).type === "disabled"
+  );
 }
 
 /**
