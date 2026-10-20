@@ -131,6 +131,11 @@ export interface TabPanelContext {
     autoFocus: boolean;
     onAutoFocusConsumed: () => void;
   };
+  plan: {
+    /** Set when a shortcut opened the tab: the panel takes focus so its single-key shortcuts work. */
+    autoFocus: boolean;
+    onAutoFocusConsumed: () => void;
+  };
   goal: {
     snapshot: GoalSnapshot | null;
     openCompleteInputRequest: number;
@@ -194,7 +199,11 @@ const TAB_RENDERERS = {
     Label: PlanTabLabel,
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Plan tab">
-        <PlanTab workspaceId={ctx.workspaceId} />
+        <PlanTab
+          workspaceId={ctx.workspaceId}
+          autoFocus={ctx.plan.autoFocus}
+          onAutoFocusConsumed={ctx.plan.onAutoFocusConsumed}
+        />
       </ErrorBoundary>
     ),
   },

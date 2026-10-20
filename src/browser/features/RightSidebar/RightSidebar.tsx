@@ -705,6 +705,9 @@ interface RightSidebarTabsetNodeProps {
   /** The Artifacts panel should take focus once it renders (opened via shortcut). */
   autoFocusArtifacts: boolean;
   onArtifactsAutoFocusConsumed: () => void;
+  /** The Plan panel should take focus once it renders (opened via shortcut). */
+  autoFocusPlan: boolean;
+  onPlanAutoFocusConsumed: () => void;
   // RightSidebar / GoalTab UI requests user-facing transitions only;
   // `budget_limited` is internal-only.
   onGoalSetStatus: (
@@ -952,6 +955,10 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
     artifacts: {
       autoFocus: props.autoFocusArtifacts,
       onAutoFocusConsumed: props.onArtifactsAutoFocusConsumed,
+    },
+    plan: {
+      autoFocus: props.autoFocusPlan,
+      onAutoFocusConsumed: props.onPlanAutoFocusConsumed,
     },
     goal: {
       snapshot: props.goal,
@@ -1503,6 +1510,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // panel claims focus once it renders, like terminals do with autoFocusTerminalSession. The
   // value is the pane whose copy claims it (Artifacts, like Review, can be open in two panes).
   const [artifactsFocusTabsetId, setArtifactsFocusTabsetId] = React.useState<string | null>(null);
+  const [planFocusTabsetId, setPlanFocusTabsetId] = React.useState<string | null>(null);
   const llmDebugLogsEnabled = useLlmDebugLogsEnabled(api);
   const desktopAvailable = useDesktopAvailable(api, desktopExperimentEnabled, workspaceId);
 
@@ -1971,11 +1979,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       }
       e.preventDefault();
       setCollapsed(false);
-      setLayout((prev) => selectOrAddTab(prev, "plan"));
+      const next = selectOrAddTab(getBaseLayout(), "plan");
+      setLayout(() => next);
+      setPlanFocusTabsetId(next.focusedTabsetId);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [setCollapsed, setLayout]);
+  }, [getBaseLayout, setCollapsed, setLayout]);
 
   // Auto-surface the Workflows tab when a run starts: the tab is the primary
   // run-detail surface (the chat card stays collapsed while it exists), but a
@@ -2525,6 +2535,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const focusPickedTool = (tabsetId: string, tool: TabType) => {
     if (tool === "review") setReviewFocusRequest((prev) => nextReviewFocusRequest(prev, tabsetId));
     else if (tool === "artifacts") setArtifactsFocusTabsetId(tabsetId);
+    else if (tool === "plan") setPlanFocusTabsetId(tabsetId);
     else setTabToFocus(tool);
   };
 
@@ -2927,6 +2938,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         goalCompleteInputRequest={goalCompleteInputRequest}
         autoFocusArtifacts={artifactsAutoFocusTabsetId === node.id}
         onArtifactsAutoFocusConsumed={() => setArtifactsFocusTabsetId(null)}
+        autoFocusPlan={planFocusTabsetId === node.id}
+        onPlanAutoFocusConsumed={() => setPlanFocusTabsetId(null)}
         onGoalSetStatus={handleGoalSetStatus}
         onGoalUpdateObjective={handleGoalUpdateObjective}
         onGoalUpdateBudget={handleGoalUpdateBudget}

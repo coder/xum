@@ -847,6 +847,13 @@ export const KEYBINDS = {
   /** Copy the active file's full contents to the clipboard in immersive review */
   REVIEW_COPY_FILE: { key: "y" },
 
+  // Plan tab shortcuts: only handled while focus is inside the Plan tab, like the Artifacts
+  // panel's single-key shortcuts.
+  /** Open the plan file in the external editor (Plan tab) */
+  PLAN_TAB_EDIT: { key: "e" },
+  /** Copy the plan to the clipboard (Plan tab) */
+  PLAN_TAB_COPY: { key: "y" },
+
   /** Toggle plan annotation mode in propose_plan */
   TOGGLE_PLAN_ANNOTATE: { key: "a", shift: true },
 
