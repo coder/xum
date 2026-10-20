@@ -987,6 +987,48 @@ describe("WorktreeManager.createWorkspace", () => {
     }
   });
 
+  it("caches an old-git result: one probe, eager creation each time (#5574)", async () => {
+    // Unlike a failed probe, a parsed old version is a real answer for this PATH, so the next
+    // creation must not spawn git --version again.
+    const fixture = await createWorktreeManagerFixture();
+    const realExec = disposableExec.execFileAsync;
+    let probes = 0;
+    const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+      (file, args, options) => {
+        const proc = realExec(file, args, options);
+        if (file === "git" && args[0] === "--version") {
+          probes++;
+          Object.defineProperty(proc, "result", {
+            value: proc.result.then((output) => ({ ...output, stdout: "git version 2.35.7\n" })),
+          });
+        }
+        return proc;
+      }
+    );
+    try {
+      await withUniquePath(fixture.rootDir, async () => {
+        for (const branchName of ["old-git-one", "old-git-two"]) {
+          const result = await fixture.manager.createWorkspace({
+            projectPath: fixture.projectPath,
+            branchName,
+            trunkBranch: "main",
+            skipRemoteSync: true,
+            trusted: true,
+            initLogger: fixture.initLogger,
+            deferMaterialization: true,
+          });
+          if (!result.success || !result.workspacePath) throw new Error("Expected creation");
+          expect(result.pendingMaterialization).toBeUndefined();
+          expect(existsSync(path.join(result.workspacePath, "README.md"))).toBe(true);
+        }
+        expect(probes).toBe(1);
+      });
+    } finally {
+      execSpy.mockRestore();
+      await fixture.cleanup();
+    }
+  });
+
   it("honors cancellation before a cached capability result is used", async () => {
     const fixture = await createWorktreeManagerFixture();
     const controller = new AbortController();

@@ -485,6 +485,33 @@ describe("PortableDesktopSession", () => {
     });
   });
 
+  test("a cached binary without the execute bit is not available (#5574)", async () => {
+    if (process.platform === "win32") {
+      // Windows has no execute bit; the cached .exe check is existence only there.
+      return;
+    }
+    await withPortableDesktopHarness(async ({ tempDir }) => {
+      const cacheShim = await writePortableDesktopShim({
+        rootDir: tempDir,
+        installMode: "cache",
+        config: {
+          startupInfo: createStartupInfo({ display: 14, vncPort: 5903, geometry: "800x600" }),
+          screenshotResult: createScreenshotResult(800, 600, "cache-screenshot"),
+          actionResult: { success: true },
+        },
+      });
+      const emptyBinDir = path.join(tempDir, "empty-bin");
+      await fs.mkdir(emptyBinDir);
+      process.env.PATH = emptyBinDir;
+      const cachedBinary = path.join(cacheShim.binDir, DESKTOP_DEFAULTS.BINARY_NAME);
+
+      expect(PortableDesktopSession.checkAvailability(tempDir)).toBe(true);
+      // Starting it would fail with EACCES, so the prerequisite check must not count it.
+      await fs.chmod(cachedBinary, 0o644);
+      expect(PortableDesktopSession.checkAvailability(tempDir)).toBe(false);
+    });
+  });
+
   test("parses startup JSON and exposes the reported session info", async () => {
     await withPortableDesktopHarness(async ({ tempDir }) => {
       if (process.platform === "win32") {

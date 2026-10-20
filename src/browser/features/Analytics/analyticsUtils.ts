@@ -128,9 +128,16 @@ export function formatUsdAxisTick(amount: number): string {
 const EPOCH_MS_MIN = 1e12;
 const EPOCH_MS_MAX = 1e13;
 
+// Epoch-ms columns of the analytics schema (src/common/analytics/schemaSql.ts) that the name rule
+// below misses. A closed list of the schema's own columns: widening the name pattern found one
+// more column per review round and did not converge (#5790).
+const SCHEMA_EPOCH_MS_COLUMNS: ReadonlySet<string> = new Set(["rolled_up_at_ms"]);
+
 function isEpochMsTimestamp(normalizedName: string, value: number): boolean {
   return (
-    (normalizedName.includes("timestamp") || normalizedName.endsWith("_at")) &&
+    (normalizedName.includes("timestamp") ||
+      normalizedName.endsWith("_at") ||
+      SCHEMA_EPOCH_MS_COLUMNS.has(normalizedName)) &&
     Number.isInteger(value) &&
     value >= EPOCH_MS_MIN &&
     value < EPOCH_MS_MAX

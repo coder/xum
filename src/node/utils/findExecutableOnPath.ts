@@ -12,7 +12,8 @@ function isRegularFile(candidate: string): boolean {
   }
 }
 
-function isExecutableFile(candidate: string): boolean {
+/** A regular file (symlinks followed) that this process may execute. */
+export function isExecutableFile(candidate: string): boolean {
   if (!isRegularFile(candidate)) return false;
   try {
     accessSync(candidate, constants.X_OK);

@@ -103,6 +103,19 @@ describe("findExecutableOnPath", () => {
     }
   );
 
+  // Runs in CI's Test / Windows job (#5574): a plain env object may carry only `Path`, and a
+  // name that already ends in a PATHEXT extension must match without a second extension.
+  test.if(isWindows)("reads `Path` and matches a name that has a PATHEXT extension", async () => {
+    const cwd = await makeDir("cwd");
+    const binDir = await makeDir("bin");
+    const expected = expectedPath(await writeTool(binDir));
+
+    const viaPath = findExecutableOnPath(TOOL, { env: { Path: binDir }, cwd });
+    expect(viaPath?.toLowerCase()).toBe(expected);
+    const withExtension = findExecutableOnPath(`${TOOL}.exe`, { env: { PATH: binDir }, cwd });
+    expect(withExtension?.toLowerCase()).toBe(expected);
+  });
+
   test("still resolves absolute PATH entries when the process cwd is gone", async () => {
     const binDir = await makeDir("bin");
     const expected = await writeTool(binDir);

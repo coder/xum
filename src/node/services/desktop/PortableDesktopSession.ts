@@ -12,7 +12,7 @@ import { assert } from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { execFileAsync } from "@/node/utils/disposableExec";
-import { findExecutableOnPath } from "@/node/utils/findExecutableOnPath";
+import { findExecutableOnPath, isExecutableFile } from "@/node/utils/findExecutableOnPath";
 
 interface PortableDesktopStartupInfo {
   width: number;
@@ -74,7 +74,9 @@ function resolvePortableDesktopBinary(rootDir: string): string {
       : DESKTOP_DEFAULTS.BINARY_NAME;
   const cacheDir = path.join(rootDir, "cache", DESKTOP_DEFAULTS.CACHE_DIR_NAME);
   const cachedBinaryPath = path.join(cacheDir, binaryFileName);
-  if (existsSync(cachedBinaryPath)) {
+  // Executable, not just present: a cached file without the execute bit fails to start with
+  // EACCES, so it must not count as available (#5574).
+  if (isExecutableFile(cachedBinaryPath)) {
     return cachedBinaryPath;
   }
 

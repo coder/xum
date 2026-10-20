@@ -8823,7 +8823,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "#### Goals the agent creates",
       "",
-      "A plain `xum run` (without `--goal`) whose agent calls `set_goal` adopts that goal when the first turn ends. From then on the run behaves like a CLI Goal Run: it drives the goal to completion and uses the exit codes below. The goal's own budget and turn cap bound the extra spend, because `set_goal` requires at least one of them. A run whose agent never sets a goal still executes a single request.",
+      "A plain `xum run` (without `--goal`) whose agent calls `set_goal` adopts that goal when the first turn ends. With `--mode plan`, it also adopts a goal that the agent sets in the execution turn that follows the auto-approved plan. From then on the run behaves like a CLI Goal Run: it drives the goal to completion and uses the exit codes below. The goal's own budget and turn cap bound the extra spend, because `set_goal` requires at least one of them. A run whose agent never sets a goal still executes a single request.",
       "",
       "With `--json`, adoption emits a `goal-adopted` event (`goalId`, `objective`, `status`, `budgetCents`, `turnCap`), followed by the same `goal-continuing`, `goal-completed`, or `goal-incomplete` events as `--goal`. The `goal-not-continued` event that earlier versions emitted no longer exists.",
       "",
