@@ -59,12 +59,13 @@ export const FLIGHT_RECORDER_RPC_MAX_ERROR_CODE_CHARS = 64;
 /** A completed (non-subscription) call longer than this is kept as a span and trips `slow-rpc`. */
 export const FLIGHT_RECORDER_SLOW_RPC_MS = 2000;
 /**
- * Calls that run long by design: a manual perf capture, and a user's bash command. They keep their
- * spans but do not trip `slow-rpc`, so the trip list shows stalls, not expected waits (#5554).
+ * Calls that run long by design: a manual perf capture lasts its whole capture window. They keep
+ * their spans but do not trip `slow-rpc`, so the trip list shows stalls, not expected waits
+ * (#5554). `workspace.executeBash` is not exempt: internal latency-sensitive callers (git status
+ * refresh, branch probes) use it too, so its slow calls stay visible.
  */
 export const FLIGHT_RECORDER_SLOW_RPC_TRIP_EXEMPT_PATHS: ReadonlySet<string> = new Set([
   "perfCaptures.captureNow",
-  "workspace.executeBash",
 ]);
 export const FLIGHT_RECORDER_RPC_SLOW_CALL_CAPACITY = 200;
 export const FLIGHT_RECORDER_RPC_WS_WAIT_CAPACITY = 200;

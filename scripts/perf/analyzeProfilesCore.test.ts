@@ -7,7 +7,6 @@ import {
   buildReport,
   createFrameIdentifier,
   looksLikeCpuProfile,
-  PROFILER_START_FRAME,
   readCpuProfile,
   renderFolded,
   renderJson,
@@ -52,10 +51,8 @@ function cpuProfile(
     })),
     startTime: 0,
     endTime: endTime ?? timeDeltas.reduce((sum, d) => sum + Math.max(d, 0), 0),
-    // A zero-time first sample: readCpuProfile charges the first sample to `(profiler start)`, so
-    // the given samples are weighed as written.
-    samples: [nodes[0].id, ...samples],
-    timeDeltas: [0, ...timeDeltas],
+    samples,
+    timeDeltas,
   };
 }
 
@@ -165,28 +162,6 @@ describe("readCpuProfile", () => {
     expect(result.warnings).toEqual(["1 negative timeDeltas clamped to 0 (sample reordering)"]);
   });
 
-  test("charges the first sample's time to (profiler start), not to the function it hit", () => {
-    // Raw profile (no helper): Profiler.start blocks 400 ms before the first sample lands in A.
-    const result = read({
-      nodes: [
-        {
-          id: 1,
-          callFrame: { functionName: "(root)", url: "", lineNumber: -1, columnNumber: -1 },
-          children: [2],
-        },
-        { id: 2, callFrame: { functionName: "A", url: APP, lineNumber: 0, columnNumber: 0 } },
-      ],
-      startTime: 0,
-      endTime: 401_000,
-      samples: [2, 2],
-      timeDeltas: [400_000, 1000],
-    });
-    expect(result.profile.stacks).toEqual([
-      { frames: [expect.objectContaining({ functionName: "A" })], weightUs: 1000, count: 1 },
-      { frames: [PROFILER_START_FRAME], weightUs: 400_000, count: 1 },
-    ]);
-  });
-
   test("accepts parent links instead of children", () => {
     const json = cpuProfile(
       [
@@ -206,7 +181,7 @@ describe("readCpuProfile", () => {
     [
       "sample referencing a missing node",
       cpuProfile([root([])], [99], [1]),
-      /sample 1 references unknown node 99/,
+      /sample 0 references unknown node 99/,
     ],
     ["length mismatch", cpuProfile([root([])], [1, 1], [1]), /differ in length/],
     [
@@ -569,7 +544,7 @@ test("CLI skips malformed files, ignores other JSON and still reports valid prof
     expect(
       report.candidate.inputs.skipped.map((s) => [s.path.split("/").pop(), s.reason.split(":")[0]])
     ).toEqual([
-      ["chrome-cpu-profile.json", "samples (3) and timeDeltas (2) differ in length"],
+      ["chrome-cpu-profile.json", "samples (2) and timeDeltas (1) differ in length"],
       ["truncated.cpuprofile", "invalid JSON"],
     ]);
     expect(report.candidate.inputs.ignored.map((s) => s.path.split("/").pop())).toEqual([
