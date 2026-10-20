@@ -6200,6 +6200,27 @@ describe("ProviderModelFactory Ollama tool schemas", () => {
     });
   });
 
+  // #6083: a draft-07 `dependencies` entry is a schema when it is an object and a list of
+  // property names when it is an array. Only the schema needs the rewrite.
+  it("rewrites type arrays in draft-07 schema dependencies and keeps property lists", async () => {
+    const sent = await sendTools({
+      mcp_tool: rawTool({
+        type: "object",
+        properties: { a: { type: "string" }, b: { type: "string" } },
+        dependencies: {
+          a: { properties: { c: { type: ["string", "null"] } } },
+          b: ["a"],
+        },
+      }),
+    });
+
+    expect(typeArrayPaths(sent.mcp_tool)).toEqual([]);
+    expect((sent.mcp_tool as { dependencies: unknown }).dependencies).toEqual({
+      a: { properties: { c: { anyOf: [{ type: "string" }, { type: "null" }] } } },
+      b: ["a"],
+    });
+  });
+
   // Old Ollama's OpenAI-compatible /v1 endpoint decodes tools into the same Go structs, so a
   // custom openai-compatible provider pointed at it needs the same rewrite.
   it("rewrites type arrays for custom openai-compatible providers", async () => {

@@ -476,6 +476,32 @@ describe("generateWorkspaceIdentity candidate settings", () => {
     }
   );
 
+  // #5954: Bedrock and OpenRouter spell "thinking off" in their own namespaces.
+  test.each([{ route: "bedrock" as const }, { route: "openrouter" as const }])(
+    "forces propose_name when the $route route serializes thinking off",
+    async ({ route }) => {
+      const model = "anthropic:claude-haiku-5-5";
+      const aiService = titleAIService((modelString) =>
+        Promise.resolve(
+          Ok({
+            ...pinnedOptionsFor(modelString, createTitleModel(modelString)).data,
+            optionsRouteProvider: route,
+          })
+        )
+      );
+      const streamTextSpy = spyOn(aiSdk, "streamText").mockReturnValue(proposeNameStream);
+
+      const result = await generateWorkspaceIdentity(
+        "Add setting",
+        [{ model, thinkingLevel: "off" }],
+        aiService
+      );
+
+      expect(result.success).toBe(true);
+      expect(streamTextSpy.mock.calls[0]?.[0].toolChoice).toEqual(forcedProposeName);
+    }
+  );
+
   test("skips a candidate whose model cannot be created and reports the last failure", async () => {
     const createModelWithPinnedOptions = mock((modelString: string) =>
       Promise.resolve(

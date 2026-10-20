@@ -48,8 +48,15 @@ describe("fast mode service tier", () => {
     );
     expect(getFastModeUnavailableReason("team-claude:claude-opus-5-5", custom)).toBe("route");
     expect(getFastModeUnavailableReason("team-claude:claude-haiku-4-5", custom)).toBe("model");
-    // A generic OpenAI-compatible dialect gives the model no known identity.
-    expect(getFastModeUnavailableReason("team-compat:claude-opus-5-5", custom)).toBe("model");
+    // #5764: an unknown identity cannot rule fast mode out, so the route is the reason. A generic
+    // OpenAI-compatible dialect, a Copilot model and a bare Coder model have no known identity.
+    expect(getFastModeUnavailableReason("team-compat:claude-opus-5-5", custom)).toBe("route");
+    expect(getFastModeUnavailableReason("team-compat:claude-haiku-4-5", custom)).toBe("route");
+    expect(getFastModeUnavailableReason("github-copilot:claude-opus-5-5", null)).toBe("route");
+    expect(getFastModeUnavailableReason("coder:claude-opus-5-5", null)).toBe("route");
+    // A Coder or Bedrock model with a known upstream keeps the model reason.
+    expect(getFastModeUnavailableReason("coder:anthropic/claude-haiku-4-5", null)).toBe("model");
+    expect(getFastModeUnavailableReason("bedrock:anthropic.claude-haiku-4-5", null)).toBe("model");
   });
 
   test("resolves direct native providers and rejects gateway routes", () => {

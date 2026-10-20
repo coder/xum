@@ -3416,6 +3416,65 @@ describe("CoderOauthService", () => {
       expect((deps.providersConfig.coder as Record<string, unknown>).discoveredModels).toEqual([]);
     });
 
+    // #5762: dispose() stops a committed login's discovery. Before, its retries outlived the
+    // service and reached whichever fetch mock the next test installed (#5758).
+    it("stops a committed login's provider discovery on dispose", async () => {
+      deps.providersConfig = { coder: { deploymentUrl: DEPLOYMENT_URL } };
+      let listingRequests = 0;
+      let firstListing!: () => void;
+      const listingStarted = new Promise<void>((resolve) => (firstListing = resolve));
+      mockFetch(async (input, init) => {
+        const url = fetchUrl(input);
+        if (url.startsWith("http://127.0.0.1")) {
+          return originalFetch(input, init);
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/buildinfo`) {
+          return jsonResponse({ version: "v2.99.0" });
+        }
+        if (url === `${DEPLOYMENT_URL}/.well-known/oauth-authorization-server`) {
+          return discoveryResponse();
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/register`) {
+          return jsonResponse({ client_id: "client_new", client_secret: "secret_new" });
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/tokens`) {
+          return jsonResponse({
+            access_token: "at_dispose",
+            refresh_token: "rt_dispose",
+            expires_in: 86400,
+            token_type: "Bearer",
+          });
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          if (new Headers(init?.headers).get("authorization") !== "Bearer at_dispose") {
+            return new Response("forbidden", { status: 403 });
+          }
+          listingRequests++;
+          firstListing();
+          // Transient: discovery retries it after a delay.
+          return new Response("unavailable", { status: 500 });
+        }
+        return new Response(`unexpected url: ${url}`, { status: 500 });
+      });
+
+      const startResult = await service.startDesktopFlow({ deploymentUrl: DEPLOYMENT_URL });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) return;
+      const { flowId, authorizeUrl } = startResult.data;
+      const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
+      const callbackUrl = new URL(new URL(authorizeUrl).searchParams.get("redirect_uri")!);
+      callbackUrl.searchParams.set("code", "auth_code_dispose");
+      callbackUrl.searchParams.set("state", flowId);
+      await originalFetch(callbackUrl);
+      expect((await waitPromise).success).toBe(true);
+
+      await listingStarted;
+      await service.dispose();
+      // The retries run a few hundred ms apart. A stopped discovery makes none of them.
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      expect(listingRequests).toBe(1);
+    });
+
     /** Re-login fetch mock whose post-login discovery lists exactly one anthropic model. */
     function mockReLoginFetch(): void {
       mockFetch(async (input, init) => {
