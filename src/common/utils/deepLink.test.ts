@@ -2,6 +2,20 @@ import { describe, expect, test } from "bun:test";
 import { parseXumDeepLink, resolveProjectPathFromProjectQuery } from "./deepLink";
 
 describe("parseXumDeepLink", () => {
+  test("parses canonical xum://chat/new", () => {
+    const payload = parseXumDeepLink(
+      "xum://chat/new/?project=xum&projectPath=%2Ftmp%2Frepo&projectId=proj_123&prompt=hello%20world"
+    );
+
+    expect(payload).toEqual({
+      type: "new_chat",
+      project: "xum",
+      projectPath: "/tmp/repo",
+      projectId: "proj_123",
+      prompt: "hello world",
+    });
+  });
+
   test("normalizes the legacy mux:// scheme to the same payload", () => {
     expect(parseXumDeepLink("mux://chat/new?prompt=hello")).toEqual(
       parseXumDeepLink("xum://chat/new?prompt=hello")
