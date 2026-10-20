@@ -251,6 +251,17 @@ describe("retainExemptKernelRecordResult", () => {
       expect(retained?.skillDir).toBe(skillDir);
       expect(retained?.pluginRoot).toBeUndefined();
       expect(JSON.stringify(retained).length).toBeLessThanOrEqual(MAX_FILE_CONTENT_SIZE);
+
+      // Corrupted input with skillDirUnavailable too: the snapshot trusts the
+      // reason over the path, so the path must not survive alone.
+      const corrupted = retainExemptKernelRecordResult("agent_skill_read", {
+        success: true,
+        skill: { ...skill, body: "B".repeat(MAX_FILE_CONTENT_SIZE), pad },
+        skillDir,
+        skillDirUnavailable: `Off host ${"u".repeat(3000)}`,
+      }) as { skillDir?: string; skill?: unknown };
+      expect(AgentSkillPackageSchema.safeParse(corrupted?.skill).success).toBe(true);
+      expect(corrupted?.skillDir).toBeUndefined();
     });
 
     it("keeps the skill without its location when the location leaves no body budget", () => {
