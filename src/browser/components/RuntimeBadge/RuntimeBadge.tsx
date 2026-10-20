@@ -82,6 +82,12 @@ function getRuntimeInfo(
         label: `Coder Workspace: ${coderWorkspaceName ?? runtimeConfig.host}`,
       };
     }
+    if (runtimeConfig.daytona) {
+      return {
+        type: "daytona",
+        label: `Daytona sandbox: ${runtimeConfig.daytona.sandboxId ?? runtimeConfig.host}`,
+      };
+    }
     const hostname = extractSshHostname(runtimeConfig);
     return { type: "ssh", label: `SSH: ${hostname ?? runtimeConfig.host}` };
   }

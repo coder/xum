@@ -10,9 +10,12 @@ import {
   buildRuntimeString,
   RUNTIME_MODE,
   CODER_RUNTIME_PLACEHOLDER,
+  DAYTONA_RUNTIME_PLACEHOLDER,
 } from "@/common/types/runtime";
+import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import {
+  readDaytonaOptionDefaults,
   readOptionField,
   readSshOptionDefaults,
   type RuntimeOptionDefaults,
@@ -50,6 +53,7 @@ export interface DraftWorkspaceSettings {
 interface SshRuntimeConfig {
   host: string;
   coder?: CoderWorkspaceConfig;
+  daytona?: DaytonaSandboxConfig;
 }
 
 interface SshRuntimeState {
@@ -89,6 +93,9 @@ const buildRuntimeForMode = (
       const effectiveHost =
         sshConfig.coder && !sshConfig.host.trim() ? CODER_RUNTIME_PLACEHOLDER : sshConfig.host;
 
+      if (sshConfig.daytona) {
+        return { mode: "ssh", host: DAYTONA_RUNTIME_PLACEHOLDER, daytona: sshConfig.daytona };
+      }
       return {
         mode: "ssh",
         host: effectiveHost,
@@ -126,8 +133,12 @@ const mergeRememberedRuntimeConfig = (
           !nextRuntime.host.trim() && remembered.ssh.host.trim()
             ? remembered.ssh.host
             : nextRuntime.host,
+        // A Daytona selection must never pick up a remembered Coder config: one managed
+        // backend per workspace (the runtime schema rejects both).
         coder:
-          nextRuntime.coder === undefined && remembered.ssh.coder != null
+          nextRuntime.coder === undefined &&
+          nextRuntime.daytona == null &&
+          remembered.ssh.coder != null
             ? remembered.ssh.coder
             : nextRuntime.coder,
       };
@@ -163,6 +174,7 @@ const mergeRememberedRuntimeConfig = (
 const normalizeRuntimeChoice = (value: unknown): RuntimeChoice | null => {
   if (
     value === "coder" ||
+    value === "daytona" ||
     value === RUNTIME_MODE.LOCAL ||
     value === RUNTIME_MODE.WORKTREE ||
     value === RUNTIME_MODE.SSH ||
@@ -179,6 +191,8 @@ const buildRuntimeFromChoice = (choice: RuntimeChoice): ParsedRuntime => {
   switch (choice) {
     case "coder":
       return { mode: RUNTIME_MODE.SSH, host: CODER_RUNTIME_PLACEHOLDER };
+    case "daytona":
+      return { mode: RUNTIME_MODE.SSH, host: DAYTONA_RUNTIME_PLACEHOLDER };
     case RUNTIME_MODE.LOCAL:
       return { mode: RUNTIME_MODE.LOCAL };
     case RUNTIME_MODE.WORKTREE:
@@ -222,6 +236,8 @@ export function useDraftWorkspaceSettings(
   coderConfigFallback: CoderWorkspaceConfig;
   /** Preserves the last SSH host when leaving Coder so the input stays populated. */
   sshHostFallback: string;
+  /** Project Daytona defaults (Settings > Runtimes) that start a Daytona selection. */
+  daytonaConfigFallback: DaytonaSandboxConfig;
   /** Set the currently selected runtime (discriminated union) */
   setSelectedRuntime: (runtime: ParsedRuntime) => void;
   setTrunkBranch: (branch: string) => void;
@@ -350,9 +366,11 @@ export function useDraftWorkspaceSettings(
 
   const coderDefaultFromString =
     parsedDefault?.mode === RUNTIME_MODE.SSH && parsedDefault.host === CODER_RUNTIME_PLACEHOLDER;
+  const daytonaDefault = settingsDefaultRuntime === "daytona";
   // Defaults must stay explicit and sticky; last-used SSH state should only seed inputs.
-  const defaultRuntimeChoice: RuntimeChoice =
-    defaultRuntimeMode === RUNTIME_MODE.SSH && coderDefaultFromString
+  const defaultRuntimeChoice: RuntimeChoice = daytonaDefault
+    ? "daytona"
+    : defaultRuntimeMode === RUNTIME_MODE.SSH && coderDefaultFromString
       ? "coder"
       : defaultRuntimeMode;
 
@@ -415,9 +433,15 @@ export function useDraftWorkspaceSettings(
   // `setSelectedRuntime` changed on every keystroke and re-rendered CreationControls (#5937).
   // useDraftWorkspaceSettings.compiler.test.tsx guards their identity.
   // Uses discriminated union: SSH has host, Docker has image.
+  // Parsed into a fresh object, so it too must follow the last hook to keep its identity.
+  const daytonaConfigFallback = readDaytonaOptionDefaults(lastRuntimeConfigs);
   const defaultRuntime = buildRuntimeForMode(
     defaultRuntimeMode,
-    { host: defaultSshHost, coder: defaultSshCoder },
+    {
+      host: defaultSshHost,
+      coder: defaultSshCoder,
+      daytona: daytonaDefault ? daytonaConfigFallback : undefined,
+    },
     defaultDockerImage,
     lastShareCredentials,
     defaultDevcontainerConfigPath,
@@ -491,6 +515,7 @@ export function useDraftWorkspaceSettings(
     },
     coderConfigFallback,
     sshHostFallback,
+    daytonaConfigFallback,
     setSelectedRuntime,
     setTrunkBranch,
     getRuntimeString,

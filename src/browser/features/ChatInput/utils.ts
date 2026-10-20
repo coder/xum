@@ -35,7 +35,8 @@ export type CreationRuntimeValidationError =
   | { mode: "ssh"; kind: "missingHost" }
   | { mode: "ssh"; kind: "missingCoderWorkspace" }
   | { mode: "ssh"; kind: "missingCoderTemplate" }
-  | { mode: "ssh"; kind: "missingCoderPreset" };
+  | { mode: "ssh"; kind: "missingCoderPreset" }
+  | { mode: "ssh"; kind: "missingDaytonaSandbox" };
 
 export interface SkillInvocation {
   descriptor: InvocableSkill;
@@ -456,6 +457,13 @@ export function validateCreationRuntime(
   }
 
   if (runtime.mode === "ssh") {
+    // Daytona: a new sandbox needs nothing more (snapshot and size have defaults); attaching
+    // (shared) needs the picked sandbox.
+    if (runtime.daytona) {
+      return runtime.daytona.shared === true && !(runtime.daytona.sandboxId ?? "").trim()
+        ? { mode: "ssh", kind: "missingDaytonaSandbox" }
+        : null;
+    }
     if (runtime.coder) {
       if (runtime.coder.existingWorkspace) {
         // Existing mode: workspace name is required

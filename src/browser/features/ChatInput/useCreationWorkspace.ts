@@ -11,6 +11,7 @@ import type {
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
+import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import { handOffCreationAiSelection } from "@/browser/utils/aiSelectionIntent";
 import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
@@ -187,6 +188,8 @@ interface UseCreationWorkspaceReturn {
   coderConfigFallback: CoderWorkspaceConfig;
   /** Fallback SSH host used when leaving the Coder runtime. */
   sshHostFallback: string;
+  /** Project Daytona defaults used when selecting the Daytona runtime. */
+  daytonaConfigFallback: DaytonaSandboxConfig;
   defaultRuntimeMode: RuntimeChoice;
   /** Set the currently selected runtime (discriminated union) */
   setSelectedRuntime: (runtime: ParsedRuntime) => void;
@@ -210,7 +213,10 @@ interface UseCreationWorkspaceReturn {
 }
 
 /** Runtime availability status for each mode */
-export type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus>;
+// Daytona is `ssh` plus a sub-config, so its availability rides next to the mode-keyed entries.
+export type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus> & {
+  daytona?: RuntimeAvailabilityStatus;
+};
 
 export type RuntimeAvailabilityState =
   | { status: "loading" }
@@ -350,8 +356,14 @@ export function useCreationWorkspace({
     useState<RuntimeAvailabilityState>({ status: "loading" });
 
   // Centralized draft workspace settings with automatic persistence
-  const { settings, coderConfigFallback, sshHostFallback, setSelectedRuntime, setTrunkBranch } =
-    useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk, draftId ?? "");
+  const {
+    settings,
+    coderConfigFallback,
+    sshHostFallback,
+    daytonaConfigFallback,
+    setSelectedRuntime,
+    setTrunkBranch,
+  } = useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk, draftId ?? "");
   const creationAgentId = resolveCreationAgentId(settings.agentId, agentBaseById);
 
   // The draft owns its AI choices and manual name (CreationDraftStore).
@@ -1061,6 +1073,7 @@ export function useCreationWorkspace({
     selectedRuntime: settings.selectedRuntime,
     coderConfigFallback,
     sshHostFallback,
+    daytonaConfigFallback,
     defaultRuntimeMode: settings.defaultRuntimeMode,
     setSelectedRuntime,
     toast,

@@ -6,6 +6,7 @@ import type { z } from "zod";
 import type { RuntimeConfigSchema } from "../orpc/schemas";
 import { RuntimeEnablementIdSchema, RuntimeModeSchema } from "../orpc/schemas/runtime";
 import type { CoderWorkspaceConfig } from "../orpc/schemas/coder";
+import type { DaytonaSandboxConfig } from "../orpc/schemas/daytona";
 
 // Re-export CoderWorkspaceConfig type from schema (single source of truth)
 export type { CoderWorkspaceConfig };
@@ -111,6 +112,14 @@ export const DEVCONTAINER_RUNTIME_PREFIX = "devcontainer ";
 /** Placeholder host for Coder SSH runtimes (where host is derived from Coder config) */
 export const CODER_RUNTIME_PLACEHOLDER = "coder://";
 
+/** Placeholder host for Daytona SSH runtimes (finalizeConfig derives the real alias) */
+export const DAYTONA_RUNTIME_PLACEHOLDER = "daytona://";
+
+/** Hosts the creation UI fills in for managed SSH backends; never a user's SSH host. */
+export function isManagedSshPlaceholder(host: string): boolean {
+  return host === CODER_RUNTIME_PLACEHOLDER || host === DAYTONA_RUNTIME_PLACEHOLDER;
+}
+
 export type RuntimeConfig = z.infer<typeof RuntimeConfigSchema>;
 
 /**
@@ -120,7 +129,7 @@ export type RuntimeConfig = z.infer<typeof RuntimeConfigSchema>;
 export type ParsedRuntime =
   | { mode: "local" }
   | { mode: "worktree" }
-  | { mode: "ssh"; host: string; coder?: CoderWorkspaceConfig }
+  | { mode: "ssh"; host: string; coder?: CoderWorkspaceConfig; daytona?: DaytonaSandboxConfig }
   | { mode: "docker"; image: string; shareCredentials?: boolean }
   | { mode: "devcontainer"; configPath: string; shareCredentials?: boolean };
 
@@ -235,6 +244,7 @@ export function buildRuntimeConfig(parsed: ParsedRuntime): RuntimeConfig | undef
         host: parsed.host.trim(),
         srcBaseDir: "~/mux", // Default remote base directory (tilde resolved by backend)
         coder: parsed.coder,
+        daytona: parsed.daytona,
       };
     case RUNTIME_MODE.DOCKER:
       return {
