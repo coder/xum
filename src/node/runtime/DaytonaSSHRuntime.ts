@@ -1094,7 +1094,14 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     }
     // A failed check (dirty or unpushed work) keeps the workspace and its sandbox.
     const sshResult = await sshDelete();
-    if (!sshResult.success) return sshResult;
+    if (!sshResult.success) {
+      if (!force) return sshResult;
+      // Forced: the workspace goes anyway, so the sandbox is still released or handed off.
+      const notice =
+        `The checkout ${deletedPath} could not be deleted on Daytona sandbox "${sandboxId}" ` +
+        `(${sshResult.error}); delete it there if you no longer need it.`;
+      return this.settleSandbox(sandboxId, { success: true, deletedPath, notice }, { force });
+    }
     return this.settleSandbox(sandboxId, sshResult, {
       force,
       errorPrefix: "SSH delete succeeded, but ",

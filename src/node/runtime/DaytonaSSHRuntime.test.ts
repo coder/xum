@@ -773,6 +773,30 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(newAccount.find("xum-same")).toBeUndefined();
   });
 
+  it("still hands off a started sandbox when a forced removal cannot delete the checkout", async () => {
+    const labels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.getInstanceId() };
+    rig.plane.addSandbox({ id: "sb-1", name: "xum-owner", labels });
+    const owner = { sandboxId: "xum-owner", shared: false, ...SMALL };
+    rig.workspaces.push(
+      { workspaceId: "ws-o", runtimeConfig: sshDaytonaConfig(owner) },
+      { workspaceId: "ws-t", runtimeConfig: sshDaytonaConfig({ sandboxId: "sb-1", shared: true }) }
+    );
+    claimRemovals();
+    await rig.service.ensureSshAccess("xum-owner");
+    sshDeleteSpy.mockResolvedValue({ success: false, error: "ssh: host unreachable" });
+
+    const forced = await makeRuntime(owner, rig, { workspaceId: "ws-o" }).deleteWorkspace(
+      "/home/me/project",
+      "ws-o",
+      true
+    );
+
+    expect(forced.success).toBe(true);
+    expect(forced.success ? forced.notice : forced.error).toContain("ssh: host unreachable");
+    expect(rig.plane.find("sb-1")?.labels).toEqual({});
+    expect(rig.writer.removed).toContain("xum-owner");
+  });
+
   it("starts a stopped sandbox to run the dirty check and keeps a dirty workspace", async () => {
     rig.plane.addSandbox({ id: "sb-dirty", state: "stopped" });
     sshDeleteSpy.mockResolvedValue({ success: false, error: "uncommitted changes" });
