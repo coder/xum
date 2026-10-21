@@ -92,6 +92,7 @@ import {
   chooseStagedMethod,
   detectInstallMethods,
   generatesManifest,
+  methodLabel,
   installMethodRequest,
   marketplaceManifest,
   readInstalledGeneratedFrom,
@@ -2715,9 +2716,27 @@ export class AgentPluginInstallService {
     });
     if (!plugin) {
       const reasons = diagnostics.map((d) => d.message);
-      throw new Error(
-        reasons.length > 0 ? `Invalid plugin: ${reasons.join("; ")}` : "Invalid plugin manifest."
-      );
+      const problem =
+        reasons.length > 0 ? `Invalid plugin: ${reasons.join("; ")}` : "Invalid plugin manifest.";
+      // A preview without a method must still reach the "Install as" choice: when the first
+      // method's manifest is invalid (a broken .claude-plugin/plugin.json next to valid skill
+      // folders), preview the next method and name the problem. No file was written: of a
+      // repository's methods only `skills` generates one, and it is always the last method.
+      // A marketplace entry has its own methods (entryInstallMethods) and gets no fallback.
+      const next =
+        marketplace === undefined ? choice.methods[choice.methods.indexOf(method) + 1] : undefined;
+      if (request.mode === "first" && next !== undefined) {
+        assert(!generatesManifest(method), "validateStagedClone: a generated manifest is last");
+        const fallback = await this.validateStagedClone(stagedDir, source, {
+          mode: "exact",
+          method: next,
+        });
+        return {
+          ...fallback,
+          warnings: [`${methodLabel(method)}: ${problem}`, ...fallback.warnings],
+        };
+      }
+      throw new Error(problem);
     }
     return {
       plugin,

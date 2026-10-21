@@ -282,7 +282,7 @@ function sameInstallMethod(a: AgentPluginInstallMethod, b: AgentPluginInstallMet
   }
 }
 
-function methodLabel(method: AgentPluginInstallMethod): string {
+export function methodLabel(method: AgentPluginInstallMethod): string {
   return AGENT_PLUGIN_INSTALL_METHOD_LABELS[method.kind];
 }
 
@@ -396,6 +396,34 @@ export interface MarketplaceEntryContext {
 }
 
 /**
+ * SECURITY AUDIT (downgrade): a build that predates `generatedFrom` reads a generated plugin.json
+ * as an ordinary Agent Plugin and fills in the default component paths: hooks.js, agents/,
+ * workflows/, mcp.json or .mcp.json (`contributes`), and hooks/hooks.json (Codex hooks, which an
+ * `extensions["com.openai"].hooks` list replaces). So the generated manifest names each of them
+ * explicitly: `contributes` paths point into `.git`, which no commit can create (git refuses to
+ * track a `.git` path), so they never resolve, and an empty Codex hooks list turns the default
+ * file off. Those builds then load only the skills roots the manifest lists. Builds before
+ * `contributes` existed (#3872, the experimental flag) read only skills/ and mcp.json.
+ */
+export const INERT_COMPONENT_PATH = ".git/xum-generated-no-component";
+
+/** The `contributes` and `extensions["com.openai"]` members that keep older builds inert. */
+export function inertGeneratedComponents(): {
+  contributes: Record<"hooks" | "agents" | "workflows" | "mcp", string>;
+  openai: { hooks: [] };
+} {
+  return {
+    contributes: {
+      hooks: INERT_COMPONENT_PATH,
+      agents: INERT_COMPONENT_PATH,
+      workflows: INERT_COMPONENT_PATH,
+      mcp: INERT_COMPONENT_PATH,
+    },
+    openai: { hooks: [] },
+  };
+}
+
+/**
  * The methods of a marketplace entry's folder: its own manifest when it has one; else the entry
  * as the manifest, for a relative source only (an update must find the entry again in the same
  * repository); else Skills for a remote repository of SKILL.md files. A manifest plus entry
@@ -493,6 +521,13 @@ export function chooseStagedMethod(
     return { method, methods, warnings, skillsCliSkills: [] };
   }
   const method = chooseInstallMethod(detected.methods, request);
+  if (method === undefined && request.mode === "update" && detected.methods.length > 0) {
+    // The installed plugin.json is the repository's own, or a Claude one: Xum does not turn it
+    // into a generated skills install on update (InstallMethodRequest).
+    throw new Error(
+      `The repository no longer has the manifest this plugin was installed from; it fits: ${detected.methods.map(methodLabel).join(", ")}. Uninstall the plugin and install it again to choose a method.`
+    );
+  }
   if (method === undefined) throw new Error(noInstallMethodMessage(source.subpath));
   return {
     method,
@@ -522,12 +557,16 @@ async function skillsManifest(
   const dropped = roots
     .slice(MAX_SKILLS_ROOTS)
     .flatMap((root) => root.skills.map((skill) => `${root.root}/${skill}`));
+  const inert = inertGeneratedComponents();
   const manifest = {
     $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
     name: generatedPluginName(source),
     description: `Skills from ${displayRepoUrl(source.url)}${source.subpath !== undefined ? `/${source.subpath}` : ""}`,
-    contributes: { skills: kept.map((root) => root.root) },
-    extensions: { mux: { generatedFrom: { kind: "skills" } satisfies GeneratedFrom } },
+    contributes: { skills: kept.map((root) => root.root), ...inert.contributes },
+    extensions: {
+      mux: { generatedFrom: { kind: "skills" } satisfies GeneratedFrom },
+      "com.openai": inert.openai,
+    },
   };
   const warnings =
     dropped.length > 0

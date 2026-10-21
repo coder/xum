@@ -25,6 +25,11 @@ export interface ClaudePluginComponents {
   commands?: string[];
   /** `hooks` file paths, read after the default `hooks/hooks.json` (Claude merges them). */
   hooks?: string[];
+  /**
+   * File names of the `.md` files that `agents` lists (all in `contributes.agents`). Claude loads
+   * only these; discovery loads the folder only when it holds no other agent file.
+   */
+  agentFiles?: string[];
 }
 
 /** How a Claude manifest is read: the file it came from, and the skills rule. */
@@ -124,10 +129,13 @@ function readPathList(
  * Claude `agents` is a list of `.md` files. Xum reads one agents folder, so the list maps only
  * when every file sits in one folder below the plugin root. Otherwise Xum warns and reads the
  * default `agents/`. The plugin root itself is refused: it would load every Markdown file there.
+ * The listed file names go to discovery (ClaudePluginComponents.agentFiles), which refuses the
+ * folder when it holds an agent file that the list does not name.
  */
-function agentsFolder(value: unknown, warnings: string[]): { agents?: string } {
+function agentsFolder(value: unknown, warnings: string[]): { agents?: string; files?: string[] } {
   if (value === undefined) return {};
   const folders = new Set<string>();
+  const files: string[] = [];
   for (const entry of asList(value)) {
     const normalized = claudeComponentPath(entry);
     if (!normalized?.endsWith(".md")) {
@@ -135,9 +143,12 @@ function agentsFolder(value: unknown, warnings: string[]): { agents?: string } {
       break;
     }
     folders.add(path.posix.dirname(normalized));
+    files.push(path.posix.basename(normalized));
   }
   const [folder] = folders;
-  if (folders.size === 1 && folder !== undefined && folder !== ".") return { agents: folder };
+  if (folders.size === 1 && folder !== undefined && folder !== ".") {
+    return { agents: folder, files };
+  }
   warnings.push(
     "'agents' must list .md files in one folder below the plugin root; reading the default agents/ instead"
   );
@@ -270,10 +281,13 @@ export function normalizeClaudeManifest(
     replaceDefaultSkills: options.replaceDefaultSkills ?? false,
   };
   const manifest = readMetadata(raw, warnings);
+  const agents = agentsFolder(raw.agents, warnings);
   manifest.contributes = {
     ...skillsRoots(raw.skills, warnings, resolved),
-    ...agentsFolder(raw.agents, warnings),
+    ...(agents.agents !== undefined ? { agents: agents.agents } : {}),
     ...mcpFile(raw.mcpServers, warnings),
   };
-  return { manifest, warnings, claude: readClaudeComponents(raw, warnings, resolved.label) };
+  const claude = readClaudeComponents(raw, warnings, resolved.label);
+  if (agents.files !== undefined) claude.agentFiles = agents.files;
+  return { manifest, warnings, claude };
 }

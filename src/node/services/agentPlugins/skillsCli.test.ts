@@ -11,6 +11,7 @@ import {
   skillsCliStatus,
   type SkillsCliOptions,
 } from "./skillsCli";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 const REPO = "https://github.com/anthropics/skills.git";
 
@@ -216,6 +217,54 @@ describe("skills CLI run", () => {
     expect(run.output.endsWith("fatal: repository not found")).toBe(true);
     expect(run.output.length).toBeLessThan(70 * 1024);
     expect(run.output).not.toContain("progress line 0\n");
+  });
+
+  test("an existing skill folder stops the run: the CLI would replace it without asking", async () => {
+    await fakeNode("v22.20.0");
+    await fakeInstallingNpx();
+    const kept = path.join(home, ".agents", "skills", "pdf");
+    await fs.mkdir(kept, { recursive: true });
+    await fs.writeFile(path.join(kept, "SKILL.md"), "# hand-edited");
+    // A dangling link is an entry too: the CLI would delete it.
+    await fs.symlink(path.join(root, "gone"), path.join(home, ".agents", "skills", "xlsx"));
+
+    await expect(
+      installWithSkillsCli({ source: REPO, skills: ["pdf", "docx", "xlsx"] }, options)
+    ).rejects.toThrow("~/.agents/skills already has pdf, xlsx.");
+    expect(await fs.readFile(path.join(kept, "SKILL.md"), "utf8")).toBe("# hand-edited");
+    expect(
+      await fs.lstat(path.join(home, ".agents", "skills", "docx")).catch(() => null)
+    ).toBeNull();
+  });
+
+  test("another backend's run in the same home makes this one wait", async () => {
+    await fakeNode("v22.20.0");
+    await fakeInstallingNpx();
+    // Another Xum backend holds the run lock (same home, separate process mutex).
+    const held = await acquireProcessFileLock({
+      lockPath: path.join(home, ".agents", ".xum-skills-cli.lock"),
+      timeoutMs: 1000,
+      label: "test holder",
+    });
+    let settled = false;
+    const run = installWithSkillsCli({ source: REPO, skills: ["pdf"] }, options).finally(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(settled).toBe(false);
+    await held[Symbol.asyncDispose]();
+    expect(await run).toMatchObject({ status: "ran", ok: true });
+  });
+
+  test("XDG_STATE_HOME reaches the CLI, which keeps its lock file there", async () => {
+    await fakeNode("v22.20.0");
+    await writeScript("npx", 'echo "state=${XDG_STATE_HOME:-none}"');
+    const run = await installWithSkillsCli(
+      { source: REPO, skills: ["pdf"] },
+      { ...options, env: { ...options.env, XDG_STATE_HOME: "/state" } }
+    );
+    if (run.status !== "ran") throw new Error("expected a run");
+    expect(run.output).toBe("state=/state");
   });
 
   test("exit 0 without the skill folder is a missing-skill failure", async () => {

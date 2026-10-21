@@ -1014,6 +1014,26 @@ describe("discoverAgentPlugins", () => {
     expect(result.diagnostics).toEqual([]);
   });
 
+  test("a symlink to the plugin root keeps its declared skill name", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "solo", {
+      manifest: {
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "solo",
+        contributes: { skills: ["alias"] },
+      },
+    });
+    await fs.writeFile(path.join(pluginDir, "SKILL.md"), "---\nname: alias\n---\n", "utf8");
+    await fs.symlink(".", path.join(pluginDir, "alias"));
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins[0].skillsDirs).toEqual([
+      { dir: result.plugins[0].rootPath, single: true, name: "alias" },
+    ]);
+  });
+
   test("the default skills/ holds skill folders even when it has a SKILL.md", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");
@@ -1907,6 +1927,83 @@ describe("Claude Code plugin discovery", () => {
     expect(messages).toContain("'Bad_Name.md' has no valid skill name");
     expect(messages).toContain("'greet.md' is ignored");
     expect(messages).toContain("object map in 'commands'");
+  });
+
+  test("an agents list that leaves out a file in its folder loads no agents", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    await writeTree(path.join(container, "partial"), {
+      ...claudeManifest({ name: "partial", agents: ["./custom/reviewer.md"] }),
+      "custom/reviewer.md": "---\nname: reviewer\ndescription: R\n---\n",
+      "custom/internal.md": "---\nname: internal\ndescription: I\n---\n",
+    });
+    await writeTree(path.join(container, "complete"), {
+      ...claudeManifest({ name: "complete", agents: ["./custom/reviewer.md"] }),
+      "custom/reviewer.md": "---\nname: reviewer\ndescription: R\n---\n",
+      "custom/notes.txt": "not an agent",
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const byName = new Map(result.plugins.map((plugin) => [plugin.name, plugin]));
+    expect(byName.get("partial")?.agentsDir).toBeUndefined();
+    const complete = byName.get("complete");
+    expect(complete?.agentsDir).toBe(path.join(complete?.rootPath ?? "", "custom"));
+    expect(result.diagnostics.map((d) => d.message).join("\n")).toContain("internal.md");
+  });
+
+  test("a root SKILL.md is the one skill only without skills/ and a skills key", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const skill = "---\nname: solo\ndescription: S\n---\n";
+    await writeTree(path.join(container, "solo"), {
+      ...claudeManifest({ name: "solo" }),
+      "SKILL.md": skill,
+    });
+    await writeTree(path.join(container, "has-dir"), {
+      ...claudeManifest({ name: "has-dir" }),
+      "SKILL.md": skill,
+      "skills/a/SKILL.md": "---\nname: a\ndescription: A\n---\n",
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const byName = new Map(result.plugins.map((plugin) => [plugin.name, plugin]));
+    const solo = byName.get("solo");
+    expect(solo?.skillsDirs).toEqual([{ dir: solo?.rootPath ?? "", single: true, name: "solo" }]);
+    const hasDir = byName.get("has-dir");
+    expect(hasDir?.skillsDirs).toEqual([{ dir: path.join(hasDir?.rootPath ?? "", "skills") }]);
+  });
+
+  test("a command keeps its declared name through a symlink and survives a broken skill", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "cmds");
+    await writeTree(pluginDir, {
+      ...claudeManifest({
+        name: "cmds",
+        commands: ["./commands/review.md", "./commands/deploy.md"],
+      }),
+      "shared/prompt.md": "Review $ARGUMENTS",
+      "commands/deploy.md": "Deploy",
+      // An empty skill folder and a SKILL.md without frontmatter never load as skills.
+      "skills/review/SKILL.md": "no frontmatter",
+    });
+    await fs.mkdir(path.join(pluginDir, "skills", "deploy"), { recursive: true });
+    await fs.symlink(
+      path.join("..", "shared", "prompt.md"),
+      path.join(pluginDir, "commands", "review.md")
+    );
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const plugin = result.plugins[0];
+    const commands = path.join(plugin.rootPath, "commands");
+    expect(plugin.skillsDirs).toEqual([
+      { dir: path.join(plugin.rootPath, "skills") },
+      { dir: commands, single: true, name: "review", command: true },
+      { dir: commands, single: true, name: "deploy", command: true },
+    ]);
   });
 
   test("plugin.json beats .codex-plugin/plugin.json, which beats .claude-plugin/plugin.json", async () => {
