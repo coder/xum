@@ -114,7 +114,6 @@ import {
   selectOrAddTab,
   selectTabInTabset,
   setFocusedTabset,
-  splitFocusedTabset,
   updateSplitSizes,
   type RightSidebarLayoutNode,
   type RightSidebarLayoutState,
@@ -168,6 +167,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { isRightSidebarResponsivelyHidden } from "./rightSidebarVisibility";
+import { usePaletteSidebarRequests } from "./usePaletteSidebarRequests";
 import { SideChatPanel } from "./SideChatPanel";
 import { NewTabLauncher } from "./NewTabLauncher";
 import { RightSidebarOverview } from "./RightSidebarOverview";
@@ -2353,51 +2353,17 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, handler);
   }, [handleAddNewTab, workspaceId]);
 
-  // The command palette's "Right Sidebar: Split Horizontally/Vertically" and "Add Tool…". Their
-  // palette row unmounts with the palette, so without this focus would fall to <body>. Like "New
-  // Tab", focus moves into the new pane (its launcher's first row, or the tab the split moved) or
-  // into the tool, as picking it in the launcher does. While the narrow layout hides the sidebar
-  // the layout still changes (the full-screen view shows it), but nothing hidden takes focus.
-  React.useEffect(() => {
-    const shown = () => {
-      const container = sidebarContainerRef.current;
-      return container == null || !isRightSidebarResponsivelyHidden(container);
-    };
-    const handleSplit = (event: Event) => {
-      const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE>).detail;
-      if (detail?.workspaceId !== workspaceId) return;
-      setCollapsed(false);
-      const next = splitFocusedTabset(getBaseLayout(), detail.direction);
-      setLayout(() => next);
-      if (!shown()) return;
-      const tab = getFocusedActiveTab(next, NEW_TAB);
-      if (isNewTab(tab)) setLauncherAutoFocusTabsetId(next.focusedTabsetId);
-      else if (isTerminalTab(tab)) focusTerminalTab(tab);
-      else setTabToFocus(tab);
-    };
-    const handleOpenTool = (event: Event) => {
-      const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL>).detail;
-      if (detail?.workspaceId !== workspaceId || !isBaseTabId(detail.tool)) return;
-      const tool = detail.tool;
-      setCollapsed(false);
-      const tabsetId = getBaseLayout().focusedTabsetId;
-      if (shown()) handleOpenToolFromNewTab(tabsetId, tool);
-      else setLayout((prev) => openToolFromNewTab(prev, tabsetId, tool));
-    };
-    window.addEventListener(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, handleSplit);
-    window.addEventListener(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, handleOpenTool);
-    return () => {
-      window.removeEventListener(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, handleSplit);
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, handleOpenTool);
-    };
-  }, [
-    focusTerminalTab,
-    getBaseLayout,
-    handleOpenToolFromNewTab,
-    setCollapsed,
-    setLayout,
+  usePaletteSidebarRequests({
     workspaceId,
-  ]);
+    sidebarContainerRef,
+    getBaseLayout,
+    setLayout,
+    setCollapsed,
+    focusLauncher: setLauncherAutoFocusTabsetId,
+    focusTerminalTab,
+    focusTab: setTabToFocus,
+    openToolWithFocus: handleOpenToolFromNewTab,
+  });
 
   // Tools the New tab launcher offers. Unavailable ones are left out rather than shown
   // disabled; experiment tabs follow their experiment, Debug follows the LLM debug logs
