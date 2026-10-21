@@ -562,8 +562,8 @@ async function readIncludedFiles(
  * Inline `Include` directives for resolving `host`, which the ssh-config package does not
  * resolve (Xum's Daytona block relies on one). An Include inside a block that does not apply
  * to `host` is skipped, as OpenSSH does. OpenSSH restores the includer's scope when an Include
- * returns, so each expanded Include is followed by the current block's header again, or by
- * `Host *` at the top level, and later lines stay where they were written. `scope` is the
+ * returns, so each file an Include reads is followed by the current block's header again, or
+ * by `Host *` at the top level, and later lines stay where they were written. `scope` is the
  * header a nested file is read in (undefined at the top level).
  */
 async function expandIncludes(
@@ -591,10 +591,9 @@ async function expandIncludes(
       continue;
     }
     if (!sectionAppliesTo(sectionHeader, host)) continue;
-    out.push(
-      ...(await readIncludedFiles(includeMatch[1], homeDir, depth + 1, host, sectionHeader)),
-      sectionHeader ?? GLOBAL_SCOPE_HEADER
-    );
+    const files = await readIncludedFiles(includeMatch[1], homeDir, depth + 1, host, sectionHeader);
+    // OpenSSH restores the scope after each file, so one file's last block never captures the next.
+    out.push(...files.flatMap((file) => [file, sectionHeader ?? GLOBAL_SCOPE_HEADER]));
   }
   return out.join("\n");
 }

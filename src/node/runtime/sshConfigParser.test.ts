@@ -463,6 +463,35 @@ describe("resolveSSHConfig", () => {
     });
   });
 
+  test("restores the includer's block after every file an Include reads", async () => {
+    await withTempHome(async (homeDir) => {
+      const incDir = path.join(homeDir, ".ssh", "inc");
+      await fs.mkdir(incDir);
+      await fs.writeFile(path.join(incDir, "a"), "Host other\n  User otheruser\n", "utf8");
+      await fs.writeFile(path.join(incDir, "b"), "Port 2222\n", "utf8");
+      const separate = path.join(homeDir, ".ssh", "c.conf");
+      await fs.writeFile(separate, "User cuser\n", "utf8");
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.writeFile(
+        configPath,
+        // One glob matching two files, then two arguments on one Include line.
+        ["Host target", `  Include ${incDir}/*`, `  Include ${incDir}/a ${separate}`, ""].join(
+          "\n"
+        ),
+        "utf8"
+      );
+
+      const resolved = await resolveSSHConfig("target");
+      expect(resolved.port).toBe(2222);
+      expect(resolved.user).toBe("cuser");
+      if (hasOpenSsh) {
+        const openssh = opensshOptions(configPath, "target");
+        expect(openssh("port")).toBe("2222");
+        expect(openssh("user")).toBe("cuser");
+      }
+    });
+  });
+
   test("restores the includer's block after an Include nested in an included file", async () => {
     await withTempHome(async (homeDir) => {
       const inner = path.join(homeDir, ".ssh", "b.conf");
