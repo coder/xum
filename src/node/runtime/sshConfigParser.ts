@@ -408,17 +408,21 @@ function bracketExpression(
 ): { source: string; end: number } | undefined {
   const negated = segment[start + 1] === "!" || segment[start + 1] === "^";
   let i = start + (negated ? 2 : 1);
-  let items = "";
-  let invalid = false;
+  const items: Array<string | undefined> = [];
   // A "]" right after the opening (and its negation) is a member, not the close.
   for (let first = true; i < segment.length && (first || segment[i] !== "]"); first = false) {
     const member = bracketMember(segment, i);
-    items += member.source;
-    invalid ||= member.invalid === true;
+    items.push(member.source);
     i = member.next;
   }
   if (i >= segment.length) return undefined;
-  return { source: invalid ? "(?!)" : `[${negated ? "^" : ""}${items}]`, end: i };
+  return { source: bracketSource(items, negated), end: i };
+}
+
+/** An unknown named class makes the whole pattern match nothing, as glob(3) refuses it. */
+function bracketSource(items: Array<string | undefined>, negated: boolean): string {
+  if (items.includes(undefined)) return "(?!)";
+  return `[${negated ? "^" : ""}${items.join("")}]`;
 }
 
 /** glob(3)'s named classes (`[[:digit:]]`) as RegExp class contents, for the C locale. */
@@ -438,19 +442,23 @@ const NAMED_CLASSES = new Map([
 ]);
 
 /**
- * One character, range or named class of a bracket expression, and the index after it. As in
- * glob(3), `[:` opens a class only when its first `:` is followed by `]`; an unknown class
- * makes the whole pattern match nothing.
+ * The named class (`[:digit:]`) at `i`: as in glob(3), `[:` opens one only when its first `:`
+ * is followed by `]`. Its source is undefined for an unknown class name.
  */
-function bracketMember(
+function namedClass(
   segment: string,
   i: number
-): { source: string; next: number; invalid?: boolean } {
-  const colon = segment.startsWith("[:", i) ? segment.indexOf(":", i + 2) : -1;
-  if (colon !== -1 && segment[colon + 1] === "]") {
-    const source = NAMED_CLASSES.get(segment.slice(i + 2, colon));
-    return { source: source ?? "", next: colon + 2, invalid: source === undefined };
-  }
+): { source: string | undefined; next: number } | undefined {
+  if (!segment.startsWith("[:", i)) return undefined;
+  const colon = segment.indexOf(":", i + 2);
+  if (colon === -1 || segment[colon + 1] !== "]") return undefined;
+  return { source: NAMED_CLASSES.get(segment.slice(i + 2, colon)), next: colon + 2 };
+}
+
+/** One character, range or named class of a bracket expression, and the index after it. */
+function bracketMember(segment: string, i: number): { source: string | undefined; next: number } {
+  const named = namedClass(segment, i);
+  if (named) return named;
   const range = segment[i + 1] === "-" && i + 2 < segment.length && segment[i + 2] !== "]";
   if (!range) return { source: escapeRegExp(segment[i]), next: i + 1 };
   const [low, high] = [segment[i], segment[i + 2]];
