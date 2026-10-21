@@ -2949,6 +2949,7 @@ describe("AgentPluginInstallService", () => {
       // Present, but a Claude package never loads them.
       "hooks.js": "export default {};\n",
       "workflows/release.js": "// wf\n",
+      "skills/greet/workflow.js": "// skill wf\n",
     };
     for (const [relative, content] of Object.entries(files)) {
       await fsPromises.mkdir(path.dirname(path.join(remoteDir, relative)), { recursive: true });
@@ -2964,6 +2965,10 @@ describe("AgentPluginInstallService", () => {
     expect(preview.agents).toEqual(["reviewer.md"]);
     expect(preview.hook).toBeUndefined();
     expect(preview.workflows).toEqual([]);
+    // A skill's workflow.js is not offered for review: a Claude package runs no Xum code.
+    expect(preview.reviewedComponents.map((row) => row.name)).not.toContain(
+      "skills/greet/workflow.js"
+    );
     expect(preview.codexHooks.map((hook) => [hook.event, hook.status])).toEqual([
       ["PreToolUse", "claude-plugin"],
     ]);

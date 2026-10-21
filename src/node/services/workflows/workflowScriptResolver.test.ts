@@ -440,7 +440,7 @@ describe("resolveWorkflowScript", () => {
       expect(resolved.source).toContain("plugin-flow");
     });
 
-    test("a Claude package runs no workflow code: no workflows/ and no command script", async () => {
+    test("a Claude package runs no workflow code: no workflows/, command or skill script", async () => {
       using tempDir = new TestTempDir("workflow-script-claude-plugin");
       const container = path.join(tempDir.path, ".mux", "plugins");
       const pluginDir = path.join(container, "kit");
@@ -453,6 +453,9 @@ describe("resolveWorkflowScript", () => {
       // A script next to the command: the command's skill directory is the commands folder.
       await writeWorkflowFile(path.join(pluginDir, "commands"), "workflow.js");
       await fs.writeFile(path.join(pluginDir, "commands", "review.md"), "Review\n");
+      const skillDir = path.join(pluginDir, "skills", "flow");
+      await writeWorkflowFile(skillDir, "SKILL.md", "---\nname: flow\ndescription: d\n---\nBody\n");
+      await writeWorkflowFile(skillDir, "workflow.js");
       const input = {
         runtime: new LocalRuntime(tempDir.path),
         workspacePath: tempDir.path,
@@ -466,6 +469,9 @@ describe("resolveWorkflowScript", () => {
       await expect(
         resolveWorkflowScript({ ...input, scriptPath: "skill://review/workflow.js" })
       ).rejects.toThrow("is a Claude command");
+      await expect(
+        resolveWorkflowScript({ ...input, scriptPath: "skill://flow/workflow.js" })
+      ).rejects.toThrow("comes from a Claude Code plugin");
     });
 
     test("plugin workflows retain a global fallback after rejecting an outward project alias", async () => {
