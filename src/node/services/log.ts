@@ -480,6 +480,7 @@ function formatCallerLocation(filePath: string, lineNum: string): string {
  * Error objects and uncaught exceptions keep their source-mapped stacks.
  */
 function rawCallSites(): NodeJS.CallSite[] {
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- only stored and restored, never called
   const previous = Error.prepareStackTrace;
   try {
     Error.prepareStackTrace = (_error, callSites) => callSites;

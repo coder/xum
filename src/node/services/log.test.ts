@@ -149,11 +149,12 @@ describe("log file sink state machine", () => {
   test("a log line names its caller without running the global stack formatter", () => {
     // Stands in for source-map-support's hook, which maps (and parses source maps for) every
     // frame of every formatted stack (#6556).
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- restored as is in finally
     const previous = Error.prepareStackTrace;
     let formattedStacks = 0;
-    Error.prepareStackTrace = (error, callSites) => {
+    Error.prepareStackTrace = (error, callSites): unknown => {
       formattedStacks++;
-      return previous ? previous(error, callSites) : String(error);
+      return previous ? (previous(error, callSites) as unknown) : String(error);
     };
     const entries: LogEntry[] = [];
     const feed = subscribeLogFeed((event) => {
@@ -166,9 +167,8 @@ describe("log file sink state machine", () => {
       Error.prepareStackTrace = previous;
     }
     expect(formattedStacks).toBe(0);
-    expect(entries.map((entry) => entry.location)).toEqual([
-      expect.stringMatching(/^src\/node\/services\/log\.test\.ts:\d+$/),
-    ]);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].location).toMatch(/^src\/node\/services\/log\.test\.ts:\d+$/);
   });
 
   test("closeLogFile transitions sink to closed and blocks reopen attempts", () => {
