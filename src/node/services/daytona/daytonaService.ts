@@ -299,9 +299,12 @@ export class DaytonaService {
   private readonly removalLocks = new MutexMap<string>();
   /**
    * Workspaces whose removal passed its checks and deleted its checkout, but that the
-   * workspace list may still show until the removal is persisted.
+   * workspace list may still show until the removal is persisted, by that removal's
+   * pendingRemoval marker. A removal that then fails (deregistration rejects) releases its
+   * marker, and a retry claims a new one: either way the record no longer applies, so the
+   * still registered workspace counts as a reference again.
    */
-  private readonly removedWorkspaces = new Set<string>();
+  private readonly removedWorkspaces = new Map<string, string>();
 
   constructor(options: DaytonaServiceOptions) {
     this.credentialsStore = options.credentialsStore;
@@ -463,8 +466,10 @@ export class DaytonaService {
   ): StoredSandboxRef[] {
     return refs.flatMap((ref) => {
       const stored = getDaytonaSandboxId(ref.runtimeConfig);
-      const counts =
-        ref.workspaceId !== workspaceId && !this.removedWorkspaces.has(ref.workspaceId);
+      const removed =
+        ref.pendingRemovalId !== undefined &&
+        this.removedWorkspaces.get(ref.workspaceId) === ref.pendingRemovalId;
+      const counts = ref.workspaceId !== workspaceId && !removed;
       return counts && stored
         ? [{ stored, attached: !isDedicatedDaytonaSandbox(ref.runtimeConfig) }]
         : [];
@@ -490,9 +495,14 @@ export class DaytonaService {
     return this.removalLocks.withLock("daytona-sandbox-removal", fn);
   }
 
-  /** The workspace no longer references its sandbox, even while the workspace list shows it. */
+  /**
+   * The workspace no longer references its sandbox while its current removal is in flight,
+   * even though the workspace list still shows it. A listed workspace without a removal
+   * marker is not recorded: it keeps counting, which can only keep a sandbox.
+   */
   recordWorkspaceRemoval(workspaceId: string): void {
-    this.removedWorkspaces.add(workspaceId);
+    const ref = this.listWorkspaces?.().find((entry) => entry.workspaceId === workspaceId);
+    if (ref?.pendingRemovalId) this.removedWorkspaces.set(workspaceId, ref.pendingRemovalId);
   }
 
   recordSetupFailure(sandboxId: string, reason: string): void {

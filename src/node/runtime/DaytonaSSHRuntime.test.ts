@@ -40,6 +40,14 @@ afterEach(async () => {
   await rig.cleanup();
 });
 
+/**
+ * Give every listed workspace a pendingRemoval marker, as each removal claims one: these
+ * tests remove workspaces one after another without deregistering them.
+ */
+function claimRemovals(testRig = rig): void {
+  for (const ref of testRig.workspaces) ref.pendingRemovalId ??= `rm-${ref.workspaceId}`;
+}
+
 function makeRuntime(
   daytona: DaytonaSandboxConfig,
   testRig = rig,
@@ -641,8 +649,8 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       const source = { sandboxId: "sb-pair", shared: false, ...SMALL };
       const fork = { ...source, forked: true };
       rig.workspaces.push(
-        { workspaceId: "ws-1", runtimeConfig: sshDaytonaConfig(source) },
-        { workspaceId: "ws-fork", runtimeConfig: sshDaytonaConfig(fork) }
+        { workspaceId: "ws-1", runtimeConfig: sshDaytonaConfig(source), pendingRemovalId: "rm-1" },
+        { workspaceId: "ws-fork", runtimeConfig: sshDaytonaConfig(fork), pendingRemovalId: "rm-2" }
       );
       return Promise.all([
         makeRuntime(source).deleteWorkspace("/home/me/project", "feature", false),
@@ -729,6 +737,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       { workspaceId: "ws-o2", runtimeConfig: sshDaytonaConfig(owner("xum-attached-first")) },
       { workspaceId: "ws-t2", runtimeConfig: sshDaytonaConfig(attached("sb-2")) }
     );
+    claimRemovals();
 
     // The owner goes first: its removal says the sandbox now outlives Xum's workspaces, and the
     // attached workspace's removal only releases it.
@@ -748,6 +757,43 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(ownerLast).toEqual({ success: true, deletedPath: expect.any(String) as string });
     expect(rig.plane.find("sb-2")).toBeUndefined();
     expect(deletes()).toBe(1);
+  });
+
+  it("counts a workspace whose removal failed after its checkout step as a reference again", async () => {
+    rig.plane.addSandbox({ id: "sb-kept", state: "stopped" });
+    const owner = { sandboxId: "sb-kept", shared: false, ...SMALL };
+    const fork = { ...owner, forked: true };
+    // Each removal claims its workspace's pendingRemoval marker before any destructive step.
+    const forkRef = {
+      workspaceId: "ws-fork",
+      runtimeConfig: sshDaytonaConfig(fork),
+      pendingRemovalId: "rm-1" as string | undefined,
+    };
+    rig.workspaces.push(
+      { workspaceId: "ws-owner", runtimeConfig: sshDaytonaConfig(owner), pendingRemovalId: "rm-o" },
+      forkRef
+    );
+
+    // Forced on a stopped sandbox: the fork's checkout stays on it, unchecked.
+    const forced = await makeRuntime(fork, rig, { workspaceId: "ws-fork" }).deleteWorkspace(
+      "/home/me/project",
+      "feature-fork",
+      true
+    );
+    expect(forced.success).toBe(true);
+    // Deregistration then fails: the fork stays registered and its marker is released, or a
+    // retry claims a new one.
+    for (const pendingRemovalId of [undefined, "rm-2"]) {
+      forkRef.pendingRemovalId = pendingRemovalId;
+      const removal = await makeRuntime(owner, rig, { workspaceId: "ws-owner" }).deleteWorkspace(
+        "/home/me/project",
+        "feature",
+        false
+      );
+      expect(removal.success).toBe(true);
+      expect(rig.plane.find("sb-kept")).toBeDefined();
+    }
+    expect(rig.plane.countCalls("DELETE /sandbox/sb-kept")).toBe(0);
   });
 
   it("never starts a stopped sandbox for the checks a forced removal skips", async () => {
@@ -781,6 +827,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       { workspaceId: "ws-fork", runtimeConfig: sshDaytonaConfig({ ...owner, forked: true }) },
       { workspaceId: "ws-attached", runtimeConfig: sshDaytonaConfig(attached) }
     );
+    claimRemovals();
     // Tokens and include blocks are per stored string: the name and the id.
     await rig.service.ensureSshAccess("xum-owner-abc123");
     await rig.service.ensureSshAccess("sb-7");

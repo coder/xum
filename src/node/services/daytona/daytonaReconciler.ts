@@ -15,6 +15,8 @@ export const DAYTONA_JOB_PROBE_FAILURE_LIMIT = 3;
 export interface DaytonaWorkspaceRef {
   workspaceId: string;
   runtimeConfig: RuntimeConfig | undefined;
+  /** The marker of a removal in flight (WorkspaceConfigSchema.pendingRemoval). */
+  pendingRemovalId?: string;
 }
 
 export interface DaytonaReconcilerOptions {
@@ -52,14 +54,18 @@ export interface DaytonaReconcilerOptions {
 export function listDaytonaWorkspaceRefs(config: {
   projects: ReadonlyMap<
     string,
-    { workspaces: ReadonlyArray<Pick<Workspace, "id" | "runtimeConfig">> }
+    { workspaces: ReadonlyArray<Pick<Workspace, "id" | "runtimeConfig" | "pendingRemoval">> }
   >;
 }): DaytonaWorkspaceRef[] {
   const refs: DaytonaWorkspaceRef[] = [];
   for (const project of config.projects.values()) {
     for (const workspace of project.workspaces) {
-      if (workspace.id)
-        refs.push({ workspaceId: workspace.id, runtimeConfig: workspace.runtimeConfig });
+      if (!workspace.id) continue;
+      refs.push({
+        workspaceId: workspace.id,
+        runtimeConfig: workspace.runtimeConfig,
+        pendingRemovalId: workspace.pendingRemoval?.removalId,
+      });
     }
   }
   return refs;
