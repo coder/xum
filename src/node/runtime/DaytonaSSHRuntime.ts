@@ -232,9 +232,12 @@ function growsDisk(sandbox: DaytonaSandbox, preset: DaytonaSizePreset): boolean 
   return sandbox.disk !== undefined && sandbox.disk < preset.diskGiB;
 }
 
-/** A running sandbox can only grow cpu and memory. */
+/**
+ * A running sandbox can only grow cpu and memory. An unreported value may be above the preset,
+ * so it is resized stopped, where either direction is allowed.
+ */
 function shrinksCompute(sandbox: DaytonaSandbox, preset: DaytonaSizePreset): boolean {
-  return (sandbox.cpu ?? 0) > preset.cpu || (sandbox.memory ?? 0) > preset.memoryGiB;
+  return (sandbox.cpu ?? Infinity) > preset.cpu || (sandbox.memory ?? Infinity) > preset.memoryGiB;
 }
 
 function changesCompute(sandbox: DaytonaSandbox, preset: DaytonaSizePreset): boolean {

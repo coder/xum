@@ -46,6 +46,8 @@ export class FakeDaytonaControlPlane {
   rejectCreateResources = false;
   /** Leave `disk` out of sandbox responses, which Daytona's schema allows. */
   omitDisk = false;
+  /** Leave `cpu` and `memory` out of sandbox responses, which Daytona's schema allows. */
+  omitCompute = false;
   /** Resources a sandbox gets when created without any. */
   snapshotResources = { cpu: 1, memory: 1, disk: 3 };
   /** Routes (`METHOD /path`) that never answer, for timeout tests. */
@@ -244,8 +246,7 @@ export class FakeDaytonaControlPlane {
       id: sandbox.id,
       name: sandbox.name,
       state: sandbox.state,
-      cpu: sandbox.cpu,
-      memory: sandbox.memory,
+      ...(this.omitCompute ? {} : { cpu: sandbox.cpu, memory: sandbox.memory }),
       ...(this.omitDisk ? {} : { disk: sandbox.disk }),
       labels: sandbox.labels,
       ...(sandbox.sandboxClass ? { sandboxClass: sandbox.sandboxClass } : {}),

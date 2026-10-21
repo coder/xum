@@ -437,6 +437,29 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     });
   });
 
+  it("resizes a sandbox whose cpu and memory Daytona did not report while it is stopped", async () => {
+    rig.plane.rejectCreateResources = true;
+    rig.plane.omitCompute = true;
+    // Above the preset: resizing the running sandbox to it would be a shrink Daytona refuses.
+    rig.plane.snapshotResources = { cpu: 8, memory: 16, disk: 30 };
+
+    await makeRuntime({
+      sandboxId: "xum-unknown-compute",
+      shared: false,
+      snapshot: "fixed-snap",
+      cpu: 4,
+      memoryGiB: 8,
+      diskGiB: 20,
+    }).postCreateSetup(initParams());
+
+    expect(rig.plane.find("xum-unknown-compute")).toMatchObject({
+      state: "started",
+      cpu: 4,
+      memory: 8,
+      disk: 30,
+    });
+  });
+
   it("deletes the sandbox it created when setup fails afterwards", async () => {
     rig.writer.verifyError = new Error("Your ssh config sets User");
     const params = initParams();
