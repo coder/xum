@@ -355,17 +355,21 @@ const SidebarPanelFrame: React.FC<{
  * 3. default (400px) - Fallback when no custom width set
  *
  * Collapsing and expanding slide the width (see SidebarSlidePhase).
+ *
+ * `containerRef` is destructured on purpose: React Compiler rejects reading a ref prop as
+ * `props.containerRef` during render ("Cannot access refs during render") and would leave this
+ * component uncompiled.
  */
-const SidebarContainer: React.FC<SidebarContainerProps> = (props) => {
+const SidebarContainer: React.FC<SidebarContainerProps> = ({ containerRef, ...props }) => {
   const width = props.customWidth ? `${props.customWidth}px` : "400px";
   const immersiveHidden = props.immersiveHidden === true;
-  const { phase, sliding } = useSidebarSlidePhase(props.collapsed, props.containerRef);
+  const { phase, sliding } = useSidebarSlidePhase(props.collapsed, containerRef);
   const animating = sliding && !props.isResizing;
-  useInertWhile(props.containerRef, immersiveHidden);
+  useInertWhile(containerRef, immersiveHidden);
 
   return (
     <div
-      ref={props.containerRef}
+      ref={containerRef}
       aria-hidden={immersiveHidden || undefined}
       // globals.css eases the chat's room for the overview card only while this is set.
       data-right-sidebar-animating={animating || undefined}
