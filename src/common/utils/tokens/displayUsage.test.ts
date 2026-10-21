@@ -325,18 +325,19 @@ describe("createDisplayUsage", () => {
       }
     });
 
-    test("keeps GPT-5.5 on base rates at the published 272K boundary", () => {
-      const usage: LanguageModelV2Usage = {
-        inputTokens: 272000,
-        outputTokens: 1000,
-        totalTokens: 273000,
-      };
-
-      const result = createDisplayUsage(usage, "openai:gpt-5.5");
-
-      expect(result).toBeDefined();
-      expect(result!.input.cost_usd).toBeCloseTo(1.36);
-      expect(result!.output.cost_usd).toBeCloseTo(0.03);
+    test("applies GPT-5.5's long-context tier only above its published 272K boundary", () => {
+      for (const tokens of [272000, 272001]) {
+        const longContext = tokens > 272000;
+        const result = createDisplayUsage(
+          { inputTokens: tokens, outputTokens: 1000, totalTokens: tokens + 1000 },
+          "openai:gpt-5.5"
+        );
+        expect(result?.input.cost_usd).toBeCloseTo(
+          ((tokens * 5) / 1e6) * (longContext ? 2 : 1),
+          12
+        );
+        expect(result?.output.cost_usd).toBeCloseTo(0.001 * 30 * (longContext ? 1.5 : 1), 12);
+      }
     });
 
     test("prices Gemini 3.1 Pro above its 200K threshold at the long-context rates", () => {
