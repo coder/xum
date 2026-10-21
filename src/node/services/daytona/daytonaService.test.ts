@@ -198,6 +198,7 @@ describe("DaytonaService", () => {
       readTokens: () => Promise.resolve([]),
       verifyResolvedConfig: () =>
         shadowed ? Promise.reject(new Error("ssh config shadows User")) : Promise.resolve(),
+      repointGateway: () => Promise.resolve(),
     };
     const withWriter = new DaytonaService({
       credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
