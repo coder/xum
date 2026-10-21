@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { execFile } from "child_process";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -70,5 +70,22 @@ describe("agent-home seeding", () => {
     expect(await collectAgentHomeSeedFiles({ xumHome: hostXum, home: hostHome }, "~/.mux")).toEqual(
       []
     );
+  });
+
+  it("never reads a file larger than the remaining seed budget", async () => {
+    const huge = path.join(hostXum, "skills", "data", "model.bin");
+    await fs.mkdir(path.dirname(huge), { recursive: true });
+    // Sparse: 64 MiB on paper, no disk used.
+    await fs.writeFile(huge, "");
+    await fs.truncate(huge, 64 * 1024 * 1024);
+    const readFile = spyOn(fs, "readFile");
+    try {
+      const files = await collectAgentHomeSeedFiles({ xumHome: hostXum, home: hostHome }, "~/.mux");
+
+      expect(files).toEqual([]);
+      expect(readFile.mock.calls.map(([file]) => String(file))).not.toContain(huge);
+    } finally {
+      readFile.mockRestore();
+    }
   });
 });

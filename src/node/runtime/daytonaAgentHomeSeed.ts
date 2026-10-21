@@ -45,12 +45,19 @@ interface SeedBudget {
 }
 
 async function readRegularFile(
-  filePath: string
+  filePath: string,
+  budget: SeedBudget
 ): Promise<{ content: Buffer; mode: number } | null> {
   try {
     // stat follows symlinks: plugin installs link skills into the skills directory.
     const stat = await fs.stat(filePath);
     if (!stat.isFile()) return null;
+    // Check before reading: a large file must not be loaded only to be dropped.
+    if (stat.size > budget.remainingBytes) {
+      log.debug("Skipping a file past the Daytona seed size limit", { filePath, size: stat.size });
+      budget.exhausted = true;
+      return null;
+    }
     return { content: await fs.readFile(filePath), mode: stat.mode };
   } catch (error) {
     if (isErrnoWithCode(error, "ENOENT")) return null;
@@ -134,7 +141,7 @@ async function collectEntry(
     await collectDirectory(files, budget, hostPath, remotePath, depth + 1);
     return;
   }
-  const file = stat.isFile() ? await readRegularFile(hostPath) : null;
+  const file = stat.isFile() ? await readRegularFile(hostPath, budget) : null;
   if (file) addFile(files, budget, remotePath, file);
 }
 
@@ -146,7 +153,7 @@ export async function collectAgentHomeSeedFiles(
   const files: AgentHomeSeedFile[] = [];
   const budget: SeedBudget = { remainingBytes: MAX_SEED_BYTES, exhausted: false };
   for (const name of SEEDED_HOOK_FILES) {
-    const file = await readRegularFile(path.join(sources.xumHome, name));
+    const file = await readRegularFile(path.join(sources.xumHome, name), budget);
     if (file) addFile(files, budget, path.posix.join(remoteXumHome, name), file);
   }
   await collectDirectory(
