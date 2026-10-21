@@ -714,8 +714,10 @@ export class DaytonaService {
       return {
         ok: true,
         sandboxes: sandboxes
+          // Error states (destroyed and destroying included) cannot be started or attached.
           .filter(
-            (sandbox) => !DESTROYING_STATES.has(sandbox.state ?? "") && !isWindowsClass(sandbox)
+            (sandbox) =>
+              mapDaytonaSandboxState(sandbox.state) !== "error" && !isWindowsClass(sandbox)
           )
           .map(toSummary),
       };

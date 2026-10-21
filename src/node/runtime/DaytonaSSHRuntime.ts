@@ -241,6 +241,24 @@ function makeStatusEmitter(statusSink: EnsureReadyOptions["statusSink"]): Status
  * An unreported disk is left as it is: the snapshot's may be larger than the preset's, and
  * sending the preset would then be a shrink Daytona refuses, failing (and deleting) the sandbox.
  */
+/** Why an existing sandbox cannot be attached, before the workspace is persisted. */
+function attachRefusal(
+  sandboxId: string,
+  state: DaytonaSandboxState,
+  sandbox: DaytonaSandbox
+): string | undefined {
+  if (sandbox.sandboxClass === DAYTONA_WINDOWS_SANDBOX_CLASS) {
+    return `Daytona sandbox "${sandboxId}" is a Windows sandbox. ${LINUX_ONLY}`;
+  }
+  // Setup's start never brings an error state up, so every retry would fail.
+  if (state !== "error") return undefined;
+  const reason = sandbox.errorReason ? ` (${sandbox.errorReason})` : "";
+  return (
+    `Daytona sandbox "${sandboxId}" is in state ${sandbox.state ?? "unknown"}${reason}, ` +
+    "which Xum cannot start; pick another sandbox"
+  );
+}
+
 function growsDisk(sandbox: DaytonaSandbox, preset: DaytonaSizePreset): boolean {
   return sandbox.disk !== undefined && sandbox.disk < preset.diskGiB;
 }
@@ -736,8 +754,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
     }
     const exists = found.state !== "missing";
-    if (attaching && found.sandbox?.sandboxClass === DAYTONA_WINDOWS_SANDBOX_CLASS) {
-      return Err(`Daytona sandbox "${sandboxId}" is a Windows sandbox. ${LINUX_ONLY}`);
+    if (attaching && found.sandbox) {
+      const refusal = attachRefusal(sandboxId, found.state, found.sandbox);
+      if (refusal) return Err(refusal);
     }
     if (attaching === exists) return Ok(undefined);
     return Err(

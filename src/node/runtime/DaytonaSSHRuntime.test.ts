@@ -351,6 +351,23 @@ describe("DaytonaSSHRuntime Windows sandboxes", () => {
     expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
   });
 
+  it("neither offers nor attaches a sandbox in an error state", async () => {
+    rig.plane.addSandbox({ id: "sb-broken", state: "build_failed" });
+    rig.plane.addSandbox({ id: "sb-ok" });
+    const runtime = makeRuntime({});
+    const finalized = await runtime.finalizeConfig(
+      "b",
+      sshDaytonaConfig({ sandboxId: "sb-broken" })
+    );
+    if (!finalized.success) throw new Error(finalized.error);
+
+    // startAndWait never brings such a sandbox up: setup would fail on every retry.
+    const refused = await runtime.validateBeforePersist("b", finalized.data);
+    expect(refused.success ? "" : refused.error).toContain("build_failed");
+    const listed = await rig.service.listSandboxes();
+    expect(listed.ok && listed.sandboxes.map((s) => s.id)).toEqual(["sb-ok"]);
+  });
+
   it("offers neither Windows snapshots nor Windows sandboxes", async () => {
     rig.plane.addSandbox({ id: "sb-win", sandboxClass: "windows" });
     rig.plane.addSandbox({ id: "sb-linux", sandboxClass: "linux-vm" });
