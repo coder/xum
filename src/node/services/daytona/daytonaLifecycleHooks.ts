@@ -116,6 +116,9 @@ async function deleteForArchive(
   args: Parameters<BeforeArchiveHook>[0],
   sandboxId: string
 ): Promise<Result<void>> {
+  // Both outcomes (delete, or stop when the checks fail) end a surviving job.
+  const refusal = await refuseUnderRemoteJobs(options, args, sandboxId);
+  if (refusal) return Err(refusal);
   const check = options.checkSandboxDeletable
     ? await options.checkSandboxDeletable(args.workspaceMetadata)
     : Err("its worktree could not be checked for uncommitted work");
@@ -153,13 +156,27 @@ async function stopForArchive(
   if (!isRunning(state)) {
     return Ok(undefined);
   }
-  if (args.refuseStopUnderUnverifiedRemoteJobs === true) {
-    const refusal = await probeRemoteJobs(options, args.workspaceMetadata, sandboxId);
-    if (refusal) return Err(refusal);
-  }
+  const refusal = await refuseUnderRemoteJobs(options, args, sandboxId, state);
+  if (refusal) return Err(refusal);
   log.debug("Stopping Daytona sandbox before archive", { sandboxId, state });
   await stopSandbox(options, sandboxId);
   return Ok(undefined);
+}
+
+/**
+ * Why a model-driven archive must not stop or delete the sandbox: a detached job may survive
+ * in it. A sandbox that is not running has no job to end.
+ */
+async function refuseUnderRemoteJobs(
+  options: DaytonaArchiveHookOptions,
+  args: Parameters<BeforeArchiveHook>[0],
+  sandboxId: string,
+  knownState?: string
+): Promise<string | undefined> {
+  if (args.refuseStopUnderUnverifiedRemoteJobs !== true) return undefined;
+  const state = knownState ?? (await options.daytonaService.getSandboxState(sandboxId)).state;
+  if (!isRunning(state)) return undefined;
+  return probeRemoteJobs(options, args.workspaceMetadata, sandboxId);
 }
 
 async function probeRemoteJobs(

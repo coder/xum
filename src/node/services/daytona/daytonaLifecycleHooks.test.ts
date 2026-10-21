@@ -3,7 +3,7 @@ import { execFileSync } from "child_process";
 import * as fs from "fs/promises";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
-import { Ok, type Result } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { DaytonaSSHRuntime } from "@/node/runtime/DaytonaSSHRuntime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
@@ -145,6 +145,44 @@ describe("createDaytonaArchiveHook", () => {
 
     expect(result.success).toBe(true);
     expect(rig.plane.find("sb-parent")?.state).toBe("started");
+  });
+
+  it("never deletes or stops a sandbox under an unverified job on a model-driven archive delete", async () => {
+    const modelArchive = (
+      sandboxId: string,
+      check: DaytonaArchiveHookOptions["checkSandboxDeletable"],
+      probe?: DaytonaArchiveHookOptions["hasUnsettledRemoteBackgroundJobs"]
+    ) =>
+      createDaytonaArchiveHook({
+        daytonaService: rig.service,
+        getArchiveBehavior: () => "delete",
+        checkSandboxDeletable: check,
+        hasUnsettledRemoteBackgroundJobs: probe,
+      })({
+        workspaceId: "ws",
+        workspaceMetadata: metadata({ sandboxId, shared: false }),
+        refuseStopUnderUnverifiedRemoteJobs: true,
+      });
+    const dirtyCheck = (): Promise<Result<void, string>> =>
+      Promise.resolve(Err("Workspace contains uncommitted changes."));
+    const jobRuns = () => Promise.resolve(Ok(true));
+    for (const id of ["sb-job", "sb-job-dirty", "sb-unprobed", "sb-idle"]) {
+      rig.plane.addSandbox({ id });
+    }
+
+    // A surviving job refuses both outcomes: the delete (clean checks) and the stop (dirty).
+    expect((await modelArchive("sb-job", cleanCheck, jobRuns)).success).toBe(false);
+    expect((await modelArchive("sb-job-dirty", dirtyCheck, jobRuns)).success).toBe(false);
+    // No probe: Xum cannot verify, so it refuses too.
+    expect((await modelArchive("sb-unprobed", cleanCheck)).success).toBe(false);
+    for (const id of ["sb-job", "sb-job-dirty", "sb-unprobed"]) {
+      expect(rig.plane.find(id)?.state).toBe("started");
+    }
+
+    // Verified idle: the delete goes ahead.
+    const idle = () => Promise.resolve(Ok(false));
+    expect((await modelArchive("sb-idle", cleanCheck, idle)).success).toBe(true);
+    expect(rig.plane.find("sb-idle")).toBeUndefined();
   });
 
   it("keeps a dirty sandbox on archive delete: starts it for the check, then stops it and warns", async () => {
