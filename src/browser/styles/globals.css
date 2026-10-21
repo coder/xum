@@ -1353,7 +1353,8 @@ input[type="checkbox"] {
 /* Tutorial highlight effect */
 .tutorial-highlight {
   position: relative;
-  z-index: 9997;
+  /* Under the tutorial backdrop and every dialog layer (see TutorialTooltip). */
+  z-index: 1497;
   border-radius: 6px;
   box-shadow: 0 0 0 2px var(--color-accent);
   animation: tutorial-pulse 1.5s ease-in-out infinite;

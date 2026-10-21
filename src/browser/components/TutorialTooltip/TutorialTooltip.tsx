@@ -1,6 +1,8 @@
-import React, { useState, useRef, useLayoutEffect } from "react";
+import React, { useState, useRef, useLayoutEffect, useEffect, useId } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "@/common/lib/utils";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 
 // The bubble's secondary texts (step counter, body, Skip, opt-out). Plain text-muted on the modal
 // background is below WCAG AA in dark (3.78) and flexoki-light (4.47); 30% of the text color
@@ -41,7 +43,9 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
   onDisableTutorial,
 }) => {
   const tooltipRef = useRef<HTMLDivElement>(null);
+  const titleId = useId();
   const [position, setPosition] = useState<TooltipPosition | null>(null);
+  const isPositioned = position !== null;
 
   useLayoutEffect(() => {
     const targetEl = document.querySelector(`[data-tutorial="${step.target}"]`);
@@ -152,21 +156,58 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
     };
   }, [step.target]);
 
+  // Move focus into the bubble once it is on screen (a hidden element cannot take focus), so
+  // Escape, Skip and Next work from the keyboard (#5701). Later steps keep focus on the control
+  // that advanced them. When the bubble closes and leaves focus on the body, focus goes back to
+  // where it was. An open modal dialog traps focus, so the bubble cannot take it from one.
+  useEffect(() => {
+    const bubble = tooltipRef.current;
+    if (!isPositioned || !bubble) return;
+    const previous = document.activeElement;
+    bubble.focus();
+    return () => {
+      const active = document.activeElement;
+      const focusLost = active === null || active === document.body || bubble.contains(active);
+      if (focusLost && previous instanceof HTMLElement && previous.isConnected) previous.focus();
+    };
+  }, [isPositioned]);
+
+  // Escape counts as Skip. Only keys sent to the bubble reach this handler, so an open popover,
+  // menu, dialog or editor keeps its own Escape: #5670 took every Escape with a window listener.
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    // A layer that already handled this Escape marks it with preventDefault.
+    if (!matchesKeybind(e, KEYBINDS.CANCEL) || e.defaultPrevented) return;
+    e.preventDefault();
+    // The window's stream-interrupt listener must not also act on this Escape.
+    stopKeyboardPropagation(e);
+    onDismiss();
+  };
+
   const isLastStep = currentStep === totalSteps;
 
+  // Stacking (#5701): the highlight (.tutorial-highlight, 1497), this backdrop (1498) and the
+  // bubble (1499) sit just under the shared Dialog layer (1500). Every layer the user opens on
+  // purpose (dialogs such as Settings, popovers, selects, the command palette) draws over the
+  // tutorial and keeps its keys, and everything the tutorial covered before stays covered.
   return createPortal(
     <>
       {/* Backdrop - subtle overlay */}
       <div
         // Dim painted on a pseudo-element so iOS/iPadOS 26 WebKit's status-bar edge
         // sampler ignores this fixed overlay (same pattern as Dialog/LeftSidebar).
-        className="fixed inset-0 z-[9998] before:absolute before:inset-0 before:bg-black/20"
+        className="fixed inset-0 z-[1498] before:absolute before:inset-0 before:bg-black/20"
         data-testid="tutorial-backdrop"
         onClick={onDismiss}
       />
       {/* Tooltip */}
+      {/* A group, not a dialog: role="dialog" would count as an open dialog portal in shared
+          key and focus checks (isEventFromDialogPortal, the Backup section's topmost dialog). */}
       <div
         ref={tooltipRef}
+        role="group"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        onKeyDown={handleKeyDown}
         style={{
           position: "fixed",
           top: position?.top ?? -9999,
@@ -174,7 +215,7 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
           visibility: position ? "visible" : "hidden",
         }}
         className={cn(
-          "z-[9999] w-72 rounded-lg border-2 border-accent bg-modal-bg p-4 shadow-lg",
+          "z-[1499] w-72 rounded-lg border-2 border-accent bg-modal-bg p-4 shadow-lg outline-none",
           "text-foreground"
         )}
       >
@@ -183,7 +224,9 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
 
         {/* Header */}
         <div className="mb-2 flex items-start justify-between">
-          <h3 className="text-sm font-semibold">{step.title}</h3>
+          <h3 id={titleId} className="text-sm font-semibold">
+            {step.title}
+          </h3>
           <span className={cn(TUTORIAL_MUTED_TEXT, "text-xs")}>
             {currentStep}/{totalSteps}
           </span>

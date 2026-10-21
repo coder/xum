@@ -69,6 +69,16 @@ export async function disableTutorials(app: { baseUrl: string | undefined }): Pr
 }
 
 /**
+ * Clears the saved tutorial state (the opt-out and every finished tutorial) before the page loads,
+ * so the creation tutorial shows again. A merge patch with null deletes the key (RFC 7386).
+ */
+export async function resetTutorials(app: { baseUrl: string | undefined }): Promise<void> {
+  await appClient(app).config.updateUserPreferences({
+    patches: [{ ui: { tutorialState: null } }],
+  });
+}
+
+/**
  * Sends a chat message with the Send button and waits until the composer has taken it. Pressing
  * Enter right after `fill` can arrive before the composer is ready (seen on the phone target).
  */
