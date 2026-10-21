@@ -258,13 +258,16 @@ export class DaytonaService {
   /** Why the setup of a sandbox Xum created (and then deleted) failed, for later turns. */
   private readonly setupFailures = new Map<string, string>();
   private readonly listWorkspaces?: () => DaytonaWorkspaceRef[];
-  /** Per sandbox: serializes "is this its last workspace" decisions. */
+  /**
+   * Serializes "is this its last workspace" decisions. One key for every sandbox: workspaces
+   * may name one sandbox by its name or by its id, so a per-string key would not serialize them.
+   */
   private readonly removalLocks = new MutexMap<string>();
   /**
-   * Per sandbox: workspaces whose removal passed its checks and deleted its checkout, but
-   * that the workspace list may still show until the removal is persisted.
+   * Workspaces whose removal passed its checks and deleted its checkout, but that the
+   * workspace list may still show until the removal is persisted.
    */
-  private readonly removedWorkspaces = new Map<string, Set<string>>();
+  private readonly removedWorkspaces = new Set<string>();
 
   constructor(options: DaytonaServiceOptions) {
     this.credentialsStore = options.credentialsStore;
@@ -329,31 +332,57 @@ export class DaytonaService {
 
   /**
    * Whether a workspace other than `workspaceId` (archived ones included) references the
-   * sandbox. Fails closed, as referenced, when the workspace list or the caller's id is
-   * unknown: a kept sandbox only costs storage (the reconciler stops it), a deleted one loses
-   * the other workspace's work.
+   * sandbox. Daytona takes a sandbox's name or its id, and both get stored: Xum keeps the name
+   * of a sandbox it created, the attach picker the id. So when another workspace stores a
+   * different string, the sandbox is looked up and matched by both. Fails closed, as
+   * referenced, when the workspace list, the caller's id or the lookup is unavailable: a kept
+   * sandbox only costs storage (the reconciler stops it), a deleted one loses the other
+   * workspace's work. A sandbox that is already gone has no references left to protect.
    */
-  isSandboxReferencedElsewhere(sandboxId: string, workspaceId: string | undefined): boolean {
+  async isSandboxReferencedElsewhere(
+    sandboxId: string,
+    workspaceId: string | undefined
+  ): Promise<boolean> {
     if (!this.listWorkspaces || !workspaceId) return true;
-    const removed = this.removedWorkspaces.get(sandboxId);
-    return this.listWorkspaces().some(
-      (ref) =>
-        ref.workspaceId !== workspaceId &&
-        !removed?.has(ref.workspaceId) &&
-        getDaytonaSandboxId(ref.runtimeConfig) === sandboxId
-    );
+    const others = this.sandboxIdsStoredElsewhere(this.listWorkspaces(), workspaceId);
+    if (others.includes(sandboxId)) return true;
+    if (others.length === 0) return false;
+    const aliases = await this.sandboxAliases(sandboxId);
+    return aliases === undefined || others.some((stored) => aliases.has(stored));
   }
 
-  /** Run `fn` after every earlier removal decision for this sandbox has settled. */
-  withSandboxRemovalLock<T>(sandboxId: string, fn: () => Promise<T>): Promise<T> {
-    return this.removalLocks.withLock(sandboxId, fn);
+  /** What the other workspaces (removals in flight excluded) store as their sandbox. */
+  private sandboxIdsStoredElsewhere(refs: DaytonaWorkspaceRef[], workspaceId: string): string[] {
+    return refs.flatMap((ref) => {
+      const stored = getDaytonaSandboxId(ref.runtimeConfig);
+      const counts =
+        ref.workspaceId !== workspaceId && !this.removedWorkspaces.has(ref.workspaceId);
+      return counts && stored ? [stored] : [];
+    });
   }
 
-  /** The workspace no longer references the sandbox, even while the workspace list shows it. */
-  recordWorkspaceRemoval(sandboxId: string, workspaceId: string): void {
-    const removed = this.removedWorkspaces.get(sandboxId) ?? new Set<string>();
-    removed.add(workspaceId);
-    this.removedWorkspaces.set(sandboxId, removed);
+  /** The sandbox's id and name (empty when it is gone); undefined when the lookup fails. */
+  private async sandboxAliases(sandboxId: string): Promise<Set<string> | undefined> {
+    try {
+      const { sandbox } = await this.getSandboxState(sandboxId);
+      return new Set([sandbox?.id, sandbox?.name].filter((alias): alias is string => !!alias));
+    } catch (error) {
+      log.warn("Could not look up a Daytona sandbox to match its references", {
+        sandboxId,
+        error: getErrorMessage(error),
+      });
+      return undefined;
+    }
+  }
+
+  /** Run `fn` after every earlier removal decision has settled. */
+  withSandboxRemovalLock<T>(fn: () => Promise<T>): Promise<T> {
+    return this.removalLocks.withLock("daytona-sandbox-removal", fn);
+  }
+
+  /** The workspace no longer references its sandbox, even while the workspace list shows it. */
+  recordWorkspaceRemoval(workspaceId: string): void {
+    this.removedWorkspaces.add(workspaceId);
   }
 
   recordSetupFailure(sandboxId: string, reason: string): void {

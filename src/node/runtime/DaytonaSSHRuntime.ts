@@ -942,21 +942,21 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     sandboxId: string,
     deletedPath: string
   ): Promise<DeleteResult | undefined> {
-    return this.daytonaService.withSandboxRemovalLock(sandboxId, async () => {
-      if (this.sandboxFateOnDelete(sandboxId) !== "delete") return undefined;
+    return this.daytonaService.withSandboxRemovalLock(async () => {
+      if ((await this.sandboxFateOnDelete(sandboxId)) !== "delete") return undefined;
       const result = await this.deleteOwnedSandbox(sandboxId, deletedPath, undefined);
       // Forced: the workspace goes whether or not the sandbox delete worked.
-      this.recordRemoval(sandboxId);
+      this.recordRemoval();
       return result;
     });
   }
 
-  private recordRemoval(sandboxId: string): void {
-    if (this.workspaceId) this.daytonaService.recordWorkspaceRemoval(sandboxId, this.workspaceId);
+  private recordRemoval(): void {
+    if (this.workspaceId) this.daytonaService.recordWorkspaceRemoval(this.workspaceId);
   }
 
-  private sandboxFateOnDelete(sandboxId: string): SandboxFate {
-    if (this.daytonaService.isSandboxReferencedElsewhere(sandboxId, this.workspaceId)) {
+  private async sandboxFateOnDelete(sandboxId: string): Promise<SandboxFate> {
+    if (await this.daytonaService.isSandboxReferencedElsewhere(sandboxId, this.workspaceId)) {
       return "keep";
     }
     return this.daytonaConfig.shared === true ? "release" : "delete";
@@ -1038,14 +1038,14 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     result: { success: true; deletedPath: string },
     errorPrefix: string | undefined
   ): Promise<DeleteResult> {
-    return this.daytonaService.withSandboxRemovalLock(sandboxId, async () => {
+    return this.daytonaService.withSandboxRemovalLock(async () => {
       const settled = await this.applySandboxFate(
         sandboxId,
         result,
-        this.sandboxFateOnDelete(sandboxId),
+        await this.sandboxFateOnDelete(sandboxId),
         errorPrefix
       );
-      if (settled.success) this.recordRemoval(sandboxId);
+      if (settled.success) this.recordRemoval();
       return settled;
     });
   }

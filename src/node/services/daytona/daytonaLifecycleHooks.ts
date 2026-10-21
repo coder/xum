@@ -40,7 +40,7 @@ export interface DaytonaArchiveHookOptions {
 
 export function createDaytonaArchiveHook(options: DaytonaArchiveHookOptions): BeforeArchiveHook {
   return async (args): Promise<Result<void>> => {
-    const sandboxId = unsharedSandboxId(options, args.workspaceMetadata);
+    const sandboxId = await unsharedSandboxId(options, args.workspaceMetadata);
     if (!sandboxId) return Ok(undefined);
 
     const result = isDedicatedDaytonaSandbox(args.workspaceMetadata.runtimeConfig)
@@ -70,16 +70,16 @@ async function applyArchiveBehavior(
 }
 
 /** The archived workspace's sandbox, unless another workspace (archived ones too) uses it. */
-function unsharedSandboxId(
+async function unsharedSandboxId(
   options: DaytonaArchiveHookOptions,
   workspaceMetadata: WorkspaceMetadata
-): string | undefined {
+): Promise<string | undefined> {
   // A shared-checkout sub-agent copies its parent's runtime config, sandbox ID included:
   // the sandbox belongs to the parent.
   if (workspaceMetadata.taskIsolation === "none") return undefined;
   const sandboxId = getDaytonaSandboxId(workspaceMetadata.runtimeConfig);
   if (!sandboxId) return undefined;
-  if (options.daytonaService.isSandboxReferencedElsewhere(sandboxId, workspaceMetadata.id)) {
+  if (await options.daytonaService.isSandboxReferencedElsewhere(sandboxId, workspaceMetadata.id)) {
     return undefined;
   }
   return sandboxId;

@@ -104,6 +104,28 @@ describe("createDaytonaArchiveHook", () => {
     expect(rig.writer.removed).toEqual(["sb-shared"]);
   });
 
+  it("leaves a sandbox alone that another workspace attached by its id, or that cannot be looked up", async () => {
+    // Created by Xum under a name; the attach picker stored the same sandbox's real id.
+    rig.plane.addSandbox({ id: "sb-9", name: "xum-owner-def456" });
+    rig.workspaces.push({
+      workspaceId: "attached",
+      runtimeConfig: metadata({ sandboxId: "sb-9", shared: true }).runtimeConfig,
+    });
+    const owner = { sandboxId: "xum-owner-def456", shared: false };
+
+    expect((await archive(owner, "delete")).success).toBe(true);
+    expect(rig.plane.find("sb-9")?.state).toBe("started");
+
+    // Without the lookup Xum cannot tell: it keeps the sandbox.
+    rig.workspaces[0] = {
+      workspaceId: "attached",
+      runtimeConfig: metadata({ sandboxId: "sb-other", shared: true }).runtimeConfig,
+    };
+    rig.plane.failingRoutes.add("GET /sandbox/xum-owner-def456");
+    expect((await archive(owner, "delete")).success).toBe(true);
+    expect(rig.plane.find("sb-9")?.state).toBe("started");
+  });
+
   it("leaves the parent's sandbox alone when a shared-checkout sub-agent is archived", async () => {
     rig.plane.addSandbox({ id: "sb-parent" });
     const hook = createDaytonaArchiveHook({

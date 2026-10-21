@@ -402,6 +402,26 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     sshDeleteSpy.mockRestore();
   });
 
+  it("keeps a sandbox another workspace attached by its id while the owner stores its name", async () => {
+    // Xum created it under a name; the attach picker stores the real id of the same sandbox.
+    rig.plane.addSandbox({ id: "sb-7", name: "xum-owner-abc123" });
+    const owner = { sandboxId: "xum-owner-abc123", shared: false, ...SMALL };
+    rig.workspaces.push(
+      { workspaceId: "ws-1", runtimeConfig: sshDaytonaConfig(owner) },
+      {
+        workspaceId: "ws-attached",
+        runtimeConfig: sshDaytonaConfig({ sandboxId: "sb-7", shared: true }),
+      }
+    );
+
+    for (const force of [false, true]) {
+      const result = await makeRuntime(owner).deleteWorkspace("/home/me/project", "feature", force);
+      expect(result.success).toBe(true);
+      expect(rig.plane.find("sb-7")).toBeDefined();
+    }
+    expect(rig.plane.calls.filter((call) => call.startsWith("DELETE /sandbox/"))).toEqual([]);
+  });
+
   it("starts a stopped sandbox to run the dirty check and keeps a dirty workspace", async () => {
     rig.plane.addSandbox({ id: "sb-dirty", state: "stopped" });
     sshDeleteSpy.mockResolvedValue({ success: false, error: "uncommitted changes" });
