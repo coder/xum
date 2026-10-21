@@ -4,7 +4,7 @@
  * preview lists the entries, the user installs one entry per install, and updates read the entry
  * again from marketplace.json at the new commit.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
@@ -258,6 +258,65 @@ describe("AgentPluginInstallService Claude marketplaces", () => {
     ).toBeNull();
   });
 
+  test("a generated entry loads only its listed agents, and older builds only its components", async () => {
+    const agent = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\n`;
+    await writeFiles(marketDir, {
+      ".claude-plugin/marketplace.json": marketplace([
+        { name: "kit", source: "./plugins/kit", agents: ["./agents/a.md", "./agents/b.md"] },
+        { name: "partial", source: "./plugins/kit", agents: ["./agents/a.md"] },
+      ]),
+      "plugins/kit/skills/lint/SKILL.md": skillMd("lint"),
+      "plugins/kit/agents/a.md": agent("a"),
+      "plugins/kit/agents/b.md": agent("b"),
+      "plugins/kit/hooks.js": "export default {};",
+      "plugins/kit/workflows/w.js": "export default async () => {};",
+      "plugins/kit/mcp.json": "{}",
+      "plugins/kit/.mcp.json": JSON.stringify({ mcpServers: {} }),
+      "plugins/kit/hooks/hooks.json": JSON.stringify({ hooks: {} }),
+    });
+    await commit(marketDir, "kit");
+    const partial = await previewEntry("partial");
+    expect(partial.agents).toEqual([]);
+    expect(partial.warnings.some((warning) => warning.includes("b.md"))).toBe(true);
+
+    const kit = await previewEntry("kit");
+    expect(kit.agents).toEqual(["a.md", "b.md"]);
+    await install(kit);
+    const installed = path.join(xumRoot, "plugins", "kit");
+    const current = (await discoverAgentPluginAt({ pluginDir: installed, scope: "global" })).plugin;
+    // This build: the Claude default .mcp.json, no hooks.js or workflows/.
+    expect(current?.mcpConfigPath).toBe(path.join(current?.rootPath ?? "", ".mcp.json"));
+    expect(current?.hooksPath).toBeUndefined();
+
+    // An older build reads the marker as opaque: drop it to read the file as such a build does.
+    const manifestPath = path.join(installed, "plugin.json");
+    const manifest = JSON.parse(await fsPromises.readFile(manifestPath, "utf8")) as {
+      extensions: Record<string, unknown>;
+    };
+    delete manifest.extensions.mux;
+    await fsPromises.writeFile(manifestPath, JSON.stringify(manifest));
+    const older = (await discoverAgentPluginAt({ pluginDir: installed, scope: "global" })).plugin;
+    expect(older?.hooksPath).toBeUndefined();
+    expect(older?.workflowsDir).toBeUndefined();
+    expect(older?.mcpConfigPath).toBeUndefined();
+    expect(older?.openai?.hooks).toEqual([]);
+    // The entry declared these agents, and the user reviewed them.
+    expect(older?.agentsDir).toBe(path.join(older?.rootPath ?? "", "agents"));
+  });
+
+  test("a root entry with an empty skills list installs no skills", async () => {
+    await writeFiles(marketDir, {
+      ".claude-plugin/marketplace.json": marketplace([
+        { name: "none", source: "./", strict: false, skills: [] },
+      ]),
+    });
+    await commit(marketDir, "none");
+    const listed = await service.previewSource({ input: marketDir });
+    if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
+    expect(listed.marketplace.entries.map((entry) => entry.skillCount)).toEqual([0]);
+    expect((await previewEntry("none")).skills).toEqual([]);
+  });
+
   test("an entry with its own plugin manifest uses it; strict entry components only warn", async () => {
     await writeFiles(marketDir, {
       ".claude-plugin/marketplace.json": marketplace([
@@ -279,6 +338,106 @@ describe("AgentPluginInstallService Claude marketplaces", () => {
     // The install is a normal subpath install of the Claude plugin.
     await install(preview);
     expect(await installedSkills("own")).toEqual(["base"]);
+  });
+
+  test("an entry name with '_' installs under a plugin name and updates by the entry name", async () => {
+    await writeFiles(marketDir, {
+      ".claude-plugin/marketplace.json": marketplace([
+        { name: "Doc_Tools", source: "./", strict: false, skills: ["./skills/pdf"] },
+      ]),
+    });
+    await commit(marketDir, "underscore");
+    const preview = await previewEntry("Doc_Tools");
+    expect(preview.manifest.name).toBe("doc-tools");
+    await install(preview);
+    await writeFiles(marketDir, {
+      ".claude-plugin/marketplace.json": marketplace([
+        {
+          name: "Doc_Tools",
+          source: "./",
+          strict: false,
+          skills: ["./skills/pdf", "./skills/art"],
+        },
+      ]),
+    });
+    await commit(marketDir, "add art");
+    await updateWithReview("doc-tools");
+    expect(await installedSkills("doc-tools")).toEqual(["pdf", "art"]);
+  });
+
+  test("entry MCP servers are no conflict; a remote entry with components needs a manifest", async () => {
+    const remoteDir = path.join(tmpRoot, "remote-skills");
+    await initRepo(remoteDir);
+    await writeFiles(remoteDir, { "skills/one/SKILL.md": skillMd("one") });
+    await commit(remoteDir, "init");
+    await writeFiles(marketDir, {
+      ".claude-plugin/marketplace.json": marketplace([
+        {
+          name: "own",
+          source: "./plugins/own",
+          strict: false,
+          mcpServers: { x: { command: "x" } },
+        },
+        {
+          name: "picked",
+          source: { source: "url", url: remoteDir },
+          skills: ["./skills/one"],
+        },
+      ]),
+      "plugins/own/.claude-plugin/plugin.json": JSON.stringify({ name: "own" }),
+      "plugins/own/skills/base/SKILL.md": skillMd("base"),
+    });
+    await commit(marketDir, "own and picked");
+    expect((await previewEntry("own")).skills.map((skill) => skill.name)).toEqual(["base"]);
+    await expect(previewEntry("picked")).rejects.toThrow("lists its own components");
+  });
+
+  test("a listing scans each shared folder once, a few folders at a time", async () => {
+    const entries = Array.from({ length: 24 }, (_, index) => ({
+      name: `e${index}`,
+      source: "./",
+      strict: false,
+      // Twelve distinct skills lists, each listed by two entries.
+      skills: [`./skills/s${index % 12}`],
+    }));
+    const files: Record<string, string> = {
+      ".claude-plugin/marketplace.json": marketplace(entries),
+    };
+    for (let index = 0; index < 12; index++) {
+      files[`skills/s${index}/SKILL.md`] = skillMd(`s${index}`);
+    }
+    await writeFiles(marketDir, files);
+    await commit(marketDir, "many");
+    interface Scanner {
+      acceptedSkillNames: (...args: unknown[]) => Promise<Set<string>>;
+    }
+    const proto = AgentPluginInstallService.prototype as unknown as Scanner;
+    const real = proto.acceptedSkillNames;
+    let active = 0;
+    let peak = 0;
+    let calls = 0;
+    const spy = spyOn(proto, "acceptedSkillNames").mockImplementation(async function (
+      this: unknown,
+      ...args: unknown[]
+    ) {
+      calls++;
+      active++;
+      peak = Math.max(peak, active);
+      try {
+        return await real.apply(this, args);
+      } finally {
+        active--;
+      }
+    });
+    try {
+      const listed = await service.previewSource({ input: marketDir });
+      if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
+      expect(listed.marketplace.entries.every((entry) => entry.skillCount === 1)).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(calls).toBe(12);
+    expect(peak).toBeLessThanOrEqual(8);
   });
 
   test("a url entry installs the other repository as a normal git source", async () => {

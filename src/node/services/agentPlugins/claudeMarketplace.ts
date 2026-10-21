@@ -19,7 +19,7 @@ import type {
   AgentPluginMarketplaceEntry,
   AgentPluginMarketplaceListing,
 } from "@/common/orpc/schemas/agentPlugins";
-import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
+import { isValidMarketplaceEntryName } from "@/common/utils/agentPluginName";
 import { displayRepoUrl } from "@/common/utils/agentPluginSource";
 import { getErrorMessage } from "@/common/utils/errors";
 import { GITHUB_SHORTHAND_PATTERN } from "@/node/utils/gitUrls";
@@ -148,10 +148,10 @@ function readEntry(value: unknown, index: number, seen: Set<string>): ClaudeMark
     ...(skillCount !== undefined ? { skillCount } : {}),
   };
   if (name === undefined) return { ...entry, problem: "The entry has no name." };
-  if (!isValidAgentPluginName(name)) {
+  if (!isValidMarketplaceEntryName(name)) {
     return {
       ...entry,
-      problem: `'${name}' is not a valid plugin name (lowercase letters, digits, '-' and '.').`,
+      problem: `'${name}' is not a valid plugin name (letters, digits, '.', '_' and '-').`,
     };
   }
   if (seen.has(name)) return { ...entry, problem: `'${name}' is listed more than once.` };
@@ -277,7 +277,18 @@ function relativeEntrySource(
   if (marketplace.pluginRootProblem !== undefined) throw new Error(marketplace.pluginRootProblem);
   // Each part is checked on its own before the join, so `..` cannot cancel a pluginRoot folder.
   const folder = marketplaceRelativePath(source);
-  const joined = [marketplace.pluginRoot, folder].filter((part) => part !== "").join("/");
+  // The Claude rule: "." and "./..." start at the marketplace root; only a bare folder name (no
+  // "/") starts at metadata.pluginRoot, and any other path needs the "./" prefix.
+  const trimmed = source.trim();
+  const explicit = trimmed === "." || trimmed.startsWith("./");
+  if (!explicit && (folder === "" || folder.includes("/"))) {
+    throw new Error(
+      `The source '${source}' must start with './'. Only a single folder name resolves under metadata.pluginRoot.`
+    );
+  }
+  const joined = explicit
+    ? folder
+    : [marketplace.pluginRoot, folder].filter((part) => part !== "").join("/");
   return { kind: "relative", subpath: joined === "" ? undefined : joined };
 }
 
@@ -390,16 +401,17 @@ export function findMarketplaceEntry(
   return entry;
 }
 
-/** Component keys of an entry: with a plugin.json there, they add to it or conflict (strict). */
+/**
+ * Component keys of an entry: with a plugin.json there, they add to it or conflict (strict).
+ * These are Claude's six; entry `mcpServers` and `lspServers` simply do not apply then.
+ */
 const ENTRY_COMPONENT_KEYS = [
   "skills",
   "commands",
   "agents",
   "hooks",
-  "mcpServers",
   "outputStyles",
   "themes",
-  "lspServers",
 ] as const;
 
 export function entryDeclaresComponents(entry: ClaudeMarketplaceEntry): boolean {
@@ -449,7 +461,8 @@ export function entryAsManifest(entry: ClaudeMarketplaceEntry): {
   for (const key of ENTRY_MANIFEST_KEYS) {
     if (entry.raw[key] !== undefined) raw[key] = entry.raw[key];
   }
-  // The listing already checked the (trimmed) name: the plugin takes the entry name.
+  // The listing already checked the (trimmed) name against the marketplace grammar; the
+  // caller derives the plugin name from it (marketplaceManifest).
   raw.name = entry.name;
   const warnings = IGNORED_ENTRY_KEYS.filter((key) => entry.raw[key] !== undefined).map(
     (key) => `Xum ignores '${key}' of the marketplace entry '${entry.name}'`

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   describeMarketplaceEntries,
+  entryDeclaresComponents,
   findMarketplaceEntry,
   parseClaudeMarketplace,
   resolveEntrySource,
@@ -84,17 +85,36 @@ describe("parseClaudeMarketplace", () => {
 });
 
 describe("resolveEntrySource", () => {
-  test("a relative path is a folder of the marketplace repository, joined to pluginRoot", () => {
+  test("a relative path is a folder of the marketplace repository; a bare name joins pluginRoot", () => {
     expect(resolveOnly("./")).toEqual({ kind: "relative", subpath: undefined });
     expect(resolveOnly("./plugins/demo/")).toEqual({ kind: "relative", subpath: "plugins/demo" });
-    expect(resolveOnly("demo", { metadata: { pluginRoot: "./plugins" } })).toEqual({
+    const pluginRoot = { metadata: { pluginRoot: "./plugins" } };
+    expect(resolveOnly("demo", pluginRoot)).toEqual({ kind: "relative", subpath: "plugins/demo" });
+    // pluginRoot has no effect on a source that starts with "./" (the Claude rule).
+    expect(resolveOnly("./", pluginRoot)).toEqual({ kind: "relative", subpath: undefined });
+    expect(resolveOnly(".", pluginRoot)).toEqual({ kind: "relative", subpath: undefined });
+    expect(resolveOnly("./tools/demo", pluginRoot)).toEqual({
       kind: "relative",
-      subpath: "plugins/demo",
+      subpath: "tools/demo",
     });
-    expect(resolveOnly("./", { metadata: { pluginRoot: "./plugins" } })).toEqual({
-      kind: "relative",
-      subpath: "plugins",
-    });
+    // A path with "/" is not a bare name and needs "./", with or without pluginRoot.
+    expect(resolveOnly("team-a/demo", pluginRoot)).toContain("must start with './'");
+    expect(resolveOnly("team-a/demo")).toContain("must start with './'");
+  });
+
+  test("entry names follow the marketplace grammar, and conflicts are Claude's six keys", () => {
+    const parsed = marketplace([
+      { name: "My_Tool.v2", source: "./x" },
+      { name: "_hidden", source: "./x" },
+      { name: "a..b", source: "./x" },
+    ]);
+    expect(
+      describeMarketplaceEntries(parsed, REMOTE_MARKETPLACE).map((row) => row.installable)
+    ).toEqual([true, false, false]);
+    const entry = (raw: Record<string, unknown>) =>
+      marketplace([{ name: "demo", source: "./x", ...raw }]).entries[0];
+    expect(entryDeclaresComponents(entry({ mcpServers: {}, lspServers: {} }))).toBe(false);
+    expect(entryDeclaresComponents(entry({ themes: ["./t"] }))).toBe(true);
   });
 
   test("relative paths cannot leave the repository", () => {

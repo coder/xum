@@ -47,6 +47,7 @@ import {
 import {
   AGENT_PLUGIN_SCHEMA_ID_1_0_0,
   MAX_SKILLS_ROOTS,
+  inertGeneratedComponents,
   isPlainObject,
   readGeneratedFrom,
   type GeneratedFrom,
@@ -282,7 +283,7 @@ function sameInstallMethod(a: AgentPluginInstallMethod, b: AgentPluginInstallMet
   }
 }
 
-function methodLabel(method: AgentPluginInstallMethod): string {
+export function methodLabel(method: AgentPluginInstallMethod): string {
   return AGENT_PLUGIN_INSTALL_METHOD_LABELS[method.kind];
 }
 
@@ -427,6 +428,14 @@ export function entryInstallMethods(
   if (ctx.relative) {
     return { methods: [{ kind: "claude-marketplace", entry: name }], warnings: [] };
   }
+  // In Claude Code the entry is this plugin's manifest. Xum does not generate one for another
+  // repository (an update must find the entry again), so an entry that names components would
+  // install a different component set as Skills: refuse it instead.
+  if (entryDeclaresComponents(ctx.entry)) {
+    throw new Error(
+      `The marketplace entry '${name}' lists its own components, and the repository it points to has no plugin manifest. Xum does not install such an entry; install the repository as Skills instead.`
+    );
+  }
   const skills = detected.find((method) => method.kind === "skills");
   return { methods: skills !== undefined ? [skills] : [], warnings: [] };
 }
@@ -493,6 +502,13 @@ export function chooseStagedMethod(
     return { method, methods, warnings, skillsCliSkills: [] };
   }
   const method = chooseInstallMethod(detected.methods, request);
+  if (method === undefined && request.mode === "update" && detected.methods.length > 0) {
+    // The installed plugin.json is the repository's own, or a Claude one: Xum does not turn it
+    // into a generated skills install on update (InstallMethodRequest).
+    throw new Error(
+      `The repository no longer has the manifest this plugin was installed from; it fits: ${detected.methods.map(methodLabel).join(", ")}. Uninstall the plugin and install it again to choose a method.`
+    );
+  }
   if (method === undefined) throw new Error(noInstallMethodMessage(source.subpath));
   return {
     method,
@@ -522,12 +538,16 @@ async function skillsManifest(
   const dropped = roots
     .slice(MAX_SKILLS_ROOTS)
     .flatMap((root) => root.skills.map((skill) => `${root.root}/${skill}`));
+  const inert = inertGeneratedComponents();
   const manifest = {
     $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
     name: generatedPluginName(source),
     description: `Skills from ${displayRepoUrl(source.url)}${source.subpath !== undefined ? `/${source.subpath}` : ""}`,
-    contributes: { skills: kept.map((root) => root.root) },
-    extensions: { mux: { generatedFrom: { kind: "skills" } satisfies GeneratedFrom } },
+    contributes: { skills: kept.map((root) => root.root), ...inert.contributes },
+    extensions: {
+      mux: { generatedFrom: { kind: "skills" } satisfies GeneratedFrom },
+      "com.openai": inert.openai,
+    },
   };
   const warnings =
     dropped.length > 0
@@ -548,19 +568,41 @@ export function marketplaceManifest(ctx: MarketplaceEntryContext): {
   warnings: string[];
 } {
   const { raw, warnings } = entryAsManifest(ctx.entry);
+  // An entry name can hold what a plugin name cannot (`_`, capitals): the plugin takes the
+  // nearest valid name, and the marker keeps the entry name for updates.
+  raw.name = toPluginName(ctx.entry.name);
   const normalized = normalizeClaudeManifest(raw, {
     label: `the marketplace entry '${ctx.entry.name}'`,
     replaceDefaultSkills: ctx.rootSource,
   });
   assert(isPlainObject(normalized.manifest), "marketplaceManifest: the entry is an object");
-  const commands = normalized.claude.commands;
+  const { commands, agentFiles } = normalized.claude;
   const generatedFrom: GeneratedFrom = {
     kind: "claude-marketplace",
     entry: ctx.entry.name,
     ...(commands !== undefined ? { commands } : {}),
+    ...(agentFiles !== undefined ? { agentFiles } : {}),
   };
+  const contributes = isPlainObject(normalized.manifest.contributes)
+    ? normalized.manifest.contributes
+    : {};
+  // Downgrade safety (inertGeneratedComponents): an older build reads this file as a plain
+  // plugin.json, so every component the entry does not declare points at the inert path. This
+  // build reads an inert agents or MCP path as "not declared" (claudeMarketplaceManifest), so
+  // the Claude defaults (agents/, .mcp.json) still apply here.
+  const inert = inertGeneratedComponents();
   return {
-    manifest: { ...normalized.manifest, extensions: { mux: { generatedFrom } } },
+    manifest: {
+      ...normalized.manifest,
+      contributes: {
+        ...contributes,
+        hooks: inert.contributes.hooks,
+        workflows: inert.contributes.workflows,
+        agents: contributes.agents ?? inert.contributes.agents,
+        mcp: contributes.mcp ?? inert.contributes.mcp,
+      },
+      extensions: { mux: { generatedFrom }, "com.openai": inert.openai },
+    },
     warnings: [...warnings, ...normalized.warnings],
   };
 }

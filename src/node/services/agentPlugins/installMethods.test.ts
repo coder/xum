@@ -14,7 +14,7 @@ import {
   toPluginName,
   writeGeneratedManifest,
 } from "./installMethods";
-import { AGENT_PLUGIN_SCHEMA_ID_1_0_0, MAX_SKILLS_ROOTS } from "./manifest";
+import { AGENT_PLUGIN_SCHEMA_ID_1_0_0, INERT_COMPONENT_PATH, MAX_SKILLS_ROOTS } from "./manifest";
 
 const SKILL = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\n`;
 
@@ -183,13 +183,54 @@ describe("writeGeneratedManifest", () => {
       $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
       name: "skills",
       description: "Skills from github.com/acme/skills",
-      contributes: { skills: ["skills", ".agents/skills"] },
-      extensions: { mux: { generatedFrom: { kind: "skills" } } },
+      contributes: {
+        skills: ["skills", ".agents/skills"],
+        hooks: INERT_COMPONENT_PATH,
+        agents: INERT_COMPONENT_PATH,
+        workflows: INERT_COMPONENT_PATH,
+        mcp: INERT_COMPONENT_PATH,
+      },
+      extensions: { mux: { generatedFrom: { kind: "skills" } }, "com.openai": { hooks: [] } },
     });
     const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
     expect(plugin?.skillsOnly).toBe(true);
     expect(plugin?.hooksPath).toBeUndefined();
     expect(plugin?.agentsDir).toBeUndefined();
+  });
+
+  test("a build that ignores the marker still loads only the listed skills", async () => {
+    using tmp = new DisposableTempDir("install-methods");
+    await writeTree(tmp.path, ["skills/a"], {
+      "hooks.js": "export default {};",
+      "agents/x.md": SKILL("x"),
+      "workflows/run.js": "export {};",
+      "mcp.json": "{}",
+      "hooks/hooks.json": JSON.stringify({ hooks: {} }),
+    });
+    await fs.mkdir(path.join(tmp.path, ".git"));
+    await writeGeneratedManifest(tmp.path, { kind: "skills" }, source);
+    // An older build treats extensions.mux as opaque: drop the marker to read the file as one.
+    const manifestPath = path.join(tmp.path, "plugin.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as {
+      extensions: Record<string, unknown>;
+    };
+    delete manifest.extensions.mux;
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+
+    const { plugin, diagnostics } = await discoverAgentPluginAt({
+      pluginDir: tmp.path,
+      scope: "global",
+    });
+
+    expect(plugin?.skillsOnly).toBeUndefined();
+    expect(plugin?.skillsDirs).toEqual([{ dir: path.join(plugin?.rootPath ?? "", "skills") }]);
+    expect(plugin?.hooksPath).toBeUndefined();
+    expect(plugin?.agentsDir).toBeUndefined();
+    expect(plugin?.workflowsDir).toBeUndefined();
+    expect(plugin?.mcpConfigPath).toBeUndefined();
+    // An empty Codex hooks list turns hooks/hooks.json off.
+    expect(plugin?.openai?.hooks).toEqual([]);
+    expect(diagnostics.filter((d) => d.severity === "error")).toEqual([]);
   });
 
   test("names every skill past the root cap", async () => {

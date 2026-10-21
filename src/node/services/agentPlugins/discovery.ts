@@ -23,6 +23,7 @@ import { noComponentConsent, type ComponentConsent } from "./componentConsent";
 import type { ApprovedCopiesSource } from "./approvedCopies";
 import {
   hasGeneratedFromMarker,
+  INERT_COMPONENT_PATH,
   readGeneratedFrom,
   isPlainObject,
   isValidAgentPluginName,
@@ -36,6 +37,9 @@ import {
 } from "./openaiExtension";
 import { normalizeClaudeManifest, type ClaudePluginComponents } from "./claudeManifest";
 import { pluginSkillFileName } from "./claudeCommands";
+import { pluginAgentIdOf } from "./agentFiles";
+import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
+import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 
 /**
  * Agent Plugins 1.0.0 discovery (§4, §6).
@@ -581,10 +585,10 @@ async function classifySkillsRoot(args: {
   }
   // The declared folder name, not the canonical one: a contained symlink keeps the name the
   // author wrote. The plugin root has no folder name of its own, so it takes the plugin's.
-  const name =
-    args.canonical === args.rootReal
-      ? args.pluginName
-      : path.basename(path.join(args.rootReal, args.relative));
+  // Decide "root" from the declared path, not the canonical one: `alias -> .` is still
+  // the folder the author named `alias`.
+  const declaredPath = path.resolve(args.rootReal, args.relative);
+  const name = declaredPath === args.rootReal ? args.pluginName : path.basename(declaredPath);
   return { dir: args.canonical, single: true, name };
 }
 
@@ -600,10 +604,12 @@ async function listCommandFiles(
   ) => Promise<string | undefined>
 ): Promise<Array<{ dir: string; file: string }>> {
   if (relative.endsWith(".md")) {
-    const canonical = await resolveComponent(relative, "file");
-    return canonical === undefined
-      ? []
-      : [{ dir: path.dirname(canonical), file: path.basename(canonical) }];
+    // The declared file name is the command name, also when the file is a contained symlink
+    // (as for a folder's entries): resolve the file for containment, then read it through
+    // its declared parent folder.
+    if ((await resolveComponent(relative, "file")) === undefined) return [];
+    const dir = await resolveComponent(path.posix.dirname(relative), "directory");
+    return dir === undefined ? [] : [{ dir, file: path.posix.basename(relative) }];
   }
   const dir = await resolveComponent(relative, "directory");
   if (dir === undefined) return [];
@@ -616,13 +622,75 @@ async function listCommandFiles(
     .map((file) => ({ dir, file }));
 }
 
-/** The skill folder names of some skills roots, valid or not. */
-async function listSkillNames(roots: PluginSkillsRoot[]): Promise<Set<string>> {
+/**
+ * The names of the skills that load from some skills roots: a valid folder name and a contained,
+ * regular SKILL.md that parses. An empty or broken skill folder does not hide a command.
+ */
+async function listSkillNames(roots: PluginSkillsRoot[], rootReal: string): Promise<Set<string>> {
   const names = new Set<string>();
   for (const root of roots) {
-    for (const { name } of await listPluginSkillFolders(root)) names.add(name);
+    for (const { name, file } of await listPluginSkillFolders(root)) {
+      if (await isLoadableSkill(name, file, rootReal)) names.add(name);
+    }
   }
   return names;
+}
+
+async function isLoadableSkill(name: string, file: string, rootReal: string): Promise<boolean> {
+  const skillName = SkillNameSchema.safeParse(name);
+  if (!skillName.success) return false;
+  try {
+    const real = await fsPromises.realpath(file);
+    if (!real.startsWith(rootReal + path.sep)) return false;
+    const stat = await fsPromises.stat(real);
+    if (!stat.isFile() || stat.size > MAX_FILE_SIZE) return false;
+    parseSkillMarkdown({
+      content: await fsPromises.readFile(real, "utf8"),
+      byteSize: stat.size,
+      directoryName: skillName.data,
+      allowDisplayName: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Claude's single-skill layout: a plugin with SKILL.md at its root, no skills/ and no `skills`
+ * key loads as one skill (the caller passes "." as the declared skills path).
+ */
+async function isClaudeRootSkill(rootReal: string): Promise<boolean> {
+  if ((await fsPromises.lstat(path.join(rootReal, "skills")).catch(() => null)) !== null) {
+    return false;
+  }
+  const skillFile = await fsPromises.lstat(path.join(rootReal, SKILL_FILENAME)).catch(() => null);
+  return skillFile?.isFile() === true || skillFile?.isSymbolicLink() === true;
+}
+
+/**
+ * Claude `agents` lists single files, but every agent scan site reads the whole folder. So a
+ * folder that holds an agent file the list does not name loads no agents at all (with a
+ * warning naming those files): Xum never loads an agent the manifest left out.
+ */
+async function keepDeclaredAgentsOnly(args: {
+  agentsDir: string | undefined;
+  declaredFiles: string[] | undefined;
+  warn: (message: string) => void;
+}): Promise<string | undefined> {
+  if (args.agentsDir === undefined || args.declaredFiles === undefined) return args.agentsDir;
+  const entries = await fsPromises.readdir(args.agentsDir, { withFileTypes: true }).catch(() => []);
+  const declared = new Set(args.declaredFiles);
+  const undeclared = entries
+    .filter((entry) => entry.isFile() && pluginAgentIdOf(entry.name) !== null)
+    .map((entry) => entry.name)
+    .filter((name) => !declared.has(name))
+    .sort((a, b) => a.localeCompare(b));
+  if (undeclared.length === 0) return args.agentsDir;
+  args.warn(
+    `'agents' does not list ${undeclared.join(", ")} in its folder; Xum reads whole agent folders, so it loads no agents from this plugin`
+  );
+  return undefined;
 }
 
 /**
@@ -638,9 +706,10 @@ async function resolveCommandRoots(args: {
     relativePath: string,
     expectKind: "file" | "directory"
   ) => Promise<string | undefined>;
+  rootReal: string;
   warn: (message: string) => void;
 }): Promise<PluginSkillsRoot[]> {
-  const taken = await listSkillNames(args.skillsDirs);
+  const taken = await listSkillNames(args.skillsDirs, args.rootReal);
   const roots: PluginSkillsRoot[] = [];
   for (const relative of args.declared ?? ["commands"]) {
     for (const { dir, file } of await listCommandFiles(relative, args.resolveComponent)) {
@@ -751,12 +820,16 @@ function skillsOnlyManifest(manifest: AgentPluginManifest): AgentPluginManifest 
  */
 function claudeMarketplaceManifest(manifest: AgentPluginManifest): AgentPluginManifest {
   const { contributes, extensions, ...metadata } = manifest;
-  // Absent members stay undefined, which every reader treats as "not declared".
+  // Absent members stay undefined, which every reader treats as "not declared". The generator
+  // writes the inert path for an agents or MCP path the entry did not declare (downgrade
+  // safety, inertGeneratedComponents), so it reads as "not declared" too: the Claude defaults.
   const { skills, agents, mcp } = contributes ?? {};
+  const declared = (value: string | undefined) =>
+    value === INERT_COMPONENT_PATH ? undefined : value;
   const mux = extensions?.mux;
   return {
     ...metadata,
-    contributes: { skills, agents, mcp },
+    contributes: { skills, agents: declared(agents), mcp: declared(mcp) },
     extensions: { mux: { generatedFrom: isPlainObject(mux) ? mux.generatedFrom : undefined } },
   };
 }
@@ -791,8 +864,10 @@ function packageRules(args: {
       manifest: claudeMarketplaceManifest(args.manifest),
       skillsOnly: false,
       claudePackage: true,
-      claudeComponents:
-        generatedFrom.commands !== undefined ? { commands: generatedFrom.commands } : {},
+      claudeComponents: {
+        ...(generatedFrom.commands !== undefined ? { commands: generatedFrom.commands } : {}),
+        ...(generatedFrom.agentFiles !== undefined ? { agentFiles: generatedFrom.agentFiles } : {}),
+      },
     };
   }
   const skillsOnly = hasGeneratedFromMarker(args.manifest);
@@ -993,7 +1068,9 @@ async function discoverPluginAt(args: {
     });
 
   const skillsDirs = await resolveSkillsRoots({
-    declared: contributes?.skills,
+    declared:
+      contributes?.skills ??
+      (claudePackage && (await isClaudeRootSkill(rootReal)) ? ["."] : undefined),
     rootReal,
     pluginName: manifest.name,
     resolveComponent,
@@ -1004,6 +1081,7 @@ async function discoverPluginAt(args: {
         declared: claudeComponents?.commands,
         skillsDirs,
         resolveComponent,
+        rootReal,
         warn: (message) => {
           log.debug(`Agent plugin ${pluginDir}: ${message}`);
           diagnostics.push({ path: rootReal, scope, severity: "warning", message });
@@ -1019,10 +1097,18 @@ async function discoverPluginAt(args: {
         manifestDialect: claudePackage ? "claude" : codexFallback ? "codex" : undefined,
         resolveComponent,
       });
-  const xumComponents = await resolveXumComponents({
+  const { agentsDir: resolvedAgentsDir, ...xumComponents } = await resolveXumComponents({
     allowed: xumComponentGate({ codexFallback, foreign: claudePackage || skillsOnly, skillsOnly }),
     contributes,
     resolveComponent,
+  });
+  const agentsDir = await keepDeclaredAgentsOnly({
+    agentsDir: resolvedAgentsDir,
+    declaredFiles: claudePackage ? claudeComponents?.agentFiles : undefined,
+    warn: (message) => {
+      log.debug(`Agent plugin ${pluginDir}: ${message}`);
+      diagnostics.push({ path: rootReal, scope, severity: "warning", message });
+    },
   });
 
   return {
@@ -1039,6 +1125,7 @@ async function discoverPluginAt(args: {
     ...(allSkillsRoots.length > 0 ? { skillsDirs: allSkillsRoots } : {}),
     ...mcp,
     ...xumComponents,
+    ...(agentsDir !== undefined ? { agentsDir } : {}),
   };
 }
 
