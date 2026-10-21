@@ -2293,19 +2293,17 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   // Same follow-ups as opening these tabs by shortcut: panels with keyboard navigation take focus
   // because the user just picked them; other tools focus their tab.
-  const focusPickedTool = React.useCallback((tool: TabType) => {
+  // Plain functions: React Compiler memoizes them.
+  const focusPickedTool = (tool: TabType) => {
     if (tool === "review") _setFocusTrigger((prev) => prev + 1);
     else if (tool === "artifacts") setAutoFocusArtifacts(true);
     else setTabToFocus(tool);
-  }, []);
+  };
 
-  const handleOpenToolFromNewTab = React.useCallback(
-    (tabsetId: string, tool: BaseTabType) => {
-      focusPickedTool(tool);
-      setLayout((prev) => openToolFromNewTab(prev, tabsetId, tool));
-    },
-    [focusPickedTool, setLayout]
-  );
+  const handleOpenToolFromNewTab = (tabsetId: string, tool: BaseTabType) => {
+    focusPickedTool(tool);
+    setLayout((prev) => openToolFromNewTab(prev, tabsetId, tool));
+  };
 
   // A strip's "+" button (tabsetId) or the shortcut (focused tabset): show that tabset's New
   // tab and move focus into its launcher.
