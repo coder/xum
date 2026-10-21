@@ -368,6 +368,37 @@ describe("DaytonaSSHRuntime Windows sandboxes", () => {
     expect(listed.ok && listed.sandboxes.map((s) => s.id)).toEqual(["sb-ok"]);
   });
 
+  it("neither offers nor accepts a snapshot that is not active", async () => {
+    rig.plane.snapshots.push(
+      { name: "snap-building", state: "building" },
+      { name: "snap-inactive", state: "inactive" },
+      { name: "snap-active", state: "active" },
+      // No state reported: accepted, as before Daytona reported one.
+      { name: "snap-unknown" }
+    );
+    const runtime = makeRuntime({});
+    const validate = async (snapshot: string) => {
+      const finalized = await runtime.finalizeConfig("b", sshDaytonaConfig({ snapshot }));
+      if (!finalized.success) return finalized;
+      return runtime.validateBeforePersist("b", finalized.data);
+    };
+    const error = (result: Awaited<ReturnType<typeof validate>>) =>
+      result.success ? "" : result.error;
+
+    expect(error(await validate("snap-building"))).toContain("building");
+    const inactive = error(await validate("snap-inactive"));
+    expect(inactive).toContain("inactive");
+    expect(inactive).toContain("activate");
+    expect((await validate("snap-active")).success).toBe(true);
+    expect((await validate("snap-unknown")).success).toBe(true);
+    const listed = await rig.service.listSnapshots();
+    expect(listed.ok && listed.snapshots.map((s) => s.name)).toEqual([
+      "snap-active",
+      "snap-unknown",
+    ]);
+    expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
+  });
+
   it("offers neither Windows snapshots nor Windows sandboxes", async () => {
     rig.plane.addSandbox({ id: "sb-win", sandboxClass: "windows" });
     rig.plane.addSandbox({ id: "sb-linux", sandboxClass: "linux-vm" });

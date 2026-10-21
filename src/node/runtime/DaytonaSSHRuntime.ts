@@ -241,6 +241,19 @@ function makeStatusEmitter(statusSink: EnsureReadyOptions["statusSink"]): Status
  * An unreported disk is left as it is: the snapshot's may be larger than the preset's, and
  * sending the preset would then be a shrink Daytona refuses, failing (and deleting) the sandbox.
  */
+/**
+ * Only an active snapshot creates sandboxes (SnapshotState: building, pending, pulling,
+ * snapshotting, inactive, error, build_failed, removing do not); none reported passes.
+ */
+function snapshotStateRefusal(snapshot: string, state: string | undefined): string | undefined {
+  if (!state || state === "active") return undefined;
+  const next =
+    state === "inactive"
+      ? "activate it in Daytona or pick another snapshot"
+      : "pick another snapshot";
+  return `Daytona snapshot "${snapshot}" is ${state}, not active; ${next}`;
+}
+
 /** Why an existing sandbox cannot be attached, before the workspace is persisted. */
 function attachRefusal(
   sandboxId: string,
@@ -768,7 +781,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
 
   /** Refused before any sandbox is created: a Windows snapshot makes a billed box setup fails on. */
   private async checkSnapshotClass(snapshot: string): Promise<Result<void, string>> {
-    let found: { windows: boolean } | undefined;
+    let found: Awaited<ReturnType<DaytonaRuntimeService["findSnapshot"]>>;
     try {
       found = await this.daytonaService.findSnapshot(snapshot);
     } catch (error) {
@@ -776,8 +789,11 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     }
     // A stale choice (deleted after it was saved as a default) would fail every setup retry.
     if (!found) return Err(`Daytona snapshot "${snapshot}" was not found; pick another snapshot`);
-    if (!found.windows) return Ok(undefined);
-    return Err(`Daytona snapshot "${snapshot}" creates Windows sandboxes. ${LINUX_ONLY}`);
+    if (found.windows) {
+      return Err(`Daytona snapshot "${snapshot}" creates Windows sandboxes. ${LINUX_ONLY}`);
+    }
+    const refusal = snapshotStateRefusal(snapshot, found.state);
+    return refusal ? Err(refusal) : Ok(undefined);
   }
 
   /** The sandbox may not exist yet, so only compute the path (as Coder does). */

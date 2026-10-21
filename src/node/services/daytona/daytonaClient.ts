@@ -73,17 +73,22 @@ const SnapshotSchema = z.object({
   name: z.string(),
   /** The class of the sandboxes the snapshot creates, as on a sandbox. */
   sandboxClass: z.string().nullish(),
+  /** SnapshotState: only "active" creates sandboxes (building, inactive, error, ...). */
+  state: z.string().nullish(),
 });
 
 export interface DaytonaSnapshot {
   name: string;
   sandboxClass?: string;
+  state?: string;
 }
 
 function toSnapshot(item: z.infer<typeof SnapshotSchema>): DaytonaSnapshot {
-  return item.sandboxClass
-    ? { name: item.name, sandboxClass: item.sandboxClass }
-    : { name: item.name };
+  return {
+    name: item.name,
+    ...(item.sandboxClass ? { sandboxClass: item.sandboxClass } : {}),
+    ...(item.state ? { state: item.state } : {}),
+  };
 }
 
 const SnapshotPageSchema = z.object({

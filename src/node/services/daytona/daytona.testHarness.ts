@@ -39,7 +39,12 @@ export class FakeDaytonaControlPlane {
   readonly createBodies: Array<Record<string, unknown>> = [];
   readonly revokedTokens: string[] = [];
   /** The organization's snapshots; `listedOnly` ones only come with the list, not by name. */
-  readonly snapshots: Array<{ name: string; sandboxClass?: string; listedOnly?: boolean }> = [];
+  readonly snapshots: Array<{
+    name: string;
+    sandboxClass?: string;
+    listedOnly?: boolean;
+    state?: string;
+  }> = [];
   /** The snapshot GET /config advertises as the deployment default; unset advertises none. */
   defaultSnapshot?: string;
   /** Answer POST /sandbox with 400 when it carries cpu/memory/disk (fixed-resource snapshot). */

@@ -110,6 +110,11 @@ const RAW_STATE_MAP: Record<string, ObservedSandboxState> = {
   unknown: "error",
 };
 
+/** Only an active snapshot creates sandboxes; one with no reported state is taken as active. */
+function isActiveSnapshot(snapshot: DaytonaSnapshot): boolean {
+  return !snapshot.state || snapshot.state === "active";
+}
+
 /** Collapse Daytona's ~20 sandbox states to the five Xum acts on; unknown values are errors. */
 export function mapDaytonaSandboxState(raw: string | undefined): ObservedSandboxState {
   return (raw ? RAW_STATE_MAP[raw] : undefined) ?? "error";
@@ -732,7 +737,9 @@ export class DaytonaService {
       const snapshots = await client.listSnapshots();
       return {
         ok: true,
-        snapshots: snapshots.filter((s) => !isWindowsClass(s)).map(({ name }) => ({ name })),
+        snapshots: snapshots
+          .filter((s) => !isWindowsClass(s) && isActiveSnapshot(s))
+          .map(({ name }) => ({ name })),
       };
     } catch (error) {
       return toResultError(error);
@@ -740,11 +747,11 @@ export class DaytonaService {
   }
 
   /**
-   * The snapshot named `name`, with whether it creates Windows sandboxes; undefined when
+   * The snapshot named `name`, with whether it creates Windows sandboxes and its state; undefined when
    * Daytona has none by that name. The list is the fallback for one the lookup does not find
    * by name (it serves the snapshot picker).
    */
-  async findSnapshot(name: string): Promise<{ windows: boolean } | undefined> {
+  async findSnapshot(name: string): Promise<{ windows: boolean; state?: string } | undefined> {
     const { client } = await this.getClient();
     let snapshot: DaytonaSnapshot | undefined;
     try {
@@ -753,7 +760,12 @@ export class DaytonaService {
       if (!isDaytonaNotFound(error)) throw error;
       snapshot = (await client.listSnapshots()).find((listed) => listed.name === name);
     }
-    return snapshot && { windows: isWindowsClass(snapshot) };
+    return (
+      snapshot && {
+        windows: isWindowsClass(snapshot),
+        ...(snapshot.state ? { state: snapshot.state } : {}),
+      }
+    );
   }
 
   /** Stable per Xum install, so the reconciler only ever touches this install's sandboxes. */
