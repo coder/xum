@@ -81,10 +81,10 @@ async function expectReadable(entries: Measured[]) {
   await expect(failing.join("\n")).toBe("");
 }
 
-/** The tutorial bubble: the dialog-like box that holds the step counter and the Skip button. */
+/** The tutorial bubble: the group that holds the step counter and the Skip button. */
 function findTutorial(root: HTMLElement): HTMLElement {
   const skip = within(root).getByRole("button", { name: "Skip" });
-  const bubble = skip.closest<HTMLElement>(".z-\\[9999\\]");
+  const bubble = skip.closest<HTMLElement>('[role="group"]');
   if (!bubble) throw new Error("tutorial bubble not found");
   return bubble;
 }
