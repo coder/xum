@@ -242,3 +242,9 @@ Xum rules:
 Report confirmed bugs first (title, expected vs actual, root cause `file:line`, steps, video path,
 repro test), then unverified risks, then rejected findings by reason, then the charters run and
 their cost.
+
+In Xum, attach the latest report as an artifact. Write it to
+`$XUM_SCRATCH_DIR/artifacts/bug-bash-report.md` and publish it with the `artifact` tool. After each
+new round, update that same file and publish it again, so the Artifacts tab keeps one report with a
+version per round. The run folder is git-ignored and local, so the artifact is the copy the user
+can open.
