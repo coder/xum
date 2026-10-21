@@ -853,7 +853,12 @@ interface ResolvedRemoteRef {
   sha: string;
 }
 
-function gitEnv(): Record<string, string> {
+/**
+ * The Git environment of every staging clone, fetch and checkout, and of the skills CLI's own
+ * clone (skillsCli.ts). `ambient` is the environment the Git process inherits: its
+ * GIT_SSH_COMMAND (a custom identity, proxy or wrapper) is kept, as for the preview.
+ */
+export function gitEnv(ambient: NodeJS.ProcessEnv = process.env): Record<string, string> {
   // Fail fast instead of hanging on credential prompts: installs run from the
   // UI with no terminal attached (acceptance: "private repo without auth" must
   // fail cleanly).
@@ -886,9 +891,8 @@ function gitEnv(): Record<string, string> {
     GIT_CONFIG_SYSTEM: os.devNull,
     ...GIT_NO_HOOKS_ENV,
   };
-  if (process.env.GIT_SSH_COMMAND === undefined) {
-    env.GIT_SSH_COMMAND = "ssh -oBatchMode=yes";
-  }
+  const sshCommand = ambient.GIT_SSH_COMMAND;
+  env.GIT_SSH_COMMAND = sshCommand ?? "ssh -oBatchMode=yes";
   return env;
 }
 
