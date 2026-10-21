@@ -60,6 +60,7 @@ import { expandTildeForSSH } from "./tildeExpansion";
 import {
   redactChildStderr,
   redactDaytonaError,
+  redactDaytonaPty,
   redactDaytonaTokens,
 } from "./daytonaTokenRedaction";
 
@@ -566,7 +567,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   override async createPtySession(params: PtySessionParams): Promise<PtyHandle> {
     const ready = await this.ensureReady();
     if (!ready.ready) throw new Error(ready.error);
-    return super.createPtySession(params);
+    return redactDaytonaPty(await super.createPtySession(params));
   }
 
   /** Init output (sync, git push, hook) can quote ssh's stderr, so it is redacted too. */

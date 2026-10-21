@@ -245,6 +245,43 @@ describe("DaytonaSSHRuntime integrated terminals", () => {
     ).rejects.toThrow("no longer exists");
     expect(opened).toBe(false);
   });
+
+  it("keep the token out of what the terminal prints", async () => {
+    rig.plane.addSandbox({ id: "sb-term-tok" });
+    await rig.service.ensureSshAccess("sb-term-tok");
+    const token = rig.writer.tokens.get("sb-term-tok");
+    if (!token) throw new Error("expected a minted token");
+    let emit: (data: string) => void = () => undefined;
+    const runtime = makeRuntime({ sandboxId: "sb-term-tok" }, rig, {
+      transport: {
+        ...localShellTransport(rig.rootDir),
+        createPtySession: () =>
+          Promise.resolve({
+            write: () => undefined,
+            resize: () => undefined,
+            kill: () => undefined,
+            onData: (handler: (data: string) => void) => {
+              emit = handler;
+              return { dispose: () => undefined };
+            },
+            onExit: () => ({ dispose: () => undefined }),
+          }),
+      },
+    });
+
+    const pty = await runtime.createPtySession({
+      workspacePath: "~/src/project/feature",
+      cols: 80,
+      rows: 24,
+    });
+    const printed: string[] = [];
+    pty.onData((data) => printed.push(data));
+    emit(`${token}@gateway: Permission denied (publickey).\r\n`);
+
+    expect(printed.join("")).toBe(
+      `${DAYTONA_TOKEN_PLACEHOLDER}@gateway: Permission denied (publickey).\r\n`
+    );
+  });
 });
 
 describe("DaytonaSSHRuntime.finalizeConfig and validateBeforePersist", () => {
