@@ -18,7 +18,7 @@ import {
 import { loadOrCreateInstallationId } from "@/node/config/installationIdentity";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { retireSshConnections } from "@/node/runtime/transports";
-import { redactDaytonaTokens, rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
+import { rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
 import { getDaytonaSandboxId, isDedicatedDaytonaSandbox } from "@/common/types/runtime";
 import { log } from "@/node/services/log";
 import { sleepWithAbort } from "@/node/utils/abort";
@@ -274,6 +274,9 @@ export class DaytonaService {
     config: DaytonaGatewayConfig;
   };
   private readonly tokens = new Map<string, DaytonaSshAccess>();
+  /** Bumped (unique per process) whenever a sandbox's cached token becomes another one. */
+  private readonly tokenGenerations = new Map<string, number>();
+  private lastTokenGeneration = 0;
   private readonly tokenRequests = new Map<string, Promise<DaytonaSshAccess>>();
   /** Bumped by every settings change, so a mint that spans one can tell. */
   private credentialsGeneration = 0;
@@ -330,7 +333,7 @@ export class DaytonaService {
     for (const { sandboxId, token } of await this.sshConfigWriter.readTokens()) {
       rememberDaytonaToken(token);
       if (!this.tokens.has(sandboxId)) {
-        this.tokens.set(sandboxId, { token, expiresAt: new Date(0).toISOString() });
+        this.cacheNewToken(sandboxId, { token, expiresAt: new Date(0).toISOString() });
       }
     }
   }
@@ -921,15 +924,28 @@ export class DaytonaService {
   }
 
   /**
-   * The gateway refused the sandbox's token (revoked outside Xum, or one an earlier process
-   * left): mint a new one and rewrite the include file. `failure` is the raw ssh error; when it
-   * names a token other than the cached one, a concurrent command already replaced it.
+   * Which token the sandbox's ssh commands use now. Capture it before a command: if the gateway
+   * refuses that command's token, pass it to replaceRejectedSshToken.
    */
-  async replaceRejectedSshToken(sandboxId: string, failure: string): Promise<void> {
+  sshTokenGeneration(sandboxId: string): number {
+    return this.tokenGenerations.get(sandboxId) ?? 0;
+  }
+
+  private cacheNewToken(sandboxId: string, access: DaytonaSshAccess): void {
+    this.tokens.set(sandboxId, access);
+    this.tokenGenerations.set(sandboxId, ++this.lastTokenGeneration);
+  }
+
+  /**
+   * The gateway refused the token of a command that started at `attemptGeneration` (revoked
+   * outside Xum, or one an earlier process left): mint a new one and rewrite the include file.
+   * Nothing to do when the token changed since: a concurrent command already replaced it, and
+   * the current one must stay live. The generation, not the ssh error, decides: the OpenSSH
+   * pool redacts the token from its errors.
+   */
+  async replaceRejectedSshToken(sandboxId: string, attemptGeneration: number): Promise<void> {
+    if (this.sshTokenGeneration(sandboxId) !== attemptGeneration) return;
     const cached = this.tokens.get(sandboxId);
-    if (cached && !failure.includes(cached.token) && redactDaytonaTokens(failure) !== failure) {
-      return;
-    }
     this.readyAt.delete(sandboxId);
     // Due at once, so the next ensureSshAccess mints, writes, and revokes the refused one.
     if (cached) this.tokens.set(sandboxId, { ...cached, expiresAt: new Date(0).toISOString() });
@@ -1004,7 +1020,7 @@ export class DaytonaService {
     }
     const outdatedAfterWrite = this.settleOutdatedMint(mint, true);
     if (outdatedAfterWrite) return outdatedAfterWrite;
-    this.tokens.set(sandboxId, access);
+    this.cacheNewToken(sandboxId, access);
     if (previous && previous.token !== access.token) {
       await this.revokeQuietly(client, sandboxId, previous.token);
     }

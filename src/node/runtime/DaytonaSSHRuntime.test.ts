@@ -1041,6 +1041,49 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
     expect(rig.plane.countCalls("POST /sandbox/sb-gone/ssh-access")).toBe(1);
   });
 
+  it("never replaces a token that a concurrent command already replaced", async () => {
+    rig.plane.addSandbox({ id: "sb-race" });
+    await rig.service.ensureSshAccess("sb-race");
+    const first = rig.writer.tokens.get("sb-race");
+    if (!first) throw new Error("expected a minted token");
+    const local = localShellTransport(rig.rootDir);
+    const refuse = (user: string) =>
+      Promise.reject(
+        new RuntimeError(`${user}@127.0.0.1: Permission denied (publickey).`, "network")
+      );
+    // Command A: the gateway refuses the first token until the include file holds another.
+    const runtimeA = makeRuntime({ sandboxId: "sb-race" }, rig, {
+      transport: {
+        ...local,
+        spawnRemoteProcess: (command, options) =>
+          rig.writer.tokens.get("sb-race") === first
+            ? refuse(first)
+            : local.spawnRemoteProcess(command, options),
+      },
+    });
+    // Command B ran on the first token too, but its refusal arrives once A has replaced it, with
+    // the token already redacted (as the OpenSSH pool reports a probe failure).
+    let attemptsB = 0;
+    const runtimeB = makeRuntime({ sandboxId: "sb-race" }, rig, {
+      transport: {
+        ...local,
+        spawnRemoteProcess: async (command, options) => {
+          if (attemptsB++ > 0) return local.spawnRemoteProcess(command, options);
+          const streamA = await runtimeA.exec("true", { cwd: "/tmp", timeout: 10 });
+          expect(await streamA.exitCode).toBe(0);
+          return refuse(DAYTONA_TOKEN_PLACEHOLDER);
+        },
+      },
+    });
+
+    const stream = await runtimeB.exec("echo ok", { cwd: "/tmp", timeout: 10 });
+
+    expect(await new Response(stream.stdout).text()).toBe("ok\n");
+    // Only A's refused token was revoked; the one A minted stays live.
+    expect(rig.plane.revokedTokens).toEqual([first]);
+    expect(rig.plane.countCalls("POST /sandbox/sb-race/ssh-access")).toBe(2);
+  });
+
   it("replaces a token the gateway refused and retries the command once", async () => {
     rig.plane.addSandbox({ id: "sb-rev" });
     await rig.service.ensureSshAccess("sb-rev");

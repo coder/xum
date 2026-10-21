@@ -82,6 +82,7 @@ export type DaytonaRuntimeService = Pick<
   | "markSandboxReady"
   | "invalidateSandboxReady"
   | "replaceRejectedSshToken"
+  | "sshTokenGeneration"
   | "sandboxReferencesElsewhere"
   | "isAliasStoredElsewhere"
   | "withSandboxRemovalLock"
@@ -391,10 +392,13 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     options: ExecOptions & { deadlineMs?: number }
   ): Promise<SpawnResult> {
     let result: SpawnResult;
+    const sandboxId = this.daytonaConfig.sandboxId;
+    // Before the attempt: a refusal replaces only the token this command used.
+    const tokenGeneration = sandboxId ? this.daytonaService.sshTokenGeneration(sandboxId) : 0;
     try {
       result = await super.spawnRemoteProcess(fullCommand, options);
     } catch (error) {
-      if (!(await this.recoverForRetry(error, options.abortSignal))) {
+      if (!(await this.recoverForRetry(error, tokenGeneration, options.abortSignal))) {
         throw redactDaytonaError(error);
       }
       try {
@@ -409,7 +413,6 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       ...result,
       onExit: (exitCode, stderr) => {
         // The ready cache must not hide a sandbox that stopped: the next ensureReady checks.
-        const sandboxId = this.daytonaConfig.sandboxId;
         if (sandboxId && this.isTransportFailureExit(exitCode, stderr)) {
           this.daytonaService.invalidateSandboxReady(sandboxId);
         }
@@ -424,7 +427,11 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * "Permission denied", so only a started sandbox gets a new token. Throws a clear error for
    * a sandbox deleted outside Xum.
    */
-  private recoverForRetry(error: unknown, abortSignal: AbortSignal | undefined): Promise<boolean> {
+  private recoverForRetry(
+    error: unknown,
+    tokenGeneration: number,
+    abortSignal: AbortSignal | undefined
+  ): Promise<boolean> {
     return this.daytonaService.withAccountLease(async () => {
       const sandboxId = this.daytonaConfig.sandboxId;
       if (!sandboxId || !isRuntimeTransportError(error) || abortSignal?.aborted) return false;
@@ -433,17 +440,22 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       if (!tokenRejected && !this.restartsStoppedSandbox) return false;
       this.daytonaService.invalidateSandboxReady(sandboxId);
       const state = await this.readStateAfterFailure(sandboxId);
-      return this.recoverInState(sandboxId, state, { error, tokenRejected }, abortSignal);
+      return this.recoverInState(
+        sandboxId,
+        state,
+        { error, tokenRejected, tokenGeneration },
+        abortSignal
+      );
     });
   }
 
   private recoverInState(
     sandboxId: string,
     state: DaytonaSandboxState | undefined,
-    failure: { error: unknown; tokenRejected: boolean },
+    failure: { error: unknown; tokenRejected: boolean; tokenGeneration: number },
     abortSignal: AbortSignal | undefined
   ): Promise<boolean> {
-    const { error, tokenRejected } = failure;
+    const { error, tokenRejected, tokenGeneration } = failure;
     if (state === "missing") {
       throw new RuntimeError(
         sandboxMissingMessage(sandboxId),
@@ -452,18 +464,20 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       );
     }
     if (state === "started") {
-      return tokenRejected ? this.replaceRejectedToken(sandboxId, error) : Promise.resolve(false);
+      return tokenRejected
+        ? this.replaceRejectedToken(sandboxId, tokenGeneration)
+        : Promise.resolve(false);
     }
     if (state === undefined || !this.restartsStoppedSandbox) return Promise.resolve(false);
     return this.restartSandbox(sandboxId, abortSignal);
   }
 
-  private async replaceRejectedToken(sandboxId: string, error: unknown): Promise<boolean> {
+  private async replaceRejectedToken(sandboxId: string, tokenGeneration: number): Promise<boolean> {
     log.info("The Daytona gateway refused the ssh token; replacing it and retrying once", {
       sandboxId,
     });
     try {
-      await this.daytonaService.replaceRejectedSshToken(sandboxId, errorChainText(error));
+      await this.daytonaService.replaceRejectedSshToken(sandboxId, tokenGeneration);
     } catch (replaceError) {
       log.warn("Could not replace the refused Daytona ssh token", {
         sandboxId,
