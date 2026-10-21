@@ -8,13 +8,17 @@ import { resolveSSHConfig } from "./sshConfigParser";
 const hasOpenSsh = spawnSync("ssh", ["-V"]).status === 0;
 
 /** What OpenSSH resolves for `host` from `configPath` alone: the parity reference. */
-function opensshUserAndProxy(configPath: string, host: string) {
+function opensshOptions(configPath: string, host: string) {
   const output = spawnSync("ssh", ["-G", "-F", configPath, host], { encoding: "utf8" }).stdout;
-  const value = (key: string) =>
+  return (key: string) =>
     output
       .split("\n")
       .find((line) => line.startsWith(`${key} `))
       ?.slice(key.length + 1);
+}
+
+function opensshUserAndProxy(configPath: string, host: string) {
+  const value = opensshOptions(configPath, host);
   return { user: value("user"), proxyCommand: value("proxycommand") };
 }
 
@@ -411,6 +415,44 @@ describe("resolveSSHConfig", () => {
       if (hasOpenSsh) {
         for (const host of ["gated", "elsewhere", "gated-not"]) {
           expect(await resolve(host)).toEqual(opensshUserAndProxy(configPath, host));
+        }
+      }
+    });
+  });
+
+  // OpenSSH restores the including file's scope when an Include returns.
+  test("keeps lines after a top-level Include global when the included file ends in a Host block", async () => {
+    await withTempHome(async (homeDir) => {
+      const included = path.join(homeDir, ".ssh", "inc.conf");
+      await fs.writeFile(included, "Host other\n  User otheruser\n", "utf8");
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.writeFile(configPath, `Include ${included}\nPort 2222\n`, "utf8");
+
+      expect((await resolveSSHConfig("target")).port).toBe(2222);
+      if (hasOpenSsh) expect(opensshOptions(configPath, "target")("port")).toBe("2222");
+    });
+  });
+
+  test("restores the includer's block after an Include nested in an included file", async () => {
+    await withTempHome(async (homeDir) => {
+      const inner = path.join(homeDir, ".ssh", "b.conf");
+      const outer = path.join(homeDir, ".ssh", "a.conf");
+      await fs.writeFile(inner, "Host other\n  User otheruser\n", "utf8");
+      await fs.writeFile(outer, `Include ${inner}\nUser x\n`, "utf8");
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.writeFile(
+        configPath,
+        ["Host target", `  Include ${outer}`, "Host *", "  User fallback", ""].join("\n"),
+        "utf8"
+      );
+
+      expect((await resolveSSHConfig("target")).user).toBe("x");
+      expect((await resolveSSHConfig("elsewhere")).user).toBe("fallback");
+      if (hasOpenSsh) {
+        for (const host of ["target", "elsewhere"]) {
+          expect((await resolveSSHConfig(host)).user).toBe(
+            opensshUserAndProxy(configPath, host).user
+          );
         }
       }
     });

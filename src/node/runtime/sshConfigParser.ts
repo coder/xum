@@ -257,6 +257,8 @@ const INCLUDE_LINE_PATTERN = /^\s*include(?:\s*=\s*|\s+)(.+?)\s*$/i;
 const SECTION_LINE_PATTERN = /^\s*(?:host|match)(?:\s*=\s*|\s+)\S/i;
 const HOST_LINE_PATTERN = /^\s*host(?:\s*=\s*|\s+)(.+?)\s*$/i;
 const MATCH_ALL_LINE_PATTERN = /^\s*match(?:\s*=\s*|\s+)all\s*$/i;
+// Matches every host, so lines after it apply as top-level lines do.
+const GLOBAL_SCOPE_HEADER = "Host *";
 
 /**
  * A config line's arguments, split as OpenSSH 8.6+ does (misc.c's argv_split): quotes may
@@ -535,12 +537,14 @@ async function readIncludedFiles(
   value: string,
   homeDir: string,
   depth: number,
-  host: string
+  host: string,
+  scope: string | undefined
 ): Promise<string[]> {
   const contents: string[] = [];
   for (const file of await resolveIncludePaths(value, homeDir, host)) {
     try {
-      contents.push(await expandIncludes(await fs.readFile(file, "utf8"), homeDir, depth, host));
+      const content = await fs.readFile(file, "utf8");
+      contents.push(await expandIncludes(content, homeDir, depth, host, scope));
     } catch (error) {
       // OpenSSH skips missing include files silently.
       if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") {
@@ -557,17 +561,20 @@ async function readIncludedFiles(
 /**
  * Inline `Include` directives for resolving `host`, which the ssh-config package does not
  * resolve (Xum's Daytona block relies on one). An Include inside a block that does not apply
- * to `host` is skipped, as OpenSSH does. One inside a block that applies is followed by that
- * block's header again, so later lines of the block stay scoped to it as in OpenSSH.
+ * to `host` is skipped, as OpenSSH does. OpenSSH restores the includer's scope when an Include
+ * returns, so each expanded Include is followed by the current block's header again, or by
+ * `Host *` at the top level, and later lines stay where they were written. `scope` is the
+ * header a nested file is read in (undefined at the top level).
  */
 async function expandIncludes(
   content: string,
   homeDir: string,
   depth: number,
-  host: string
+  host: string,
+  scope?: string
 ): Promise<string> {
   const out: string[] = [];
-  let sectionHeader: string | undefined;
+  let sectionHeader = scope;
   for (const line of content.split(/\r?\n/)) {
     if (SECTION_LINE_PATTERN.test(line)) {
       sectionHeader = line.trim();
@@ -584,10 +591,10 @@ async function expandIncludes(
       continue;
     }
     if (!sectionAppliesTo(sectionHeader, host)) continue;
-    out.push(...(await readIncludedFiles(includeMatch[1], homeDir, depth + 1, host)));
-    if (sectionHeader) {
-      out.push(sectionHeader);
-    }
+    out.push(
+      ...(await readIncludedFiles(includeMatch[1], homeDir, depth + 1, host, sectionHeader)),
+      sectionHeader ?? GLOBAL_SCOPE_HEADER
+    );
   }
   return out.join("\n");
 }
