@@ -104,6 +104,34 @@ describe("createDaytonaArchiveHook", () => {
     expect(rig.writer.removed).toEqual(["sb-shared"]);
   });
 
+  it("applies the archive policy once the last active workspace on a sandbox is archived", async () => {
+    rig.plane.addSandbox({ id: "sb-shared" });
+    const owner = {
+      workspaceId: "owner",
+      runtimeConfig: metadata({ sandboxId: "sb-shared", shared: false }).runtimeConfig,
+      archived: false,
+    };
+    rig.workspaces.push(owner);
+    const fork = { sandboxId: "sb-shared", forked: true, shared: false };
+
+    // The owner still works in the sandbox: archiving the fork leaves it running.
+    expect((await archive(fork, "stop")).success).toBe(true);
+    expect(rig.plane.find("sb-shared")?.state).toBe("started");
+
+    // Archived first, the owner no longer uses it: archiving the fork applies the policy.
+    owner.archived = true;
+    expect((await archive(fork, "stop")).success).toBe(true);
+    expect(rig.plane.find("sb-shared")?.state).toBe("stopped");
+
+    // Delete stops instead: the owner's checkout on it was never checked, and it may come back.
+    rig.plane.find("sb-shared")!.state = "started";
+    const warnings: string[] = [];
+    expect((await archive(fork, "delete", cleanCheck, (w) => warnings.push(w))).success).toBe(true);
+    expect(rig.plane.find("sb-shared")?.state).toBe("stopped");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("archived workspace");
+  });
+
   it("leaves a sandbox alone that another workspace attached by its id, or that cannot be looked up", async () => {
     // Created by Xum under a name; the attach picker stored the same sandbox's real id.
     rig.plane.addSandbox({ id: "sb-9", name: "xum-owner-def456" });

@@ -22,7 +22,7 @@ export interface DaytonaArchiveHookOptions {
     | "getSandboxState"
     | "stopAndWait"
     | "deleteSandbox"
-    | "isSandboxReferencedElsewhere"
+    | "sandboxUseElsewhere"
     | "isAliasStoredElsewhere"
     | "releaseSshAccess"
     | "withAccountLease"
@@ -52,7 +52,8 @@ async function archiveSandbox(
   const sandboxId = storedSandboxId(args.workspaceMetadata);
   if (!sandboxId) return Ok(undefined);
   const workspaceId = args.workspaceMetadata.id;
-  if (await options.daytonaService.isSandboxReferencedElsewhere(sandboxId, workspaceId)) {
+  const others = await options.daytonaService.sandboxUseElsewhere(sandboxId, workspaceId);
+  if (others === "active") {
     // The sandbox stays as it is, but ssh access is per stored string: another workspace that
     // stores the same sandbox under its other identifier (name or id) never uses this alias.
     if (!options.daytonaService.isAliasStoredElsewhere(sandboxId, workspaceId)) {
@@ -61,8 +62,9 @@ async function archiveSandbox(
     return Ok(undefined);
   }
 
+  // Only archived workspaces left on it: nobody works there now, so the policy applies.
   const result = isDedicatedDaytonaSandbox(args.workspaceMetadata.runtimeConfig)
-    ? await applyArchiveBehavior(options, args, sandboxId)
+    ? await applyArchiveBehavior(options, args, sandboxId, others === "archived")
     : Ok(undefined);
   if (result.success) await releaseSshAccess(options, sandboxId);
   return result;
@@ -71,19 +73,40 @@ async function archiveSandbox(
 async function applyArchiveBehavior(
   options: DaytonaArchiveHookOptions,
   args: Parameters<BeforeArchiveHook>[0],
-  sandboxId: string
+  sandboxId: string,
+  archivedOthers: boolean
 ): Promise<Result<void>> {
   // The archive operation's policy snapshot wins (see the Coder hook).
   const behavior = args.coderWorkspaceArchiveBehavior ?? options.getArchiveBehavior();
   if (behavior === "keep") return Ok(undefined);
   try {
     if (behavior === "delete") {
-      return await deleteForArchive(options, args, sandboxId);
+      return archivedOthers
+        ? await stopInsteadOfDelete(options, args, sandboxId)
+        : await deleteForArchive(options, args, sandboxId);
     }
     return await stopForArchive(options, args, sandboxId);
   } catch (error) {
     return Err(`Failed to ${behavior} Daytona sandbox "${sandboxId}": ${getErrorMessage(error)}`);
   }
+}
+
+/**
+ * Archived workspaces still have checkouts on the sandbox: they were never checked for
+ * unsaved work, and unarchiving one needs the sandbox back. So it is stopped, not deleted.
+ */
+async function stopInsteadOfDelete(
+  options: DaytonaArchiveHookOptions,
+  args: Parameters<BeforeArchiveHook>[0],
+  sandboxId: string
+): Promise<Result<void>> {
+  const stopped = await stopForArchive(options, args, sandboxId);
+  if (stopped.success) {
+    args.reportWarning?.(
+      `Daytona sandbox "${sandboxId}" was stopped, not deleted: an archived workspace still has its checkout on it.`
+    );
+  }
+  return stopped;
 }
 
 /** The sandbox as the archived workspace stores it (its name or its id). */

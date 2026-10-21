@@ -1,3 +1,4 @@
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { Workspace } from "@/common/types/project";
 import { getDaytonaSandboxId, type RuntimeConfig } from "@/common/types/runtime";
 import { Err, type Result } from "@/common/types/result";
@@ -17,6 +18,8 @@ export interface DaytonaWorkspaceRef {
   runtimeConfig: RuntimeConfig | undefined;
   /** The marker of a removal in flight (WorkspaceConfigSchema.pendingRemoval). */
   pendingRemovalId?: string;
+  /** Archived now: archive applies its sandbox policy once only archived workspaces use it. */
+  archived?: boolean;
 }
 
 export interface DaytonaReconcilerOptions {
@@ -54,7 +57,11 @@ export interface DaytonaReconcilerOptions {
 export function listDaytonaWorkspaceRefs(config: {
   projects: ReadonlyMap<
     string,
-    { workspaces: ReadonlyArray<Pick<Workspace, "id" | "runtimeConfig" | "pendingRemoval">> }
+    {
+      workspaces: ReadonlyArray<
+        Pick<Workspace, "id" | "runtimeConfig" | "pendingRemoval" | "archivedAt" | "unarchivedAt">
+      >;
+    }
   >;
 }): DaytonaWorkspaceRef[] {
   const refs: DaytonaWorkspaceRef[] = [];
@@ -65,6 +72,7 @@ export function listDaytonaWorkspaceRefs(config: {
         workspaceId: workspace.id,
         runtimeConfig: workspace.runtimeConfig,
         pendingRemovalId: workspace.pendingRemoval?.removalId,
+        archived: isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt),
       });
     }
   }

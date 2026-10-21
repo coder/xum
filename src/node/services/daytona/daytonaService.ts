@@ -40,6 +40,7 @@ import type { DaytonaWorkspaceRef } from "./daytonaReconciler";
 interface StoredSandboxRef {
   stored: string;
   attached: boolean;
+  archived: boolean;
 }
 
 /**
@@ -457,6 +458,24 @@ export class DaytonaService {
     return matched.every((ref) => ref.attached) ? "attached" : "other";
   }
 
+  /**
+   * For archive: whether another workspace still works in the sandbox ("active"), only
+   * archived ones reference it ("archived"), or none does. Matched and failing closed (as
+   * "active") like sandboxReferencesElsewhere; removal still counts archived workspaces.
+   */
+  async sandboxUseElsewhere(
+    sandboxId: string,
+    workspaceId: string | undefined
+  ): Promise<"none" | "archived" | "active"> {
+    if (!this.listWorkspaces || !workspaceId) return "active";
+    const others = this.refsStoredElsewhere(this.listWorkspaces(), workspaceId);
+    if (others.length === 0) return "none";
+    const matched = await this.refsMatchingSandbox(sandboxId, others);
+    if (!matched) return "active";
+    if (matched.length === 0) return "none";
+    return matched.every((ref) => ref.archived) ? "archived" : "active";
+  }
+
   /** The refs that store this sandbox by its name or its id; undefined when the lookup fails. */
   private async refsMatchingSandbox(
     sandboxId: string,
@@ -492,7 +511,13 @@ export class DaytonaService {
         this.removedWorkspaces.get(ref.workspaceId) === ref.pendingRemovalId;
       const counts = ref.workspaceId !== workspaceId && !removed;
       return counts && stored
-        ? [{ stored, attached: !isDedicatedDaytonaSandbox(ref.runtimeConfig) }]
+        ? [
+            {
+              stored,
+              attached: !isDedicatedDaytonaSandbox(ref.runtimeConfig),
+              archived: ref.archived === true,
+            },
+          ]
         : [];
     });
   }
