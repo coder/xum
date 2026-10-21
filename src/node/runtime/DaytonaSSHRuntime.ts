@@ -224,8 +224,12 @@ function makeStatusEmitter(statusSink: EnsureReadyOptions["statusSink"]): Status
   return (phase, detail) => statusSink?.({ phase, runtimeType: "ssh", detail });
 }
 
+/**
+ * An unreported disk is left as it is: the snapshot's may be larger than the preset's, and
+ * sending the preset would then be a shrink Daytona refuses, failing (and deleting) the sandbox.
+ */
 function growsDisk(sandbox: DaytonaSandbox, preset: DaytonaSizePreset): boolean {
-  return sandbox.disk === undefined || sandbox.disk < preset.diskGiB;
+  return sandbox.disk !== undefined && sandbox.disk < preset.diskGiB;
 }
 
 /** A running sandbox can only grow cpu and memory. */

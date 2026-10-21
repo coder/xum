@@ -44,6 +44,8 @@ export class FakeDaytonaControlPlane {
   defaultSnapshot?: string;
   /** Answer POST /sandbox with 400 when it carries cpu/memory/disk (fixed-resource snapshot). */
   rejectCreateResources = false;
+  /** Leave `disk` out of sandbox responses, which Daytona's schema allows. */
+  omitDisk = false;
   /** Resources a sandbox gets when created without any. */
   snapshotResources = { cpu: 1, memory: 1, disk: 3 };
   /** Routes (`METHOD /path`) that never answer, for timeout tests. */
@@ -244,7 +246,7 @@ export class FakeDaytonaControlPlane {
       state: sandbox.state,
       cpu: sandbox.cpu,
       memory: sandbox.memory,
-      disk: sandbox.disk,
+      ...(this.omitDisk ? {} : { disk: sandbox.disk }),
       labels: sandbox.labels,
       ...(sandbox.sandboxClass ? { sandboxClass: sandbox.sandboxClass } : {}),
     };

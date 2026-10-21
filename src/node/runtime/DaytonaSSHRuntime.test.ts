@@ -414,6 +414,29 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     });
   });
 
+  it("never sends a preset disk over a disk size Daytona did not report", async () => {
+    rig.plane.rejectCreateResources = true;
+    rig.plane.omitDisk = true;
+    // The snapshot's disk is larger than the preset's: sending the preset would shrink it.
+    rig.plane.snapshotResources = { cpu: 1, memory: 1, disk: 30 };
+
+    await makeRuntime({
+      sandboxId: "xum-unknown-disk",
+      shared: false,
+      snapshot: "fixed-snap",
+      cpu: 4,
+      memoryGiB: 8,
+      diskGiB: 20,
+    }).postCreateSetup(initParams());
+
+    expect(rig.plane.find("xum-unknown-disk")).toMatchObject({
+      state: "started",
+      cpu: 4,
+      memory: 8,
+      disk: 30,
+    });
+  });
+
   it("deletes the sandbox it created when setup fails afterwards", async () => {
     rig.writer.verifyError = new Error("Your ssh config sets User");
     const params = initParams();
