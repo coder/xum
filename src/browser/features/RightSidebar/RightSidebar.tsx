@@ -496,6 +496,25 @@ function persistTerminalTitles(key: string, titles: Map<TabType, string>): void 
   updatePersistedState(key, trimRecordToChars(capped, TERMINAL_TITLES_MAX_CHARS));
 }
 
+/** A request to focus the Review panel of one pane; `seq` makes each request a new value. */
+interface ReviewFocusRequest {
+  tabsetId: string;
+  seq: number;
+}
+
+/** A request to focus the Review panel in `tabsetId`, distinct from `prev` even for that pane. */
+function nextReviewFocusRequest(
+  prev: ReviewFocusRequest | null,
+  tabsetId: string
+): ReviewFocusRequest {
+  return { tabsetId, seq: (prev?.seq ?? 0) + 1 };
+}
+
+/** The Review panel focus trigger for this pane: 0 unless the latest request names it. */
+function getReviewFocusTrigger(request: ReviewFocusRequest | null, tabsetId: string): number {
+  return request?.tabsetId === tabsetId ? request.seq : 0;
+}
+
 function hasMountedReviewPanel(node: RightSidebarLayoutNode): boolean {
   if (node.type === "tabset") {
     return node.activeTab === "review";
@@ -1278,8 +1297,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   workflowRunBaseline = null,
   collapsedBeforeLoad,
 }) => {
-  // Trigger for focusing Review panel (preserves hunk selection)
-  const [focusTrigger, _setFocusTrigger] = React.useState(0);
+  // Request to focus the Review panel (preserves hunk selection). Review can be open in more than
+  // one pane (after a drag), so each request names the pane whose copy takes focus.
+  const [reviewFocusRequest, setReviewFocusRequest] = React.useState<ReviewFocusRequest | null>(
+    null
+  );
 
   // Review hunk totals are reported by the Review panel when mounted, while
   // unread-assisted is reported by an always-mounted headless component so the
@@ -1362,8 +1384,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const [goalCompleteInputRequest, setGoalCompleteInputRequest] = React.useState(0);
   // Artifacts tab shortcuts (J/K, Shift+F, ...) only see keys while focus is inside the panel.
   // Opening the tab by shortcut leaves focus where it was (usually the chat input), so the
-  // panel claims focus once it renders, like terminals do with autoFocusTerminalSession.
-  const [autoFocusArtifacts, setAutoFocusArtifacts] = React.useState(false);
+  // panel claims focus once it renders, like terminals do with autoFocusTerminalSession. The
+  // value is the pane whose copy claims it (Artifacts, like Review, can be open in two panes).
+  const [artifactsFocusTabsetId, setArtifactsFocusTabsetId] = React.useState<string | null>(null);
   const llmDebugLogsEnabled = useLlmDebugLogsEnabled(api);
   const desktopAvailable = useDesktopAvailable(api, desktopExperimentEnabled, workspaceId);
 
@@ -1686,9 +1709,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   const selectOrOpenReviewTab = React.useCallback(() => {
     if (!canReviewDiffs) return;
-    setLayout((prev) => selectOrAddTab(prev, "review"));
-    _setFocusTrigger((prev) => prev + 1);
-  }, [canReviewDiffs, setLayout]);
+    const next = selectOrAddTab(getBaseLayout(), "review");
+    setLayout(() => next);
+    setReviewFocusRequest((prev) => nextReviewFocusRequest(prev, next.focusedTabsetId));
+  }, [canReviewDiffs, getBaseLayout, setLayout]);
 
   React.useEffect(() => {
     const handleOpenGoalTab = (event: Event) => {
@@ -1799,12 +1823,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       }
       e.preventDefault();
       setCollapsed(false);
-      setLayout((prev) => selectOrAddTab(prev, "artifacts"));
-      setAutoFocusArtifacts(true);
+      const next = selectOrAddTab(getBaseLayout(), "artifacts");
+      setLayout(() => next);
+      setArtifactsFocusTabsetId(next.focusedTabsetId);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [artifactsExperimentEnabled, setCollapsed, setLayout]);
+  }, [artifactsExperimentEnabled, getBaseLayout, setCollapsed, setLayout]);
 
   // Auto-surface the Workflows tab when a run starts: the tab is the primary
   // run-detail surface (the chat card stays collapsed while it exists), but a
@@ -1916,9 +1941,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
           } else if (target?.tab === "review") {
             // Review panel keyboard navigation (j/k) is gated on focus. If the user explicitly
             // opened the tab via shortcut, focus the panel so it works immediately.
-            _setFocusTrigger((prev) => prev + 1);
+            setReviewFocusRequest((prev) => nextReviewFocusRequest(prev, target.tabsetId));
           } else if (target?.tab === "artifacts") {
-            setAutoFocusArtifacts(true);
+            setArtifactsFocusTabsetId(target.tabsetId);
           }
 
           // A per-iteration copy: React Compiler can't lower `i++` on a variable a closure captures.
@@ -1953,7 +1978,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     setAutoFocusTerminalSession,
     setCollapsed,
     setLayout,
-    _setFocusTrigger,
   ]);
 
   React.useEffect(() => {
@@ -2273,10 +2297,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       selectOrOpenReviewTab();
       return;
     }
-    setLayout((prev) => selectOrAddTab(prev, tab));
+    const next = selectOrAddTab(getBaseLayout(), tab);
+    setLayout(() => next);
     if (tab === "artifacts") {
       // The panel claims focus once it renders, so its keyboard shortcuts work right away.
-      setAutoFocusArtifacts(true);
+      setArtifactsFocusTabsetId(next.focusedTabsetId);
       return;
     }
     if (isTerminalTab(tab)) {
@@ -2292,17 +2317,20 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const overviewTerminalTab = collectAllTabs(layout.root).find(isTerminalTab);
 
   // Same follow-ups as opening these tabs by shortcut: panels with keyboard navigation take focus
-  // because the user just picked them; other tools focus their tab.
+  // because the user just picked them; other tools focus their tab. `tabsetId` is the pane that
+  // shows the tool.
   // Plain functions: React Compiler memoizes them.
-  const focusPickedTool = (tool: TabType) => {
-    if (tool === "review") _setFocusTrigger((prev) => prev + 1);
-    else if (tool === "artifacts") setAutoFocusArtifacts(true);
+  const focusPickedTool = (tabsetId: string, tool: TabType) => {
+    if (tool === "review") setReviewFocusRequest((prev) => nextReviewFocusRequest(prev, tabsetId));
+    else if (tool === "artifacts") setArtifactsFocusTabsetId(tabsetId);
     else setTabToFocus(tool);
   };
 
   const handleOpenToolFromNewTab = (tabsetId: string, tool: BaseTabType) => {
-    focusPickedTool(tool);
-    setLayout((prev) => openToolFromNewTab(prev, tabsetId, tool));
+    // The tool can open in another pane (where it is already open), so focus follows the result.
+    const next = openToolFromNewTab(getBaseLayout(), tabsetId, tool);
+    setLayout(() => next);
+    focusPickedTool(next.focusedTabsetId, tool);
   };
 
   // A strip's "+" button (tabsetId) or the shortcut (focused tabset): show that tabset's New
@@ -2665,7 +2693,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         workspacePath={workspacePath}
         projectPath={projectPath}
         isCreating={Boolean(isCreating)}
-        focusTrigger={focusTrigger}
+        focusTrigger={getReviewFocusTrigger(reviewFocusRequest, node.id)}
         onReviewNote={onReviewNote}
         reviewStats={reviewStats}
         onReviewStatsChange={handleReviewStatsChange}
@@ -2702,8 +2730,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         autoFocusTerminalSession={autoFocusTerminalSession}
         goal={goal ?? null}
         goalCompleteInputRequest={goalCompleteInputRequest}
-        autoFocusArtifacts={autoFocusArtifacts}
-        onArtifactsAutoFocusConsumed={() => setAutoFocusArtifacts(false)}
+        autoFocusArtifacts={artifactsFocusTabsetId === node.id}
+        onArtifactsAutoFocusConsumed={() => setArtifactsFocusTabsetId(null)}
         onGoalSetStatus={handleGoalSetStatus}
         onGoalUpdateObjective={handleGoalUpdateObjective}
         onGoalUpdateBudget={handleGoalUpdateBudget}

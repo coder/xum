@@ -28,6 +28,7 @@ import {
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { MCP_APP_ENTRYPOINT_NOT_CONNECTED } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import { CommandIds } from "@/browser/utils/commandIds";
+import { QuotaLimitedStorage } from "../../../../tests/ui/quotaLimitedStorage";
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { withAppViewTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
@@ -2484,6 +2485,47 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
           { workspaceId: "w1", tabsetId: newPane, tab: "review" },
         ]);
       } finally {
+        window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      }
+    });
+  });
+
+  // A refused layout write (here localStorage is full, with no caches to evict) changes nothing
+  // on screen, so a focus request would move focus to the tab the focused pane showed before.
+  test("a refused layout write sends no focus request", async () => {
+    await withTestWindow(async () => {
+      // Exactly full: an expanded chat with a terminal session to focus behind the Stats tab.
+      const layoutKey = getRightSidebarLayoutKey("w1");
+      const before = selectOrAddTab(
+        getDefaultRightSidebarLayoutState("terminal:session-1"),
+        "costs"
+      );
+      const seeded: Array<[string, string]> = [
+        [layoutKey, JSON.stringify(before)],
+        [getRightSidebarCollapsedKey("w1"), JSON.stringify(false)],
+      ];
+      const full = new QuotaLimitedStorage(
+        seeded.reduce((used, [key, value]) => used + key.length + value.length, 0)
+      );
+      for (const [key, value] of seeded) full.seed(key, value);
+      Object.defineProperty(window, "localStorage", { configurable: true, value: full });
+
+      const requests: unknown[] = [];
+      const record = (event: Event) => requests.push((event as CustomEvent).detail);
+      window.addEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const actions = getActions();
+        const find = (id: string) => actions.find((entry) => entry.id === id)!;
+        await find(CommandIds.navRightSidebarSplitVertical()).run();
+        await find(CommandIds.navRightSidebarAddTool()).prompt!.onSubmit({ tool: "review" });
+        await find(CommandIds.navRightSidebarFocusTerminal()).run();
+        // Every write was refused: the layout is the one from before.
+        expect(full.setItemCalls).toContain(layoutKey);
+        expect(readRightSidebarLayout("w1")).toEqual(before);
+        expect(requests).toEqual([]);
+      } finally {
+        consoleError.mockRestore();
         window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
       }
     });

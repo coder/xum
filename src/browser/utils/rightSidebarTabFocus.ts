@@ -16,10 +16,11 @@ import {
   RIGHT_SIDEBAR_TAB_KEY,
 } from "@/common/constants/storage";
 
-export function focusRightSidebarTab(workspaceId: string, tab: TabType): void {
+/** Returns false when the layout write was refused (see updateRightSidebarLayout). */
+export function focusRightSidebarTab(workspaceId: string, tab: TabType): boolean {
   // Explicit navigation must reveal the requested tool even though chats start collapsed.
   updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
-  updateRightSidebarLayout(workspaceId, (state) => selectOrAddTab(state, tab));
+  return updateRightSidebarLayout(workspaceId, (state) => selectOrAddTab(state, tab));
 }
 
 /**
@@ -31,8 +32,9 @@ export function splitRightSidebarPane(
   direction: "horizontal" | "vertical"
 ): void {
   updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
-  updateRightSidebarLayout(workspaceId, (state) => splitFocusedTabset(state, direction));
-  requestFocusedTabFocus(workspaceId);
+  if (updateRightSidebarLayout(workspaceId, (state) => splitFocusedTabset(state, direction))) {
+    requestFocusedTabFocus(workspaceId);
+  }
 }
 
 /**
@@ -42,10 +44,10 @@ export function splitRightSidebarPane(
  */
 export function openRightSidebarTool(workspaceId: string, tool: TabType): void {
   updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
-  updateRightSidebarLayout(workspaceId, (state) =>
+  const stored = updateRightSidebarLayout(workspaceId, (state) =>
     openToolFromNewTab(state, state.focusedTabsetId, tool)
   );
-  requestFocusedTabFocus(workspaceId);
+  if (stored) requestFocusedTabFocus(workspaceId);
 }
 
 /**
@@ -53,6 +55,8 @@ export function openRightSidebarTool(workspaceId: string, tool: TabType): void {
  * Ask the workspace's sidebar to focus the tab its focused pane now shows, as "Right Sidebar: New
  * Tab" focuses its launcher. Only focus travels by event: the layout is already stored, so a
  * sidebar that is not mounted (the shell's loading placeholder) still shows it once it mounts.
+ * Callers skip it when the layout write was refused: nothing changed on screen, and focus would
+ * jump to the tab that the focused pane showed before.
  */
 export function requestFocusedTabFocus(workspaceId: string): void {
   const layout = readRightSidebarLayout(workspaceId);
@@ -74,14 +78,18 @@ export function readRightSidebarLayout(workspaceId: string): RightSidebarLayoutS
   return parseRightSidebarLayoutState(raw, fallback);
 }
 
+/**
+ * Returns false when the write was refused (updatePersistedState: localStorage full even after
+ * evicting caches, setItem throwing, or no localStorage). Then the sidebar keeps its old layout.
+ */
 export function updateRightSidebarLayout(
   workspaceId: string,
   updater: (state: RightSidebarLayoutState) => RightSidebarLayoutState
-): void {
+): boolean {
   const fallback = getRightSidebarTabFallback();
   const defaultLayout = getDefaultRightSidebarLayoutState(fallback);
 
-  updatePersistedState<RightSidebarLayoutState>(
+  return updatePersistedState<RightSidebarLayoutState>(
     getRightSidebarLayoutKey(workspaceId),
     (prev) => updater(parseRightSidebarLayoutState(prev, fallback)),
     defaultLayout

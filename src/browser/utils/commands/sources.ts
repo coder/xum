@@ -435,10 +435,9 @@ const findFirstTerminalSessionTab = (
 
 function focusExistingTerminalTab(workspaceId: string): void {
   const found = findFirstTerminalSessionTab(readRightSidebarLayout(workspaceId).root);
-  if (!found) return;
-  focusRightSidebarTab(workspaceId, found.tab);
-  // "Focus Terminal" and Add Tool > Terminal: the terminal takes the keyboard, like other tools.
-  requestFocusedTabFocus(workspaceId);
+  // "Focus Terminal" and Add Tool > Terminal: the terminal takes the keyboard, like other tools,
+  // unless the layout write was refused (see requestFocusedTabFocus).
+  if (found && focusRightSidebarTab(workspaceId, found.tab)) requestFocusedTabFocus(workspaceId);
 }
 
 /**

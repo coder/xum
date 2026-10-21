@@ -28,9 +28,10 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 
 import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
-import { cleanupView, openSidebarNewTab, setupWorkspaceView } from "../helpers";
+import { cleanupView, disableTutorial, openSidebarNewTab, setupWorkspaceView } from "../helpers";
 import {
   getRightSidebarCollapsedKey,
+  getReviewImmersiveKey,
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getPersistedKeyRegistration,
@@ -141,6 +142,7 @@ describeIntegration("RightSidebar (UI)", () => {
     // Reset all right-sidebar persisted state so each test starts clean.
     updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
     updatePersistedState(getRightSidebarCollapsedKey(workspaceId), null);
+    updatePersistedState(getReviewImmersiveKey(workspaceId), null);
     await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.AGENT_BROWSER, enabled: null });
     await env.orpc.experiments.set({
       experimentId: EXPERIMENT_IDS.PORTABLE_DESKTOP,
@@ -1253,6 +1255,184 @@ describeIntegration("RightSidebar (UI)", () => {
       await cleanup();
     }
   }, 60_000);
+
+  // The palette's split and Add Tool must not move focus into a sidebar that cannot be seen. In
+  // a real browser focus() on a hidden element does nothing, but happy-dom moves focus anyway,
+  // so these fail if the sidebar stops checking (usePaletteTabFocus's isSidebarShown).
+  // Tutorial popovers take focus when their targets appear (the launcher's Terminal row, the
+  // immersive review button), which would hide what these focus tests check.
+  const withoutTutorials = (beforeRender: () => void) => () => {
+    disableTutorial();
+    beforeRender();
+  };
+  const restoreTutorials = () => {
+    globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = undefined;
+  };
+
+  // Boolean checks: a failed toBe() on two DOM elements makes this jest setup fail while it prints
+  // them ("Cannot assign to read only property 'versions'"), which hides the real failure.
+  const expectPaletteKeepsFocusOutOf = async (sidebar: HTMLElement, outside: HTMLElement) => {
+    const container = sidebar.closest<HTMLElement>("[data-right-sidebar-phase]")!;
+    outside.focus();
+    splitRightSidebarPane(workspaceId, "vertical");
+    // The layout still changes: the new pane shows its launcher.
+    await waitFor(() => expect(sidebar.querySelectorAll('[id$="-panel-new"]')).toHaveLength(1));
+    expect(container.contains(document.activeElement)).toBe(false);
+
+    openRightSidebarTool(workspaceId, "instructions");
+    await findSidebarTab(sidebar, "instructions");
+    expect(container.contains(document.activeElement)).toBe(false);
+  };
+
+  test("the palette keeps focus out of the sidebar while the narrow layout hides it", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(
+      withoutTutorials(() => seedLayout(["costs"]))
+    );
+    const outside = document.body.appendChild(document.createElement("button"));
+    try {
+      await findSidebarTab(sidebar, "costs");
+      // What the narrow layout's CSS does (isRightSidebarResponsivelyHidden reads display).
+      const container = sidebar.closest<HTMLElement>("[data-right-sidebar-phase]")!;
+      container.style.display = "none";
+      await expectPaletteKeepsFocusOutOf(sidebar, outside);
+    } finally {
+      outside.remove();
+      restoreTutorials();
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("the palette keeps focus out of the sidebar while immersive review covers it", async () => {
+    // Immersive review needs a mounted Review panel. It sits in its own pane, so the split of the
+    // focused (Stats) pane does not remount it: a remount focuses the immersive view by design.
+    const layout: RightSidebarLayoutState = {
+      version: 1,
+      openTabsOnly: true,
+      nextId: 10,
+      root: {
+        type: "split",
+        id: "split-1",
+        direction: "horizontal",
+        sizes: [50, 50],
+        children: [
+          { type: "tabset", id: "tabset-review", tabs: ["review"], activeTab: "review" },
+          { type: "tabset", id: "tabset-stats", tabs: ["costs"], activeTab: "costs" },
+        ],
+      },
+      focusedTabsetId: "tabset-stats",
+    };
+    const { sidebar, cleanup } = await setupRightSidebarView(
+      withoutTutorials(() => {
+        updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
+        updatePersistedState(getReviewImmersiveKey(workspaceId), true);
+      })
+    );
+    const outside = document.body.appendChild(document.createElement("button"));
+    try {
+      await findSidebarTab(sidebar, "review");
+      await waitFor(() =>
+        expect(sidebar.closest("[data-right-sidebar-phase]")?.getAttribute("aria-hidden")).toBe(
+          "true"
+        )
+      );
+
+      await expectPaletteKeepsFocusOutOf(sidebar, outside);
+    } finally {
+      outside.remove();
+      restoreTutorials();
+      await cleanup();
+    }
+  }, 60_000);
+
+  test.each([
+    ["review", "Review"],
+    ["artifacts", "Artifacts"],
+  ] as const)(
+    "%s takes focus in the pane that opened it, not in another pane that shows it",
+    async (tool, name) => {
+      // The tool is open in both panes (a drag can do that). Every path that focuses its panel
+      // must focus the copy in the pane it targets: here the first pane.
+      if (tool === "artifacts") {
+        await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.ARTIFACTS, enabled: true });
+      }
+      const layout: RightSidebarLayoutState = {
+        version: 1,
+        openTabsOnly: true,
+        nextId: 10,
+        root: {
+          type: "split",
+          id: "split-1",
+          direction: "horizontal",
+          sizes: [50, 50],
+          children: [
+            { type: "tabset", id: "tabset-a", tabs: [tool, "new"], activeTab: tool },
+            { type: "tabset", id: "tabset-b", tabs: [tool], activeTab: tool },
+          ],
+        },
+        focusedTabsetId: "tabset-a",
+      };
+      const { sidebar, cleanup } = await setupRightSidebarView(withoutTutorials(() => undefined));
+      const outside = document.body.appendChild(document.createElement("button"));
+      const panelOf = (tabsetId: string) =>
+        sidebar.querySelector<HTMLElement>(`[id$="-${tabsetId}-panel-${tool}"]`);
+      const expectFocusInFirstPane = () =>
+        waitFor(() => {
+          const active = document.activeElement;
+          expect(active !== outside && panelOf("tabset-a")?.contains(active) === true).toBe(true);
+          expect(panelOf("tabset-b")?.contains(active)).toBe(false);
+        });
+
+      try {
+        // The layout goes in once the fresh workspace's launcher offers the tool: an Artifacts
+        // tab stored while its experiment still reads off is pruned (useExperimentGatedTab).
+        const launcher0 = await findSidebarPanel(sidebar, "-panel-new");
+        await waitFor(
+          () =>
+            expect(
+              within(launcher0).getByRole("button", { name: new RegExp(`^${name}\\b`) })
+            ).toBeTruthy(),
+          { timeout: 10_000 }
+        );
+        updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
+        // Both panels load lazily, and a panel takes focus only once loaded.
+        await waitFor(
+          () => {
+            for (const tabsetId of ["tabset-a", "tabset-b"]) {
+              const loaded = panelOf(tabsetId)?.querySelector(`[data-testid="${tool}-panel"]`);
+              expect(loaded != null).toBe(true);
+            }
+          },
+          { timeout: 10_000 }
+        );
+
+        // The palette's "Add Tool…" (the focused pane already shows the tool).
+        outside.focus();
+        openRightSidebarTool(workspaceId, tool);
+        await expectFocusInFirstPane();
+
+        // Ctrl+1: the first tab of the layout is the first pane's copy.
+        outside.focus();
+        fireEvent.keyDown(window, { key: "1", ctrlKey: true });
+        await expectFocusInFirstPane();
+
+        // The first pane's New tab launcher: picking the tool selects the copy in that pane.
+        // Its "+" button: opening the tool from the palette closed that pane's New tab.
+        fireEvent.click(within(sidebar).getAllByRole("button", { name: "New tab" })[0]);
+        const launcher = await findSidebarPanel(sidebar, "tabset-a-panel-new");
+        outside.focus();
+        fireEvent.click(within(launcher).getByRole("button", { name: new RegExp(`^${name}\\b`) }));
+        await expectFocusInFirstPane();
+      } finally {
+        outside.remove();
+        restoreTutorials();
+        await cleanup();
+        if (tool === "artifacts") {
+          await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.ARTIFACTS, enabled: null });
+        }
+      }
+    },
+    60_000
+  );
 
   test("a new terminal gets its tab even when the layout no longer fits its budget", async () => {
     // Pad the tabset id so the layout sits just under its budget: with a terminal tab (~45 chars)
