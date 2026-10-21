@@ -137,14 +137,28 @@ async function collectSkillsRoot(
   if (!entries || !root) return;
   for (const entry of entries) {
     if (budget.exhausted) return;
-    const resolved = await resolveEntry(path.join(hostRoot, entry));
-    if (!resolved) continue;
-    const remotePath = path.posix.join(remoteRoot, entry);
-    if (resolved.stat.isDirectory()) {
-      await collectDirectory(files, budget, resolved.real, remotePath, 1, resolved.real);
-    } else if (isInside(resolved.real, root.real)) {
-      await collectFile(files, budget, resolved, remotePath);
-    }
+    await collectSkillsRootEntry(
+      files,
+      budget,
+      { hostPath: path.join(hostRoot, entry), remotePath: path.posix.join(remoteRoot, entry) },
+      root.real
+    );
+  }
+}
+
+/** A skill directory (its real path bounds what it may link to), or a file of the root. */
+async function collectSkillsRootEntry(
+  files: AgentHomeSeedFile[],
+  budget: SeedBudget,
+  entry: { hostPath: string; remotePath: string },
+  realRoot: string
+): Promise<void> {
+  const resolved = await resolveEntry(entry.hostPath);
+  if (!resolved) return;
+  if (resolved.stat.isDirectory()) {
+    await collectDirectory(files, budget, resolved.real, entry.remotePath, 1, resolved.real);
+  } else if (isInside(resolved.real, realRoot)) {
+    await collectFile(files, budget, resolved, entry.remotePath);
   }
 }
 
