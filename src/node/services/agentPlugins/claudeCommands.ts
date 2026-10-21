@@ -52,6 +52,18 @@ function firstLineDescription(name: string, body: string): string {
 }
 
 /**
+ * The Claude Code docs write `argument-hint: [issue-number]` and `[filename] [format]` unquoted.
+ * YAML reads the first as a list and refuses the second, so the command would not load, while
+ * Claude Code shows the hint as typed. Quote a bracketed top-level hint so it stays that text.
+ */
+function quoteBracketedArgumentHint(yaml: string): string {
+  return yaml.replace(
+    /^argument-hint:[ \t]*(\[.*?)[ \t]*$/m,
+    (_line, hint: string) => `argument-hint: ${JSON.stringify(hint)}`
+  );
+}
+
+/**
  * A command file as SKILL.md text: its frontmatter with `name` set to the file name,
  * `disable-model-invocation: true` forced (a Claude command is for the user), and a description
  * taken from the first body line when it has none. Text whose frontmatter does not parse as a
@@ -62,7 +74,7 @@ export function claudeCommandSkillMarkdown(name: string, content: string): strin
   if (parts === null) return content;
   let raw: unknown;
   try {
-    raw = parts.yaml.trim().length === 0 ? {} : YAML.parse(parts.yaml);
+    raw = parts.yaml.trim().length === 0 ? {} : YAML.parse(quoteBracketedArgumentHint(parts.yaml));
   } catch {
     return content;
   }
