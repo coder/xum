@@ -71,6 +71,15 @@ describe("findSkillsPackageRoots", () => {
     expect(await findSkillsPackageRoots(tmp.path)).toEqual([{ root: ".", skills: [] }]);
   });
 
+  test("a nested container restarts its own three levels", async () => {
+    using tmp = new DisposableTempDir("install-methods");
+    await writeTree(tmp.path, ["skills/a", "skills/.curated/g1/g2/deep"]);
+    expect(await findSkillsPackageRoots(tmp.path)).toEqual([
+      { root: "skills", skills: ["a"] },
+      { root: "skills/.curated/g1/g2", skills: ["deep"] },
+    ]);
+  });
+
   test("symlinks that leave the tree are not followed", async () => {
     using tmp = new DisposableTempDir("install-methods");
     const repo = path.join(tmp.path, "repo");
