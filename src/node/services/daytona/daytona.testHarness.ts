@@ -1,8 +1,10 @@
+import { spawn } from "child_process";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
 import type { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
+import type { SSHTransport } from "@/node/runtime/transports";
 import type { DaytonaWorkspaceRef } from "./daytonaReconciler";
 import { DaytonaService } from "./daytonaService";
 
@@ -299,5 +301,24 @@ export async function createDaytonaTestRig(
     clock,
     workspaces,
     cleanup: () => fs.rm(rootDir, { recursive: true, force: true }),
+  };
+}
+
+/** Runs each "remote" command in a local bash whose HOME is `home`: the sandbox end of ssh. */
+export function localShellTransport(home: string): SSHTransport {
+  const config = { host: "placeholder.xum--daytona" };
+  return {
+    spawnRemoteProcess: (command) =>
+      Promise.resolve({
+        process: spawn("bash", ["-c", command], {
+          env: { PATH: process.env.PATH ?? "", HOME: home },
+          stdio: "pipe",
+        }),
+      }),
+    isConnectionFailure: (exitCode) => exitCode === 255,
+    acquireConnection: () => Promise.resolve(),
+    getConfig: () => config,
+    createPtySession: () => Promise.reject(new Error("no PTY in this test")),
+    openReverseForward: () => Promise.reject(new Error("no forwards in this test")),
   };
 }

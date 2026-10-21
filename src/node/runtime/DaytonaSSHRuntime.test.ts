@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn, type Mock } from "bun:test";
-import { execFileSync, spawn } from "child_process";
+import { execFileSync } from "child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
 import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import {
   createDaytonaTestRig,
+  localShellTransport,
   type DaytonaTestRig,
 } from "@/node/services/daytona/daytona.testHarness";
 import { DAYTONA_READY_CACHE_MS } from "@/node/services/daytona/daytonaService";
@@ -38,12 +39,20 @@ afterEach(async () => {
 function makeRuntime(
   daytona: DaytonaSandboxConfig,
   testRig = rig,
-  options: { workspaceId?: string; transport?: SSHTransport } = {}
+  options: {
+    workspaceId?: string;
+    transport?: SSHTransport;
+    /** Both set: ensureReady also checks this workspace's checkout. */
+    projectPath?: string;
+    workspaceName?: string;
+  } = {}
 ): DaytonaSSHRuntime {
   const config = { host: "placeholder.xum--daytona", srcBaseDir: "~/src", daytona };
   const transport = options.transport ?? createSSHTransport(config, false);
   return new DaytonaSSHRuntime(config, transport, testRig.service, {
     workspaceId: options.workspaceId ?? "ws-1",
+    projectPath: options.projectPath,
+    workspaceName: options.workspaceName,
     // Empty by default: tests that seed write files here.
     agentHomeSeedSources: {
       xumHome: path.join(testRig.rootDir, "host-xum"),
@@ -76,25 +85,6 @@ function initParams(): WorkspaceInitParams & { log: string[] } {
 
 const SMALL = { cpu: 2, memoryGiB: 4, diskGiB: 10 };
 
-/** Runs each "remote" command in a local bash whose HOME is `home`: the sandbox end of ssh. */
-function localShellTransport(home: string): SSHTransport {
-  const config = { host: "placeholder.xum--daytona" };
-  return {
-    spawnRemoteProcess: (command) =>
-      Promise.resolve({
-        process: spawn("bash", ["-c", command], {
-          env: { PATH: process.env.PATH ?? "", HOME: home },
-          stdio: "pipe",
-        }),
-      }),
-    isConnectionFailure: (exitCode) => exitCode === 255,
-    acquireConnection: () => Promise.resolve(),
-    getConfig: () => config,
-    createPtySession: () => Promise.reject(new Error("no PTY in this test")),
-    openReverseForward: () => Promise.reject(new Error("no forwards in this test")),
-  };
-}
-
 describe("DaytonaSSHRuntime.ensureReady", () => {
   it("trusts a ready result for 60 s across runtime instances, then checks again", async () => {
     rig.plane.addSandbox({ id: "sb-ready" });
@@ -108,6 +98,26 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
     rig.clock.now += DAYTONA_READY_CACHE_MS;
     await makeRuntime({ sandboxId: "sb-ready" }).ensureReady();
     expect(rig.plane.countCalls("GET /sandbox/sb-ready")).toBeGreaterThan(getsAfterFirst);
+  });
+
+  it("checks each workspace's checkout while their shared sandbox is cached as ready", async () => {
+    execSpy.mockRestore();
+    rig.plane.addSandbox({ id: "sb-shared" });
+    const runtimeFor = (workspaceName: string) =>
+      makeRuntime({ sandboxId: "sb-shared" }, rig, {
+        transport: localShellTransport(rig.rootDir),
+        projectPath: "/home/me/project",
+        workspaceName,
+      });
+    const checkout = runtimeFor("ws-a").getWorkspacePath("/home/me/project", "ws-a");
+    execFileSync("git", ["init", "-q", checkout.replace(/^~/, rig.rootDir)]);
+
+    expect(await runtimeFor("ws-a").ensureReady()).toEqual({ ready: true });
+    // A fork on the same sandbox whose checkout is gone, within the ready cache.
+    const fork = await runtimeFor("ws-b").ensureReady();
+
+    expect(fork.ready).toBe(false);
+    if (!fork.ready) expect(fork.error).toContain("repository not found");
   });
 
   it("starts a stopped sandbox, reports it in the status sink, and writes the ssh token", async () => {

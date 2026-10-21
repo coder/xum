@@ -327,28 +327,42 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         errorType: "runtime_not_ready",
       };
     }
-    const setupFailure = this.daytonaService.getSetupFailure(sandboxId);
-    if (setupFailure) {
-      return {
-        ready: false,
-        error:
-          `Daytona sandbox setup failed: ${setupFailure}. Xum deleted the sandbox it had ` +
-          `created; delete this workspace and create a new one.`,
-        errorType: "runtime_not_ready",
-      };
-    }
+    const setupFailure = this.setupFailureResult(sandboxId);
+    if (setupFailure) return setupFailure;
+    const emitStatus = makeStatusEmitter(options?.statusSink);
     if (this.daytonaService.isSandboxReady(sandboxId)) {
-      this.restartsStoppedSandbox = true;
-      return { ready: true };
+      return this.ensureReadyFromCache(options, emitStatus);
     }
 
-    const emitStatus = makeStatusEmitter(options?.statusSink);
     emitStatus("checking");
     const failure = await this.bringSandboxUp(sandboxId, emitStatus, options?.signal);
     if (failure) return failure;
     const result = await this.markReadyIfRepoPresent(sandboxId, options, emitStatus);
     if (result.ready) this.restartsStoppedSandbox = true;
     return result;
+  }
+
+  private setupFailureResult(sandboxId: string): EnsureReadyResult | undefined {
+    const setupFailure = this.daytonaService.getSetupFailure(sandboxId);
+    if (!setupFailure) return undefined;
+    return {
+      ready: false,
+      error:
+        `Daytona sandbox setup failed: ${setupFailure}. Xum deleted the sandbox it had ` +
+        `created; delete this workspace and create a new one.`,
+      errorType: "runtime_not_ready",
+    };
+  }
+
+  /** The cache covers the sandbox, not this workspace's checkout: a fork shares the sandbox. */
+  private async ensureReadyFromCache(
+    options: EnsureReadyOptions | undefined,
+    emitStatus: StatusEmitter
+  ): Promise<EnsureReadyResult> {
+    const repoFailure = await this.checkRepo(options, emitStatus);
+    if (repoFailure) return repoFailure;
+    this.restartsStoppedSandbox = true;
+    return { ready: true };
   }
 
   /**
@@ -513,14 +527,26 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     options: EnsureReadyOptions | undefined,
     emitStatus: StatusEmitter
   ): Promise<EnsureReadyResult> {
-    const repoCheck = await this.checkWorkspaceRepo(options);
-    if (repoCheck && !repoCheck.ready) {
-      emitStatus("error", repoCheck.error);
-      return repoCheck;
-    }
+    const repoFailure = await this.checkRepo(options, emitStatus);
+    if (repoFailure) return repoFailure;
     this.daytonaService.markSandboxReady(sandboxId);
     emitStatus("ready");
     return { ready: true };
+  }
+
+  /** The failure when this workspace's checkout is missing or broken; reports ready otherwise. */
+  private async checkRepo(
+    options: EnsureReadyOptions | undefined,
+    emitStatus: StatusEmitter
+  ): Promise<EnsureReadyResult | undefined> {
+    const repoCheck = await this.checkWorkspaceRepo(options);
+    if (!repoCheck) return undefined;
+    if (!repoCheck.ready) {
+      emitStatus("error", repoCheck.error);
+      return repoCheck;
+    }
+    emitStatus("ready");
+    return undefined;
   }
 
   private ensureReadyFailure(
@@ -943,10 +969,32 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     try {
       const deletedPath = this.getWorkspacePath(projectPath, workspaceName);
       const check = await this.checkWorkspaceDeletable(deletedPath, false, trusted);
-      return check === "ok" || check === "missing" ? Ok(undefined) : Err(check.error);
+      if (check === "missing") return Ok(undefined);
+      if (check !== "ok") return Err(check.error);
+      return await this.checkNoUntrackedFiles(deletedPath);
     } catch (error) {
       return Err(`Failed to check workspace state: ${getErrorMessage(error)}`);
     }
+  }
+
+  /**
+   * Deleting the sandbox loses untracked files too, which the shared dirty check (made for
+   * deleting one worktree) ignores. Only this archive path checks them; a failed check keeps
+   * the sandbox.
+   */
+  private async checkNoUntrackedFiles(deletedPath: string): Promise<Result<void, string>> {
+    const result = await execBuffered(
+      this,
+      `git -C ${this.quoteForRemote(deletedPath)} ls-files --others --exclude-standard`,
+      { cwd: "/tmp", timeout: 30 }
+    );
+    if (result.exitCode !== 0) {
+      return Err(`Failed to list files git does not track: ${result.stderr.trim()}`);
+    }
+    const files = result.stdout.split("\n").filter(Boolean);
+    if (files.length === 0) return Ok(undefined);
+    const shown = files.slice(0, 5).join(", ");
+    return Err(`Workspace contains untracked files (${shown}${files.length > 5 ? ", ..." : ""})`);
   }
 
   /**

@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { execFileSync } from "child_process";
+import * as fs from "fs/promises";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
 import { Ok, type Result } from "@/common/types/result";
@@ -6,7 +8,11 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { DaytonaSSHRuntime } from "@/node/runtime/DaytonaSSHRuntime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import { createSSHTransport } from "@/node/runtime/transports";
-import { createDaytonaTestRig, type DaytonaTestRig } from "./daytona.testHarness";
+import {
+  createDaytonaTestRig,
+  localShellTransport,
+  type DaytonaTestRig,
+} from "./daytona.testHarness";
 import { createDaytonaArchiveHook, type DaytonaArchiveHookOptions } from "./daytonaLifecycleHooks";
 
 let rig: DaytonaTestRig;
@@ -148,5 +154,34 @@ describe("createDaytonaArchiveHook", () => {
       sshCheck.mockRestore();
       resolvePath.mockRestore();
     }
+  });
+
+  it("keeps a sandbox whose only unsaved work is an untracked file on archive delete", async () => {
+    rig.plane.addSandbox({ id: "sb-untracked" });
+    const daytona = { sandboxId: "sb-untracked", shared: false };
+    const config = { host: "x.xum--daytona", srcBaseDir: "~/src", daytona };
+    // Real git in a local "sandbox": a clean, committed checkout plus one new file.
+    const runtime = new DaytonaSSHRuntime(config, localShellTransport(rig.rootDir), rig.service);
+    const checkout = runtime.getWorkspacePath("/tmp/proj", "ws").replace(/^~/, rig.rootDir);
+    const git = (...args: string[]) =>
+      execFileSync("git", ["-C", checkout, "-c", "user.name=t", "-c", "user.email=t@t", ...args]);
+    await fs.mkdir(checkout, { recursive: true });
+    git("init", "-q");
+    git("commit", "-q", "--allow-empty", "-m", "init");
+    await fs.writeFile(`${checkout}/notes.md`, "not committed yet\n");
+    const warnings: string[] = [];
+
+    const result = await archive(
+      daytona,
+      "delete",
+      (workspaceMetadata) =>
+        runtime.checkSandboxDeletable(workspaceMetadata.projectPath, workspaceMetadata.name, true),
+      (warning) => warnings.push(warning)
+    );
+
+    expect(result.success).toBe(true);
+    expect(rig.plane.find("sb-untracked")?.state).toBe("stopped");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("untracked");
   });
 });
