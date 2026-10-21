@@ -213,6 +213,32 @@ describe("AgentResourceLimitsSettings", () => {
     await view.findByText(/Active: agents share 2 CPU cores/);
   });
 
+  test("keeps naming an invalid field after Try again applies the saved limits", async () => {
+    const view = renderSettings({
+      enabled: true,
+      limits: { cpuCores: 2 },
+      status: { state: "unavailable", reason: "xum runs in cgroup /init.scope." },
+      support: READY,
+    });
+    await view.findByText("Not applied: xum runs in cgroup /init.scope.");
+
+    view.edit(view.cpu(), "0.05");
+    view.edit(view.memory(), "-3");
+    const cpuError = "CPU limit must be from 0.1 to 1024 cores, or empty for no limit.";
+    const memoryError = "Memory limit must be from 0.25 to 16384 GiB, or empty for no limit.";
+    await view.findByText(cpuError);
+    view.getByText(memoryError);
+
+    fireEvent.click(view.getByRole("button", { name: "Try again" }));
+
+    await view.findByText(/Active: agents share 2 CPU cores/);
+    expect(view.set.mock.calls).toEqual([[{ cpuCores: 2 }]]);
+    // The fields still hold the invalid values, so their errors stay.
+    expect(view.memory().value).toBe("-3");
+    view.getByText(cpuError);
+    view.getByText(memoryError);
+  });
+
   const SUDO: AgentResourceLimitsSupport = { state: "sudo", cgroup: "/init.scope" };
   test.each<
     [
@@ -280,6 +306,9 @@ describe("AgentResourceLimitsSettings", () => {
 
     fireEvent.click(view.getByRole("button", { name: "Try again" }));
 
+    // Wait for the save first: a waitFor whose first check runs before the render polls again
+    // only after about 5 s under happy-dom, which made this test time out on a busy host.
+    await waitFor(() => expect(view.set).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(view.queryByText(/Not applied/)).toBeNull());
     expect(view.set.mock.calls).toEqual([[{ cpuCores: 2 }]]);
   });
