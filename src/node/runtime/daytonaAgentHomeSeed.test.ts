@@ -75,6 +75,7 @@ describe("agent-home seeding", () => {
   it("skips a file larger than the remaining seed budget, unread, and copies the rest", async () => {
     const huge = path.join(hostXum, "skills", "data", "model.bin");
     await fs.mkdir(path.dirname(huge), { recursive: true });
+    await fs.writeFile(path.join(hostXum, "skills", "data", "SKILL.md"), "# data\n");
     // Sparse: 64 MiB on paper, no disk used.
     await fs.writeFile(huge, "");
     await fs.truncate(huge, 64 * 1024 * 1024);
@@ -88,6 +89,7 @@ describe("agent-home seeding", () => {
       const files = await collectAgentHomeSeedFiles({ xumHome: hostXum, home: hostHome }, "~/.mux");
 
       expect(files.map((file) => file.remotePath)).toEqual([
+        "~/.mux/skills/data/SKILL.md",
         "~/.mux/skills/deploy/SKILL.md",
         "~/.agents/skills/lint/SKILL.md",
       ]);
@@ -134,5 +136,34 @@ describe("agent-home seeding", () => {
       "~/.mux/skills/lint/SKILL.md",
     ]);
     expect(files.some((file) => file.content.toString().includes("PRIVATE KEY"))).toBe(false);
+  });
+
+  it("copies a directory of a skills root only when it is a skill", async () => {
+    const secrets = path.join(hostHome, ".ssh");
+    await fs.mkdir(secrets, { recursive: true });
+    await fs.writeFile(path.join(secrets, "id_rsa"), "PRIVATE KEY\n");
+    const skills = path.join(hostXum, "skills");
+    await fs.mkdir(skills, { recursive: true });
+    // A root entry linked to a directory that is no skill.
+    await fs.symlink(secrets, path.join(skills, "keys"));
+    // A plain directory without SKILL.md.
+    await fs.mkdir(path.join(skills, "notes"));
+    await fs.writeFile(path.join(skills, "notes", "todo.txt"), "todo\n");
+    // A SKILL.md that is a link out of its directory does not make it a skill.
+    await fs.mkdir(path.join(skills, "borrowed"));
+    await fs.symlink(path.join(secrets, "id_rsa"), path.join(skills, "borrowed", "SKILL.md"));
+    await fs.writeFile(path.join(skills, "borrowed", "extra.txt"), "extra\n");
+    // A skill whose name discovery refuses.
+    await fs.mkdir(path.join(skills, "Not_A_Skill"));
+    await fs.writeFile(path.join(skills, "Not_A_Skill", "SKILL.md"), "# no\n");
+    // A linked real skill is still copied.
+    const linkedTarget = path.join(root, "plugins", "lint");
+    await fs.mkdir(linkedTarget, { recursive: true });
+    await fs.writeFile(path.join(linkedTarget, "SKILL.md"), "# lint\n");
+    await fs.symlink(linkedTarget, path.join(skills, "lint"));
+
+    const files = await collectAgentHomeSeedFiles({ xumHome: hostXum, home: hostHome }, "~/.mux");
+
+    expect(files.map((file) => file.remotePath)).toEqual(["~/.mux/skills/lint/SKILL.md"]);
   });
 });

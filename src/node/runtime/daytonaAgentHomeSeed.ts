@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import { SkillNameSchema } from "@/common/orpc/schemas";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { isErrnoWithCode } from "@/node/utils/fs";
@@ -129,10 +130,10 @@ function isInside(realPath: string, realRoot: string): boolean {
 }
 
 /**
- * A skills root (`~/.xum/skills`, `~/.agents/skills`). Each skill directory in it may be a
- * symlink (users and plugin installs link skills, and skill discovery follows them); inside a
- * skill, links are followed only while they stay within that skill's real directory, so a
- * link to `~/.ssh` is never copied into the sandbox.
+ * A skills root (`~/.xum/skills`, `~/.agents/skills`). Only its skill directories are copied
+ * (see isSkillDirectory). Each may be a symlink (users and plugin installs link skills, and
+ * skill discovery follows them); inside a skill, links are followed only while they stay
+ * within that skill's real directory, so a link to `~/.ssh` is never copied into the sandbox.
  */
 async function collectSkillsRoot(
   files: AgentHomeSeedFile[],
@@ -154,6 +155,17 @@ async function collectSkillsRoot(
   }
 }
 
+/**
+ * Whether a directory of a skills root is a skill as discovery sees one: a valid skill name and
+ * a regular SKILL.md. SKILL.md must also stay inside the real directory, so a root entry linked
+ * to `~/.ssh` (or holding a SKILL.md link to elsewhere) does not become a copy boundary.
+ */
+async function isSkillDirectory(name: string, realDir: string): Promise<boolean> {
+  if (!SkillNameSchema.safeParse(name).success) return false;
+  const skillFile = await resolveEntry(path.join(realDir, "SKILL.md"));
+  return skillFile !== null && skillFile.stat.isFile() && isInside(skillFile.real, realDir);
+}
+
 /** A skill directory (its real path bounds what it may link to), or a file of the root. */
 async function collectSkillsRootEntry(
   files: AgentHomeSeedFile[],
@@ -164,6 +176,15 @@ async function collectSkillsRootEntry(
   const resolved = await resolveEntry(entry.hostPath);
   if (!resolved) return;
   if (resolved.stat.isDirectory()) {
+    if (!(await isSkillDirectory(path.basename(entry.hostPath), resolved.real))) {
+      log.warn(
+        "Skipping a skills directory entry that is not a skill while seeding a Daytona sandbox",
+        {
+          hostPath: entry.hostPath,
+        }
+      );
+      return;
+    }
     await collectDirectory(files, budget, resolved.real, entry.remotePath, 1, resolved.real);
   } else if (isInside(resolved.real, realRoot)) {
     await collectFile(files, budget, resolved, entry.remotePath);
