@@ -35,22 +35,28 @@ export function isWorkspaceRightSidebarHidden(shell: Element | null | undefined)
 // file, and these read desktop-only layout classes (vscode/src/webview/webviewCss.test.ts).
 
 /**
- * Collapses or expands the right sidebar (the TOGGLE_RIGHT_SIDEBAR key and its palette command).
- * Returns false, and changes nothing, while the sidebar is not on screen: a narrow window or
- * immersive review hides it, so a flip there would be invisible until later. Immersive review
- * also hides the header toggle (ShellRightSidebarToggle), so the key and the button agree.
- * The phone full-screen view shows the narrow layout's sidebar, and a collapse there left a blank
- * view (bug bash RS2), so it counts as narrow too: its own Close button closes it. The same holds
- * while the sidebar chunk failed to load.
+ * True when the right sidebar's collapse state can change on screen, so the TOGGLE_RIGHT_SIDEBAR
+ * key and its palette command act only then (and the palette lists the command only then).
+ * A narrow window or immersive review hides the sidebar, so a flip there would be invisible until
+ * later. Immersive review also hides the header toggle (ShellRightSidebarToggle). The phone
+ * full-screen view shows the narrow layout's sidebar, and a collapse there left a blank view (bug
+ * bash RS2): its own Close button closes it. The failed-load frame ignores the collapse state to
+ * keep its Reload button on screen, so a flip there would only surface after a reload.
  */
-export function toggleRightSidebarCollapsed(workspaceId: string, shell: Element | null): boolean {
-  // The failed-load frame ignores the collapse state to keep its Reload button on screen, and it
-  // hides the header toggle, so a flip there would only surface after a reload.
+export function canToggleRightSidebar(workspaceId: string, shell: Element | null): boolean {
   if (shell?.querySelector(".right-sidebar-fullscreen, [data-right-sidebar-load-failed]") != null) {
     return false;
   }
   if (isWorkspaceRightSidebarHidden(shell)) return false;
-  if (readPersistedState(getReviewImmersiveKey(workspaceId), false)) return false;
+  return !readPersistedState(getReviewImmersiveKey(workspaceId), false);
+}
+
+/**
+ * Collapses or expands the right sidebar (the TOGGLE_RIGHT_SIDEBAR key and its palette command).
+ * Returns false, and changes nothing, unless canToggleRightSidebar() allows it.
+ */
+export function toggleRightSidebarCollapsed(workspaceId: string, shell: Element | null): boolean {
+  if (!canToggleRightSidebar(workspaceId, shell)) return false;
   updatePersistedState<boolean>(
     getRightSidebarCollapsedKey(workspaceId),
     (prev) => !prev,
@@ -76,4 +82,16 @@ export function toggleRightSidebarFromPalette(workspaceId: string): void {
   if (toggleRightSidebarCollapsed(workspaceId, document.querySelector("[data-workspace-shell]"))) {
     focusRightSidebarToggle(document);
   }
+}
+
+/**
+ * Whether the palette lists "Right Sidebar: Toggle": only while the toggle can act (Codex review
+ * of #7128: the command closed the palette and did nothing). Without a DOM (command-source unit
+ * tests) there is no layout to check.
+ */
+export function isRightSidebarToggleAvailable(workspaceId: string): boolean {
+  return (
+    typeof document === "undefined" ||
+    canToggleRightSidebar(workspaceId, document.querySelector("[data-workspace-shell]"))
+  );
 }
