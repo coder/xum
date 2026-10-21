@@ -20,6 +20,7 @@ import {
 } from "@/node/services/agentPlugins/sourceInput";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { findExecutableOnPath } from "@/node/utils/findExecutableOnPath";
 
@@ -51,10 +52,15 @@ const MAX_BUFFERED_OUTPUT_BYTES = 10 * 1024 * 1024;
 const MAX_OUTPUT_CHARS = 64 * 1024;
 
 /**
- * The CLI writes ~/.agents/skills and ~/.agents/.skill-lock.json, so two runs
- * at once could interleave writes to the same lock file.
+ * The CLI writes ~/.agents/skills and ~/.agents/.skill-lock.json with an unlocked
+ * read-modify-write, so two runs at once could lose each other's lock entries. The mutex
+ * orders the runs of this process; the file lock (in the same home, next to the CLI's lock
+ * file) also orders the runs of other Xum backends that share the home.
  */
 const runMutex = new AsyncMutex();
+const RUN_LOCK_FILE = ".xum-skills-cli.lock";
+/** A run holds the lock for at most RUN_TIMEOUT_MS; wait for one other run and some slack. */
+const RUN_LOCK_TIMEOUT_MS = RUN_TIMEOUT_MS + 30_000;
 
 export interface SkillsCliOptions {
   /** Merged over process.env; PATH selects npx and node. */
@@ -81,6 +87,8 @@ function skillsCliSource(input: string): string {
   // Again here: the parser checks the raw input, this checks what Xum runs.
   assertNoAgentPluginUrlCredentials(url);
   if (!isSkillsCliRemoteUrl(url)) throw new Error(SKILLS_CLI_NOT_REMOTE_PROBLEM);
+  const urlProblem = skillsCliSourceProblem(url);
+  if (urlProblem !== undefined) throw new Error(urlProblem);
   assert(!url.startsWith("-"), "skillsCliSource: a remote URL never starts with '-'");
   return url;
 }
@@ -218,6 +226,8 @@ const SKILLS_CLI_ENV_NAMES = new Set([
   "XDG_CONFIG_HOME",
   "XDG_CACHE_HOME",
   "XDG_DATA_HOME",
+  // The CLI keeps its global lock file in $XDG_STATE_HOME/skills when this is set.
+  "XDG_STATE_HOME",
   "SSH_AUTH_SOCK",
   "HTTP_PROXY",
   "HTTPS_PROXY",
@@ -372,6 +382,16 @@ async function hasSkillFile(homeDir: string, skill: string): Promise<boolean> {
   }
 }
 
+/** The requested skills that already have an entry in ~/.agents/skills (even a dangling link). */
+async function existingSkillFolders(homeDir: string, skills: string[]): Promise<string[]> {
+  const entries = await Promise.all(
+    skills.map((skill) =>
+      fs.lstat(path.join(homeDir, ".agents", "skills", skill)).catch(() => null)
+    )
+  );
+  return skills.filter((_skill, index) => entries[index] !== null);
+}
+
 /** The requested skills without ~/.agents/skills/<name>/SKILL.md. */
 async function missingSkillFiles(homeDir: string, skills: string[]): Promise<string[]> {
   const present = await Promise.all(skills.map((skill) => hasSkillFile(homeDir, skill)));
@@ -398,6 +418,8 @@ async function runSkillsCli(
   if (failure !== null) return { ...ran, ok: false, missingSkills: [], failure };
 
   // Exit 0 is not proof: the CLI also exits 0 when the repository has no skill with that name.
+  // No requested folder existed before the run (installWithSkillsCli), so a SKILL.md now is
+  // this run's.
   const missingSkills = await missingSkillFiles(options?.homeDir ?? os.homedir(), skills);
   if (missingSkills.length > 0) {
     return {
@@ -421,7 +443,22 @@ export async function installWithSkillsCli(
 ): Promise<SkillsCliRun> {
   const args = skillsCliArgs(input.source, input.skills);
   const command = formatCommand(["npx", ...args]);
+  const homeDir = options?.homeDir ?? os.homedir();
   await using _lock = await runMutex.acquire();
+  await using _fileLock = await acquireProcessFileLock({
+    lockPath: path.join(homeDir, ".agents", RUN_LOCK_FILE),
+    timeoutMs: RUN_LOCK_TIMEOUT_MS,
+    label: "skills CLI run lock",
+  });
+  // SECURITY: `--copy --yes` makes the CLI delete and replace an existing skill folder without
+  // asking. Xum has no consent step for that, so it refuses (also before it shows the command
+  // to copy, which carries the same flags).
+  const existing = await existingSkillFolders(homeDir, input.skills);
+  if (existing.length > 0) {
+    throw new Error(
+      `~/.agents/skills already has ${existing.join(", ")}. The skills CLI would replace ${existing.length === 1 ? "that folder" : "those folders"} without asking, so Xum did not run it. Remove or rename ${existing.length === 1 ? "it" : "them"} first, or install only the other skills.`
+    );
+  }
   const detection = await detectNode(mergedEnv(options));
   if (!detection.available) {
     return { status: "unavailable", reason: detection.reason, command };
