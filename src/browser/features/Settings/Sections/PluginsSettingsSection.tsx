@@ -558,15 +558,21 @@ const AddPluginPanel: React.FC<{
         subpath: optionalField(subpath),
         method,
       });
-      if (result.success) {
-        setPreview(result.data);
+      if (!result.success) {
+        setError(result.error);
+      } else if (result.data.kind === "marketplace") {
+        // The entry list arrives with the marketplace view; until then the panel names it.
+        setError(
+          `This repository is the Claude Code marketplace '${result.data.marketplace.name}'.`
+        );
+      } else {
+        const next = result.data.preview;
+        setPreview(next);
         // An accepted preview starts a new consent decision; failed attempts retain choices.
         setSelected({
-          skills: result.data.skills.map((skill) => skill.name),
-          mcpServers: result.data.mcpServers.map((server) => server.serverName),
+          skills: next.skills.map((skill) => skill.name),
+          mcpServers: next.mcpServers.map((server) => server.serverName),
         });
-      } else {
-        setError(result.error);
       }
     } catch (err) {
       setError(getErrorMessage(err));
@@ -723,17 +729,6 @@ const AddPluginPanel: React.FC<{
                 busy={busy}
                 error={error}
               />
-              {/* A name collision blocks only this method; the Install as choice above stays usable. */}
-              {preview.installBlockedReason !== undefined && (
-                <div className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm">
-                  <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span className="break-words">
-                    Xum cannot install this as {installMethodLabel(preview.method)}.{" "}
-                    {preview.installBlockedReason}
-                  </span>
-                </div>
-              )}
-
               <div className="flex gap-2">
                 <Button variant="ghost" size="sm" onClick={backToSource} disabled={busy}>
                   <ArrowLeft className="h-3.5 w-3.5" />
@@ -883,6 +878,17 @@ const PreviewConsent: React.FC<{
       >
         <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
         <span className="break-words">{props.error}</span>
+      </div>
+    )}
+
+    {/* A name collision blocks only this method; the Install as choice above stays usable. */}
+    {props.preview.installBlockedReason !== undefined && (
+      <div className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm">
+        <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+        <span className="break-words">
+          Xum cannot install this as {installMethodLabel(props.preview.method)}.{" "}
+          {props.preview.installBlockedReason}
+        </span>
       </div>
     )}
   </>

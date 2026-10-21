@@ -172,6 +172,12 @@ export const AgentPluginInstallMethodSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("claude-plugin") }),
   /** SKILL.md folders only: Xum writes a plugin.json for them (installMethods.ts). */
   z.object({ kind: z.literal("skills") }),
+  /**
+   * One entry of a Claude Code marketplace (`.claude-plugin/marketplace.json` at the repository
+   * root). A preview with it resolves the entry; install gets it back only when the entry has no
+   * plugin.json of its own and Xum writes one from the entry (claudeMarketplace.ts).
+   */
+  z.object({ kind: z.literal("claude-marketplace"), entry: z.string().min(1) }),
 ]);
 export type AgentPluginInstallMethod = z.infer<typeof AgentPluginInstallMethodSchema>;
 

@@ -25,6 +25,8 @@
 export const AGENT_PLUGIN_SCHEMA_ID_1_0_0 =
   "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
+import * as path from "node:path";
+
 // Name grammar shared with the install registry schema (see the module's doc comment).
 import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
 
@@ -261,11 +263,12 @@ export interface AgentPluginManifest {
 /**
  * `extensions.mux.generatedFrom`: Xum wrote this plugin.json for a repository that had none
  * (installMethods.ts). Update reads it from the installed tree to regenerate with the same
- * method. Only `kind: "skills"` exists today.
+ * method. `claude-marketplace` names the marketplace entry, and carries the entry's `commands`
+ * paths: a Claude component without a `contributes` member.
  */
-export interface GeneratedFrom {
-  kind: "skills";
-}
+export type GeneratedFrom =
+  | { kind: "skills" }
+  | { kind: "claude-marketplace"; entry: string; commands?: string[] };
 
 function generatedFromValue(manifest: Pick<AgentPluginManifest, "extensions">): unknown {
   const mux = manifest.extensions?.mux;
@@ -280,12 +283,36 @@ export function hasGeneratedFromMarker(manifest: Pick<AgentPluginManifest, "exte
   return generatedFromValue(manifest) !== undefined;
 }
 
-/** The marker when its kind is one this build generates; undefined for absent or unknown ones. */
+/** `commands` of a claude-marketplace marker: normalized safe paths, at most MAX_SKILLS_ROOTS. */
+function isMarkerCommandList(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= MAX_SKILLS_ROOTS &&
+    value.every(
+      (item) =>
+        typeof item === "string" &&
+        isSafeContributesPath(item) &&
+        path.posix.normalize(item) === item
+    )
+  );
+}
+
+/**
+ * The marker when its kind is one this build generates, in exactly the shape Xum writes;
+ * undefined for absent, unknown or malformed ones (discovery reads those as skills-only).
+ */
 export function readGeneratedFrom(
   manifest: Pick<AgentPluginManifest, "extensions">
 ): GeneratedFrom | undefined {
   const value = generatedFromValue(manifest);
-  return isPlainObject(value) && value.kind === "skills" ? { kind: "skills" } : undefined;
+  if (!isPlainObject(value)) return undefined;
+  if (value.kind === "skills") return { kind: "skills" };
+  if (value.kind !== "claude-marketplace") return undefined;
+  if (typeof value.entry !== "string" || !isValidAgentPluginName(value.entry)) return undefined;
+  if (value.commands === undefined) return { kind: "claude-marketplace", entry: value.entry };
+  return isMarkerCommandList(value.commands)
+    ? { kind: "claude-marketplace", entry: value.entry, commands: value.commands }
+    : undefined;
 }
 
 export type PluginManifestValidation =

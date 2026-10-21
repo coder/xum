@@ -2008,3 +2008,119 @@ describe("generatedFrom marker (skills-only packages)", () => {
     }
   });
 });
+
+describe("generatedFrom marker (Claude marketplace packages)", () => {
+  const SKILL = "---\nname: s\ndescription: S\n---\n";
+  /** One tree with every component kind; `marker` adds extensions.mux.generatedFrom. */
+  async function writePlugin(pluginDir: string, marker: unknown): Promise<void> {
+    const files: Record<string, string> = {
+      "plugin.json": JSON.stringify({
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "kit",
+        contributes: {
+          slashCommands: [{ name: "go", expansion: "Go" }],
+          hooks: "hooks.js",
+          workflows: "workflows",
+          mcp: ".mcp.json",
+        },
+        extensions: {
+          mux: {
+            hooks: { tools: ["bash"] },
+            ...(marker !== undefined ? { generatedFrom: marker } : {}),
+          },
+          "com.openai": { hooks: ["hooks/hooks.json"] },
+        },
+      }),
+      "skills/s/SKILL.md": SKILL,
+      "commands/c.md": "Run c\n",
+      "hooks.js": "export default {};",
+      "hooks/hooks.json": JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: "mcp_tool", server: "x", tool: "y" }] }] },
+      }),
+      "agents/a.md": "---\nname: a\ndescription: A\n---\n",
+      "workflows/w.js": "export default async () => {};",
+      ".mcp.json": JSON.stringify({ mcpServers: {} }),
+    };
+    for (const [relative, content] of Object.entries(files)) {
+      await fs.mkdir(path.dirname(path.join(pluginDir, relative)), { recursive: true });
+      await fs.writeFile(path.join(pluginDir, relative), content, "utf8");
+    }
+  }
+
+  async function surfaceOf(pluginDir: string) {
+    const { plugin } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+    if (plugin === null) throw new Error(`${pluginDir}: not a plugin`);
+    const hooks = await loadPluginCodexHooks(plugin);
+    return {
+      skills: plugin.skillsDirs?.map((root) => path.relative(plugin.rootPath, root.dir)),
+      hooksJs: plugin.hooksPath !== undefined,
+      agents: plugin.agentsDir !== undefined,
+      workflows: plugin.workflowsDir !== undefined,
+      mcp: plugin.mcpConfigPath !== undefined,
+      runnableHooks: hooks.hooks.filter((hook) => hook.status === "runnable").length,
+      listedHooks: hooks.hooks.length,
+      slashCommands: plugin.manifest.contributes?.slashCommands !== undefined,
+      openai: plugin.openai !== undefined,
+      hookTools: resolvePluginHookGrants(plugin.manifest).bridgeTools.allow.length > 0,
+      claude: plugin.claudeFallback === true,
+      skillsOnly: plugin.skillsOnly === true,
+    };
+  }
+
+  test("a claude-marketplace marker gets the Claude package set and gains nothing over plain", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    await writePlugin(path.join(tmp.path, "plain"), undefined);
+    await writePlugin(path.join(tmp.path, "marked"), {
+      kind: "claude-marketplace",
+      entry: "kit",
+      commands: ["commands"],
+    });
+    const plain = await surfaceOf(path.join(tmp.path, "plain"));
+    const marked = await surfaceOf(path.join(tmp.path, "marked"));
+    expect(plain).toMatchObject({
+      hooksJs: true,
+      workflows: true,
+      runnableHooks: 1,
+      slashCommands: true,
+      openai: true,
+      hookTools: true,
+    });
+    expect(marked).toEqual({
+      // Commands load as user-only skills: prompt files, which plain can ship as skills too.
+      skills: ["skills", "commands"],
+      hooksJs: false,
+      agents: plain.agents,
+      workflows: false,
+      mcp: plain.mcp,
+      // hooks.json is listed and never runs.
+      runnableHooks: 0,
+      listedHooks: 1,
+      slashCommands: false,
+      openai: false,
+      hookTools: false,
+      claude: true,
+      skillsOnly: false,
+    });
+  });
+
+  test("a malformed claude-marketplace marker is skills-only", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    for (const [dirName, marker] of [
+      ["no-entry", { kind: "claude-marketplace" }],
+      ["bad-entry", { kind: "claude-marketplace", entry: "Not A Name" }],
+      ["escaping-commands", { kind: "claude-marketplace", entry: "kit", commands: ["../x"] }],
+      ["commands-not-list", { kind: "claude-marketplace", entry: "kit", commands: "commands" }],
+    ] as const) {
+      await writePlugin(path.join(tmp.path, dirName), marker);
+      expect({ dirName, ...(await surfaceOf(path.join(tmp.path, dirName))) }).toMatchObject({
+        dirName,
+        skills: ["skills"],
+        agents: false,
+        mcp: false,
+        listedHooks: 0,
+        claude: false,
+        skillsOnly: true,
+      });
+    }
+  });
+});

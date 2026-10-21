@@ -20,6 +20,9 @@ import { getOwn } from "@/common/utils/getOwn";
 import type {
   AgentPluginInstallMethod,
   AgentPluginInstallPreview,
+  AgentPluginMarketplaceEntry,
+  AgentPluginMarketplaceListing,
+  AgentPluginSourcePreview,
   AgentPluginComponents,
   AgentPluginHooks,
   AgentPluginInterfaceSummary,
@@ -86,16 +89,27 @@ import {
 } from "./discovery";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
 import {
-  chooseInstallMethod,
+  chooseStagedMethod,
   detectInstallMethods,
+  generatesManifest,
   installMethodRequest,
-  noInstallMethodMessage,
+  marketplaceManifest,
   readInstalledGeneratedFrom,
-  skillsCliSkillNames,
+  relativeEntryContext,
   writeGeneratedManifest,
   type InstallMethodRequest,
+  type MarketplaceEntryContext,
   type SkillsPackageRoot,
 } from "./installMethods";
+import {
+  CLAUDE_MARKETPLACE_RELATIVE_PATH,
+  MAX_CLAUDE_MARKETPLACE_BYTES,
+  findMarketplaceEntry,
+  marketplaceListing,
+  parseClaudeMarketplace,
+  resolveEntrySource,
+  type ClaudeMarketplace,
+} from "./claudeMarketplace";
 import { pluginSkillMarkdown } from "./claudeCommands";
 import { listPluginAgentFiles, type PluginAgentFile } from "./agentFiles";
 import { checkLogoImage } from "./imageHeader";
@@ -1081,6 +1095,45 @@ function resolvePreviewSubpath(
   return parsedSubpath ?? explicit;
 }
 
+/**
+ * Ref for preview(): from the `@ref` shorthand or the separate field, refusing two different
+ * ones. An empty field is no ref.
+ */
+function resolvePreviewRef(
+  parsedRef: string | undefined,
+  rawExplicit: string | undefined
+): string | undefined {
+  const explicit = rawExplicit?.trim() ?? "";
+  if (explicit.length > 0 && parsedRef !== undefined && parsedRef !== explicit) {
+    throw new Error(
+      `Conflicting refs: '@${parsedRef}' in the source and '${explicit}' in the ref field.`
+    );
+  }
+  return parsedRef ?? (explicit.length > 0 ? explicit : undefined);
+}
+
+/** The entry name of a `claude-marketplace` method. */
+function marketplaceEntryOf(
+  method: AgentPluginInstallMethod | null | undefined
+): string | undefined {
+  return method?.kind === "claude-marketplace" ? method.entry : undefined;
+}
+
+/** The git source that preview returns and install persists. */
+function resolvedGitSource(
+  url: string,
+  resolved: Pick<ResolvedRemoteRef, "ref" | "refType">,
+  subpath: string | undefined
+): AgentPluginGitSource {
+  return {
+    type: "git",
+    url,
+    ref: resolved.ref,
+    refType: resolved.refType,
+    ...(subpath !== undefined ? { subpath } : {}),
+  };
+}
+
 /** Throws unless `subpath` is absent or already in normalizeAgentPluginSubpath form. */
 function assertNormalizedSubpath(subpath: string | undefined): void {
   if (subpath !== undefined && normalizeAgentPluginSubpath(subpath) !== subpath) {
@@ -1197,6 +1250,15 @@ function displayNameWarnings(
 }
 
 /** A preview warning's plugin-relative name for skill `name` of `skillsRoot`. */
+/** The `contributes.skills` value of a generated manifest (undefined: the default skills/). */
+function declaredSkills(manifest: Record<string, unknown>): string | string[] | undefined {
+  const skills = isPlainObject(manifest.contributes) ? manifest.contributes.skills : undefined;
+  if (typeof skills === "string") return skills;
+  return Array.isArray(skills)
+    ? skills.filter((item): item is string => typeof item === "string")
+    : undefined;
+}
+
 function skillReviewLabel(pluginRoot: string, skillsRoot: PluginSkillsRoot, name: string): string {
   const relativeRoot = path.relative(pluginRoot, skillsRoot.dir);
   // A command is its file; a single skill folder is the skill itself, and at the plugin root it
@@ -2299,7 +2361,11 @@ export class AgentPluginInstallService {
    * install fails loudly instead of installing unreviewed content. A
    * `source.subpath` stages only that folder (see extractSubpath).
    */
-  private async cloneExactSha(source: AgentPluginGitSource, sha: string): Promise<string> {
+  private async cloneExactSha(
+    source: AgentPluginGitSource,
+    sha: string,
+    options?: { readMarketplace: true }
+  ): Promise<{ dir: string; marketplaceJson: string | undefined }> {
     const subpath = source.subpath;
     const dir = await this.createStagingDir();
     try {
@@ -2327,10 +2393,78 @@ export class AgentPluginInstallService {
           `The remote moved since the preview (expected ${sha.slice(0, 12)}, got ${head.slice(0, 12)}). Run the preview again.`
         );
       }
-      return await this.stagedPluginRoot(dir, subpath, source.url, sha);
+      // Before stagedPluginRoot: a subpath clone keeps only the plugin folder, and the
+      // marketplace file sits at the repository root.
+      const marketplaceJson =
+        options?.readMarketplace === true
+          ? await this.readMarketplaceAtCommit(dir, sha)
+          : undefined;
+      return { dir: await this.stagedPluginRoot(dir, subpath, source.url, sha), marketplaceJson };
     } catch (error) {
       await this.removeDir(dir);
       throw error instanceof Error ? error : new Error(getErrorMessage(error));
+    }
+  }
+
+  /**
+   * `.claude-plugin/marketplace.json` at `sha` in a staging clone (which may be partial and
+   * sparse), or undefined when the commit has none. Only a regular file counts: a symlink blob
+   * would name another path. The blob size is checked before its content is read, and a lazy
+   * fetch of the blob runs under the clone's disk quota.
+   */
+  private async readMarketplaceAtCommit(dir: string, sha: string): Promise<string | undefined> {
+    const listing = await runGit([
+      "--literal-pathspecs",
+      "-C",
+      dir,
+      "ls-tree",
+      "-z",
+      sha,
+      "--",
+      CLAUDE_MARKETPLACE_RELATIVE_PATH,
+    ]);
+    const record = listing
+      .split("\0")
+      .map((line) => /^(\d{6}) blob ([0-9a-f]+)\t([\s\S]*)$/.exec(line))
+      .find((match) => match?.[3] === CLAUDE_MARKETPLACE_RELATIVE_PATH);
+    if (record == null) return undefined;
+    const [, mode, oid] = record;
+    if (mode !== "100644" && mode !== "100755") {
+      throw new Error(`${CLAUDE_MARKETPLACE_RELATIVE_PATH} is not a regular file.`);
+    }
+    const diskQuota = this.cloneDiskQuota(dir);
+    const size = Number((await runGit(["-C", dir, "cat-file", "-s", oid], { diskQuota })).trim());
+    if (!Number.isSafeInteger(size) || size > MAX_CLAUDE_MARKETPLACE_BYTES) {
+      throw new Error(
+        `${CLAUDE_MARKETPLACE_RELATIVE_PATH} is larger than ${MAX_CLAUDE_MARKETPLACE_BYTES / 1024} KiB.`
+      );
+    }
+    return runGit(["-C", dir, "cat-file", "blob", oid], { diskQuota });
+  }
+
+  /**
+   * cloneExactSha for an install or update, plus the context of marketplace entry `entryName`
+   * (a relative entry whose plugin.json Xum writes), read from marketplace.json at `sha`.
+   */
+  private async cloneWithEntry(
+    source: AgentPluginGitSource,
+    sha: string,
+    entryName: string | undefined
+  ): Promise<{ stagedDir: string; marketplace: MarketplaceEntryContext | undefined }> {
+    if (entryName === undefined) {
+      return { stagedDir: (await this.cloneExactSha(source, sha)).dir, marketplace: undefined };
+    }
+    const { dir, marketplaceJson } = await this.cloneExactSha(source, sha, {
+      readMarketplace: true,
+    });
+    try {
+      return {
+        stagedDir: dir,
+        marketplace: relativeEntryContext(marketplaceJson, entryName, source),
+      };
+    } catch (error) {
+      await this.removeDir(dir);
+      throw error;
     }
   }
 
@@ -2526,14 +2660,15 @@ export class AgentPluginInstallService {
 
   /**
    * Pick the install method (installMethods.ts), write the generated plugin.json of a `skills`
-   * install, then run the exact runtime validation (manifest + component discovery) against the
-   * staged clone. Throws user-facing errors for non-plugins, including a clear message for a
-   * Claude Code marketplace repo (not installable yet).
+   * or marketplace-entry install, then run the exact runtime validation (manifest + component
+   * discovery) against the staged clone. Throws user-facing errors for non-plugins. `marketplace`:
+   * the staged tree is the folder of that marketplace entry (entryInstallMethods).
    */
   private async validateStagedClone(
     stagedDir: string,
     source: Pick<AgentPluginGitSource, "url" | "subpath">,
-    request: InstallMethodRequest
+    request: InstallMethodRequest,
+    marketplace?: MarketplaceEntryContext
   ): Promise<{
     plugin: AgentPluginInfo;
     warnings: string[];
@@ -2544,15 +2679,8 @@ export class AgentPluginInstallService {
     // Every manifest candidate, and the generated plugin.json, lives in the staged tree the
     // consent receipt hashes.
     const detected = await detectInstallMethods(stagedDir);
-    const method = chooseInstallMethod(detected.methods, request);
-    if (method === undefined) {
-      if (await pathExists(path.join(stagedDir, ".claude-plugin", "marketplace.json"))) {
-        throw new Error(
-          "This repository is a Claude Code plugin marketplace (found .claude-plugin/marketplace.json). Xum does not install marketplaces yet. Install one of its plugins by its folder, as owner/repo/path/to/plugin."
-        );
-      }
-      throw new Error(noInstallMethodMessage(source.subpath));
-    }
+    const choice = chooseStagedMethod(detected, request, source, marketplace);
+    const method = choice.method;
 
     // The crash-recovery marker name is RESERVED: install/update write a
     // nonce file at this path just before their promote rename, which would
@@ -2578,8 +2706,9 @@ export class AgentPluginInstallService {
     }
 
     // After the marker check, so a refused tree never gets a generated file.
-    const generatedWarnings =
-      method.kind === "skills" ? await writeGeneratedManifest(stagedDir, method, source) : [];
+    const generatedWarnings = generatesManifest(method)
+      ? await writeGeneratedManifest(stagedDir, method, source, marketplace)
+      : [];
     const { plugin, diagnostics } = await discoverAgentPluginAt({
       pluginDir: stagedDir,
       scope: "global",
@@ -2592,13 +2721,13 @@ export class AgentPluginInstallService {
     }
     return {
       plugin,
-      warnings: [...generatedWarnings, ...diagnostics.map((d) => d.message)],
+      warnings: [...choice.warnings, ...generatedWarnings, ...diagnostics.map((d) => d.message)],
       method,
-      methods: detected.methods,
+      methods: choice.methods,
       skillsCliSkills: await this.acceptedSkillsCliNames(
         stagedDir,
         detected.skillsRoots,
-        skillsCliSkillNames(detected.skillsRoots, source)
+        choice.skillsCliSkills
       ),
     };
   }
@@ -3211,8 +3340,8 @@ export class AgentPluginInstallService {
     }
   }
 
-  previewResult(args: Parameters<AgentPluginInstallService["preview"]>[0]) {
-    return this.captureResult(() => this.preview(args));
+  previewResult(args: Parameters<AgentPluginInstallService["previewSource"]>[0]) {
+    return this.captureResult(() => this.previewSource(args));
   }
 
   installResult(args: Parameters<AgentPluginInstallService["install"]>[0]) {
@@ -3272,117 +3401,283 @@ export class AgentPluginInstallService {
     return this.captureResult(() => this.confirmComponentReview(args));
   }
 
-  async preview(args: {
+  /** The plugin preview of a source; a marketplace repository is refused (see previewSource). */
+  async preview(
+    args: Parameters<AgentPluginInstallService["previewSource"]>[0]
+  ): Promise<AgentPluginInstallPreview> {
+    const result = await this.previewSource(args);
+    if (result.kind === "marketplace") {
+      throw new Error(
+        `This repository is the Claude Code marketplace '${result.marketplace.name}'. Preview one of its plugins.`
+      );
+    }
+    return result.preview;
+  }
+
+  /**
+   * Preview a source: a plugin to review, or the entries of a Claude Code marketplace. A root
+   * clone without a plugin manifest but with `.claude-plugin/marketplace.json` lists the
+   * marketplace, unless a method was asked for (Skills installs the whole repository). Xum
+   * never looks for a marketplace under a subpath. With a `claude-marketplace` method, the
+   * preview resolves that entry's source and previews its plugin.
+   */
+  async previewSource(args: {
     input: string;
     ref?: string | undefined;
     subpath?: string | undefined;
     /** Absent: the first method that fits. */
     method?: AgentPluginInstallMethod | null | undefined;
-  }): Promise<AgentPluginInstallPreview> {
+  }): Promise<AgentPluginSourcePreview> {
     const parsed = parseAgentPluginSourceInput(args.input);
-    const explicitRef = args.ref?.trim() ?? "";
-    if (explicitRef.length > 0 && parsed.ref !== undefined && parsed.ref !== explicitRef) {
-      throw new Error(
-        `Conflicting refs: '@${parsed.ref}' in the source and '${explicitRef}' in the ref field.`
-      );
-    }
-    const ref = parsed.ref ?? (explicitRef.length > 0 ? explicitRef : undefined);
+    const ref = resolvePreviewRef(parsed.ref, args.ref);
     const subpath = resolvePreviewSubpath(parsed.subpath, args.subpath);
+    const entryName = marketplaceEntryOf(args.method);
+    if (entryName !== undefined && subpath !== undefined) {
+      throw new Error("A marketplace entry is picked at the repository root. Remove the folder.");
+    }
 
     const resolved = await this.resolveRemoteRef(parsed.url, ref);
-    const { dir: stagedDir, sha } = await this.cloneResolved(parsed.url, resolved, subpath);
+    const staged = await this.cloneResolved(parsed.url, resolved, subpath);
+    const source = resolvedGitSource(parsed.url, resolved, subpath);
+    let stagedDir = staged.dir;
     try {
-      const { plugin, warnings, method, methods, skillsCliSkills } = await this.validateStagedClone(
-        stagedDir,
-        { url: parsed.url, subpath },
-        installMethodRequest(args.method)
-      );
-      const targetPath = this.targetPathFor(plugin.name);
-      // A name collision blocks only the managed install of this method: the preview still lists
-      // the other methods and the Skills CLI choice, which creates no managed plugin.
-      const installBlockedReason = await this.collisionReason(plugin.name);
-
-      const skills = await this.collectSkillsFromRoots(plugin, warnings);
-      assertDirectivesFit(skills);
-      const { previews: mcpServers, fingerprints: mcpFingerprints } = await this.collectMcpServers(
-        plugin,
-        targetPath,
-        this.instanceIdFor(plugin.name),
-        warnings
-      );
-      const hook = this.collectHook(plugin);
-      const codexHooks = await loadPluginCodexHooks(plugin);
-      warnings.push(...codexHooks.warnings);
-      const openaiInterface = await interfaceSummary(plugin, warnings);
-      const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
-      // Display only: the names a user reads before Install show invisible controls (#6629).
-      const agents = agentFiles.map((agent) => showInvisibleControls(agent.file));
-      const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
-        showInvisibleControls
-      );
-      const workflowScripts = await this.collectWorkflowScripts(plugin, warnings);
-      const slashSurface = [...slashCommandSurface(plugin)];
-      const reviewedComponents = reviewedComponentRows([
-        ["workflows", workflowScripts.map((w) => [w.file, w])],
-        ["agents", agentFiles.map((agent) => [agent.id, agentSurface(agent)])],
-        ["slashCommands", slashSurface],
-      ]);
-      // Built from the rows above, never a second read, so it covers exactly what was shown.
-      const consentDigest = componentConsentDigest(
-        inventoryFingerprints({
-          skills,
-          mcpServers: mcpFingerprints,
-          workflows: workflowScripts,
-          agents: agentFiles,
-          slashCommands: slashSurface,
-        }),
-        hook
-      );
-      const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
-        name: command.name,
-        ...(command.description !== undefined ? { description: command.description } : {}),
-      }));
-
-      if (resolved.refType === "tag" && sha !== resolved.sha) {
-        warnings.push(
-          `Tag '${resolved.ref}' moved between resolution and clone — installing ${sha.slice(0, 12)}.`
-        );
+      if (entryName !== undefined) {
+        const entry = await this.stageMarketplaceEntry(staged, source, entryName);
+        stagedDir = entry.staged.dir;
+        return {
+          kind: "plugin",
+          preview: await this.previewStaged({ ...entry, request: { mode: "first" } }),
+        };
       }
-
-      const source: AgentPluginGitSource = {
-        type: "git",
-        url: parsed.url,
-        ref: resolved.ref,
-        refType: resolved.refType,
-        ...(subpath !== undefined ? { subpath } : {}),
-      };
+      const listing = await this.marketplaceListingAt(staged, source, args.method);
+      if (listing !== undefined) return { kind: "marketplace", marketplace: listing };
       return {
-        source,
-        method,
-        methods,
-        skillsCliSkills,
-        installBlockedReason,
-        lockedSha: sha,
-        manifest: {
-          ...manifestSummary(plugin.manifest),
-          ...(openaiInterface !== undefined ? { interface: openaiInterface } : {}),
-        },
-        // Fingerprints stay in the backend: the preview shows what the components do.
-        skills: skills.map((skill) => omitConsentFingerprint(skill)),
-        mcpServers,
-        ...(hook !== undefined ? { hook } : {}),
-        codexHooks: codexHooks.hooks,
-        agents,
-        workflows,
-        slashCommands,
-        reviewedComponents,
-        warnings,
-        targetPath: shortenHome(targetPath),
-        consentDigest,
+        kind: "plugin",
+        preview: await this.previewStaged({
+          staged,
+          source,
+          resolved,
+          request: installMethodRequest(args.method),
+        }),
       };
     } finally {
       await this.removeDir(stagedDir);
     }
+  }
+
+  /**
+   * The listing when a root clone has a marketplace file and no plugin manifest. Xum looks only
+   * at the root, and only when no method was asked for (Skills installs the whole repository).
+   */
+  private async marketplaceListingAt(
+    staged: { dir: string; sha: string },
+    source: AgentPluginGitSource,
+    method: AgentPluginInstallMethod | null | undefined
+  ): Promise<AgentPluginMarketplaceListing | undefined> {
+    if (method != null || source.subpath !== undefined) return undefined;
+    const content = await this.readMarketplaceAtCommit(staged.dir, staged.sha);
+    if (content === undefined) return undefined;
+    const { methods } = await detectInstallMethods(staged.dir);
+    if (
+      methods.some((method) => method.kind === "agent-plugin" || method.kind === "claude-plugin")
+    ) {
+      return undefined;
+    }
+    const listing = marketplaceListing({ content, source, lockedSha: staged.sha, methods });
+    const marketplace = parseClaudeMarketplace(content);
+    const entries = await Promise.all(
+      listing.entries.map((row) =>
+        this.withAcceptedSkillCount(staged.dir, marketplace, source, row)
+      )
+    );
+    return { ...listing, entries };
+  }
+
+  /**
+   * A relative entry's skill count: the skills its preview accepts (collectSkills), not the
+   * paths it lists. An entry in another repository keeps the count of paths: Xum has not cloned it.
+   */
+  private async withAcceptedSkillCount(
+    stagedDir: string,
+    marketplace: ClaudeMarketplace,
+    source: AgentPluginGitSource,
+    row: AgentPluginMarketplaceEntry
+  ): Promise<AgentPluginMarketplaceEntry> {
+    if (row.skillCount === undefined || !row.installable || row.sourceKind !== "relative") {
+      return row;
+    }
+    const entry = findMarketplaceEntry(marketplace, row.name);
+    const resolved = resolveEntrySource(marketplace, source.url, entry);
+    assert(resolved.kind === "relative", "withAcceptedSkillCount: a relative entry resolves here");
+    const folder = path.join(stagedDir, resolved.subpath ?? "");
+    let entryDir: string;
+    try {
+      entryDir = await ensurePluginPathContained(stagedDir, folder);
+    } catch {
+      // A missing or escaping folder fails its own preview with the reason.
+      return row;
+    }
+    const { manifest } = marketplaceManifest({
+      entry,
+      relative: true,
+      rootSource: resolved.subpath === undefined,
+    });
+    const accepted = await this.acceptedSkillNames(entryDir, {
+      declared: declaredSkills(manifest),
+      pluginName: entry.name,
+    });
+    return { ...row, skillCount: accepted.size };
+  }
+
+  /**
+   * Stage the plugin of marketplace entry `entryName` from a root clone of the marketplace. A
+   * root-source entry is that clone. A folder of the same repository is cloned at the same commit
+   * (so the entry and its folder match), and another repository is resolved like a typed source.
+   * Consumes `marketplace` when it returns a different folder.
+   */
+  private async stageMarketplaceEntry(
+    marketplace: { dir: string; sha: string },
+    marketplaceSource: AgentPluginGitSource,
+    entryName: string
+  ): Promise<{
+    staged: { dir: string; sha: string };
+    source: AgentPluginGitSource;
+    resolved: ResolvedRemoteRef;
+    marketplace: MarketplaceEntryContext;
+  }> {
+    const content = await this.readMarketplaceAtCommit(marketplace.dir, marketplace.sha);
+    if (content === undefined) {
+      throw new Error(`This repository has no ${CLAUDE_MARKETPLACE_RELATIVE_PATH}.`);
+    }
+    const parsed = parseClaudeMarketplace(content);
+    const entry = findMarketplaceEntry(parsed, entryName);
+    const target = resolveEntrySource(parsed, marketplaceSource.url, entry);
+    const marketplaceResolved: ResolvedRemoteRef = {
+      ref: marketplaceSource.ref,
+      refType: marketplaceSource.refType,
+      sha: marketplace.sha,
+    };
+    if (target.kind === "relative" && target.subpath === undefined) {
+      return {
+        staged: marketplace,
+        source: marketplaceSource,
+        resolved: marketplaceResolved,
+        marketplace: { entry, relative: true, rootSource: true },
+      };
+    }
+    await this.removeDir(marketplace.dir);
+    if (target.kind === "relative") {
+      const source = { ...marketplaceSource, subpath: target.subpath };
+      const { dir } = await this.cloneExactSha(source, marketplace.sha);
+      return {
+        staged: { dir, sha: marketplace.sha },
+        source,
+        resolved: marketplaceResolved,
+        marketplace: { entry, relative: true, rootSource: false },
+      };
+    }
+    const resolved = await this.resolveRemoteRef(target.url, target.ref);
+    const staged = await this.cloneResolved(target.url, resolved, target.subpath);
+    return {
+      staged,
+      source: resolvedGitSource(target.url, resolved, target.subpath),
+      resolved,
+      marketplace: { entry, relative: false, rootSource: false },
+    };
+  }
+
+  /** The consent preview of a staged clone (removed by the caller). */
+  private async previewStaged(args: {
+    staged: { dir: string; sha: string };
+    source: AgentPluginGitSource;
+    resolved: ResolvedRemoteRef;
+    request: InstallMethodRequest;
+    marketplace?: MarketplaceEntryContext;
+  }): Promise<AgentPluginInstallPreview> {
+    const { source, resolved } = args;
+    const { dir: stagedDir, sha } = args.staged;
+    const { plugin, warnings, method, methods, skillsCliSkills } = await this.validateStagedClone(
+      stagedDir,
+      source,
+      args.request,
+      args.marketplace
+    );
+    const targetPath = this.targetPathFor(plugin.name);
+    // A name collision blocks only the managed install of this method: the preview still lists
+    // the other methods and the Skills CLI choice, which creates no managed plugin.
+    const installBlockedReason = await this.collisionReason(plugin.name);
+
+    const skills = await this.collectSkillsFromRoots(plugin, warnings);
+    assertDirectivesFit(skills);
+    const { previews: mcpServers, fingerprints: mcpFingerprints } = await this.collectMcpServers(
+      plugin,
+      targetPath,
+      this.instanceIdFor(plugin.name),
+      warnings
+    );
+    const hook = this.collectHook(plugin);
+    const codexHooks = await loadPluginCodexHooks(plugin);
+    warnings.push(...codexHooks.warnings);
+    const openaiInterface = await interfaceSummary(plugin, warnings);
+    const agentFiles = await listPluginAgentFiles(plugin.agentsDir, warnings);
+    // Display only: the names a user reads before Install show invisible controls (#6629).
+    const agents = agentFiles.map((agent) => showInvisibleControls(agent.file));
+    const workflows = (await listPluginWorkflowFiles(plugin.workflowsDir)).map(
+      showInvisibleControls
+    );
+    const workflowScripts = await this.collectWorkflowScripts(plugin, warnings);
+    const slashSurface = [...slashCommandSurface(plugin)];
+    const reviewedComponents = reviewedComponentRows([
+      ["workflows", workflowScripts.map((w) => [w.file, w])],
+      ["agents", agentFiles.map((agent) => [agent.id, agentSurface(agent)])],
+      ["slashCommands", slashSurface],
+    ]);
+    // Built from the rows above, never a second read, so it covers exactly what was shown.
+    const consentDigest = componentConsentDigest(
+      inventoryFingerprints({
+        skills,
+        mcpServers: mcpFingerprints,
+        workflows: workflowScripts,
+        agents: agentFiles,
+        slashCommands: slashSurface,
+      }),
+      hook
+    );
+    const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
+      name: command.name,
+      ...(command.description !== undefined ? { description: command.description } : {}),
+    }));
+
+    if (resolved.refType === "tag" && sha !== resolved.sha) {
+      warnings.push(
+        `Tag '${resolved.ref}' moved between resolution and clone — installing ${sha.slice(0, 12)}.`
+      );
+    }
+
+    return {
+      source,
+      method,
+      methods,
+      skillsCliSkills,
+      installBlockedReason,
+      lockedSha: sha,
+      manifest: {
+        ...manifestSummary(plugin.manifest),
+        ...(openaiInterface !== undefined ? { interface: openaiInterface } : {}),
+      },
+      // Fingerprints stay in the backend: the preview shows what the components do.
+      skills: skills.map((skill) => omitConsentFingerprint(skill)),
+      mcpServers,
+      ...(hook !== undefined ? { hook } : {}),
+      codexHooks: codexHooks.hooks,
+      agents,
+      workflows,
+      slashCommands,
+      reviewedComponents,
+      warnings,
+      targetPath: shortenHome(targetPath),
+      consentDigest,
+    };
   }
 
   private async assertNoCollision(name: string): Promise<void> {
@@ -3433,12 +3728,19 @@ export class AgentPluginInstallService {
     assertNormalizedSubpath(args.source.subpath);
 
     return this.runExclusive(async () => {
-      const stagedDir = await this.cloneExactSha(args.source, args.expectedSha);
+      // A marketplace entry without its own plugin.json is read again from the marketplace file
+      // of the consented commit, so install writes the plugin.json that the preview showed.
+      const { stagedDir, marketplace } = await this.cloneWithEntry(
+        args.source,
+        args.expectedSha,
+        marketplaceEntryOf(args.method)
+      );
       try {
         const { plugin } = await this.validateStagedClone(
           stagedDir,
           args.source,
-          installMethodRequest(args.method)
+          installMethodRequest(args.method),
+          marketplace
         );
         const name = plugin.name;
         const inventory = await this.collectComponents(plugin, this.targetPathFor(name));
@@ -5966,15 +6268,23 @@ export class AgentPluginInstallService {
   ): Promise<{ stagedDir: string; plugin: AgentPluginInfo; warnings: string[] }> {
     // A subpath install tracks the same folder at the new commit; a folder
     // that disappeared upstream fails here, before any swap.
-    const stagedDir = await this.cloneExactSha(entry.source, sha);
+    // A plugin.json that Xum generated is regenerated from the new commit, unless the
+    // repository now has its own manifest. The update review covers every component as usual. A
+    // marketplace entry is read again from the marketplace file at the new commit: the staged
+    // folder holds only the entry.
+    const generatedFrom = await readInstalledGeneratedFrom(this.targetPathFor(entry.name));
+    const { stagedDir, marketplace } = await this.cloneWithEntry(
+      entry.source,
+      sha,
+      generatedFrom?.kind === "claude-marketplace" ? generatedFrom.entry : undefined
+    );
     try {
-      // A plugin.json that Xum generated is regenerated from the new commit, unless the
-      // repository now has its own manifest. The update review covers every component as usual.
-      const generatedFrom = await readInstalledGeneratedFrom(this.targetPathFor(entry.name));
-      const { plugin, warnings } = await this.validateStagedClone(stagedDir, entry.source, {
-        mode: "update",
-        generatedFrom,
-      });
+      const { plugin, warnings } = await this.validateStagedClone(
+        stagedDir,
+        entry.source,
+        { mode: "update", generatedFrom },
+        marketplace
+      );
       if (plugin.name !== entry.name) {
         // Container-entry names are identity (instanceId, PLUGIN_DATA,
         // workspace overrides hash the path) — never rename on update.
