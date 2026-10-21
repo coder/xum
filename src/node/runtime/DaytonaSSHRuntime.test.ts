@@ -626,6 +626,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
 
     // A UI or background runtime never starts the (billed) sandbox.
     const background = makeRuntime({ sandboxId: "sb-nap" }, rig, { transport });
+    // eslint-disable-next-line @typescript-eslint/await-thenable
     await expect(background.exec("echo ok", { cwd: "/tmp", timeout: 10 })).rejects.toThrow(
       "Connection closed"
     );
@@ -679,6 +680,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
       transport: refusingTransportWhile("sb-gone", () => true),
     });
 
+    // eslint-disable-next-line @typescript-eslint/await-thenable
     await expect(runtime.exec("true", { cwd: "/tmp", timeout: 10 })).rejects.toThrow(
       'Daytona sandbox "sb-gone" no longer exists'
     );

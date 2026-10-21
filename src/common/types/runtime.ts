@@ -278,7 +278,7 @@ export function isSSHRuntime(
 /** The Daytona sandbox a runtime config points at, if any. */
 export function getDaytonaSandboxId(config: RuntimeConfig | undefined): string | undefined {
   const sandboxId = isSSHRuntime(config) ? config.daytona?.sandboxId?.trim() : undefined;
-  return sandboxId ? sandboxId : undefined;
+  return sandboxId === "" ? undefined : sandboxId;
 }
 
 /**

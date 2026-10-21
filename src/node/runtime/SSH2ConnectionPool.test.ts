@@ -197,7 +197,7 @@ describe.skipIf(process.platform === "win32")(
           [
             "Host sb-1.xum--daytona",
             "  HostName 127.0.0.1",
-            `  Port ${config.port}`,
+            `  Port ${String(config.port)}`,
             "  HostKeyAlias gateway.test",
             `  UserKnownHostsFile ${knownHostsPath}`,
             "  StrictHostKeyChecking yes",
