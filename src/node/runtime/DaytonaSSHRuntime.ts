@@ -1099,20 +1099,28 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     if (prepared !== "ready" && !force) {
       return { success: false, error: prepared.error };
     }
-    // A failed check (dirty or unpushed work) keeps the workspace and its sandbox.
-    const sshResult = await sshDelete();
-    if (!sshResult.success) {
-      if (!force) return sshResult;
-      // Forced: the workspace goes anyway, so the sandbox is still released or handed off.
-      const notice =
-        `The checkout ${deletedPath} could not be deleted on Daytona sandbox "${sandboxId}" ` +
-        `(${sshResult.error}); delete it there if you no longer need it.`;
-      return this.settleSandbox(sandboxId, { success: true, deletedPath, notice }, { force });
+    return this.settleAfterSshDelete(sandboxId, deletedPath, await sshDelete(), force);
+  }
+
+  /** A failed check (dirty or unpushed work) keeps the workspace and its sandbox. */
+  private settleAfterSshDelete(
+    sandboxId: string,
+    deletedPath: string,
+    sshResult: DeleteResult,
+    force: boolean
+  ): Promise<DeleteResult> {
+    if (sshResult.success) {
+      return this.settleSandbox(sandboxId, sshResult, {
+        force,
+        errorPrefix: "SSH delete succeeded, but ",
+      });
     }
-    return this.settleSandbox(sandboxId, sshResult, {
-      force,
-      errorPrefix: "SSH delete succeeded, but ",
-    });
+    if (!force) return Promise.resolve(sshResult);
+    // Forced: the workspace goes anyway, so the sandbox is still released or handed off.
+    const notice =
+      `The checkout ${deletedPath} could not be deleted on Daytona sandbox "${sandboxId}" ` +
+      `(${sshResult.error}); delete it there if you no longer need it.`;
+    return this.settleSandbox(sandboxId, { success: true, deletedPath, notice }, { force });
   }
 
   /**
