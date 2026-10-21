@@ -68,7 +68,9 @@ export function exitCode(report: MutateReport): 0 | 1 | 3 {
 function verdict(report: MutateReport): string {
   const survived = counts(report).survived;
   const parts = report.droppedTests.length > 0 ? ["BASELINE FAILED"] : [];
-  parts.push(survived === 0 && parts.length === 0 ? "PASS" : `${survived} survived`);
+  const notRun = counts(report)["not-run"];
+  if (survived > 0 || parts.length > 0) parts.push(`${survived} survived`);
+  else parts.push(notRun > 0 ? `PASS (${notRun} not run)` : "PASS");
   return parts.join(", ");
 }
 

@@ -148,7 +148,8 @@ def sites_in(root: Path, path: str, spans: list[list[float]]) -> list[Site]:
     language = language_of(path)
     if language is None:
         return []
-    source = (root / path).read_text(encoding="utf-8")
+    # Bytes, not read_text: it would turn CRLF into LF and move mutator's byte offsets.
+    source = (root / path).read_bytes().decode("utf-8")
     functions = functions_in_file(language, source, path, str(root))
     sites = []
     for raw in discover_raw(source, language, path):
@@ -193,8 +194,8 @@ def make_worker(root: Path, tracked: list[str], into: Path) -> Path:
     return into
 
 
-def run_test(worker: Path, test: str, timeout: float | None) -> tuple[bool, float]:
-    """(passed, seconds). A timeout fails. The process group dies with it."""
+def run_test(worker: Path, test: str, timeout: float) -> tuple[bool, float, bool]:
+    """(passed, seconds, timed_out). A timeout fails. The process group dies with it."""
 
     started = time.monotonic()
     # ./ makes bun treat the argument as a path, not a name filter.
@@ -210,18 +211,25 @@ def run_test(worker: Path, test: str, timeout: float | None) -> tuple[bool, floa
     except subprocess.TimeoutExpired:
         os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
-        return False, time.monotonic() - started
-    return code == 0, time.monotonic() - started
+        return False, time.monotonic() - started, True
+    return code == 0, time.monotonic() - started, False
 
 
-def run_mutant(worker: Path, site: Site, tests: list[str], timeouts: dict[str, float]) -> str:
+def run_mutant(worker: Path, site: Site, tests: list[str], timeouts: dict[str, float], deadline: float) -> str:
+    """killed, survived, or not-run when the run's deadline cut it short."""
+
     path = worker / site.path
     original = path.read_bytes()
     # mutator's offsets are UTF-8 byte offsets; apply_site works on bytes.
-    path.write_text(apply_site(original.decode("utf-8"), site.start, site.end, site.mutant), encoding="utf-8")
+    path.write_bytes(apply_site(original.decode("utf-8"), site.start, site.end, site.mutant).encode("utf-8"))
     try:
         for test in tests:
-            passed, _seconds = run_test(worker, test, timeouts[test])
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return "not-run"
+            passed, _seconds, timed_out = run_test(worker, test, min(timeouts[test], left))
+            if timed_out and left < timeouts[test]:
+                return "not-run"  # the deadline, not the test, stopped it
             if not passed:
                 return "killed"
         return "survived"
@@ -284,10 +292,22 @@ def main(argv: list[str]) -> int:
         workers = [make_worker(root, tracked, Path(scratch) / f"w{i}") for i in range(min(args.workers, max(1, len(to_run))))] if to_run else []
         # Baselines: each test file must pass alone, unmutated.
         timeouts: dict[str, float] = {}
+        free: Queue = Queue()
+        for worker in workers:
+            free.put(worker)
+
+        def baseline(test: str) -> tuple[bool, float, bool]:
+            # One process per worker copy at a time, as for mutants.
+            worker = free.get()
+            try:
+                return run_test(worker, test, BASELINE_TIMEOUT)
+            finally:
+                free.put(worker)
+
         if workers:
             with ThreadPoolExecutor(len(workers)) as pool:
-                results = list(pool.map(lambda pair: run_test(workers[pair[0] % len(workers)], pair[1], BASELINE_TIMEOUT), enumerate(needed)))
-            for test, (passed, seconds) in zip(needed, results):
+                results = list(pool.map(baseline, needed))
+            for test, (passed, seconds, _timed_out) in zip(needed, results):
                 if passed:
                     timeouts[test] = max(MIN_TIMEOUT, seconds * TIMEOUT_FACTOR)
                 else:
@@ -297,18 +317,14 @@ def main(argv: list[str]) -> int:
 
         budget = to_run[: args.max_mutants]
         rows += [row(site, "not-run") for site in to_run[args.max_mutants :]]
-        free: Queue = Queue()
-        for worker in workers:
-            free.put(worker)
+        deadline = started + args.max_seconds
 
         def one(site: Site) -> dict:
             if not plan[site.path]:
                 return row(site, "no-test")
-            if time.monotonic() - started > args.max_seconds:
-                return row(site, "not-run")
             worker = free.get()
             try:
-                return row(site, run_mutant(worker, site, plan[site.path], timeouts))
+                return row(site, run_mutant(worker, site, plan[site.path], timeouts, deadline))
             finally:
                 free.put(worker)
 

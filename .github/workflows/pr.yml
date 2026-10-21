@@ -572,7 +572,8 @@ jobs:
     needs: [changes, test-unit]
     if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.tests == 'true' }}
     continue-on-error: true
-    timeout-minutes: 25
+    # Above the step timeouts (34 minutes) so a slow setup still leaves a summary.
+    timeout-minutes: 35
     runs-on: ubuntu-latest
     permissions:
       contents: read

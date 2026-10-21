@@ -92,3 +92,12 @@ def test_lcov_skips_only_sites_on_lines_no_report_hit():
     assert uncovered(site(4), coverage) is False
     assert uncovered(site(4), {}) is True  # a file no report lists did not run
     assert uncovered(site(3), None) is False  # no LCOV: every site runs
+
+
+def test_a_mutant_past_the_deadline_is_not_run_and_the_file_is_restored(tmp_path):
+    write(tmp_path, {"src/m.ts": "export const f = (n: number) => n < 1;\n"})
+    from mutate_report import run_mutant
+
+    s = Site("src/m.ts", "f", 1, 1, 34, 35, "<", "<=")
+    assert run_mutant(tmp_path, s, ["src/m.test.ts"], {"src/m.test.ts": 5.0}, deadline=0.0) == "not-run"
+    assert (tmp_path / "src/m.ts").read_text() == "export const f = (n: number) => n < 1;\n"
