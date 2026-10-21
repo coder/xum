@@ -34,6 +34,9 @@ import {
 } from "./openaiExtension";
 import { normalizeClaudeManifest, type ClaudePluginComponents } from "./claudeManifest";
 import { pluginSkillFileName } from "./claudeCommands";
+import { pluginAgentIdOf } from "./agentFiles";
+import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
+import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 
 /**
  * Agent Plugins 1.0.0 discovery (§4, §6).
@@ -545,8 +548,7 @@ async function classifySkillsRoot(args: {
   // Decide "root" from the declared path, not the canonical one: `alias -> .` is still
   // the folder the author named `alias`.
   const declaredPath = path.resolve(args.rootReal, args.relative);
-  const name =
-    declaredPath === args.rootReal ? args.pluginName : path.basename(declaredPath);
+  const name = declaredPath === args.rootReal ? args.pluginName : path.basename(declaredPath);
   return { dir: args.canonical, single: true, name };
 }
 
@@ -562,10 +564,12 @@ async function listCommandFiles(
   ) => Promise<string | undefined>
 ): Promise<Array<{ dir: string; file: string }>> {
   if (relative.endsWith(".md")) {
-    const canonical = await resolveComponent(relative, "file");
-    return canonical === undefined
-      ? []
-      : [{ dir: path.dirname(canonical), file: path.basename(canonical) }];
+    // The declared file name is the command name, also when the file is a contained symlink
+    // (as for a folder's entries): resolve the file for containment, then read it through
+    // its declared parent folder.
+    if ((await resolveComponent(relative, "file")) === undefined) return [];
+    const dir = await resolveComponent(path.posix.dirname(relative), "directory");
+    return dir === undefined ? [] : [{ dir, file: path.posix.basename(relative) }];
   }
   const dir = await resolveComponent(relative, "directory");
   if (dir === undefined) return [];
@@ -578,13 +582,75 @@ async function listCommandFiles(
     .map((file) => ({ dir, file }));
 }
 
-/** The skill folder names of some skills roots, valid or not. */
-async function listSkillNames(roots: PluginSkillsRoot[]): Promise<Set<string>> {
+/**
+ * The names of the skills that load from some skills roots: a valid folder name and a contained,
+ * regular SKILL.md that parses. An empty or broken skill folder does not hide a command.
+ */
+async function listSkillNames(roots: PluginSkillsRoot[], rootReal: string): Promise<Set<string>> {
   const names = new Set<string>();
   for (const root of roots) {
-    for (const { name } of await listPluginSkillFolders(root)) names.add(name);
+    for (const { name, file } of await listPluginSkillFolders(root)) {
+      if (await isLoadableSkill(name, file, rootReal)) names.add(name);
+    }
   }
   return names;
+}
+
+async function isLoadableSkill(name: string, file: string, rootReal: string): Promise<boolean> {
+  const skillName = SkillNameSchema.safeParse(name);
+  if (!skillName.success) return false;
+  try {
+    const real = await fsPromises.realpath(file);
+    if (!real.startsWith(rootReal + path.sep)) return false;
+    const stat = await fsPromises.stat(real);
+    if (!stat.isFile() || stat.size > MAX_FILE_SIZE) return false;
+    parseSkillMarkdown({
+      content: await fsPromises.readFile(real, "utf8"),
+      byteSize: stat.size,
+      directoryName: skillName.data,
+      allowDisplayName: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Claude's single-skill layout: a plugin with SKILL.md at its root, no skills/ and no `skills`
+ * key loads as one skill (the caller passes "." as the declared skills path).
+ */
+async function isClaudeRootSkill(rootReal: string): Promise<boolean> {
+  if ((await fsPromises.lstat(path.join(rootReal, "skills")).catch(() => null)) !== null) {
+    return false;
+  }
+  const skillFile = await fsPromises.lstat(path.join(rootReal, SKILL_FILENAME)).catch(() => null);
+  return skillFile?.isFile() === true || skillFile?.isSymbolicLink() === true;
+}
+
+/**
+ * Claude `agents` lists single files, but every agent scan site reads the whole folder. So a
+ * folder that holds an agent file the list does not name loads no agents at all (with a
+ * warning naming those files): Xum never loads an agent the manifest left out.
+ */
+async function keepDeclaredAgentsOnly(args: {
+  agentsDir: string | undefined;
+  declaredFiles: string[] | undefined;
+  warn: (message: string) => void;
+}): Promise<string | undefined> {
+  if (args.agentsDir === undefined || args.declaredFiles === undefined) return args.agentsDir;
+  const entries = await fsPromises.readdir(args.agentsDir, { withFileTypes: true }).catch(() => []);
+  const declared = new Set(args.declaredFiles);
+  const undeclared = entries
+    .filter((entry) => entry.isFile() && pluginAgentIdOf(entry.name) !== null)
+    .map((entry) => entry.name)
+    .filter((name) => !declared.has(name))
+    .sort((a, b) => a.localeCompare(b));
+  if (undeclared.length === 0) return args.agentsDir;
+  args.warn(
+    `'agents' does not list ${undeclared.join(", ")} in its folder; Xum reads whole agent folders, so it loads no agents from this plugin`
+  );
+  return undefined;
 }
 
 /**
@@ -600,9 +666,10 @@ async function resolveCommandRoots(args: {
     relativePath: string,
     expectKind: "file" | "directory"
   ) => Promise<string | undefined>;
+  rootReal: string;
   warn: (message: string) => void;
 }): Promise<PluginSkillsRoot[]> {
-  const taken = await listSkillNames(args.skillsDirs);
+  const taken = await listSkillNames(args.skillsDirs, args.rootReal);
   const roots: PluginSkillsRoot[] = [];
   for (const relative of args.declared ?? ["commands"]) {
     for (const { dir, file } of await listCommandFiles(relative, args.resolveComponent)) {
@@ -811,7 +878,9 @@ async function discoverPluginAt(args: {
     });
 
   const skillsDirs = await resolveSkillsRoots({
-    declared: contributes?.skills,
+    declared:
+      contributes?.skills ??
+      (claudeFallback && (await isClaudeRootSkill(rootReal)) ? ["."] : undefined),
     rootReal,
     pluginName: validation.manifest.name,
     resolveComponent,
@@ -822,6 +891,7 @@ async function discoverPluginAt(args: {
         declared: normalized.claude?.commands,
         skillsDirs,
         resolveComponent,
+        rootReal,
         warn: (message) => {
           log.debug(`Agent plugin ${pluginDir}: ${message}`);
           diagnostics.push({ path: rootReal, scope, severity: "warning", message });
@@ -847,9 +917,17 @@ async function discoverPluginAt(args: {
       : await resolveComponent(contributes?.hooks ?? "hooks.js", "file", {
           maxBytes: MAX_PLUGIN_HOOK_SOURCE_BYTES,
         });
-  const agentsDir = codexFallback
+  const resolvedAgentsDir = codexFallback
     ? undefined
     : await resolveComponent(contributes?.agents ?? "agents", "directory");
+  const agentsDir = await keepDeclaredAgentsOnly({
+    agentsDir: resolvedAgentsDir,
+    declaredFiles: claudeFallback ? normalized.claude?.agentFiles : undefined,
+    warn: (message) => {
+      log.debug(`Agent plugin ${pluginDir}: ${message}`);
+      diagnostics.push({ path: rootReal, scope, severity: "warning", message });
+    },
+  });
   const workflowsDir =
     codexFallback || foreign
       ? undefined
