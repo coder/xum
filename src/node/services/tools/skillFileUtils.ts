@@ -91,6 +91,17 @@ export function isPathInsideRoot(rootPath: string, targetPath: string): boolean 
  * stays under `containmentRoot`. Returns the canonical path on success; throws on
  * escape.
  */
+/**
+ * True when two host paths name one directory, resolved through links (~/.xum can be a link to
+ * ~/.mux). A path that cannot be resolved compares as written.
+ */
+export async function isSameHostDirectory(a: string, b: string): Promise<boolean> {
+  const [realA, realB] = await Promise.all(
+    [a, b].map((target) => fsPromises.realpath(target).catch(() => path.resolve(target)))
+  );
+  return realA === realB;
+}
+
 export async function ensurePathContained(
   containmentRoot: string,
   candidatePath: string,

@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
+import os from "node:os";
 
 import {
   isRuntimeReadFailure,
@@ -53,7 +54,11 @@ import {
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { ensureRuntimePathWithinWorkspace } from "@/node/services/tools/runtimeSkillPathUtils";
-import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import {
+  ensurePathContained,
+  hasErrorCode,
+  isSameHostDirectory,
+} from "@/node/services/tools/skillFileUtils";
 import { AgentSkillParseError, parseSkillMarkdown } from "./parseSkillMarkdown";
 import { getBuiltInSkillByName, getBuiltInSkillDescriptors } from "./builtInSkillDefinitions";
 import type { ProjectSkillContainment } from "./skillStorageContext";
@@ -75,6 +80,7 @@ import {
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import {
   getCanonicalProjectMetadataRelativePath,
+  LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR,
   listProjectMetadataRelativePaths,
 } from "@/common/compat/legacyMux";
 
@@ -101,6 +107,11 @@ export interface AgentSkillsRoots {
   projectSearchRoot?: string;
   globalRoot: string;
   universalRoot?: string;
+  /**
+   * ~/.mux/skills, where the skills CLI writes for `--agent mux` (read-only). Discovery skips it
+   * when it is the Xum home's own skills dir (globalRoot).
+   */
+  legacyMuxGlobalRoot?: string;
   /** ~/.claude/skills (claude-skills-compat experiment; read-only). */
   globalClaudeRoot?: string;
   /** Agent Plugins container dirs, e.g. <projectRoot>/.xum/plugins (read-only). */
@@ -195,6 +206,7 @@ export function getDefaultAgentSkillsRoots(
     }),
     globalRoot: `${runtime.getXumHome()}/skills`,
     universalRoot: UNIVERSAL_SKILLS_ROOT,
+    legacyMuxGlobalRoot: getLegacyMuxGlobalSkillsRoot(runtime, workspacePath),
     // Claude roots are added only when the experiment is enabled so the default
     // (off) behavior stays byte-identical to the pre-experiment scan order.
     ...(options?.includeClaudeSkills ? { globalClaudeRoot: CLAUDE_SKILLS_ROOT } : {}),
@@ -226,11 +238,58 @@ export function getProjectSkillRoots(roots: AgentSkillsRoots): string[] {
   return Array.from(new Set(roots.projectRoots ?? [roots.projectRoot]));
 }
 
-function getGlobalSkillRoots(roots: AgentSkillsRoots): string[] {
-  // Precedence within global scope: ~/.xum > ~/.agents > ~/.claude.
-  const orderedRoots = [roots.globalRoot, roots.universalRoot, roots.globalClaudeRoot].filter(
-    (root): root is string => root != null && root.length > 0
-  );
+/**
+ * ~/.mux/skills as the global runtime reads it, like universalRoot: on the Xum host (local, SSH)
+ * or in the runtime's own home (Docker). The host needs the absolute path because expandTilde
+ * maps a `~/.mux` path to the Xum home.
+ */
+export function getLegacyMuxGlobalSkillsRoot(runtime: Runtime, workspacePath: string): string {
+  return resolveGlobalRuntime(runtime, workspacePath) instanceof RemoteRuntime
+    ? `~/${LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR}`
+    : path.join(os.homedir(), LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR);
+}
+
+/** True when ~/.mux/skills is the Xum home's own skills dir (the home is ~/.mux, or links to it). */
+async function isLegacyMuxRootTheGlobalRoot(
+  globalRuntime: Runtime,
+  globalRoot: string,
+  legacyMuxRoot: string
+): Promise<boolean> {
+  try {
+    const [resolvedGlobal, resolvedLegacy] = await Promise.all(
+      [globalRoot, legacyMuxRoot].map((root) => globalRuntime.resolvePath(root))
+    );
+    if (resolvedGlobal === resolvedLegacy) return true;
+    return (
+      !(globalRuntime instanceof RemoteRuntime) &&
+      (await isSameHostDirectory(resolvedGlobal, resolvedLegacy))
+    );
+  } catch {
+    // Unresolvable: keep the root, so its scan reports why it is unavailable.
+    return false;
+  }
+}
+
+async function getGlobalSkillRoots(
+  roots: AgentSkillsRoots,
+  globalRuntime: Runtime
+): Promise<string[]> {
+  const legacyMuxRoot =
+    roots.legacyMuxGlobalRoot != null &&
+    !(await isLegacyMuxRootTheGlobalRoot(
+      globalRuntime,
+      roots.globalRoot,
+      roots.legacyMuxGlobalRoot
+    ))
+      ? roots.legacyMuxGlobalRoot
+      : undefined;
+  // Precedence within global scope: ~/.xum > ~/.agents > ~/.mux (skills CLI) > ~/.claude.
+  const orderedRoots = [
+    roots.globalRoot,
+    roots.universalRoot,
+    legacyMuxRoot,
+    roots.globalClaudeRoot,
+  ].filter((root): root is string => root != null && root.length > 0);
 
   return Array.from(new Set(orderedRoots));
 }
@@ -379,7 +438,7 @@ async function buildScanCandidates(
   return [
     ...getProjectSkillRoots(roots).map((root) => ({ scope: "project" as const, root, runtime })),
     ...projectPluginCandidates,
-    ...getGlobalSkillRoots(roots).map((root) => ({
+    ...(await getGlobalSkillRoots(roots, globalRuntime)).map((root) => ({
       scope: "global" as const,
       root,
       runtime: globalRuntime,

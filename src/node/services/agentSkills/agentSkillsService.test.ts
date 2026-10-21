@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
 import * as fs from "node:fs/promises";
+import os from "node:os";
 import * as path from "node:path";
 
 import { describe, expect, spyOn, test } from "bun:test";
@@ -883,6 +884,71 @@ describe("agentSkillsService", () => {
       scope: "global",
       description: "from claude global",
     });
+  });
+
+  test("scans ~/.mux/skills after ~/.agents/skills and before ~/.claude/skills", async () => {
+    using project = new DisposableTempDir("agent-skills-legacy-mux-project");
+    using global = new DisposableTempDir("agent-skills-legacy-mux-global");
+    using universal = new DisposableTempDir("agent-skills-legacy-mux-universal");
+    using legacyMux = new DisposableTempDir("agent-skills-legacy-mux");
+    using claude = new DisposableTempDir("agent-skills-legacy-mux-claude");
+
+    await writeSkill(universal.path, "over-legacy", "from universal");
+    await writeSkill(legacyMux.path, "over-legacy", "from legacy mux");
+    await writeSkill(legacyMux.path, "over-claude", "from legacy mux");
+    await writeSkill(claude.path, "over-claude", "from claude");
+    const roots = {
+      projectRoot: path.join(project.path, ".xum", "skills"),
+      globalRoot: global.path,
+      universalRoot: universal.path,
+      legacyMuxGlobalRoot: legacyMux.path,
+      globalClaudeRoot: claude.path,
+    };
+    const runtime = new LocalRuntime(project.path);
+
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
+
+    const description = (name: string) => skills.find((s) => s.name === name)?.description;
+    expect(description("over-legacy")).toBe("from universal");
+    expect(description("over-claude")).toBe("from legacy mux");
+    const read = await readAgentSkill(runtime, project.path, SkillNameSchema.parse("over-claude"), {
+      roots,
+    });
+    expect(read.package.frontmatter.description).toBe("from legacy mux");
+  });
+
+  test("skips ~/.mux/skills when it is the Xum home's skills dir", async () => {
+    using project = new DisposableTempDir("agent-skills-legacy-mux-same-project");
+    using home = new DisposableTempDir("agent-skills-legacy-mux-same-home");
+    const globalRoot = path.join(home.path, ".mux", "skills");
+    await writeSkill(globalRoot, "only-once", "from the Xum home");
+    // ~/.xum links to ~/.mux: two spellings of one directory.
+    await fs.symlink(path.join(home.path, ".mux"), path.join(home.path, ".xum"));
+    const runtime = new LocalRuntime(project.path);
+
+    for (const legacyMuxGlobalRoot of [globalRoot, path.join(home.path, ".xum", "skills")]) {
+      const { skills } = await discoverAgentSkills(runtime, project.path, {
+        roots: { projectRoot: "", globalRoot, universalRoot: "", legacyMuxGlobalRoot },
+        dedupeByName: false,
+      });
+      expect(skills.filter((skill) => skill.name === "only-once")).toHaveLength(1);
+    }
+  });
+
+  test("~/.mux/skills is read where universalRoot is read: the host, or a Docker home", () => {
+    const workspacePath = "/remote/workspace";
+    // SSH keeps ~/.mux as its home and reads global skills on the Xum host.
+    const sshRoots = getDefaultAgentSkillsRoots(
+      new RemotePathMappedRuntime("/tmp", "/remote"),
+      workspacePath
+    );
+    expect(sshRoots.legacyMuxGlobalRoot).toBe(path.join(os.homedir(), ".mux", "skills"));
+    // Docker reads global skills in the container, so its own ~/.mux.
+    const dockerRoots = getDefaultAgentSkillsRoots(
+      new RemotePathMappedRuntime("/tmp", "/remote", { xumHome: "/var/mux" }),
+      workspacePath
+    );
+    expect(dockerRoots.legacyMuxGlobalRoot).toBe("~/.mux/skills");
   });
 
   test("readAgentSkill resolves project before global", async () => {

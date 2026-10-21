@@ -3,7 +3,10 @@ import os from "node:os";
 import * as path from "path";
 import { tool } from "ai";
 
-import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
+import {
+  LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR,
+  listProjectMetadataRelativePaths,
+} from "@/common/compat/legacyMux";
 import {
   AgentSkillDescriptorSchema,
   SkillNameSchema,
@@ -34,7 +37,7 @@ import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdo
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
-import { ensurePathContained, hasErrorCode } from "./skillFileUtils";
+import { ensurePathContained, hasErrorCode, isSameHostDirectory } from "./skillFileUtils";
 
 interface AgentSkillListToolArgs {
   includeUnadvertised?: boolean | null;
@@ -55,6 +58,47 @@ async function listSkillDirectories(skillsRoot: string): Promise<string[]> {
     );
     return [];
   }
+}
+
+interface ListedSkillsRoot {
+  skillsRoot: string;
+  containmentRoot: string;
+  scope: "global" | "project";
+  importedSkills?: readonly string[];
+  skillConsent?: PluginSkillConsentGate;
+  /** Plugin roots only: the root is this one skill (PluginSkillsRoot `single`). */
+  singleSkillName?: string;
+}
+
+/**
+ * Host global skills roots in precedence order: ~/.xum > ~/.agents > ~/.mux > ~/.claude, the same
+ * order as getDefaultAgentSkillsRoots. All but the Xum home's are read-only.
+ */
+async function getHostGlobalSkillsRoots(
+  xumHome: string,
+  userHome: string,
+  includeClaudeSkills: boolean
+): Promise<ListedSkillsRoot[]> {
+  const xumSkillsRoot = path.join(xumHome, "skills");
+  // The skills CLI writes ~/.mux/skills for `--agent mux`; skip it when it is the Xum home's.
+  const legacyMuxSkillsRoot = path.join(userHome, LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR);
+  const userHomeRoots = [
+    path.join(userHome, ".agents", "skills"),
+    ...((await isSameHostDirectory(xumSkillsRoot, legacyMuxSkillsRoot))
+      ? []
+      : [legacyMuxSkillsRoot]),
+    // claude-skills-compat: lowest-precedence global root.
+    ...(includeClaudeSkills ? [path.join(userHome, ".claude", "skills")] : []),
+  ];
+  return [
+    { skillsRoot: xumSkillsRoot, containmentRoot: xumHome, scope: "global" },
+    // Contained at the user home, like ~/.agents/skills.
+    ...userHomeRoots.map((skillsRoot) => ({
+      skillsRoot,
+      containmentRoot: userHome,
+      scope: "global" as const,
+    })),
+  ];
 }
 
 /** The skill folders of a skills root: the root itself for a single-skill plugin root. */
@@ -266,35 +310,11 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
         const userHome = os.homedir();
 
         // Always list global skills; also list project skills when in a project workspace.
-        const roots: Array<{
-          skillsRoot: string;
-          containmentRoot: string;
-          scope: "global" | "project";
-          importedSkills?: readonly string[];
-          skillConsent?: PluginSkillConsentGate;
-          /** Plugin roots only: the root is this one skill (PluginSkillsRoot `single`). */
-          singleSkillName?: string;
-        }> = [
-          {
-            skillsRoot: path.join(xumScope.xumHome, "skills"),
-            containmentRoot: xumScope.xumHome,
-            scope: "global",
-          },
-          {
-            skillsRoot: path.join(userHome, ".agents", "skills"),
-            containmentRoot: userHome,
-            scope: "global",
-          },
-        ];
-        if (includeClaudeSkills) {
-          // claude-skills-compat: lowest-precedence global root, contained at the user home
-          // exactly like ~/.agents/skills.
-          roots.push({
-            skillsRoot: path.join(userHome, ".claude", "skills"),
-            containmentRoot: userHome,
-            scope: "global",
-          });
-        }
+        const roots: ListedSkillsRoot[] = await getHostGlobalSkillsRoots(
+          xumScope.xumHome,
+          userHome,
+          includeClaudeSkills
+        );
         if (xumScope.type === "project") {
           if (skillCtx.roots == null) {
             throw new Error("Project-local skill context requires explicit roots");

@@ -327,6 +327,59 @@ describe("agent_skill_list", () => {
     });
   });
 
+  it("lists ~/.mux/skills after ~/.agents/skills, and not again when it is the Xum home's", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-legacy-mux-home");
+    using project = new TestTempDir("test-agent-skill-list-legacy-mux-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-legacy-mux-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await writeSkill(path.join(homeDir.path, ".agents", "skills"), "shared", {
+        description: "from agents",
+      });
+      for (const name of ["shared", "cli-only"]) {
+        await writeSkill(path.join(homeDir.path, ".mux", "skills"), name, {
+          description: "from legacy mux",
+        });
+      }
+      // The skills CLI links a skill to its store copy elsewhere in the user home.
+      await writeSkill(path.join(homeDir.path, "store"), "linked", { description: "from store" });
+      await fs.symlink(
+        path.join(homeDir.path, "store", "linked"),
+        path.join(homeDir.path, ".mux", "skills", "linked")
+      );
+      const list = async (xumHome: string) => {
+        const tool = createAgentSkillListTool(
+          createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          })
+        );
+        const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+        if (!result.success) throw new Error(result.error);
+        return result.skills.map((skill) => [skill.name, skill.description]);
+      };
+
+      // A read-only root contained at the user home, like ~/.agents/skills.
+      expect(await list(xumHomeDir.path)).toEqual([
+        ["cli-only", "from legacy mux"],
+        ["linked", "from store"],
+        ["shared", "from agents"],
+      ]);
+      // With ~/.mux as the Xum home, it is only the Xum home's root: a link out of the Xum home
+      // stays refused instead of listing through the wider user-home containment.
+      await withMuxRoot(path.join(homeDir.path, ".mux"), async () => {
+        expect(await list(path.join(homeDir.path, ".mux"))).toEqual([
+          ["cli-only", "from legacy mux"],
+          ["shared", "from legacy mux"],
+        ]);
+      });
+    });
+  });
+
   it("lists Agent Plugins skills", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-plugins-on-home");
     using project = new TestTempDir("test-agent-skill-list-plugins-on-project");

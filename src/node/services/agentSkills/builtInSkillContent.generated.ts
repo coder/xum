@@ -2358,6 +2358,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- **Project (cross-tool)**: `.agents/skills/<skill-name>/SKILL.md`",
       "- **Global (Xum-specific)**: `~/.xum/skills/<skill-name>/SKILL.md`",
       "- **Universal (cross-tool)**: `~/.agents/skills/<skill-name>/SKILL.md`",
+      "- **Skills CLI (`npx skills add -g --agent mux`)**: `~/.mux/skills/<skill-name>/SKILL.md`, read-only, after `~/.agents/skills`",
       "- **Built-in**: shipped with Xum",
       "",
       "For a workspace that executes in a subproject, Xum checks the working directory and each parent directory through the checkout root. It never searches above the checkout. A nearer project definition wins over a farther one; within the same directory, `.xum/skills` wins over `.agents/skills`.",

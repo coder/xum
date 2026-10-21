@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import os from "node:os";
 import * as path from "node:path";
 
 import { describe, expect, it } from "bun:test";
@@ -9,6 +10,9 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 
 import { resolveSkillStorageContext } from "./skillStorageContext";
+
+// Host-local contexts read the real ~/.mux/skills (the skills CLI's `--agent mux` dir).
+const HOST_LEGACY_MUX_SKILLS_ROOT = path.join(os.homedir(), ".mux", "skills");
 
 describe("resolveSkillStorageContext", () => {
   it("returns explicit global-only roots when mux scope is global", () => {
@@ -30,6 +34,7 @@ describe("resolveSkillStorageContext", () => {
       projectRoot: "",
       globalRoot: path.join(tempDir.path, "skills"),
       universalRoot: "~/.agents/skills",
+      legacyMuxGlobalRoot: HOST_LEGACY_MUX_SKILLS_ROOT,
       globalPluginRoots: [path.join(tempDir.path, "plugins"), "~/.agents/plugins"],
     });
   });
@@ -55,6 +60,7 @@ describe("resolveSkillStorageContext", () => {
       projectRoot: "",
       globalRoot: path.join(runtimeMuxHome, "skills"),
       universalRoot: "~/.agents/skills",
+      legacyMuxGlobalRoot: HOST_LEGACY_MUX_SKILLS_ROOT,
       globalPluginRoots: [path.join(runtimeMuxHome, "plugins"), "~/.agents/plugins"],
     });
   });
@@ -92,6 +98,7 @@ describe("resolveSkillStorageContext", () => {
       ],
       globalRoot: path.join(tempDir.path, "skills"),
       universalRoot: "~/.agents/skills",
+      legacyMuxGlobalRoot: HOST_LEGACY_MUX_SKILLS_ROOT,
       projectPluginRoots: [
         path.join(projectRoot, ".xum", "plugins"),
         path.join(projectRoot, ".mux", "plugins"),
@@ -131,6 +138,7 @@ describe("resolveSkillStorageContext", () => {
       ],
       globalRoot: path.join(tempDir.path, "skills"),
       universalRoot: "~/.agents/skills",
+      legacyMuxGlobalRoot: HOST_LEGACY_MUX_SKILLS_ROOT,
       globalClaudeRoot: "~/.claude/skills",
       projectPluginRoots: [
         path.join(projectRoot, ".xum", "plugins"),
@@ -154,6 +162,7 @@ describe("resolveSkillStorageContext", () => {
       projectRoot: "",
       globalRoot: path.join(tempDir.path, "skills"),
       universalRoot: "~/.agents/skills",
+      legacyMuxGlobalRoot: HOST_LEGACY_MUX_SKILLS_ROOT,
       globalClaudeRoot: "~/.claude/skills",
       globalPluginRoots: [path.join(tempDir.path, "plugins"), "~/.agents/plugins"],
     });
@@ -241,6 +250,7 @@ describe("resolveSkillStorageContext", () => {
       ],
       globalRoot: path.join(xumHome, "skills"),
       universalRoot: "~/.agents/skills",
+      legacyMuxGlobalRoot: HOST_LEGACY_MUX_SKILLS_ROOT,
       projectPluginRoots: [
         path.join(projectRoot, ".xum", "plugins"),
         path.join(projectRoot, ".mux", "plugins"),
