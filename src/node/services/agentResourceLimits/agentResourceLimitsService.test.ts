@@ -347,6 +347,36 @@ describe("AgentResourceLimitsService", () => {
       expect(agentCgroupEnrollmentLineForProject(PHAROS)).toBe("");
     });
 
+    it("refuses a limit for a sub-project, whose commands share the limits of its parent", async () => {
+      const subProject = path.join(PHAROS, "packages", "web");
+      await addProject(PHAROS);
+      await config.editConfig((current) => {
+        current.projects.set(subProject, { workspaces: [], parentProjectPath: PHAROS });
+        return current;
+      });
+      service = new AgentResourceLimitsService(config, tree.host);
+      await service.start();
+
+      let error: unknown;
+      try {
+        await service.setProject(subProject, { cpuCores: 1 });
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(String(error)).toContain("shares the resource limits of its parent project");
+      // A limit saved for it by hand gets no cgroup: no command would ever join it.
+      await config.editConfig((current) => {
+        current.projects.set(subProject, {
+          workspaces: [],
+          parentProjectPath: PHAROS,
+          agentResourceLimits: { cpuCores: 1 },
+        });
+        return current;
+      });
+      expect((await service.get()).projects).toEqual({});
+    });
+
     it("refuses a limit for a project that is not in the config", async () => {
       service = new AgentResourceLimitsService(config, tree.host);
       await service.start();

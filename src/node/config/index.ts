@@ -3875,6 +3875,13 @@ export class Config {
       if (!project) {
         throw new Error(`Project not found: ${projectPath}`);
       }
+      // Sub-project workspaces belong to the parent's checkout, and their commands join the
+      // parent's cgroup, so a limit of its own would never apply. Clearing one is still allowed.
+      if (project.parentProjectPath && normalizeAgentResourceLimits(limits)) {
+        throw new Error(
+          `Sub-project ${projectPath} shares the resource limits of its parent project ${project.parentProjectPath}.`
+        );
+      }
       setProjectAgentResourceLimits(project, limits);
       return config;
     });

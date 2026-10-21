@@ -109,7 +109,9 @@ export class AgentResourceLimitsService {
     const config = this.config.loadConfigOrDefault();
     const projects = new Map<string, AgentResourceLimits>();
     for (const [projectPath, project] of config.projects) {
-      if (project.agentResourceLimits !== undefined) {
+      // A sub-project's commands join its parent's cgroup, so a limit saved for it by hand
+      // would get a cgroup that no command joins.
+      if (project.agentResourceLimits !== undefined && !project.parentProjectPath) {
         projects.set(projectPath, project.agentResourceLimits);
       }
     }

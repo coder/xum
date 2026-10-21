@@ -22,7 +22,7 @@ import type {
   AgentResourceLimitsSupport,
 } from "@/common/orpc/schemas/agentResourceLimits";
 import { getErrorMessage } from "@/common/utils/errors";
-import { getProjectDisplayName } from "@/common/utils/subProjects";
+import { getProjectDisplayName, getTopLevelProjectEntries } from "@/common/utils/subProjects";
 
 type LimitField = keyof AgentResourceLimits;
 
@@ -424,7 +424,8 @@ function changedLimits(
 /** The projects to pick from, and the picked one; null for the limit of all projects. */
 function useScopedProject(view: LimitsView | null, setScope: (scope: LimitsScope) => void) {
   const { userProjects } = useProjectContext();
-  const projects = Array.from(userProjects, ([path, config]) => ({
+  // A sub-project's agents run in its parent's checkout and share the parent's limits.
+  const projects = getTopLevelProjectEntries(userProjects).map(([path, config]) => ({
     path,
     name: getProjectDisplayName(path, config),
   }));

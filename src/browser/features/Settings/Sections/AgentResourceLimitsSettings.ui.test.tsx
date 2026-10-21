@@ -124,7 +124,7 @@ function renderSettings(initial: AgentResourceLimitsState) {
 }
 
 const PHAROS = "/home/user/src/pharos";
-let userProjects = new Map<string, { workspaces: [] }>();
+let userProjects = new Map<string, { workspaces: []; parentProjectPath?: string }>();
 let restoreDom: (() => void) | undefined;
 let projectContextSpy: { mockRestore: () => void } | undefined;
 beforeEach(() => {
@@ -230,6 +230,24 @@ describe("AgentResourceLimitsSettings for one project", () => {
     fireEvent.blur(view.cpu());
     expect(view.set.mock.calls).toEqual([]);
     expect(view.setProject.mock.calls).toEqual([]);
+  });
+
+  test("offers no sub-project, since its agents share the limits of its parent", async () => {
+    userProjects = new Map([
+      [PHAROS, { workspaces: [] }],
+      [`${PHAROS}/packages/web`, { workspaces: [], parentProjectPath: PHAROS }],
+    ]);
+    const view = renderSettings({
+      enabled: true,
+      limits: {},
+      projects: {},
+      status: ACTIVE,
+      support: READY,
+    });
+
+    const picker = await view.findByRole("combobox", { name: "Project picker" });
+    const options = Array.from(picker.querySelectorAll("option"), (option) => option.textContent);
+    expect(options).toEqual(["All projects", "pharos"]);
   });
 
   test("tells that a project limit above the shared limit does not raise it", async () => {
