@@ -141,15 +141,30 @@ function modelLabel(model: string): string {
  * The job's spend from `<job>.spend.json` (launch.ts): the proxy ledger, at list price. e2e's
  * own spend line shows no cost for these jobs (their reports carry no estimatedCostUsd).
  */
+/**
+ * Untrusted text as one inline code span: GitHub renders no link, mention or markup inside it.
+ * The fence is one backtick longer than the longest run in the text, so the text cannot close it.
+ */
+function codeSpan(text: string): string {
+  const flat = text.replace(/[\r\n]+/g, " ");
+  const longest = Math.max(0, ...(flat.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = "`".repeat(longest + 1);
+  const pad = flat.startsWith("`") || flat.endsWith("`") ? " " : "";
+  return `${fence}${pad}${flat}${pad}${fence}`;
+}
+
 function spendLine(folder: string): string {
   const read = readJson(`${folder}.spend.json`);
   const spend = "value" in read ? obj(read.value) : undefined;
+  // spend.json comes back from the sandbox, so a PR run controls its text: only numbers and
+  // code spans reach the comment (Phase 4 advisor review of #7140).
   if (spend == null)
-    return `Spend: no record (spend.json ${"problem" in read ? read.problem : "is not an object"})`;
+    return `Spend: no record (spend.json ${"problem" in read ? codeSpan(read.problem) : "is not an object"})`;
   const usd = (v: unknown) => `$${(num(v) ?? 0).toFixed(2)}`;
   let line = `Spend: ${usd(spend.spentUsd)} of the ${usd(spend.capUsd)} cap (proxy ledger)`;
   const refused = num(spend.refused) ?? 0;
-  if (refused > 0) line += `, ${refused} calls refused ${JSON.stringify(spend.refusedBy ?? {})}`;
+  if (refused > 0)
+    line += `, ${refused} calls refused ${codeSpan(JSON.stringify(spend.refusedBy ?? {}))}`;
   return line;
 }
 

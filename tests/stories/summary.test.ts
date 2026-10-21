@@ -46,11 +46,32 @@ test("a section per job in run order, each with its spend under the headline", (
   // Each spend line is in its job's head, the part a passing job folds to in the PR comment.
   const [stories, electron] = jobSections(root);
   expect(stories.head.split("\n").at(-1)).toBe(
-    'Spend: $0.27 of the $3.00 cap (proxy ledger), 2 calls refused {"budget":2}'
+    'Spend: $0.27 of the $3.00 cap (proxy ledger), 2 calls refused `{"budget":2}`'
   );
-  expect(electron.head.split("\n").at(-1)).toBe("Spend: no record (spend.json missing)");
+  expect(electron.head.split("\n").at(-1)).toBe("Spend: no record (spend.json `missing`)");
   expect(stories.rest).toContain("ASSERTION_FAILED");
   expect(page).not.toContain("preflight");
+});
+
+test("text from spend.json reaches the page only inside a code span", () => {
+  const web = "tests/stories/.e2e/stories-20261019T100000Z-1";
+  write(`${web}/report.json`, fixture("green"));
+  // A PR run controls spend.json: a crafted refusal key must not become a link or a mention.
+  write(`${web}.spend.json`, {
+    spentUsd: 0.1,
+    capUsd: 1,
+    refused: 1,
+    refusedBy: { "[x](https://example.com) @someone ``tick": 1 },
+  });
+  const line = jobSections(root)[0].head.split("\n").at(-1) ?? "";
+  const span = line.slice(line.indexOf("refused ") + "refused ".length);
+  expect(span.startsWith("```")).toBe(true);
+  expect(span.endsWith("```")).toBe(true);
+  expect(span.slice(3, -3)).toContain("[x](https://example.com) @someone ``tick");
+  // A cut-off spend.json: the parse error text is quoted the same way.
+  write(`${web}.spend.json`, '{"spentUsd": [x](https://example.com)');
+  const broken = jobSections(root)[0].head.split("\n").at(-1) ?? "";
+  expect(broken).toMatch(/^Spend: no record \(spend\.json `+[^`].*`+\)$/);
 });
 
 test("a missing, cut-off or foreign report gets a red headline that says so", () => {
