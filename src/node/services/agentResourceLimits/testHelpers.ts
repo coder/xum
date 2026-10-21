@@ -7,6 +7,8 @@ interface FakeCgroup {
   controllers?: string;
   subtreeControl?: string;
   procs?: string[];
+  /** The `cgroup.type`. Without it the file is missing, which the code reads as a domain. */
+  type?: string;
 }
 
 export interface FakeCgroupTree {
@@ -28,10 +30,17 @@ function errnoError(code: string): NodeJS.ErrnoException {
   return error;
 }
 
+/** Controllers that the kernel lets a cgroup enable while it holds processes (threaded ones). */
+const THREADED_CONTROLLERS = new Set(["cpu", "cpuset", "perf_event", "pids"]);
+
 /**
  * A cgroup v2 tree in a temp directory whose host writes follow the kernel rules the agent cgroup
- * code depends on: enabling a controller fails with EBUSY while the cgroup holds processes, and
- * writing a PID to `cgroup.procs` moves that process out of every other cgroup.
+ * code depends on (cgroup_vet_subtree_control_enable and cgroup_migrate_vet_dst):
+ * - Enabling a domain controller such as memory fails with EBUSY while the cgroup holds processes.
+ * - Enabling only threaded controllers such as cpu succeeds there, and the cgroup becomes a thread
+ *   root: enabling a domain controller then fails with EOPNOTSUPP, and its children are
+ *   "domain invalid", so moving a process into one fails with EOPNOTSUPP.
+ * - Writing a PID to `cgroup.procs` moves that process out of every other cgroup.
  */
 export async function createFakeCgroupTree(options: {
   own: string;
@@ -61,6 +70,9 @@ export async function createFakeCgroupTree(options: {
       path.join(dirOf(cgroup), "cgroup.procs"),
       (spec.procs ?? []).map((pid) => `${pid}\n`).join("")
     );
+    if (spec.type !== undefined) {
+      await fs.writeFile(path.join(dirOf(cgroup), "cgroup.type"), `${spec.type}\n`);
+    }
   };
   for (const [cgroup, spec] of Object.entries(options.cgroups)) {
     await createCgroup(cgroup, spec);
@@ -107,6 +119,12 @@ export async function createFakeCgroupTree(options: {
     }
     return options.own;
   };
+  /** A cgroup that holds processes and enables a threaded controller for its children. */
+  const isThreadRoot = async (dir: string) =>
+    (await readWords(path.join(dir, "cgroup.procs"))).length > 0 &&
+    (await readWords(path.join(dir, "cgroup.subtree_control"))).some((controller) =>
+      THREADED_CONTROLLERS.has(controller)
+    );
   const writes: FakeCgroupTree["writes"] = [];
   const sudoCalls: string[] = [];
   const host: AgentCgroupHost = {
@@ -121,26 +139,44 @@ export async function createFakeCgroupTree(options: {
       }
       const name = path.basename(file);
       if (name === "cgroup.subtree_control") {
-        if ((await readWords(path.join(path.dirname(file), "cgroup.procs"))).length > 0) {
+        const words = value.split(/\s+/).filter(Boolean);
+        const enablesDomain = words.some(
+          (word) => word.startsWith("+") && !THREADED_CONTROLLERS.has(word.slice(1))
+        );
+        const dir = path.dirname(file);
+        if (enablesDomain && (await isThreadRoot(dir))) {
+          throw errnoError("EOPNOTSUPP");
+        }
+        if (enablesDomain && (await readWords(path.join(dir, "cgroup.procs"))).length > 0) {
           throw errnoError("EBUSY");
         }
         const enabled = new Set(await readWords(file));
-        for (const word of value.split(/\s+/).filter(Boolean)) {
+        for (const word of words) {
           if (word.startsWith("+")) enabled.add(word.slice(1));
           else if (word.startsWith("-")) enabled.delete(word.slice(1));
         }
         await fs.writeFile(file, `${[...enabled].join(" ")}\n`);
       } else if (name === "cgroup.procs") {
+        if (await isThreadRoot(path.dirname(path.dirname(file)))) {
+          throw errnoError("EOPNOTSUPP");
+        }
         await movePid(file, value.trim());
       } else {
         await fs.writeFile(file, value);
       }
       writes.push({ file: path.relative(root, file), value });
     },
-    probeEnrollment: (procsFile) =>
-      Promise.resolve(
-        options.probe?.(procsFile) ?? `0::/${path.relative(root, path.dirname(procsFile))}\n`
-      ),
+    probeEnrollment: async (procsFile) => {
+      const custom = options.probe?.(procsFile);
+      if (custom !== undefined) {
+        return custom;
+      }
+      // The test shell starts in xum's cgroup and stays there when the kernel refuses the move.
+      if (await isThreadRoot(path.dirname(path.dirname(procsFile)))) {
+        return `0::${await ownCgroup()}\n`;
+      }
+      return `0::/${path.relative(root, path.dirname(procsFile))}\n`;
+    },
     isSystemdBooted: () => Promise.resolve(options.systemdBooted ?? false),
     // What the sudo step does as root: give the cgroup to the user, which makes it writable.
     delegateWithSudo: async (cgroupDir) => {

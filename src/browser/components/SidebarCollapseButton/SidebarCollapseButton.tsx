@@ -1,4 +1,4 @@
-import { PanelLeft, SquarePen } from "lucide-react";
+import { PanelLeft, PanelRight, SquarePen } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
@@ -98,20 +98,146 @@ export function LeftSidebarToggleBar(props: LeftSidebarToggleBarProps) {
 }
 
 /**
- * An invisible, inert copy of {@link LeftSidebarToggleBar} for the header the bar covers (the
+ * An inert copy of {@link LeftSidebarToggleBar}, hidden, for the header the bar covers (the
  * sidebar's TitleBar while expanded, the page header while collapsed), so header content starts
  * after the bar. Real buttons, so the coarse-pointer 44px minimum widens them like the bar's.
  */
 export function LeftSidebarToggleBarSpacer(props: { showNewChat: boolean }) {
+  // Electron drags the window where the last app-region rect in DOM order under the pointer is
+  // drag, and the hosting header's drag box comes after the fixed bar, so it covers the bar's
+  // no-drag buttons. The copy's no-drag button slots, later still, punch the holes back. An
+  // `invisible` box reports no region, so desktop hides the copy with opacity instead.
+  const isDesktop = isDesktopMode();
+  const slotClass = isDesktop && "titlebar-no-drag";
   return (
-    <div aria-hidden className={cn(BAR_LAYOUT_CLASS, "invisible")}>
-      <Button variant="ghost" size="icon" tabIndex={-1} className={TOGGLE_BUTTON_CLASS} />
+    <div
+      aria-hidden
+      className={cn(BAR_LAYOUT_CLASS, isDesktop ? "pointer-events-none opacity-0" : "invisible")}
+    >
+      <Button
+        variant="ghost"
+        size="icon"
+        tabIndex={-1}
+        className={cn(TOGGLE_BUTTON_CLASS, slotClass)}
+      />
       {props.showNewChat && (
         <>
-          <Button variant="ghost" size="icon" tabIndex={-1} className={ICON_BUTTON_CLASS} />
+          <Button
+            variant="ghost"
+            size="icon"
+            tabIndex={-1}
+            className={cn(ICON_BUTTON_CLASS, slotClass)}
+          />
           <div className={DIVIDER_CLASS} />
         </>
       )}
+    </div>
+  );
+}
+
+// Shared by the right toggle bar and its title bar hole. `right-sidebar-toggle` (globals.css)
+// shows them only where the docked right sidebar can show; the inset matches the header's
+// collapsed padding and the tab strip's, so the spacers under the bar line up with it.
+const RIGHT_BAR_LAYOUT_CLASS =
+  "right-sidebar-toggle titlebar-safe-right titlebar-safe-right-gutter-2 items-center";
+
+interface RightSidebarToggleProps {
+  collapsed: boolean;
+  onToggle: () => void;
+}
+
+/**
+ * The right sidebar's toggle, like {@link LeftSidebarToggleBar}: WorkspaceShell mounts it once at
+ * the shell's top-right corner, outside the sidebar, so it keeps its size, place and focus in both
+ * states while the sidebar's width animates. The header under it reserves its width with
+ * {@link RightSidebarToggleSpacer} while the sidebar is collapsed, and the sidebar's top-right tab
+ * strip does while it is expanded.
+ *
+ * pb-px: the header and the strip draw a 1px bottom border inside their height, so their content
+ * centers 0.5px higher than the bar's full height would.
+ * z-20: above the overview card (z-10) and the sliding panel, below immersive review (z-50).
+ * pointer-events-none: the bar's box spans the full title bar inset, but the strip caps its own
+ * (`titlebar-safe-right-capped`), so where the inset passes that cap (a narrow split pane) the
+ * box covers the strip's controls; only the button takes clicks. Electron's drag regions ignore
+ * pointer-events.
+ */
+export function RightSidebarToggle(props: RightSidebarToggleProps) {
+  const isDesktop = isDesktopMode();
+  const label = props.collapsed ? "Expand right sidebar" : "Collapse right sidebar";
+  return (
+    <div
+      data-testid="right-sidebar-toggle-bar"
+      className={cn(
+        RIGHT_BAR_LAYOUT_CLASS,
+        "pointer-events-none absolute top-0 right-0 z-20 pb-px",
+        isDesktop ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
+      )}
+    >
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={props.onToggle}
+            aria-label={label}
+            className={cn(
+              ICON_BUTTON_CLASS,
+              "pointer-events-auto",
+              isDesktop && "titlebar-no-drag"
+            )}
+          >
+            <PanelRight className="h-3.5 w-3.5" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom" align="end">
+          {label}
+        </TooltipContent>
+      </Tooltip>
+    </div>
+  );
+}
+
+/**
+ * An invisible, inert copy of {@link RightSidebarToggle}'s button for the row the bar covers (the
+ * workspace header while the sidebar is collapsed, the top-right tab strip while it is expanded),
+ * so that row's own controls end before the bar.
+ */
+export function RightSidebarToggleSpacer(props: { className?: string }) {
+  return (
+    <Button
+      aria-hidden
+      variant="ghost"
+      size="icon"
+      tabIndex={-1}
+      className={cn(ICON_BUTTON_CLASS, "invisible", props.className)}
+    />
+  );
+}
+
+/**
+ * A no-drag box under {@link RightSidebarToggle}'s button, which WorkspaceShell mounts after the
+ * sidebar. Electron drags the window where the last app-region rect in DOM order under the pointer
+ * is drag, and the toggle comes before the sidebar (for Tab order), so the sidebar's tab strip
+ * covers it, also on every frame of the width slide, when the strip's room is not under it.
+ * Transparent, not `invisible`: an `invisible` box reports no region.
+ */
+export function RightSidebarToggleHole() {
+  if (!isDesktopMode()) return null;
+  return (
+    <div
+      aria-hidden
+      className={cn(
+        RIGHT_BAR_LAYOUT_CLASS,
+        "pointer-events-none absolute top-0 right-0 pb-px opacity-0",
+        DESKTOP_TITLEBAR_HEIGHT_CLASS
+      )}
+    >
+      <Button
+        variant="ghost"
+        size="icon"
+        tabIndex={-1}
+        className={cn(ICON_BUTTON_CLASS, "titlebar-no-drag")}
+      />
     </div>
   );
 }

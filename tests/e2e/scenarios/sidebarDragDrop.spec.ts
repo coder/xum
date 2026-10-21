@@ -17,7 +17,7 @@ test.describe("sidebar drag and drop", () => {
     await ui.projects.openFirstWorkspace();
 
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
-    await expect(sidebar).toBeVisible({ timeout: 5000 });
+    await ui.metaSidebar.expectVisible();
 
     // A fresh workspace shows only the New tab: open Stats, then Review, from its launcher.
     await ui.metaSidebar.selectTab("Stats");
@@ -59,7 +59,7 @@ test.describe("sidebar drag and drop", () => {
     await ui.projects.openFirstWorkspace();
 
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
-    await expect(sidebar).toBeVisible({ timeout: 5000 });
+    await ui.metaSidebar.expectVisible();
 
     // Open Stats, Review, and a terminal (a fresh workspace shows only the New tab)
     await ui.metaSidebar.selectTab("Stats");
@@ -117,7 +117,7 @@ test.describe("sidebar drag and drop", () => {
     await ui.projects.openFirstWorkspace();
 
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
-    await expect(sidebar).toBeVisible();
+    await ui.metaSidebar.expectVisible();
 
     // Open Stats, Review, and a terminal (a fresh workspace shows only the New tab)
     await ui.metaSidebar.selectTab("Stats");
@@ -157,7 +157,7 @@ test.describe("sidebar drag and drop", () => {
   }) => {
     await ui.projects.openFirstWorkspace();
     // Tabs start collapsed; explicitly open them before exercising the tabstrip.
-    await page.getByRole("button", { name: /^Expand (right )?sidebar$/ }).click();
+    await page.getByRole("button", { name: "Expand right sidebar", exact: true }).click();
 
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
     await expect(sidebar).toBeVisible();

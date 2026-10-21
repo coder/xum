@@ -1,10 +1,12 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { showFeedbackToast } from "@/browser/utils/feedbackToast";
 import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { isWorkspaceRowRendered } from "@/browser/utils/ui/workspaceDomNav";
+import { cn } from "@/common/lib/utils";
 import { PopoverError } from "../PopoverError/PopoverError";
 
 // The header's inline title edit (#6328). The sidebar row's edit needs that row on screen; this
@@ -101,7 +103,11 @@ export function WorkspaceHeaderTitle(props: {
     );
   }
   return (
-    <span ref={props.edit.fieldRef} className="flex min-w-0 flex-1">
+    // The header around it drags the window on desktop: the field must stay clickable.
+    <span
+      ref={props.edit.fieldRef}
+      className={cn("flex min-w-0 flex-1", isDesktopMode() && "titlebar-no-drag")}
+    >
       <WorkspaceHeaderTitleInput
         key={props.workspaceId}
         workspaceId={props.workspaceId}

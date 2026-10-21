@@ -62,6 +62,85 @@ describe("applyAgentCgroupLimits", () => {
     expect(await tree.read("xum/xum-agents", "cpu.max")).toBe("200000 100000");
   });
 
+  it("repairs a cgroup that enabled cpu while it still held processes", async () => {
+    // What an earlier xum left behind: the kernel accepted +cpu with processes in the cgroup, so it
+    // became a thread root, and xum-agents, a domain child, refused every process.
+    tree = await createFakeCgroupTree({
+      own: "/xum",
+      cgroups: {
+        xum: { controllers: "cpu memory", subtreeControl: "cpu", procs: ["101", "102"] },
+        "xum/xum-agents": {},
+      },
+    });
+
+    const result = await applyAgentCgroupLimits({ cpuCores: 30 }, tree.host);
+
+    expect(result.status).toEqual({ state: "active", cgroup: "/xum/xum-agents" });
+    expect(await tree.read("xum", "cgroup.procs")).toBe("");
+    expect(
+      (await tree.read("xum/xum-app", "cgroup.procs")).split("\n").filter(Boolean).sort()
+    ).toEqual(["101", "102"]);
+    expect(await tree.read("xum", "cgroup.subtree_control")).toBe("cpu\n");
+    expect(await tree.read("xum/xum-agents", "cpu.max")).toBe("3000000 100000");
+  });
+
+  describe("leaves a populated cgroup alone when undoing its controllers would reset settings", () => {
+    it.each<[string, Parameters<typeof createFakeCgroupTree>[0]["cgroups"], string]>([
+      [
+        "another threaded controller, such as an admin's pids",
+        { xum: { controllers: "cpu memory pids", subtreeControl: "pids", procs: ["101"] } },
+        "pids",
+      ],
+      [
+        "cpu with a threaded child, whose cpu limits may be in use",
+        {
+          xum: { controllers: "cpu memory", subtreeControl: "cpu", procs: ["101"] },
+          "xum/worker": { type: "threaded" },
+        },
+        "cpu",
+      ],
+    ])("%s", async (_name, cgroups, enabled) => {
+      tree = await createFakeCgroupTree({ own: "/xum", cgroups });
+
+      const result = await applyAgentCgroupLimits({ cpuCores: 2 }, tree.host);
+
+      expect(result.status).toEqual({
+        state: "unavailable",
+        reason: `Could not set up cgroup /xum/xum-agents: ${path.join(tree.root, "xum")} holds processes and enables ${enabled} for its children, so xum cannot move the processes without resetting those settings.`,
+      });
+      expect(tree.writes).toEqual([]);
+      expect(await tree.read("xum", "cgroup.procs")).toBe("101\n");
+    });
+  });
+
+  it("gives up when new processes keep starting in xum's cgroup while xum moves them", async () => {
+    tree = await createFakeCgroupTree({
+      own: "/xum",
+      cgroups: { xum: { controllers: "cpu memory", procs: ["101"] } },
+    });
+    // A process forks in the cgroup after every move, so the cgroup is never empty.
+    let nextPid = 200;
+    const fakeTree = tree;
+    const host = {
+      ...tree.host,
+      writeFile: async (file: string, value: string) => {
+        await fakeTree.host.writeFile(file, value);
+        if (file.endsWith(path.join("xum-app", "cgroup.procs"))) {
+          await fakeTree.addProcess("xum", String(nextPid++));
+        }
+      },
+    };
+
+    const result = await applyAgentCgroupLimits({ cpuCores: 2 }, host);
+
+    expect(result.status).toEqual({
+      state: "unavailable",
+      reason: `Could not set up cgroup /xum/xum-agents: New processes kept starting in ${path.join(tree.root, "xum")} while xum moved them.`,
+    });
+    // xum enabled no controller, so the cgroup did not become a thread root.
+    expect(await tree.read("xum", "cgroup.subtree_control")).toBe("\n");
+  });
+
   it("uses the parent cgroup once xum runs in xum-app", async () => {
     tree = await createFakeCgroupTree({
       own: "/xum/xum-app",

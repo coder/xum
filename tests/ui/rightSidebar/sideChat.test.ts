@@ -21,7 +21,7 @@ import { collectAllTabsWithTabset, dockTabToEdge } from "@/browser/utils/rightSi
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { makeSideChatTabType } from "@/browser/types/rightSidebar";
 
-import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
+import { getRightSidebarCollapsedKey, getRightSidebarLayoutKey } from "@/common/constants/storage";
 import { updatePersistedState, readPersistedState } from "@/browser/hooks/usePersistedState";
 import { collectAllTabs, type RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { getRetryBarrierDerivation } from "@/browser/components/ChatPane/retryBarrierDerivation";
@@ -33,6 +33,19 @@ import { createAppHarness, type AppHarness } from "../harness";
 import { openSidebarNewTab } from "../helpers";
 
 const SIDE_PANE_SELECTOR = `[${SIDE_CHAT_PANE_ATTR}]`;
+/**
+ * A turn that stays live until it is stopped (the mock holds it before its first tool call).
+ * Tests that check a stream is left running use it: the finite [mock:long-stream] (about 18 s of
+ * timers) ended first on a loaded runner, and its deltas re-render the transcript in this same
+ * process, which slowed every other step. In the Escape tests an ended stream would also hide a
+ * listener that stopped the wrong chat.
+ */
+const HELD_TURN = "[mock:tool:parallel-step]";
+/**
+ * Creating a side chat copies and rewrites the parent's history in the backend. At load ~100 it
+ * took up to 10 s, so the earlier 10 s budget (#6375) flaked.
+ */
+const SIDE_CHAT_CREATION_TIMEOUT_MS = 30_000;
 const COMPOSER_SELECTOR = 'textarea[aria-label="Message"]';
 
 function getSidePane(app: AppHarness, workspaceId?: string): HTMLElement | null {
@@ -105,7 +118,7 @@ async function waitForSideChatId(app: AppHarness): Promise<string> {
       expect(sideChats).toHaveLength(1);
       return sideChats[0].id;
     },
-    { timeout: 10_000 }
+    { timeout: SIDE_CHAT_CREATION_TIMEOUT_MS }
   );
 }
 
@@ -139,7 +152,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       branchPrefix: "side-launcher",
       beforeRender: (workspaceId) => {
         // This test exercises the expanded launcher's panes, not the collapsed overview.
-        updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+        updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
         updatePersistedState(getRightSidebarLayoutKey(workspaceId), {
           version: 1,
           openTabsOnly: true,
@@ -164,8 +177,11 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     parentStream.start();
     try {
       await parentStream.waitForSubscription(10_000);
-      await sendFrom(() => getMainComposer(app), app.workspaceId, "[mock:long-stream] main");
-      expect(await parentStream.waitForEvent("stream-start", 10_000)).not.toBeNull();
+      await sendFrom(() => getMainComposer(app), app.workspaceId, `${HELD_TURN} main`);
+      // The file's first send pays the cold backend send path: at load ~100 it took 5 s from
+      // sendMessage to the model call and 7.5 s from the click to stream-start, so 10 s flaked.
+      // Same stream-start budget as the other tests here (#6215).
+      expect(await parentStream.waitForEvent("stream-start", 30_000)).not.toBeNull();
       const draft = "Keep this unsent main question";
       act(() =>
         getDraftStore().setText({ kind: "workspace", workspaceId: app.workspaceId }, draft)
@@ -205,7 +221,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
           expect(chats).toHaveLength(2);
           return chats.find((ws) => ws.id !== firstId)!.id;
         },
-        { timeout: 10_000 }
+        { timeout: SIDE_CHAT_CREATION_TIMEOUT_MS }
       );
       await waitFor(() => expect(getSideComposer(app, secondId).value).toBe(""), {
         timeout: 10_000,
@@ -228,6 +244,9 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await waitFor(() => expect(getSideComposer(app, firstId).value).toBe(firstDraft));
       expect(getSidePane(app, firstId)?.textContent).not.toContain("Only the second side chat");
       expect(getMainComposer(app).value).toBe(draft);
+      // The held main turn cannot finish by itself, so it must still be live.
+      expect(parentStream.getEvents().some((event) => event.type === "stream-abort")).toBe(false);
+      expect(isStreaming(app.workspaceId)).toBe(true);
     } finally {
       send.mockRestore();
       parentStream.stop();
@@ -238,7 +257,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
   test("the launcher prevents duplicate requests and remains usable after creation fails", async () => {
     const app = await createAppHarness({
       branchPrefix: "side-launcher-retry",
-      beforeRender: () => updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false),
+      beforeRender: (workspaceId) =>
+        updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false),
     });
     const service = app.env.services.toORPCContext().workspaceService;
     const create = jest.spyOn(service, "createSideChat");
@@ -425,6 +445,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     let observingStartup = true;
     let parentDeltas = 0;
     const parentStops: string[] = [];
+    const parentStarts: string[] = [];
+    const parentEnds: string[] = [];
     const sideStartupSymptoms = new Set<string>();
     const sideStarts: string[] = [];
 
@@ -465,6 +487,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       if (event.workspaceId === app.workspaceId) {
         if (type === "stream-delta") parentDeltas += 1;
         if (type === "stream-abort" || type === "stream-error") parentStops.push(type);
+        if (event.message.type === "stream-start") parentStarts.push(event.message.messageId);
+        if (event.message.type === "stream-end") parentEnds.push(event.message.messageId);
       } else {
         if (type === "stream-start") sideStarts.push(event.workspaceId);
         if (
@@ -528,11 +552,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await waitFor(() => expect(parentDeltas).toBeGreaterThan(deltasBeforeOpen), {
         timeout: 10_000,
       });
-      expect(isStreaming(app.workspaceId)).toBe(true);
       expect(parentStops).toEqual([]);
-      expect((await context.historyService.readPartial(app.workspaceId))?.id).toBe(
-        parentPartial.id
-      );
       expect(sideStartupSymptoms).toEqual(new Set());
       expect(sideStarts).toEqual([]);
       expect(service.getOrCreateSession(childId).hasPendingAutoRetry()).toBe(false);
@@ -543,7 +563,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       expect(isStreaming(childId)).toBe(false);
 
       // Only an explicit question starts this independent conversation. It remains a side chat,
-      // which is the backend's read-only capability boundary, while the parent keeps streaming.
+      // which is the backend's read-only capability boundary, and the parent turn runs on.
       observingStartup = false;
       const question = "Explain this context without continuing the main task";
       await sendFrom(() => getSideComposer(app), childId, question);
@@ -560,8 +580,25 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
         (await app.env.orpc.workspace.getInfo({ workspaceId: childId }))?.sideChatParentWorkspaceId
       ).toBe(app.workspaceId);
       expect(getTranscript(app, "main").textContent).not.toContain(question);
-      expect(isStreaming(app.workspaceId)).toBe(true);
+
+      // The parent's [mock:long-stream] is finite (about 18 s of timers). On a loaded runner the
+      // steps above outlast it, so asserting it was "still streaming" here flaked. The invariant is
+      // that opening the side chat never stopped or restarted the parent turn: it starts and ends
+      // once, as the message the side chat copied. The budget covers the rest of that stream.
+      await waitFor(() => expect(parentEnds).toEqual([parentPartial.id]), { timeout: 30_000 });
+      expect(parentStarts).toEqual([parentPartial.id]);
       expect(parentStops).toEqual([]);
+      // The premise: the side chat copied the parent turn mid-stream, not its finished reply.
+      const turnText = async (workspaceId: string) => {
+        const history = await context.historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!history.success) throw new Error(history.error);
+        const turn = history.data.find((message) => message.id === parentPartial.id);
+        if (turn == null) throw new Error(`${workspaceId} has no copy of the parent turn`);
+        return turn.parts.map((part) => (part.type === "text" ? part.text : "")).join("");
+      };
+      const copiedText = await turnText(childId);
+      expect(copiedText.length).toBeGreaterThan(0);
+      expect(copiedText.length).toBeLessThan((await turnText(app.workspaceId)).length);
     } finally {
       observingStartup = false;
       observer.disconnect();
@@ -580,13 +617,18 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     try {
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const id = await waitForSideChatId(app);
-      const closeButton = await waitFor(() => {
-        const button = app.view.container.querySelector<HTMLButtonElement>(
-          'button[aria-label="Close side chat"]'
-        );
-        if (!button) throw new Error("side tab not ready");
-        return button;
-      });
+      // Waits on backend work (the new side chat's tab, the real discard below) get a budget:
+      // the discard alone took 1.6 s at load ~100, past waitFor's one-second default (#6375).
+      const closeButton = await waitFor(
+        () => {
+          const button = app.view.container.querySelector<HTMLButtonElement>(
+            'button[aria-label="Close side chat"]'
+          );
+          if (!button) throw new Error("side tab not ready");
+          return button;
+        },
+        { timeout: 10_000 }
+      );
       remove.mockResolvedValueOnce({ success: false, error: "Keep this tab for retry" });
       fireEvent.click(closeButton);
       await waitFor(() =>
@@ -604,7 +646,9 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
 
       // Successful retry is the only path that removes the still-reachable tab.
       fireEvent.click(closeButton);
-      await waitFor(() => expect(app.view.container.contains(closeButton)).toBe(false));
+      await waitFor(() => expect(app.view.container.contains(closeButton)).toBe(false), {
+        timeout: 10_000,
+      });
       expect(await app.env.orpc.workspace.getInfo({ workspaceId: id })).toBeNull();
     } finally {
       remove.mockRestore();
@@ -665,7 +709,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
           expect(sideChats).toHaveLength(2);
           return sideChats.map((metadata) => metadata.id);
         },
-        { timeout: 10_000 }
+        { timeout: SIDE_CHAT_CREATION_TIMEOUT_MS }
       );
       expect(ids).toContain(firstId);
       await waitFor(
@@ -705,7 +749,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
           expect(sideChats).toHaveLength(2);
           return sideChats.find((ws) => ws.id !== firstId)!.id;
         },
-        { timeout: 10_000 }
+        { timeout: SIDE_CHAT_CREATION_TIMEOUT_MS }
       );
       const sideTab = (id: string) =>
         app.view.container.querySelector<HTMLElement>(`[role="tab"][id$="-tab-side:${id}"]`);
@@ -779,7 +823,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
           expect(sideChats).toHaveLength(2);
           return sideChats.find((ws) => ws.id !== firstId)!.id;
         },
-        { timeout: 10_000 }
+        { timeout: SIDE_CHAT_CREATION_TIMEOUT_MS }
       );
       // Registration precedes the open-tab event; dock only after that event selects the second.
       await waitFor(() => expect(getSidePane(app, secondId)).not.toBeNull(), { timeout: 10_000 });
@@ -804,14 +848,10 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       collectors.push(firstStream, secondStream);
       for (const collector of collectors) collector.start();
       await Promise.all(collectors.map((collector) => collector.waitForSubscription(10_000)));
-      await sendFrom(() => getSideComposer(app, firstId), firstId, "[mock:long-stream] first side");
+      await sendFrom(() => getSideComposer(app, firstId), firstId, `${HELD_TURN} first side`);
       expect(await firstStream.waitForEvent("stream-start", 10_000)).not.toBeNull();
       await waitFor(() => expect(isStreaming(firstId)).toBe(true), { timeout: 10_000 });
-      await sendFrom(
-        () => getSideComposer(app, secondId),
-        secondId,
-        "[mock:long-stream] second side"
-      );
+      await sendFrom(() => getSideComposer(app, secondId), secondId, `${HELD_TURN} second side`);
       expect(await secondStream.waitForEvent("stream-start", 10_000)).not.toBeNull();
       await waitFor(() => expect(isStreaming(secondId)).toBe(true), { timeout: 10_000 });
       interruptSpy.mockClear();
@@ -835,9 +875,9 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await expect(interruptSpy.mock.results[0]?.value).resolves.toMatchObject({ success: true });
       await waitFor(() => expect(isStreaming(firstId)).toBe(false), { timeout: 10_000 });
       expect(await firstStream.waitForEvent("stream-abort", 10_000)).not.toBeNull();
-      // The finite mock may finish naturally during setup on slow CI. The invariant is that
-      // Escape did not abort its sibling, not that the sibling stays live for a fixed duration.
+      // The held sibling cannot finish by itself, so Escape must have left it live.
       expect(secondStream.getEvents().some((event) => event.type === "stream-abort")).toBe(false);
+      expect(isStreaming(secondId)).toBe(true);
     } finally {
       for (const collector of collectors) collector.stop();
       interruptSpy.mockRestore();
@@ -872,8 +912,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const sideChatId = await waitForSideChatId(app);
       await waitFor(() => expect(getSidePane(app)).not.toBeNull());
-      await startStream("side", sideChatId, "[mock:long-stream] side stream");
-      await startStream("main", app.workspaceId, "[mock:long-stream] main stream");
+      await startStream("side", sideChatId, `${HELD_TURN} side stream`);
+      await startStream("main", app.workspaceId, `${HELD_TURN} main stream`);
 
       // Focus in the main transcript: only the main chat stops.
       interruptSpy.mockClear();
@@ -885,8 +925,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
 
       // Restart both, side last; focus in the side transcript: only the side chat stops.
       await stopViaApi(sideChatId);
-      await startStream("main", app.workspaceId, "[mock:long-stream] main again");
-      await startStream("side", sideChatId, "[mock:long-stream] side again");
+      await startStream("main", app.workspaceId, `${HELD_TURN} main again`);
+      await startStream("side", sideChatId, `${HELD_TURN} side again`);
       interruptSpy.mockClear();
       pressEscapeOn(getTranscript(app, "side"));
       await waitFor(() => expect(interruptSpy).toHaveBeenCalled(), { timeout: 10_000 });

@@ -119,7 +119,6 @@ import {
   TimelinePreviewSchema,
   TimelineSubscriptionEventSchema,
 } from "./timeline";
-import { LayoutPresetsConfigSchema } from "./uiLayouts";
 import {
   TerminalCreateParamsSchema,
   TerminalResizeParamsSchema,
@@ -420,6 +419,8 @@ export const ProviderConfigInfoSchema = z.object({
   baseUrlSource: z.enum(["config", "env"]).nullish(),
   /** Active base URL for display only. Env values must not be persisted from this field. */
   baseUrlResolved: z.string().nullish(),
+  /** Header name that carries the workspace id on chat requests (see sessionHeader.ts). */
+  sessionHeader: z.string().optional(),
   providerType: z.enum(CUSTOM_PROVIDER_TYPES).optional(),
   displayName: z.string().optional(),
   isCustom: z.boolean().optional(),
@@ -2033,6 +2034,15 @@ export const workspace = {
           .nullish(),
       }),
       output: ResultSchema(z.void(), z.string()),
+    },
+    // Milliseconds until the next heartbeat slot opens; null while the scheduler does not track
+    // the workspace (see HeartbeatService.getMsUntilNextHeartbeat).
+    next: {
+      // Not blank: the service asserts on it, and client input must fail validation instead.
+      input: z.object({
+        workspaceId: z.string().refine((id) => id.trim().length > 0, "workspaceId is blank"),
+      }),
+      output: z.number().nullable(),
     },
   },
   goalDefaults: {
@@ -3925,22 +3935,6 @@ export const drafts = {
   subscribe: {
     input: z.void(),
     output: eventIterator(DraftEventSchema),
-  },
-};
-
-// UI Layouts (global settings)
-export const uiLayouts = {
-  getAll: {
-    input: z.void(),
-    output: LayoutPresetsConfigSchema,
-  },
-  saveAll: {
-    input: z
-      .object({
-        layoutPresets: LayoutPresetsConfigSchema,
-      })
-      .strict(),
-    output: z.void(),
   },
 };
 

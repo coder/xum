@@ -43,22 +43,22 @@ function draftsOf(limits: AgentResourceLimits): Drafts {
   return { cpuCores: formatLimit(limits.cpuCores), memoryGiB: formatLimit(limits.memoryGiB) };
 }
 
-/** The limits in the drafts, or why one draft is not a valid limit. */
-function parseDrafts(drafts: Drafts): { limits: AgentResourceLimits } | { error: string } {
+/** The limits in the drafts, or why each invalid draft is not a valid limit. */
+function parseDrafts(drafts: Drafts): { limits: AgentResourceLimits } | { errors: string[] } {
   const limits: AgentResourceLimits = {};
+  const errors: string[] = [];
   for (const { field, label, unit } of FIELDS) {
     const value = parseLimit(field, drafts[field]);
     if (value === null) {
       const range = AGENT_RESOURCE_LIMITS_RANGE[field];
-      return {
-        error: `${label} must be from ${range.min} to ${range.max} ${unit}, or empty for no limit.`,
-      };
-    }
-    if (value !== undefined) {
+      errors.push(
+        `${label} must be from ${range.min} to ${range.max} ${unit}, or empty for no limit.`
+      );
+    } else if (value !== undefined) {
       limits[field] = value;
     }
   }
-  return { limits };
+  return errors.length > 0 ? { errors } : { limits };
 }
 
 function sameLimits(a: AgentResourceLimits, b: AgentResourceLimits): boolean {
@@ -181,7 +181,11 @@ function StatusLine(props: {
 function useAgentResourceLimits() {
   const api = useLiveAPI();
   const [view, setView] = useState<LimitsView | null>(null);
+  // A failed load or save. A later request that succeeds clears it.
   const [error, setError] = useState<string | null>(null);
+  // Why the drafts are not valid limits. Only a blur checks them again, so a request that succeeds
+  // (Try again saves the saved limits) does not hide them while a field still holds the value.
+  const [fieldErrors, setFieldErrors] = useState<string[]>([]);
 
   useEffect(() => {
     // API doubles in tests of other settings can omit this namespace.
@@ -195,7 +199,10 @@ function useAgentResourceLimits() {
       const reset = !loaded;
       loaded = true;
       setView((current) => withAppliedLimits(reset ? null : current, next));
-      if (reset) setError(null);
+      if (reset) {
+        setError(null);
+        setFieldErrors([]);
+      }
     }).catch((loadError: unknown) => {
       if (isStreamFailure(loadError, controller.signal)) {
         setError(`Failed to load agent resource limits: ${getErrorMessage(loadError)}`);
@@ -231,7 +238,8 @@ function useAgentResourceLimits() {
     view,
     setDraft,
     error,
-    setError,
+    fieldErrors,
+    setFieldErrors,
     save,
     setEnabled,
     disabled: view === null || api == null,
@@ -280,18 +288,19 @@ function LimitFields(props: {
 
 /** Settings > Agents: one CPU and memory limit that all local agent processes share. */
 export function AgentResourceLimitsSettings() {
-  const { view, setDraft, error, setError, save, setEnabled, disabled } = useAgentResourceLimits();
+  const { view, setDraft, error, fieldErrors, setFieldErrors, save, setEnabled, disabled } =
+    useAgentResourceLimits();
 
   const handleBlur = () => {
     if (!view) {
       return;
     }
     const parsed = parseDrafts(view.drafts);
-    if ("error" in parsed) {
-      setError(parsed.error);
+    if ("errors" in parsed) {
+      setFieldErrors(parsed.errors);
       return;
     }
-    setError(null);
+    setFieldErrors([]);
     if (!sameLimits(parsed.limits, view.state.limits)) {
       save(parsed.limits);
     }
@@ -329,6 +338,11 @@ export function AgentResourceLimitsSettings() {
             onRetry={() => save(view.state.limits)}
           />
         ) : null}
+        {fieldErrors.map((fieldError) => (
+          <div key={fieldError} className="text-danger-light text-xs">
+            {fieldError}
+          </div>
+        ))}
         {error ? <div className="text-danger-light text-xs">{error}</div> : null}
       </div>
     </div>

@@ -37,7 +37,6 @@ import {
   type PremiumServiceTier,
   ultrafastModeAvailable,
 } from "./utils/fastModeServiceTier";
-import { handleLayoutSlotHotkeys } from "./utils/ui/layoutSlotHotkeys";
 import { buildSortedWorkspacesByProject } from "./utils/ui/workspaceFiltering";
 import {
   computePinnedMoveOrderForWorkspace,
@@ -123,7 +122,6 @@ import { WorkspaceViewGuard } from "./features/StaticWorkspaceView/workspaceView
 import { TutorialProvider } from "./contexts/TutorialContext";
 import { PowerModeProvider } from "./contexts/PowerModeContext";
 import { TooltipProvider } from "./components/Tooltip/Tooltip";
-import { UILayoutsProvider, useUILayouts } from "@/browser/contexts/UILayoutsContext";
 import { PerfFlightRecorder } from "./components/PerfFlightRecorder/PerfFlightRecorder";
 import { ProviderOptionsProvider } from "./contexts/ProviderOptionsContext";
 import { getWorkspaceSidebarKey } from "./utils/workspace";
@@ -152,7 +150,6 @@ import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen"
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { markAppShellReady } from "@/browser/utils/perf/appShellReady";
-import { Err, Ok } from "@/common/types/result";
 import { serverPathLabel } from "@/common/utils/paths";
 
 // T3 #5971 (route split): each page is its own chunk. The workspace page's ErrorBoundary sits inside
@@ -295,7 +292,6 @@ function AppInner() {
     },
     [setTheme]
   );
-  const { layoutPresets, applySlotToWorkspace, saveCurrentWorkspaceToSlot } = useUILayouts();
   const { getMinOverride: getMinThinkingOverride } = useMinThinkingLevels();
   const { api, status, error, authenticate, retry } = useAPI();
   // Handlers and command sources see null offline, even while useAPI() keeps the last client.
@@ -1096,21 +1092,6 @@ function AppInner() {
     onOpenAbout: openAboutDialog,
     remoteConnection: window.api?.remoteConnection,
     supportedUpdateChannels,
-    layoutPresets,
-    onApplyLayoutSlot: (workspaceId, slot) => {
-      void applySlotToWorkspace(workspaceId, slot).catch(() => {
-        // Best-effort only.
-      });
-    },
-    onCaptureLayoutSlot: async (workspaceId, slot, name) => {
-      try {
-        const result = await saveCurrentWorkspaceToSlot(workspaceId, slot, name);
-        // A refused capture (nothing saveable open) reaches the palette, which shows it.
-        return result.success ? Ok(undefined) : Err(result.error);
-      } catch {
-        return Err("Failed to save layout.");
-      }
-    },
     onClearTimingStats: (workspaceId: string) => workspaceStore.clearTimingStats(workspaceId),
     api: liveApi,
     confirmDialog,
@@ -1323,29 +1304,6 @@ function AppInner() {
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
   }, []);
-
-  // Layout slot hotkeys (Ctrl/Cmd+Alt+1..9 by default)
-  useEffect(() => {
-    const handleKeyDownCapture = (e: KeyboardEvent) => {
-      handleLayoutSlotHotkeys(e, {
-        isCommandPaletteOpen,
-        // Layout slots change the hidden page, so they stay inert under either modal.
-        isSettingsOpen: isPageCoveredByModal,
-        selectedWorkspaceId: selectedWorkspace?.workspaceId ?? null,
-        layoutPresets,
-        applySlotToWorkspace,
-      });
-    };
-
-    window.addEventListener("keydown", handleKeyDownCapture, { capture: true });
-    return () => window.removeEventListener("keydown", handleKeyDownCapture, { capture: true });
-  }, [
-    isCommandPaletteOpen,
-    isPageCoveredByModal,
-    selectedWorkspace,
-    layoutPresets,
-    applySlotToWorkspace,
-  ]);
 
   // Subscribe to menu bar "Open Settings" (macOS Cmd+, from app menu)
   useEffect(() => {
@@ -1695,27 +1653,25 @@ function App() {
   return (
     <>
       <PerfFlightRecorder />
-      <UILayoutsProvider>
-        <TooltipProvider delayDuration={200}>
-          <SettingsProvider>
-            <AboutDialogProvider>
-              <ProviderOptionsProvider>
-                <SplashScreenProvider>
-                  <TutorialProvider>
-                    <CommandRegistryProvider>
-                      <PowerModeProvider>
-                        <ConfirmDialogProvider>
-                          <AppInner />
-                        </ConfirmDialogProvider>
-                      </PowerModeProvider>
-                    </CommandRegistryProvider>
-                  </TutorialProvider>
-                </SplashScreenProvider>
-              </ProviderOptionsProvider>
-            </AboutDialogProvider>
-          </SettingsProvider>
-        </TooltipProvider>
-      </UILayoutsProvider>
+      <TooltipProvider delayDuration={200}>
+        <SettingsProvider>
+          <AboutDialogProvider>
+            <ProviderOptionsProvider>
+              <SplashScreenProvider>
+                <TutorialProvider>
+                  <CommandRegistryProvider>
+                    <PowerModeProvider>
+                      <ConfirmDialogProvider>
+                        <AppInner />
+                      </ConfirmDialogProvider>
+                    </PowerModeProvider>
+                  </CommandRegistryProvider>
+                </TutorialProvider>
+              </SplashScreenProvider>
+            </ProviderOptionsProvider>
+          </AboutDialogProvider>
+        </SettingsProvider>
+      </TooltipProvider>
     </>
   );
 }

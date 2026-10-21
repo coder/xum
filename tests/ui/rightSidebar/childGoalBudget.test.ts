@@ -23,7 +23,7 @@ import {
 
 import { detectDefaultTrunkBranch } from "@/node/git";
 import {
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   RIGHT_SIDEBAR_TAB_KEY,
   getRightSidebarLayoutKey,
 } from "@/common/constants/storage";
@@ -99,7 +99,7 @@ describe("RightSidebar child goal budget (UI)", () => {
         }
 
         cleanupDom = installDom();
-        updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+        updatePersistedState(getRightSidebarCollapsedKey(target.id), false);
         updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "goal");
         updatePersistedState(getRightSidebarLayoutKey(target.id), null);
         markAiSelectionIntent(target.id, "model", UNPRICED_COMPOSER_MODEL);

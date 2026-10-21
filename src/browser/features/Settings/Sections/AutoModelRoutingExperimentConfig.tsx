@@ -15,7 +15,6 @@ import { useAPI } from "@/browser/contexts/API";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { SELECTED_WORKSPACE_KEY } from "@/common/constants/storage";
-import { formatWorkspaceLabel, isPersistedWorkspaceSelection } from "./LayoutsSection";
 import { useAutoModelRouting } from "@/browser/hooks/useAutoModelRouting";
 import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -38,6 +37,23 @@ import {
   AUTO_MODEL_ROUTING_RECENT_MESSAGE_LIMIT,
   DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
 } from "@/constants/autoModelRouting";
+
+interface PersistedWorkspaceSelection {
+  workspaceId: string;
+}
+
+function isPersistedWorkspaceSelection(value: unknown): value is PersistedWorkspaceSelection {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Partial<Record<keyof PersistedWorkspaceSelection, unknown>>;
+  return typeof candidate.workspaceId === "string";
+}
+
+function formatWorkspaceLabel(projectName: string, namedWorkspacePath: string): string {
+  return `${projectName}/${namedWorkspacePath.split("/").pop() ?? namedWorkspacePath}`;
+}
 
 const INHERIT_THINKING = "inherit";
 const SUPPORTED_EVALUATION_PROVIDERS = AUTO_MODEL_ROUTING_EVALUATION_PROVIDERS.join(", ");
@@ -88,10 +104,10 @@ export function AutoModelRoutingExperimentConfig() {
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [classifying, setClassifying] = useState(false);
   // The preview is a paid evaluator request billed to a workspace's usage ledger. Settings
-  // routes carry no workspace in the URL, so it goes to the last selected one (the target
-  // LayoutsSection captures into as well). The stored selection is untrusted and may be a
-  // legacy shape, so only its id is read and the workspace itself is resolved through live
-  // metadata: a removed workspace disables the preview instead of being billed.
+  // routes carry no workspace in the URL, so it goes to the last selected one. The stored
+  // selection is untrusted and may be a legacy shape, so only its id is read and the workspace
+  // itself is resolved through live metadata: a removed workspace disables the preview instead
+  // of being billed.
   const workspaceContext = useOptionalWorkspaceContext();
   const [persistedWorkspaceId] = useState(() => {
     const stored = readPersistedState<unknown>(SELECTED_WORKSPACE_KEY, null);

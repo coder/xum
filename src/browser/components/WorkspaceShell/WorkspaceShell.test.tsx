@@ -1,11 +1,13 @@
 import "../../../../tests/ui/dom";
 
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render as renderUnwrapped } from "@testing-library/react";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getReviewImmersiveKey, RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
+import { getReviewImmersiveKey, getRightSidebarCollapsedKey } from "@/common/constants/storage";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { useEffect, useSyncExternalStore, type MutableRefObject } from "react";
+import { useEffect, useSyncExternalStore, type MutableRefObject, type ReactElement } from "react";
+import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { installDom } from "../../../../tests/ui/dom";
 import * as RealLottieModule from "lottie-react";
 import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
@@ -17,6 +19,7 @@ import * as RealOpenTerminalModule from "@/browser/hooks/useOpenTerminal";
 import * as RealReviewsModule from "@/browser/hooks/useReviews";
 import * as RealConnectionStatusToastModule from "@/browser/components/ConnectionStatusToast/ConnectionStatusToast";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import { loadReactCompiledModule } from "../../../../tests/ui/reactCompiledModule";
 
 interface MockWorkspaceState {
   loading?: boolean;
@@ -63,15 +66,16 @@ function setWorkflowRuns(authoritative: boolean, activeWorkflowRunCount: number)
   workflowRuns = { authoritative, sidebarState: { activeWorkflowRunCount } };
   act(() => workflowRunListeners.forEach((listener) => listener()));
 }
-// The workflow-run baseline the stub sidebar received when it mounted.
+// The workflow-run baseline and the collapsed state from before the load that the stub sidebar
+// received when it mounted.
 let mountedWorkflowRunBaseline: number | null | undefined;
+let mountedCollapsedBeforeLoad: boolean | undefined;
 // What the stub sidebar's own window listeners received, in order.
 const sidebarInput: string[] = [];
 const SIDEBAR_EVENT_TYPES = [
   CUSTOM_EVENTS.OPEN_GOAL_TAB,
   CUSTOM_EVENTS.OPEN_ARTIFACT,
   CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
-  CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR,
 ];
 
 // Snapshot the real exports at file scope, before any test mocks the module. Do not load a second
@@ -142,6 +146,7 @@ void mock.module("@/browser/features/RightSidebar/RightSidebar", () => ({
   RightSidebar: (props: {
     addTerminalRef: MutableRefObject<(() => void) | null>;
     workflowRunBaseline?: number | null;
+    collapsedBeforeLoad?: boolean;
     fullscreen?: boolean;
     onCloseFullscreen?: () => void;
   }) => {
@@ -153,8 +158,9 @@ void mock.module("@/browser/features/RightSidebar/RightSidebar", () => ({
     props.addTerminalRef.current = addTerminalMock;
     // Like RightSidebar, it subscribes to its shortcuts and events in an effect.
     useEffect(() => {
-      // Like RightSidebar, it reads the baseline in its first effect.
+      // Like RightSidebar, it reads the baseline and the earlier collapsed state in its first effect.
       mountedWorkflowRunBaseline = props.workflowRunBaseline;
+      mountedCollapsedBeforeLoad = props.collapsedBeforeLoad;
       const onKey = (e: KeyboardEvent) => {
         if (e.ctrlKey || e.shiftKey) sidebarInput.push(`key:${e.ctrlKey ? "ctrl+" : ""}${e.key}`);
       };
@@ -165,7 +171,7 @@ void mock.module("@/browser/features/RightSidebar/RightSidebar", () => ({
         window.removeEventListener("keydown", onKey);
         for (const type of SIDEBAR_EVENT_TYPES) window.removeEventListener(type, onEvent);
       };
-    }, [props.workflowRunBaseline]);
+    }, [props.workflowRunBaseline, props.collapsedBeforeLoad]);
     return (
       <div
         data-testid="right-sidebar"
@@ -208,6 +214,23 @@ void mock.module("@/browser/components/ConnectionStatusToast/ConnectionStatusToa
 }));
 
 import { WorkspaceShell, estimateWorkspaceShellFallbackWidthPx } from "./WorkspaceShell";
+
+/**
+ * The shell as production builds it. React Compiler reuses a child's element while the props
+ * it is built from keep their values, and Bun loads sources uncompiled, so only this copy shows a
+ * child that reads shell state behind React's back (a persisted key read during render) going
+ * stale. Loaded per test, after the module mocks above.
+ */
+function loadCompiledWorkspaceShell(): typeof WorkspaceShell {
+  const compiled = loadReactCompiledModule(path.join(import.meta.dir, "WorkspaceShell.tsx"));
+  if (typeof compiled.WorkspaceShell !== "function") {
+    throw new Error("WorkspaceShell.tsx must export WorkspaceShell");
+  }
+  return compiled.WorkspaceShell as typeof WorkspaceShell;
+}
+
+// The app renders the shell inside its TooltipProvider (the right sidebar toggle has a tooltip).
+const render = (ui: ReactElement) => renderUnwrapped(ui, { wrapper: TooltipProvider });
 
 /** Inert itself or under an inert ancestor (makeOthersInert marks the covered siblings). */
 function isInert(element: HTMLElement): boolean {
@@ -303,6 +326,7 @@ describe("WorkspaceShell loading placeholders", () => {
     sidebarInput.length = 0;
     workflowRuns = { authoritative: true, sidebarState: { activeWorkflowRunCount: 0 } };
     mountedWorkflowRunBaseline = undefined;
+    mountedCollapsedBeforeLoad = undefined;
   });
 
   it("keeps the chat pane mounted during hydration in web mode", () => {
@@ -422,6 +446,23 @@ describe("WorkspaceShell loading placeholders", () => {
     expect(openTerminalMock).not.toHaveBeenCalled();
   });
 
+  // Immersive review covers the sidebar the toggle acts on.
+  it("drops the right sidebar toggle while immersive review is on", () => {
+    const view = render(<WorkspaceShell {...defaultProps} />);
+    const toggle = /^(Collapse|Expand) right sidebar$/;
+    expect(view.getByRole("button", { name: toggle })).toBeTruthy();
+
+    act(() => {
+      updatePersistedState(getReviewImmersiveKey(defaultProps.workspaceId), true);
+    });
+    expect(view.queryByRole("button", { name: toggle })).toBeNull();
+
+    act(() => {
+      updatePersistedState(getReviewImmersiveKey(defaultProps.workspaceId), false);
+    });
+    expect(view.getByRole("button", { name: toggle })).toBeTruthy();
+  });
+
   describe("full-screen sidebar (phones)", () => {
     it("shows the sidebar full-screen from the menu's Sidebar row", () => {
       rightSidebarDisplay = "none";
@@ -505,7 +546,7 @@ describe("WorkspaceShell loading placeholders", () => {
   describe("while the sidebar chunk loads", () => {
     it("reserves no sidebar width for a new chat without a saved preference", () => {
       gateSidebar();
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), null);
       const view = render(<WorkspaceShell {...defaultProps} />);
       const box = view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
       expect(box?.style.width).toBe("0px");
@@ -516,14 +557,60 @@ describe("WorkspaceShell loading placeholders", () => {
       ).toBe("true");
     });
 
+    // The collapsed flag is per workspace: a new workspace starts collapsed instead of inheriting
+    // an open sidebar (which would only show the New tab launcher), and the open one stays open.
+    it("starts a new workspace collapsed while another workspace's sidebar stays open", () => {
+      gateSidebar();
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), false);
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      const box = () => view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
+      expect(box()?.style.width).not.toBe("0px");
+
+      view.rerender(<WorkspaceShell {...defaultProps} workspaceId="workspace-new" />);
+      expect(box()?.style.width).toBe("0px");
+
+      view.rerender(<WorkspaceShell {...defaultProps} />);
+      expect(box()?.style.width).not.toBe("0px");
+    });
+
     it("keeps the sidebar's box, empty when collapsed (the card floats, so it takes no room)", () => {
       gateSidebar();
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), true);
       const view = render(<WorkspaceShell {...defaultProps} />);
       const box = view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
       expect(view.queryByTestId("right-sidebar")).toBeNull();
       expect(box?.style.width).toBe("0px");
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), false);
+    });
+
+    // The toggle lives in the shell, not the lazy sidebar, so it already works while the chunk
+    // loads. Compiled, as it ships: the loading box must follow the shell's state, not a read of
+    // the persisted key that nothing re-renders it for.
+    it("expands the loading sidebar from the right sidebar toggle", () => {
+      const CompiledWorkspaceShell = loadCompiledWorkspaceShell();
+      gateSidebar();
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), true);
+      const view = render(<CompiledWorkspaceShell {...defaultProps} />);
+      const box = () => view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
+      expect(box()?.style.width).toBe("0px");
+
+      fireEvent.click(view.getByRole("button", { name: "Expand right sidebar" }));
+
+      expect(box()?.style.width).not.toBe("0px");
+      expect(view.getByRole("button", { name: "Collapse right sidebar" })).toBeTruthy();
+    });
+
+    // RightSidebar hands a terminal the keyboard when it sees the sidebar expand. This expand
+    // happened before it mounted, so the shell tells it the sidebar was collapsed until then.
+    it("tells the sidebar it was collapsed when the toggle expands it before the chunk loads", async () => {
+      const gate = gateSidebar();
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), true);
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      fireEvent.click(view.getByRole("button", { name: "Expand right sidebar" }));
+
+      await gate.load();
+
+      expect(mountedCollapsedBeforeLoad).toBe(true);
     });
 
     it("shows a loading sidebar full-screen on phones, closable with Close and Escape", () => {
@@ -587,10 +674,6 @@ describe("WorkspaceShell loading placeholders", () => {
       window.dispatchEvent(
         createCustomEvent(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, { workspaceId: "w" })
       );
-      // The header's stand-in for the collapsed overview card.
-      window.dispatchEvent(
-        createCustomEvent(CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR, { workspaceId: "w" })
-      );
       fireEvent.click(view.getByRole("button", { name: "New terminal" }));
       expect(typed).toBe(true); // Shift+I in a text field stays a typed letter
       expect([otherListener, addTerminalMock.mock.calls.length]).toEqual([[], 0]);
@@ -606,7 +689,6 @@ describe("WorkspaceShell loading placeholders", () => {
         CUSTOM_EVENTS.OPEN_GOAL_TAB,
         CUSTOM_EVENTS.OPEN_ARTIFACT,
         CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
-        CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR,
       ]);
       expect([otherListener, addTerminalMock.mock.calls.length]).toEqual([["artifact"], 1]);
       expect(sideChatSeen).toBe(1); // and not replayed
@@ -643,7 +725,7 @@ describe("WorkspaceShell loading placeholders", () => {
     it("shows a failed collapsed sidebar at its expanded width, so Reload is not clipped", async () => {
       const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
       const gate = gateSidebar();
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), true);
       const view = render(<WorkspaceShell {...defaultProps} />);
       const box = () => view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
       expect(box()?.style.width).toBe("0px");
@@ -652,7 +734,7 @@ describe("WorkspaceShell loading placeholders", () => {
       expect(box()?.style.width).not.toBe("0px");
       // Docked, with no card: globals.css keys on this to stop reserving the card's room.
       expect(box()?.hasAttribute("data-right-sidebar-load-failed")).toBe(true);
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), false);
       consoleError.mockRestore();
     });
 

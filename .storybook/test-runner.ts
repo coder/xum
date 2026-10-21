@@ -155,7 +155,8 @@ const config: TestRunnerConfig = {
       // the controls must size themselves to the 24px minimum. Plays cannot emulate the pointer.
       const client = await page.context().newCDPSession(page);
       const viewport = page.viewportSize();
-      const strip = page.getByRole("tablist").locator("..");
+      // The row sits in a wrapper that holds its desktop no-drag region.
+      const strip = page.getByRole("tablist").locator("../..");
       try {
         await page.setViewportSize({ width: 1200, height: 900 });
         const desktop = await strip.boundingBox();
@@ -166,12 +167,9 @@ const config: TestRunnerConfig = {
         const tablet = await strip.boundingBox();
         if (!desktop || !tablet) throw new Error("Tab strip is missing");
         assert.equal(tablet.height, desktop.height, "Touch must not grow the tablet tab strip");
-        for (const name of [
-          "Close New tab",
-          "Close Instructions",
-          "All tabs",
-          "Collapse sidebar",
-        ]) {
+        // The strip's room for the right sidebar toggle is inert; the toggle itself (in
+        // WorkspaceShell) is a fixed 24px button.
+        for (const name of ["Close New tab", "Close Instructions", "New tab", "All tabs"]) {
           const box = await page.getByRole("button", { name, exact: true }).boundingBox();
           if (!box) throw new Error(`${name} button is missing`);
           assert(

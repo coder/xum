@@ -5,14 +5,14 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/To
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { useDroppable, useDndContext } from "@dnd-kit/core";
-import { Check, ChevronDown, PanelRightClose, X } from "lucide-react";
-import { isNewTab, type TabType } from "@/browser/types/rightSidebar";
+import { Check, ChevronDown, Plus, X } from "lucide-react";
+import type { TabType } from "@/browser/types/rightSidebar";
 import { formatKeybind, formatKeybindForAria, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   isDesktopMode,
   DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
 } from "@/browser/hooks/useDesktopTitlebar";
-import { NewTabLabel } from "./Tabs/TabLabels";
+import { RightSidebarToggleSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 
 // Re-export for consumers that import from this file
 export { getTabName } from "./Tabs";
@@ -50,10 +50,13 @@ interface RightSidebarTabStripProps {
   ariaLabel?: string;
   /** Unique ID of this tabset (for drag/drop) */
   tabsetId: string;
-  /** The All tabs menu's New tab row: open (or show) this tabset's New tab */
+  /** The "+" button after the tabs: open (or show) this tabset's New tab */
   onAddNewTab: () => void;
-  /** Collapses the sidebar. Only the strip at the sidebar's top-right corner gets it. */
-  onCollapseSidebar?: () => void;
+  /**
+   * Ends with room for WorkspaceShell's right sidebar toggle, which sits over the sidebar's
+   * top-right corner. Only the strip in that corner reserves it.
+   */
+  reservesSidebarToggle?: boolean;
 }
 
 /**
@@ -64,8 +67,7 @@ const SortableTab: React.FC<{
   item: RightSidebarTabStripItem;
   index: number;
   tabsetId: string;
-  isDesktop: boolean;
-}> = ({ item, index, tabsetId, isDesktop }) => {
+}> = ({ item, index, tabsetId }) => {
   // Create a unique sortable ID that encodes tabset + tab
   const sortableId = `${tabsetId}:${item.tab}`;
 
@@ -86,7 +88,7 @@ const SortableTab: React.FC<{
   const sortableOnKeyDown = listeners?.onKeyDown;
 
   return (
-    <div className={cn("relative shrink-0", isDesktop && "titlebar-no-drag")} style={style}>
+    <div className="relative shrink-0" style={style}>
       <Tooltip>
         <TooltipTrigger asChild>
           <div
@@ -197,14 +199,9 @@ const TabCloseButton: React.FC<{
   </button>
 );
 
-/** True inside a strip control that acts on the whole sidebar: using it must not focus its pane. */
-export function isSidebarControlTarget(target: EventTarget): boolean {
-  return target instanceof Element && target.closest("[data-sidebar-control]") != null;
-}
-
 /**
- * Icon buttons after the tabs (All tabs, collapse). Coarse pointers get a 24px target:
- * tablets have no global touch floor (phones get 44px from it).
+ * Icon buttons after the tabs ("+", All tabs). Coarse pointers get a 24px target: tablets have no
+ * global touch floor (phones get 44px from it).
  */
 function stripIconButtonClassName(isDesktop: boolean): string {
   return cn(
@@ -213,30 +210,36 @@ function stripIconButtonClassName(isDesktop: boolean): string {
   );
 }
 
-const StripIconButton: React.FC<{
-  label: string;
-  isDesktop: boolean;
-  sidebarControl?: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}> = (props) => (
+const TAB_LIST_LABEL = "All tabs";
+const NEW_TAB_LABEL = "New tab";
+
+/**
+ * Opens (or shows) this tabset's New tab. It sits right after the tabs, like a browser's "+",
+ * so it follows the last tab; once the tabs overflow, the row scrolls while "+" stays in view.
+ */
+const NewTabButton: React.FC<{ isDesktop: boolean; onAddNewTab: () => void }> = (props) => (
   <Tooltip>
     <TooltipTrigger asChild>
       <button
         type="button"
-        data-sidebar-control={props.sidebarControl ? "" : undefined}
         className={stripIconButtonClassName(props.isDesktop)}
-        onClick={props.onClick}
-        aria-label={props.label}
+        aria-label={NEW_TAB_LABEL}
+        aria-keyshortcuts={formatKeybindForAria(KEYBINDS.NEW_SIDEBAR_TAB)}
+        onClick={props.onAddNewTab}
       >
-        {props.children}
+        <Plus className="h-3.5 w-3.5" />
       </button>
     </TooltipTrigger>
-    <TooltipContent side="bottom">{props.label}</TooltipContent>
+    <TooltipContent side="bottom">
+      {NEW_TAB_LABEL}
+      {/* Phones have no keyboard: hidden there. */}
+      <span className="mobile-hide-shortcut-hints">
+        {" "}
+        ({formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB)})
+      </span>
+    </TooltipContent>
   </Tooltip>
 );
-
-const TAB_LIST_LABEL = "All tabs";
 
 /** Arrow keys move between the menu's rows, like a menu (Tab works too). */
 function handleTabListArrowKeys(event: React.KeyboardEvent<HTMLElement>): void {
@@ -253,53 +256,41 @@ const TabListMenuRow: React.FC<{
   label: React.ReactNode;
   selected: boolean;
   disabled?: boolean;
-  keyShortcuts?: string;
   onPick: () => void;
-  children?: React.ReactNode;
 }> = (props) => (
   <button
     type="button"
     disabled={props.disabled}
     aria-current={props.selected || undefined}
-    aria-keyshortcuts={props.keyShortcuts}
     className="text-content-secondary hover:bg-hover focus:bg-hover flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-xs outline-none disabled:opacity-50"
     onClick={props.onPick}
   >
     <Check className={cn("h-3 w-3 shrink-0", !props.selected && "invisible")} />
     <span className="flex min-w-0 items-center gap-1.5 truncate">{props.label}</span>
-    {props.children}
   </button>
 );
 
 /**
  * Lists every tab in the strip, so a tab scrolled out of the row is one pick away (a narrow
- * pane shows only a tab or two, and touch users may not know the row scrolls). Its last row
- * opens (or shows) the New tab, which therefore has no row among the tabs.
+ * pane shows only a tab or two, and touch users may not know the row scrolls). An open New tab
+ * is listed like any other tab; the strip's "+" button opens one.
  */
 const TabListMenu: React.FC<{
   items: RightSidebarTabStripItem[];
   isDesktop: boolean;
-  onAddNewTab: () => void;
 }> = (props) => {
   const [open, setOpen] = React.useState(false);
   const [tooltipOpen, setTooltipOpen] = React.useState(false);
   const contentRef = React.useRef<HTMLDivElement>(null);
 
-  const tabRows = props.items.filter((item) => !isNewTab(item.tab));
-  const newTabSelected = props.items.some((item) => isNewTab(item.tab) && item.selected);
-
-  // A pick moves focus out of the menu (to the tab, or into the New tab's launcher), so Radix
-  // does not send it back to this button on close.
+  // A pick moves focus out of the menu (to the tab), so Radix does not send it back to this
+  // button on close.
   const pick = (item: RightSidebarTabStripItem) => {
     setOpen(false);
     item.onSelect();
     // The strip scrolls the selected tab into view itself; focus() would also scroll the
     // sidebar's overflow-hidden ancestors.
     document.getElementById(item.id)?.focus({ preventScroll: true });
-  };
-  const pickNewTab = () => {
-    setOpen(false);
-    props.onAddNewTab();
   };
 
   return (
@@ -331,7 +322,7 @@ const TabListMenu: React.FC<{
         }}
         onKeyDown={handleTabListArrowKeys}
       >
-        {tabRows.map((item) => (
+        {props.items.map((item) => (
           <TabListMenuRow
             key={item.id}
             label={item.menuLabel ?? item.label}
@@ -340,47 +331,55 @@ const TabListMenu: React.FC<{
             onPick={() => pick(item)}
           />
         ))}
-        {tabRows.length > 0 && (
-          <div role="separator" className="border-separator-light my-1 border-t" />
-        )}
-        <TabListMenuRow
-          label={<NewTabLabel />}
-          selected={newTabSelected}
-          keyShortcuts={formatKeybindForAria(KEYBINDS.NEW_SIDEBAR_TAB)}
-          onPick={pickNewTab}
-        >
-          {/* Screen readers get it from aria-keyshortcuts. Phones have no keyboard: hidden. */}
-          <span
-            aria-hidden="true"
-            className="text-muted mobile-hide-shortcut-hints ml-auto shrink-0 pl-2 text-[10px]"
-          >
-            ({formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB)})
-          </span>
-        </TabListMenuRow>
       </PopoverContent>
     </Popover>
   );
 };
 
-/** The strip's right end, past the free space after the tabs: All tabs and the collapse button. */
+/** The strip's right end, past the free space after the tabs: All tabs and the toggle's room. */
 const StripEndControls: React.FC<{
   items: RightSidebarTabStripItem[];
   isDesktop: boolean;
-  onAddNewTab: () => void;
-  onCollapseSidebar?: () => void;
+  reservesSidebarToggle: boolean;
 }> = (props) => (
-  <div className="ml-auto flex shrink-0 items-center gap-1">
-    <TabListMenu items={props.items} isDesktop={props.isDesktop} onAddNewTab={props.onAddNewTab} />
-    {props.onCollapseSidebar && (
-      <StripIconButton
-        label="Collapse sidebar"
-        isDesktop={props.isDesktop}
-        sidebarControl
-        onClick={props.onCollapseSidebar}
-      >
-        <PanelRightClose className="h-3.5 w-3.5" />
-      </StripIconButton>
+  <div
+    className="ml-auto flex shrink-0 items-center gap-1"
+    data-sidebar-toggle-room={props.reservesSidebarToggle || undefined}
+  >
+    <TabListMenu items={props.items} isDesktop={props.isDesktop} />
+    {props.reservesSidebarToggle && <RightSidebarToggleSpacer />}
+  </div>
+);
+
+/**
+ * One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges) while the
+ * controls after it stay in view. Its wrapper holds the desktop no-drag box over the row's
+ * visible part (see the strip's drag regions). `rowRef` is destructured on purpose: React
+ * Compiler rejects reading a ref prop as `props.rowRef` during render ("Cannot access refs
+ * during render") and would leave this row uncompiled.
+ */
+const TabScrollRow: React.FC<{
+  rowRef: React.RefObject<HTMLDivElement>;
+  ariaLabel: string;
+  items: RightSidebarTabStripItem[];
+  tabsetId: string;
+  isDesktop: boolean;
+}> = ({ rowRef, ...props }) => (
+  <div className="relative flex min-w-0">
+    {props.isDesktop && (
+      <div aria-hidden className="titlebar-no-drag pointer-events-none absolute inset-0" />
     )}
+    <div
+      ref={rowRef}
+      data-tab-scroll-row
+      role="tablist"
+      aria-label={props.ariaLabel}
+      className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
+    >
+      {props.items.map((item, index) => (
+        <SortableTab key={item.id} item={item} index={index} tabsetId={props.tabsetId} />
+      ))}
+    </div>
   </div>
 );
 
@@ -422,7 +421,7 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
   ariaLabel = "Sidebar views",
   tabsetId,
   onAddNewTab,
-  onCollapseSidebar,
+  reservesSidebarToggle,
 }) => {
   const { active } = useDndContext();
   const activeData = active?.data.current as TabDragData | undefined;
@@ -468,42 +467,42 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
       className={cn(
         // Capped inset: the tabs live in one scrolling row, so the full overlay inset on a
         // narrow pane would shrink that row to zero and hide every tab.
-        "border-border-light titlebar-safe-right-capped titlebar-safe-right-gutter-2 flex min-w-0 items-center gap-1 border-b px-2 py-1.5 transition-colors",
-        // With the collapse button, a pane at its minimum width cannot fit all buttons: overflow
-        // on the left (the Panel clips it) so the collapse button stays visible. With room to
-        // spare, the right-end group's ml-auto takes the free space and this has no effect.
-        "has-[[data-sidebar-control]]:justify-end",
-        isDesktop && DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
+        "border-border-light titlebar-safe-right-capped titlebar-safe-right-gutter-2 relative flex min-w-0 items-center gap-1 border-b px-2 transition-colors",
+        // As tall as the workspace header, so the right sidebar toggle over this strip's end and
+        // over the header's end sit on one line in both states. Phones keep their taller rows
+        // (44px touch tabs); only the full-screen sidebar shows the strip there.
+        "[@media(max-width:768px)_and_(pointer:coarse)]:py-1.5",
+        // The desktop title bar also takes no text selection, as `.titlebar-drag` areas have.
+        isDesktop ? [DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS, "select-none"] : "min-h-8",
+        // With the toggle's room, a pane at its minimum width cannot fit all controls: overflow on
+        // the left (the Panel clips it) so the room under the toggle stays at the end. With room
+        // to spare, the right-end group's ml-auto takes the free space and this has no effect.
+        "has-[[data-sidebar-toggle-room]]:justify-end",
         showDropHighlight && "bg-accent/30",
-        isDraggingFromHere && "bg-accent/10",
-        // In desktop mode, make header draggable for window movement
-        isDesktop && "titlebar-drag"
+        isDraggingFromHere && "bg-accent/10"
       )}
     >
-      {/* One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges)
-          while the controls after it stay in view. */}
-      <div
-        ref={scrollRowRef}
-        data-tab-scroll-row
-        role="tablist"
-        aria-label={ariaLabel}
-        className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
-      >
-        {items.map((item, index) => (
-          <SortableTab
-            key={item.id}
-            item={item}
-            index={index}
-            tabsetId={tabsetId}
-            isDesktop={isDesktop}
-          />
-        ))}
-      </div>
+      {/* Desktop drag regions. Chromium does not clip region rects to the scrolling row, Electron
+          lets the later rect win, and app-region inherits (an explicit `none` still reports a
+          no-drag rect). So no ancestor of the tabs may set a region, or a scrolled-out tab's own
+          rect would cover the workspace header and the strip's empty space. Instead, a drag
+          backdrop fills the strip, and a no-drag sibling of the row covers exactly the row's
+          visible box, which keeps the visible tabs clickable. */}
+      {isDesktop && (
+        <div aria-hidden className="titlebar-drag pointer-events-none absolute inset-0" />
+      )}
+      <TabScrollRow
+        rowRef={scrollRowRef}
+        ariaLabel={ariaLabel}
+        items={items}
+        tabsetId={tabsetId}
+        isDesktop={isDesktop}
+      />
+      <NewTabButton isDesktop={isDesktop} onAddNewTab={onAddNewTab} />
       <StripEndControls
         items={items}
         isDesktop={isDesktop}
-        onAddNewTab={onAddNewTab}
-        onCollapseSidebar={onCollapseSidebar}
+        reservesSidebarToggle={reservesSidebarToggle === true}
       />
     </div>
   );

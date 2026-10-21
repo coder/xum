@@ -103,9 +103,6 @@ export const CommandIds = {
   // Analytics commands
   analyticsRebuildDatabase: () => "analytics:rebuild-database" as const,
 
-  // Layout commands
-  layoutApplySlot: (slot: number) => `layout:apply-slot:${slot}` as const,
-  layoutCaptureSlot: (slot: number) => `layout:capture-slot:${slot}` as const,
   // Settings commands
   settingsOpen: () => "settings:open" as const,
   settingsOpenSection: (section: string) => `settings:open:${section}` as const,

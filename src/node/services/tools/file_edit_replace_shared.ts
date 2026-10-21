@@ -37,6 +37,40 @@ export type OperationOutcome = OperationResult | OperationError;
 // Local code previously imported StringReplaceArgs from this module.
 export type StringReplaceArgs = FileEditReplaceStringToolArgs;
 
+const MAX_WHITESPACE_HINT_TOKENS = 200;
+
+/**
+ * The agent-note hint for a search string that is missing from the file only because its
+ * whitespace differs (#2732): tabs vs spaces, trailing spaces or line breaks. It names the
+ * 1-based line where the whitespace-insensitive match starts, so the model can copy the exact
+ * text. The edit itself stays exact: the hint never applies the near match.
+ */
+export function whitespaceMismatchHint(content: string, needle: string): string | undefined {
+  // Without whitespace the needle is a literal that the exact search already missed.
+  if (!/\s/u.test(needle) || needle.trim() === "") return undefined;
+  const tokens = needle.trim().split(/\s+/u);
+  // The search costs about file length x token count on a failed edit, so a huge needle gets the
+  // generic note instead of a slow (or stack-overflowing) regex.
+  if (tokens.length > MAX_WHITESPACE_HINT_TOKENS) return undefined;
+  // Each whitespace run in the needle may be any whitespace (or none) in the file. Tokens hold
+  // no whitespace, so no two `\s*` are adjacent.
+  const pattern = new RegExp(tokens.map(escapeRegExp).join("\\s*"), "gu");
+  const match = pattern.exec(content);
+  // Two near matches: naming the first could send the retry to the wrong block.
+  if (match === null || pattern.exec(content) !== null) return undefined;
+  const line = content.slice(0, match.index).split("\n").length;
+  return `It matches the text at line ${line} only when whitespace is ignored: the indentation (tabs vs spaces), trailing spaces or line breaks differ. Read the file around line ${line}, copy its exact whitespace, then retry.`;
+}
+
+function oldStringNotFoundNote(content: string, oldString: string): string {
+  const next = whitespaceMismatchHint(content, oldString) ?? NOTE_READ_FILE_FIRST_RETRY;
+  return `${EDIT_FAILED_NOTE_PREFIX} The old_string does not exist in the file. ${next}`;
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
 /**
  * Handle string-based replacement
  */
@@ -66,7 +100,7 @@ export function handleStringReplace(
     return {
       success: false,
       error: "old_string not found in file. The text to replace must exist in the file.",
-      note: `${EDIT_FAILED_NOTE_PREFIX} The old_string does not exist in the file. ${NOTE_READ_FILE_FIRST_RETRY}`,
+      note: oldStringNotFoundNote(originalContent, args.old_string),
     };
   }
 

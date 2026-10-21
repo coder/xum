@@ -416,6 +416,7 @@ async function enableControllers(
   host: AgentCgroupHost
 ): Promise<void> {
   const subtreeControl = path.join(baseDir, "cgroup.subtree_control");
+  await emptyBaseCgroup(baseDir, host);
   const enabled = await readWords(subtreeControl);
   const toEnable = needed.filter((controller) => !enabled.includes(controller));
   if (toEnable.length === 0) {
@@ -436,6 +437,59 @@ async function enableControllers(
       await moveProcesses(baseDir, path.join(baseDir, APP_CGROUP), host);
     }
   }
+}
+
+/**
+ * Move every process of the base cgroup into xum-app before any controller is enabled, not only
+ * after EBUSY. The kernel refuses memory while the cgroup holds processes, but accepts a threaded
+ * controller such as cpu. The cgroup then becomes a thread root whose domain children refuse
+ * processes (EOPNOTSUPP), so with only a CPU limit no agent could join xum-agents.
+ */
+async function emptyBaseCgroup(baseDir: string, host: AgentCgroupHost): Promise<void> {
+  const procsFile = path.join(baseDir, "cgroup.procs");
+  if ((await readWords(procsFile)).length === 0) {
+    return;
+  }
+  // Only threaded controllers can be on here. They keep the cgroup a thread root, which refuses
+  // the moves into xum-app. Turning one off resets its settings in every child, so undo only what
+  // a xum without this fix left: cpu alone, with no threaded child whose cpu limits are in use.
+  const subtreeControl = path.join(baseDir, "cgroup.subtree_control");
+  const enabled = await readWords(subtreeControl);
+  if (enabled.length > 0) {
+    if (enabled.join(" ") !== "cpu" || (await hasThreadedChild(baseDir))) {
+      throw new Error(
+        `${baseDir} holds processes and enables ${enabled.join(" ")} for its children, so xum cannot move the processes without resetting those settings.`
+      );
+    }
+    await host.writeFile(subtreeControl, "-cpu");
+  }
+  // Repeat for processes that forked during a move: one left behind makes a thread root again.
+  for (let attempt = 1; ; attempt += 1) {
+    await moveProcesses(baseDir, path.join(baseDir, APP_CGROUP), host);
+    if ((await readWords(procsFile)).length === 0) {
+      return;
+    }
+    if (attempt >= MAX_ENABLE_ATTEMPTS) {
+      throw new Error(`New processes kept starting in ${baseDir} while xum moved them.`);
+    }
+  }
+}
+
+/** Whether a child of the cgroup is threaded, so its processes count as the cgroup's own. */
+async function hasThreadedChild(baseDir: string): Promise<boolean> {
+  const entries = await fs.readdir(baseDir, { withFileTypes: true });
+  for (const entry of entries.filter((child) => child.isDirectory())) {
+    const typeFile = path.join(baseDir, entry.name, "cgroup.type");
+    // The kernel always has this file. A missing one, as in a test tree, is a domain cgroup.
+    const type = await fs.readFile(typeFile, "utf-8").catch((error: unknown) => {
+      if (hasErrorCode(error, "ENOENT")) return "domain";
+      throw error;
+    });
+    if (type.trim() === "threaded") {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function moveProcesses(fromDir: string, toDir: string, host: AgentCgroupHost): Promise<void> {

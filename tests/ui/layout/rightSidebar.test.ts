@@ -30,7 +30,7 @@ import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
 import { cleanupView, openSidebarNewTab, setupWorkspaceView } from "../helpers";
 import {
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getPersistedKeyRegistration,
@@ -39,7 +39,7 @@ import {
 } from "@/common/constants/storage";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 // RightSidebarLayoutState used for initial setup via persisted-state helpers - acceptable for test fixtures
 import {
   getDefaultRightSidebarLayoutState,
@@ -139,7 +139,7 @@ describeIntegration("RightSidebar (UI)", () => {
   beforeEach(async () => {
     // Reset all right-sidebar persisted state so each test starts clean.
     updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
-    updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
+    updatePersistedState(getRightSidebarCollapsedKey(workspaceId), null);
     await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.AGENT_BROWSER, enabled: null });
     await env.orpc.experiments.set({
       experimentId: EXPERIMENT_IDS.PORTABLE_DESKTOP,
@@ -165,7 +165,7 @@ describeIntegration("RightSidebar (UI)", () => {
   async function setupRightSidebarView(beforeRender?: () => void) {
     const cleanupDom = installDom();
     // Most tests exercise open tools; individual tests can clear this to cover the default.
-    updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+    updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
     beforeRender?.();
     const view = renderApp({ apiClient: env.orpc, metadata });
 
@@ -215,7 +215,7 @@ describeIntegration("RightSidebar (UI)", () => {
   const getTabs = (sidebar: HTMLElement) =>
     Array.from(sidebar.querySelectorAll<HTMLElement>('[role="tab"]'));
 
-  /** The All tabs menu's New tab row opens the New tab; its launcher lists the tools. */
+  /** The strip's "+" button opens the New tab; its launcher lists the tools. */
   async function openLauncher(sidebar: HTMLElement): Promise<HTMLElement> {
     await openSidebarNewTab(sidebar);
     return findSidebarPanel(sidebar, "-panel-new");
@@ -246,15 +246,15 @@ describeIntegration("RightSidebar (UI)", () => {
   }, 60_000);
 
   test("a fresh chat starts collapsed and opens tools only on request", async () => {
-    const { sidebar, cleanup } = await setupRightSidebarView(() => {
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
+    const { view, sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), null);
     });
 
     try {
-      expect(sidebar.classList.contains("right-sidebar-overview-card")).toBe(true);
+      expect(sidebar.querySelector(".right-sidebar-overview-card")).not.toBeNull();
       expect(sidebar.querySelector('[role="tablist"]')).toBeNull();
       expect(sidebar.querySelector('[role="tabpanel"]')).toBeNull();
-      fireEvent.click(within(sidebar).getByRole("button", { name: "Expand sidebar" }));
+      fireEvent.click(within(view.container).getByRole("button", { name: "Expand right sidebar" }));
       const launcher = await findSidebarPanel(sidebar, "-panel-new");
       expect(within(launcher).getByRole("button", { name: "Review" })).toBeTruthy();
     } finally {
@@ -541,7 +541,7 @@ describeIntegration("RightSidebar (UI)", () => {
   test("sidebar collapse and expand via button", async () => {
     const { view, sidebar, cleanup } = await setupRightSidebarView(() => {
       // Start expanded
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
     });
 
     try {
@@ -551,12 +551,10 @@ describeIntegration("RightSidebar (UI)", () => {
         if (!tablist) throw new Error("Tablist should be visible when expanded");
       });
 
-      const collapseButton = await findRequiredElement(
-        sidebar,
-        'button[aria-label*="ollapse"]',
-        "Collapse button not found"
-      );
-      fireEvent.click(collapseButton);
+      const toggle = within(view.container).getByRole("button", {
+        name: "Collapse right sidebar",
+      });
+      fireEvent.click(toggle);
 
       // Wait for collapse - tablist should not be rendered
       await waitFor(() => {
@@ -564,14 +562,9 @@ describeIntegration("RightSidebar (UI)", () => {
         if (tablist) throw new Error("Tablist should be hidden when collapsed");
       });
 
-      // Re-query sidebar and find expand button (sidebar reference may be stale after collapse)
-      const collapsedSidebar = view.container.querySelector(
-        '[role="complementary"][aria-label="Workspace insights"]'
-      )!;
-      expect(collapsedSidebar).toBeTruthy();
-      const expandButton = collapsedSidebar.querySelector('button[aria-label="Expand sidebar"]')!;
-      expect(expandButton).toBeTruthy();
-      fireEvent.click(expandButton);
+      // The same element expands the sidebar again.
+      expect(toggle.getAttribute("aria-label")).toBe("Expand right sidebar");
+      fireEvent.click(toggle);
 
       // Wait for expand - tablist should be visible again
       await waitFor(() => {
@@ -583,7 +576,9 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
-  test("collapsing from the top pane keeps the focused pane for Expand", async () => {
+  // The toggle sits over the top pane's strip but acts on the whole sidebar, so expanding
+  // returns to the pane the user was in.
+  test("collapsing over the top pane keeps the focused pane for Expand", async () => {
     const splitLayout: RightSidebarLayoutState = {
       version: 1,
       openTabsOnly: true,
@@ -601,69 +596,85 @@ describeIntegration("RightSidebar (UI)", () => {
       focusedTabsetId: "tabset-bottom",
     };
     const { view, sidebar, cleanup } = await setupRightSidebarView(() => {
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
       updatePersistedState(getRightSidebarLayoutKey(workspaceId), splitLayout);
     });
 
     try {
-      const collapseButton = await findRequiredElement(
-        sidebar,
-        'button[aria-label="Collapse sidebar"]',
-        "Collapse button not found"
-      );
+      await findSidebarTab(sidebar, "costs");
+      const toggle = within(view.container).getByRole("button", {
+        name: "Collapse right sidebar",
+      });
       // A real click: mousedown, then focus, then click.
-      fireEvent.mouseDown(collapseButton);
-      collapseButton.focus();
-      fireEvent.mouseUp(collapseButton);
-      fireEvent.click(collapseButton);
+      fireEvent.mouseDown(toggle);
+      toggle.focus();
+      fireEvent.mouseUp(toggle);
+      fireEvent.click(toggle);
+      await waitFor(() => expect(sidebar.querySelector('[role="tablist"]')).toBeNull());
+      fireEvent.click(toggle);
 
-      const collapsedSidebar = view.container.querySelector(
-        '[role="complementary"][aria-label="Workspace insights"]'
-      )!;
-      const expandButton = await findRequiredElement(
-        collapsedSidebar,
-        'button[aria-label="Expand sidebar"]',
-        "Expand button not found"
-      );
-      fireEvent.click(expandButton);
-
-      await waitFor(() =>
-        expect(activeTabDescription()).toMatch(/^tab .*-tabset-bottom-panel-costs$/)
-      );
+      await findSidebarTab(sidebar, "costs");
+      expect(
+        readPersistedState<RightSidebarLayoutState | null>(
+          getRightSidebarLayoutKey(workspaceId),
+          null
+        )?.focusedTabsetId
+      ).toBe("tabset-bottom");
     } finally {
       await cleanup();
     }
   }, 60_000);
 
-  test("the header's stand-in for the overview card expands the sidebar onto its focused tab", async () => {
-    const { view, cleanup } = await setupRightSidebarView(() => {
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
-      seedLayout(["costs"]);
-    });
+  test("collapsing keeps the panel mounted over the card until the width transition ends", async () => {
+    const { view, sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs"]));
+    // happy-dom runs no CSS transitions: stand in for the container's width transition.
+    class FakeCSSTransition {
+      transitionProperty = "width";
+      finish!: () => void;
+      finished = new Promise<void>((resolve) => {
+        this.finish = resolve;
+      });
+    }
+    let running: FakeCSSTransition | null = null;
+    const globals = globalThis as { CSSTransition?: unknown };
+    const proto = HTMLElement.prototype as { getAnimations?: () => unknown[] };
+    globals.CSSTransition = FakeCSSTransition;
+    proto.getAnimations = function (this: HTMLElement) {
+      return this === sidebar && running != null ? [running] : [];
+    };
+    const card = () => sidebar.querySelector(".right-sidebar-overview-card");
+    const panel = () => sidebar.querySelector('[role="tabpanel"][id*="costs"]');
 
     try {
-      // globals.css shows this button only where the card would cover the transcript; the DOM
-      // carries it whenever the sidebar is collapsed.
-      const expandButton = await waitFor(() =>
-        within(view.container).getByRole("button", { name: "Expand right sidebar" })
-      );
-      fireEvent.click(expandButton);
-
-      // Same path as the card's Expand: focus lands on the sidebar's tab instead of falling to
-      // the page body when the header button unmounts.
-      await waitFor(() => {
-        const costsTab = view.container.querySelector<HTMLElement>(
-          '[role="tab"][aria-controls*="costs"]'
-        );
-        if (costsTab?.getAttribute("aria-selected") !== "true") {
-          throw new Error("Stats tab should be selected after expanding from the header");
-        }
-        expect(document.activeElement).toBe(costsTab);
+      await findSidebarPanel(sidebar, "-panel-costs");
+      const toggle = within(view.container).getByRole("button", {
+        name: "Collapse right sidebar",
       });
-      expect(
-        within(view.container).queryByRole("button", { name: "Expand right sidebar" })
-      ).toBeNull();
+
+      const closing = new FakeCSSTransition();
+      running = closing;
+      fireEvent.click(toggle);
+      // The card is revealed under the panel as it slides out.
+      expect(card()).not.toBeNull();
+      expect(panel()).not.toBeNull();
+      running = null;
+      closing.finish();
+      await waitFor(() => expect(panel()).toBeNull());
+      expect(card()).not.toBeNull();
+
+      const opening = new FakeCSSTransition();
+      running = opening;
+      fireEvent.click(toggle);
+      // Expanding drops the card at once and slides the panel in.
+      expect(card()).toBeNull();
+      expect(panel()).not.toBeNull();
+      running = null;
+      opening.finish();
+      await opening.finished;
+      expect(panel()).not.toBeNull();
     } finally {
+      delete proto.getAnimations;
+      delete globals.CSSTransition;
       await cleanup();
     }
   }, 60_000);
@@ -972,7 +983,7 @@ describeIntegration("RightSidebar (UI)", () => {
 
   test("dragging the handle far right collapses into the overview card, which reopens Review", async () => {
     const { view, sidebar, cleanup } = await setupRightSidebarView(() => {
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
       seedLayout(["costs"]);
     });
 
@@ -1068,10 +1079,10 @@ describeIntegration("RightSidebar (UI)", () => {
       expect(costsPanel).toBeTruthy();
       expect(reviewPanel).toBeTruthy();
 
-      // One collapse button for the whole sidebar, in the top pane's strip.
-      const collapseButtons = sidebar.querySelectorAll('button[aria-label="Collapse sidebar"]');
-      expect(collapseButtons.length).toBe(1);
-      expect(collapseButtons[0].closest("[data-tabset-id]")?.getAttribute("data-tabset-id")).toBe(
+      // Room for the shell's one toggle, in the top pane's strip only.
+      const toggleRooms = sidebar.querySelectorAll('button[aria-hidden="true"][tabindex="-1"]');
+      expect(toggleRooms.length).toBe(1);
+      expect(toggleRooms[0].closest("[data-tabset-id]")?.getAttribute("data-tabset-id")).toBe(
         "tabset-top"
       );
     } finally {

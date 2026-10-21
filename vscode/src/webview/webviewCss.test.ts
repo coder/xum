@@ -158,10 +158,14 @@ const DESKTOP_ONLY_CLASSES = new Set([
   // which the webview never applies.
   "right-sidebar-fullscreen",
   "right-sidebar-fullscreen-header",
-  // The collapsed right sidebar's overview card and its header stand-in: both query the desktop
-  // workspace shell's width, and the webview renders neither the shell nor the right sidebar.
+  // The collapsed right sidebar's overview card, and the right sidebar toggle with its header
+  // spacer: they query the desktop workspace shell's width, and the webview renders neither the
+  // shell nor the right sidebar.
   "right-sidebar-overview-card",
-  "right-sidebar-overview-expand",
+  "right-sidebar-toggle",
+  // The chat scrollport eases its room for that card only while the right sidebar slides in the
+  // desktop workspace shell.
+  "chat-reserved-inline-end-scrollport",
   // Project sidebar only: the webview shows one workspace and no project sidebar.
   "react-colorful",
   "section-color-picker",

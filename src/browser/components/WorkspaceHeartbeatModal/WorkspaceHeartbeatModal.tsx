@@ -11,6 +11,7 @@ import {
 import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
 import { useWorkspaceHeartbeat } from "@/browser/hooks/useWorkspaceHeartbeat";
+import type { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import assert from "@/common/utils/assert";
 import {
   clampIntervalMinutes,
@@ -107,6 +108,11 @@ interface WorkspaceHeartbeatModalProps {
   workspaceId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /**
+   * Returns focus to the opener on close (Radix only refocuses a DialogTrigger, and this dialog
+   * opens from state). The opener records focus, since this dialog loads on its first open.
+   */
+  focusReturn?: ReturnType<typeof useModalFocusReturn>;
 }
 
 function getValidationErrorMessage(value: string): string | null {
@@ -308,7 +314,10 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
 
   return (
     <Dialog open={props.open} onOpenChange={props.onOpenChange}>
-      <DialogContent className="max-h-[90vh] max-w-[calc(100vw-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:max-w-2xl lg:max-w-5xl">
+      <DialogContent
+        {...props.focusReturn}
+        className="max-h-[90vh] max-w-[calc(100vw-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:max-w-2xl lg:max-w-5xl"
+      >
         <DialogHeader className="border-border border-b px-6 py-5 pr-12">
           <DialogTitle className="flex items-center gap-2">
             <HeartPulse className="h-5 w-5" />

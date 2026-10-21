@@ -154,7 +154,7 @@ describe("CommandPalette ranking", () => {
         keywords: ["output", "panel"],
       },
       { id: "ws:new", title: "New Workspace", section: "Workspaces", keywords: ["create"] },
-      { id: "layout:toggle", title: "Toggle Layout", section: "Layouts", keywords: [] },
+      { id: "layout:toggle", title: "Toggle Layout", section: "Appearance", keywords: [] },
     ];
 
     const result = rankByPaletteQuery({

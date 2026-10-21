@@ -511,23 +511,18 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
   };
 
   /**
-   * Open a tool from the right sidebar's New tab launcher. The New tab row at the bottom of the
-   * strip's All tabs menu first adds or shows the New tab.
+   * Open a tool from the right sidebar's New tab launcher. The strip's "+" button first adds or
+   * shows the New tab.
    */
   async function openFromNewTab(toolName: string): Promise<void> {
     const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
-    // Tools are opt-in now: wait for either the collapsed expand action or the open strip.
-    const expandButton = page.getByRole("button", { name: /^Expand (right )?sidebar$/ });
-    const menuButton = sidebar.getByRole("button", { name: "All tabs", exact: true }).first();
-    await expect(expandButton.or(menuButton)).toBeVisible();
+    // Tools are opt-in now: wait for either the collapsed sidebar's toggle or the open strip.
+    const expandButton = page.getByRole("button", { name: "Expand right sidebar", exact: true });
+    const newTabButton = sidebar.getByRole("button", { name: "New tab", exact: true }).first();
+    await expect(expandButton.or(newTabButton)).toBeVisible();
     if (await expandButton.isVisible()) await expandButton.click();
-    await expect(menuButton).toBeVisible();
-    await menuButton.click();
-    // The menu renders in a portal, outside the sidebar.
-    await page
-      .getByRole("dialog", { name: "All tabs" })
-      .getByRole("button", { name: "New tab", exact: true })
-      .click();
+    await expect(newTabButton).toBeVisible();
+    await newTabButton.click();
     const row = sidebar.getByRole("tabpanel").getByRole("button", { name: toolName, exact: true });
     await expect(row).toBeVisible();
     await row.click();
@@ -535,7 +530,15 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
 
   const metaSidebar = {
     async expectVisible(): Promise<void> {
-      await expect(page.getByRole("complementary", { name: "Workspace insights" })).toBeVisible();
+      // Collapsed (a fresh workspace's state), the sidebar is 0px wide and only its toggle shows
+      // (the overview card floats outside the sidebar's box), so either state counts.
+      const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
+      const expandButton = page.getByRole("button", { name: "Expand right sidebar", exact: true });
+      await expect
+        .poll(async () => (await sidebar.isVisible()) || (await expandButton.isVisible()), {
+          message: "neither the expanded right sidebar nor its Expand toggle is visible",
+        })
+        .toBe(true);
     },
 
     async selectTab(label: string): Promise<void> {
@@ -553,7 +556,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
 
     async addTerminal(): Promise<void> {
-      // A New tab's launcher (opened from the All tabs menu) has the Terminal row.
+      // A New tab's launcher (opened with the strip's "+") has the Terminal row.
       await openFromNewTab("Terminal");
       // Wait for a terminal tab to appear (name may be "Terminal" or include cwd path)
       // and be selected. Only terminal tabs have a "Close terminal" button.

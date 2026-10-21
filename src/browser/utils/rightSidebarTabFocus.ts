@@ -8,13 +8,13 @@ import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePer
 import { isTabType, type TabType } from "@/browser/types/rightSidebar";
 import {
   getRightSidebarLayoutKey,
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   RIGHT_SIDEBAR_TAB_KEY,
 } from "@/common/constants/storage";
 
 export function focusRightSidebarTab(workspaceId: string, tab: TabType): void {
   // Explicit navigation must reveal the requested tool even though chats start collapsed.
-  updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+  updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
   updateRightSidebarLayout(workspaceId, (state) => selectOrAddTab(state, tab));
 }
 

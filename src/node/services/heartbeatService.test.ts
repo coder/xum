@@ -746,6 +746,35 @@ describe("HeartbeatService", () => {
       expect(resetDeadline).toBeGreaterThan(initialDeadline!);
     });
 
+    test("reports the time until the tracked deadline, and none for an untracked workspace", async () => {
+      service.start();
+      await getInternals().resyncFromConfig(0);
+      // resyncFromConfig(0) puts the first deadline one interval after time 0.
+      expect(service.getMsUntilNextHeartbeat(testWorkspaceId, 1000)).toBe(
+        defaultHeartbeatIntervalMs - 1000
+      );
+      // A passed deadline reads as due (zero or less), not as a wrapped or absent value.
+      expect(
+        service.getMsUntilNextHeartbeat(testWorkspaceId, defaultHeartbeatIntervalMs + 5000)
+      ).toBe(-5000);
+      expect(service.getMsUntilNextHeartbeat("untracked-ws", 1000)).toBeNull();
+
+      // The report follows the countdown an idle trigger resets on new activity.
+      const activityAt = Date.now();
+      wsEmitter.emit("activity", {
+        workspaceId: testWorkspaceId,
+        activity: { recency: activityAt, streaming: false },
+      });
+      const deadline = getInternals().nextEligibleAtByWorkspaceId.get(testWorkspaceId);
+      expect(deadline).toBeGreaterThanOrEqual(activityAt + defaultHeartbeatIntervalMs);
+      expect(service.getMsUntilNextHeartbeat(testWorkspaceId, activityAt)).toBe(
+        (deadline ?? Number.NaN) - activityAt
+      );
+
+      service.stop();
+      expect(service.getMsUntilNextHeartbeat(testWorkspaceId)).toBeNull();
+    });
+
     test("activity event does not reset the countdown for interval-triggered workspaces", async () => {
       await setProjectsConfig(
         makeProjectsConfig([

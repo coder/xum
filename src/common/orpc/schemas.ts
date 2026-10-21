@@ -171,7 +171,6 @@ export {
   browser,
   devtools,
   drafts,
-  uiLayouts,
   desktop,
   general,
   menu,

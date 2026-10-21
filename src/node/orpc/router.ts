@@ -127,7 +127,7 @@ import {
 import { Err, Ok } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import { normalizeAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
-import { AutoModelRouterTag } from "@/node/services/di/tags";
+import { AutoModelRouterTag, Heartbeat } from "@/node/services/di/tags";
 
 import {
   createAuthMiddleware,
@@ -167,7 +167,6 @@ import {
 } from "./routerSubscriptions";
 
 import { checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
-import { DEFAULT_LAYOUT_PRESETS_CONFIG } from "@/common/types/uiLayouts";
 
 import { getAgentSkill, listAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import {
@@ -392,7 +391,7 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) => context.tokenizerService.calculateWorkspaceStats(input)),
     },
     // Config-backed procedures ride handlerGen. Interruption posture (also applies to
-    // the `config` and `uiLayouts` namespaces below): reads are single Effect.sync
+    // the `config` namespace below): reads are single Effect.sync
     // steps (interruption is a don't-care); mutations wrap the whole pre-Effect
     // handler body in one atomicPromise thunk, so a client abort never interrupts the
     // in-flight Semaphore(1)-serialized config edit, multi-step bodies (mutate + notify)
@@ -876,27 +875,6 @@ export const router = (authToken?: string) => {
         .input(schemas.drafts.subscribe.input)
         .output(schemas.drafts.subscribe.output)
         .handler(({ context, signal }) => subscribeDrafts(context, signal)),
-    },
-    uiLayouts: {
-      getAll: t
-        .input(schemas.uiLayouts.getAll.input)
-        .output(schemas.uiLayouts.getAll.output)
-        .handler(
-          handlerGen(function* ({ context }) {
-            return yield* Effect.sync(() => {
-              const config = context.config.loadConfigOrDefault();
-              return config.layoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;
-            });
-          })
-        ),
-      saveAll: t
-        .input(schemas.uiLayouts.saveAll.input)
-        .output(schemas.uiLayouts.saveAll.output)
-        .handler(
-          handlerGen(function* ({ context }, input) {
-            yield* atomicPromise(async () => context.config.saveLayoutPresets(input.layoutPresets));
-          })
-        ),
     },
     agents: {
       list: t
@@ -2134,6 +2112,15 @@ export const router = (authToken?: string) => {
           .input(schemas.workspace.heartbeat.set.input)
           .output(schemas.workspace.heartbeat.set.output)
           .handler(({ context, input }) => setWorkspaceHeartbeat(context, input)),
+        next: t
+          .input(schemas.workspace.heartbeat.next.input)
+          .output(schemas.workspace.heartbeat.next.output)
+          .handler(
+            handlerGen(function* (_options, input) {
+              const heartbeat = yield* Heartbeat;
+              return heartbeat.getMsUntilNextHeartbeat(input.workspaceId);
+            })
+          ),
       },
       goalDefaults: {
         // Per-workspace override of the global `goalDefaults` block.

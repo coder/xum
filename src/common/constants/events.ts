@@ -150,13 +150,6 @@ export const CUSTOM_EVENTS = {
   OPEN_NEW_SIDEBAR_TAB: "mux:openNewSidebarTab",
 
   /**
-   * Expand the collapsed right sidebar on its focused tab, the same path as the overview card's
-   * Expand button. Sent by the header's stand-in for the card where the card would cover the
-   * transcript. Detail: { workspaceId: string }
-   */
-  EXPAND_RIGHT_SIDEBAR: "mux:expandRightSidebar",
-
-  /**
    * Start a new chat the way the left sidebar's "New chat" button does. Sent by the app shell's
    * toggle bar while the sidebar is collapsed; ProjectSidebar stays mounted and owns
    * the draft logic. No payload.
@@ -299,9 +292,6 @@ export interface CustomEventPayloads {
     openCompleteInput?: boolean;
   };
   [CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB]: {
-    workspaceId: string;
-  };
-  [CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR]: {
     workspaceId: string;
   };
   [CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB]: {

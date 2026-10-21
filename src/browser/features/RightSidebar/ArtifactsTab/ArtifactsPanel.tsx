@@ -273,6 +273,41 @@ const SELECTION_EXTENDING_KEYS = new Set([
   "PageDown",
 ]);
 
+/** Whether a keyboard selection is in progress after this keydown in the viewer. */
+function selectingAfterKeyDown(selecting: boolean, e: React.KeyboardEvent): boolean {
+  // A held Shift auto-repeats until the arrow press, so only a fresh press resets.
+  if (e.key === "Shift") return e.repeat && selecting;
+  return selecting || (e.shiftKey && SELECTION_EXTENDING_KEYS.has(e.key));
+}
+
+/**
+ * The viewer's keyboard path in annotate mode: Shift+Arrow (etc.) extends a selection, and
+ * releasing Shift opens the comment box for it. The flag lasts one Shift gesture (#5760): a new
+ * Shift press or focus leaving the viewer clears it, so a later bare Shift release cannot open a
+ * box for an old selection. Annotate mode turning off and on needs no reset of its own: the next
+ * gesture starts with a Shift press.
+ */
+function keyboardSelectionHandlers(
+  selectingRef: { current: boolean },
+  openAnnotation: (pick: ArtifactAnnotationPick) => void
+) {
+  return {
+    onKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => {
+      selectingRef.current = selectingAfterKeyDown(selectingRef.current, e);
+    },
+    onKeyUp: (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (e.key !== "Shift" || !selectingRef.current) return;
+      selectingRef.current = false;
+      const pick = textAnchorFromSelection(e.currentTarget, window.getSelection());
+      if (pick != null) openAnnotation(pick);
+    },
+    // Focus that moves inside the viewer (caret browsing onto a link) keeps the gesture.
+    onBlur: (e: React.FocusEvent<HTMLDivElement>) => {
+      if (!e.currentTarget.contains(e.relatedTarget)) selectingRef.current = false;
+    },
+  };
+}
+
 /**
  * The annotate shortcut's first press, not its auto-repeat: a held key toggled annotate mode at
  * the key-repeat rate (#6347). The frame's key bridge ignores repeats the same way.
@@ -976,6 +1011,10 @@ export function ArtifactsPanel(props: {
     );
 
   // Xum-rendered kinds: a text selection inside the viewer opens the comment popover.
+  const keyboardSelection =
+    annotating && annotateSupport === "host"
+      ? keyboardSelectionHandlers(keyboardSelectingRef, openAnnotation)
+      : null;
   const viewerScroll = (
     <div
       data-testid="artifact-viewer-scroll"
@@ -993,25 +1032,9 @@ export function ArtifactsPanel(props: {
             }
           : undefined
       }
-      onKeyDown={
-        annotating && annotateSupport === "host"
-          ? (e) => {
-              if (e.shiftKey && SELECTION_EXTENDING_KEYS.has(e.key)) {
-                keyboardSelectingRef.current = true;
-              }
-            }
-          : undefined
-      }
-      onKeyUp={
-        annotating && annotateSupport === "host"
-          ? (e) => {
-              if (e.key !== "Shift" || !keyboardSelectingRef.current) return;
-              keyboardSelectingRef.current = false;
-              const pick = textAnchorFromSelection(e.currentTarget, window.getSelection());
-              if (pick != null) openAnnotation(pick);
-            }
-          : undefined
-      }
+      onKeyDown={keyboardSelection?.onKeyDown}
+      onKeyUp={keyboardSelection?.onKeyUp}
+      onBlur={keyboardSelection?.onBlur}
     >
       {viewerBody}
     </div>

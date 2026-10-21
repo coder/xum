@@ -5,7 +5,7 @@ import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getDefaultRightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import {
   LEFT_SIDEBAR_COLLAPSED_KEY,
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getRightSidebarLayoutKey,
@@ -145,7 +145,7 @@ function createWorkflowFixture(initialRun: WorkflowRunRecord, sidebarWidth = 480
         ],
       });
       updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarCollapsedKey(WORKSPACE_ID), false);
       updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "workflows");
       updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, sidebarWidth);
       updatePersistedState(

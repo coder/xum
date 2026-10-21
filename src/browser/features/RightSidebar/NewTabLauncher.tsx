@@ -26,8 +26,8 @@ interface NewTabLauncherProps {
   onOpenSideChat?: () => void;
   creatingSideChat: boolean;
   /**
-   * Focus the first row once shown. Set only when the user asked for a New tab (its row in the
-   * All tabs menu or the shortcut), never for the New tab a fresh workspace starts with, so the
+   * Focus the first row once shown. Set only when the user asked for a New tab (the strip's "+"
+   * button or the shortcut), never for the New tab a fresh workspace starts with, so the
    * launcher does not steal focus from the chat input.
    */
   autoFocus: boolean;

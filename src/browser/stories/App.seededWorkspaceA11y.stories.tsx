@@ -60,7 +60,7 @@ function renderSeededClient() {
     ],
   });
   expandLeftSidebar();
-  expandRightSidebar();
+  expandRightSidebar("ws-a11y-seeded");
   return client;
 }
 
@@ -85,7 +85,7 @@ async function expectOneMainLandmark(canvasElement: HTMLElement) {
   await expect(within(mains[0]).queryByRole("contentinfo")).toBeNull();
 }
 
-/** Space between the right sidebar's tab row and the All tabs button. */
+/** Space between the right sidebar's tab row and its "+" (New tab) button. */
 const TAB_GAP_PX = 4;
 
 /** WCAG 2.2 target-size minimum (Lighthouse `target-size`). */
@@ -98,7 +98,8 @@ async function expectSeededPageAudits(canvasElement: HTMLElement) {
   const composer = await canvas.findByRole("textbox", { name: "Message" }, { timeout: 15_000 });
   await expect(composer).not.toHaveAttribute("aria-expanded");
 
-  // aria-required-children: the tablist owns only tabs. The All tabs button stays next to it.
+  // aria-required-children: the tablist owns only tabs. The "+" and All tabs buttons stay next
+  // to it.
   const tablist = await canvas.findByRole("tablist", { name: "Sidebar views" });
   await expect(within(tablist).getAllByRole("tab").length).toBeGreaterThan(0);
   const nonTabChildren = Array.from(
@@ -107,20 +108,28 @@ async function expectSeededPageAudits(canvasElement: HTMLElement) {
     .filter((element) => element.closest('[role="tab"]') === null)
     .map((element) => element.getAttribute("aria-label") ?? element.outerHTML.slice(0, 80));
   await expect(nonTabChildren).toEqual([]);
-  const tabStrip = tablist.parentElement;
+  // The row sits in a wrapper that holds its desktop no-drag region.
+  const tabStrip = tablist.parentElement?.parentElement;
   if (!tabStrip) throw new Error("Tab strip not rendered");
+  const newTab = within(tabStrip).getByRole("button", { name: "New tab" });
   const allTabs = within(tabStrip).getByRole("button", { name: "All tabs" });
   // The sidebar fades in, so wait for it before checking visibility.
   await waitFor(() => expect(allTabs).toBeVisible());
   // The tablist renders its own box: Safari has dropped the role of `display: contents`
   // elements, which have no client rects (#5962).
   await expect(tablist.getClientRects().length).toBeGreaterThan(0);
-  // It stays beside the scrolling row, not after an offscreen last tab.
+  // They stay beside the scrolling row, not after an offscreen last tab.
   const row = tablist.getBoundingClientRect();
+  const plus = newTab.getBoundingClientRect();
   const menu = allTabs.getBoundingClientRect();
-  await expect(menu.left).toBeGreaterThanOrEqual(row.right + TAB_GAP_PX - 1);
+  await expect(Math.abs(plus.left - (row.right + TAB_GAP_PX))).toBeLessThan(1);
+  await expect(menu.left).toBeGreaterThanOrEqual(plus.right + TAB_GAP_PX - 1);
   await expect(menu.right).toBeLessThanOrEqual(tabStrip.getBoundingClientRect().right);
-  await expect(Math.abs(menu.top + menu.height / 2 - (row.top + row.height / 2))).toBeLessThan(1);
+  for (const button of [plus, menu]) {
+    await expect(
+      Math.abs(button.top + button.height / 2 - (row.top + row.height / 2))
+    ).toBeLessThan(1);
+  }
 
   // button-name: icon-only and combobox triggers need a name of their own.
   await expect(await canvas.findByRole("button", { name: "Open in editor" })).toBeVisible();
@@ -195,27 +204,31 @@ const narrowSidebarStory = (theme: ThemeMode): AppStory => ({
     );
     await expect(tablist.getClientRects().length).toBeGreaterThan(0);
     const tabs = within(tablist).getAllByRole("tab");
+    const newTab = within(sidebar).getByRole("button", { name: "New tab" });
     const allTabs = within(sidebar).getByRole("button", { name: "All tabs" });
     await waitFor(() => expect(allTabs).toBeVisible());
     const bounds = sidebar.getBoundingClientRect();
-    for (const element of [tablist, allTabs]) {
+    for (const element of [tablist, newTab, allTabs]) {
       const rect = element.getBoundingClientRect();
       await expect(rect.left).toBeGreaterThanOrEqual(bounds.left);
       await expect(rect.right).toBeLessThanOrEqual(bounds.right);
     }
     await expect(tablist.scrollWidth).toBeGreaterThan(tablist.clientWidth);
     const rows = new Set(
-      [...tabs, allTabs].map((element) => {
+      [...tabs, newTab, allTabs].map((element) => {
         const rect = element.getBoundingClientRect();
         return Math.round(rect.top + rect.height / 2);
       })
     );
     await expect(rows.size).toBe(1);
+    await expect(tablist).not.toContainElement(newTab);
     await expect(tablist).not.toContainElement(allTabs);
-    // The overflowing row fills the strip up to All tabs.
+    // The overflowing row fills the strip up to "+", and All tabs follows it.
     const row = tablist.getBoundingClientRect();
+    const plus = newTab.getBoundingClientRect();
     const menu = allTabs.getBoundingClientRect();
-    await expect(Math.abs(menu.left - (row.right + TAB_GAP_PX))).toBeLessThan(1);
+    await expect(Math.abs(plus.left - (row.right + TAB_GAP_PX))).toBeLessThan(1);
+    await expect(Math.abs(menu.left - (plus.right + TAB_GAP_PX))).toBeLessThan(1);
   },
 });
 
@@ -312,7 +325,7 @@ const LANDMARK_LAYOUTS: Record<
         ],
         gitDiff: { diffOutput: REVIEW_DIFF, numstatOutput: REVIEW_NUMSTAT },
       });
-      expandRightSidebar();
+      expandRightSidebar(REVIEW_WORKSPACE_ID);
       // Immersive mode is persisted per workspace, so start each story with the chat showing.
       updatePersistedState(getReviewImmersiveKey(REVIEW_WORKSPACE_ID), false);
       return client;

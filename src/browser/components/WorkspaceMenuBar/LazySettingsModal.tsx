@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { MODAL_DIALOG_OVERLAY_ATTRIBUTE } from "@/browser/utils/ui/keybinds";
+import type { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import { LazyFeature } from "../LazyFeature/LazyFeature";
 import { Dialog, DialogContent, DialogTitle } from "../Dialog/Dialog";
 
@@ -12,6 +13,8 @@ export function LazySettingsModal(props: {
   open: boolean;
   /** Escape or a click outside the loading dialog cancels the open. */
   onClose: () => void;
+  /** Returns focus to the opener when the loading dialog closes (useModalFocusReturn). */
+  focusReturn?: ReturnType<typeof useModalFocusReturn>;
   children: React.ReactNode;
 }) {
   const [mounted, setMounted] = useState(false);
@@ -24,7 +27,12 @@ export function LazySettingsModal(props: {
     <>
       <div {...{ [MODAL_DIALOG_OVERLAY_ATTRIBUTE]: "" }} data-state="open" hidden />
       <Dialog open onOpenChange={(open) => !open && props.onClose()}>
-        <DialogContent aria-describedby={undefined} aria-busy showCloseButton={false}>
+        <DialogContent
+          aria-describedby={undefined}
+          aria-busy
+          showCloseButton={false}
+          {...props.focusReturn}
+        >
           <DialogTitle>{props.name}</DialogTitle>
           <p className="text-muted text-sm">Loading…</p>
         </DialogContent>

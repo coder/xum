@@ -31,6 +31,26 @@ function canLoadFontFamily(primary: string, fontSize: number): boolean {
   return isFontFamilyAvailableInBrowser(family, fontSize);
 }
 
+/**
+ * Undoes the focus ghostty-web takes when it opens a terminal that must not take it. Blurring
+ * alone leaves focus on the page body, where keystrokes reach the chat: for example after the
+ * right sidebar's toggle expanded a sidebar showing a terminal, the toggle loses focus. Focus goes
+ * back to the element that had it, unless something else took it since.
+ */
+function blurAndRestoreFocus(terminal: Terminal, container: HTMLElement, previous: Element | null) {
+  const terminalHadFocus = container.contains(document.activeElement);
+  terminal.blur();
+  if (
+    terminalHadFocus &&
+    previous instanceof HTMLElement &&
+    previous !== document.body &&
+    previous.isConnected &&
+    !container.contains(previous)
+  ) {
+    previous.focus({ preventScroll: true });
+  }
+}
+
 function resolveTerminalFontFamily(fontFamily: string, fontSize: number): string {
   const formatted = formatCssFontFamilyList(fontFamily);
   const parts = splitFontFamilyList(fontFamily).map(stripOuterQuotes).filter(Boolean);
@@ -512,6 +532,8 @@ export function TerminalView({
         const fitAddon = new FitAddon();
         terminal.loadAddon(fitAddon);
 
+        // open() focuses the terminal; without autoFocus, focus goes back to this below.
+        const focusBeforeOpen = document.activeElement;
         terminal.open(containerEl);
         fitAddon.fit();
 
@@ -584,12 +606,12 @@ export function TerminalView({
             textarea.focus();
           }
         } else {
-          // Blur immediately
-          terminal.blur();
-          // Counter the delayed focus() in ghostty-web
           const termToBlur = terminal;
+          // Blur immediately
+          blurAndRestoreFocus(termToBlur, containerEl, focusBeforeOpen);
+          // Counter the delayed focus() in ghostty-web
           setTimeout(() => {
-            termToBlur.blur();
+            blurAndRestoreFocus(termToBlur, containerEl, focusBeforeOpen);
           }, 0);
         }
 

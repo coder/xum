@@ -27,7 +27,7 @@ import assert from "@/common/utils/assert";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   normalizeTerminalBadgeConfig,
 } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -191,14 +191,8 @@ import {
   type BaseTabType,
 } from "@/browser/features/RightSidebar/Tabs/tabConfig";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
-import {
-  getEffectiveSlotKeybind,
-  getLayoutsConfigOrDefault,
-  getPresetForSlot,
-} from "@/browser/utils/uiLayouts";
 import { formatProjectHierarchyLabel, getTopLevelProjectEntries } from "@/common/utils/subProjects";
 import { serverPathLabel } from "@/common/utils/paths";
-import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLayouts";
 import {
   hasTab,
   openToolFromNewTab,
@@ -338,15 +332,6 @@ export interface BuildSourcesParams {
   /** Desktop-only bridge (window.api.remoteConnection); absent in browser mode and server windows. */
   remoteConnection?: RemoteConnectionApi;
 
-  // Layout slots
-  layoutPresets?: LayoutPresetsConfig | null;
-  onApplyLayoutSlot?: (workspaceId: string, slot: LayoutSlotNumber) => void;
-  /** Errs with a user-facing message when the layout cannot be saved. */
-  onCaptureLayoutSlot?: (
-    workspaceId: string,
-    slot: LayoutSlotNumber,
-    name: string
-  ) => Promise<Result<void>>;
   onClearTimingStats?: (workspaceId: string) => void;
 }
 
@@ -356,7 +341,6 @@ export interface BuildSourcesParams {
  */
 export const COMMAND_SECTIONS = {
   WORKSPACES: "Workspaces",
-  LAYOUTS: "Layouts",
   NAVIGATION: "Navigation",
   CHAT: "Chat",
   MODE: "Modes & Model",
@@ -368,7 +352,6 @@ export const COMMAND_SECTIONS = {
 } as const;
 
 const section = {
-  layouts: COMMAND_SECTIONS.LAYOUTS,
   workspaces: COMMAND_SECTIONS.WORKSPACES,
   navigation: COMMAND_SECTIONS.NAVIGATION,
   chat: COMMAND_SECTIONS.CHAT,
@@ -489,7 +472,7 @@ function buildToggleTabCommand(
     run: () => {
       updateRightSidebarLayout(workspaceId, (s) => toggleTab(s, tabId as TabType));
       if (!visible) {
-        updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+        updatePersistedState<boolean>(getRightSidebarCollapsedKey(workspaceId), false);
       }
     },
   };
@@ -1173,7 +1156,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           title: "Right Sidebar: Split Horizontally",
           section: section.navigation,
           run: () => {
-            updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            updatePersistedState(getRightSidebarCollapsedKey(wsId), false);
             updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "horizontal"));
           },
         },
@@ -1182,7 +1165,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           title: "Right Sidebar: Split Vertically",
           section: section.navigation,
           run: () => {
-            updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            updatePersistedState(getRightSidebarCollapsedKey(wsId), false);
             updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical"));
           },
         },
@@ -1249,7 +1232,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
 
               // Same as picking the tool in the focused pane's New tab: it takes the New tab's
               // place, or is selected where it is already open.
-              updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+              updatePersistedState(getRightSidebarCollapsedKey(wsId), false);
               updateRightSidebarLayout(wsId, (s) => openToolFromNewTab(s, s.focusedTabsetId, tool));
               // While the sidebar is hidden (phones) that tab cannot be seen, so WorkspaceMenuBar
               // shows it in the full-screen sidebar; with the sidebar visible it ignores the event.
@@ -1263,75 +1246,6 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           },
         }
       );
-    }
-
-    return list;
-  });
-
-  // Layout slots
-  actions.push(() => {
-    const list: CommandAction[] = [];
-    const selected = p.selectedWorkspace;
-    if (!selected) {
-      return list;
-    }
-
-    const config = getLayoutsConfigOrDefault(p.layoutPresets);
-
-    for (const slot of [1, 2, 3, 4, 5, 6, 7, 8, 9] as const) {
-      const preset = getPresetForSlot(config, slot);
-      const keybind = getEffectiveSlotKeybind(config, slot);
-      assert(keybind, `Slot ${slot} must have a default keybind`);
-      const shortcutHint = formatKeybind(keybind);
-
-      list.push({
-        id: CommandIds.layoutApplySlot(slot),
-        title: `Layout: Apply Slot ${slot}`,
-        subtitle: preset ? preset.name : "Empty",
-        section: section.layouts,
-        shortcutHint,
-        enabled: () => Boolean(preset) && Boolean(p.onApplyLayoutSlot),
-        run: () => {
-          if (!preset) return;
-          void p.onApplyLayoutSlot?.(selected.workspaceId, slot);
-        },
-      });
-
-      if (p.onCaptureLayoutSlot) {
-        list.push({
-          id: CommandIds.layoutCaptureSlot(slot),
-          title: `Layout: Capture current to Slot ${slot}…`,
-          subtitle: preset ? preset.name : "Empty",
-          section: section.layouts,
-          run: () => undefined,
-          prompt: {
-            title: `Capture Layout Slot ${slot}`,
-            fields: [
-              {
-                type: "text",
-                name: "name",
-                label: "Name",
-                placeholder: `Slot ${slot}`,
-                initialValue: preset ? preset.name : `Slot ${slot}`,
-                getInitialValue: () => getPresetForSlot(config, slot)?.name ?? `Slot ${slot}`,
-                validate: (v) => (!v.trim() ? "Name is required" : null),
-              },
-            ],
-            onSubmit: async (vals) => {
-              const result = await p.onCaptureLayoutSlot?.(
-                selected.workspaceId,
-                slot,
-                vals.name.trim()
-              );
-              // The palette has already closed and ignores the submit promise, so a toast is the
-              // only way the user learns the capture was refused.
-              if (result && !result.success) {
-                showCommandFeedbackToast({ type: "error", message: result.error });
-              }
-            },
-          },
-        });
-      }
     }
 
     return list;

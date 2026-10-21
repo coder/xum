@@ -58,12 +58,16 @@ test(
       "open Settings > Plugins and open the hook review of the hook-guard plugin. Only look: do " +
         "not click Trust, Turn off or any other button in the review."
     );
-    // Only the PreToolUse hook: the user never trusted the others, so they still need review,
-    // and a judge read "hook-guard" as all of them (first run).
-    await agent.assert(
-      "Xum does not ask to allow or review the PreToolUse hook of hook-guard again, and that " +
-        "hook is trusted. Its other hooks were never trusted, so they may still need review."
-    );
+    // The exact checks first, then the judge: the judge sees one screen.
     await expectTrusted();
+    // Only what the screen shows now. A claim about a later prompt ("does not ask again") made
+    // the judge answer ASSERTION_INCONCLUSIVE in a merge-queue run (#7070 item 6). Only the
+    // PreToolUse hook: the user never trusted the others, so they still need review, and a judge
+    // read "hook-guard" as all of them (first run).
+    await agent.assert(
+      "In the hook review of the hook-guard plugin, its PreToolUse hook (MCP tool guard / " +
+        "check_command) shows as trusted, with no Trust button for it. Its other hooks can still " +
+        "show that they need review."
+    );
   }
 );

@@ -67,9 +67,9 @@ function setupDesktopStory(phone = false): APIClient {
   updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, 320);
   for (const workspaceId of [CALLER_ID, isolatedWorkspace.id]) {
     updatePersistedState(getRightSidebarLayoutKey(workspaceId), undefined);
+    expandRightSidebar(workspaceId);
   }
   expandProjects([isolatedWorkspace.projectPath]);
-  expandRightSidebar();
   return client;
 }
 
