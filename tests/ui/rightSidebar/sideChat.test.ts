@@ -21,7 +21,7 @@ import { collectAllTabsWithTabset, dockTabToEdge } from "@/browser/utils/rightSi
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { makeSideChatTabType } from "@/browser/types/rightSidebar";
 
-import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
+import { getRightSidebarCollapsedKey, getRightSidebarLayoutKey } from "@/common/constants/storage";
 import { updatePersistedState, readPersistedState } from "@/browser/hooks/usePersistedState";
 import { collectAllTabs, type RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { getRetryBarrierDerivation } from "@/browser/components/ChatPane/retryBarrierDerivation";
@@ -139,7 +139,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       branchPrefix: "side-launcher",
       beforeRender: (workspaceId) => {
         // This test exercises the expanded launcher's panes, not the collapsed overview.
-        updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+        updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
         updatePersistedState(getRightSidebarLayoutKey(workspaceId), {
           version: 1,
           openTabsOnly: true,
@@ -238,7 +238,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
   test("the launcher prevents duplicate requests and remains usable after creation fails", async () => {
     const app = await createAppHarness({
       branchPrefix: "side-launcher-retry",
-      beforeRender: () => updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false),
+      beforeRender: (workspaceId) =>
+        updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false),
     });
     const service = app.env.services.toORPCContext().workspaceService;
     const create = jest.spyOn(service, "createSideChat");

@@ -52,7 +52,7 @@ function setupEmptyStatsWithTutorial() {
     userPreferences: { ui: { sidebarFlatMode: true, tutorialState: { disabled: false } } },
   });
   expandLeftSidebar();
-  expandRightSidebar();
+  expandRightSidebar(WORKSPACE_ID);
   updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "costs");
   // The per-workspace layout remembers the last tab across stories; drop it so "costs" applies.
   updatePersistedState(getRightSidebarLayoutKey(WORKSPACE_ID), null);

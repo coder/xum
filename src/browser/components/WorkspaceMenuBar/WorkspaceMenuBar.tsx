@@ -6,7 +6,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { cn } from "@/common/lib/utils";
 import { isWorkspacePinned } from "@/common/utils/pin";
 
-import { RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
+import { getRightSidebarCollapsedKey } from "@/common/constants/storage";
 import {
   getUserPreferences,
   updateUserPreferences,
@@ -243,7 +243,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const stopRuntimeError = usePopoverError();
 
   const [rightSidebarCollapsed] = usePersistedState<boolean>(
-    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    getRightSidebarCollapsedKey(workspaceId),
     RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
     {
       // This state is toggled from RightSidebar, so we need cross-component updates.

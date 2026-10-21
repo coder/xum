@@ -24,7 +24,7 @@ import { UILayoutsProvider } from "@/browser/contexts/UILayoutsContext";
 import { WorkspaceProvider } from "@/browser/contexts/WorkspaceContext";
 import { SplashScreenProvider } from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { TerminalRouterProvider } from "@/browser/terminal/TerminalRouterContext";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
@@ -50,7 +50,6 @@ import {
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   SELECTED_WORKSPACE_KEY,
@@ -314,7 +313,7 @@ export const CostsTab: Story = {
           ],
           sessionUsage: createSessionUsage(0.56),
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-costs");
         return client;
       }}
     >
@@ -376,7 +375,7 @@ export const CostsTabWithCacheCreate: Story = {
             version: 1,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-cache-create");
         return client;
       }}
     >
@@ -445,7 +444,7 @@ export const CostsTabMultiModel: Story = {
             version: 1,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-multi-model");
         return client;
       }}
     >
@@ -486,7 +485,7 @@ export const ReviewTab: Story = {
           ],
           sessionUsage: createSessionUsage(0.42),
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-review");
         return client;
       }}
     >
@@ -534,7 +533,7 @@ export const StatsTabIdle: Story = {
           ],
           sessionUsage: createSessionUsage(0.25),
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-stats-idle");
         return client;
       }}
     >
@@ -578,7 +577,7 @@ export const StatsTabStreaming: Story = {
           historySequence: 2,
           streamText: "I'll create a test suite for you. Let me start by analyzing...",
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-stats-streaming");
         return client;
       }}
     >
@@ -722,7 +721,7 @@ export const ReviewTabSortByLastEdit: Story = {
             numstatOutput: SAMPLE_NUMSTAT_OUTPUT,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-review-sort");
         return client;
       }}
     >
@@ -793,7 +792,7 @@ export const ReviewTabSortByFileOrder: Story = {
             numstatOutput: SAMPLE_NUMSTAT_OUTPUT,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-review-file-order");
         return client;
       }}
     >
@@ -890,7 +889,7 @@ export const DiffPaddingAlignment: Story = {
             numstatOutput: ALIGNMENT_TEST_NUMSTAT,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-diff-alignment");
         return client;
       }}
     >
@@ -967,7 +966,7 @@ export const DiffPaddingAlignmentModification: Story = {
             numstatOutput: MODIFICATION_NUMSTAT,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-diff-modification");
         return client;
       }}
     >
@@ -1080,7 +1079,7 @@ export const ReviewTabReadMore: Story = {
             fileContents: new Map([["src/components/Button.tsx", BUTTON_FILE_CONTENT]]),
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-read-more");
         return client;
       }}
     >
@@ -1146,7 +1145,7 @@ export const ReviewTabWithFileFilter: Story = {
             numstatOutput: SAMPLE_NUMSTAT_OUTPUT,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-review-file-filter");
         return client;
       }}
     >
@@ -1230,7 +1229,7 @@ export const ReviewTabReadMoreBoundaries: Story = {
             fileContents: new Map([["src/utils/math.ts", SMALL_FILE_CONTENT]]),
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-read-more-boundaries");
         return client;
       }}
     >
@@ -1272,7 +1271,7 @@ export const ReviewTabWithUntrackedFiles: Story = {
             ],
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-untracked");
         return client;
       }}
     >
@@ -1362,7 +1361,7 @@ export const CompactionModelWarning: Story = {
             version: 1,
           },
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-compact-warning");
         return client;
       }}
     >
@@ -1471,7 +1470,7 @@ export const OutputTabEmpty: Story = {
           messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
           logEntries: [],
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-output-empty");
         return client;
       }}
     >
@@ -1505,7 +1504,7 @@ export const OutputTabWithLogs: Story = {
           messages: [createUserMessage("msg-1", "Show logs", { historySequence: 1 })],
           logEntries: createOutputLogEntries(),
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-output-logs");
         return client;
       }}
     >
@@ -1534,7 +1533,7 @@ export const OutputTabErrorsOnly: Story = {
           messages: [createUserMessage("msg-1", "Check errors", { historySequence: 1 })],
           logEntries: createOutputLogEntries(),
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-output-errors");
         return client;
       }}
     >
@@ -1566,7 +1565,7 @@ export const NewTabLauncher: Story = {
         });
         // The keyboard play opens Workflows, not just its launcher row.
         client.workflows.listScripts = () => Promise.resolve([]);
-        expandRightSidebar();
+        expandRightSidebar("ws-new-tab");
         return client;
       }}
     >
@@ -1671,7 +1670,7 @@ export const NewTabLauncherNarrow: Story = {
           sessionUsage: createSessionUsage(0.12),
           logEntries: [],
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-new-tab-narrow");
         return client;
       }}
     >
@@ -1730,7 +1729,7 @@ export const ManyTabsSingleRow: Story = {
           messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
           sessionUsage: createSessionUsage(0.34),
         });
-        expandRightSidebar();
+        expandRightSidebar("ws-many-tabs");
         return client;
       }}
     >
@@ -1776,7 +1775,7 @@ export const TabsReachableUnderWideTitlebarInset: Story = {
             projectName: "my-app",
             messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
           });
-          expandRightSidebar();
+          expandRightSidebar("ws-wide-inset");
           return client;
         }}
       >
@@ -1868,8 +1867,8 @@ export const CollapsedOverview: Story = {
           ],
         });
         collapseLeftSidebar();
-        // Exercise the app's default, not the helper's explicitly collapsed preference.
-        updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
+        // Exercise the app's default: no saved collapsed flag for the workspace.
+        collapseRightSidebar();
         return client;
       }}
     />

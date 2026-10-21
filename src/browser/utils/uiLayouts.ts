@@ -15,7 +15,7 @@ import {
   getRightSidebarLayoutKey,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   LEFT_SIDEBAR_WIDTH_KEY,
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   RIGHT_SIDEBAR_WIDTH_KEY,
 } from "@/common/constants/storage";
 import {
@@ -92,8 +92,11 @@ export function resolveRightSidebarWidthPx(width: RightSidebarWidthPreset): numb
   return clampInt(viewportWidth * width.value, 300, 1200);
 }
 
-function readCurrentRightSidebarCollapsed(): boolean {
-  return readPersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, RIGHT_SIDEBAR_DEFAULT_COLLAPSED);
+function readCurrentRightSidebarCollapsed(workspaceId: string): boolean {
+  return readPersistedState<boolean>(
+    getRightSidebarCollapsedKey(workspaceId),
+    RIGHT_SIDEBAR_DEFAULT_COLLAPSED
+  );
 }
 
 function readCurrentRightSidebarWidthPx(): number {
@@ -250,7 +253,7 @@ export function createPresetFromCurrentWorkspace(
 
   const leftSidebarCollapsed = readCurrentLeftSidebarCollapsed();
   const leftSidebarWidthPx = readCurrentLeftSidebarWidthPx();
-  const rightSidebarCollapsed = readCurrentRightSidebarCollapsed();
+  const rightSidebarCollapsed = readCurrentRightSidebarCollapsed(workspaceId);
   const rightSidebarWidthPx = readCurrentRightSidebarWidthPx();
   const rightSidebarLayout = readRightSidebarLayout(workspaceId);
 
@@ -427,7 +430,10 @@ export async function applyLayoutPresetToWorkspace(
       clampInt(preset.leftSidebarWidthPx, 200, 600)
     );
   }
-  updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, preset.rightSidebar.collapsed);
+  updatePersistedState<boolean>(
+    getRightSidebarCollapsedKey(workspaceId),
+    preset.rightSidebar.collapsed
+  );
   updatePersistedState<number>(
     RIGHT_SIDEBAR_WIDTH_KEY,
     resolveRightSidebarWidthPx(preset.rightSidebar.width)

@@ -5,7 +5,7 @@ import { Button } from "../Button/Button";
 import { LazyFeature } from "../LazyFeature/LazyFeature";
 import {
   LEFT_SIDEBAR_WIDTH_KEY,
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getReviewImmersiveKey,
 } from "@/common/constants/storage";
@@ -268,12 +268,21 @@ function LazyRightSidebar(
  * (RightSidebar listens to the same persisted key). Immersive review covers the sidebar it
  * toggles, so it is not there then.
  */
-function ShellRightSidebarToggle(props: { collapsed: boolean; immersive: boolean }) {
+function ShellRightSidebarToggle(props: {
+  workspaceId: string;
+  collapsed: boolean;
+  immersive: boolean;
+}) {
   if (props.immersive) return null;
   return (
     <RightSidebarToggle
       collapsed={props.collapsed}
-      onToggle={() => updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, !props.collapsed)}
+      onToggle={() =>
+        updatePersistedState<boolean>(
+          getRightSidebarCollapsedKey(props.workspaceId),
+          !props.collapsed
+        )
+      }
     />
   );
 }
@@ -321,7 +330,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   // from the first paint, read from state rather than from the card element: the sidebar chunk
   // loads lazily, and keying on the card would shift the transcript once it mounts.
   const [rightSidebarCollapsed] = usePersistedState<boolean>(
-    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    getRightSidebarCollapsedKey(props.workspaceId),
     RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
     {
       listener: true,
@@ -373,7 +382,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
     // Like Codex desktop: dragging the handle far enough right collapses the sidebar into its
     // overview card (and back out reopens it). RightSidebar listens to the same persisted key.
     onDragCollapseChange: (collapsed) => {
-      updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, collapsed);
+      updatePersistedState<boolean>(getRightSidebarCollapsedKey(props.workspaceId), collapsed);
     },
   });
 
@@ -443,7 +452,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
     fullscreenReturnFocusRef.current = returnFocusTo;
     // Opening the sidebar expands it, like every other way to open it (tab shortcuts, "Open in
     // Artifacts"). A collapsed sidebar would unmount its panels each time the view closes.
-    updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+    updatePersistedState(getRightSidebarCollapsedKey(props.workspaceId), false);
     setFullscreenSidebarWorkspaceId(props.workspaceId);
   };
   const handleRequestSidebarFullscreen = () => {
@@ -546,7 +555,11 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
       />
 
       {/* Between the chat and the sidebar, for Tab order. */}
-      <ShellRightSidebarToggle collapsed={rightSidebarCollapsed} immersive={isReviewImmersive} />
+      <ShellRightSidebarToggle
+        workspaceId={props.workspaceId}
+        collapsed={rightSidebarCollapsed}
+        immersive={isReviewImmersive}
+      />
 
       <LazyRightSidebar
         held={heldSidebarInput}

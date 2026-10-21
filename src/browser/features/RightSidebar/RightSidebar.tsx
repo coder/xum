@@ -3,7 +3,7 @@ import { addWindowListenerWhile } from "@/browser/utils/events";
 import React from "react";
 import { X } from "lucide-react";
 import {
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   RIGHT_SIDEBAR_TAB_KEY,
   getReviewImmersiveKey,
   TERMINAL_TITLES_MAX_CHARS,
@@ -1317,10 +1317,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // or app crash.
   const terminalCreateError = usePopoverError();
 
-  // Manual collapse state (persisted globally)
+  // Manual collapse state, persisted per workspace so a new workspace starts collapsed.
   // WorkspaceShell expands it when it opens the phone full-screen view (see there).
   const [collapsed, setCollapsed] = usePersistedState<boolean>(
-    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    getRightSidebarCollapsedKey(workspaceId),
     RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
     {
       listener: true,
@@ -1481,7 +1481,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   );
 
   // Layout is per-workspace so each workspace can have its own split/tab configuration
-  // (e.g., different numbers of terminals). Width and collapsed state remain global.
+  // (e.g., different numbers of terminals). Width remains global.
   const layoutKey = getRightSidebarLayoutKey(workspaceId);
   const [layoutRaw, setLayoutRaw] = usePersistedState<RightSidebarLayoutState>(
     layoutKey,

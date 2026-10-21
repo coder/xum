@@ -562,10 +562,21 @@ export const MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY = "mobile-left-sidebar:scroll-to
 export const RIGHT_SIDEBAR_TAB_KEY = "right-sidebar-tab";
 
 /**
- * Right sidebar collapsed state (global, manual toggle)
+ * Legacy global right sidebar collapsed state, replaced by getRightSidebarCollapsedKey.
+ * Never read or written again; still registered so the stored value is accounted for.
  * Format: "right-sidebar:collapsed"
  */
-export const RIGHT_SIDEBAR_COLLAPSED_KEY = "right-sidebar:collapsed";
+export const LEGACY_RIGHT_SIDEBAR_COLLAPSED_KEY = "right-sidebar:collapsed";
+
+/**
+ * Right sidebar collapsed state per workspace (manual toggle). Per workspace so a new workspace
+ * starts collapsed (RIGHT_SIDEBAR_DEFAULT_COLLAPSED) instead of inheriting an open sidebar from
+ * the last workspace, where it would only show the New tab launcher.
+ * Format: "right-sidebar:workspace-collapsed:{workspaceId}"
+ */
+export function getRightSidebarCollapsedKey(workspaceId: string): string {
+  return `right-sidebar:workspace-collapsed:${workspaceId}`;
+}
 
 /**
  * Right sidebar width (unified across all tabs)
@@ -576,7 +587,7 @@ export const RIGHT_SIDEBAR_WIDTH_KEY = "right-sidebar:width";
 /**
  * Get the localStorage key for right sidebar dock-lite layout per workspace.
  * Each workspace can have its own split/tab configuration (e.g., different
- * numbers of terminals). Width and collapsed state remain global.
+ * numbers of terminals). Width remains global.
  * Format: "right-sidebar:layout:{workspaceId}"
  */
 export function getRightSidebarLayoutKey(workspaceId: string): string {
@@ -888,6 +899,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getPinnedTodoExpandedKey, "ui", false, 16),
   workspaceKey(getSubAgentTasksExpandedKey, "ui", false, 16),
   workspaceKey(getRightSidebarLayoutKey, "ui", false, RIGHT_SIDEBAR_LAYOUT_MAX_CHARS),
+  workspaceKey(getRightSidebarCollapsedKey, "ui", false, 16),
   // Record<terminalSessionId, title>, pruned when sessions close.
   workspaceKey(getTerminalTitlesKey, "ui", false, TERMINAL_TITLES_MAX_CHARS),
   workspaceKey(getReviewFileFilterKey, "ui", false, 512),
@@ -914,7 +926,9 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY, "ui", 32),
   // Legacy global tab; still read as a fallback for the per-workspace layout.
   globalKey(RIGHT_SIDEBAR_TAB_KEY, "ui", 64),
-  globalKey(RIGHT_SIDEBAR_COLLAPSED_KEY, "ui", 16),
+  // Legacy global flag, now per workspace (getRightSidebarCollapsedKey). Never written again, so
+  // no budget (0).
+  globalKey(LEGACY_RIGHT_SIDEBAR_COLLAPSED_KEY, "ui", 0),
   globalKey(RIGHT_SIDEBAR_WIDTH_KEY, "ui", 16),
   globalKey(REMOTE_CONNECTION_URL_KEY, "ui", 2048),
   // Server tokens have no length limit elsewhere; a token kept only in memory would log the user

@@ -16,7 +16,7 @@ import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   LEFT_SIDEBAR_COLLAPSED_KEY,
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   getRightSidebarLayoutKey,
 } from "@/common/constants/storage";
 import type { WorkflowRunRecord, WorkflowRunStreamEvent } from "@/common/types/workflow";
@@ -85,7 +85,7 @@ function setup(layout: RightSidebarLayoutState = LAYOUT, workspaceId = WORKSPACE
   });
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
   // Start without a preference: the default is collapsed, but the phone view must still open.
-  updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
+  updatePersistedState(getRightSidebarCollapsedKey(workspaceId), null);
   updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
   // The Browser tool polls for sessions; this story has none.
   client.browser = {
@@ -183,7 +183,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
     await expect(leftSidebar?.closest("[inert]")).toBeNull();
     await expect(toggleBar?.closest("[inert]")).toBeNull();
     // Opening the view expanded the sidebar (it was collapsed), so its panels stay mounted.
-    await expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+    await expect(readPersistedState(getRightSidebarCollapsedKey(WORKSPACE_ID), true)).toBe(false);
 
     // Reopening shows the tab used last, the same panel instance, not a remounted copy.
     await openSidebarFromMenu(canvasElement);

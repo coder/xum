@@ -27,7 +27,7 @@ import assert from "@/common/utils/assert";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   normalizeTerminalBadgeConfig,
 } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -489,7 +489,7 @@ function buildToggleTabCommand(
     run: () => {
       updateRightSidebarLayout(workspaceId, (s) => toggleTab(s, tabId as TabType));
       if (!visible) {
-        updatePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+        updatePersistedState<boolean>(getRightSidebarCollapsedKey(workspaceId), false);
       }
     },
   };
@@ -1173,7 +1173,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           title: "Right Sidebar: Split Horizontally",
           section: section.navigation,
           run: () => {
-            updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            updatePersistedState(getRightSidebarCollapsedKey(wsId), false);
             updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "horizontal"));
           },
         },
@@ -1182,7 +1182,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           title: "Right Sidebar: Split Vertically",
           section: section.navigation,
           run: () => {
-            updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            updatePersistedState(getRightSidebarCollapsedKey(wsId), false);
             updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical"));
           },
         },
@@ -1249,7 +1249,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
 
               // Same as picking the tool in the focused pane's New tab: it takes the New tab's
               // place, or is selected where it is already open.
-              updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+              updatePersistedState(getRightSidebarCollapsedKey(wsId), false);
               updateRightSidebarLayout(wsId, (s) => openToolFromNewTab(s, s.focusedTabsetId, tool));
               // While the sidebar is hidden (phones) that tab cannot be seen, so WorkspaceMenuBar
               // shows it in the full-screen sidebar; with the sidebar visible it ignores the event.

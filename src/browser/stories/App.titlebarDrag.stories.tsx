@@ -195,7 +195,7 @@ export const RightSidebarToggle = desktopStory({
     <AppWithMocks
       setup={() => {
         const client = setupWorkspace();
-        expandRightSidebar();
+        expandRightSidebar("ws-titlebar-drag");
         return client;
       }}
     />

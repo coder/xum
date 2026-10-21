@@ -4,7 +4,7 @@ import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   LEFT_SIDEBAR_COLLAPSED_KEY,
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getRightSidebarLayoutKey,
 } from "@/common/constants/storage";
@@ -32,7 +32,7 @@ function setupDesktopStory(state: DesktopStoryState, sidebarWidth = 640) {
     experiments: { [EXPERIMENT_IDS.PORTABLE_DESKTOP]: true },
   });
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
-  updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+  updatePersistedState(getRightSidebarCollapsedKey(WORKSPACE_ID), false);
   updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, sidebarWidth);
   updatePersistedState(getRightSidebarLayoutKey(WORKSPACE_ID), {
     version: 1,

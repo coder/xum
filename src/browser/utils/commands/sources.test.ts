@@ -33,7 +33,7 @@ import { withAppViewTab } from "@/browser/features/RightSidebar/AppViewTab/appVi
 import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
 
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { RIGHT_SIDEBAR_COLLAPSED_KEY, getRightSidebarLayoutKey } from "@/common/constants/storage";
+import { getRightSidebarCollapsedKey, getRightSidebarLayoutKey } from "@/common/constants/storage";
 import { focusInstructionsTab } from "@/browser/utils/instructionsTabFocus";
 import { readRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import {
@@ -2459,19 +2459,19 @@ describe("Right Sidebar: New Tab palette action", () => {
 describe("explicit sidebar navigation from a collapsed chat", () => {
   test.each([null, true])("Instructions opens with collapse preference %s", async (collapsed) => {
     await withTestWindow(() => {
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, collapsed);
+      updatePersistedState(getRightSidebarCollapsedKey("w1"), collapsed);
       focusInstructionsTab("w1");
-      expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+      expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
       expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe("instructions");
     });
   });
 
   test.each([null, true])("Add Tool opens with collapse preference %s", async (collapsed) => {
     await withTestWindow(async () => {
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, collapsed);
+      updatePersistedState(getRightSidebarCollapsedKey("w1"), collapsed);
       const action = getActions().find((entry) => entry.id === CommandIds.navRightSidebarAddTool());
       await action!.prompt!.onSubmit({ tool: "review" });
-      expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+      expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
       const layout = readRightSidebarLayout("w1");
       expect(layout.root).toMatchObject({ tabs: ["review"], activeTab: "review" });
     });
@@ -2488,7 +2488,7 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
         await getActions()
           .find((entry) => entry.id === id)!
           .run();
-        expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+        expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
         expect(readRightSidebarLayout("w1").root).toMatchObject({ type: "split", direction });
       });
     }
@@ -2512,14 +2512,14 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
         };
         await run();
         // With no session there is nothing to focus: leave the new chat collapsed.
-        expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(true);
+        expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(true);
         const layout = selectOrAddTab(
           getDefaultRightSidebarLayoutState("terminal:session-1"),
           "costs"
         );
         updatePersistedState(getRightSidebarLayoutKey("w1"), layout);
         await run();
-        expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+        expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
         expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe("terminal:session-1");
       });
     }

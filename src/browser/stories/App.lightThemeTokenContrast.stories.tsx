@@ -164,7 +164,7 @@ function setupWorkspaceWithSidebars(options: { flatSidebar: boolean }) {
   });
   // setupSimpleChatStory collapses the right sidebar; open both for this screen.
   expandLeftSidebar();
-  expandRightSidebar();
+  expandRightSidebar("ws-light-tokens");
   updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "review");
   return client;
 }
@@ -398,7 +398,7 @@ function setupCodeWorkspace(tab: "review" | "costs", withGutterReview = false) {
     },
   });
   expandLeftSidebar();
-  expandRightSidebar();
+  expandRightSidebar("ws-light-code");
   updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, tab);
   // The per-workspace layout remembers the last tab across stories; drop it so `tab` applies.
   updatePersistedState(getRightSidebarLayoutKey("ws-light-code"), null);

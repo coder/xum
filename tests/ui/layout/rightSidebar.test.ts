@@ -30,7 +30,7 @@ import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
 import { cleanupView, openSidebarNewTab, setupWorkspaceView } from "../helpers";
 import {
-  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  getRightSidebarCollapsedKey,
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getPersistedKeyRegistration,
@@ -139,7 +139,7 @@ describeIntegration("RightSidebar (UI)", () => {
   beforeEach(async () => {
     // Reset all right-sidebar persisted state so each test starts clean.
     updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
-    updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
+    updatePersistedState(getRightSidebarCollapsedKey(workspaceId), null);
     await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.AGENT_BROWSER, enabled: null });
     await env.orpc.experiments.set({
       experimentId: EXPERIMENT_IDS.PORTABLE_DESKTOP,
@@ -165,7 +165,7 @@ describeIntegration("RightSidebar (UI)", () => {
   async function setupRightSidebarView(beforeRender?: () => void) {
     const cleanupDom = installDom();
     // Most tests exercise open tools; individual tests can clear this to cover the default.
-    updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+    updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
     beforeRender?.();
     const view = renderApp({ apiClient: env.orpc, metadata });
 
@@ -247,7 +247,7 @@ describeIntegration("RightSidebar (UI)", () => {
 
   test("a fresh chat starts collapsed and opens tools only on request", async () => {
     const { view, sidebar, cleanup } = await setupRightSidebarView(() => {
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), null);
     });
 
     try {
@@ -541,7 +541,7 @@ describeIntegration("RightSidebar (UI)", () => {
   test("sidebar collapse and expand via button", async () => {
     const { view, sidebar, cleanup } = await setupRightSidebarView(() => {
       // Start expanded
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
     });
 
     try {
@@ -596,7 +596,7 @@ describeIntegration("RightSidebar (UI)", () => {
       focusedTabsetId: "tabset-bottom",
     };
     const { view, sidebar, cleanup } = await setupRightSidebarView(() => {
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
       updatePersistedState(getRightSidebarLayoutKey(workspaceId), splitLayout);
     });
 
@@ -983,7 +983,7 @@ describeIntegration("RightSidebar (UI)", () => {
 
   test("dragging the handle far right collapses into the overview card, which reopens Review", async () => {
     const { view, sidebar, cleanup } = await setupRightSidebarView(() => {
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
       seedLayout(["costs"]);
     });
 

@@ -60,7 +60,7 @@ function renderSeededClient() {
     ],
   });
   expandLeftSidebar();
-  expandRightSidebar();
+  expandRightSidebar("ws-a11y-seeded");
   return client;
 }
 
@@ -325,7 +325,7 @@ const LANDMARK_LAYOUTS: Record<
         ],
         gitDiff: { diffOutput: REVIEW_DIFF, numstatOutput: REVIEW_NUMSTAT },
       });
-      expandRightSidebar();
+      expandRightSidebar(REVIEW_WORKSPACE_ID);
       // Immersive mode is persisted per workspace, so start each story with the chat showing.
       updatePersistedState(getReviewImmersiveKey(REVIEW_WORKSPACE_ID), false);
       return client;

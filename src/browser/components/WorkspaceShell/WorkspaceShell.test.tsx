@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { act, cleanup, fireEvent, render as renderUnwrapped } from "@testing-library/react";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getReviewImmersiveKey, RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
+import { getReviewImmersiveKey, getRightSidebarCollapsedKey } from "@/common/constants/storage";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { useEffect, useSyncExternalStore, type MutableRefObject, type ReactElement } from "react";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
@@ -546,7 +546,7 @@ describe("WorkspaceShell loading placeholders", () => {
   describe("while the sidebar chunk loads", () => {
     it("reserves no sidebar width for a new chat without a saved preference", () => {
       gateSidebar();
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), null);
       const view = render(<WorkspaceShell {...defaultProps} />);
       const box = view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
       expect(box?.style.width).toBe("0px");
@@ -557,14 +557,30 @@ describe("WorkspaceShell loading placeholders", () => {
       ).toBe("true");
     });
 
+    // The collapsed flag is per workspace: a new workspace starts collapsed instead of inheriting
+    // an open sidebar (which would only show the New tab launcher), and the open one stays open.
+    it("starts a new workspace collapsed while another workspace's sidebar stays open", () => {
+      gateSidebar();
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), false);
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      const box = () => view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
+      expect(box()?.style.width).not.toBe("0px");
+
+      view.rerender(<WorkspaceShell {...defaultProps} workspaceId="workspace-new" />);
+      expect(box()?.style.width).toBe("0px");
+
+      view.rerender(<WorkspaceShell {...defaultProps} />);
+      expect(box()?.style.width).not.toBe("0px");
+    });
+
     it("keeps the sidebar's box, empty when collapsed (the card floats, so it takes no room)", () => {
       gateSidebar();
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), true);
       const view = render(<WorkspaceShell {...defaultProps} />);
       const box = view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
       expect(view.queryByTestId("right-sidebar")).toBeNull();
       expect(box?.style.width).toBe("0px");
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), false);
     });
 
     // The toggle lives in the shell, not the lazy sidebar, so it already works while the chunk
@@ -573,7 +589,7 @@ describe("WorkspaceShell loading placeholders", () => {
     it("expands the loading sidebar from the right sidebar toggle", () => {
       const CompiledWorkspaceShell = loadCompiledWorkspaceShell();
       gateSidebar();
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), true);
       const view = render(<CompiledWorkspaceShell {...defaultProps} />);
       const box = () => view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
       expect(box()?.style.width).toBe("0px");
@@ -588,7 +604,7 @@ describe("WorkspaceShell loading placeholders", () => {
     // happened before it mounted, so the shell tells it the sidebar was collapsed until then.
     it("tells the sidebar it was collapsed when the toggle expands it before the chunk loads", async () => {
       const gate = gateSidebar();
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), true);
       const view = render(<WorkspaceShell {...defaultProps} />);
       fireEvent.click(view.getByRole("button", { name: "Expand right sidebar" }));
 
@@ -709,7 +725,7 @@ describe("WorkspaceShell loading placeholders", () => {
     it("shows a failed collapsed sidebar at its expanded width, so Reload is not clipped", async () => {
       const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
       const gate = gateSidebar();
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), true);
       const view = render(<WorkspaceShell {...defaultProps} />);
       const box = () => view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
       expect(box()?.style.width).toBe("0px");
@@ -718,7 +734,7 @@ describe("WorkspaceShell loading placeholders", () => {
       expect(box()?.style.width).not.toBe("0px");
       // Docked, with no card: globals.css keys on this to stop reserving the card's room.
       expect(box()?.hasAttribute("data-right-sidebar-load-failed")).toBe(true);
-      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarCollapsedKey(defaultProps.workspaceId), false);
       consoleError.mockRestore();
     });
 
