@@ -1,7 +1,8 @@
 /**
  * Story: a chat survives trips through Settings. The user sends a message and gets the reply,
- * then opens Settings, visits Models and Providers, and closes it, once by the agent and three
- * more times by exact steps (no model calls). Closing Settings returns to the route it opened
+ * then opens Settings, visits Models and Providers, and closes it: first the agent opens Settings
+ * and Models and exact steps do the rest, then three more trips by exact steps (no model
+ * calls). Closing Settings returns to the route it opened
  * from (RouterContext navigateFromSettings), so the chat, its reply and a working message box
  * must still be there. It replaces the Playwright tests "chat history survives settings
  * navigation" (tests/e2e/scenarios/persistence.spec.ts) and "survives rapid settings navigation"
