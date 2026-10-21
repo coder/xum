@@ -1,3 +1,4 @@
+import type { UsePopoverErrorResult } from "@/browser/hooks/usePopoverError";
 import type { FrontendWorkspaceMetadata, WorkspaceRemoveWarning } from "@/common/types/workspace";
 
 /**
@@ -40,4 +41,13 @@ export function formatWorkspaceRemoveWarnings(warnings: readonly WorkspaceRemove
       }
     })
     .join("\n");
+}
+
+/** Show the warnings a successful removal returned, if any (#5143, #7100). */
+export function showWorkspaceRemoveWarnings(
+  popover: Pick<UsePopoverErrorResult, "showError">,
+  workspaceId: string,
+  warnings: readonly WorkspaceRemoveWarning[] | undefined
+): void {
+  if (warnings?.length) popover.showError(workspaceId, formatWorkspaceRemoveWarnings(warnings));
 }

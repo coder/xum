@@ -14,7 +14,10 @@ import {
 } from "@/browser/contexts/WorkspaceContext";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
-import { formatWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
+import {
+  formatWorkspaceRemoveWarnings,
+  showWorkspaceRemoveWarnings,
+} from "@/browser/utils/workspace";
 import { ChevronDown, ChevronRight, FolderX, Loader2, Search, Trash2 } from "lucide-react";
 import { ArchiveIcon, ArchiveRestoreIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
@@ -736,6 +739,8 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
     try {
       const result = await removeWorkspace(workspaceId);
       if (result.success) {
+        // What the removal kept for the user to own, e.g. a Daytona sandbox (#7100).
+        showWorkspaceRemoveWarnings(removeWarning, workspaceId, result.warnings);
         onWorkspacesChanged?.();
         return;
       }
@@ -756,9 +761,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
             : {}),
         });
         if (forced.success) {
-          if (forced.warnings?.length) {
-            removeWarning.showError(workspaceId, formatWorkspaceRemoveWarnings(forced.warnings));
-          }
+          showWorkspaceRemoveWarnings(removeWarning, workspaceId, forced.warnings);
           onWorkspacesChanged?.();
           return;
         }
@@ -817,12 +820,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
             });
             if (result.success) {
               // The dialog showed the non-forced error; the forced retry can leave more behind.
-              if (result.warnings?.length) {
-                removeWarning.showError(
-                  workspaceId,
-                  formatWorkspaceRemoveWarnings(result.warnings)
-                );
-              }
+              showWorkspaceRemoveWarnings(removeWarning, workspaceId, result.warnings);
               onWorkspacesChanged?.();
             }
             return result;

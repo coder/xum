@@ -19,7 +19,7 @@ import { loadOrCreateInstallationId } from "@/node/config/installationIdentity";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { retireSshConnections } from "@/node/runtime/transports";
 import { redactDaytonaTokens, rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
-import { getDaytonaSandboxId } from "@/common/types/runtime";
+import { getDaytonaSandboxId, isDedicatedDaytonaSandbox } from "@/common/types/runtime";
 import { log } from "@/node/services/log";
 import { sleepWithAbort } from "@/node/utils/abort";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -34,6 +34,12 @@ import {
   type DaytonaSshAccess,
 } from "./daytonaClient";
 import type { DaytonaWorkspaceRef } from "./daytonaReconciler";
+
+/** What another workspace stores as its sandbox, and whether it attached it. */
+interface StoredSandboxRef {
+  stored: string;
+  attached: boolean;
+}
 
 export const DAYTONA_LABEL_INSTANCE = "xum.instance";
 export const DAYTONA_LABEL_WORKSPACE_ID = "xum.workspaceId";
@@ -406,30 +412,36 @@ export class DaytonaService {
     sandboxId: string,
     workspaceId: string | undefined
   ): Promise<boolean> {
-    if (!this.listWorkspaces || !workspaceId) return true;
-    const others = this.sandboxIdsStoredElsewhere(this.listWorkspaces(), workspaceId);
-    if (others.includes(sandboxId)) return true;
-    if (others.length === 0) return false;
-    const aliases = await this.sandboxAliases(sandboxId);
-    return aliases === undefined || others.some((stored) => aliases.has(stored));
+    return (await this.sandboxReferencesElsewhere(sandboxId, workspaceId)) !== "none";
   }
 
   /**
-   * Whether the sandbox carries this install's label, so Xum created it. False when it is gone
-   * or the lookup fails: then it is only released, never deleted.
+   * Who else references the sandbox, matched as in isSandboxReferencedElsewhere: "none",
+   * "attached" (only workspaces that attached it, through which Xum never deletes it), or
+   * "other" (a workspace that may delete it, or a failed lookup).
    */
-  async isCreatedByThisInstall(sandboxId: string): Promise<boolean> {
-    try {
-      const { sandbox } = await this.getSandboxState(sandboxId);
-      const instance = sandbox?.labels?.[DAYTONA_LABEL_INSTANCE];
-      return instance !== undefined && instance === (await this.getInstanceId());
-    } catch (error) {
-      log.warn("Could not look up a Daytona sandbox's labels; keeping it", {
-        sandboxId,
-        error: getErrorMessage(error),
-      });
-      return false;
-    }
+  async sandboxReferencesElsewhere(
+    sandboxId: string,
+    workspaceId: string | undefined
+  ): Promise<"none" | "attached" | "other"> {
+    if (!this.listWorkspaces || !workspaceId) return "other";
+    const others = this.refsStoredElsewhere(this.listWorkspaces(), workspaceId);
+    if (others.length === 0) return "none";
+    const matched = await this.refsMatchingSandbox(sandboxId, others);
+    if (!matched) return "other";
+    if (matched.length === 0) return "none";
+    return matched.every((ref) => ref.attached) ? "attached" : "other";
+  }
+
+  /** The refs that store this sandbox by its name or its id; undefined when the lookup fails. */
+  private async refsMatchingSandbox(
+    sandboxId: string,
+    refs: StoredSandboxRef[]
+  ): Promise<StoredSandboxRef[] | undefined> {
+    const aliases = refs.every((ref) => ref.stored === sandboxId)
+      ? new Set([sandboxId])
+      : await this.sandboxAliases(sandboxId);
+    return aliases && refs.filter((ref) => ref.stored === sandboxId || aliases.has(ref.stored));
   }
 
   /**
@@ -439,16 +451,23 @@ export class DaytonaService {
    */
   isAliasStoredElsewhere(alias: string, workspaceId: string | undefined): boolean {
     if (!this.listWorkspaces || !workspaceId) return true;
-    return this.sandboxIdsStoredElsewhere(this.listWorkspaces(), workspaceId).includes(alias);
+    return this.refsStoredElsewhere(this.listWorkspaces(), workspaceId).some(
+      (ref) => ref.stored === alias
+    );
   }
 
   /** What the other workspaces (removals in flight excluded) store as their sandbox. */
-  private sandboxIdsStoredElsewhere(refs: DaytonaWorkspaceRef[], workspaceId: string): string[] {
+  private refsStoredElsewhere(
+    refs: DaytonaWorkspaceRef[],
+    workspaceId: string
+  ): StoredSandboxRef[] {
     return refs.flatMap((ref) => {
       const stored = getDaytonaSandboxId(ref.runtimeConfig);
       const counts =
         ref.workspaceId !== workspaceId && !this.removedWorkspaces.has(ref.workspaceId);
-      return counts && stored ? [stored] : [];
+      return counts && stored
+        ? [{ stored, attached: !isDedicatedDaytonaSandbox(ref.runtimeConfig) }]
+        : [];
     });
   }
 

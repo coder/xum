@@ -736,7 +736,12 @@ export interface Runtime {
     /** keepBranch: remove only the checkout, e.g. a rollback on a branch it did not create (#4775). */
     options?: { keepBranch?: boolean }
   ): Promise<
-    | { success: true; deletedPath: string }
+    | {
+        success: true;
+        deletedPath: string;
+        /** For the user: something the removal kept on purpose that they now own (#7100). */
+        notice?: string;
+      }
     | {
         success: false;
         error: string;

@@ -706,7 +706,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(result).toMatchObject({ success: false, leftoverPaths: ['Daytona sandbox "sb-stuck"'] });
   });
 
-  it("deletes a sandbox Xum created with its last workspace, even one that attached it", async () => {
+  it("never deletes a sandbox Xum created through a workspace that attached it, and says so", async () => {
     const labels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.getInstanceId() };
     const owner = (sandboxId: string) => ({ sandboxId, shared: false, ...SMALL });
     const attached = (sandboxId: string) => ({ sandboxId, shared: true });
@@ -718,6 +718,8 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       );
     const deletes = () =>
       rig.plane.calls.filter((call) => /^DELETE \/sandbox\/[^/]+$/.test(call)).length;
+    const notice = (result: Awaited<ReturnType<typeof remove>>) =>
+      result.success ? result.notice : result.error;
     // Each sandbox: the owner stores its name, another workspace attached it by its id.
     rig.plane.addSandbox({ id: "sb-1", name: "xum-owner-first", labels });
     rig.plane.addSandbox({ id: "sb-2", name: "xum-attached-first", labels });
@@ -728,19 +730,24 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       { workspaceId: "ws-t2", runtimeConfig: sshDaytonaConfig(attached("sb-2")) }
     );
 
-    // The owner goes first: the attached workspace's removal deletes it.
-    expect((await remove("ws-o1", owner("xum-owner-first"))).success).toBe(true);
+    // The owner goes first: its removal says the sandbox now outlives Xum's workspaces, and the
+    // attached workspace's removal only releases it.
+    const ownerFirst = await remove("ws-o1", owner("xum-owner-first"));
+    expect(ownerFirst.success).toBe(true);
+    expect(notice(ownerFirst)).toContain('"xum-owner-first"');
+    const attachedLast = await remove("ws-t1", attached("sb-1"));
+    expect(attachedLast).toEqual({ success: true, deletedPath: expect.any(String) as string });
     expect(rig.plane.find("sb-1")).toBeDefined();
-    expect((await remove("ws-t1", attached("sb-1"))).success).toBe(true);
-    expect(rig.plane.find("sb-1")).toBeUndefined();
-    expect(deletes()).toBe(1);
+    expect(deletes()).toBe(0);
 
-    // The attached workspace goes first: the owner's removal deletes it.
-    expect((await remove("ws-t2", attached("sb-2"))).success).toBe(true);
+    // The attached workspace goes first: the owner's removal deletes it, with nothing to say.
+    const attachedFirst = await remove("ws-t2", attached("sb-2"));
+    expect(attachedFirst).toEqual({ success: true, deletedPath: expect.any(String) as string });
     expect(rig.plane.find("sb-2")).toBeDefined();
-    expect((await remove("ws-o2", owner("xum-attached-first"))).success).toBe(true);
+    const ownerLast = await remove("ws-o2", owner("xum-attached-first"));
+    expect(ownerLast).toEqual({ success: true, deletedPath: expect.any(String) as string });
     expect(rig.plane.find("sb-2")).toBeUndefined();
-    expect(deletes()).toBe(2);
+    expect(deletes()).toBe(1);
   });
 
   it("never starts a stopped sandbox for the checks a forced removal skips", async () => {

@@ -82,8 +82,7 @@ export type DaytonaRuntimeService = Pick<
   | "markSandboxReady"
   | "invalidateSandboxReady"
   | "replaceRejectedSshToken"
-  | "isSandboxReferencedElsewhere"
-  | "isCreatedByThisInstall"
+  | "sandboxReferencesElsewhere"
   | "isAliasStoredElsewhere"
   | "withSandboxRemovalLock"
   | "waitUntilDestroyed"
@@ -185,17 +184,18 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Pro
 }
 
 type DeleteResult =
-  | { success: true; deletedPath: string }
+  | { success: true; deletedPath: string; notice?: string }
   | { success: false; error: string; leftoverPaths?: string[] };
 
 type StatusEmitter = (phase: RuntimeStatusEvent["phase"], detail?: string) => void;
 
 /**
  * What deleting a workspace does to its sandbox: "keep" it (another workspace, archived ones
- * included, still references it), "release" only Xum's ssh access (the last workspace on an
- * attached sandbox), or "delete" it (the last workspace on a sandbox Xum created).
+ * included, still references it), "handOff" (keep it for workspaces that only attached it, so
+ * Xum no longer deletes it), "release" only Xum's ssh access (the last workspace on an attached
+ * sandbox), or "delete" it (the last workspace on a sandbox Xum created).
  */
-type SandboxFate = "keep" | "release" | "delete";
+type SandboxFate = "keep" | "handOff" | "release" | "delete";
 
 const HOST_KEY_FAILURE = /Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED/;
 
@@ -1025,13 +1025,16 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   }
 
   private async sandboxFateOnDelete(sandboxId: string): Promise<SandboxFate> {
-    if (await this.daytonaService.isSandboxReferencedElsewhere(sandboxId, this.workspaceId)) {
-      return "keep";
-    }
-    if (this.daytonaConfig.shared !== true) return "delete";
-    // Attached to a sandbox Xum created for another workspace, which was removed first: this
-    // is its last workspace, so it goes as it would with its owner.
-    return (await this.daytonaService.isCreatedByThisInstall(sandboxId)) ? "delete" : "release";
+    const owned = this.daytonaConfig.shared !== true;
+    const others = await this.daytonaService.sandboxReferencesElsewhere(
+      sandboxId,
+      this.workspaceId
+    );
+    // An attached sandbox is the user's, even one Xum created for another workspace: Xum never
+    // deletes it, since its checks cover only this workspace's checkout.
+    if (others === "attached" && owned) return "handOff";
+    if (others !== "none") return "keep";
+    return owned ? "delete" : "release";
   }
 
   /**
@@ -1149,7 +1152,13 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         });
       }
     }
-    return result;
+    if (fate !== "handOff") return result;
+    const notice =
+      `Daytona sandbox "${sandboxId}" was kept for a workspace that attached it. Xum never ` +
+      "deletes an attached sandbox, so it stays when that workspace is removed too; delete it " +
+      "in Daytona when you no longer need it.";
+    log.info(notice, { workspaceId: this.workspaceId });
+    return { ...result, notice };
   }
 
   /** Start the sandbox (if stopped or archived) so the dirty and unpushed checks can run. */

@@ -111,6 +111,7 @@ import { SettingsProvider, useSettings } from "./contexts/SettingsContext";
 import { AboutDialogProvider, useAboutDialog } from "./contexts/AboutDialogContext";
 import { ConfirmDialogProvider, useConfirmDialog } from "./contexts/ConfirmDialogContext";
 import { confirmAndRemoveSubagent } from "@/browser/utils/subagentRemoval";
+import { showWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
 import { AboutDialog } from "./features/About/AboutDialog";
 import { LazySettingsPage } from "@/browser/features/Settings/LazySettingsPage";
 import { LazyAnalyticsDashboard } from "@/browser/features/Analytics/LazyAnalyticsDashboard";
@@ -956,10 +957,12 @@ function AppInner() {
       const result = await removeWorkspace(workspaceId);
       if (!result.success) {
         paletteRemoveError.showError(workspaceId, result.error ?? "Failed to remove workspace");
+      } else {
+        showWorkspaceRemoveWarnings(paletteRemoveWarning, workspaceId, result.warnings);
       }
       return result;
     },
-    [removeWorkspace, paletteRemoveError]
+    [removeWorkspace, paletteRemoveError, paletteRemoveWarning]
   );
   const removeSubagentFromPalette = async (workspaceId: string, title: string) => {
     const notice = await confirmAndRemoveSubagent({
