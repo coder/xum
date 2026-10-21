@@ -221,6 +221,39 @@ describe("DaytonaService", () => {
     expect(mintKeys).toEqual(["Bearer k", "Bearer other", "Bearer third"]);
   });
 
+  it("keeps a lease on its account when another process saves another key", async () => {
+    const lookupKeys: string[] = [];
+    service = new DaytonaService({
+      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
+      rootDir,
+      fetch: ((input: string | URL | Request, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : input.toString();
+        if ((init?.method ?? "GET") === "GET" && url.endsWith("/sandbox/sb-1")) {
+          lookupKeys.push((init?.headers as Record<string, string>).Authorization);
+        }
+        return plane.fetch(input, init);
+      }) as typeof fetch,
+      now: () => clock,
+    });
+    const generation = async () => (await service.getAccount()).generation;
+    await service.getSshToken("sb-1");
+    const before = await generation();
+
+    await service.withAccountLease(async () => {
+      await service.getSandboxState("sb-1");
+      await new DaytonaCredentialsStore(rootDir, {}).update({ apiKey: "other" });
+      await service.getSandboxState("sb-1");
+      expect(await generation()).toBe(before);
+    });
+    expect(lookupKeys).toEqual(["Bearer k", "Bearer k"]);
+
+    // The first resolve after the lease takes the new account and retires the old one once.
+    await service.getSandboxState("sb-1");
+    await service.getSandboxState("sb-1");
+    expect(lookupKeys.slice(2)).toEqual(["Bearer other", "Bearer other"]);
+    expect(await generation()).toBe(before + 1);
+  });
+
   it("leaves a resolve during its own settings save to that save", async () => {
     const revokeKeys: string[] = [];
     const store = new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" });

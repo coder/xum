@@ -325,6 +325,12 @@ export class DaytonaService {
    * that sees another account retires what this process cached for the old one.
    */
   private accountFingerprint?: string;
+  /**
+   * The credentials last resolved. While an account lease or this process's settings save
+   * runs, every resolve returns these, so an operation never mixes two accounts when another
+   * process saves new ones mid-way; the first resolve once idle reads the store again.
+   */
+  private credentialsSnapshot?: { credentials: DaytonaResolvedCredentials | null };
   /** Operations running under withAccountLease; setConfig refuses while any runs. */
   private accountLeases = 0;
   /** The settings change being saved; new leases wait for it. */
@@ -420,7 +426,9 @@ export class DaytonaService {
   private async applyConfig(patch: DaytonaCredentialsPatch): Promise<DaytonaPublicConfig> {
     const previousClient = await this.getClientIfConfigured();
     await this.credentialsStore.update(patch);
-    this.accountFingerprint = await this.readAccountFingerprint();
+    this.credentialsSnapshot = await this.readSavedCredentials();
+    this.accountFingerprint =
+      this.credentialsSnapshot && fingerprintAccount(this.credentialsSnapshot.credentials);
     // Revoke the old account's tokens with the old credentials, which may not work for the
     // new ones.
     const tokens = await this.retireAccountCaches();
@@ -451,9 +459,11 @@ export class DaytonaService {
     return tokens;
   }
 
-  private async readAccountFingerprint(): Promise<string | undefined> {
+  private async readSavedCredentials(): Promise<
+    { credentials: DaytonaResolvedCredentials | null } | undefined
+  > {
     try {
-      return fingerprintAccount(await this.credentialsStore.resolve());
+      return { credentials: await this.credentialsStore.resolve() };
     } catch (error) {
       log.debug("Could not read the saved Daytona settings", { error: getErrorMessage(error) });
       return undefined;
@@ -641,8 +651,16 @@ export class DaytonaService {
 
   /** Unusable settings (an http DAYTONA_API_URL) throw a `not_configured` DaytonaApiError. */
   private async resolveCredentials(): Promise<DaytonaResolvedCredentials | null> {
+    const pinned = () =>
+      (this.accountLeases > 0 || this.settingsChange !== undefined) && this.credentialsSnapshot;
+    const held = pinned();
+    if (held) return held.credentials;
     try {
       const credentials = await this.credentialsStore.resolve();
+      // A lease or save that started during the read keeps the account it started with.
+      const heldNow = pinned();
+      if (heldNow) return heldNow.credentials;
+      this.credentialsSnapshot = { credentials };
       await this.noticeAccount(credentials);
       return credentials;
     } catch (error) {
