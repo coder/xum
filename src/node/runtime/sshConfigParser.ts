@@ -255,6 +255,8 @@ function toStringArray(value: ComputedConfigValue | undefined): string[] {
 const MAX_INCLUDE_DEPTH = 16;
 const INCLUDE_LINE_PATTERN = /^\s*include(?:\s*=\s*|\s+)(.+?)\s*$/i;
 const SECTION_LINE_PATTERN = /^\s*(?:host|match)(?:\s*=\s*|\s+)\S/i;
+const HOST_LINE_PATTERN = /^\s*host(?:\s*=\s*|\s+)(.+?)\s*$/i;
+const MATCH_ALL_LINE_PATTERN = /^\s*match(?:\s*=\s*|\s+)all\s*$/i;
 
 function splitIncludeArgs(value: string): string[] {
   const args: string[] = [];
@@ -297,12 +299,33 @@ async function resolveIncludePaths(value: string, homeDir: string): Promise<stri
   return files;
 }
 
+/**
+ * Whether the section `header` (undefined: before any Host/Match) applies to `host`. OpenSSH
+ * reads an Include inside an inactive block as matching nothing (readconf.c's
+ * SSHCONF_NEVERMATCH), so such an include is skipped. A Host block uses the same pattern
+ * matching as `compute`. Of Match blocks only `Match all` counts: the other criteria (exec,
+ * user, canonical, final, the host after HostName) are not known here, and skipping an
+ * include can only miss an option, where including it could apply one (a ProxyCommand) to a
+ * host OpenSSH leaves alone.
+ */
+function sectionAppliesTo(header: string | undefined, host: string): boolean {
+  if (header === undefined) return true;
+  const hostLine = HOST_LINE_PATTERN.exec(header);
+  if (hostLine) return glob(splitIncludeArgs(hostLine[1]), host);
+  return MATCH_ALL_LINE_PATTERN.test(header);
+}
+
 /** The expanded content of each file one Include line names, in order. */
-async function readIncludedFiles(value: string, homeDir: string, depth: number): Promise<string[]> {
+async function readIncludedFiles(
+  value: string,
+  homeDir: string,
+  depth: number,
+  host: string
+): Promise<string[]> {
   const contents: string[] = [];
   for (const file of await resolveIncludePaths(value, homeDir)) {
     try {
-      contents.push(await expandIncludes(await fs.readFile(file, "utf8"), homeDir, depth));
+      contents.push(await expandIncludes(await fs.readFile(file, "utf8"), homeDir, depth, host));
     } catch (error) {
       // OpenSSH skips missing include files silently.
       if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") {
@@ -317,12 +340,17 @@ async function readIncludedFiles(value: string, homeDir: string, depth: number):
 }
 
 /**
- * Inline `Include` directives, which the ssh-config package does not resolve (Xum's Daytona
- * block relies on one). An Include inside a Host/Match block is followed by that block's header
- * again, so later lines of the block stay scoped to it as in OpenSSH. Approximation: Host blocks
- * inside the included file are not additionally gated by the enclosing block's pattern.
+ * Inline `Include` directives for resolving `host`, which the ssh-config package does not
+ * resolve (Xum's Daytona block relies on one). An Include inside a block that does not apply
+ * to `host` is skipped, as OpenSSH does. One inside a block that applies is followed by that
+ * block's header again, so later lines of the block stay scoped to it as in OpenSSH.
  */
-async function expandIncludes(content: string, homeDir: string, depth: number): Promise<string> {
+async function expandIncludes(
+  content: string,
+  homeDir: string,
+  depth: number,
+  host: string
+): Promise<string> {
   const out: string[] = [];
   let sectionHeader: string | undefined;
   for (const line of content.split(/\r?\n/)) {
@@ -340,7 +368,8 @@ async function expandIncludes(content: string, homeDir: string, depth: number): 
       log.debug("SSH config Include nesting too deep; ignoring", { include: includeMatch[1] });
       continue;
     }
-    out.push(...(await readIncludedFiles(includeMatch[1], homeDir, depth + 1)));
+    if (!sectionAppliesTo(sectionHeader, host)) continue;
+    out.push(...(await readIncludedFiles(includeMatch[1], homeDir, depth + 1, host)));
     if (sectionHeader) {
       out.push(sectionHeader);
     }
@@ -348,13 +377,14 @@ async function expandIncludes(content: string, homeDir: string, depth: number): 
   return out.join("\n");
 }
 
-async function loadSSHConfig(): Promise<SSHConfig | null> {
+/** The user's ssh config with its Includes expanded for `host`. */
+async function loadSSHConfig(host: string): Promise<SSHConfig | null> {
   const homeDir = getHomeDir();
   const configPath = path.join(homeDir, ".ssh", "config");
 
   try {
     const content = await fs.readFile(configPath, "utf8");
-    const parsed = SSHConfig.parse(await expandIncludes(content, homeDir, 0));
+    const parsed = SSHConfig.parse(await expandIncludes(content, homeDir, 0, host));
     return parsed;
   } catch (error) {
     if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") {
@@ -371,7 +401,7 @@ export async function resolveSSHConfig(host: string): Promise<ResolvedSSHConfig>
   const { host: hostAlias, user: userOverride } = parseHostAndUser(host);
   const homeDir = getHomeDir();
 
-  const config = await loadSSHConfig();
+  const config = await loadSSHConfig(hostAlias);
   const computed = config
     ? userOverride
       ? config.compute({ Host: hostAlias, User: userOverride })

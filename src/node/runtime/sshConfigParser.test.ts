@@ -1,8 +1,22 @@
+import { spawnSync } from "child_process";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { DaytonaSshConfigWriter } from "./daytonaSshConfig";
 import { resolveSSHConfig } from "./sshConfigParser";
+
+const hasOpenSsh = spawnSync("ssh", ["-V"]).status === 0;
+
+/** What OpenSSH resolves for `host` from `configPath` alone: the parity reference. */
+function opensshUserAndProxy(configPath: string, host: string) {
+  const output = spawnSync("ssh", ["-G", "-F", configPath, host], { encoding: "utf8" }).stdout;
+  const value = (key: string) =>
+    output
+      .split("\n")
+      .find((line) => line.startsWith(`${key} `))
+      ?.slice(key.length + 1);
+  return { user: value("user"), proxyCommand: value("proxycommand") };
+}
 
 describe("resolveSSHConfig", () => {
   test("applies Host + Match host proxy rules", async () => {
@@ -143,6 +157,35 @@ describe("resolveSSHConfig", () => {
 
       expect(resolved.hostName).toBe("10.0.0.5");
       expect(resolved.user).toBe("boxuser");
+    });
+  });
+
+  test("applies an Include inside a Host block only to the hosts that block matches", async () => {
+    await withTempHome(async (homeDir) => {
+      const included = path.join(homeDir, ".ssh", "gated.conf");
+      await fs.writeFile(included, "Host *\n  User gateduser\n  ProxyCommand nc %h %p\n", "utf8");
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.writeFile(
+        configPath,
+        ["Host gated !gated-not", `  Include ${included}`, "Host *", "  User fallback", ""].join(
+          "\n"
+        ),
+        "utf8"
+      );
+
+      const resolve = async (host: string) => {
+        const { user, proxyCommand } = await resolveSSHConfig(host);
+        return { user, proxyCommand };
+      };
+      expect(await resolve("gated")).toEqual({ user: "gateduser", proxyCommand: "nc %h %p" });
+      for (const host of ["elsewhere", "gated-not"]) {
+        expect(await resolve(host)).toEqual({ user: "fallback", proxyCommand: undefined });
+      }
+      if (hasOpenSsh) {
+        for (const host of ["gated", "elsewhere", "gated-not"]) {
+          expect(await resolve(host)).toEqual(opensshUserAndProxy(configPath, host));
+        }
+      }
     });
   });
 });
