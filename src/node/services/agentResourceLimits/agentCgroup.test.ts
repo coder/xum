@@ -84,6 +84,24 @@ describe("applyAgentCgroupLimits", () => {
     expect(await tree.read("xum/xum-agents", "cpu.max")).toBe("3000000 100000");
   });
 
+  it("turns other threaded controllers back on after the repair", async () => {
+    // An admin's pids controller, left on in the populated cgroup, also makes it a thread root.
+    tree = await createFakeCgroupTree({
+      own: "/xum",
+      cgroups: {
+        xum: { controllers: "cpu memory pids", subtreeControl: "pids", procs: ["101"] },
+      },
+    });
+
+    const result = await applyAgentCgroupLimits({ cpuCores: 2 }, tree.host);
+
+    expect(result.status).toEqual({ state: "active", cgroup: "/xum/xum-agents" });
+    expect((await tree.read("xum", "cgroup.subtree_control")).trim().split(" ").sort()).toEqual([
+      "cpu",
+      "pids",
+    ]);
+  });
+
   it("uses the parent cgroup once xum runs in xum-app", async () => {
     tree = await createFakeCgroupTree({
       own: "/xum/xum-app",

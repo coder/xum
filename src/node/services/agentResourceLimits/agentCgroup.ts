@@ -450,21 +450,33 @@ async function emptyBaseCgroup(baseDir: string, host: AgentCgroupHost): Promise<
   if ((await readWords(procsFile)).length === 0) {
     return;
   }
-  // Only threaded controllers can be on here, enabled by a xum without this fix. They keep the
-  // cgroup a thread root, which refuses the moves into xum-app, so turn them off first.
+  // Only threaded controllers can be on here: cpu from a xum without this fix, or ones such as
+  // pids that an admin enabled. They keep the cgroup a thread root, which refuses the moves into
+  // xum-app, so turn them off for the move and back on once the cgroup is empty.
   const subtreeControl = path.join(baseDir, "cgroup.subtree_control");
-  const stale = await readWords(subtreeControl);
-  if (stale.length > 0) {
-    await host.writeFile(subtreeControl, stale.map((controller) => `-${controller}`).join(" "));
+  const threaded = await readWords(subtreeControl);
+  if (threaded.length > 0) {
+    await host.writeFile(subtreeControl, threaded.map((controller) => `-${controller}`).join(" "));
   }
-  // Repeat for processes that forked during a move: one left behind makes a thread root again.
-  for (let attempt = 1; ; attempt += 1) {
-    await moveProcesses(baseDir, path.join(baseDir, APP_CGROUP), host);
-    if ((await readWords(procsFile)).length === 0) {
-      return;
+  try {
+    // Repeat for processes that forked during a move: one left behind makes a thread root again.
+    for (let attempt = 1; ; attempt += 1) {
+      await moveProcesses(baseDir, path.join(baseDir, APP_CGROUP), host);
+      if ((await readWords(procsFile)).length === 0) {
+        return;
+      }
+      if (attempt >= MAX_ENABLE_ATTEMPTS) {
+        throw new Error(`New processes kept starting in ${baseDir} while xum moved them.`);
+      }
     }
-    if (attempt >= MAX_ENABLE_ATTEMPTS) {
-      throw new Error(`New processes kept starting in ${baseDir} while xum moved them.`);
+  } finally {
+    // The kernel accepts threaded controllers with or without processes, so this also restores
+    // them when the move failed.
+    if (threaded.length > 0) {
+      await host.writeFile(
+        subtreeControl,
+        threaded.map((controller) => `+${controller}`).join(" ")
+      );
     }
   }
 }
