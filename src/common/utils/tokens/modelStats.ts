@@ -9,12 +9,13 @@ export interface ModelStats {
   max_output_tokens?: number;
   input_cost_per_token: number;
   output_cost_per_token: number;
-  input_cost_per_token_above_200k_tokens?: number;
-  output_cost_per_token_above_200k_tokens?: number;
+  input_cost_per_token_above_threshold?: number;
+  output_cost_per_token_above_threshold?: number;
   cache_creation_input_token_cost?: number;
-  cache_creation_input_token_cost_above_200k_tokens?: number;
+  cache_creation_input_token_cost_above_threshold?: number;
   cache_read_input_token_cost?: number;
-  cache_read_input_token_cost_above_200k_tokens?: number;
+  cache_read_input_token_cost_above_threshold?: number;
+  /** Prompt size above which a request bills at the `_above_threshold` rates. */
   tiered_pricing_threshold_tokens?: number;
 }
 
@@ -26,15 +27,27 @@ interface RawModelData {
   input_cost_per_image_token?: number;
   output_cost_per_image_token?: number;
   cache_read_input_image_token_cost?: number;
-  input_cost_per_token_above_200k_tokens?: number;
-  output_cost_per_token_above_200k_tokens?: number;
   cache_creation_input_token_cost?: number;
-  cache_creation_input_token_cost_above_200k_tokens?: number;
   cache_read_input_token_cost?: number;
-  cache_read_input_token_cost_above_200k_tokens?: number;
-  tiered_pricing_threshold_tokens?: number | string | null;
   [key: string]: unknown;
 }
+
+const LONG_CONTEXT_RATE_CLASSES = [
+  "input_cost_per_token",
+  "output_cost_per_token",
+  "cache_creation_input_token_cost",
+  "cache_read_input_token_cost",
+] as const;
+export type LongContextRateClass = (typeof LONG_CONTEXT_RATE_CLASSES)[number];
+
+/**
+ * A long-context rate, which LiteLLM names after its threshold in thousands of prompt
+ * tokens (`input_cost_per_token_above_272k_tokens`). Service-tier variants such as
+ * `..._tokens_priority` do not match: serviceTierPricing derives those from Standard.
+ */
+export const LONG_CONTEXT_RATE_FIELD = new RegExp(
+  `^(${LONG_CONTEXT_RATE_CLASSES.join("|")})_above_(\\d+)k_tokens$`
+);
 
 export const PROVIDER_KEY_ALIASES: Record<string, string> = {
   // GitHub Copilot keys in models.json use underscores for LiteLLM provider names.
@@ -68,19 +81,20 @@ export function parseNum(value: unknown): number | null {
   return null;
 }
 
-const DEFAULT_TIERED_PRICING_THRESHOLD_TOKENS = 200_000;
-
 function parseOptionalNumber(value: unknown): number | undefined {
   return parseNum(value) ?? undefined;
 }
 
-function hasTieredPricing(data: RawModelData): boolean {
-  return (
-    parseOptionalNumber(data.input_cost_per_token_above_200k_tokens) != null ||
-    parseOptionalNumber(data.output_cost_per_token_above_200k_tokens) != null ||
-    parseOptionalNumber(data.cache_creation_input_token_cost_above_200k_tokens) != null ||
-    parseOptionalNumber(data.cache_read_input_token_cost_above_200k_tokens) != null
-  );
+/** The threshold of the entry's long-context rates, in thousands of prompt tokens. */
+function findLongContextThresholdK(data: RawModelData): number | undefined {
+  let lowest: number | undefined;
+  for (const [field, value] of Object.entries(data)) {
+    const match = LONG_CONTEXT_RATE_FIELD.exec(field);
+    if (match === null || parseNum(value) === null) continue;
+    // Pricing models one long-context tier; LiteLLM gives no model more than one.
+    lowest = Math.min(lowest ?? Infinity, Number(match[2]));
+  }
+  return lowest;
 }
 
 /**
@@ -96,12 +110,11 @@ export function hasUsableTokenLimits(data: RawModelData): boolean {
  * Extracts ModelStats from validated raw data
  */
 function extractModelStats(data: RawModelData): ModelStats {
-  const tieredPricingThresholdTokens =
-    parseOptionalNumber(data.tiered_pricing_threshold_tokens) ??
-    // LiteLLM names long-context rates with `_above_200k_tokens` but does not ship a
-    // separate threshold field. Keep 200K as the compatibility default unless an override
-    // (like GPT-5.5's published 272K boundary) is provided explicitly.
-    (hasTieredPricing(data) ? DEFAULT_TIERED_PRICING_THRESHOLD_TOKENS : undefined);
+  const thresholdK = findLongContextThresholdK(data);
+  const aboveThreshold = (rateClass: LongContextRateClass) =>
+    thresholdK === undefined
+      ? undefined
+      : parseOptionalNumber(data[`${rateClass}_above_${thresholdK}k_tokens`]);
 
   return {
     max_input_tokens: parseNum(data.max_input_tokens) ?? 0,
@@ -117,27 +130,21 @@ function extractModelStats(data: RawModelData): ModelStats {
         : typeof data.output_cost_per_token === "number"
           ? data.output_cost_per_token
           : 0,
-    input_cost_per_token_above_200k_tokens: parseOptionalNumber(
-      data.input_cost_per_token_above_200k_tokens
-    ),
-    output_cost_per_token_above_200k_tokens: parseOptionalNumber(
-      data.output_cost_per_token_above_200k_tokens
-    ),
+    input_cost_per_token_above_threshold: aboveThreshold("input_cost_per_token"),
+    output_cost_per_token_above_threshold: aboveThreshold("output_cost_per_token"),
     cache_creation_input_token_cost:
       typeof data.cache_creation_input_token_cost === "number"
         ? data.cache_creation_input_token_cost
         : undefined,
-    cache_creation_input_token_cost_above_200k_tokens: parseOptionalNumber(
-      data.cache_creation_input_token_cost_above_200k_tokens
+    cache_creation_input_token_cost_above_threshold: aboveThreshold(
+      "cache_creation_input_token_cost"
     ),
     cache_read_input_token_cost:
       typeof data.cache_read_input_token_cost === "number"
         ? data.cache_read_input_token_cost
         : undefined,
-    cache_read_input_token_cost_above_200k_tokens: parseOptionalNumber(
-      data.cache_read_input_token_cost_above_200k_tokens
-    ),
-    tiered_pricing_threshold_tokens: tieredPricingThresholdTokens,
+    cache_read_input_token_cost_above_threshold: aboveThreshold("cache_read_input_token_cost"),
+    tiered_pricing_threshold_tokens: thresholdK === undefined ? undefined : thresholdK * 1000,
   };
 }
 

@@ -80,7 +80,6 @@ const EXCLUDE_OVERSIZED = [
   "TasksSection",
   "CreationControls",
   "ArchivedWorkspaces",
-  "LayoutsSection",
   "AgentModePicker",
   "WorkspaceHeartbeatModal",
   "ExperimentsSection",

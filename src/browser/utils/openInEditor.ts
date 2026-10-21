@@ -35,7 +35,7 @@ function trimTrailingSlash(path: string): string {
   return path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path;
 }
 
-// Guarded token generator (mirrors createLayoutPresetId/createHeaderRowId): Crypto.randomUUID
+// Guarded token generator (mirrors createHeaderRowId): Crypto.randomUUID
 // exists only in secure contexts, and Xum's browser UI can be served from a plain-HTTP remote
 // origin. Throwing here would reject every built-in editor open before the recording RPC's
 // try/catch; the fallback distinguishes placeholder frames and each launch's rollback.

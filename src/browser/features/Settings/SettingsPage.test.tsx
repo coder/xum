@@ -17,8 +17,8 @@ describe("SettingsPage", () => {
     });
   });
 
-  test("replaces the removed Governor route with General", () => {
-    expect(getSettingsSectionRedirect("governor", false)).toEqual({
+  test.each(["governor", "layouts"])("replaces the removed %s route with General", (section) => {
+    expect(getSettingsSectionRedirect(section, false)).toEqual({
       section: "general",
       replace: true,
     });

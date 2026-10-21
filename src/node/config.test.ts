@@ -53,6 +53,29 @@ describe("Config", () => {
     expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
   });
 
+  // Layout presets were removed: an old config that still has them must load, and the next
+  // save drops only that key (the user chose this over keeping it for downgrades).
+  it("loads a config with legacy layoutPresets and drops only that key on save", async () => {
+    const configFile = path.join(tempDir, "config.json");
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        projects: [],
+        defaultProjectDir: "/home/user/code",
+        layoutPresets: { version: 2, slots: [{ slot: 1, preset: { id: "p1", name: "Old" } }] },
+      })
+    );
+
+    expect(config.loadConfigOrDefault().defaultProjectDir).toBe("/home/user/code");
+    expect(config.getConfigLoadError()).toBeNull();
+
+    await config.setUpdateChannel("npm");
+
+    const persisted = JSON.parse(fs.readFileSync(configFile, "utf-8")) as Record<string, unknown>;
+    expect(persisted.layoutPresets).toBeUndefined();
+    expect(persisted.defaultProjectDir).toBe("/home/user/code");
+  });
+
   describe("hidden-model preferences", () => {
     const unrelated = "openrouter:openai/gpt-5";
 

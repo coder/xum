@@ -24,6 +24,7 @@ import { formatHeartbeatIntervalShort, HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/c
 import { useAppConfig } from "@/browser/stores/AppConfigStore";
 import { SIDE_CHAT_INITIAL_TITLE } from "@/constants/workspaceDefaults";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
+import { LazySettingsModal } from "@/browser/components/WorkspaceMenuBar/LazySettingsModal";
 import { useOptionalAPI, type APIClient } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import {
@@ -31,6 +32,7 @@ import {
   formatGoalTurns,
 } from "@/browser/features/Tools/Goal/goalToolUtils";
 import { useGitStatus } from "@/browser/stores/GitStatusStore";
+import { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import {
   useOptionalWorkspaceSidebarState,
   useWorkspaceUsage,
@@ -49,6 +51,13 @@ import { TAB_ICONS } from "./Tabs/tabIcons";
  * row. The card floats over the chat, so every list in it is capped to keep it bounded.
  */
 export const OVERVIEW_MAX_LIST_ROWS = 3;
+
+// The card shows on every page with a collapsed sidebar, and this modal rarely opens, so it loads
+// on the Heartbeat row's first click (like the menu bar's copy, #5971).
+const WorkspaceHeartbeatModal = React.lazy(async () => ({
+  default: (await import("@/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal"))
+    .WorkspaceHeartbeatModal,
+}));
 
 interface RightSidebarOverviewProps {
   workspaceId: string;
@@ -156,9 +165,9 @@ function useSessionStats(
 /**
  * What the collapsed right sidebar shows instead of a bare rail (Codex desktop style): a small
  * card over the chat's top-right corner with the gist of each sidebar tab (stats, goal, changes,
- * outputs, side chats, running work, heartbeat); each row reopens the sidebar on its tab. Only
- * data is shown, no explanatory copy, and sections without data are left out, so the card
- * stays as small as the workspace allows.
+ * outputs, side chats, running work, heartbeat); each row reopens the sidebar on its tab, and the
+ * heartbeat row opens the heartbeat settings. Only data is shown, no explanatory copy, and
+ * sections without data are left out, so the card stays as small as the workspace allows.
  */
 export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props) => {
   const { workspaceMetadata } = useWorkspaceMetadata();
@@ -188,143 +197,166 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
   const heartbeatIntervalMs =
     heartbeat?.intervalMs ?? defaultHeartbeatIntervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS;
   const showActivity = workflowRuns > 0 || terminals > 0 || heartbeat != null;
+  // The Heartbeat row opens the workspace's heartbeat settings: it has no sidebar tab to open.
+  const [heartbeatModalOpen, setHeartbeatModalOpen] = React.useState(false);
+  // Recorded here, not in the dialog: it loads on its first open, after the row took focus. The
+  // loading dialog gets its own copy: its close (also when the chunk arrives) consumes the
+  // recorded opener, which the real dialog's close still needs.
+  const heartbeatFocusReturn = useModalFocusReturn(heartbeatModalOpen);
+  const heartbeatLoadingFocusReturn = useModalFocusReturn(heartbeatModalOpen);
 
   return (
-    <div className="divide-border-light flex flex-col divide-y px-3 pb-1.5 text-xs">
-      {/* Stats lead the card (the Stats tab's session totals). */}
-      <OverviewStats workspaceId={props.workspaceId} onOpen={() => props.onOpenTab("costs")} />
+    <>
+      <div className="divide-border-light flex flex-col divide-y px-3 pb-1.5 text-xs">
+        {/* Stats lead the card (the Stats tab's session totals). */}
+        <OverviewStats workspaceId={props.workspaceId} onOpen={() => props.onOpenTab("costs")} />
 
-      {goal != null && goalStatus != null && (
-        <OverviewSection title="Goal">
-          <OverviewRow
-            Icon={TAB_ICONS.goal}
-            label={goal.objective}
-            detail={<span className={goalStatus.className}>{goalStatus.label}</span>}
-            sub={getGoalLimits(goal)}
-            onClick={() => props.onOpenTab("goal")}
-          />
-        </OverviewSection>
-      )}
+        {goal != null && goalStatus != null && (
+          <OverviewSection title="Goal">
+            <OverviewRow
+              Icon={TAB_ICONS.goal}
+              label={goal.objective}
+              detail={<span className={goalStatus.className}>{goalStatus.label}</span>}
+              sub={getGoalLimits(goal)}
+              onClick={() => props.onOpenTab("goal")}
+            />
+          </OverviewSection>
+        )}
 
-      {hasRepository && (
-        <OverviewSection title={branch ?? "Changes"}>
-          <OverviewRow
-            Icon={TAB_ICONS.review}
-            label="Changes"
-            detail={
-              (gitStatus != null || props.unreadAssisted > 0) && (
-                <span className="counter-nums flex items-center gap-1.5">
-                  {gitStatus != null && (
-                    <>
-                      <span className="text-success-light-text">
-                        +{gitStatus.outgoingAdditions.toLocaleString()}
+        {hasRepository && (
+          <OverviewSection title={branch ?? "Changes"}>
+            <OverviewRow
+              Icon={TAB_ICONS.review}
+              label="Changes"
+              detail={
+                (gitStatus != null || props.unreadAssisted > 0) && (
+                  <span className="counter-nums flex items-center gap-1.5">
+                    {gitStatus != null && (
+                      <>
+                        <span className="text-success-light-text">
+                          +{gitStatus.outgoingAdditions.toLocaleString()}
+                        </span>
+                        <span className="text-danger-light">
+                          -{gitStatus.outgoingDeletions.toLocaleString()}
+                        </span>
+                      </>
+                    )}
+                    {/* Reported apart from git status, so it shows even before that loads. */}
+                    {props.unreadAssisted > 0 && (
+                      <span
+                        className="text-review-accent inline-flex items-center gap-0.5"
+                        aria-label={`${props.unreadAssisted} unread agent-flagged hunk${props.unreadAssisted === 1 ? "" : "s"}`}
+                      >
+                        <Sparkles className="h-3 w-3" aria-hidden="true" />
+                        {props.unreadAssisted}
                       </span>
-                      <span className="text-danger-light">
-                        -{gitStatus.outgoingDeletions.toLocaleString()}
-                      </span>
-                    </>
-                  )}
-                  {/* Reported apart from git status, so it shows even before that loads. */}
-                  {props.unreadAssisted > 0 && (
-                    <span
-                      className="text-review-accent inline-flex items-center gap-0.5"
-                      aria-label={`${props.unreadAssisted} unread agent-flagged hunk${props.unreadAssisted === 1 ? "" : "s"}`}
+                    )}
+                  </span>
+                )
+              }
+              onClick={() => props.onOpenTab("review")}
+            />
+          </OverviewSection>
+        )}
+
+        {/* Renders nothing while both experiments are off: no files and no app views. */}
+        <OverviewOutputs
+          workspaceId={props.workspaceId}
+          onOpenTab={props.onOpenTab}
+          showFiles={props.artifactsEnabled}
+          showAppViews={props.mcpAppsEnabled}
+        />
+
+        {showSideChats && (
+          <OverviewSection
+            title="Side chats"
+            action={
+              props.onNewSideChat != null && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label="New side chat"
+                      onClick={props.onNewSideChat}
+                      disabled={props.creatingSideChat}
+                      className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent -mr-1 flex h-5 w-5 items-center justify-center rounded-md focus-visible:ring-1 disabled:opacity-50"
                     >
-                      <Sparkles className="h-3 w-3" aria-hidden="true" />
-                      {props.unreadAssisted}
-                    </span>
-                  )}
-                </span>
+                      <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent align="center">New side chat</TooltipContent>
+                </Tooltip>
               )
             }
-            onClick={() => props.onOpenTab("review")}
-          />
-        </OverviewSection>
-      )}
+          >
+            {(revealedSideChatId != null
+              ? sideChats
+              : sideChats.slice(0, OVERVIEW_MAX_LIST_ROWS)
+            ).map((sideChat, index) => (
+              <OverviewRow
+                key={sideChat.id}
+                Icon={MessageCircle}
+                label={sideChatLabels[index]}
+                sub={sideChatOrdinals[index]}
+                focusOnMount={sideChat.id === revealedSideChatId}
+                onClick={() => props.onOpenTab(makeSideChatTabType(sideChat.id))}
+              />
+            ))}
+            {revealedSideChatId == null && (
+              // Closed side chats have no tab to reopen, so "more" lists them here instead
+              // (the card scrolls past its height cap) and moves focus to the first one shown.
+              <MoreRow
+                count={sideChats.length - OVERVIEW_MAX_LIST_ROWS}
+                onClick={() => setRevealedSideChatId(sideChats[OVERVIEW_MAX_LIST_ROWS]?.id ?? null)}
+              />
+            )}
+          </OverviewSection>
+        )}
 
-      {/* Renders nothing while both experiments are off: no files and no app views. */}
-      <OverviewOutputs
-        workspaceId={props.workspaceId}
-        onOpenTab={props.onOpenTab}
-        showFiles={props.artifactsEnabled}
-        showAppViews={props.mcpAppsEnabled}
-      />
-
-      {showSideChats && (
-        <OverviewSection
-          title="Side chats"
-          action={
-            props.onNewSideChat != null && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    aria-label="New side chat"
-                    onClick={props.onNewSideChat}
-                    disabled={props.creatingSideChat}
-                    className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent -mr-1 flex h-5 w-5 items-center justify-center rounded-md focus-visible:ring-1 disabled:opacity-50"
-                  >
-                    <Plus className="h-3.5 w-3.5" aria-hidden="true" />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent align="center">New side chat</TooltipContent>
-              </Tooltip>
-            )
-          }
-        >
-          {(revealedSideChatId != null
-            ? sideChats
-            : sideChats.slice(0, OVERVIEW_MAX_LIST_ROWS)
-          ).map((sideChat, index) => (
-            <OverviewRow
-              key={sideChat.id}
-              Icon={MessageCircle}
-              label={sideChatLabels[index]}
-              sub={sideChatOrdinals[index]}
-              focusOnMount={sideChat.id === revealedSideChatId}
-              onClick={() => props.onOpenTab(makeSideChatTabType(sideChat.id))}
-            />
-          ))}
-          {revealedSideChatId == null && (
-            // Closed side chats have no tab to reopen, so "more" lists them here instead
-            // (the card scrolls past its height cap) and moves focus to the first one shown.
-            <MoreRow
-              count={sideChats.length - OVERVIEW_MAX_LIST_ROWS}
-              onClick={() => setRevealedSideChatId(sideChats[OVERVIEW_MAX_LIST_ROWS]?.id ?? null)}
-            />
-          )}
-        </OverviewSection>
-      )}
-
-      {showActivity && (
-        // Each row names itself, so this group needs no visible heading.
-        <OverviewSection title="Activity" showTitle={false}>
-          {workflowRuns > 0 && (
-            <OverviewRow
-              Icon={TAB_ICONS.workflows}
-              label="Workflows"
-              detail={<span className="counter-nums">{workflowRuns}</span>}
-              onClick={() => props.onOpenTab("workflows")}
-            />
-          )}
-          {terminals > 0 && (
-            <OverviewRow
-              Icon={SquareTerminal}
-              label="Terminals"
-              detail={<span className="counter-nums">{terminals}</span>}
-              onClick={props.onOpenTerminals}
-            />
-          )}
-          {heartbeat != null && (
-            <OverviewRow
-              Icon={HeartPulse}
-              label="Heartbeat"
-              detail={`Every ${formatHeartbeatIntervalShort(heartbeatIntervalMs)}`}
-            />
-          )}
-        </OverviewSection>
-      )}
-    </div>
+        {showActivity && (
+          // Each row names itself, so this group needs no visible heading.
+          <OverviewSection title="Activity" showTitle={false}>
+            {workflowRuns > 0 && (
+              <OverviewRow
+                Icon={TAB_ICONS.workflows}
+                label="Workflows"
+                detail={<span className="counter-nums">{workflowRuns}</span>}
+                onClick={() => props.onOpenTab("workflows")}
+              />
+            )}
+            {terminals > 0 && (
+              <OverviewRow
+                Icon={SquareTerminal}
+                label="Terminals"
+                detail={<span className="counter-nums">{terminals}</span>}
+                onClick={props.onOpenTerminals}
+              />
+            )}
+            {heartbeat != null && (
+              <OverviewHeartbeatRow
+                workspaceId={props.workspaceId}
+                heartbeat={heartbeat}
+                intervalMs={heartbeatIntervalMs}
+                onConfigure={() => setHeartbeatModalOpen(true)}
+              />
+            )}
+          </OverviewSection>
+        )}
+      </div>
+      <LazySettingsModal
+        name="Heartbeat settings"
+        open={heartbeatModalOpen}
+        onClose={() => setHeartbeatModalOpen(false)}
+        focusReturn={heartbeatLoadingFocusReturn}
+      >
+        <WorkspaceHeartbeatModal
+          workspaceId={props.workspaceId}
+          open={heartbeatModalOpen}
+          onOpenChange={setHeartbeatModalOpen}
+          focusReturn={heartbeatFocusReturn}
+        />
+      </LazySettingsModal>
+    </>
   );
 };
 
@@ -367,6 +399,118 @@ const OverviewStats: React.FC<{ workspaceId: string; onOpen: () => void }> = (pr
     </div>
   );
 };
+
+/** How often the heartbeat countdown updates: the scheduler's own tick, so a due slot shows soon. */
+const HEARTBEAT_COUNTDOWN_TICK_MS = 30_000;
+
+/**
+ * The Heartbeat row: when the next heartbeat is due, with the cadence under it. It owns the
+ * countdown and its subscriptions, so clock ticks and activity rerender only this row. Until the
+ * scheduler reports a deadline (it tracks no sub-agent, and nothing in the first minute after
+ * startup), it shows the cadence.
+ */
+const OverviewHeartbeatRow: React.FC<{
+  workspaceId: string;
+  heartbeat: NonNullable<FrontendWorkspaceMetadata["heartbeat"]>;
+  intervalMs: number;
+  onConfigure: () => void;
+}> = (props) => {
+  const { workspaceMetadata } = useWorkspaceMetadata();
+  const sidebarState = useOptionalWorkspaceSidebarState(props.workspaceId);
+  // Heartbeats never fire for sub-agent workspaces, so the menu bar offers no settings there either.
+  const canConfigure = workspaceMetadata.get(props.workspaceId)?.parentWorkspaceId == null;
+  // Changes whenever the scheduler can move the deadline: a settings edit, new activity, or a turn
+  // starting or ending (a heartbeat's own turn among them).
+  const scheduleKey = [
+    props.intervalMs,
+    props.heartbeat.trigger,
+    props.heartbeat.scheduleUpdatedAt,
+    sidebarState?.canInterrupt,
+    sidebarState?.recencyTimestamp,
+  ].join("|");
+  const next = useNextHeartbeat(props.workspaceId, scheduleKey);
+  const cadence = `Every ${formatHeartbeatIntervalShort(props.intervalMs)}`;
+  return (
+    <OverviewRow
+      Icon={HeartPulse}
+      label="Heartbeat"
+      sub={next != null ? cadence : null}
+      detail={next != null ? formatHeartbeatCountdown(next.atMs - next.nowMs) : cadence}
+      onClick={canConfigure ? props.onConfigure : undefined}
+    />
+  );
+};
+
+/** "Next in 3h" / "Next in 12m", or "Due now" once the deadline has passed. */
+function formatHeartbeatCountdown(remainingMs: number): string {
+  if (remainingMs <= 0) return "Due now";
+  const minutes = Math.ceil(remainingMs / 60_000);
+  if (minutes < 60) return `Next in ${minutes}m`;
+  return `Next in ${Math.round(remainingMs / 3_600_000)}h`;
+}
+
+/**
+ * The scheduler's next heartbeat deadline and the time it is measured against, or null while it
+ * reports none. Read again when `scheduleKey` changes (at once) and on every clock tick: the
+ * scheduler also moves the deadline on events the renderer does not see (a fired or skipped
+ * slot, any activity for an idle trigger, and its first tracking a minute after startup). The
+ * read is an in-memory lookup, so a tick costs one cheap call while the row shows.
+ */
+function useNextHeartbeat(
+  workspaceId: string,
+  scheduleKey: string
+): { atMs: number; nowMs: number } | null {
+  const clockMs = useClock(HEARTBEAT_COUNTDOWN_TICK_MS);
+  const deadline = useHeartbeatDeadline(workspaceId, `${scheduleKey}|${clockMs}`);
+  return deadline?.atMs != null
+    ? { atMs: deadline.atMs, nowMs: Math.max(clockMs, deadline.readAtMs) }
+    : null;
+}
+
+/** The wall clock, updated every `intervalMs`. It is an external source, so a timer subscribes. */
+function useClock(intervalMs: number): number {
+  const [nowMs, setNowMs] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), intervalMs);
+    return () => clearInterval(timer);
+  }, [intervalMs]);
+  return nowMs;
+}
+
+/**
+ * One read of the scheduler's deadline per `readKey`, as a local time, with the time it was read. A failed read
+ * reports no deadline, so the row shows the cadence. Keyed by workspace, so a switch never shows
+ * the previous workspace's deadline.
+ */
+function useHeartbeatDeadline(
+  workspaceId: string,
+  readKey: string
+): { atMs: number | null; readAtMs: number } | null {
+  const api = useOptionalAPI()?.api ?? null;
+  const [read, setRead] = React.useState<{
+    workspaceId: string;
+    atMs: number | null;
+    readAtMs: number;
+  } | null>(null);
+
+  React.useEffect(() => {
+    if (api == null) return;
+    const controller = new AbortController();
+    // The server reports a duration, so its clock never mixes with this one: a remote `xum
+    // server` host's clock can differ from the browser's.
+    const settle = (dueInMs: number | null) => {
+      if (controller.signal.aborted) return;
+      const readAtMs = Date.now();
+      setRead({ workspaceId, atMs: dueInMs == null ? null : readAtMs + dueInMs, readAtMs });
+    };
+    api.workspace.heartbeat
+      .next({ workspaceId }, { signal: controller.signal })
+      .then(settle, () => settle(null));
+    return () => controller.abort();
+  }, [api, workspaceId, readKey]);
+
+  return read?.workspaceId === workspaceId ? read : null;
+}
 
 /**
  * App view rows of the Outputs list: all once More revealed them, otherwise at least one when

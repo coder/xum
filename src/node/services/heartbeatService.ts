@@ -850,6 +850,24 @@ export class HeartbeatService {
     );
   }
 
+  /**
+   * Milliseconds until the workspace's next heartbeat slot opens, for the sidebar's "Next in"
+   * label. A duration, not the deadline: a remote renderer's clock can differ from this host's,
+   * so it counts down from its own read time. Null while the scheduler does not track the
+   * workspace: heartbeats off, a sub-agent or archived workspace, or the first minute after
+   * startup. Zero or less means the slot is due: it waits for the next tick or the queue, or it
+   * is running. An idle trigger's deadline moves with each new activity, and any slot can still
+   * be skipped when it fires (see checkEligibility).
+   */
+  getMsUntilNextHeartbeat(workspaceId: string, now: number = Date.now()): number | null {
+    assert(
+      workspaceId.trim().length > 0,
+      "HeartbeatService.getMsUntilNextHeartbeat requires a workspaceId"
+    );
+    const deadline = this.nextEligibleAtByWorkspaceId.get(workspaceId);
+    return deadline == null ? null : deadline - now;
+  }
+
   async checkEligibility(workspaceId: string, now: number): Promise<HeartbeatEligibilityResult> {
     assert(
       workspaceId.trim().length > 0,

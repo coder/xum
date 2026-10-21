@@ -5,7 +5,13 @@
  * Retired entries stay: they price usage recorded before the model was retired.
  */
 
-interface ModelData {
+import type { LongContextRateClass } from "./modelStats";
+
+// Long-context rates use LiteLLM's names, which carry the provider's published threshold
+// in thousands of prompt tokens: `input_cost_per_token_above_272k_tokens`.
+type LongContextRates = Partial<Record<`${LongContextRateClass}_above_${number}k_tokens`, number>>;
+
+interface ModelData extends LongContextRates {
   max_input_tokens: number;
   max_output_tokens?: number;
   input_cost_per_token: number;
@@ -13,16 +19,8 @@ interface ModelData {
   input_cost_per_image_token?: number;
   output_cost_per_image_token?: number;
   cache_read_input_image_token_cost?: number;
-  input_cost_per_token_above_200k_tokens?: number;
-  output_cost_per_token_above_200k_tokens?: number;
   cache_creation_input_token_cost?: number;
-  cache_creation_input_token_cost_above_200k_tokens?: number;
   cache_read_input_token_cost?: number;
-  cache_read_input_token_cost_above_200k_tokens?: number;
-  // LiteLLM's upstream schema hard-codes the field suffix `_above_200k_tokens`, but
-  // some providers publish a different long-context boundary. Omit this to keep the
-  // historical 200K default; set it explicitly when the provider documents another cutoff.
-  tiered_pricing_threshold_tokens?: number;
   litellm_provider?: string;
   mode?: string;
   supports_function_calling?: boolean;
@@ -440,14 +438,13 @@ export const modelsExtra: Record<string, ModelData> = {
     max_input_tokens: 922000,
     max_output_tokens: 128000,
     input_cost_per_token: 0.000002, // $2 per million input tokens (<272K prompt tokens)
-    input_cost_per_token_above_200k_tokens: 0.000004, // $4 per million input tokens (>272K)
+    input_cost_per_token_above_272k_tokens: 0.000004, // $4 per million input tokens (>272K)
     output_cost_per_token: 0.00001, // $10 per million output tokens (<272K prompt tokens)
-    output_cost_per_token_above_200k_tokens: 0.000015, // $15 per million output tokens (>272K)
+    output_cost_per_token_above_272k_tokens: 0.000015, // $15 per million output tokens (>272K)
     cache_read_input_token_cost: 0.0000001, // $0.10 per million cached input tokens (<272K)
-    cache_read_input_token_cost_above_200k_tokens: 0.0000002, // $0.20 per million cached input tokens (>272K)
+    cache_read_input_token_cost_above_272k_tokens: 0.0000002, // $0.20 per million cached input tokens (>272K)
     cache_creation_input_token_cost: 0.0000025, // $2.50 per million tokens (1.25x input)
-    cache_creation_input_token_cost_above_200k_tokens: 0.000005, // $5 per million tokens (1.25x long-context input)
-    tiered_pricing_threshold_tokens: 272000, // OpenAI's published boundary is 272K (field names say 200K)
+    cache_creation_input_token_cost_above_272k_tokens: 0.000005, // $5 per million tokens (1.25x long-context input)
     litellm_provider: "openai",
     mode: "chat",
     supports_function_calling: true,
@@ -464,14 +461,13 @@ export const modelsExtra: Record<string, ModelData> = {
     max_input_tokens: 922000,
     max_output_tokens: 128000,
     input_cost_per_token: 0.0000001,
-    input_cost_per_token_above_200k_tokens: 0.0000002,
+    input_cost_per_token_above_272k_tokens: 0.0000002,
     output_cost_per_token: 0.0000005,
-    output_cost_per_token_above_200k_tokens: 0.00000075,
+    output_cost_per_token_above_272k_tokens: 0.00000075,
     cache_read_input_token_cost: 0.00000001,
-    cache_read_input_token_cost_above_200k_tokens: 0.00000002,
+    cache_read_input_token_cost_above_272k_tokens: 0.00000002,
     cache_creation_input_token_cost: 0.000000125,
-    cache_creation_input_token_cost_above_200k_tokens: 0.00000025,
-    tiered_pricing_threshold_tokens: 272000,
+    cache_creation_input_token_cost_above_272k_tokens: 0.00000025,
     litellm_provider: "openai",
     mode: "chat",
     supports_function_calling: true,
@@ -498,14 +494,13 @@ export const modelsExtra: Record<string, ModelData> = {
     max_input_tokens: 1050000,
     max_output_tokens: 128000,
     input_cost_per_token: 0.00001, // $10 per million input tokens (<272K prompt tokens)
-    input_cost_per_token_above_200k_tokens: 0.00002, // $20 per million input tokens (>272K)
+    input_cost_per_token_above_272k_tokens: 0.00002, // $20 per million input tokens (>272K)
     output_cost_per_token: 0.00005, // $50 per million output tokens (<272K prompt tokens)
-    output_cost_per_token_above_200k_tokens: 0.000075, // $75 per million output tokens (>272K)
+    output_cost_per_token_above_272k_tokens: 0.000075, // $75 per million output tokens (>272K)
     cache_read_input_token_cost: 0.000001, // $1 per million cached input tokens (<272K)
-    cache_read_input_token_cost_above_200k_tokens: 0.000002, // $2 per million cached input tokens (>272K)
+    cache_read_input_token_cost_above_272k_tokens: 0.000002, // $2 per million cached input tokens (>272K)
     cache_creation_input_token_cost: 0.0000125, // $12.50 per million tokens (1.25x input)
-    cache_creation_input_token_cost_above_200k_tokens: 0.000025, // $25 per million tokens (1.25x long-context input)
-    tiered_pricing_threshold_tokens: 272000, // OpenAI's published boundary is 272K (field names say 200K)
+    cache_creation_input_token_cost_above_272k_tokens: 0.000025, // $25 per million tokens (1.25x long-context input)
     litellm_provider: "openai",
     mode: "chat",
     supports_function_calling: true,
@@ -522,14 +517,13 @@ export const modelsExtra: Record<string, ModelData> = {
     max_input_tokens: 922000,
     max_output_tokens: 128000,
     input_cost_per_token: 0.000002,
-    input_cost_per_token_above_200k_tokens: 0.000004,
+    input_cost_per_token_above_272k_tokens: 0.000004,
     output_cost_per_token: 0.00001,
-    output_cost_per_token_above_200k_tokens: 0.000015,
+    output_cost_per_token_above_272k_tokens: 0.000015,
     cache_read_input_token_cost: 0.0000002,
-    cache_read_input_token_cost_above_200k_tokens: 0.0000004,
+    cache_read_input_token_cost_above_272k_tokens: 0.0000004,
     cache_creation_input_token_cost: 0.0000025,
-    cache_creation_input_token_cost_above_200k_tokens: 0.000005,
-    tiered_pricing_threshold_tokens: 272000,
+    cache_creation_input_token_cost_above_272k_tokens: 0.000005,
     litellm_provider: "openai",
     mode: "chat",
     supports_function_calling: true,
@@ -689,14 +683,13 @@ export const modelsExtra: Record<string, ModelData> = {
     max_input_tokens: 1000000,
     max_output_tokens: 128000,
     input_cost_per_token: 0.0000001, // $0.10 per million input tokens
-    input_cost_per_token_above_200k_tokens: 0.0000005, // $0.50 per million input tokens (>100K)
+    input_cost_per_token_above_100k_tokens: 0.0000005, // $0.50 per million input tokens (>100K)
     output_cost_per_token: 0.0000005, // $0.50 per million output tokens
-    output_cost_per_token_above_200k_tokens: 0.0000025, // $2.50 per million output tokens (>100K)
+    output_cost_per_token_above_100k_tokens: 0.0000025, // $2.50 per million output tokens (>100K)
     cache_creation_input_token_cost: 0.000000125, // $0.125 per million tokens (1.25x input)
-    cache_creation_input_token_cost_above_200k_tokens: 0.000000625, // $0.625 per million (>100K)
+    cache_creation_input_token_cost_above_100k_tokens: 0.000000625, // $0.625 per million (>100K)
     cache_read_input_token_cost: 0.00000001, // $0.01 per million tokens (0.1x input)
-    cache_read_input_token_cost_above_200k_tokens: 0.00000005, // $0.05 per million (>100K)
-    tiered_pricing_threshold_tokens: 100000, // Anthropic's published boundary is 100K (field names say 200K)
+    cache_read_input_token_cost_above_100k_tokens: 0.00000005, // $0.05 per million (>100K)
     litellm_provider: "anthropic",
     mode: "chat",
     supports_function_calling: true,

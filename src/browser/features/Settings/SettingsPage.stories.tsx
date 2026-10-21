@@ -5,7 +5,6 @@ import {
   openSettingsDialog,
   waitForChatInputAutofocusDone,
 } from "@/browser/stories/storyPlayHelpers.js";
-import type { LayoutPresetsConfig } from "@/common/types/uiLayouts";
 import { setupSettingsStory } from "./Sections/settingsStoryUtils.js";
 
 export default {
@@ -23,7 +22,6 @@ const BASE_SECTION_LABELS = [
   "Secrets",
   "Security",
   "Server Access",
-  "Layouts",
   "Runtimes",
   "Experiments",
   "Keybinds",
@@ -42,7 +40,6 @@ const SECTION_CONTENT_MATCHERS: Record<BaseSectionLabel, RegExp> = {
   Secrets: /Secrets are stored in/i,
   Security: /Project Trust/i,
   "Server Access": /Server access sessions/i,
-  Layouts: /Layout Slots|Add layout/i,
   Runtimes: /Default runtime/i,
   Experiments: /Experimental features that are still in development/i,
   Keybinds: /Open agent picker/i,
@@ -127,50 +124,43 @@ export const SectionsSmoke: AppStory = {
   },
 };
 
-const LAYOUT_PRESET = {
-  version: 2,
-  slots: [
-    {
-      slot: 1,
-      preset: {
-        id: "preset-1",
-        name: "My Layout",
-        leftSidebarCollapsed: false,
-        rightSidebar: {
-          collapsed: true,
-          width: { mode: "px", value: 400 },
-          layout: {
-            version: 1,
-            nextId: 2,
-            focusedTabsetId: "tabset-1",
-            root: { type: "tabset", id: "tabset-1", tabs: ["costs"], activeTab: "costs" },
-          },
-        },
-      },
-    },
-  ],
-} satisfies LayoutPresetsConfig;
+const CUSTOM_MODEL_ID = "story-custom-model";
 
 // Real-browser Escape routing: an inline editor inside the modal cancels its own edit without
 // closing settings, while an unclaimed Escape closes the modal.
 export const EscapeInInlineEditor: AppStory = {
   parameters: { pixel: PIXEL_DISABLED },
-  render: () => <AppWithMocks setup={() => setupSettingsStory({ layoutPresets: LAYOUT_PRESET })} />,
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            anthropic: {
+              apiKeySet: true,
+              isEnabled: true,
+              isConfigured: true,
+              baseUrl: "",
+              models: [CUSTOM_MODEL_ID],
+            },
+          },
+        })
+      }
+    />
+  ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     const dialog = await openSettings(canvasElement);
     const settings = within(dialog);
-    await clickSectionButton(dialog, "Layouts");
+    await clickSectionButton(dialog, "Models");
 
-    await userEvent.dblClick(await settings.findByText("My Layout"));
-    const rename = await settings.findByRole("textbox", { name: "Rename layout Slot 1" });
-    await expect(rename).toHaveFocus();
+    // The custom model row's inline editor (ModelRow) cancels its own edit on Escape.
+    await userEvent.click(await settings.findByRole("button", { name: "Edit model" }));
+    const editor = await settings.findByDisplayValue(CUSTOM_MODEL_ID);
+    await expect(editor).toHaveFocus();
     await userEvent.keyboard("{Escape}");
 
-    await waitFor(() =>
-      expect(settings.queryByRole("textbox", { name: "Rename layout Slot 1" })).toBeNull()
-    );
+    await waitFor(() => expect(settings.queryByDisplayValue(CUSTOM_MODEL_ID)).toBeNull());
     await expect(getSettingsDialog()).toBe(dialog);
-    await expect(settings.getByText("My Layout")).toBeVisible();
+    await expect(settings.getByRole("button", { name: "Edit model" })).toBeVisible();
 
     dialog.focus();
     await userEvent.keyboard("{Escape}");

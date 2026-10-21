@@ -55,11 +55,6 @@ import {
 import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { SettingsBackupSchema } from "@/common/config/schemas/settingsBackup";
 import {
-  isLayoutPresetsConfigEmpty,
-  normalizeLayoutPresetsConfig,
-  type LayoutPresetsConfig,
-} from "@/common/types/uiLayouts";
-import {
   deriveLegacySubagentAiDefaultsProjection,
   mergeLegacySubagentAiDefaults,
   normalizeAgentAiDefaults,
@@ -3142,11 +3137,6 @@ export class Config {
     );
     const migrations = normalizeConfigMigrations(parsed.migrations);
 
-    const layoutPresetsRaw = normalizeLayoutPresetsConfig(parsed.layoutPresets);
-    const layoutPresets = isLayoutPresetsConfigEmpty(layoutPresetsRaw)
-      ? undefined
-      : layoutPresetsRaw;
-
     const config: LegacyAdvisorProjectsConfig = {
       projects: projectsMap,
       apiServerBindHost: parseOptionalNonEmptyString(parsed.apiServerBindHost),
@@ -3159,7 +3149,6 @@ export class Config {
       defaultProjectDir: parseOptionalNonEmptyString(parsed.defaultProjectDir),
       viewedSplashScreens: parsed.viewedSplashScreens,
       userPreferences,
-      layoutPresets,
       taskSettings,
       chatTranscriptFullWidth: parseOptionalBoolean(parsed.chatTranscriptFullWidth),
       muxGatewayEnabled,
@@ -3438,12 +3427,6 @@ export class Config {
         data.userPreferences = userPreferences;
       }
 
-      if (config.layoutPresets) {
-        const normalized = normalizeLayoutPresetsConfig(config.layoutPresets);
-        if (!isLayoutPresetsConfigEmpty(normalized)) {
-          data.layoutPresets = normalized;
-        }
-      }
       if (config.viewedSplashScreens) {
         data.viewedSplashScreens = config.viewedSplashScreens;
       }
@@ -3921,16 +3904,6 @@ export class Config {
       const viewed = config.viewedSplashScreens ?? [];
       if (!viewed.includes(splashId)) viewed.push(splashId);
       return { ...config, viewedSplashScreens: viewed };
-    });
-  }
-
-  async saveLayoutPresets(layoutPresets: LayoutPresetsConfig): Promise<void> {
-    await this.editConfig((config) => {
-      const normalized = normalizeLayoutPresetsConfig(layoutPresets);
-      return {
-        ...config,
-        layoutPresets: isLayoutPresetsConfigEmpty(normalized) ? undefined : normalized,
-      };
     });
   }
 

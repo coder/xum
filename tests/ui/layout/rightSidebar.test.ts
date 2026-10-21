@@ -46,6 +46,7 @@ import {
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import type { TabType } from "@/browser/types/rightSidebar";
+import { openRightSidebarTool, splitRightSidebarPane } from "@/browser/utils/rightSidebarTabFocus";
 import { BROWSER_VIEWPORT_ATTR } from "@/browser/utils/ui/keybinds";
 
 const RIGHT_SIDEBAR_SELECTOR = '[role="complementary"][aria-label="Workspace insights"]';
@@ -1201,6 +1202,53 @@ describeIntegration("RightSidebar (UI)", () => {
       await waitFor(() => {
         expect(launcher.contains(document.activeElement)).toBe(true);
       });
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("the palette's splits reveal the sidebar and move focus into the new pane", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      seedLayout(["costs", "goal"]);
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), true);
+    });
+    // What the palette's "Right Sidebar: Split Horizontally/Vertically" runs.
+    const split = (direction: "horizontal" | "vertical") =>
+      splitRightSidebarPane(workspaceId, direction);
+
+    try {
+      // From two tabs, the split moves the shown one (Stats) to the new pane: focus follows it.
+      split("vertical");
+      await waitFor(() => {
+        const active = document.activeElement;
+        expect(active?.getAttribute("role")).toBe("tab");
+        expect(active?.getAttribute("aria-controls")).toContain("-panel-costs");
+      });
+      expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), true)).toBe(false);
+
+      // Stats is now alone in the focused pane, so the next split gives the new pane a New tab:
+      // focus lands on its launcher's first row.
+      split("horizontal");
+      const launcher = await findSidebarPanel(sidebar, "-panel-new");
+      await waitFor(() => {
+        expect(document.activeElement).toBe(launcher.querySelector("button"));
+      });
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("the palette's Add Tool reveals the sidebar with focus on the tool's tab", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), true);
+    });
+
+    try {
+      // What the palette's "Right Sidebar: Add Tool…" runs for Stats.
+      openRightSidebarTool(workspaceId, "costs");
+      const statsTab = await findSidebarTab(sidebar, "costs");
+      await waitFor(() => expect(document.activeElement).toBe(statsTab));
+      expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), true)).toBe(false);
     } finally {
       await cleanup();
     }

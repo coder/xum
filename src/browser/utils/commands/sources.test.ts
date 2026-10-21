@@ -2466,6 +2466,29 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
     });
   });
 
+  // The sidebar moves focus there (tests/ui/layout/rightSidebar.test.ts).
+  test("Add Tool and the splits ask the sidebar to focus the tab they showed", async () => {
+    await withTestWindow(async () => {
+      const requests: unknown[] = [];
+      const record = (event: Event) => requests.push((event as CustomEvent).detail);
+      window.addEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      try {
+        const actions = getActions();
+        const find = (id: string) => actions.find((entry) => entry.id === id)!;
+        await find(CommandIds.navRightSidebarSplitVertical()).run();
+        // The split's new pane holds a New tab, which Add Tool then replaces with the tool.
+        const newPane = readRightSidebarLayout("w1").focusedTabsetId;
+        await find(CommandIds.navRightSidebarAddTool()).prompt!.onSubmit({ tool: "review" });
+        expect(requests).toEqual([
+          { workspaceId: "w1", tabsetId: newPane, tab: "new" },
+          { workspaceId: "w1", tabsetId: newPane, tab: "review" },
+        ]);
+      } finally {
+        window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      }
+    });
+  });
+
   test.each([null, true])("Add Tool opens with collapse preference %s", async (collapsed) => {
     await withTestWindow(async () => {
       updatePersistedState(getRightSidebarCollapsedKey("w1"), collapsed);
@@ -2510,17 +2533,31 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
               .prompt!.onSubmit({ tool: "terminal" });
           }
         };
-        await run();
-        // With no session there is nothing to focus: leave the new chat collapsed.
-        expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(true);
-        const layout = selectOrAddTab(
-          getDefaultRightSidebarLayoutState("terminal:session-1"),
-          "costs"
-        );
-        updatePersistedState(getRightSidebarLayoutKey("w1"), layout);
-        await run();
-        expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
-        expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe("terminal:session-1");
+        const focusRequests: unknown[] = [];
+        const record = (event: Event) => focusRequests.push((event as CustomEvent).detail);
+        window.addEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+        try {
+          await run();
+          // With no session there is nothing to focus: leave the new chat collapsed.
+          expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(true);
+          expect(focusRequests).toEqual([]);
+          const layout = selectOrAddTab(
+            getDefaultRightSidebarLayoutState("terminal:session-1"),
+            "costs"
+          );
+          updatePersistedState(getRightSidebarLayoutKey("w1"), layout);
+          await run();
+          expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
+          expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe(
+            "terminal:session-1"
+          );
+          // The sidebar hands the terminal the keyboard.
+          expect(focusRequests).toEqual([
+            { workspaceId: "w1", tabsetId: layout.focusedTabsetId, tab: "terminal:session-1" },
+          ]);
+        } finally {
+          window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+        }
       });
     }
   );
