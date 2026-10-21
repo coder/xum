@@ -190,24 +190,27 @@ describe("DaytonaSshConfigWriter", () => {
     expect(await Bun.file(sshConfigPath).exists()).toBe(false);
   });
 
-  it("refuses a Xum root whose path holds an ssh % token, writing nothing", async () => {
-    const tokenWriter = new DaytonaSshConfigWriter({
-      xumHome: path.join(tempDir, "xum%d"),
-      sshConfigPath,
-    });
-    const input = { sandboxId: "sb-1", token: "tok", gateway: GATEWAY };
-    for (const update of [
-      () => tokenWriter.writeSandbox(input),
-      () => tokenWriter.updateToken(input),
-      () => tokenWriter.repointGateway(GATEWAY),
-    ]) {
-      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
-      await expect(update()).rejects.toThrow(
-        `Daytona ssh setup cannot use ${tokenWriter.paths.dir}`
-      );
+  it.each(["xum%d", "xum*", "xum?", "xum[abc]"])(
+    "refuses a Xum root that ssh would read as a token or glob (%s), writing nothing",
+    async (root) => {
+      const tokenWriter = new DaytonaSshConfigWriter({
+        xumHome: path.join(tempDir, root),
+        sshConfigPath,
+      });
+      const input = { sandboxId: "sb-1", token: "tok", gateway: GATEWAY };
+      for (const update of [
+        () => tokenWriter.writeSandbox(input),
+        () => tokenWriter.updateToken(input),
+        () => tokenWriter.repointGateway(GATEWAY),
+      ]) {
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+        await expect(update()).rejects.toThrow(
+          `Daytona ssh setup cannot use ${tokenWriter.paths.dir}`
+        );
+      }
+      expect(await fs.readdir(tempDir)).toEqual([]);
     }
-    expect(await fs.readdir(tempDir)).toEqual([]);
-  });
+  );
 
   it("writes a self-hosted IPv6 gateway as OpenSSH resolves it, refusing zone ids", async () => {
     const gateway = { ...GATEWAY, host: "2001:db8::10", port: 2222 };
