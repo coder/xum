@@ -67,7 +67,7 @@ A sandbox Xum created can serve several workspaces when you fork one. Xum delete
 
 If the sandbox is still being destroyed (for example after a failed setup), delete waits up to a minute for Daytona to finish. A forced delete removes the workspace even when Daytona refuses to delete the sandbox; it then shows a warning that names the sandbox, which you delete in the Daytona dashboard.
 
-With **Remote box on archive** set to delete, Xum first checks the workspace for uncommitted or unpushed work. If it finds some, or cannot run the check, it stops the sandbox instead and shows a warning.
+With **Remote box on archive** set to delete, Xum first checks the workspace for uncommitted or unpushed work and for untracked files. If it finds some, or cannot run the check, it stops the sandbox instead and shows a warning. Files git ignores (for example `node_modules`, build output or `.env`) do not count, so copy any you need before you archive with this setting.
 
 Once a minute, Xum also stops running sandboxes that carry this install's label but that no workspace uses. It never deletes them.
 
