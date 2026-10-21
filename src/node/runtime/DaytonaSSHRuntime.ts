@@ -970,15 +970,8 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       return sshDelete();
     }
 
-    // Force ("cancel creation" or an explicit force delete): the sandbox may not be reachable
-    // yet, so delete it without SSH. A kept sandbox only loses this workspace's checkout.
-    const forced = force ? await this.forceDeleteLastReference(sandboxId, deletedPath) : undefined;
+    const forced = force ? await this.forcedRemovalWithoutSsh(sandboxId, deletedPath) : undefined;
     if (forced) return forced;
-    // A forced removal skips the checks, so it never starts a stopped (billed) sandbox for
-    // them: its checkout stays on the sandbox, which this removal keeps or releases.
-    if (force && !(await this.isSandboxStarted(sandboxId))) {
-      return this.settleSandbox(sandboxId, { success: true, deletedPath }, undefined);
-    }
 
     const prepared = await this.startForDeleteChecks(sandboxId, abortSignal);
     if (prepared === "missing") {
@@ -994,6 +987,23 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     const sshResult = await sshDelete();
     if (!sshResult.success) return sshResult;
     return this.settleSandbox(sandboxId, sshResult, "SSH delete succeeded, but ");
+  }
+
+  /**
+   * Force ("cancel creation" or an explicit force delete): the sandbox may not be reachable
+   * yet, so delete it without SSH. A kept sandbox only loses this workspace's checkout.
+   * Undefined when the forced removal still needs SSH (a started sandbox that stays).
+   */
+  private async forcedRemovalWithoutSsh(
+    sandboxId: string,
+    deletedPath: string
+  ): Promise<DeleteResult | undefined> {
+    const deleted = await this.forceDeleteLastReference(sandboxId, deletedPath);
+    if (deleted) return deleted;
+    // A forced removal skips the checks, so it never starts a stopped (billed) sandbox for
+    // them: its checkout stays on the sandbox, which this removal keeps or releases.
+    if (await this.isSandboxStarted(sandboxId)) return undefined;
+    return this.settleSandbox(sandboxId, { success: true, deletedPath }, undefined);
   }
 
   /** The force path's sandbox delete, when this is the last workspace on a sandbox Xum created. */

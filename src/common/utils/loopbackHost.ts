@@ -12,16 +12,16 @@ export function isLoopbackHost(host: string): boolean {
   const bare =
     normalized.startsWith("[") && normalized.endsWith("]") ? normalized.slice(1, -1) : normalized;
 
-  if (bare === "localhost" || bare === "::1") return true;
+  return bare === "localhost" || bare === "::1" || isIpv4Loopback(bare);
+}
 
-  // Match 127.x.y.z only for literal IPv4 addresses (4 numeric octets, 0-255).
-  // This prevents hostnames like "127.example.com" from being misclassified.
-  if (bare.startsWith("127.")) {
-    const parts = bare.split(".");
-    if (parts.length === 4 && parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255)) {
-      return true;
-    }
-  }
-
-  return false;
+// Match 127.x.y.z only for literal IPv4 addresses (4 numeric octets, 0-255).
+// This prevents hostnames like "127.example.com" from being misclassified.
+function isIpv4Loopback(host: string): boolean {
+  const parts = host.split(".");
+  return (
+    parts[0] === "127" &&
+    parts.length === 4 &&
+    parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255)
+  );
 }
