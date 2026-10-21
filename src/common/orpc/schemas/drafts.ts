@@ -280,6 +280,11 @@ export const CreationDraftExecutionSchema = z.object({
   agent: z.object({ id: z.string().min(1), scope: AgentDefinitionScopeSchema }).nullable(),
   runtime: ParsedRuntimeSchema.nullable(),
   trunkBranch: z.string().nullable(),
+  /**
+   * The draft's last Daytona choice (an existing sandbox, a snapshot, a size), restored when
+   * the user switches to another runtime and back. Never written to the project defaults.
+   */
+  lastDaytona: DaytonaSandboxConfigSchema.optional(),
 });
 
 /**

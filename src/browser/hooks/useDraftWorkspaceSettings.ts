@@ -437,7 +437,8 @@ export function useDraftWorkspaceSettings(
   // useDraftWorkspaceSettings.compiler.test.tsx guards their identity.
   // Uses discriminated union: SSH has host, Docker has image.
   // Parsed into a fresh object, so it too must follow the last hook to keep its identity.
-  const daytonaConfigFallback = readDaytonaOptionDefaults(lastRuntimeConfigs);
+  const daytonaConfigFallback =
+    execution?.lastDaytona ?? readDaytonaOptionDefaults(lastRuntimeConfigs);
   const defaultRuntime = buildRuntimeForMode(
     defaultRuntimeMode,
     {
@@ -469,7 +470,13 @@ export function useDraftWorkspaceSettings(
       devcontainerShareCredentials: lastDevcontainerShareCredentials,
     });
 
-    getCreationDraftStore().updateExecution(draftId, { runtime: mergedRuntime });
+    getCreationDraftStore().updateExecution(draftId, {
+      runtime: mergedRuntime,
+      // Only in the draft: an attached sandbox must never become a project default.
+      ...(mergedRuntime.mode === RUNTIME_MODE.SSH && mergedRuntime.daytona
+        ? { lastDaytona: mergedRuntime.daytona }
+        : {}),
+    });
 
     // Persist host/image/coder so they're remembered when switching modes.
     // Avoid wiping the remembered value when the UI switches modes with an empty field.
