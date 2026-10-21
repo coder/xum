@@ -446,7 +446,14 @@ describe("DaytonaService", () => {
     const order: string[] = [];
     /** Per retirement: whether the sandbox's next ssh access would set it up again. */
     const staleAtRetire: boolean[] = [];
-    const record = (input: { token: string; gateway: { host: string; hostKeys: string[] } }) => {
+    /** The include file: what ensureSshAccess reads back before it trusts its cache. */
+    const includeFile = new Map<string, string>();
+    const record = (input: {
+      sandboxId: string;
+      token: string;
+      gateway: { host: string; hostKeys: string[] };
+    }) => {
+      includeFile.set(input.sandboxId, input.token);
       writes.push(`${input.token}@${input.gateway.host} ${input.gateway.hostKeys.join(",")}`);
       return Promise.resolve();
     };
@@ -459,6 +466,7 @@ describe("DaytonaService", () => {
         writeSandbox: record,
         updateToken: record,
         removeSandbox: (sandboxId) => {
+          includeFile.delete(sandboxId);
           order.push(`remove ${sandboxId}`);
           return Promise.resolve();
         },
@@ -466,7 +474,8 @@ describe("DaytonaService", () => {
           order.push(`repoint ${gateway.host} ${gateway.hostKeys.join(",")}`);
           return Promise.resolve();
         },
-        readTokens: () => Promise.resolve([]),
+        readTokens: () =>
+          Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
         verifyResolvedConfig: () => Promise.resolve(),
       },
       retireSshConnections: (sandboxId) => {

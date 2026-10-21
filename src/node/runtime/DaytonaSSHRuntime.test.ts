@@ -1444,7 +1444,7 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
       transport: {
         ...localShellTransport(rig.rootDir),
         spawnRemoteProcess: () => {
-          readsWhenSpawned = readTokens.mock.calls.length;
+          readsWhenSpawned ??= readTokens.mock.calls.length;
           return Promise.reject(
             new RuntimeError(`${stale}@127.0.0.1: Permission denied (publickey).`, "network")
           );
@@ -1459,6 +1459,45 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
     expect(readsWhenSpawned).toBe(2);
     expect(String(error)).not.toContain(stale);
     expect(String(error)).toContain(`${DAYTONA_TOKEN_PLACEHOLDER}@127.0.0.1: Permission denied`);
+  });
+
+  it("follows the include file another backend sharing the root edits", async () => {
+    rig.plane.addSandbox({ id: "sb-both" });
+    await rig.service.ensureSshAccess("sb-both");
+    const ours = rig.writer.tokens.get("sb-both");
+
+    // Another backend archives a workspace on the sandbox and removes its alias.
+    rig.writer.tokens.delete("sb-both");
+    await rig.service.ensureSshAccess("sb-both");
+    expect(rig.writer.fullWrites).toEqual(["sb-both", "sb-both"]);
+    const rewritten = rig.writer.tokens.get("sb-both");
+    expect(rewritten).toBeDefined();
+    expect(rewritten).not.toBe(ours);
+
+    // Another backend mints and writes its own token; ssh now sends that one.
+    const theirs = "other-backend-token-5e2b";
+    rig.writer.tokens.set("sb-both", theirs);
+    const runtime = makeRuntime({ sandboxId: "sb-both" }, rig, {
+      transport: {
+        ...localShellTransport(rig.rootDir),
+        spawnRemoteProcess: () =>
+          Promise.reject(
+            new RuntimeError(`${theirs}@127.0.0.1: Permission denied (publickey).`, "network")
+          ),
+      },
+    });
+    const error = await runtime.exec("true", { cwd: "/tmp", timeout: 10 }).then(
+      () => new Error("exec unexpectedly succeeded"),
+      (rejection: unknown) => rejection
+    );
+    expect(String(error)).not.toContain(theirs);
+    expect(String(error)).toContain(DAYTONA_TOKEN_PLACEHOLDER);
+
+    // Held as the sandbox's token: a release revokes it with the block.
+    rig.writer.tokens.set("sb-both", theirs);
+    await rig.service.ensureSshAccess("sb-both");
+    await rig.service.releaseSshAccess("sb-both");
+    expect(rig.plane.revokedTokens).toContain(theirs);
   });
 });
 

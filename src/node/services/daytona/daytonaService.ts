@@ -361,7 +361,7 @@ export class DaytonaService {
   /** Sandboxes whose include block and `~/.ssh/config` block this process has written. */
   private readonly sshConfigured = new Set<string>();
   private readonly readyAt = new Map<string, number>();
-  private persistedTokensLoad?: Promise<void>;
+  /** Whether the include file was read once, seeding the tokens an earlier process left. */
   private persistedTokensLoaded = false;
   private readonly readyRequests = new Map<string, SandboxReadyRequest>();
   /** Why the setup of a sandbox Xum created (and then deleted) failed, for later turns. */
@@ -396,36 +396,66 @@ export class DaytonaService {
   }
 
   /**
-   * Tokens an earlier Xum process wrote to the include file. ssh keeps sending them until Xum
-   * replaces them, so the redactor must know them; holding them also lets a replacement, a
-   * settings change or an archive revoke them. The file has no expiry, so they are due for
-   * refresh at once. Startup starts this load but goes on when it fails or is slow, so every
-   * ssh to a sandbox (ensureSshAccess, the runtime's commands) waits for it first. Loads once;
-   * a failed read is logged and retried by the next caller. A missing file loads nothing.
+   * Register every token the include file holds now with the redactor. The file is shared by
+   * every Xum backend on this root, and ssh sends whatever token it holds: one an earlier
+   * process left (ssh keeps sending it until Xum replaces it) or one another backend wrote
+   * since. So every ssh to a sandbox (ensureSshAccess, the runtime's commands) reads it first,
+   * and a failed read fails that ssh. Startup reads it too but goes on when the read fails.
+   * A missing file holds nothing.
    */
-  loadPersistedTokens(): Promise<void> {
-    if (this.persistedTokensLoaded) return Promise.resolve();
-    this.persistedTokensLoad ??= this.readPersistedTokens().then(
-      () => {
-        this.persistedTokensLoaded = true;
-      },
-      (error: unknown) => {
-        this.persistedTokensLoad = undefined;
-        log.warn("Could not read the Daytona ssh tokens an earlier Xum process left", {
-          error: getErrorMessage(error),
-        });
-        throw error;
-      }
-    );
-    return this.persistedTokensLoad;
+  async loadPersistedTokens(): Promise<void> {
+    await this.readIncludeFileTokens();
   }
 
-  private async readPersistedTokens(): Promise<void> {
-    for (const { sandboxId, token } of await this.sshConfigWriter.readTokens()) {
+  private async readIncludeFileTokens(): Promise<Map<string, string>> {
+    let entries: Array<{ sandboxId: string; token: string }>;
+    try {
+      entries = await this.sshConfigWriter.readTokens();
+    } catch (error) {
+      log.warn("Could not read the Daytona ssh tokens in the include file", {
+        error: getErrorMessage(error),
+      });
+      throw error;
+    }
+    const tokens = new Map<string, string>();
+    for (const { sandboxId, token } of entries) {
       rememberDaytonaToken(token);
-      if (!this.tokens.has(sandboxId)) {
+      tokens.set(sandboxId, token);
+      // An earlier process's tokens: holding them lets a replacement, a settings change or an
+      // archive revoke them. The file has no expiry, so they are due for refresh at once.
+      if (!this.persistedTokensLoaded && !this.tokens.has(sandboxId)) {
         this.cacheNewToken(sandboxId, { token, expiresAt: new Date(0).toISOString() });
       }
+    }
+    this.persistedTokensLoaded = true;
+    return tokens;
+  }
+
+  /**
+   * This process's view of the include file goes stale when another backend edits it: one
+   * that released the sandbox's access removed the alias (write it again), one that minted
+   * wrote its own token (hold that one, which ssh now sends). Skipped when this process
+   * changed the sandbox's access during the read, which then may predate its own write.
+   */
+  private async revalidateSshAccess(sandboxId: string): Promise<void> {
+    const generation = this.sshTokenGeneration(sandboxId);
+    const releases = this.accessReleases.get(sandboxId);
+    const fileToken = (await this.readIncludeFileTokens()).get(sandboxId);
+    const unchanged =
+      generation === this.sshTokenGeneration(sandboxId) &&
+      releases === this.accessReleases.get(sandboxId);
+    if (!unchanged || !this.sshConfigured.has(sandboxId)) return;
+    const cached = this.tokens.get(sandboxId);
+    if (fileToken === undefined) {
+      this.sshConfigured.delete(sandboxId);
+      this.readyAt.delete(sandboxId);
+      // Due at once: the mint writes the alias again and revokes this token.
+      if (cached) this.tokens.set(sandboxId, { ...cached, expiresAt: new Date(0).toISOString() });
+      return;
+    }
+    // Its expiry is unknown; it was minted after this process's, so that expiry is a bound.
+    if (cached && cached.token !== fileToken) {
+      this.cacheNewToken(sandboxId, { token: fileToken, expiresAt: cached.expiresAt });
     }
   }
 
@@ -1196,7 +1226,7 @@ export class DaytonaService {
    */
   ensureSshAccess(sandboxId: string): Promise<void> {
     return this.withAccountLease(async () => {
-      await this.loadPersistedTokens();
+      await this.revalidateSshAccess(sandboxId);
       // Fails before a mint when the control plane cannot say where the gateway is.
       await this.getGatewayConfig();
       // A cached token was written by the mint that produced it, so only a mint writes files.
