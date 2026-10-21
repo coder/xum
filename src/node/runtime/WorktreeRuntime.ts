@@ -47,6 +47,10 @@ export class WorktreeRuntime extends LocalBaseRuntime {
     this.currentWorkspacePath = options?.workspacePath;
   }
 
+  protected override agentCgroupProjectPath(): string | undefined {
+    return this.currentProjectPath;
+  }
+
   getWorkspacePath(projectPath: string, workspaceName: string): string {
     // Honor an explicit persisted path for this runtime's own workspace so callers (cwd resolution,
     // ensureReady, agent discovery) land in the shared parent checkout instead of a name-derived

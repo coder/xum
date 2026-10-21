@@ -99,6 +99,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: { cpuCores: 8, memoryGiB: 16 },
+      projects: {},
       status: ACTIVE,
       support: READY,
     });
@@ -108,6 +109,7 @@ describe("AgentResourceLimitsSettings", () => {
     view.saveElsewhere({
       enabled: true,
       limits: { cpuCores: 4, memoryGiB: 16 },
+      projects: {},
       status: ACTIVE,
       support: READY,
     });
@@ -126,6 +128,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: { cpuCores: 8 },
+      projects: {},
       status: { state: "active", cgroup: "/xum/xum-agents" },
       support: READY,
     });
@@ -146,6 +149,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: { cpuCores: 8, memoryGiB: 16 },
+      projects: {},
       status: { state: "active", cgroup: "/xum/xum-agents" },
       support: READY,
     });
@@ -161,6 +165,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: { cpuCores: 8 },
+      projects: {},
       status: ACTIVE,
       support: READY,
     });
@@ -186,6 +191,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: {},
+      projects: {},
       status: { state: "off" },
       support: READY,
     });
@@ -201,6 +207,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: { cpuCores: 2 },
+      projects: {},
       status: { state: "unavailable", reason: "xum runs in cgroup /init.scope." },
       support: READY,
     });
@@ -270,7 +277,7 @@ describe("AgentResourceLimitsSettings", () => {
   ])(
     "tells before any limit applies that applying them %s, and keeps the switch usable",
     async (_name, setting, support, note) => {
-      const view = renderSettings({ ...setting, status: OFF, support });
+      const view = renderSettings({ ...setting, projects: {}, status: OFF, support });
 
       await view.findByText(note);
       expect(view.toggle().disabled).toBe(false);
@@ -282,6 +289,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: { cpuCores: 2 },
+      projects: {},
       status: { state: "unavailable", reason },
       support: { state: "unsupported", reason },
     });
@@ -299,6 +307,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: false,
       limits: { cpuCores: 2 },
+      projects: {},
       status: { state: "unavailable", reason: "Could not remove the limits: EACCES" },
       support: READY,
     });
@@ -319,6 +328,7 @@ describe.each([...GAP_MODES])("AgentResourceLimitsSettings while reconnecting (%
     const server = createServer({
       enabled: true,
       limits: { cpuCores: 8 },
+      projects: {},
       status: ACTIVE,
       support: READY,
     });

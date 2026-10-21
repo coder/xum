@@ -1,3 +1,5 @@
+import { createHash } from "crypto";
+import type { Dirent } from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
 import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
@@ -6,7 +8,10 @@ import type {
   AgentResourceLimitsSupport,
 } from "@/common/orpc/schemas/agentResourceLimits";
 import { getErrorMessage } from "@/common/utils/errors";
-import { agentCgroupEnrollmentLine } from "@/node/runtime/agentCgroupEnrollment";
+import {
+  agentCgroupEnrollmentLine,
+  type AgentCgroupEnrollmentTargets,
+} from "@/node/runtime/agentCgroupEnrollment";
 import { log } from "@/node/services/log";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -20,6 +25,13 @@ const AGENTS_CGROUP = "xum-agents";
  * processes cannot enable controllers for its children.
  */
 const APP_CGROUP = "xum-app";
+/**
+ * While a project has a limit of its own, `xum-agents` enables controllers for its children, so it
+ * cannot hold processes: the agent commands of projects without their own limit run here.
+ */
+const DEFAULT_CGROUP = "default";
+/** The prefix of the child of `xum-agents` for one project with a limit of its own. */
+const PROJECT_CGROUP_PREFIX = "p-";
 const MAX_ENABLE_ATTEMPTS = 5;
 const PROBE_TIMEOUT_MS = 10_000;
 /** The files that delegate a cgroup to a user, besides its directory (see the kernel's cgroup-v2.rst). */
@@ -50,13 +62,22 @@ export interface AgentCgroupHost {
   isSystemdBooted: () => Promise<boolean>;
   /** With `sudo -n`, give the cgroup at `cgroupDir` to xum's user, as the docs' sudo step does. */
   delegateWithSudo: (cgroupDir: string) => Promise<void>;
+  /** Remove an empty cgroup; the kernel fails with EBUSY while it holds processes or children. */
+  removeCgroup: (cgroupDir: string) => Promise<void>;
 }
+
+/** The limits of each project that has a limit of its own, keyed by its path in config.json. */
+export type ProjectAgentResourceLimits = ReadonlyMap<string, AgentResourceLimits>;
 
 export interface AgentCgroupResult {
   status: AgentResourceLimitsStatus;
-  /** The `cgroup.procs` file new agent shells join, or null when no limit applies. */
-  enrollmentTarget: string | null;
+  /** Where new agent shells go, or null when no limit applies. */
+  enrollment: AgentCgroupEnrollmentTargets | null;
+  /** The cgroup of each project with a limit of its own, while the limits are active. */
+  projectCgroups: ReadonlyMap<string, string>;
 }
+
+const NO_PROJECT_CGROUPS: ReadonlyMap<string, string> = new Map();
 
 export const linuxAgentCgroupHost: AgentCgroupHost = {
   platform: process.platform,
@@ -72,6 +93,7 @@ export const linuxAgentCgroupHost: AgentCgroupHost = {
     return (await probe.result).stdout;
   },
   uid: process.getuid?.(),
+  removeCgroup: (cgroupDir) => fs.rmdir(cgroupDir),
   isSystemdBooted: async () => {
     try {
       await fs.access("/run/systemd/system");
@@ -126,6 +148,15 @@ export function memoryMaxValue(memoryGiB: number | undefined): string {
   return memoryGiB === undefined ? "max" : String(Math.round(memoryGiB * 2 ** 30));
 }
 
+/**
+ * The name of a project's child of `xum-agents`: the same in every xum server that reads the same
+ * config, and a valid cgroup name for any project path.
+ */
+export function projectCgroupName(projectPath: string): string {
+  const hash = createHash("sha256").update(projectPath).digest("hex");
+  return `${PROJECT_CGROUP_PREFIX}${hash.slice(0, 12)}`;
+}
+
 /** The cgroup v2 path in `/proc/self/cgroup` (the `0::` line), or null outside cgroup v2. */
 export function parseSelfCgroup(contents: string): string | null {
   for (const line of contents.split("\n")) {
@@ -144,13 +175,17 @@ export function parseSelfCgroup(contents: string): string | null {
  * `trySudo` is set only for applies a user asked for (startup, a save, the switch, Try again).
  * Every config write re-applies limits that are not applied, and on a host where sudo needs a
  * password each sudo call can add an auth-log entry or incident mail.
+ *
+ * `projects` are the limits of single projects. Each gets its own child of `xum-agents`, so the
+ * kernel holds a project to its own limit and to the shared one, whichever is lower.
  */
 export async function applyAgentCgroupLimits(
   limits: AgentResourceLimits,
   host: AgentCgroupHost,
-  options: { trySudo: boolean } = { trySudo: false }
+  options: { trySudo?: boolean; projects?: ProjectAgentResourceLimits } = {}
 ): Promise<AgentCgroupResult> {
-  const needed = neededControllers(limits);
+  const projects = options.projects ?? new Map<string, AgentResourceLimits>();
+  const needed = neededControllers([limits, ...projects.values()]);
   if (needed.length === 0) {
     failedSudoDelegations.delete(host);
     try {
@@ -161,7 +196,7 @@ export async function applyAgentCgroupLimits(
         `Could not remove the limits from the agent cgroup: ${getErrorMessage(error)}`
       );
     }
-    return { status: { state: "off" }, enrollmentTarget: null };
+    return { status: { state: "off" }, enrollment: null, projectCgroups: NO_PROJECT_CGROUPS };
   }
 
   const plan = await planAgentCgroup(needed, host);
@@ -169,14 +204,14 @@ export async function applyAgentCgroupLimits(
     return unavailable(plan.reason);
   }
   if (plan.state === "sudo") {
-    const problem = await delegateBaseWithSudo(plan, options.trySudo, host);
+    const problem = await delegateBaseWithSudo(plan, options.trySudo === true, host);
     if (problem !== null) {
       return problem;
     }
   }
   const baseDir = path.join(host.cgroupRoot, plan.base);
   try {
-    return await setUpAgentsCgroup(plan.base, baseDir, limits, needed, host);
+    return await setUpAgentsCgroup(plan.base, baseDir, limits, needed, projects, host);
   } catch (error) {
     return unavailable(
       `Could not set up cgroup ${plan.base}/${AGENTS_CGROUP}: ${getErrorMessage(error)}`
@@ -193,7 +228,7 @@ export async function checkAgentCgroupSupport(
   limits: AgentResourceLimits,
   host: AgentCgroupHost
 ): Promise<AgentResourceLimitsSupport> {
-  const needed = neededControllers(limits);
+  const needed = neededControllers([limits]);
   try {
     const plan = await planAgentCgroup(needed.length > 0 ? needed : ["cpu", "memory"], host);
     return plan.state === "ready" || plan.state === "sudo"
@@ -204,10 +239,11 @@ export async function checkAgentCgroupSupport(
   }
 }
 
-function neededControllers(limits: AgentResourceLimits): Controller[] {
+/** The controllers that any of `limitSets` needs. */
+function neededControllers(limitSets: readonly AgentResourceLimits[]): Controller[] {
   const needed: Controller[] = [];
-  if (limits.cpuCores !== undefined) needed.push("cpu");
-  if (limits.memoryGiB !== undefined) needed.push("memory");
+  if (limitSets.some((limits) => limits.cpuCores !== undefined)) needed.push("cpu");
+  if (limitSets.some((limits) => limits.memoryGiB !== undefined)) needed.push("memory");
   return needed;
 }
 
@@ -334,19 +370,159 @@ async function setUpAgentsCgroup(
   baseDir: string,
   limits: AgentResourceLimits,
   needed: Controller[],
+  projects: ProjectAgentResourceLimits,
   host: AgentCgroupHost
 ): Promise<AgentCgroupResult> {
-  await enableControllers(baseDir, needed, host);
+  await enableControllers(baseDir, needed, host, APP_CGROUP);
   const agentsDir = path.join(baseDir, AGENTS_CGROUP);
   await fs.mkdir(agentsDir, { recursive: true });
-  await writeLimits(baseDir, limits, host);
-  const procsFile = path.join(agentsDir, "cgroup.procs");
+  await writeLimits(baseDir, AGENTS_CGROUP, limits, host);
   const agentsCgroup = path.posix.join(base, AGENTS_CGROUP);
-  const probed = parseSelfCgroup(await host.probeEnrollment(procsFile));
-  if (probed !== agentsCgroup) {
-    return unavailable(`A test command ran in cgroup ${probed ?? "unknown"}, not ${agentsCgroup}.`);
+  const status: AgentResourceLimitsStatus = { state: "active", cgroup: agentsCgroup };
+  if (projects.size === 0) {
+    // No project limit: agent commands join xum-agents itself, as before project limits.
+    await unnestAgentsCgroup(agentsDir, host);
+    const procsFile = path.join(agentsDir, "cgroup.procs");
+    const problem = await checkEnrollment(procsFile, agentsCgroup, host);
+    return (
+      problem ?? {
+        status,
+        enrollment: { fallback: procsFile, byProject: new Map() },
+        projectCgroups: NO_PROJECT_CGROUPS,
+      }
+    );
   }
-  return { status: { state: "active", cgroup: agentsCgroup }, enrollmentTarget: procsFile };
+  return setUpProjectCgroups(agentsDir, agentsCgroup, projects, status, host);
+}
+
+/**
+ * Give each project with a limit its own child of `xum-agents`, and move every other agent command
+ * into `default`: a cgroup that enables controllers for its children cannot hold processes.
+ */
+async function setUpProjectCgroups(
+  agentsDir: string,
+  agentsCgroup: string,
+  projects: ProjectAgentResourceLimits,
+  status: AgentResourceLimitsStatus,
+  host: AgentCgroupHost
+): Promise<AgentCgroupResult> {
+  await fs.mkdir(path.join(agentsDir, DEFAULT_CGROUP), { recursive: true });
+  await enableControllers(
+    agentsDir,
+    neededControllers([...projects.values()]),
+    host,
+    DEFAULT_CGROUP
+  );
+  // A controller that only the shared limit needs stays off for the children, and a controller
+  // turned on for an earlier project limit stays on; writeLimits writes max for it.
+  await writeLimits(agentsDir, DEFAULT_CGROUP, {}, host);
+  const defaultProcs = path.join(agentsDir, DEFAULT_CGROUP, "cgroup.procs");
+  const defaultProblem = await checkEnrollment(
+    defaultProcs,
+    path.posix.join(agentsCgroup, DEFAULT_CGROUP),
+    host
+  );
+  if (defaultProblem !== null) {
+    return defaultProblem;
+  }
+  const byProject = new Map<string, string>();
+  const projectCgroups = new Map<string, string>();
+  const keep = new Set([DEFAULT_CGROUP]);
+  for (const [projectPath, projectLimits] of projects) {
+    const name = projectCgroupName(projectPath);
+    keep.add(name);
+    await fs.mkdir(path.join(agentsDir, name), { recursive: true });
+    await writeLimits(agentsDir, name, projectLimits, host);
+    const procsFile = path.join(agentsDir, name, "cgroup.procs");
+    const cgroup = path.posix.join(agentsCgroup, name);
+    const problem = await checkEnrollment(procsFile, cgroup, host);
+    if (problem !== null) {
+      return problem;
+    }
+    byProject.set(projectPath, procsFile);
+    projectCgroups.set(projectPath, cgroup);
+  }
+  await removeEmptyChildren(agentsDir, keep, host);
+  return { status, enrollment: { fallback: defaultProcs, byProject }, projectCgroups };
+}
+
+/** Why a test command did not join `cgroup` through `procsFile`, or null when it did. */
+async function checkEnrollment(
+  procsFile: string,
+  cgroup: string,
+  host: AgentCgroupHost
+): Promise<AgentCgroupResult | null> {
+  const probed = parseSelfCgroup(await host.probeEnrollment(procsFile));
+  return probed === cgroup
+    ? null
+    : unavailable(`A test command ran in cgroup ${probed ?? "unknown"}, not ${cgroup}.`);
+}
+
+/**
+ * Go back to the layout without project limits: write max to the children of `xum-agents`, turn
+ * their controllers off, so that the kernel accepts agent commands in `xum-agents` again, and
+ * remove the children once they are empty. Commands that still run in a child keep running there
+ * without a project limit.
+ */
+async function unnestAgentsCgroup(agentsDir: string, host: AgentCgroupHost): Promise<void> {
+  const children = await listAgentChildren(agentsDir);
+  for (const name of children) {
+    await writeLimits(agentsDir, name, {}, host);
+  }
+  const enabled = (await readSubtreeControl(agentsDir)).filter(
+    (controller) => controller === "cpu" || controller === "memory"
+  );
+  if (enabled.length > 0) {
+    await host.writeFile(
+      path.join(agentsDir, "cgroup.subtree_control"),
+      enabled.map((controller) => `-${controller}`).join(" ")
+    );
+  }
+  await removeEmptyChildren(agentsDir, new Set(), host);
+}
+
+/**
+ * Remove the children of `xum-agents` that xum made and no longer needs, once they are empty.
+ * A child that still holds processes loses its limit and stays until a later apply.
+ */
+async function removeEmptyChildren(
+  agentsDir: string,
+  keep: ReadonlySet<string>,
+  host: AgentCgroupHost
+): Promise<void> {
+  for (const name of await listAgentChildren(agentsDir)) {
+    if (keep.has(name)) {
+      continue;
+    }
+    await writeLimits(agentsDir, name, {}, host);
+    try {
+      await host.removeCgroup(path.join(agentsDir, name));
+    } catch (error) {
+      if (!hasErrorCode(error, "EBUSY")) {
+        throw error;
+      }
+    }
+  }
+}
+
+/** The children of `xum-agents` that xum made: `default` and one for each limited project. */
+async function listAgentChildren(agentsDir: string): Promise<string[]> {
+  let entries: Dirent[];
+  try {
+    entries = await fs.readdir(agentsDir, { withFileTypes: true });
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) {
+      return [];
+    }
+    throw error;
+  }
+  return entries
+    .filter(
+      (entry) =>
+        entry.isDirectory() &&
+        (entry.name === DEFAULT_CGROUP || entry.name.startsWith(PROJECT_CGROUP_PREFIX))
+    )
+    .map((entry) => entry.name);
 }
 
 /** Remove the limits from an existing `xum-agents` cgroup, for agent processes still in it. */
@@ -367,7 +543,8 @@ async function clearAgentCgroupLimits(host: AgentCgroupHost): Promise<void> {
     }
     throw error;
   }
-  await writeLimits(baseDir, {}, host);
+  await writeLimits(baseDir, AGENTS_CGROUP, {}, host);
+  await unnestAgentsCgroup(path.join(baseDir, AGENTS_CGROUP), host);
 }
 
 /** xum's own cgroup, and the base cgroup: the same, or its parent once xum moved into `xum-app`. */
@@ -410,14 +587,19 @@ async function findBaseCgroup(
   return { own, base: name === APP_CGROUP ? path.posix.dirname(own) : own };
 }
 
+/**
+ * Enable `needed` for the children of the cgroup at `dir`. While `dir` holds processes the kernel
+ * refuses with EBUSY, so its processes move into its child `leaf` first.
+ */
 async function enableControllers(
-  baseDir: string,
+  dir: string,
   needed: Controller[],
-  host: AgentCgroupHost
+  host: AgentCgroupHost,
+  leaf: string
 ): Promise<void> {
-  const subtreeControl = path.join(baseDir, "cgroup.subtree_control");
-  await emptyBaseCgroup(baseDir, host);
-  const enabled = await readWords(subtreeControl);
+  const subtreeControl = path.join(dir, "cgroup.subtree_control");
+  await emptyCgroup(dir, leaf, host);
+  const enabled = await readSubtreeControl(dir);
   const toEnable = needed.filter((controller) => !enabled.includes(controller));
   if (toEnable.length === 0) {
     return;
@@ -434,44 +616,56 @@ async function enableControllers(
       if (!hasErrorCode(error, "EBUSY") || attempt >= MAX_ENABLE_ATTEMPTS) {
         throw error;
       }
-      await moveProcesses(baseDir, path.join(baseDir, APP_CGROUP), host);
+      await moveProcesses(dir, path.join(dir, leaf), host);
     }
   }
 }
 
 /**
- * Move every process of the base cgroup into xum-app before any controller is enabled, not only
- * after EBUSY. The kernel refuses memory while the cgroup holds processes, but accepts a threaded
- * controller such as cpu. The cgroup then becomes a thread root whose domain children refuse
- * processes (EOPNOTSUPP), so with only a CPU limit no agent could join xum-agents.
+ * Move every process of the cgroup at `dir` into its child `leaf` (xum-app for the base cgroup,
+ * default for xum-agents) before any controller is enabled, not only after EBUSY. The kernel
+ * refuses memory while the cgroup holds processes, but accepts a threaded controller such as cpu.
+ * The cgroup then becomes a thread root whose domain children refuse processes (EOPNOTSUPP), so
+ * with only a CPU limit no agent could join its cgroup.
  */
-async function emptyBaseCgroup(baseDir: string, host: AgentCgroupHost): Promise<void> {
-  const procsFile = path.join(baseDir, "cgroup.procs");
-  if ((await readWords(procsFile)).length === 0) {
+async function emptyCgroup(dir: string, leaf: string, host: AgentCgroupHost): Promise<void> {
+  if ((await readProcs(dir)).length === 0) {
     return;
   }
   // Only threaded controllers can be on here. They keep the cgroup a thread root, which refuses
-  // the moves into xum-app. Turning one off resets its settings in every child, so undo only what
+  // the moves into the leaf. Turning one off resets its settings in every child, so undo only what
   // a xum without this fix left: cpu alone, with no threaded child whose cpu limits are in use.
-  const subtreeControl = path.join(baseDir, "cgroup.subtree_control");
-  const enabled = await readWords(subtreeControl);
+  const subtreeControl = path.join(dir, "cgroup.subtree_control");
+  const enabled = await readSubtreeControl(dir);
   if (enabled.length > 0) {
-    if (enabled.join(" ") !== "cpu" || (await hasThreadedChild(baseDir))) {
+    if (enabled.join(" ") !== "cpu" || (await hasThreadedChild(dir))) {
       throw new Error(
-        `${baseDir} holds processes and enables ${enabled.join(" ")} for its children, so xum cannot move the processes without resetting those settings.`
+        `${dir} holds processes and enables ${enabled.join(" ")} for its children, so xum cannot move the processes without resetting those settings.`
       );
     }
     await host.writeFile(subtreeControl, "-cpu");
   }
   // Repeat for processes that forked during a move: one left behind makes a thread root again.
   for (let attempt = 1; ; attempt += 1) {
-    await moveProcesses(baseDir, path.join(baseDir, APP_CGROUP), host);
-    if ((await readWords(procsFile)).length === 0) {
+    await moveProcesses(dir, path.join(dir, leaf), host);
+    if ((await readProcs(dir)).length === 0) {
       return;
     }
     if (attempt >= MAX_ENABLE_ATTEMPTS) {
-      throw new Error(`New processes kept starting in ${baseDir} while xum moved them.`);
+      throw new Error(`New processes kept starting in ${dir} while xum moved them.`);
     }
+  }
+}
+
+/** The processes of the cgroup at `dir`; none for a directory that is not a cgroup yet. */
+async function readProcs(dir: string): Promise<string[]> {
+  try {
+    return await readWords(path.join(dir, "cgroup.procs"));
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) {
+      return [];
+    }
+    throw error;
   }
 }
 
@@ -506,20 +700,36 @@ async function moveProcesses(fromDir: string, toDir: string, host: AgentCgroupHo
   }
 }
 
-/** Write the limits of `xum-agents`, or `max` for a limit that is not set. */
+/** Write the limits of the child `name` of `parentDir`, or `max` for a limit that is not set. */
 async function writeLimits(
-  baseDir: string,
+  parentDir: string,
+  name: string,
   limits: AgentResourceLimits,
   host: AgentCgroupHost
 ): Promise<void> {
-  const agentsDir = path.join(baseDir, AGENTS_CGROUP);
-  // A controller's files exist in xum-agents only while the controller is on in its parent.
-  const enabled = await readWords(path.join(baseDir, "cgroup.subtree_control"));
+  const dir = path.join(parentDir, name);
+  // A controller's files exist in a child only while the controller is on in its parent.
+  const enabled = await readSubtreeControl(parentDir);
   if (enabled.includes("cpu")) {
-    await host.writeFile(path.join(agentsDir, "cpu.max"), cpuMaxValue(limits.cpuCores));
+    await host.writeFile(path.join(dir, "cpu.max"), cpuMaxValue(limits.cpuCores));
   }
   if (enabled.includes("memory")) {
-    await host.writeFile(path.join(agentsDir, "memory.max"), memoryMaxValue(limits.memoryGiB));
+    await host.writeFile(path.join(dir, "memory.max"), memoryMaxValue(limits.memoryGiB));
+  }
+}
+
+/**
+ * The controllers that the cgroup at `dir` enables for its children. The kernel gives every cgroup
+ * this file. A directory without it is not a cgroup that xum set up yet, so it enables none.
+ */
+async function readSubtreeControl(dir: string): Promise<string[]> {
+  try {
+    return await readWords(path.join(dir, "cgroup.subtree_control"));
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) {
+      return [];
+    }
+    throw error;
   }
 }
 
@@ -528,5 +738,9 @@ async function readWords(file: string): Promise<string[]> {
 }
 
 function unavailable(reason: string): AgentCgroupResult {
-  return { status: { state: "unavailable", reason }, enrollmentTarget: null };
+  return {
+    status: { state: "unavailable", reason },
+    enrollment: null,
+    projectCgroups: NO_PROJECT_CGROUPS,
+  };
 }
