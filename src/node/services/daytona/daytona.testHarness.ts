@@ -42,6 +42,8 @@ export class FakeDaytonaControlPlane {
   readonly hangingRoutes = new Set<string>();
   /** Routes (`METHOD /path`) that answer 500. */
   readonly failingRoutes = new Set<string>();
+  /** POST /sandbox creates the sandbox, then answers 500 (the create's outcome looks unknown). */
+  failAfterCreate = false;
   private nextId = 1;
   private nextToken = 1;
 
@@ -112,6 +114,10 @@ export class FakeDaytonaControlPlane {
       if (this.rejectCreateResources && hasResources) {
         return fail(400, "Cannot specify Sandbox resources when using a snapshot");
       }
+      // Daytona names are unique per organization: a taken name is a conflict.
+      if (typeof body.name === "string" && this.find(body.name)) {
+        return fail(409, `Sandbox with name ${body.name} already exists`);
+      }
       const id = `sb-${this.nextId++}`;
       const sandbox = this.addSandbox({
         id,
@@ -123,6 +129,7 @@ export class FakeDaytonaControlPlane {
         disk: typeof body.disk === "number" ? body.disk : this.snapshotResources.disk,
         labels: (body.labels as Record<string, string> | undefined) ?? {},
       });
+      if (this.failAfterCreate) return fail(500, "Internal error");
       return json(200, this.view(sandbox));
     }
 

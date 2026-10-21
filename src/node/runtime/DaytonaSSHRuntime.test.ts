@@ -272,6 +272,52 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     }
   });
 
+  it("never deletes a sandbox that took its name before the create request", async () => {
+    // Another Xum install created this name between validateBeforePersist and the create.
+    const other = rig.plane.addSandbox({
+      id: "sb-other",
+      name: "xum-raced",
+      labels: { "xum.instance": "another-install", "xum.workspaceId": "ws-other" },
+    });
+
+    const failure = await makeRuntime({ sandboxId: "xum-raced", shared: false, ...SMALL })
+      .postCreateSetup(initParams())
+      .then(
+        () => undefined,
+        (error: unknown) => error
+      );
+
+    expect(String(failure)).toContain("already exists");
+    expect(rig.plane.calls.filter((call) => call.startsWith("DELETE /sandbox/"))).toEqual([]);
+    expect(rig.plane.find("xum-raced")).toBe(other);
+  });
+
+  it("after a create of unknown outcome, deletes the sandbox only when it has its labels", async () => {
+    const setUp = (sandboxId: string) =>
+      makeRuntime({ sandboxId, shared: false, ...SMALL })
+        .postCreateSetup(initParams())
+        .then(
+          () => undefined,
+          (error: unknown) => error
+        );
+
+    // The create went through, but the answer was a 500: the sandbox is this setup's.
+    rig.plane.failAfterCreate = true;
+    expect(String(await setUp("xum-maybe"))).toContain("HTTP 500");
+    expect(rig.plane.find("xum-maybe")).toBeUndefined();
+
+    // A 500 without a create, while another install holds the name: keep that sandbox.
+    rig.plane.failAfterCreate = false;
+    rig.plane.failingRoutes.add("POST /sandbox");
+    const other = rig.plane.addSandbox({
+      id: "sb-other",
+      name: "xum-theirs",
+      labels: { "xum.instance": "another-install", "xum.workspaceId": "ws-1" },
+    });
+    expect(String(await setUp("xum-theirs"))).toContain("HTTP 500");
+    expect(rig.plane.find("xum-theirs")).toBe(other);
+  });
+
   it("seeds the agent home of a created sandbox but never of an attached one", async () => {
     const hostXum = path.join(rig.rootDir, "host-xum");
     await fs.mkdir(hostXum, { recursive: true });

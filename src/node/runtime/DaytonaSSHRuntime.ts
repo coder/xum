@@ -46,6 +46,8 @@ import { Err, Ok } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import { DaytonaApiError, type DaytonaSandbox } from "@/node/services/daytona/daytonaClient";
 import {
+  DAYTONA_LABEL_INSTANCE,
+  DAYTONA_LABEL_WORKSPACE_ID,
   DAYTONA_START_TIMEOUT_MS,
   type DaytonaService,
 } from "@/node/services/daytona/daytonaService";
@@ -136,6 +138,20 @@ function invalidSizeError(): string {
 
 function isBadRequest(error: unknown): boolean {
   return error instanceof DaytonaApiError && error.kind === "bad_request";
+}
+
+/**
+ * What a failed setup may delete: "none" before any create, "created" after a create that
+ * succeeded, "unknown" after a failed one. A failed create may still have created the sandbox
+ * (a timeout, a 5xx), or the name may belong to another install's sandbox (a 409 when it was
+ * taken after validateBeforePersist): only the labels tell, so they are checked first.
+ */
+type CreateOutcome = "none" | "created" | "unknown";
+
+interface CreateAttempt {
+  outcome: CreateOutcome;
+  /** The labels the last create request carried. */
+  labels?: Record<string, string>;
 }
 
 /** Resolve with `promise`, or reject as soon as `signal` aborts (the shared work keeps going). */
@@ -643,12 +659,11 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     // A fork reuses its source's sandbox: create nothing (and so never delete it on failure).
     const creates = this.daytonaConfig.shared !== true && this.daytonaConfig.forked !== true;
 
-    let createRequested = false;
+    const create: CreateAttempt = { outcome: "none" };
     try {
       if (creates) {
         params.initLogger.logStep(`Creating Daytona sandbox "${sandboxId}"...`);
-        createRequested = true;
-        await this.createSandbox(sandboxId, params);
+        await this.createSandbox(sandboxId, params, create);
         params.initLogger.logStep("Daytona sandbox created");
       }
       await this.connectAndSeed(sandboxId, creates, params);
@@ -657,10 +672,13 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       const errorMsg = redactDaytonaTokens(getErrorMessage(error));
       log.error("Daytona sandbox setup failed", { sandboxId, error: errorMsg });
       params.initLogger.logStderr(`Daytona sandbox setup failed: ${errorMsg}`);
-      if (createRequested) {
-        // Later turns report this reason instead of "deleted outside Xum".
+      if (creates) {
+        // Later turns report this reason instead of "deleted outside Xum", and never use a
+        // sandbox of that name that Xum did not create.
         this.daytonaService.recordSetupFailure(sandboxId, errorMsg);
-        await this.deleteCreatedSandbox(sandboxId, params.initLogger);
+      }
+      if (create.outcome !== "none") {
+        await this.deleteCreatedSandbox(sandboxId, create, params.initLogger);
       }
       throw new Error(`Daytona sandbox setup failed: ${errorMsg}`);
     }
@@ -707,9 +725,14 @@ export class DaytonaSSHRuntime extends SSHRuntime {
 
   private async deleteCreatedSandbox(
     sandboxId: string,
+    create: CreateAttempt,
     initLogger: WorkspaceInitParams["initLogger"]
   ): Promise<void> {
     try {
+      if (create.outcome === "unknown" && !(await this.carriesLabels(sandboxId, create.labels))) {
+        log.warn("Not deleting a Daytona sandbox this setup may not have created", { sandboxId });
+        return;
+      }
       initLogger.logStep(`Deleting the sandbox "${sandboxId}" this setup created...`);
       await this.daytonaService.deleteSandbox(sandboxId);
     } catch (error) {
@@ -723,11 +746,38 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     }
   }
 
+  /** After a create of unknown outcome: the sandbox has this install's and workspace's labels. */
+  private async carriesLabels(
+    sandboxId: string,
+    labels: Record<string, string> | undefined
+  ): Promise<boolean> {
+    const { sandbox } = await this.daytonaService.getSandboxState(sandboxId);
+    if (!sandbox || !labels) return false;
+    return [DAYTONA_LABEL_INSTANCE, DAYTONA_LABEL_WORKSPACE_ID].every(
+      (key) => labels[key] !== undefined && sandbox.labels?.[key] === labels[key]
+    );
+  }
+
+  /** One create request; `create.outcome` tells postCreateSetup what a failure may delete. */
+  private async requestCreate(
+    request: Parameters<DaytonaRuntimeService["createSandbox"]>[0],
+    create: CreateAttempt
+  ): Promise<void> {
+    create.outcome = "unknown";
+    create.labels = request.labels;
+    await this.daytonaService.createSandbox(request);
+    create.outcome = "created";
+  }
+
   /**
    * Create with the preset resources. Daytona rejects resources (HTTP 400) for snapshots with
    * fixed resources: then create with the snapshot's own size and resize to the preset.
    */
-  private async createSandbox(sandboxId: string, params: WorkspaceInitParams): Promise<void> {
+  private async createSandbox(
+    sandboxId: string,
+    params: WorkspaceInitParams,
+    create: CreateAttempt
+  ): Promise<void> {
     const preset = resolveSizePreset(this.daytonaConfig);
     if (!preset) throw new Error(invalidSizeError());
     const base = {
@@ -743,12 +793,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       autoDeleteInterval: DAYTONA_AUTO_DELETE_DISABLED,
     };
     try {
-      await this.daytonaService.createSandbox({
-        ...base,
-        cpu: preset.cpu,
-        memory: preset.memoryGiB,
-        disk: preset.diskGiB,
-      });
+      await this.requestCreate(
+        { ...base, cpu: preset.cpu, memory: preset.memoryGiB, disk: preset.diskGiB },
+        create
+      );
       return;
     } catch (error) {
       if (!isBadRequest(error)) throw error;
@@ -757,7 +805,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
           `creating with the snapshot's size and resizing to ${preset.label}...`
       );
     }
-    await this.daytonaService.createSandbox(base);
+    await this.requestCreate(base, create);
     await this.resizeToPreset(sandboxId, preset);
   }
 
