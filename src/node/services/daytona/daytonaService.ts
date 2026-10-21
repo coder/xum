@@ -18,6 +18,8 @@ import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { redactDaytonaTokens, rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
 import { getDaytonaSandboxId } from "@/common/types/runtime";
 import { log } from "@/node/services/log";
+import { sleepWithAbort } from "@/node/utils/abort";
+import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import {
   DaytonaApiError,
   DaytonaClient,
@@ -145,7 +147,6 @@ export interface DaytonaServiceOptions {
 export interface DaytonaStartAndWaitOptions {
   /** Called when Xum asks Daytona to start the sandbox (for a "Starting sandbox" status). */
   onStarting?: () => void;
-  pollIntervalMs?: number;
   signal?: AbortSignal;
 }
 
@@ -193,10 +194,6 @@ function toSummary(sandbox: DaytonaSandbox): DaytonaSandboxSummary {
   };
 }
 
-function defaultSleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 /**
  * Daytona lifecycle and credential access shared by the runtime, the reconciler and the
  * `daytona` oRPC namespace. One instance per Xum backend: it owns the per-sandbox SSH token
@@ -219,8 +216,8 @@ export class DaytonaService {
   /** Why the setup of a sandbox Xum created (and then deleted) failed, for later turns. */
   private readonly setupFailures = new Map<string, string>();
   private readonly listWorkspaces?: () => DaytonaWorkspaceRef[];
-  /** Per sandbox: the chain that serializes "is this its last workspace" decisions. */
-  private readonly removalLocks = new Map<string, Promise<unknown>>();
+  /** Per sandbox: serializes "is this its last workspace" decisions. */
+  private readonly removalLocks = new MutexMap<string>();
   /**
    * Per sandbox: workspaces whose removal passed its checks and deleted its checkout, but
    * that the workspace list may still show until the removal is persisted.
@@ -234,7 +231,7 @@ export class DaytonaService {
       options.sshConfigWriter ?? new DaytonaSshConfigWriter({ xumHome: options.rootDir });
     this.fetchImpl = options.fetch;
     this.now = options.now ?? Date.now;
-    this.sleep = options.sleep ?? defaultSleep;
+    this.sleep = options.sleep ?? sleepWithAbort;
     this.listWorkspaces = options.listWorkspaces;
   }
 
@@ -305,23 +302,7 @@ export class DaytonaService {
 
   /** Run `fn` after every earlier removal decision for this sandbox has settled. */
   withSandboxRemovalLock<T>(sandboxId: string, fn: () => Promise<T>): Promise<T> {
-    const run = (this.removalLocks.get(sandboxId) ?? Promise.resolve()).then(fn);
-    // The caller gets the rejection through `run`; the chain only needs to keep going.
-    const settled: Promise<void> = run
-      .then(
-        () => undefined,
-        (error: unknown) => {
-          log.debug("Daytona sandbox removal step failed", {
-            sandboxId,
-            error: getErrorMessage(error),
-          });
-        }
-      )
-      .then(() => {
-        if (this.removalLocks.get(sandboxId) === settled) this.removalLocks.delete(sandboxId);
-      });
-    this.removalLocks.set(sandboxId, settled);
-    return run;
+    return this.removalLocks.withLock(sandboxId, fn);
   }
 
   /** The workspace no longer references the sandbox, even while the workspace list shows it. */
@@ -396,7 +377,7 @@ export class DaytonaService {
       return {
         ok: true,
         sandboxes: sandboxes
-          .filter((sandbox) => sandbox.state !== "destroyed" && sandbox.state !== "destroying")
+          .filter((sandbox) => !DESTROYING_STATES.has(sandbox.state ?? ""))
           .map(toSummary),
       };
     } catch (error) {
@@ -471,9 +452,7 @@ export class DaytonaService {
       }
       const remaining = deadline - this.now();
       if (remaining <= 0) throw startTimeoutError(sandboxId, sandbox);
-      await this.sleep(
-        Math.min(options.pollIntervalMs ?? DAYTONA_START_POLL_INTERVAL_MS, remaining)
-      );
+      await this.sleep(Math.min(DAYTONA_START_POLL_INTERVAL_MS, remaining));
     }
   }
 

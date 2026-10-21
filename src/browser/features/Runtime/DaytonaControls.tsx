@@ -346,6 +346,6 @@ export function DaytonaSandboxForm(props: DaytonaSandboxFormProps) {
 export function DaytonaCreationForm(
   props: Omit<DaytonaSandboxFormProps, "resources" | "allowExisting">
 ) {
-  const resources = useDaytonaResources({ enabled: true, loadSandboxes: true });
+  const resources = useDaytonaResources({ loadSandboxes: true });
   return <DaytonaSandboxForm {...props} resources={resources} allowExisting />;
 }

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { DaytonaErrorKind } from "@/common/orpc/schemas/daytona";
 import { getErrorMessage } from "@/common/utils/errors";
+import { linkAbortSignal } from "@/node/utils/abort";
 
 /**
  * Thin typed fetch client for the Daytona control plane (public OpenAPI spec at
@@ -11,7 +12,7 @@ import { getErrorMessage } from "@/common/utils/errors";
  * method and path only, never the query string (revoke passes the token there).
  */
 
-export const DAYTONA_REQUEST_TIMEOUT_MS = 15_000;
+const DAYTONA_REQUEST_TIMEOUT_MS = 15_000;
 
 export class DaytonaApiError extends Error {
   readonly kind: DaytonaErrorKind;
@@ -98,7 +99,6 @@ export interface DaytonaCreateSandboxRequest {
   autoArchiveInterval?: number;
   /** Minutes; negative disables. */
   autoDeleteInterval?: number;
-  env?: Record<string, string>;
 }
 
 export interface DaytonaResizeRequest {
@@ -153,7 +153,7 @@ function extractServerMessage(bodyText: string): string | undefined {
     return toPlainExcerpt(bodyText);
   }
   if (parsed && typeof parsed === "object" && "message" in parsed) {
-    const message = (parsed as { message: unknown }).message;
+    const message = parsed.message;
     if (typeof message === "string") return toPlainExcerpt(message);
     if (Array.isArray(message)) {
       return toPlainExcerpt(message.filter((m) => typeof m === "string").join("; "));
@@ -295,10 +295,8 @@ export class DaytonaClient {
       controller.abort();
     }, this.timeoutMs);
     const callerSignal = init.callerSignal;
-    const abortFromCaller = () => controller.abort();
-    callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
+    const unlinkCaller = linkAbortSignal(callerSignal, controller);
     try {
-      if (callerSignal?.aborted) controller.abort();
       const response = await this.fetchImpl(url, {
         method: init.method,
         headers: init.headers,
@@ -316,7 +314,7 @@ export class DaytonaClient {
       });
     } finally {
       clearTimeout(timer);
-      callerSignal?.removeEventListener("abort", abortFromCaller);
+      unlinkCaller();
     }
   }
 
@@ -394,10 +392,6 @@ export class DaytonaClient {
 
   async stopSandbox(id: string, signal?: AbortSignal): Promise<void> {
     await this.request("POST", `/sandbox/${encodeURIComponent(id)}/stop`, { signal });
-  }
-
-  async archiveSandbox(id: string, signal?: AbortSignal): Promise<void> {
-    await this.request("POST", `/sandbox/${encodeURIComponent(id)}/archive`, { signal });
   }
 
   async deleteSandbox(id: string, signal?: AbortSignal): Promise<void> {

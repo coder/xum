@@ -306,7 +306,7 @@ export function DaytonaAccessForm() {
  * other runtime option defaults so the creation controls start from them.
  */
 export function DaytonaDefaultsForm(props: { projectPath: string; disabled?: boolean }) {
-  const resources = useDaytonaResources({ enabled: true, loadSandboxes: false });
+  const resources = useDaytonaResources({ loadSandboxes: false });
   const defaults = readDaytonaOptionDefaults(useRuntimeOptionDefaults(props.projectPath));
   return (
     <DaytonaSandboxForm

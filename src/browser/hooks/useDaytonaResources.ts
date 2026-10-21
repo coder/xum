@@ -33,9 +33,10 @@ export const EMPTY_DAYTONA_RESOURCES: DaytonaResources = {
 };
 
 interface UseDaytonaResourcesOptions {
-  /** Fetch only while a Daytona form is visible: each list is a billed-account API call. */
-  enabled: boolean;
-  /** The existing-sandbox picker is creation-only; Settings defaults never need the list. */
+  /**
+   * The existing-sandbox picker is creation-only; Settings defaults never need the list, and
+   * each list is a billed-account API call.
+   */
   loadSandboxes: boolean;
 }
 
@@ -43,10 +44,10 @@ export function useDaytonaResources(options: UseDaytonaResourcesOptions): Dayton
   const { api } = useAPI();
   // One state object so consumers get a stable identity until something actually loads.
   const [resources, setResources] = useState<DaytonaResources>(EMPTY_DAYTONA_RESOURCES);
-  const { enabled, loadSandboxes } = options;
+  const { loadSandboxes } = options;
 
   useEffect(() => {
-    if (!api || !enabled) return;
+    if (!api) return;
     let active = true;
     const update = (patch: Partial<DaytonaResources>) => {
       if (active) setResources((prev) => ({ ...prev, ...patch }));
@@ -97,7 +98,7 @@ export function useDaytonaResources(options: UseDaytonaResourcesOptions): Dayton
     return () => {
       active = false;
     };
-  }, [api, enabled, loadSandboxes]);
+  }, [api, loadSandboxes]);
 
   return resources;
 }

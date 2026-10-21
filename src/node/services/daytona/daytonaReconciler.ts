@@ -116,23 +116,20 @@ export class DaytonaReconciler {
     if (!(await service.checkAvailability()).available) return;
 
     const refs = this.collectReferences();
-    let sandboxes: DaytonaSandbox[] | undefined;
+    let sandboxes: DaytonaSandbox[];
     try {
       sandboxes = await this.call(service.listInstanceSandboxes(), "listing Daytona sandboxes");
     } catch (error) {
       // Without the list Xum cannot map stored names to ids or see states: keepalive and
       // orphans wait for the next sweep instead of guessing.
       log.warn("Daytona reconcile: could not list sandboxes", { error: getErrorMessage(error) });
+      return;
     }
 
-    if (sandboxes) {
-      for (const ref of refs) {
-        await this.keepAlive(ref, sandboxes);
-      }
+    for (const ref of refs) {
+      await this.keepAlive(ref, sandboxes);
     }
-    if (sandboxes) {
-      await this.stopOrphans(sandboxes, refs);
-    }
+    await this.stopOrphans(sandboxes, refs);
   }
 
   private collectReferences(): Array<{ workspaceId: string; sandboxId: string }> {

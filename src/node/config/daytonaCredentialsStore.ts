@@ -4,6 +4,7 @@ import { getXumHome } from "@/common/constants/paths";
 import { DAYTONA_DEFAULT_API_URL } from "@/common/constants/daytona";
 import type { DaytonaApiKeySource, DaytonaPublicConfig } from "@/common/orpc/schemas/daytona";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import { log } from "@/node/services/log";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
@@ -90,11 +91,10 @@ function parseStoredCredentials(raw: string): DaytonaStoredCredentials | undefin
   } catch {
     return undefined;
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
-  const record = parsed as Record<string, unknown>;
+  if (!isPlainObject(parsed)) return undefined;
   const stored: DaytonaStoredCredentials = {};
   for (const field of CREDENTIAL_FIELDS) {
-    const value = nonEmpty(record[field]);
+    const value = nonEmpty(parsed[field]);
     if (value) stored[field] = value;
   }
   return stored;

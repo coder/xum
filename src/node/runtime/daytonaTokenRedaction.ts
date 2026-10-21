@@ -33,7 +33,7 @@ export function rememberDaytonaToken(token: string, now = Date.now()): void {
 export function redactDaytonaTokens(text: string): string {
   let redacted = text;
   for (const token of rememberedTokens.keys()) {
-    if (redacted.includes(token)) redacted = redacted.split(token).join(DAYTONA_TOKEN_PLACEHOLDER);
+    redacted = redacted.replaceAll(token, DAYTONA_TOKEN_PLACEHOLDER);
   }
   return redacted;
 }

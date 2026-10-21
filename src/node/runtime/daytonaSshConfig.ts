@@ -11,6 +11,7 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { ensureManagedSSHConfigBlock } from "@/node/runtime/muxSshConfigWriter";
 import { log } from "@/node/services/log";
+import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
@@ -173,26 +174,8 @@ function renderIncludeFile(blocks: Map<string, string>): string {
   return `${[INCLUDE_FILE_HEADER, ...blocks.values()].join("\n\n")}\n`;
 }
 
-// One chain per include file across writer instances: blocks of different sandboxes share it.
-const includeFileLocks = new Map<string, Promise<unknown>>();
-
-function withIncludeFileLock<T>(includePath: string, fn: () => Promise<T>): Promise<T> {
-  const previous = includeFileLocks.get(includePath) ?? Promise.resolve();
-  const run = previous.then(fn);
-  // The caller gets the rejection through `run`; the chain only needs to keep going.
-  const settled: Promise<void> = run
-    .then(
-      () => undefined,
-      (error: unknown) => {
-        log.debug("Daytona ssh include update failed", { error: getErrorMessage(error) });
-      }
-    )
-    .then(() => {
-      if (includeFileLocks.get(includePath) === settled) includeFileLocks.delete(includePath);
-    });
-  includeFileLocks.set(includePath, settled);
-  return run;
-}
+// One lock per include file across writer instances: blocks of different sandboxes share it.
+const includeFileLocks = new MutexMap<string>();
 
 export interface DaytonaSshConfigWriterOptions {
   xumHome: string;
@@ -247,7 +230,7 @@ export class DaytonaSshConfigWriter {
 
   async removeSandbox(sandboxId: string): Promise<void> {
     const alias = toXumDaytonaHost(sandboxId);
-    await withIncludeFileLock(this.paths.includePath, async () => {
+    await includeFileLocks.withLock(this.paths.includePath, async () => {
       const blocks = await this.readBlocks();
       if (!blocks.delete(alias)) return;
       await this.writeBlocks(blocks);
@@ -274,7 +257,7 @@ export class DaytonaSshConfigWriter {
   }): Promise<void> {
     const block = renderDaytonaHostBlock({ ...input, knownHostsPath: this.paths.knownHostsPath });
     const alias = toXumDaytonaHost(input.sandboxId);
-    return withIncludeFileLock(this.paths.includePath, async () => {
+    return includeFileLocks.withLock(this.paths.includePath, async () => {
       const blocks = await this.readBlocks();
       blocks.set(alias, block);
       await this.writeBlocks(blocks);

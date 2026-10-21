@@ -376,8 +376,7 @@ type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus> & {
  * Returns a record of runtime mode to availability status.
  */
 export async function checkRuntimeAvailability(
-  projectPath: string,
-  options: { daytonaService?: DaytonaRuntimeService } = {}
+  projectPath: string
 ): Promise<RuntimeAvailabilityMap> {
   const [
     isGit,
@@ -395,7 +394,7 @@ export async function checkRuntimeAvailability(
     isEngineResponsive("docker"),
     checkDevcontainerCliVersion(),
     scanDevcontainerConfigs(projectPath),
-    checkDaytonaAvailability(options.daytonaService),
+    checkDaytonaAvailability(),
   ]);
 
   const devcontainerConfigInfo = buildDevcontainerConfigInfo(devcontainerConfigs);
@@ -441,10 +440,8 @@ export async function checkRuntimeAvailability(
   };
 }
 
-async function checkDaytonaAvailability(
-  explicitService: DaytonaRuntimeService | undefined
-): Promise<RuntimeAvailabilityStatus> {
-  const daytonaService = explicitService ?? globalDaytonaService;
+async function checkDaytonaAvailability(): Promise<RuntimeAvailabilityStatus> {
+  const daytonaService = globalDaytonaService;
   if (!daytonaService) {
     return { available: false, reason: "Daytona is not initialized" };
   }
