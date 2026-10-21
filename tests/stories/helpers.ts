@@ -1,11 +1,12 @@
 /**
- * Steps that the Electron stories share. Every attempt starts a new Xum Electron on the one
- * seeded XUM_ROOT, so the UI state that an earlier story left (an expanded project, an open
- * page) is still there: these steps work from either state.
+ * Exact steps that the stories share, on web and on Electron. On Electron every attempt starts a
+ * new Xum Electron on the one seeded XUM_ROOT, so the UI state that an earlier story left (an
+ * expanded project, an open page) is still there. On web a fresh context starts with the project
+ * collapsed, and a story can expand it. These steps work from either state.
  */
 import type { Screen } from "e2e";
 import { expect } from "e2e";
-import { WORKSPACE_TITLE } from "../../bugbash/repros/helpers";
+import { WORKSPACE_TITLE } from "../bugbash/repros/helpers";
 
 /** Waits until the sidebar lists the seeded project: the app has loaded its projects. */
 export async function waitForProjects(screen: Screen): Promise<void> {

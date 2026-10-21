@@ -6,7 +6,7 @@
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { WORKSPACE_TITLE } from "../../bugbash/repros/helpers";
-import { openPlayground } from "./helpers";
+import { openPlayground } from "../helpers";
 
 test(
   "the workspace menu bar is the desktop title bar",

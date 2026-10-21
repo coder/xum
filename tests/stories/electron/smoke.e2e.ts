@@ -6,7 +6,7 @@
  */
 import { test } from "@e2e-dev/web";
 import { WORKSPACE_TITLE } from "../../bugbash/repros/helpers";
-import { openPlayground } from "./helpers";
+import { openPlayground } from "../helpers";
 
 test(
   "Xum Electron opens the playground workspace",
