@@ -62,6 +62,28 @@ describe("applyAgentCgroupLimits", () => {
     expect(await tree.read("xum/xum-agents", "cpu.max")).toBe("200000 100000");
   });
 
+  it("repairs a cgroup that enabled cpu while it still held processes", async () => {
+    // What an earlier xum left behind: the kernel accepted +cpu with processes in the cgroup, so it
+    // became a thread root, and xum-agents, a domain child, refused every process.
+    tree = await createFakeCgroupTree({
+      own: "/xum",
+      cgroups: {
+        xum: { controllers: "cpu memory", subtreeControl: "cpu", procs: ["101", "102"] },
+        "xum/xum-agents": {},
+      },
+    });
+
+    const result = await applyAgentCgroupLimits({ cpuCores: 30 }, tree.host);
+
+    expect(result.status).toEqual({ state: "active", cgroup: "/xum/xum-agents" });
+    expect(await tree.read("xum", "cgroup.procs")).toBe("");
+    expect(
+      (await tree.read("xum/xum-app", "cgroup.procs")).split("\n").filter(Boolean).sort()
+    ).toEqual(["101", "102"]);
+    expect(await tree.read("xum", "cgroup.subtree_control")).toBe("cpu\n");
+    expect(await tree.read("xum/xum-agents", "cpu.max")).toBe("3000000 100000");
+  });
+
   it("uses the parent cgroup once xum runs in xum-app", async () => {
     tree = await createFakeCgroupTree({
       own: "/xum/xum-app",

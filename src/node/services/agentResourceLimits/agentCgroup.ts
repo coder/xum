@@ -416,6 +416,7 @@ async function enableControllers(
   host: AgentCgroupHost
 ): Promise<void> {
   const subtreeControl = path.join(baseDir, "cgroup.subtree_control");
+  await emptyBaseCgroup(baseDir, host);
   const enabled = await readWords(subtreeControl);
   const toEnable = needed.filter((controller) => !enabled.includes(controller));
   if (toEnable.length === 0) {
@@ -434,6 +435,36 @@ async function enableControllers(
         throw error;
       }
       await moveProcesses(baseDir, path.join(baseDir, APP_CGROUP), host);
+    }
+  }
+}
+
+/**
+ * Move every process of the base cgroup into xum-app before any controller is enabled, not only
+ * after EBUSY. The kernel refuses memory while the cgroup holds processes, but accepts a threaded
+ * controller such as cpu. The cgroup then becomes a thread root whose domain children refuse
+ * processes (EOPNOTSUPP), so with only a CPU limit no agent could join xum-agents.
+ */
+async function emptyBaseCgroup(baseDir: string, host: AgentCgroupHost): Promise<void> {
+  const procsFile = path.join(baseDir, "cgroup.procs");
+  if ((await readWords(procsFile)).length === 0) {
+    return;
+  }
+  // Only threaded controllers can be on here, enabled by a xum without this fix. They keep the
+  // cgroup a thread root, which refuses the moves into xum-app, so turn them off first.
+  const subtreeControl = path.join(baseDir, "cgroup.subtree_control");
+  const stale = await readWords(subtreeControl);
+  if (stale.length > 0) {
+    await host.writeFile(subtreeControl, stale.map((controller) => `-${controller}`).join(" "));
+  }
+  // Repeat for processes that forked during a move: one left behind makes a thread root again.
+  for (let attempt = 1; ; attempt += 1) {
+    await moveProcesses(baseDir, path.join(baseDir, APP_CGROUP), host);
+    if ((await readWords(procsFile)).length === 0) {
+      return;
+    }
+    if (attempt >= MAX_ENABLE_ATTEMPTS) {
+      throw new Error(`New processes kept starting in ${baseDir} while xum moved them.`);
     }
   }
 }
