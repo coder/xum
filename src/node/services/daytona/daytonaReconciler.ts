@@ -154,14 +154,14 @@ export class DaytonaReconciler {
     ref: { workspaceId: string; sandboxId: string },
     sandboxes: DaytonaSandbox[]
   ): Promise<DaytonaSandbox | undefined> {
-    // Xum stores a name for sandboxes it created; last-activity only takes the real id.
-    const listed = sandboxes.find((sb) => sb.id === ref.sandboxId || sb.name === ref.sandboxId);
+    // Xum stores a name for sandboxes it created; last-activity only takes the real id. An
+    // attached sandbox carries no label of this install, so the list does not show it.
+    const sandbox =
+      sandboxes.find((sb) => sb.id === ref.sandboxId || sb.name === ref.sandboxId) ??
+      (await this.lookUpSandbox(ref.sandboxId));
     // A stopped sandbox has nothing to keep alive, and checking its jobs over ssh would start it.
-    if (listed && !isStarted(listed)) return undefined;
-    if (!(await this.isWorkspaceActive(ref.workspaceId))) return undefined;
-    // An attached sandbox carries no label of this install, so the list does not show it.
-    const sandbox = listed ?? (await this.lookUpSandbox(ref.sandboxId));
-    return sandbox && isStarted(sandbox) ? sandbox : undefined;
+    if (!sandbox || !isStarted(sandbox)) return undefined;
+    return (await this.isWorkspaceActive(ref.workspaceId)) ? sandbox : undefined;
   }
 
   private async isWorkspaceActive(workspaceId: string): Promise<boolean> {

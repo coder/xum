@@ -137,4 +137,18 @@ describe("DaytonaReconciler.sweep", () => {
     expect(rig.plane.calls.filter((call) => call.endsWith("/last-activity"))).toEqual([]);
     expect(activityChecks).toEqual([]);
   });
+
+  it("asks about an attached sandbox's jobs only once its state shows it started", async () => {
+    // Attached by the user (no label of this install) and stopped: an ssh job probe would
+    // start it.
+    rig.plane.addSandbox({ id: "sb-attached-off", state: "stopped" });
+
+    await makeReconciler(
+      [{ id: "ws-attached-off", runtimeConfig: daytonaConfig("sb-attached-off") }],
+      ["ws-attached-off"]
+    ).sweep();
+
+    expect(activityChecks).toEqual([]);
+    expect(rig.plane.countCalls("POST /sandbox/sb-attached-off/last-activity")).toBe(0);
+  });
 });
