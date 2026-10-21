@@ -166,4 +166,18 @@ describe("agent-home seeding", () => {
 
     expect(files.map((file) => file.remotePath)).toEqual(["~/.mux/skills/lint/SKILL.md"]);
   });
+
+  it("copies only skill directories of a skills root that is itself a link", async () => {
+    const secrets = path.join(hostHome, ".ssh");
+    await fs.mkdir(path.join(secrets, "keys"), { recursive: true });
+    await fs.writeFile(path.join(secrets, "id_rsa"), "PRIVATE KEY\n");
+    await fs.writeFile(path.join(secrets, "keys", "id_ed25519"), "PRIVATE KEY\n");
+    await fs.mkdir(path.join(secrets, "lint"));
+    await fs.writeFile(path.join(secrets, "lint", "SKILL.md"), "# lint\n");
+    await fs.symlink(secrets, path.join(hostXum, "skills"));
+
+    const files = await collectAgentHomeSeedFiles({ xumHome: hostXum, home: hostHome }, "~/.mux");
+
+    expect(files.map((file) => file.remotePath)).toEqual(["~/.mux/skills/lint/SKILL.md"]);
+  });
 });

@@ -142,16 +142,13 @@ async function collectSkillsRoot(
   remoteRoot: string
 ): Promise<void> {
   const entries = await readDirectory(hostRoot);
-  const root = entries ? await resolveEntry(hostRoot) : null;
-  if (!entries || !root) return;
+  if (!entries) return;
   for (const entry of entries) {
     if (isSpent(budget)) return;
-    await collectSkillsRootEntry(
-      files,
-      budget,
-      { hostPath: path.join(hostRoot, entry), remotePath: path.posix.join(remoteRoot, entry) },
-      root.real
-    );
+    await collectSkillsRootEntry(files, budget, {
+      hostPath: path.join(hostRoot, entry),
+      remotePath: path.posix.join(remoteRoot, entry),
+    });
   }
 }
 
@@ -166,29 +163,31 @@ async function isSkillDirectory(name: string, realDir: string): Promise<boolean>
   return skillFile !== null && skillFile.stat.isFile() && isInside(skillFile.real, realDir);
 }
 
-/** A skill directory (its real path bounds what it may link to), or a file of the root. */
+/**
+ * A skill directory (its real path bounds what it may link to). Discovery reads nothing else
+ * of a skills root, and the root itself may be a link to `~/.ssh`, so other entries (files
+ * included) are skipped.
+ */
 async function collectSkillsRootEntry(
   files: AgentHomeSeedFile[],
   budget: SeedBudget,
-  entry: { hostPath: string; remotePath: string },
-  realRoot: string
+  entry: { hostPath: string; remotePath: string }
 ): Promise<void> {
   const resolved = await resolveEntry(entry.hostPath);
   if (!resolved) return;
-  if (resolved.stat.isDirectory()) {
-    if (!(await isSkillDirectory(path.basename(entry.hostPath), resolved.real))) {
-      log.warn(
-        "Skipping a skills directory entry that is not a skill while seeding a Daytona sandbox",
-        {
-          hostPath: entry.hostPath,
-        }
-      );
-      return;
-    }
-    await collectDirectory(files, budget, resolved.real, entry.remotePath, 1, resolved.real);
-  } else if (isInside(resolved.real, realRoot)) {
-    await collectFile(files, budget, resolved, entry.remotePath);
+  const isSkill =
+    resolved.stat.isDirectory() &&
+    (await isSkillDirectory(path.basename(entry.hostPath), resolved.real));
+  if (!isSkill) {
+    log.warn(
+      "Skipping a skills directory entry that is not a skill while seeding a Daytona sandbox",
+      {
+        hostPath: entry.hostPath,
+      }
+    );
+    return;
   }
+  await collectDirectory(files, budget, resolved.real, entry.remotePath, 1, resolved.real);
 }
 
 async function collectDirectory(
