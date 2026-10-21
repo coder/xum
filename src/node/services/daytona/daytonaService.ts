@@ -31,6 +31,7 @@ import {
   type DaytonaGatewayConfig,
   type DaytonaResizeRequest,
   type DaytonaSandbox,
+  type DaytonaSnapshot,
   type DaytonaSshAccess,
 } from "./daytonaClient";
 import type { DaytonaWorkspaceRef } from "./daytonaReconciler";
@@ -694,15 +695,21 @@ export class DaytonaService {
     }
   }
 
-  /** Whether the snapshot creates Windows sandboxes; false for one Daytona does not find. */
-  async isWindowsSnapshot(name: string): Promise<boolean> {
+  /**
+   * The snapshot named `name`, with whether it creates Windows sandboxes; undefined when
+   * Daytona has none by that name. The list is the fallback for one the lookup does not find
+   * by name (it serves the snapshot picker).
+   */
+  async findSnapshot(name: string): Promise<{ windows: boolean } | undefined> {
     const { client } = await this.getClient();
+    let snapshot: DaytonaSnapshot | undefined;
     try {
-      return isWindowsClass(await client.getSnapshot(name));
+      snapshot = await client.getSnapshot(name);
     } catch (error) {
-      if (isDaytonaNotFound(error)) return false;
-      throw error;
+      if (!isDaytonaNotFound(error)) throw error;
+      snapshot = (await client.listSnapshots()).find((listed) => listed.name === name);
     }
+    return snapshot && { windows: isWindowsClass(snapshot) };
   }
 
   /** Stable per Xum install, so the reconciler only ever touches this install's sandboxes. */

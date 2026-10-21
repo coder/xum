@@ -38,8 +38,8 @@ export class FakeDaytonaControlPlane {
   readonly calls: string[] = [];
   readonly createBodies: Array<Record<string, unknown>> = [];
   readonly revokedTokens: string[] = [];
-  /** The organization's snapshots, by name. */
-  readonly snapshots: Array<{ name: string; sandboxClass?: string }> = [];
+  /** The organization's snapshots; `listedOnly` ones only come with the list, not by name. */
+  readonly snapshots: Array<{ name: string; sandboxClass?: string; listedOnly?: boolean }> = [];
   /** Answer POST /sandbox with 400 when it carries cpu/memory/disk (fixed-resource snapshot). */
   rejectCreateResources = false;
   /** Resources a sandbox gets when created without any. */
@@ -152,7 +152,9 @@ export class FakeDaytonaControlPlane {
     }
     const snapshotMatch = /^GET \/snapshots\/([^/]+)$/.exec(route);
     if (snapshotMatch) {
-      const snapshot = this.snapshots.find((s) => s.name === decodeURIComponent(snapshotMatch[1]));
+      const snapshot = this.snapshots.find(
+        (s) => s.name === decodeURIComponent(snapshotMatch[1]) && !s.listedOnly
+      );
       return snapshot ? json(200, snapshot) : fail(404, "Snapshot not found");
     }
 

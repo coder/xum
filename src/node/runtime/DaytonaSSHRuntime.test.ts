@@ -315,8 +315,27 @@ describe("DaytonaSSHRuntime Windows sandboxes", () => {
 
     expect((await validate({ sandboxId: "sb-linux" })).success).toBe(true);
     expect((await validate({ snapshot: "daytona-small" })).success).toBe(true);
-    // A snapshot Daytona does not list by that name: Daytona's create decides, as before.
-    expect((await validate({ snapshot: "unlisted" })).success).toBe(true);
+    expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
+  });
+
+  it("refuses a snapshot Daytona no longer has before persisting", async () => {
+    // A general snapshot may come only with the list, not by name.
+    rig.plane.snapshots.push({
+      name: "general-small",
+      sandboxClass: "container",
+      listedOnly: true,
+    });
+    const runtime = makeRuntime({});
+    const validate = async (snapshot: string) => {
+      const finalized = await runtime.finalizeConfig("b", sshDaytonaConfig({ snapshot }));
+      if (!finalized.success) return finalized;
+      return runtime.validateBeforePersist("b", finalized.data);
+    };
+
+    // A stale project default: deleted after it was saved.
+    const stale = await validate("deleted-snapshot");
+    expect(stale.success ? "" : stale.error).toContain('"deleted-snapshot" was not found');
+    expect((await validate("general-small")).success).toBe(true);
     expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
   });
 

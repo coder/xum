@@ -84,7 +84,7 @@ export type DaytonaRuntimeService = Pick<
   | "invalidateSandboxReady"
   | "replaceRejectedSshToken"
   | "sshTokenGeneration"
-  | "isWindowsSnapshot"
+  | "findSnapshot"
   | "sandboxReferencesElsewhere"
   | "isAliasStoredElsewhere"
   | "withSandboxRemovalLock"
@@ -703,11 +703,15 @@ export class DaytonaSSHRuntime extends SSHRuntime {
 
   /** Refused before any sandbox is created: a Windows snapshot makes a billed box setup fails on. */
   private async checkSnapshotClass(snapshot: string): Promise<Result<void, string>> {
+    let found: { windows: boolean } | undefined;
     try {
-      if (!(await this.daytonaService.isWindowsSnapshot(snapshot))) return Ok(undefined);
+      found = await this.daytonaService.findSnapshot(snapshot);
     } catch (error) {
       return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
     }
+    // A stale choice (deleted after it was saved as a default) would fail every setup retry.
+    if (!found) return Err(`Daytona snapshot "${snapshot}" was not found; pick another snapshot`);
+    if (!found.windows) return Ok(undefined);
     return Err(`Daytona snapshot "${snapshot}" creates Windows sandboxes. ${LINUX_ONLY}`);
   }
 
