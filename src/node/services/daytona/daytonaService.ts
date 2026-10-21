@@ -553,7 +553,10 @@ export class DaytonaService {
     );
   }
 
-  /** What the other workspaces (removals in flight excluded) store as their sandbox. */
+  /**
+   * What the other workspaces (removals in flight and borrowed checkouts excluded) store as
+   * their sandbox.
+   */
   private refsStoredElsewhere(
     refs: DaytonaWorkspaceRef[],
     workspaceId: string
@@ -563,7 +566,7 @@ export class DaytonaService {
       const removed =
         ref.pendingRemovalId !== undefined &&
         this.removedWorkspaces.get(ref.workspaceId) === ref.pendingRemovalId;
-      const counts = ref.workspaceId !== workspaceId && !removed;
+      const counts = ref.workspaceId !== workspaceId && !removed && ref.borrowsCheckout !== true;
       return counts && stored
         ? [
             {

@@ -20,6 +20,12 @@ export interface DaytonaWorkspaceRef {
   pendingRemovalId?: string;
   /** Archived now: archive applies its sandbox policy once only archived workspaces use it. */
   archived?: boolean;
+  /**
+   * `taskIsolation: "none"` (a side chat, a shared-checkout sub-agent): it copies another
+   * workspace's runtime config and works in that one's checkout, so it never owns or holds a
+   * sandbox. Its activity still keeps the sandbox alive.
+   */
+  borrowsCheckout?: boolean;
 }
 
 export interface DaytonaReconcilerOptions {
@@ -59,7 +65,15 @@ export function listDaytonaWorkspaceRefs(config: {
     string,
     {
       workspaces: ReadonlyArray<
-        Pick<Workspace, "id" | "runtimeConfig" | "pendingRemoval" | "archivedAt" | "unarchivedAt">
+        Pick<
+          Workspace,
+          | "id"
+          | "runtimeConfig"
+          | "pendingRemoval"
+          | "archivedAt"
+          | "unarchivedAt"
+          | "taskIsolation"
+        >
       >;
     }
   >;
@@ -73,6 +87,7 @@ export function listDaytonaWorkspaceRefs(config: {
         runtimeConfig: workspace.runtimeConfig,
         pendingRemovalId: workspace.pendingRemoval?.removalId,
         archived: isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt),
+        borrowsCheckout: workspace.taskIsolation === "none",
       });
     }
   }

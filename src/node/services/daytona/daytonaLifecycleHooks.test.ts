@@ -14,6 +14,7 @@ import {
   type DaytonaTestRig,
 } from "./daytona.testHarness";
 import { createDaytonaArchiveHook, type DaytonaArchiveHookOptions } from "./daytonaLifecycleHooks";
+import { listDaytonaWorkspaceRefs } from "./daytonaReconciler";
 
 let rig: DaytonaTestRig;
 
@@ -194,6 +195,26 @@ describe("createDaytonaArchiveHook", () => {
 
     expect(result.success).toBe(true);
     expect(rig.plane.find("sb-parent")?.state).toBe("started");
+  });
+
+  it("applies the archive policy to a sandbox whose only other user is a side chat", async () => {
+    rig.plane.addSandbox({ id: "sb-main" });
+    const daytona = { sandboxId: "sb-main", shared: false };
+    // A side chat copies its main chat's runtime config but borrows its checkout.
+    const sideChat = {
+      id: "side",
+      runtimeConfig: metadata(daytona).runtimeConfig,
+      taskIsolation: "none" as const,
+    };
+    rig.workspaces.push(
+      ...listDaytonaWorkspaceRefs({
+        projects: new Map([["/tmp/proj", { workspaces: [sideChat] }]]),
+      })
+    );
+
+    expect((await archive(daytona, "stop")).success).toBe(true);
+
+    expect(rig.plane.find("sb-main")?.state).toBe("stopped");
   });
 
   it("never deletes or stops a sandbox under an unverified job on a model-driven archive delete", async () => {
