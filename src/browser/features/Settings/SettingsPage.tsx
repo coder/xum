@@ -171,6 +171,9 @@ export function getSettingsSections(
   return sections;
 }
 
+// Sections that no longer exist. Old deep links and restored last-visited routes still name them.
+const REMOVED_SETTINGS_SECTION_IDS = new Set(["governor", "layouts"]);
+
 export function getSettingsSectionRedirect(
   activeSection: string,
   memoryEnabled: boolean,
@@ -181,7 +184,7 @@ export function getSettingsSectionRedirect(
   }
 
   // Removed section: replace so the restored URL and back stack drop the dead route.
-  if (activeSection === "governor") {
+  if (REMOVED_SETTINGS_SECTION_IDS.has(activeSection)) {
     return { section: BASE_SECTIONS[0]?.id ?? "general", replace: true };
   }
 
