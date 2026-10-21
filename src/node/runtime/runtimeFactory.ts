@@ -7,6 +7,7 @@ import { WorktreeRuntime } from "./WorktreeRuntime";
 import { SSHRuntime } from "./SSHRuntime";
 import { CoderSSHRuntime } from "./CoderSSHRuntime";
 import { DaytonaSSHRuntime, type DaytonaRuntimeService } from "./DaytonaSSHRuntime";
+import { redactDaytonaTokens } from "./daytonaTokenRedaction";
 import { createSSHTransport } from "./transports";
 import { DockerRuntime, getContainerName } from "./DockerRuntime";
 import { DevcontainerRuntime } from "./DevcontainerRuntime";
@@ -90,8 +91,9 @@ export function runBackgroundInit(
   return withInitUseLease(useLeases, workspaceId, () => runFullInit(runtime, params)).then(
     () => undefined,
     (error: unknown) => {
-      const errorMsg = getErrorMessage(error);
-      logger?.error(`Workspace init failed for ${workspaceId}:`, { error });
+      // An Error serializes to `{}` in the log; a Daytona ssh error may name its token.
+      const errorMsg = redactDaytonaTokens(getErrorMessage(error));
+      logger?.error(`Workspace init failed for ${workspaceId}:`, { error: errorMsg });
       params.initLogger.logStderr(`Initialization failed: ${errorMsg}`);
       params.initLogger.logComplete(-1);
     }
