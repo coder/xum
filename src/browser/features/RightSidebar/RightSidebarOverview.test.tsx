@@ -26,6 +26,7 @@ import type {
 import type { TabType } from "@/browser/types/rightSidebar";
 import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as RealGitStatusStoreModule from "@/browser/stores/GitStatusStore";
+import * as RealHeartbeatModalModule from "@/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal";
 
 // The card subscribes to the workspace and git stores directly; stubbing those hooks keeps
 // these tests on the card's own gating and navigation.
@@ -35,6 +36,10 @@ let workspaceUsage: WorkspaceUsageState = { totalTokens: 0 };
 restoreModulesAfterSuite([
   ["@/browser/stores/WorkspaceStore", { ...RealWorkspaceStoreModule }],
   ["@/browser/stores/GitStatusStore", { ...RealGitStatusStoreModule }],
+  [
+    "@/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal",
+    { ...RealHeartbeatModalModule },
+  ],
 ]);
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   ...RealWorkspaceStoreModule,
@@ -44,6 +49,13 @@ void mock.module("@/browser/stores/WorkspaceStore", () => ({
 void mock.module("@/browser/stores/GitStatusStore", () => ({
   ...RealGitStatusStoreModule,
   useGitStatus: () => gitStatus,
+}));
+// The real modal needs the heartbeat API; these tests only check which workspace's settings open.
+void mock.module("@/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal", () => ({
+  WorkspaceHeartbeatModal: (props: { workspaceId: string; open: boolean }) =>
+    props.open ? (
+      <div role="dialog" aria-label={`Heartbeat settings for ${props.workspaceId}`} />
+    ) : null,
 }));
 
 import { OVERVIEW_MAX_LIST_ROWS, RightSidebarOverview } from "./RightSidebarOverview";
@@ -711,6 +723,117 @@ describe("RightSidebarOverview", () => {
     ]);
     const activity = view.getByRole("region", { name: "Activity" });
     expect(activity.textContent).toContain("Every 5m");
+  });
+
+  test("the heartbeat row opens this workspace's heartbeat settings", async () => {
+    const { view } = renderOverview([
+      workspace({ id: WORKSPACE_ID, heartbeat: { enabled: true, intervalMs: 300_000 } }),
+    ]);
+    fireEvent.click(view.getByRole("button", { name: /Heartbeat/ }));
+    await view.findByRole("dialog", { name: `Heartbeat settings for ${WORKSPACE_ID}` });
+  });
+
+  test("a sub-agent's heartbeat row opens nothing: heartbeats never fire there", () => {
+    const { view } = renderOverview([
+      workspace({
+        id: WORKSPACE_ID,
+        parentWorkspaceId: "ws-parent",
+        heartbeat: { enabled: true, intervalMs: 300_000 },
+      }),
+    ]);
+    const activity = view.getByRole("region", { name: "Activity" });
+    expect(activity.textContent).toContain("Every 5m");
+    expect(within(activity).queryByRole("button", { name: /Heartbeat/ })).toBeNull();
+  });
+
+  test("shows when the next heartbeat is due, with the cadence under it", async () => {
+    const dayMs = 24 * 60 * 60 * 1000;
+    const { view } = renderOverview(
+      [workspace({ id: WORKSPACE_ID, heartbeat: { enabled: true, intervalMs: dayMs } })],
+      {
+        client: createTestApiClient({
+          workspace: {
+            heartbeat: { next: () => Promise.resolve(Date.now() + 3 * 60 * 60 * 1000) },
+          },
+        }),
+      }
+    );
+    const activity = view.getByRole("region", { name: "Activity" });
+    await waitFor(() => expect(activity.textContent).toContain("Next in 3h"));
+    expect(activity.textContent).toContain("Every 24h");
+  });
+
+  test("a passed deadline reads Due now, and a finished turn asks for the new one", async () => {
+    sidebarState = { canInterrupt: true };
+    let nextAt = Date.now() - 1000;
+    const nextCalls: string[] = [];
+    const { rerender, view } = renderOverview(
+      [workspace({ id: WORKSPACE_ID, heartbeat: { enabled: true, intervalMs: 300_000 } })],
+      {
+        client: createTestApiClient({
+          workspace: {
+            heartbeat: {
+              next: (input: { workspaceId: string }) => {
+                nextCalls.push(input.workspaceId);
+                return Promise.resolve(nextAt);
+              },
+            },
+          },
+        }),
+      }
+    );
+    const activity = view.getByRole("region", { name: "Activity" });
+    await waitFor(() => expect(activity.textContent).toContain("Due now"));
+
+    // The heartbeat's turn ended, and the scheduler moved the deadline.
+    nextAt = Date.now() + 4 * 60 * 1000 + 30_000;
+    sidebarState = { canInterrupt: false };
+    rerender({ artifactsEnabled: false, mcpAppsEnabled: false });
+    await waitFor(() => expect(activity.textContent).toContain("Next in 5m"));
+    expect(nextCalls).toEqual([WORKSPACE_ID, WORKSPACE_ID]);
+  });
+
+  test("a clock tick past the deadline asks the scheduler again", async () => {
+    // Captures the countdown's timer so the test fires its tick, with the clock moved past it.
+    const realSetInterval = globalThis.setInterval;
+    const ticks: Array<() => void> = [];
+    const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation(((
+      handler: () => void,
+      ms?: number
+    ) => {
+      if (ms === 30_000) ticks.push(handler);
+      return realSetInterval(handler, ms);
+    }) as typeof setInterval);
+    const startMs = Date.now();
+    const answers = [startMs + 1000, startMs + 2 * 60 * 60 * 1000];
+    let calls = 0;
+    try {
+      const { view } = renderOverview(
+        [workspace({ id: WORKSPACE_ID, heartbeat: { enabled: true, intervalMs: 300_000 } })],
+        {
+          client: createTestApiClient({
+            workspace: {
+              heartbeat: { next: () => Promise.resolve(answers[Math.min(calls++, 1)]) },
+            },
+          }),
+        }
+      );
+      const activity = view.getByRole("region", { name: "Activity" });
+      await waitFor(() => expect(activity.textContent).toContain("Next in 1m"));
+      expect(calls).toBe(1);
+
+      // The slot fired (or was skipped) without any event the renderer sees.
+      const dateSpy = spyOn(Date, "now").mockReturnValue(startMs + 30_000);
+      try {
+        act(() => ticks.forEach((tick) => tick()));
+        await waitFor(() => expect(activity.textContent).toContain("Next in 2h"));
+        expect(calls).toBe(2);
+      } finally {
+        dateSpy.mockRestore();
+      }
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
   });
 
   test("a heartbeat without its own interval shows the default cadence", () => {

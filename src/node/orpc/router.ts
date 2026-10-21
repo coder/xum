@@ -126,7 +126,7 @@ import {
 import { Err, Ok } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import { normalizeAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
-import { AutoModelRouterTag } from "@/node/services/di/tags";
+import { AutoModelRouterTag, Heartbeat } from "@/node/services/di/tags";
 
 import {
   createAuthMiddleware,
@@ -2101,6 +2101,15 @@ export const router = (authToken?: string) => {
           .input(schemas.workspace.heartbeat.set.input)
           .output(schemas.workspace.heartbeat.set.output)
           .handler(({ context, input }) => setWorkspaceHeartbeat(context, input)),
+        next: t
+          .input(schemas.workspace.heartbeat.next.input)
+          .output(schemas.workspace.heartbeat.next.output)
+          .handler(
+            handlerGen(function* (_options, input) {
+              const heartbeat = yield* Heartbeat;
+              return heartbeat.getNextHeartbeatAt(input.workspaceId);
+            })
+          ),
       },
       goalDefaults: {
         // Per-workspace override of the global `goalDefaults` block.

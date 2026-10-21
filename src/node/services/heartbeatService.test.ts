@@ -746,6 +746,28 @@ describe("HeartbeatService", () => {
       expect(resetDeadline).toBeGreaterThan(initialDeadline!);
     });
 
+    test("reports the tracked deadline, and none for an untracked workspace", async () => {
+      service.start();
+      await getInternals().resyncFromConfig(0);
+      expect(service.getNextHeartbeatAt(testWorkspaceId)).toBe(defaultHeartbeatIntervalMs);
+      expect(service.getNextHeartbeatAt("untracked-ws")).toBeNull();
+
+      // The report follows the countdown an idle trigger resets on new activity.
+      wsEmitter.emit("activity", {
+        workspaceId: testWorkspaceId,
+        activity: { recency: Date.now(), streaming: false },
+      });
+      expect(service.getNextHeartbeatAt(testWorkspaceId)).toBe(
+        getInternals().nextEligibleAtByWorkspaceId.get(testWorkspaceId) ?? null
+      );
+      expect(service.getNextHeartbeatAt(testWorkspaceId)).toBeGreaterThan(
+        defaultHeartbeatIntervalMs
+      );
+
+      service.stop();
+      expect(service.getNextHeartbeatAt(testWorkspaceId)).toBeNull();
+    });
+
     test("activity event does not reset the countdown for interval-triggered workspaces", async () => {
       await setProjectsConfig(
         makeProjectsConfig([

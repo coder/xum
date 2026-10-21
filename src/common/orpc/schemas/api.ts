@@ -2030,6 +2030,12 @@ export const workspace = {
       }),
       output: ResultSchema(z.void(), z.string()),
     },
+    // When the next heartbeat slot opens (epoch ms); null while the scheduler does not track the
+    // workspace (see HeartbeatService.getNextHeartbeatAt).
+    next: {
+      input: z.object({ workspaceId: z.string() }),
+      output: z.number().nullable(),
+    },
   },
   goalDefaults: {
     // Per-workspace override of the global `goalDefaults` block. `get`
