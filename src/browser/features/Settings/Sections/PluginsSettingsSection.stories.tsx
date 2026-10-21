@@ -477,7 +477,8 @@ export const AddPluginConsentPreview: Story = {
     await canvas.findByText("Slash commands (1)");
     await canvas.findByText("/grill");
     await canvas.findByText("hooks.json hooks (3)");
-    await canvas.findByText(/None of these run until you trust each one/);
+    // Mixed hooks: the note is true for the trusted-later ones and the never-run one.
+    await canvas.findByText(/None of these run until you trust each one.*marked "Never runs"/);
     await canvas.findByText(/Never runs: Xum runs only mcp_tool hooks/);
     await canvas.findByText(/Unknown top-level field 'hooks' ignored/);
     await canvas.findByRole("button", { name: /Install/ });

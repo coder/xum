@@ -530,6 +530,19 @@ const ManageComponentsPanel: React.FC<{
   );
 };
 
+/**
+ * Install trusts none of the hooks (Codex trust per hash), and some can never run (a Claude
+ * plugin hook, a command handler): the note must be true for every hook listed.
+ */
+function hooksRunNote(hooks: AgentPluginInstallPreview["codexHooks"]): string {
+  const neverRun = hooks.filter((hook) => hook.status !== "runnable").length;
+  if (neverRun === hooks.length) return "Xum never runs these hooks.";
+  const untilTrusted = "None of these run until you trust each one in Settings → Plugins.";
+  return neverRun === 0
+    ? untilTrusted
+    : `${untilTrusted} Hooks marked "Never runs" do not run at all.`;
+}
+
 /** Two-phase add flow: source input → consent preview → install. */
 const AddPluginPanel: React.FC<{
   onInstalled: () => void;
@@ -803,10 +816,7 @@ const AddPluginPanel: React.FC<{
               <h4 className="text-foreground mb-1 text-xs font-medium">
                 hooks.json hooks ({preview.codexHooks.length})
               </h4>
-              {/* Install trusts none of them (Codex trust per hash): consent must say so. */}
-              <p className="text-muted mb-1 text-xs">
-                None of these run until you trust each one in Settings → Plugins.
-              </p>
+              <p className="text-muted mb-1 text-xs">{hooksRunNote(preview.codexHooks)}</p>
               <ul className="space-y-1">
                 {preview.codexHooks.map((hook) => (
                   <li key={hook.key} className="text-xs break-all">
