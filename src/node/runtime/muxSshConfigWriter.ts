@@ -8,6 +8,7 @@ import {
   MUX_CODER_SSH_BLOCK_START,
 } from "@/constants/coder";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 
 interface EnsureMuxCoderSSHConfigFileOptions {
   coderBinaryPath: string;
@@ -253,11 +254,22 @@ export async function ensureManagedSSHConfigBlock(opts: {
 
   await fs.mkdir(sshConfigDir, { recursive: true, mode: 0o700 });
 
-  // Coder and Daytona setups can run at once: without the lock both read the old file and the
-  // last rename drops the other's block. (In this process only, like the include file lock.)
-  await sshConfigFileLocks.withLock(sshConfigPath, () =>
-    writeManagedBlock(sshConfigPath, markers, opts.block)
-  );
+  // Coder and Daytona setups can run at once, in this backend or another one sharing the config
+  // (even under a different Xum root): without both locks two writers read the old file and the
+  // last rename drops the other's block. The file lock sits next to the resolved config.
+  await sshConfigFileLocks.withLock(sshConfigPath, async () => {
+    const release = await acquireCrossProcessLock({
+      lockPath: `${sshConfigPath}.xum.lock`,
+      acquireTimeoutMs: 30_000,
+      staleMs: 60_000,
+      timeoutMessage: "Another Xum process is updating the ssh config.",
+    });
+    try {
+      await writeManagedBlock(sshConfigPath, markers, opts.block);
+    } finally {
+      await release();
+    }
+  });
 }
 
 async function writeManagedBlock(

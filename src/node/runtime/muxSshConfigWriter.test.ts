@@ -8,6 +8,7 @@ import {
   MUX_CODER_SSH_BLOCK_END,
   MUX_CODER_SSH_BLOCK_START,
 } from "@/constants/coder";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { ensureManagedSSHConfigBlock, ensureMuxCoderSSHConfigFile } from "./muxSshConfigWriter";
 
 function renderExpectedMuxBlock(coderBinaryPath: string): string {
@@ -68,6 +69,48 @@ describe("ensureMuxCoderSSHConfigFile", () => {
     expect(content).toContain("Host *.first");
     expect(content).toContain("Host *.second");
     expect(content).toContain("Host work");
+  });
+
+  it("waits for another backend's file lock on the resolved config before writing", async () => {
+    const sshConfigPath = await makeSSHConfigPath();
+    const targetPath = path.join(path.dirname(sshConfigPath), "real-config");
+    await writeSSHConfig(targetPath, "Host work\n  User me\n");
+    await fs.symlink(targetPath, sshConfigPath);
+    const block = (label: string) => ({
+      markers: { start: `# >>> ${label} >>>`, end: `# <<< ${label} <<<`, label },
+      block: [`# >>> ${label} >>>`, `Host *.${label}`, `# <<< ${label} <<<`].join("\n"),
+      sshConfigPath,
+    });
+    const lockPath = `${targetPath}.xum.lock`;
+
+    // Held by this process, the file lock looks to the writers like another backend mid-write.
+    const release = await acquireCrossProcessLock({
+      lockPath,
+      acquireTimeoutMs: 1_000,
+      staleMs: 60_000,
+      timeoutMessage: "test holder",
+    });
+    let settled = false;
+    const running = Promise.all([
+      ensureManagedSSHConfigBlock(block("first")),
+      ensureManagedSSHConfigBlock(block("second")),
+    ]).finally(() => {
+      settled = true;
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(settled).toBe(false);
+      expect(await readSSHConfig(targetPath)).toBe("Host work\n  User me\n");
+    } finally {
+      await release();
+    }
+    await running;
+
+    const content = await readSSHConfig(targetPath);
+    expect(content).toContain("Host *.first");
+    expect(content).toContain("Host *.second");
+    expect(content).toContain("Host work");
+    expect(await fs.readdir(path.dirname(targetPath))).not.toContain(path.basename(lockPath));
   });
 
   it("creates block from an empty config", async () => {
