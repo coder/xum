@@ -89,24 +89,14 @@ function normalizeApiUrl(value: string): string {
   return parsed.toString().replace(/\/+$/, "");
 }
 
-/** Why a stored API URL cannot be used; undefined when it is unset or valid. */
-function storedApiUrlProblem(value: string | undefined): string | undefined {
+/** Why an API URL cannot be used; undefined when it is unset or valid. */
+function apiUrlProblem(value: string | undefined): string | undefined {
   if (!value) return undefined;
   try {
     normalizeApiUrl(value);
     return undefined;
   } catch (error) {
     return getErrorMessage(error);
-  }
-}
-
-function validApiUrl(value: string | undefined, source: string): string | undefined {
-  if (!value) return undefined;
-  try {
-    return normalizeApiUrl(value);
-  } catch (error) {
-    log.warn(`Ignoring invalid ${source}`, { error: getErrorMessage(error) });
-    return undefined;
   }
 }
 
@@ -202,22 +192,19 @@ export class DaytonaCredentialsStore {
     const envKey = nonEmpty(this.env.DAYTONA_API_KEY);
     const apiKey = stored.apiKey ?? envKey;
     if (!apiKey) return null;
-    // A saved URL names the deployment the key belongs to (an http one saved before http was
-    // refused, or a hand edit): falling back to DAYTONA_API_URL or the default would send the
-    // key elsewhere, so Daytona stays unusable until the user fixes or clears it.
-    const storedProblem = storedApiUrlProblem(stored.apiUrl);
-    if (storedProblem) {
+    // The URL in use (saved, else DAYTONA_API_URL) names the deployment the key belongs to: an
+    // invalid one (an http URL saved before http was refused, a hand edit, a typo in the env)
+    // must not fall back to another URL or the default, which would send the key elsewhere.
+    // So Daytona stays unusable until the user fixes it.
+    const { source, value } = this.configuredApiUrl(stored);
+    const problem = apiUrlProblem(value);
+    if (problem) {
       throw new DaytonaConfigError(
-        `The Daytona API URL saved in Settings cannot be used (${storedProblem}); ` +
-          "fix or clear it in Settings > Runtimes"
-      );
-    }
-    // The environment names the deployment to use: falling back to the default one would send
-    // the key to a deployment the operator did not pick, so it stays unusable until fixed.
-    if (this.insecureEnvApiUrl(stored)) {
-      throw new DaytonaConfigError(
-        "DAYTONA_API_URL must use https (http is accepted only for localhost and 127.0.0.1); " +
-          "fix it, or set the API URL in Settings > Runtimes"
+        source === "settings"
+          ? `The Daytona API URL saved in Settings cannot be used (${problem}); ` +
+              "fix or clear it in Settings > Runtimes"
+          : `DAYTONA_API_URL cannot be used (${problem}); ` +
+              "fix it, or set the API URL in Settings > Runtimes"
       );
     }
     return {
@@ -240,27 +227,20 @@ export class DaytonaCredentialsStore {
     };
   }
 
-  /**
-   * A saved URL wins, shown as written when it does not validate so the user can fix it (resolve
-   * refuses it). An env URL that does not validate is ignored (self-healing), as if unset, except
-   * one that only fails for plain http: that one is shown, and resolve refuses it.
-   */
-  private resolveApiUrl(stored: DaytonaStoredCredentials): string {
-    if (stored.apiUrl) {
-      return storedApiUrlProblem(stored.apiUrl) ? stored.apiUrl : normalizeApiUrl(stored.apiUrl);
-    }
-    return (
-      this.insecureEnvApiUrl(stored) ??
-      validApiUrl(nonEmpty(this.env.DAYTONA_API_URL), "DAYTONA_API_URL") ??
-      DAYTONA_DEFAULT_API_URL
-    );
+  /** The saved URL wins over DAYTONA_API_URL; neither set means Daytona's default. */
+  private configuredApiUrl(stored: DaytonaStoredCredentials): {
+    source: "settings" | "env" | "default";
+    value?: string;
+  } {
+    if (stored.apiUrl) return { source: "settings", value: stored.apiUrl };
+    const envUrl = nonEmpty(this.env.DAYTONA_API_URL);
+    return envUrl ? { source: "env", value: envUrl } : { source: "default" };
   }
 
-  /** DAYTONA_API_URL when it would be used and is http to a host that is not loopback. */
-  private insecureEnvApiUrl(stored: DaytonaStoredCredentials): string | undefined {
-    const envUrl = nonEmpty(this.env.DAYTONA_API_URL);
-    if (!envUrl || stored.apiUrl) return undefined;
-    const parsed = URL.canParse(envUrl) ? new URL(envUrl) : undefined;
-    return parsed?.protocol === "http:" && !isLoopbackHost(parsed.hostname) ? envUrl : undefined;
+  /** An invalid URL is shown as written, so the user sees what to fix (resolve refuses it). */
+  private resolveApiUrl(stored: DaytonaStoredCredentials): string {
+    const { value } = this.configuredApiUrl(stored);
+    if (!value) return DAYTONA_DEFAULT_API_URL;
+    return apiUrlProblem(value) ? value : normalizeApiUrl(value);
   }
 }

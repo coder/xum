@@ -109,19 +109,19 @@ describe("DaytonaCredentialsStore", () => {
     }
   });
 
-  it("refuses a non-loopback http DAYTONA_API_URL", async () => {
+  it("refuses every DAYTONA_API_URL that does not validate instead of using the default", async () => {
     await fs.writeFile(
       path.join(rootDir, "daytona.json"),
       JSON.stringify({ apiKey: KEY }),
       "utf-8"
     );
     // The environment names the deployment, so another one must not get the key instead.
-    const fromEnv = new DaytonaCredentialsStore(rootDir, {
-      DAYTONA_API_URL: "http://byoc.example.com/api",
-    });
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
-    await expect(fromEnv.resolve()).rejects.toThrow(/DAYTONA_API_URL/);
-    expect((await fromEnv.getPublicConfig()).apiUrl).toBe("http://byoc.example.com/api");
+    for (const envUrl of ["http://byoc.example.com/api", "not a url", "ftp://byoc.example.com"]) {
+      const fromEnv = new DaytonaCredentialsStore(rootDir, { DAYTONA_API_URL: envUrl });
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+      await expect(fromEnv.resolve()).rejects.toThrow(/DAYTONA_API_URL/);
+      expect((await fromEnv.getPublicConfig()).apiUrl).toBe(envUrl);
+    }
   });
 
   it("rejects an API URL that is not plain http(s)", async () => {
