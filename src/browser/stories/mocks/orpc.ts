@@ -41,11 +41,6 @@ import type {
   WorkspaceActivitySnapshot,
 } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/node/config";
-import {
-  DEFAULT_LAYOUT_PRESETS_CONFIG,
-  normalizeLayoutPresetsConfig,
-  type LayoutPresetsConfig,
-} from "@/common/types/uiLayouts";
 import type {
   ModelCatalogSearchInput,
   WorkspaceChatMessage,
@@ -159,8 +154,6 @@ type MockBackupData<Route extends Exclude<MockBackupRoute, "getSettings">> = Ext
 type MockBackupSettings = NonNullable<MockBackupRouteOutput<"getSettings">>;
 
 export interface MockORPCClientOptions {
-  /** Layout presets config for Settings → Layouts stories */
-  layoutPresets?: LayoutPresetsConfig;
   /** Agent Plugin installer mock data (Settings → Plugins). */
   agentPlugins?: {
     items?: AgentPluginListItem[];
@@ -586,7 +579,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     coderTemplatesResult,
     coderPresetsResult = new Map<string, CoderListPresetsResult>(),
     coderWorkspacesResult,
-    layoutPresets: initialLayoutPresets,
     agentSkills = [],
     invalidAgentSkills = [],
     unavailableAgentSkillSources = [],
@@ -840,8 +832,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     unapprovedProjectImports: [],
   };
 
-  let layoutPresets = initialLayoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;
-
   const mockStats: ChatStats = {
     consumers: [],
     totalTokens: 0,
@@ -950,18 +940,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       restore: (_input: Parameters<APIClient["backup"]["restore"]>[0]) =>
         Promise.resolve({ success: true as const, data: backupRestoreResult }),
     },
-    // Settings → Layouts (layout presets)
-    // Stored in-memory for Storybook only.
-    // Frontend code normalizes the response defensively, but we normalize here too so
-    // stories remain stable even if they mutate the config.
     drafts: createMockDraftsApi(),
-    uiLayouts: {
-      getAll: () => Promise.resolve(layoutPresets),
-      saveAll: (input: { layoutPresets: unknown }) => {
-        layoutPresets = normalizeLayoutPresetsConfig(input.layoutPresets);
-        return Promise.resolve(undefined);
-      },
-    },
     experiments: {
       set: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => {
         experiments = { ...experiments, [input.experimentId]: input.enabled === true };

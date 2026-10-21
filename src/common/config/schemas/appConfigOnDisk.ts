@@ -168,7 +168,6 @@ export const AppConfigOnDiskSchema = z
     serverAuthGithubOwner: z.string().optional(),
     defaultProjectDir: z.string().optional(),
     viewedSplashScreens: z.array(z.string()).optional(),
-    layoutPresets: z.unknown().optional(),
     userPreferences: UserPreferencesSchema.optional(),
     taskSettings: TaskSettingsSchema.optional(),
     /**

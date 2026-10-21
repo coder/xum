@@ -166,7 +166,6 @@ import {
 } from "./routerSubscriptions";
 
 import { checkRuntimeAvailability } from "@/node/runtime/runtimeFactory";
-import { DEFAULT_LAYOUT_PRESETS_CONFIG } from "@/common/types/uiLayouts";
 
 import { getAgentSkill, listAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import {
@@ -383,7 +382,7 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) => context.tokenizerService.calculateWorkspaceStats(input)),
     },
     // Config-backed procedures ride handlerGen. Interruption posture (also applies to
-    // the `config` and `uiLayouts` namespaces below): reads are single Effect.sync
+    // the `config` namespace below): reads are single Effect.sync
     // steps (interruption is a don't-care); mutations wrap the whole pre-Effect
     // handler body in one atomicPromise thunk, so a client abort never interrupts the
     // in-flight Semaphore(1)-serialized config edit, multi-step bodies (mutate + notify)
@@ -867,27 +866,6 @@ export const router = (authToken?: string) => {
         .input(schemas.drafts.subscribe.input)
         .output(schemas.drafts.subscribe.output)
         .handler(({ context, signal }) => subscribeDrafts(context, signal)),
-    },
-    uiLayouts: {
-      getAll: t
-        .input(schemas.uiLayouts.getAll.input)
-        .output(schemas.uiLayouts.getAll.output)
-        .handler(
-          handlerGen(function* ({ context }) {
-            return yield* Effect.sync(() => {
-              const config = context.config.loadConfigOrDefault();
-              return config.layoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;
-            });
-          })
-        ),
-      saveAll: t
-        .input(schemas.uiLayouts.saveAll.input)
-        .output(schemas.uiLayouts.saveAll.output)
-        .handler(
-          handlerGen(function* ({ context }, input) {
-            yield* atomicPromise(async () => context.config.saveLayoutPresets(input.layoutPresets));
-          })
-        ),
     },
     agents: {
       list: t

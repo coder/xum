@@ -118,7 +118,6 @@ import {
   TimelinePreviewSchema,
   TimelineSubscriptionEventSchema,
 } from "./timeline";
-import { LayoutPresetsConfigSchema } from "./uiLayouts";
 import {
   TerminalCreateParamsSchema,
   TerminalResizeParamsSchema,
@@ -3921,22 +3920,6 @@ export const drafts = {
   subscribe: {
     input: z.void(),
     output: eventIterator(DraftEventSchema),
-  },
-};
-
-// UI Layouts (global settings)
-export const uiLayouts = {
-  getAll: {
-    input: z.void(),
-    output: LayoutPresetsConfigSchema,
-  },
-  saveAll: {
-    input: z
-      .object({
-        layoutPresets: LayoutPresetsConfigSchema,
-      })
-      .strict(),
-    output: z.void(),
   },
 };
 

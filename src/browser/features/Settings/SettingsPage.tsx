@@ -10,7 +10,6 @@ import {
   Bot,
   HeartPulse,
   Keyboard,
-  Layout,
   Container,
   Shield,
   ShieldCheck,
@@ -37,7 +36,6 @@ import { MCPSettingsSection } from "./Sections/MCPSettingsSection";
 import { PluginsSettingsSection } from "./Sections/PluginsSettingsSection";
 import { SecretsSection } from "./Sections/SecretsSection";
 import { InstructionsSection } from "./Sections/InstructionsSection";
-import { LayoutsSection } from "./Sections/LayoutsSection";
 import { RuntimesSection } from "./Sections/RuntimesSection";
 import { ExperimentsSection } from "./Sections/ExperimentsSection";
 import { ServerAccessSection } from "./Sections/ServerAccessSection";
@@ -115,12 +113,6 @@ const BASE_SECTIONS: SettingsSection[] = [
     label: "Server Access",
     icon: <Shield className="h-4 w-4" />,
     component: ServerAccessSection,
-  },
-  {
-    id: "layouts",
-    label: "Layouts",
-    icon: <Layout className="h-4 w-4" />,
-    component: LayoutsSection,
   },
   {
     id: "runtimes",

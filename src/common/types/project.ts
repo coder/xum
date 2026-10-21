@@ -20,7 +20,6 @@ import type { AgentAiDefaults } from "./agentAiDefaults";
 import type { AutoModelRoutingConfig } from "./autoModelRouting";
 import type { RuntimeEnablementId } from "./runtime";
 import type { TaskSettings } from "./tasks";
-import type { LayoutPresetsConfig } from "./uiLayouts";
 import type { ThinkingLevel } from "./thinking";
 import type { GoalDefaults } from "@/constants/goals";
 
@@ -84,8 +83,6 @@ export interface ProjectsConfig {
   userPreferences?: UserPreferences;
   /** Global task settings (agent sub-workspaces, queue limits, nesting depth) */
   taskSettings?: TaskSettings;
-  /** UI layout presets + hotkeys (shared via ~/.xum/config.json). */
-  layoutPresets?: LayoutPresetsConfig;
   /** Let chat transcripts use the full chat pane width instead of the default readable column. */
   chatTranscriptFullWidth?: boolean;
   /**
