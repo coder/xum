@@ -44,18 +44,28 @@ function nonEmpty(value: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+/** Settings input the user must correct; the router reports it as a bad request. */
+export class DaytonaConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DaytonaConfigError";
+  }
+}
+
 function normalizeApiUrl(value: string): string {
   let parsed: URL;
   try {
     parsed = new URL(value);
   } catch {
-    throw new Error(`Daytona API URL is not a valid URL: ${value}`);
+    throw new DaytonaConfigError(`Daytona API URL is not a valid URL: ${value}`);
   }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    throw new Error("Daytona API URL must use http or https");
+    throw new DaytonaConfigError("Daytona API URL must use http or https");
   }
   if (parsed.username || parsed.password || parsed.search || parsed.hash) {
-    throw new Error("Daytona API URL must not contain credentials, a query or a fragment");
+    throw new DaytonaConfigError(
+      "Daytona API URL must not contain credentials, a query or a fragment"
+    );
   }
   return parsed.toString().replace(/\/+$/, "");
 }

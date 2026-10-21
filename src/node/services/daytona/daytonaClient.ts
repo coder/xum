@@ -125,18 +125,39 @@ interface RequestOptions {
 const MAX_PAGES = 50;
 const PAGE_LIMIT = 100;
 
+const MAX_SERVER_MESSAGE_CHARS = 200;
+
+/**
+ * Error text ends up in toasts and turn errors: a proxy or a non-Daytona URL can answer with a
+ * whole HTML page, so drop tags, collapse whitespace and keep a short excerpt.
+ */
+function toPlainExcerpt(text: string): string | undefined {
+  const plain = text
+    .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!plain) return undefined;
+  return plain.length > MAX_SERVER_MESSAGE_CHARS
+    ? `${plain.slice(0, MAX_SERVER_MESSAGE_CHARS)}...`
+    : plain;
+}
+
 function extractServerMessage(bodyText: string): string | undefined {
   if (!bodyText) return undefined;
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(bodyText);
-    if (parsed && typeof parsed === "object" && "message" in parsed) {
-      const message = (parsed as { message: unknown }).message;
-      if (typeof message === "string") return message;
-      if (Array.isArray(message)) return message.filter((m) => typeof m === "string").join("; ");
-    }
+    parsed = JSON.parse(bodyText);
   } catch {
     // Not JSON (proxy error page etc.): keep a short plain-text excerpt instead.
-    return bodyText.slice(0, 200);
+    return toPlainExcerpt(bodyText);
+  }
+  if (parsed && typeof parsed === "object" && "message" in parsed) {
+    const message = (parsed as { message: unknown }).message;
+    if (typeof message === "string") return toPlainExcerpt(message);
+    if (Array.isArray(message)) {
+      return toPlainExcerpt(message.filter((m) => typeof m === "string").join("; "));
+    }
   }
   return undefined;
 }

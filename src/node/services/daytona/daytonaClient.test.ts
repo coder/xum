@@ -70,6 +70,27 @@ describe("DaytonaClient", () => {
     }
   });
 
+  it("reduces an HTML error page or a long message to a short plain-text excerpt", async () => {
+    const page = `<!DOCTYPE html><html><head><style>body { color: red }</style></head><body>
+      <h1>502 Bad Gateway</h1>
+      <p>nginx</p></body></html>`;
+    const htmlClient = new DaytonaClient({
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+      fetch: fakeFetch(() => new Response(page, { status: 502 })).fetch,
+    });
+    const htmlError = await captureError(htmlClient.listSandboxes());
+    expect(htmlError.serverMessage).toBe("502 Bad Gateway nginx");
+
+    const longClient = new DaytonaClient({
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+      fetch: fakeFetch(() => jsonResponse(500, { message: `<b>${"x".repeat(500)}</b>` })).fetch,
+    });
+    const longError = await captureError(longClient.listSandboxes());
+    expect(longError.serverMessage).toBe(`${"x".repeat(200)}...`);
+  });
+
   it("fails with a timeout error instead of hanging on a stuck control plane", async () => {
     const hangingFetch = ((_input: string | URL | Request, init?: RequestInit) =>
       new Promise<Response>((_resolve, reject) => {
