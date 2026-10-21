@@ -34,6 +34,43 @@ interface TooltipPosition {
   actualPosition: "top" | "bottom" | "left" | "right";
 }
 
+/**
+ * Moves focus into the bubble once it is on screen (a hidden element cannot take focus), so
+ * Escape, Skip and Next work from the keyboard (#5701). Later steps keep focus on the control that
+ * advanced them. When the bubble closes and leaves focus on the body, focus goes back to where it
+ * was. An open modal dialog traps focus, so the bubble cannot take it from one.
+ */
+function useBubbleFocus(
+  tooltipRef: React.RefObject<HTMLDivElement | null>,
+  isPositioned: boolean
+): void {
+  useEffect(() => {
+    const bubble = tooltipRef.current;
+    if (!isPositioned || !bubble) return;
+    const previous = document.activeElement;
+    bubble.focus();
+    return () => {
+      const active = document.activeElement;
+      const focusLost = active === document.body || bubble.contains(active);
+      if (focusLost && previous instanceof HTMLElement && previous.isConnected) previous.focus();
+    };
+  }, [tooltipRef, isPositioned]);
+}
+
+/**
+ * Escape on the bubble counts as Skip. Only keys sent to the bubble reach this handler, so an open
+ * popover, menu, dialog or editor keeps its own Escape: #5670 took every Escape with a window
+ * listener.
+ */
+function dismissOnEscape(e: React.KeyboardEvent, onDismiss: () => void): void {
+  // A layer that already handled this Escape marks it with preventDefault.
+  if (!matchesKeybind(e, KEYBINDS.CANCEL) || e.defaultPrevented) return;
+  e.preventDefault();
+  // The window's stream-interrupt listener must not also act on this Escape.
+  stopKeyboardPropagation(e);
+  onDismiss();
+}
+
 export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
   step,
   currentStep,
@@ -156,32 +193,7 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
     };
   }, [step.target]);
 
-  // Move focus into the bubble once it is on screen (a hidden element cannot take focus), so
-  // Escape, Skip and Next work from the keyboard (#5701). Later steps keep focus on the control
-  // that advanced them. When the bubble closes and leaves focus on the body, focus goes back to
-  // where it was. An open modal dialog traps focus, so the bubble cannot take it from one.
-  useEffect(() => {
-    const bubble = tooltipRef.current;
-    if (!isPositioned || !bubble) return;
-    const previous = document.activeElement;
-    bubble.focus();
-    return () => {
-      const active = document.activeElement;
-      const focusLost = active === null || active === document.body || bubble.contains(active);
-      if (focusLost && previous instanceof HTMLElement && previous.isConnected) previous.focus();
-    };
-  }, [isPositioned]);
-
-  // Escape counts as Skip. Only keys sent to the bubble reach this handler, so an open popover,
-  // menu, dialog or editor keeps its own Escape: #5670 took every Escape with a window listener.
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    // A layer that already handled this Escape marks it with preventDefault.
-    if (!matchesKeybind(e, KEYBINDS.CANCEL) || e.defaultPrevented) return;
-    e.preventDefault();
-    // The window's stream-interrupt listener must not also act on this Escape.
-    stopKeyboardPropagation(e);
-    onDismiss();
-  };
+  useBubbleFocus(tooltipRef, isPositioned);
 
   const isLastStep = currentStep === totalSteps;
 
@@ -207,7 +219,7 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
         role="group"
         aria-labelledby={titleId}
         tabIndex={-1}
-        onKeyDown={handleKeyDown}
+        onKeyDown={(e) => dismissOnEscape(e, onDismiss)}
         style={{
           position: "fixed",
           top: position?.top ?? -9999,
