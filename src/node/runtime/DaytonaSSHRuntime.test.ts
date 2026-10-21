@@ -4,6 +4,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
 import type { RuntimeConfig } from "@/common/types/runtime";
+import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
 import {
   createDaytonaTestRig,
   localShellTransport,
@@ -322,10 +323,29 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     }
   });
 
-  it("deletes its sandbox in the account that created it when Settings switch accounts during setup", async () => {
+  it("refuses a settings change while it creates a sandbox, and takes one afterwards", async () => {
     const newAccount = rig.addAccount("new-key");
     // The user saves another account's key while the create request is in flight.
-    rig.plane.onRequest.set("POST /sandbox", () => rig.service.setConfig({ apiKey: "new-key" }));
+    let refusal: unknown;
+    rig.plane.onRequest.set("POST /sandbox", () =>
+      rig.service.setConfig({ apiKey: "new-key" }).catch((error: unknown) => {
+        refusal = error;
+      })
+    );
+
+    await makeRuntime({ sandboxId: "xum-kept", shared: false, ...SMALL }).postCreateSetup(
+      initParams()
+    );
+
+    expect(String(refusal)).toContain("Daytona is busy");
+    expect(rig.plane.find("xum-kept")?.state).toBe("started");
+    expect(newAccount.calls).toEqual([]);
+    expect((await rig.service.setConfig({ apiKey: "new-key" })).apiKeySource).toBe("settings");
+  });
+
+  it("deletes its sandbox in the account that created it if the settings still change", async () => {
+    // Defense behind the refusal above: setup fails, and cleans up where it created.
+    spyOn(rig.service, "isAccountCurrent").mockReturnValue(false);
 
     const failure = await makeRuntime({ sandboxId: "xum-moved", shared: false, ...SMALL })
       .postCreateSetup(initParams())
@@ -336,7 +356,6 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
 
     expect(String(failure)).toContain("Daytona settings changed");
     expect(rig.plane.find("xum-moved")).toBeUndefined();
-    expect(newAccount.calls).toEqual([]);
   });
 
   it("never deletes a sandbox that took its name before the create request", async () => {
@@ -437,6 +456,63 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       expect(rig.plane.find("sb-7")).toBeDefined();
     }
     expect(rig.plane.calls.filter((call) => call.startsWith("DELETE /sandbox/"))).toEqual([]);
+  });
+
+  it("refuses a settings change between its checks and the sandbox delete", async () => {
+    rig.plane.addSandbox({ id: "sb-clean" });
+    const newAccount = rig.addAccount("new-key");
+    let refusal: unknown;
+    sshDeleteSpy.mockImplementation(async () => {
+      await rig.service.setConfig({ apiKey: "new-key" }).catch((error: unknown) => {
+        refusal = error;
+      });
+      return { success: true, deletedPath: "/path" };
+    });
+
+    const result = await makeRuntime({ sandboxId: "sb-clean", shared: false }).deleteWorkspace(
+      "/home/me/project",
+      "feature",
+      false
+    );
+
+    expect(result.success).toBe(true);
+    expect(String(refusal)).toContain("Daytona is busy");
+    expect(rig.plane.find("sb-clean")).toBeUndefined();
+    expect(newAccount.calls).toEqual([]);
+    expect((await rig.service.setConfig({ apiKey: "new-key" })).apiKeySource).toBe("settings");
+  });
+
+  it("starts a delete after a settings change being saved, in the new account only", async () => {
+    // The same name in both accounts: the delete must check and delete the new one's.
+    rig.plane.addSandbox({ id: "sb-1", name: "xum-same" });
+    const newAccount = rig.addAccount("new-key");
+    newAccount.addSandbox({ id: "sb-9", name: "xum-same" });
+    let releaseUpdate = () => undefined as void;
+    const updateGate = new Promise<void>((resolve) => (releaseUpdate = resolve));
+    const updateSpy = spyOn(DaytonaCredentialsStore.prototype, "update").mockImplementation(
+      async function (this: DaytonaCredentialsStore, patch) {
+        await updateGate;
+        updateSpy.mockRestore();
+        return this.update(patch);
+      }
+    );
+    try {
+      const saved = rig.service.setConfig({ apiKey: "new-key" });
+      const deleted = makeRuntime({ sandboxId: "xum-same", shared: false }).deleteWorkspace(
+        "/home/me/project",
+        "feature",
+        false
+      );
+      releaseUpdate();
+      await saved;
+      expect((await deleted).success).toBe(true);
+    } finally {
+      updateSpy.mockRestore();
+    }
+
+    expect(rig.plane.calls.filter((call) => call.includes("xum-same"))).toEqual([]);
+    expect(rig.plane.find("xum-same")).toBeDefined();
+    expect(newAccount.find("xum-same")).toBeUndefined();
   });
 
   it("starts a stopped sandbox to run the dirty check and keeps a dirty workspace", async () => {

@@ -24,6 +24,7 @@ export interface DaytonaArchiveHookOptions {
     | "deleteSandbox"
     | "isSandboxReferencedElsewhere"
     | "releaseSshAccess"
+    | "withAccountLease"
   >;
   getArchiveBehavior: () => CoderWorkspaceArchiveBehavior;
   /** As for Coder: model-driven archives must not stop a box under a surviving detached job. */
@@ -39,16 +40,22 @@ export interface DaytonaArchiveHookOptions {
 }
 
 export function createDaytonaArchiveHook(options: DaytonaArchiveHookOptions): BeforeArchiveHook {
-  return async (args): Promise<Result<void>> => {
-    const sandboxId = await unsharedSandboxId(options, args.workspaceMetadata);
-    if (!sandboxId) return Ok(undefined);
+  // Its checks decide what it stops or deletes: all of it runs on one account.
+  return (args) => options.daytonaService.withAccountLease(() => archiveSandbox(options, args));
+}
 
-    const result = isDedicatedDaytonaSandbox(args.workspaceMetadata.runtimeConfig)
-      ? await applyArchiveBehavior(options, args, sandboxId)
-      : Ok(undefined);
-    if (result.success) await releaseSshAccess(options, sandboxId);
-    return result;
-  };
+async function archiveSandbox(
+  options: DaytonaArchiveHookOptions,
+  args: Parameters<BeforeArchiveHook>[0]
+): Promise<Result<void>> {
+  const sandboxId = await unsharedSandboxId(options, args.workspaceMetadata);
+  if (!sandboxId) return Ok(undefined);
+
+  const result = isDedicatedDaytonaSandbox(args.workspaceMetadata.runtimeConfig)
+    ? await applyArchiveBehavior(options, args, sandboxId)
+    : Ok(undefined);
+  if (result.success) await releaseSshAccess(options, sandboxId);
+  return result;
 }
 
 async function applyArchiveBehavior(

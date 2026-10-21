@@ -67,6 +67,7 @@ export type DaytonaRuntimeService = Pick<
   DaytonaService,
   | "checkAvailability"
   | "getSandboxState"
+  | "withAccountLease"
   | "getAccount"
   | "isAccountCurrent"
   | "buildLabels"
@@ -325,28 +326,30 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * checks share one control-plane request. A sandbox removed outside Xum is reported, never
    * silently recreated.
    */
-  override async ensureReady(options?: EnsureReadyOptions): Promise<EnsureReadyResult> {
-    const sandboxId = this.daytonaConfig.sandboxId;
-    if (!sandboxId) {
-      return {
-        ready: false,
-        error: "Daytona sandbox id not set",
-        errorType: "runtime_not_ready",
-      };
-    }
-    const setupFailure = this.setupFailureResult(sandboxId);
-    if (setupFailure) return setupFailure;
-    const emitStatus = makeStatusEmitter(options?.statusSink);
-    if (this.daytonaService.isSandboxReady(sandboxId)) {
-      return this.ensureReadyFromCache(options, emitStatus);
-    }
+  override ensureReady(options?: EnsureReadyOptions): Promise<EnsureReadyResult> {
+    return this.daytonaService.withAccountLease(async () => {
+      const sandboxId = this.daytonaConfig.sandboxId;
+      if (!sandboxId) {
+        return {
+          ready: false,
+          error: "Daytona sandbox id not set",
+          errorType: "runtime_not_ready",
+        };
+      }
+      const setupFailure = this.setupFailureResult(sandboxId);
+      if (setupFailure) return setupFailure;
+      const emitStatus = makeStatusEmitter(options?.statusSink);
+      if (this.daytonaService.isSandboxReady(sandboxId)) {
+        return this.ensureReadyFromCache(options, emitStatus);
+      }
 
-    emitStatus("checking");
-    const failure = await this.bringSandboxUp(sandboxId, emitStatus, options?.signal);
-    if (failure) return failure;
-    const result = await this.markReadyIfRepoPresent(sandboxId, options, emitStatus);
-    if (result.ready) this.restartsStoppedSandbox = true;
-    return result;
+      emitStatus("checking");
+      const failure = await this.bringSandboxUp(sandboxId, emitStatus, options?.signal);
+      if (failure) return failure;
+      const result = await this.markReadyIfRepoPresent(sandboxId, options, emitStatus);
+      if (result.ready) this.restartsStoppedSandbox = true;
+      return result;
+    });
   }
 
   private setupFailureResult(sandboxId: string): EnsureReadyResult | undefined {
@@ -416,18 +419,17 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * "Permission denied", so only a started sandbox gets a new token. Throws a clear error for
    * a sandbox deleted outside Xum.
    */
-  private async recoverForRetry(
-    error: unknown,
-    abortSignal: AbortSignal | undefined
-  ): Promise<boolean> {
-    const sandboxId = this.daytonaConfig.sandboxId;
-    if (!sandboxId || !isRuntimeTransportError(error) || abortSignal?.aborted) return false;
-    const tokenRejected = isTokenRejected(error);
-    // A UI or background runtime never starts the sandbox, so only a refused token is worth a look.
-    if (!tokenRejected && !this.restartsStoppedSandbox) return false;
-    this.daytonaService.invalidateSandboxReady(sandboxId);
-    const state = await this.readStateAfterFailure(sandboxId);
-    return this.recoverInState(sandboxId, state, { error, tokenRejected }, abortSignal);
+  private recoverForRetry(error: unknown, abortSignal: AbortSignal | undefined): Promise<boolean> {
+    return this.daytonaService.withAccountLease(async () => {
+      const sandboxId = this.daytonaConfig.sandboxId;
+      if (!sandboxId || !isRuntimeTransportError(error) || abortSignal?.aborted) return false;
+      const tokenRejected = isTokenRejected(error);
+      // A UI or background runtime never starts the sandbox, so only a refused token is worth a look.
+      if (!tokenRejected && !this.restartsStoppedSandbox) return false;
+      this.daytonaService.invalidateSandboxReady(sandboxId);
+      const state = await this.readStateAfterFailure(sandboxId);
+      return this.recoverInState(sandboxId, state, { error, tokenRejected }, abortSignal);
+    });
   }
 
   private recoverInState(
@@ -695,7 +697,11 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * sync, worktree creation and init hook. If anything fails after the create request was
    * sent, the sandbox this call created is deleted again so it cannot linger and bill.
    */
-  async postCreateSetup(params: WorkspaceInitParams): Promise<void> {
+  postCreateSetup(params: WorkspaceInitParams): Promise<void> {
+    return this.daytonaService.withAccountLease(() => this.provisionSandbox(params));
+  }
+
+  private async provisionSandbox(params: WorkspaceInitParams): Promise<void> {
     const sandboxId = this.daytonaConfig.sandboxId;
     if (!sandboxId) {
       throw new Error("Daytona sandbox id is required (should be set by finalizeConfig)");
@@ -921,7 +927,27 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * stopped or archived sandbox is started for them: unlike Coder, never delete unchecked work
    * to avoid a start. Force skips the checks.
    */
-  override async deleteWorkspace(
+  override deleteWorkspace(
+    projectPath: string,
+    workspaceName: string,
+    force: boolean,
+    abortSignal?: AbortSignal,
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
+  ): Promise<DeleteResult> {
+    return this.daytonaService.withAccountLease(() =>
+      this.deleteWorkspaceAndSandbox(
+        projectPath,
+        workspaceName,
+        force,
+        abortSignal,
+        trusted,
+        options
+      )
+    );
+  }
+
+  private async deleteWorkspaceAndSandbox(
     projectPath: string,
     workspaceName: string,
     force: boolean,
@@ -990,25 +1016,27 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * the "delete" behavior uses it to decide between deleting and stopping the sandbox. A
    * stopped or archived sandbox is started for the check; a missing one has nothing to lose.
    */
-  async checkSandboxDeletable(
+  checkSandboxDeletable(
     projectPath: string,
     workspaceName: string,
     trusted: boolean | undefined
   ): Promise<Result<void, string>> {
-    const sandboxId = this.daytonaConfig.sandboxId;
-    if (!sandboxId) return Err("Daytona sandbox id is not set");
-    const prepared = await this.startForDeleteChecks(sandboxId, undefined);
-    if (prepared === "missing") return Ok(undefined);
-    if (prepared !== "ready") return Err(prepared.error);
-    try {
-      const deletedPath = this.getWorkspacePath(projectPath, workspaceName);
-      const check = await this.checkWorkspaceDeletable(deletedPath, false, trusted);
-      if (check === "missing") return Ok(undefined);
-      if (check !== "ok") return Err(check.error);
-      return await this.checkNoUntrackedFiles(deletedPath);
-    } catch (error) {
-      return Err(`Failed to check workspace state: ${getErrorMessage(error)}`);
-    }
+    return this.daytonaService.withAccountLease(async () => {
+      const sandboxId = this.daytonaConfig.sandboxId;
+      if (!sandboxId) return Err("Daytona sandbox id is not set");
+      const prepared = await this.startForDeleteChecks(sandboxId, undefined);
+      if (prepared === "missing") return Ok(undefined);
+      if (prepared !== "ready") return Err(prepared.error);
+      try {
+        const deletedPath = this.getWorkspacePath(projectPath, workspaceName);
+        const check = await this.checkWorkspaceDeletable(deletedPath, false, trusted);
+        if (check === "missing") return Ok(undefined);
+        if (check !== "ok") return Err(check.error);
+        return await this.checkNoUntrackedFiles(deletedPath);
+      } catch (error) {
+        return Err(`Failed to check workspace state: ${getErrorMessage(error)}`);
+      }
+    });
   }
 
   /**

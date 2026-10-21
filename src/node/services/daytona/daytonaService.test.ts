@@ -5,6 +5,7 @@ import * as path from "path";
 import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
 import { DaytonaApiError } from "./daytonaClient";
 import {
+  DAYTONA_BUSY_MESSAGE,
   DAYTONA_LABEL_INSTANCE,
   DAYTONA_LABEL_PROJECT,
   DaytonaService,
@@ -258,19 +259,23 @@ describe("DaytonaService", () => {
     return { service: heldService, started, releaseMint, written, includeFile };
   }
 
-  it("revokes a token minted across a settings change instead of writing or caching it", async () => {
+  it("refuses a settings change while a token is minted, and takes it afterwards", async () => {
     const held = serviceWithHeldMint();
 
     const access = held.service.ensureSshAccess("sb-1");
     await held.started;
-    await held.service.setConfig({ target: "eu" });
+    const refusal = await held.service.setConfig({ target: "eu" }).then(
+      () => undefined,
+      (error: unknown) => error
+    );
+    expect(String(refusal)).toContain(DAYTONA_BUSY_MESSAGE);
     held.releaseMint();
     await access;
 
-    // tok1 was minted under the old settings: revoked, never written or kept.
+    expect(held.written).toEqual(["tok1"]);
+    expect((await held.service.setConfig({ target: "eu" })).target).toBe("eu");
+    // The change revokes the old settings' token.
     expect(plane.revoked).toEqual(["tok1"]);
-    expect(held.written).not.toContain("tok1");
-    expect((await held.service.getSshToken("sb-1")).token).not.toBe("tok1");
   });
 
   /** A service whose ssh setup writes are recorded as `token@host keys`. */
@@ -296,13 +301,13 @@ describe("DaytonaService", () => {
     return { service: recording, writes };
   }
 
-  it("pairs a token minted after a settings change with the new settings' gateway", async () => {
+  it("refuses a settings change while it looks up the gateway for a token", async () => {
     let gatewayFetched!: () => void;
     const fetched = new Promise<void>((resolve) => (gatewayFetched = resolve));
     let releaseGateway!: () => void;
     const released = new Promise<void>((resolve) => (releaseGateway = resolve));
     let held = false;
-    // The first /config answer is computed under the old settings, then delivered late.
+    // The first /config answer is delivered late, while the user saves new settings.
     const fetchHoldingFirstConfig = (async (input: string | URL | Request, init?: RequestInit) => {
       const response = await plane.fetch(input, init);
       const url = input instanceof Request ? input.url : input.toString();
@@ -317,12 +322,15 @@ describe("DaytonaService", () => {
 
     const access = racing.ensureSshAccess("sb-1");
     await fetched;
-    await racing.setConfig({ target: "eu" });
-    plane.gatewayHost = "ssh.eu.test";
+    const refusal = await racing.setConfig({ target: "eu" }).then(
+      () => undefined,
+      (error: unknown) => error
+    );
+    expect(String(refusal)).toContain(DAYTONA_BUSY_MESSAGE);
     releaseGateway();
     await access;
 
-    expect(writes).toEqual(["tok1@ssh.eu.test ssh-ed25519 AAAA"]);
+    expect(writes).toEqual(["tok1@ssh.test ssh-ed25519 AAAA"]);
   });
 
   it("rewrites a sandbox's ssh setup once Daytona moves its gateway keys", async () => {

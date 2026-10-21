@@ -8,10 +8,11 @@ import type {
   DaytonaTestConnectionResult,
 } from "@/common/orpc/schemas/daytona";
 import { getErrorMessage } from "@/common/utils/errors";
-import type {
-  DaytonaCredentialsPatch,
-  DaytonaCredentialsStore,
-  DaytonaResolvedCredentials,
+import {
+  DaytonaConfigError,
+  type DaytonaCredentialsPatch,
+  type DaytonaCredentialsStore,
+  type DaytonaResolvedCredentials,
 } from "@/node/config/daytonaCredentialsStore";
 import { loadOrCreateInstallationId } from "@/node/config/installationIdentity";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
@@ -112,6 +113,15 @@ function sandboxStateError(sandboxId: string, sandbox: DaytonaSandbox): DaytonaA
 export interface DaytonaAccount {
   client: DaytonaClient;
   generation: number;
+}
+
+export const DAYTONA_BUSY_MESSAGE =
+  "Daytona is busy creating, starting, deleting or checking sandboxes. Save these settings " +
+  "again when it is done.";
+
+/** Wait until `promise` settles; its outcome belongs to whoever started it. */
+async function settled(promise: Promise<unknown>): Promise<void> {
+  await Promise.allSettled([promise]);
 }
 
 interface MintStamp {
@@ -257,6 +267,10 @@ export class DaytonaService {
   private readonly tokenRequests = new Map<string, Promise<DaytonaSshAccess>>();
   /** Bumped by every settings change, so a mint that spans one can tell. */
   private credentialsGeneration = 0;
+  /** Operations running under withAccountLease; setConfig refuses while any runs. */
+  private accountLeases = 0;
+  /** The settings change being saved; new leases wait for it. */
+  private settingsChange?: Promise<DaytonaPublicConfig>;
   /** Per sandbox: bumped by every release of its SSH access, so a mint that spans one can tell. */
   private readonly accessReleases = new Map<string, number>();
   private readonly sshConfigWriter: NonNullable<DaytonaServiceOptions["sshConfigWriter"]>;
@@ -308,7 +322,37 @@ export class DaytonaService {
     return this.credentialsStore.getPublicConfig();
   }
 
+  /**
+   * Run a Daytona operation that makes more than one control-plane call, or acts on what an
+   * earlier one returned (create and set up, delete after its checks, start and mint, archive,
+   * a reconcile sweep), against one account. setConfig refuses while any runs, so none spans a
+   * settings change; one that starts while a change is saved waits for it. Leases nest.
+   */
+  async withAccountLease<T>(fn: () => Promise<T>): Promise<T> {
+    while (this.settingsChange) await settled(this.settingsChange);
+    this.accountLeases++;
+    try {
+      return await fn();
+    } finally {
+      this.accountLeases--;
+    }
+  }
+
+  /** Refused at once (DaytonaConfigError, shown in Settings) while a lease is held. */
   async setConfig(patch: DaytonaCredentialsPatch): Promise<DaytonaPublicConfig> {
+    while (this.settingsChange) await settled(this.settingsChange);
+    // No await between this check and the assignment: a lease cannot start in between.
+    if (this.accountLeases > 0) throw new DaytonaConfigError(DAYTONA_BUSY_MESSAGE);
+    const change = this.applyConfig(patch);
+    this.settingsChange = change;
+    try {
+      return await change;
+    } finally {
+      if (this.settingsChange === change) this.settingsChange = undefined;
+    }
+  }
+
+  private async applyConfig(patch: DaytonaCredentialsPatch): Promise<DaytonaPublicConfig> {
     const previousClient = await this.getClientIfConfigured();
     await this.credentialsStore.update(patch);
     // A mint in flight finishes under the old settings: it sees the bump and starts over.
@@ -722,7 +766,7 @@ export class DaytonaService {
       onStarting: new Set(options.onStarting ? [options.onStarting] : []),
       starting: false,
     };
-    request.promise = (async () => {
+    request.promise = this.withAccountLease(async () => {
       await this.startAndWait(sandboxId, this.now() + DAYTONA_START_TIMEOUT_MS, {
         onStarting: () => {
           request.starting = true;
@@ -730,7 +774,7 @@ export class DaytonaService {
         },
       });
       await this.ensureSshAccess(sandboxId);
-    })().finally(() => {
+    }).finally(() => {
       this.readyRequests.delete(sandboxId);
     });
     this.readyRequests.set(sandboxId, request);
@@ -742,27 +786,29 @@ export class DaytonaService {
    * writes known_hosts and the `~/.ssh/config` block and checks that ssh resolves the token as
    * the user; a refresh rewrites only the include file.
    */
-  async ensureSshAccess(sandboxId: string): Promise<void> {
-    // Fails before a mint when the control plane cannot say where the gateway is.
-    await this.getGatewayConfig();
-    // A cached token was written by the mint that produced it, so only a mint writes files.
-    const access = await this.getSshToken(sandboxId, {
-      onNewToken: async ({ token }) => {
-        // Looked up after the mint, so a settings change before it cannot pair this token with
-        // the old deployment's gateway; one after it makes the mint start over.
-        const gateway = toSshGateway(await this.getGatewayConfig());
-        if (this.sshConfigured.has(sandboxId)) {
-          await this.sshConfigWriter.updateToken({ sandboxId, token, gateway });
-          return;
-        }
-        await this.sshConfigWriter.writeSandbox({ sandboxId, token, gateway });
-      },
+  ensureSshAccess(sandboxId: string): Promise<void> {
+    return this.withAccountLease(async () => {
+      // Fails before a mint when the control plane cannot say where the gateway is.
+      await this.getGatewayConfig();
+      // A cached token was written by the mint that produced it, so only a mint writes files.
+      const access = await this.getSshToken(sandboxId, {
+        onNewToken: async ({ token }) => {
+          // Looked up after the mint, so a settings change before it cannot pair this token with
+          // the old deployment's gateway; one after it makes the mint start over.
+          const gateway = toSshGateway(await this.getGatewayConfig());
+          if (this.sshConfigured.has(sandboxId)) {
+            await this.sshConfigWriter.updateToken({ sandboxId, token, gateway });
+            return;
+          }
+          await this.sshConfigWriter.writeSandbox({ sandboxId, token, gateway });
+        },
+      });
+      if (this.sshConfigured.has(sandboxId)) return;
+      // Outside the mint: when the user's ssh config shadows the token, a retry after they fix it
+      // reuses this token (already written) instead of minting another one.
+      await this.sshConfigWriter.verifyResolvedConfig(sandboxId, access.token);
+      this.sshConfigured.add(sandboxId);
     });
-    if (this.sshConfigured.has(sandboxId)) return;
-    // Outside the mint: when the user's ssh config shadows the token, a retry after they fix it
-    // reuses this token (already written) instead of minting another one.
-    await this.sshConfigWriter.verifyResolvedConfig(sandboxId, access.token);
-    this.sshConfigured.add(sandboxId);
   }
 
   /**
@@ -819,7 +865,9 @@ export class DaytonaService {
     const inFlight = this.tokenRequests.get(sandboxId);
     if (inFlight) return inFlight;
 
-    const request = this.mintSshToken(sandboxId, cached, options).finally(() => {
+    const request = this.withAccountLease(() =>
+      this.mintSshToken(sandboxId, cached, options)
+    ).finally(() => {
       this.tokenRequests.delete(sandboxId);
     });
     this.tokenRequests.set(sandboxId, request);

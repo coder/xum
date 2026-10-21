@@ -27,6 +27,7 @@ export interface DaytonaReconcilerOptions {
     | "hasExpiringSshToken"
     | "ensureSshAccess"
     | "getSandboxState"
+    | "withAccountLease"
   >;
   /** Every workspace Xum knows, archived ones included (they still own their sandbox). */
   listWorkspaces: () => DaytonaWorkspaceRef[];
@@ -133,7 +134,12 @@ export class DaytonaReconciler {
     this.timer = undefined;
   }
 
-  async sweep(): Promise<void> {
+  /** One account for the whole sweep: it stops sandboxes from what it listed. */
+  sweep(): Promise<void> {
+    return this.options.daytonaService.withAccountLease(() => this.sweepOnce());
+  }
+
+  private async sweepOnce(): Promise<void> {
     const service = this.options.daytonaService;
     // No credentials: no Daytona workspaces can be reached, and nothing to reconcile.
     if (!(await service.checkAvailability()).available) return;
