@@ -35,39 +35,23 @@ interface PaletteSidebarRequestOptions {
  * the sidebar, the layout still changes (its full-screen view shows it), but nothing takes focus.
  */
 export function usePaletteSidebarRequests(options: PaletteSidebarRequestOptions): void {
-  const {
-    workspaceId,
-    sidebarContainerRef,
-    getBaseLayout,
-    setLayout,
-    setCollapsed,
-    focusLauncher,
-    focusTerminalTab,
-    focusTab,
-    openToolWithFocus,
-  } = options;
+  // A ref, so the listeners subscribe once per workspace and still call the latest callbacks
+  // (as in useWorkspaceActionKeybinds).
+  const optionsRef = React.useRef(options);
+  React.useLayoutEffect(() => {
+    optionsRef.current = options;
+  });
+  const workspaceId = options.workspaceId;
   React.useEffect(() => {
-    const shown = () => isSidebarShown(sidebarContainerRef.current);
     const handleSplit = (event: Event) => {
       const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE>).detail;
-      if (detail?.workspaceId !== workspaceId) return;
-      setCollapsed(false);
-      const next = splitFocusedTabset(getBaseLayout(), detail.direction);
-      setLayout(() => next);
-      if (!shown()) return;
-      const tab = getFocusedActiveTab(next, NEW_TAB);
-      if (isNewTab(tab)) focusLauncher(next.focusedTabsetId);
-      else if (isTerminalTab(tab)) focusTerminalTab(tab);
-      else focusTab(tab);
+      if (detail?.workspaceId === workspaceId) splitPane(optionsRef.current, detail.direction);
     };
     const handleOpenTool = (event: Event) => {
       const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL>).detail;
-      if (detail?.workspaceId !== workspaceId || !isBaseTabId(detail.tool)) return;
-      const tool = detail.tool;
-      setCollapsed(false);
-      const tabsetId = getBaseLayout().focusedTabsetId;
-      if (shown()) openToolWithFocus(tabsetId, tool);
-      else setLayout((prev) => openToolFromNewTab(prev, tabsetId, tool));
+      if (detail?.workspaceId === workspaceId && isBaseTabId(detail.tool)) {
+        openTool(optionsRef.current, detail.tool);
+      }
     };
     window.addEventListener(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, handleSplit);
     window.addEventListener(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, handleOpenTool);
@@ -75,17 +59,28 @@ export function usePaletteSidebarRequests(options: PaletteSidebarRequestOptions)
       window.removeEventListener(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, handleSplit);
       window.removeEventListener(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, handleOpenTool);
     };
-  }, [
-    workspaceId,
-    sidebarContainerRef,
-    getBaseLayout,
-    setLayout,
-    setCollapsed,
-    focusLauncher,
-    focusTerminalTab,
-    focusTab,
-    openToolWithFocus,
-  ]);
+  }, [workspaceId]);
+}
+
+function splitPane(options: PaletteSidebarRequestOptions, direction: "horizontal" | "vertical") {
+  options.setCollapsed(false);
+  const next = splitFocusedTabset(options.getBaseLayout(), direction);
+  options.setLayout(() => next);
+  if (!isSidebarShown(options.sidebarContainerRef.current)) return;
+  const tab = getFocusedActiveTab(next, NEW_TAB);
+  if (isNewTab(tab)) options.focusLauncher(next.focusedTabsetId);
+  else if (isTerminalTab(tab)) options.focusTerminalTab(tab);
+  else options.focusTab(tab);
+}
+
+function openTool(options: PaletteSidebarRequestOptions, tool: BaseTabType) {
+  options.setCollapsed(false);
+  const tabsetId = options.getBaseLayout().focusedTabsetId;
+  if (isSidebarShown(options.sidebarContainerRef.current)) {
+    options.openToolWithFocus(tabsetId, tool);
+  } else {
+    options.setLayout((prev) => openToolFromNewTab(prev, tabsetId, tool));
+  }
 }
 
 function isSidebarShown(container: HTMLElement | null): boolean {
