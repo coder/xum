@@ -316,6 +316,8 @@ interface AgentSkillScanCandidate {
   singleSkillName?: string;
   /** Agent Plugins only: the single skill is a Claude command, `<root>/<name>.md` (claudeCommands.ts). */
   commandSkill?: true | undefined;
+  /** Agent Plugins only: the plugin is a Claude Code package (AgentPluginInfo.claudeFallback). */
+  claudePackagePlugin?: true | undefined;
   importedSkills?: string[];
   /** Managed plugins only: the reviewed skill fingerprints (#6498). */
   skillConsent?: PluginSkillConsentGate;
@@ -393,6 +395,7 @@ async function buildPluginScanCandidates(args: {
         pluginName: plugin.name,
         singleSkillName: root.name,
         commandSkill: root.command,
+        claudePackagePlugin: plugin.claudeFallback,
         importedSkills,
         skillConsent,
         pluginConsent: plugin.componentConsent,
@@ -1145,6 +1148,8 @@ export interface ResolvedAgentSkill {
    * of its own, so the `skill://` resolver runs no script for it.
    */
   commandSkill?: true | undefined;
+  /** The skill's plugin is a Claude Code package (AgentPluginInfo.claudeFallback): no script runs. */
+  claudePackagePlugin?: true | undefined;
 }
 
 /** Stamp a plugin skill's provenance on its read result (see ResolvedAgentSkill.pluginName). */
@@ -1152,7 +1157,7 @@ function withPluginName(
   resolved: ResolvedAgentSkill | null,
   candidate: Pick<
     AgentSkillScanCandidate,
-    "pluginName" | "pluginConsent" | "pluginApprovedCopies" | "commandSkill"
+    "pluginName" | "pluginConsent" | "pluginApprovedCopies" | "commandSkill" | "claudePackagePlugin"
   >
 ): ResolvedAgentSkill | null {
   if (resolved == null || candidate.pluginName == null) return resolved;
@@ -1162,6 +1167,7 @@ function withPluginName(
     pluginConsent: candidate.pluginConsent,
     pluginApprovedCopies: candidate.pluginApprovedCopies,
     ...(candidate.commandSkill === true ? { commandSkill: true } : {}),
+    ...(candidate.claudePackagePlugin === true ? { claudePackagePlugin: true } : {}),
   };
 }
 

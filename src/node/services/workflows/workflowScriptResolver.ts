@@ -191,6 +191,12 @@ async function resolveSkillWorkflowScript(
   if (resolvedSkill.commandSkill === true) {
     throw new Error(`Skill '${parsed.skillName}' is a Claude command and has no workflow scripts`);
   }
+  // A Claude Code package runs no Xum code (docs/agents/agent-skills.mdx): no workflow scripts.
+  if (resolvedSkill.claudePackagePlugin === true) {
+    throw new Error(
+      `Skill '${parsed.skillName}' comes from a Claude Code plugin and has no workflow scripts`
+    );
+  }
 
   if (resolvedSkill.package.scope === "project" && !input.projectTrusted) {
     throw new Error("Project trust is required to run project skill workflow scripts");

@@ -2416,7 +2416,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "| `.mcp.json`, or one `mcpServers` JSON file | MCP servers. `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` work in `args`, `env` and `cwd`. A `command` can be `${CLAUDE_PLUGIN_ROOT}/<path>`. |",
       "| `hooks/hooks.json` and the `hooks` files   | Listed in Settings. They never run. See [Plugin hooks](/hooks/plugins#claude-code-plugin-hooks).                                                     |",
       "",
-      "Xum reads one MCP file: an `mcpServers` path replaces `.mcp.json` instead of adding to it. Xum ignores every other manifest key with a warning, for example `lspServers`, `outputStyles`, `userConfig`, `settings`, `dependencies` and `workflows`, and also inline `mcpServers`, `hooks` and `commands` objects. A Claude Code plugin runs no Xum code: Xum ignores its `hooks.js`, `workflows/` and `bin/`. Commands get the same [component review](#component-review) as skills.",
+      "Xum reads one MCP file: an `mcpServers` path replaces `.mcp.json` instead of adding to it. Xum ignores every other manifest key with a warning, for example `lspServers`, `outputStyles`, `userConfig`, `settings`, `dependencies` and `workflows`, and also inline `mcpServers`, `hooks` and `commands` objects. A Claude Code plugin runs no Xum code: Xum ignores its `hooks.js`, `workflows/`, `bin/` and every skill's `workflow.js`. Commands get the same [component review](#component-review) as skills.",
       "",
       "#### Component review",
       "",
