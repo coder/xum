@@ -2033,7 +2033,8 @@ export const workspace = {
     // When the next heartbeat slot opens (epoch ms); null while the scheduler does not track the
     // workspace (see HeartbeatService.getNextHeartbeatAt).
     next: {
-      input: z.object({ workspaceId: z.string() }),
+      // Non-empty: getNextHeartbeatAt asserts on it, and client input must fail validation instead.
+      input: z.object({ workspaceId: z.string().min(1) }),
       output: z.number().nullable(),
     },
   },

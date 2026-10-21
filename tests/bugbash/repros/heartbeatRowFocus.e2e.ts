@@ -16,6 +16,9 @@ test(
     await openPlayground(app, screen, browser);
     const row = screen.getByRole("button", /^Heartbeat/);
     const dialog = screen.getByRole("dialog", "Configure heartbeat");
+    // The row reads the real scheduler through workspace.heartbeat.next (the unit tests mock it).
+    await expect(row).toContainText(/Next in \d+m/);
+    await expect(row).toContainText("Every 10m");
     for (const key of ["Enter", "Space"]) {
       await row.focus();
       await browser.keyboard.press(key);
