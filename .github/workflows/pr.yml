@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: ["**"]
+    # The default three, plus ready_for_review: the PR story lane (stories-pr) skips drafts, so
+    # it runs once a draft is marked ready. The other jobs run again on that commit.
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
   workflow_dispatch:
     inputs:
@@ -790,7 +793,8 @@ jobs:
 
   stories:
     name: Test / Stories
-    # The agentic story lane (stories.yml), once for each merge-queue entry. The repo variable
+    # The agentic story lane (stories.yml), once for each merge-queue entry, with its defaults:
+    # Sonnet 5.5 and $3 a job (stories-pr runs it with Haiku on PR pushes). The repo variable
     # STORIES_MODE picks the mode. Unset or anything but "block" is warn mode: the check shows its
     # result, but Required drops it (the results step). With "block", a failure fails Required.
     # The user's bar for "block": 50 queue runs with less than 5% failures. The lane runs
@@ -804,6 +808,35 @@ jobs:
     # By name, not `secrets: inherit`: the lane gets this one key only.
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+  stories-pr:
+    # The check reads "Test / Stories (Haiku) / make test-stories", apart from the queue's lane.
+    name: Test / Stories (Haiku)
+    # The same lane on each push to a PR that is not a draft: Haiku on PRs, Sonnet in the queue
+    # (the user's pick). $1 a job. It restores this PR's seed, else main's, so most steps replay.
+    # The repo variable STORIES_PR_MODE picks the mode, as STORIES_MODE does for the queue lane:
+    # anything but "block" is warn mode, and Required drops the result (the results step). The
+    # user's bar for "block": warn until 50 PR runs with less than 5% failures.
+    # ROLLBACK: set the STORIES_PR_MODE repo variable back to "warn" (Settings -> Secrets and
+    # variables -> Actions -> Variables). No code change. To stop the lane, delete this job.
+    needs: [changes]
+    # The guard is here, not only in stories.yml: the call passes a required secret, which fork
+    # and Dependabot PRs do not get, so the call itself would fail.
+    if: >-
+      github.event_name == 'pull_request' &&
+      !github.event.pull_request.draft &&
+      needs.changes.outputs.tests == 'true' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
+    uses: ./.github/workflows/stories.yml
+    permissions:
+      contents: read
+    # By name, not `secrets: inherit`: the lane gets this one key only.
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    with:
+      model: anthropic:claude-haiku-5-5
+      budget_usd: "1"
 
   build-linux:
     name: Build / Linux
@@ -985,6 +1018,8 @@ jobs:
       - crap
       # Counts only in stories block mode (vars.STORIES_MODE == 'block'); see the stories job.
       - stories
+      # Counts only in PR stories block mode (vars.STORIES_PR_MODE == 'block'); see stories-pr.
+      - stories-pr
     runs-on: ubuntu-latest
     # superseded: read this workflow's runs/jobs and check out the decision script.
     permissions:
@@ -994,16 +1029,19 @@ jobs:
       # The job results Required judges. In CRAP warn mode (vars.CRAP_MODE is
       # not "block") Quality / CRAP never decides Required, so its result is
       # dropped here, and every later step reads this list. The same for
-      # Test / Stories in stories warn mode (vars.STORIES_MODE is not "block").
+      # Test / Stories in stories warn mode (vars.STORIES_MODE is not "block"),
+      # and for Test / Stories (Haiku) in PR stories warn mode
+      # (vars.STORIES_PR_MODE is not "block").
       - id: results
         env:
           CRAP_MODE: ${{ vars.CRAP_MODE }}
           STORIES_MODE: ${{ vars.STORIES_MODE }}
+          STORIES_PR_MODE: ${{ vars.STORIES_PR_MODE }}
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          # shellcheck disable=SC2016 # $mode and $stories are jq variables, not shell ones.
-          filter='to_entries[] | select(.key != "crap" or $mode == "block") | select(.key != "stories" or $stories == "block") | .value.result'
-          echo "list=$(jq -r --arg mode "$CRAP_MODE" --arg stories "$STORIES_MODE" "$filter" <<<"$NEEDS_JSON" | paste -sd ' ' -)" >>"$GITHUB_OUTPUT"
+          # shellcheck disable=SC2016 # $mode, $stories and $storiesPr are jq variables, not shell ones.
+          filter='to_entries[] | select(.key != "crap" or $mode == "block") | select(.key != "stories" or $stories == "block") | select(.key != "stories-pr" or $storiesPr == "block") | .value.result'
+          echo "list=$(jq -r --arg mode "$CRAP_MODE" --arg stories "$STORIES_MODE" --arg storiesPr "$STORIES_PR_MODE" "$filter" <<<"$NEEDS_JSON" | paste -sd ' ' -)" >>"$GITHUB_OUTPUT"
       # A cancelled duplicate run must not leave a red Required when another run for
       # this PR will publish one (#4547). The script stands down only with proof and
       # fails closed otherwise; see its header for the rules.

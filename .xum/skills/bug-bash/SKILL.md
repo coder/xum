@@ -164,10 +164,14 @@ job (a story job only) and refuses any entry that is not a regular `<sha256>.jso
 or less, more than 1000 entries, or more than 128 MiB in all. Each run
 summary counts the outcomes (`Cache N replayed`). An empty or missing seed is a cold run.
 CI: the `Stories` workflow (`.github/workflows/stories.yml`) runs one `make test-stories` with
-`BUGBASH_BUDGET_USD=3` (the cap per job) once for each PR in the merge queue (pr.yml's
-`Test / Stories` job calls it), nightly on main and on demand (Actions > Stories > Run workflow,
-on any branch). `Required` waits for it in the queue but counts its result only when the repo
-variable `STORIES_MODE` is `block`. Unset is warn mode: a failure shows but blocks no merge. When
+Sonnet 5.5 and `BUGBASH_BUDGET_USD=3` (the cap per job) once for each PR in the merge queue
+(pr.yml's `Test / Stories` job calls it), nightly on main and on demand (Actions > Stories > Run
+workflow, on any branch). `Required` waits for it in the queue but counts its result only when the
+repo variable `STORIES_MODE` is `block`. Unset is warn mode: a failure shows but blocks no merge.
+On each push to a PR that is not a draft, pr.yml's `Test / Stories (Haiku)` job runs it with
+Haiku 5.5 and a $1 cap per job (its `model` and `budget_usd` inputs): Haiku on PRs, Sonnet in the
+queue. Fork and Dependabot PRs skip it. `Required` counts that result only when the repo variable
+`STORIES_PR_MODE` is `block`: warn until 50 PR runs with less than 5% failures. When
 every failed job's proxy record holds a provider 5xx (`bun tests/stories/summary.ts
 --upstream-fault`), the workflow runs `make test-stories` once more. It restores the seed with actions/cache
 (this ref's newest, else main's), writes a table of the tests, their cache outcomes and each
