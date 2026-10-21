@@ -19,6 +19,8 @@ class FakeControlPlane {
   readonly calls: string[] = [];
   private tokenCounter = 0;
   readonly revoked: string[] = [];
+  gatewayHost = "ssh.test";
+  gatewayHostKeys = ["ssh-ed25519 AAAA"];
 
   constructor(private readonly now: () => number) {}
 
@@ -34,7 +36,10 @@ class FakeControlPlane {
       new Response(body === undefined ? "" : JSON.stringify(body), { status });
 
     if (route === "GET /config") {
-      return json(200, { sshGatewayHost: "ssh.test", sshGatewayHostKeys: ["ssh-ed25519 AAAA"] });
+      return json(200, {
+        sshGatewayHost: this.gatewayHost,
+        sshGatewayHostKeys: this.gatewayHostKeys,
+      });
     }
     if (route === "GET /sandbox") {
       if (init?.headers && (init.headers as Record<string, string>).Authorization !== "Bearer k") {
@@ -266,6 +271,85 @@ describe("DaytonaService", () => {
     expect(plane.revoked).toEqual(["tok1"]);
     expect(held.written).not.toContain("tok1");
     expect((await held.service.getSshToken("sb-1")).token).not.toBe("tok1");
+  });
+
+  /** A service whose ssh setup writes are recorded as `token@host keys`. */
+  function serviceRecordingWrites(fetchImpl: typeof fetch = plane.fetch) {
+    const writes: string[] = [];
+    const record = (input: { token: string; gateway: { host: string; hostKeys: string[] } }) => {
+      writes.push(`${input.token}@${input.gateway.host} ${input.gateway.hostKeys.join(",")}`);
+      return Promise.resolve();
+    };
+    const recording = new DaytonaService({
+      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
+      rootDir,
+      fetch: fetchImpl,
+      now: () => clock,
+      sshConfigWriter: {
+        writeSandbox: record,
+        updateToken: record,
+        removeSandbox: () => Promise.resolve(),
+        readTokens: () => Promise.resolve([]),
+        verifyResolvedConfig: () => Promise.resolve(),
+      },
+    });
+    return { service: recording, writes };
+  }
+
+  it("pairs a token minted after a settings change with the new settings' gateway", async () => {
+    let gatewayFetched!: () => void;
+    const fetched = new Promise<void>((resolve) => (gatewayFetched = resolve));
+    let releaseGateway!: () => void;
+    const released = new Promise<void>((resolve) => (releaseGateway = resolve));
+    let held = false;
+    // The first /config answer is computed under the old settings, then delivered late.
+    const fetchHoldingFirstConfig = (async (input: string | URL | Request, init?: RequestInit) => {
+      const response = await plane.fetch(input, init);
+      const url = input instanceof Request ? input.url : input.toString();
+      if (!held && url.endsWith("/config")) {
+        held = true;
+        gatewayFetched();
+        await released;
+      }
+      return response;
+    }) as typeof fetch;
+    const { service: racing, writes } = serviceRecordingWrites(fetchHoldingFirstConfig);
+
+    const access = racing.ensureSshAccess("sb-1");
+    await fetched;
+    await racing.setConfig({ target: "eu" });
+    plane.gatewayHost = "ssh.eu.test";
+    releaseGateway();
+    await access;
+
+    expect(writes).toEqual(["tok1@ssh.eu.test ssh-ed25519 AAAA"]);
+  });
+
+  it("rewrites a sandbox's ssh setup once Daytona moves its gateway keys", async () => {
+    const { service: watching, writes } = serviceRecordingWrites();
+    const configFetches = () => plane.calls.filter((call) => call === "GET /config").length;
+
+    await watching.ensureSshAccess("sb-1");
+    clock += 4 * 60_000;
+    await watching.ensureSshAccess("sb-1");
+    expect(configFetches()).toBe(1);
+
+    // Rotated (and listed in another order) while Xum runs.
+    plane.gatewayHostKeys = ["ssh-rsa CCCC", "ssh-ed25519 BBBB"];
+    clock += 2 * 60_000;
+    await watching.ensureSshAccess("sb-1");
+    expect(writes).toEqual([
+      "tok1@ssh.test ssh-ed25519 AAAA",
+      "tok2@ssh.test ssh-rsa CCCC,ssh-ed25519 BBBB",
+    ]);
+    expect(plane.revoked).toEqual(["tok1"]);
+
+    // A refetch that finds the same gateway, keys reordered, rewrites nothing.
+    plane.gatewayHostKeys = ["ssh-ed25519 BBBB", "ssh-rsa CCCC"];
+    clock += 6 * 60_000;
+    await watching.ensureSshAccess("sb-1");
+    expect(configFetches()).toBe(3);
+    expect(writes).toHaveLength(2);
   });
 
   it("revokes a token minted across a release, keeping the access released", async () => {

@@ -50,6 +50,12 @@ export const DAYTONA_START_TIMEOUT_MS = 180_000;
  * the cache lives here, keyed by sandbox, rather than on a runtime instance.
  */
 export const DAYTONA_READY_CACHE_MS = 60_000;
+/**
+ * How long Daytona's `/config` (gateway endpoint and host keys) is trusted. Daytona can move
+ * its gateway or rotate its keys while Xum runs; a refetch that sees a change rewrites every
+ * sandbox's ssh setup on its next use.
+ */
+export const DAYTONA_GATEWAY_CONFIG_TTL_MS = 5 * 60_000;
 /** How long a delete waits for a sandbox Daytona is already destroying to go away. */
 export const DAYTONA_DESTROY_WAIT_MS = 60_000;
 
@@ -207,6 +213,20 @@ function toSummary(sandbox: DaytonaSandbox): DaytonaSandboxSummary {
   };
 }
 
+function toSshGateway(config: DaytonaGatewayConfig) {
+  return {
+    host: config.sshGatewayHost,
+    port: config.sshGatewayPort,
+    hostKeys: config.sshGatewayHostKeys,
+  };
+}
+
+/** What the ssh setup depends on; key order from Daytona is not significant. */
+function gatewayIdentity(config: DaytonaGatewayConfig): string {
+  const { host, port, hostKeys } = toSshGateway(config);
+  return JSON.stringify([host, port, [...hostKeys].sort()]);
+}
+
 /**
  * Daytona lifecycle and credential access shared by the runtime, the reconciler and the
  * `daytona` oRPC namespace. One instance per Xum backend: it owns the per-sandbox SSH token
@@ -218,7 +238,12 @@ export class DaytonaService {
   private readonly fetchImpl?: typeof fetch;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
-  private gatewayCache?: { apiUrl: string; config: DaytonaGatewayConfig };
+  private gatewayCache?: {
+    apiUrl: string;
+    generation: number;
+    fetchedAt: number;
+    config: DaytonaGatewayConfig;
+  };
   private readonly tokens = new Map<string, DaytonaSshAccess>();
   private readonly tokenRequests = new Map<string, Promise<DaytonaSshAccess>>();
   /** Bumped by every settings change, so a mint that spans one can tell. */
@@ -370,11 +395,39 @@ export class DaytonaService {
   }
 
   async getGatewayConfig(): Promise<DaytonaGatewayConfig> {
+    const generation = this.credentialsGeneration;
     const { client, credentials } = await this.getClient();
-    if (this.gatewayCache?.apiUrl === credentials.apiUrl) return this.gatewayCache.config;
+    const cached = this.cachedGateway(credentials.apiUrl, generation);
+    if (cached && this.now() - cached.fetchedAt < DAYTONA_GATEWAY_CONFIG_TTL_MS) {
+      return cached.config;
+    }
     const config = await client.getConfig();
-    this.gatewayCache = { apiUrl: credentials.apiUrl, config };
+    // Fetched across a settings change: never cache it for lookups under the new settings.
+    if (this.credentialsGeneration !== generation) return config;
+    if (cached && gatewayIdentity(cached.config) !== gatewayIdentity(config)) {
+      this.retireSshSetup();
+    }
+    this.gatewayCache = { apiUrl: credentials.apiUrl, generation, fetchedAt: this.now(), config };
     return config;
+  }
+
+  /** The cached `/config` of these settings, fresh or not. */
+  private cachedGateway(apiUrl: string, generation: number) {
+    const cached = this.gatewayCache;
+    return cached?.apiUrl === apiUrl && cached.generation === generation ? cached : undefined;
+  }
+
+  /**
+   * Daytona moved its gateway or rotated its host keys: every include block and the
+   * known_hosts pins are stale. Each sandbox's next ssh access mints a token, which rewrites
+   * its whole ssh setup and revokes the old token.
+   */
+  private retireSshSetup(): void {
+    this.sshConfigured.clear();
+    this.readyAt.clear();
+    for (const [sandboxId, access] of this.tokens) {
+      this.tokens.set(sandboxId, { ...access, expiresAt: new Date(0).toISOString() });
+    }
   }
 
   async testConnection(): Promise<DaytonaTestConnectionResult> {
@@ -632,15 +685,14 @@ export class DaytonaService {
    * the user; a refresh rewrites only the include file.
    */
   async ensureSshAccess(sandboxId: string): Promise<void> {
-    const gatewayConfig = await this.getGatewayConfig();
-    const gateway = {
-      host: gatewayConfig.sshGatewayHost,
-      port: gatewayConfig.sshGatewayPort,
-      hostKeys: gatewayConfig.sshGatewayHostKeys,
-    };
+    // Fails before a mint when the control plane cannot say where the gateway is.
+    await this.getGatewayConfig();
     // A cached token was written by the mint that produced it, so only a mint writes files.
     const access = await this.getSshToken(sandboxId, {
       onNewToken: async ({ token }) => {
+        // Looked up after the mint, so a settings change before it cannot pair this token with
+        // the old deployment's gateway; one after it makes the mint start over.
+        const gateway = toSshGateway(await this.getGatewayConfig());
         if (this.sshConfigured.has(sandboxId)) {
           await this.sshConfigWriter.updateToken({ sandboxId, token, gateway });
           return;
