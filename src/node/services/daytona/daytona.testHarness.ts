@@ -24,7 +24,7 @@ export interface FakeSandbox {
   memory: number;
   disk: number;
   labels: Record<string, string>;
-  /** GETs left before a transitional state settles (creating/starting -> started). */
+  /** GETs left before a transitional state settles (creating/starting -> started, destroying -> gone). */
   pendingPolls: number;
 }
 
@@ -135,6 +135,10 @@ export class FakeDaytonaControlPlane {
     if (!sandbox) return fail(404, "Sandbox not found");
 
     if (method === "GET" && !action) {
+      if (sandbox.state === "destroying" && sandbox.pendingPolls === 0) {
+        this.sandboxes.delete(sandbox.id);
+        return fail(404, "Sandbox not found");
+      }
       if (sandbox.pendingPolls > 0) {
         sandbox.pendingPolls -= 1;
       } else if (sandbox.state === "creating" || sandbox.state === "starting") {
@@ -209,7 +213,7 @@ export class FakeDaytonaControlPlane {
 /** Records ssh config writes instead of touching `~/.ssh/config`. */
 export class FakeDaytonaSshConfigWriter implements Pick<
   DaytonaSshConfigWriter,
-  "writeSandbox" | "updateToken" | "removeSandbox" | "verifyResolvedUser"
+  "writeSandbox" | "updateToken" | "removeSandbox" | "verifyResolvedUser" | "readTokens"
 > {
   /** Current token per sandbox alias, as the include file would hold it. */
   readonly tokens = new Map<string, string>();
@@ -232,6 +236,10 @@ export class FakeDaytonaSshConfigWriter implements Pick<
     this.removed.push(sandboxId);
     this.tokens.delete(sandboxId);
     return Promise.resolve();
+  }
+
+  readTokens(): Promise<Array<{ sandboxId: string; token: string }>> {
+    return Promise.resolve([...this.tokens].map(([sandboxId, token]) => ({ sandboxId, token })));
   }
 
   verifyResolvedUser(): Promise<void> {

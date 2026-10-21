@@ -15,7 +15,7 @@ import type {
 } from "@/node/config/daytonaCredentialsStore";
 import { loadOrCreateInstallationId } from "@/node/config/installationIdentity";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
-import { rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
+import { redactDaytonaTokens, rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
 import { getDaytonaSandboxId } from "@/common/types/runtime";
 import { log } from "@/node/services/log";
 import {
@@ -48,6 +48,10 @@ export const DAYTONA_START_TIMEOUT_MS = 180_000;
  * the cache lives here, keyed by sandbox, rather than on a runtime instance.
  */
 export const DAYTONA_READY_CACHE_MS = 60_000;
+/** How long a delete waits for a sandbox Daytona is already destroying to go away. */
+export const DAYTONA_DESTROY_WAIT_MS = 60_000;
+
+const DESTROYING_STATES = new Set(["destroying", "destroyed"]);
 
 type ObservedSandboxState = Exclude<DaytonaSandboxState, "missing">;
 
@@ -126,7 +130,7 @@ export interface DaytonaServiceOptions {
   /** Defaults to a writer for the real `~/.ssh/config`; tests pass one aimed at a temp dir. */
   sshConfigWriter?: Pick<
     DaytonaSshConfigWriter,
-    "writeSandbox" | "updateToken" | "removeSandbox" | "verifyResolvedUser"
+    "writeSandbox" | "updateToken" | "removeSandbox" | "verifyResolvedUser" | "readTokens"
   >;
   fetch?: typeof fetch;
   now?: () => number;
@@ -215,6 +219,13 @@ export class DaytonaService {
   /** Why the setup of a sandbox Xum created (and then deleted) failed, for later turns. */
   private readonly setupFailures = new Map<string, string>();
   private readonly listWorkspaces?: () => DaytonaWorkspaceRef[];
+  /** Per sandbox: the chain that serializes "is this its last workspace" decisions. */
+  private readonly removalLocks = new Map<string, Promise<unknown>>();
+  /**
+   * Per sandbox: workspaces whose removal passed its checks and deleted its checkout, but
+   * that the workspace list may still show until the removal is persisted.
+   */
+  private readonly removedWorkspaces = new Map<string, Set<string>>();
 
   constructor(options: DaytonaServiceOptions) {
     this.credentialsStore = options.credentialsStore;
@@ -225,6 +236,21 @@ export class DaytonaService {
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? defaultSleep;
     this.listWorkspaces = options.listWorkspaces;
+  }
+
+  /**
+   * Tokens an earlier Xum process wrote to the include file. ssh keeps sending them until Xum
+   * replaces them, so the redactor must know them; holding them also lets a replacement, a
+   * settings change or an archive revoke them. The file has no expiry, so they are due for
+   * refresh at once. Startup calls this before any ssh runs.
+   */
+  async loadPersistedTokens(): Promise<void> {
+    for (const { sandboxId, token } of await this.sshConfigWriter.readTokens()) {
+      rememberDaytonaToken(token);
+      if (!this.tokens.has(sandboxId)) {
+        this.tokens.set(sandboxId, { token, expiresAt: new Date(0).toISOString() });
+      }
+    }
   }
 
   getPublicConfig(): Promise<DaytonaPublicConfig> {
@@ -268,10 +294,41 @@ export class DaytonaService {
    */
   isSandboxReferencedElsewhere(sandboxId: string, workspaceId: string | undefined): boolean {
     if (!this.listWorkspaces || !workspaceId) return true;
+    const removed = this.removedWorkspaces.get(sandboxId);
     return this.listWorkspaces().some(
       (ref) =>
-        ref.workspaceId !== workspaceId && getDaytonaSandboxId(ref.runtimeConfig) === sandboxId
+        ref.workspaceId !== workspaceId &&
+        !removed?.has(ref.workspaceId) &&
+        getDaytonaSandboxId(ref.runtimeConfig) === sandboxId
     );
+  }
+
+  /** Run `fn` after every earlier removal decision for this sandbox has settled. */
+  withSandboxRemovalLock<T>(sandboxId: string, fn: () => Promise<T>): Promise<T> {
+    const run = (this.removalLocks.get(sandboxId) ?? Promise.resolve()).then(fn);
+    // The caller gets the rejection through `run`; the chain only needs to keep going.
+    const settled: Promise<void> = run
+      .then(
+        () => undefined,
+        (error: unknown) => {
+          log.debug("Daytona sandbox removal step failed", {
+            sandboxId,
+            error: getErrorMessage(error),
+          });
+        }
+      )
+      .then(() => {
+        if (this.removalLocks.get(sandboxId) === settled) this.removalLocks.delete(sandboxId);
+      });
+    this.removalLocks.set(sandboxId, settled);
+    return run;
+  }
+
+  /** The workspace no longer references the sandbox, even while the workspace list shows it. */
+  recordWorkspaceRemoval(sandboxId: string, workspaceId: string): void {
+    const removed = this.removedWorkspaces.get(sandboxId) ?? new Set<string>();
+    removed.add(workspaceId);
+    this.removedWorkspaces.set(sandboxId, removed);
   }
 
   recordSetupFailure(sandboxId: string, reason: string): void {
@@ -461,6 +518,26 @@ export class DaytonaService {
     await client.stopSandbox(sandboxId);
   }
 
+  /**
+   * Whether the sandbox is gone, waiting up to DAYTONA_DESTROY_WAIT_MS while Daytona destroys
+   * it (a failed setup deletes its sandbox while a removal of the workspace may already run).
+   * False for a sandbox in any other state, or one still being destroyed at the deadline.
+   */
+  async waitUntilDestroyed(sandboxId: string): Promise<boolean> {
+    const { client } = await this.getClient();
+    const deadline = this.now() + DAYTONA_DESTROY_WAIT_MS;
+    for (;;) {
+      const sandbox = await client.getSandbox(sandboxId).catch((error: unknown) => {
+        if (isDaytonaNotFound(error)) return undefined;
+        throw error;
+      });
+      if (!sandbox) return true;
+      const remaining = deadline - this.now();
+      if (!DESTROYING_STATES.has(sandbox.state ?? "") || remaining <= 0) return false;
+      await this.sleep(Math.min(DAYTONA_START_POLL_INTERVAL_MS, remaining));
+    }
+  }
+
   /** Stop and wait until Daytona reports the sandbox stopped (a resize of disk needs that). */
   async stopAndWait(sandboxId: string, deadline: number): Promise<void> {
     await this.stopSandbox(sandboxId);
@@ -578,6 +655,22 @@ export class DaytonaService {
     // reuses this token (already written) instead of minting another one.
     await this.sshConfigWriter.verifyResolvedUser(sandboxId, access.token);
     this.sshConfigured.add(sandboxId);
+  }
+
+  /**
+   * The gateway refused the sandbox's token (revoked outside Xum, or one an earlier process
+   * left): mint a new one and rewrite the include file. `failure` is the raw ssh error; when it
+   * names a token other than the cached one, a concurrent command already replaced it.
+   */
+  async replaceRejectedSshToken(sandboxId: string, failure: string): Promise<void> {
+    const cached = this.tokens.get(sandboxId);
+    if (cached && !failure.includes(cached.token) && redactDaytonaTokens(failure) !== failure) {
+      return;
+    }
+    this.readyAt.delete(sandboxId);
+    // Due at once, so the next ensureSshAccess mints, writes, and revokes the refused one.
+    if (cached) this.tokens.set(sandboxId, { ...cached, expiresAt: new Date(0).toISOString() });
+    await this.ensureSshAccess(sandboxId);
   }
 
   /** Whether this process holds a token for the sandbox that is close to expiry. */

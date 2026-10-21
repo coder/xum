@@ -415,6 +415,78 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     }
   });
 
+  describe("two workspaces on one sandbox removed at the same time", () => {
+    // Neither removal is persisted yet, so the workspace list shows both throughout.
+    function removeBoth() {
+      rig.plane.addSandbox({ id: "sb-pair" });
+      const source = { sandboxId: "sb-pair", shared: false, ...SMALL };
+      const fork = { ...source, forked: true };
+      rig.workspaces.push(
+        { workspaceId: "ws-1", runtimeConfig: sshDaytonaConfig(source) },
+        { workspaceId: "ws-fork", runtimeConfig: sshDaytonaConfig(fork) }
+      );
+      return Promise.all([
+        makeRuntime(source).deleteWorkspace("/home/me/project", "feature", false),
+        makeRuntime(fork, rig, { workspaceId: "ws-fork" }).deleteWorkspace(
+          "/home/me/project",
+          "feature-fork",
+          false
+        ),
+      ]);
+    }
+
+    it("deletes the sandbox exactly once", async () => {
+      const results = await removeBoth();
+
+      expect(results.map((result) => result.success)).toEqual([true, true]);
+      expect(rig.plane.countCalls("DELETE /sandbox/sb-pair")).toBe(1);
+      expect(rig.writer.removed).toContain("sb-pair");
+    });
+
+    it("keeps the sandbox when the other removal is refused for uncommitted work", async () => {
+      sshDeleteSpy.mockImplementation((_projectPath, workspaceName) =>
+        Promise.resolve(
+          workspaceName === "feature-fork"
+            ? { success: false, error: "uncommitted changes" }
+            : { success: true, deletedPath: "/path" }
+        )
+      );
+
+      const results = await removeBoth();
+
+      expect(results.map((result) => result.success)).toEqual([true, false]);
+      expect(rig.plane.countCalls("DELETE /sandbox/sb-pair")).toBe(0);
+      expect(rig.plane.find("sb-pair")).toBeDefined();
+    });
+  });
+
+  it("waits for a sandbox Daytona is already destroying instead of refusing the delete", async () => {
+    // A failed setup deletes the sandbox it created while the workspace's removal runs.
+    rig.plane.addSandbox({ id: "sb-going", state: "destroying", pendingPolls: 2 });
+
+    const result = await makeRuntime({ sandboxId: "sb-going", shared: false }).deleteWorkspace(
+      "/home/me/project",
+      "feature",
+      false
+    );
+
+    expect(result.success).toBe(true);
+    expect(rig.plane.find("sb-going")).toBeUndefined();
+  });
+
+  it("names the sandbox left behind when a forced delete cannot delete it", async () => {
+    rig.plane.addSandbox({ id: "sb-stuck" });
+    rig.plane.failingRoutes.add("DELETE /sandbox/sb-stuck");
+
+    const result = await makeRuntime({ sandboxId: "sb-stuck", shared: false }).deleteWorkspace(
+      "/home/me/project",
+      "feature",
+      true
+    );
+
+    expect(result).toMatchObject({ success: false, leftoverPaths: ['Daytona sandbox "sb-stuck"'] });
+  });
+
   it("never deletes an attached sandbox, even with its last workspace", async () => {
     rig.plane.addSandbox({ id: "sb-users" });
     rig.workspaces.push({
@@ -504,6 +576,30 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
     expect(String(error)).not.toContain(token);
     expect(String(error)).toContain(DAYTONA_TOKEN_PLACEHOLDER);
   });
+  it("keeps a token an earlier Xum process left in the include file out of errors", async () => {
+    // Never minted in this process: only the include file, read at startup, knows it.
+    const stale = "earlier-process-token-7f3a";
+    rig.plane.addSandbox({ id: "sb-old" });
+    rig.writer.tokens.set("sb-old", stale);
+    await rig.service.loadPersistedTokens();
+    const runtime = makeRuntime({ sandboxId: "sb-old" }, rig, {
+      transport: {
+        ...localShellTransport(rig.rootDir),
+        // What a skills listing or a workspace open hits right after a restart.
+        spawnRemoteProcess: () =>
+          Promise.reject(
+            new RuntimeError(`${stale}@127.0.0.1: Permission denied (publickey).`, "network")
+          ),
+      },
+    });
+
+    const error = await runtime.exec("true", { cwd: "/tmp", timeout: 10 }).then(
+      () => new Error("exec unexpectedly succeeded"),
+      (rejection: unknown) => rejection
+    );
+    expect(String(error)).not.toContain(stale);
+    expect(String(error)).toContain(`${DAYTONA_TOKEN_PLACEHOLDER}@127.0.0.1: Permission denied`);
+  });
 });
 
 describe("DaytonaSSHRuntime reconnect after a stop", () => {
@@ -532,5 +628,37 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
     expect(await new Response(stream.stdout).text()).toBe("ok\n");
     expect(await stream.exitCode).toBe(0);
     expect(rig.plane.countCalls("POST /sandbox/sb-nap/start")).toBe(1);
+  });
+
+  it("replaces a token the gateway refused and retries the command once", async () => {
+    rig.plane.addSandbox({ id: "sb-rev" });
+    await rig.service.ensureSshAccess("sb-rev");
+    const refused = rig.writer.tokens.get("sb-rev");
+    if (!refused) throw new Error("expected a minted token");
+    const local = localShellTransport(rig.rootDir);
+    let healthResets = 0;
+    const transport: SSHTransport = {
+      ...local,
+      resetConnectionHealth: () => {
+        healthResets++;
+      },
+      // Revoked outside Xum: the gateway refuses it until the include file holds another.
+      spawnRemoteProcess: (command, options) =>
+        rig.writer.tokens.get("sb-rev") === refused
+          ? Promise.reject(
+              new RuntimeError(`${refused}@127.0.0.1: Permission denied (publickey).`, "network")
+            )
+          : local.spawnRemoteProcess(command, options),
+    };
+    // Not a turn's runtime: a new token starts nothing, so any runtime replaces it.
+    const runtime = makeRuntime({ sandboxId: "sb-rev" }, rig, { transport });
+
+    const stream = await runtime.exec("echo ok", { cwd: "/tmp", timeout: 10 });
+    expect(await new Response(stream.stdout).text()).toBe("ok\n");
+    expect(await stream.exitCode).toBe(0);
+    expect(rig.writer.tokens.get("sb-rev")).not.toBe(refused);
+    expect(rig.plane.revokedTokens).toEqual([refused]);
+    expect(healthResets).toBe(1);
+    expect(rig.plane.countCalls("POST /sandbox/sb-rev/start")).toBe(0);
   });
 });

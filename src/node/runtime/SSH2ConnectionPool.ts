@@ -494,6 +494,11 @@ export class SSH2ConnectionPool {
     });
   }
 
+  /** The credentials changed (a replaced Daytona token): the next acquire connects at once. */
+  forgetHealth(config: SSHConnectionConfig): void {
+    this.health.delete(makeConnectionKey(config));
+  }
+
   /**
    * Clear all health state. Used in tests to reset between test cases
    * so backoff from one test doesn't affect subsequent tests.

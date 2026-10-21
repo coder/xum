@@ -62,6 +62,10 @@ export class OpenSSHTransport implements SSHTransport {
     return this.config;
   }
 
+  resetConnectionHealth(): void {
+    sshConnectionPool.forgetHealth(this.config);
+  }
+
   async acquireConnection(options?: SSHTransportAcquireOptions): Promise<void> {
     try {
       await sshConnectionPool.acquireConnection(this.config, {

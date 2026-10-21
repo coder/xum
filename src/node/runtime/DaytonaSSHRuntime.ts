@@ -26,7 +26,7 @@ import type {
   WorkspaceInitParams,
   WorkspaceInitResult,
 } from "./Runtime";
-import { isRuntimeTransportError } from "./Runtime";
+import { isPermanentSSHFailure, isRuntimeTransportError } from "./Runtime";
 import type { SpawnResult } from "./RemoteRuntime";
 import { SSHRuntime, type SSHRuntimeConfig } from "./SSHRuntime";
 import type { SSHTransport } from "./transports";
@@ -75,7 +75,11 @@ export type DaytonaRuntimeService = Pick<
   | "isSandboxReady"
   | "markSandboxReady"
   | "invalidateSandboxReady"
+  | "replaceRejectedSshToken"
   | "isSandboxReferencedElsewhere"
+  | "withSandboxRemovalLock"
+  | "waitUntilDestroyed"
+  | "recordWorkspaceRemoval"
   | "releaseSshAccess"
   | "recordSetupFailure"
   | "getSetupFailure"
@@ -154,7 +158,9 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Pro
   });
 }
 
-type DeleteResult = { success: true; deletedPath: string } | { success: false; error: string };
+type DeleteResult =
+  | { success: true; deletedPath: string }
+  | { success: false; error: string; leftoverPaths?: string[] };
 
 type StatusEmitter = (phase: RuntimeStatusEvent["phase"], detail?: string) => void;
 
@@ -164,6 +170,26 @@ type StatusEmitter = (phase: RuntimeStatusEvent["phase"], detail?: string) => vo
  * attached sandbox), or "delete" it (the last workspace on a sandbox Xum created).
  */
 type SandboxFate = "keep" | "release" | "delete";
+
+const HOST_KEY_FAILURE = /Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED/;
+
+function errorChainText(error: unknown): string {
+  const parts: string[] = [];
+  for (let current = error, depth = 0; current instanceof Error && depth < 4; depth++) {
+    parts.push(current.message);
+    current = current.cause;
+  }
+  return parts.join("\n");
+}
+
+/** The gateway refused the token (the ssh user name), e.g. one revoked outside Xum. */
+function isTokenRejected(error: unknown): boolean {
+  return (
+    isRuntimeTransportError(error) &&
+    isPermanentSSHFailure(error) &&
+    !HOST_KEY_FAILURE.test(errorChainText(error))
+  );
+}
 
 function redactingInitLogger(initLogger: InitLogger): InitLogger {
   return {
@@ -205,6 +231,8 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * sandbox that stopped under it; UI and background runtimes never start a billed sandbox.
    */
   private restartsStoppedSandbox = false;
+  /** SSHRuntime keeps its own reference private; a replaced token needs its backoff reset. */
+  private readonly sshTransport: SSHTransport;
 
   /** As Coder: the sandbox does not exist yet at create time, so skip host access. */
   readonly createFlags: RuntimeCreateFlags = {
@@ -231,6 +259,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       options
     );
     this.daytonaConfig = config.daytona;
+    this.sshTransport = transport;
     this.daytonaService = daytonaService;
     this.workspaceId = options?.workspaceId;
     this.agentHomeSeedSources = options?.agentHomeSeedSources;
@@ -303,8 +332,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
 
   /**
    * Every ssh command to the sandbox goes through here: its stderr and errors are redacted
-   * (the token is the ssh user name). A connection failure on a turn's runtime whose sandbox
-   * stopped within the ready cache starts the sandbox again and retries once.
+   * (the token is the ssh user name). A refused token is replaced, and a connection failure on
+   * a turn's runtime whose sandbox stopped within the ready cache starts the sandbox again;
+   * either way the command is retried once.
    */
   protected override async spawnRemoteProcess(
     fullCommand: string,
@@ -314,7 +344,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     try {
       result = await super.spawnRemoteProcess(fullCommand, options);
     } catch (error) {
-      if (!(await this.restartIfStopped(error, options.abortSignal))) {
+      if (!(await this.recoverForRetry(error, options.abortSignal))) {
         throw redactDaytonaError(error);
       }
       try {
@@ -338,16 +368,39 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     };
   }
 
-  /** True when the sandbox was found stopped (or starting) and is now started again. */
-  private async restartIfStopped(
-    error: unknown,
-    abortSignal: AbortSignal | undefined
-  ): Promise<boolean> {
+  /** True when the failure was fixed (a new token, or a restarted sandbox) and a retry may pass. */
+  private recoverForRetry(error: unknown, abortSignal: AbortSignal | undefined): Promise<boolean> {
     const sandboxId = this.daytonaConfig.sandboxId;
-    if (!sandboxId || !this.restartsStoppedSandbox || !isRuntimeTransportError(error)) {
+    if (!sandboxId || !isRuntimeTransportError(error) || abortSignal?.aborted) {
+      return Promise.resolve(false);
+    }
+    if (isTokenRejected(error)) return this.replaceRejectedToken(sandboxId, error);
+    return this.restartIfStopped(sandboxId, abortSignal);
+  }
+
+  private async replaceRejectedToken(sandboxId: string, error: unknown): Promise<boolean> {
+    log.info("The Daytona gateway refused the ssh token; replacing it and retrying once", {
+      sandboxId,
+    });
+    try {
+      await this.daytonaService.replaceRejectedSshToken(sandboxId, errorChainText(error));
+    } catch (replaceError) {
+      log.warn("Could not replace the refused Daytona ssh token", {
+        sandboxId,
+        error: getErrorMessage(redactDaytonaError(replaceError)),
+      });
       return false;
     }
-    if (abortSignal?.aborted) return false;
+    this.sshTransport.resetConnectionHealth?.();
+    return true;
+  }
+
+  /** True when the sandbox was found stopped (or starting) and is now started again. */
+  private async restartIfStopped(
+    sandboxId: string,
+    abortSignal: AbortSignal | undefined
+  ): Promise<boolean> {
+    if (!this.restartsStoppedSandbox) return false;
     this.daytonaService.invalidateSandboxReady(sandboxId);
     if (!(await this.isSandboxDown(sandboxId))) return false;
     return this.restartSandbox(sandboxId, abortSignal);
@@ -753,22 +806,43 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       return sshDelete();
     }
 
-    const fate = this.sandboxFateOnDelete(sandboxId);
     // Force ("cancel creation" or an explicit force delete): the sandbox may not be reachable
     // yet, so delete it without SSH. A kept sandbox only loses this workspace's checkout.
-    if (force && fate === "delete") {
-      return this.deleteOwnedSandbox(sandboxId, deletedPath, undefined);
-    }
+    const forced = force ? await this.forceDeleteLastReference(sandboxId, deletedPath) : undefined;
+    if (forced) return forced;
 
     const prepared = await this.startForDeleteChecks(sandboxId, abortSignal);
     if (prepared === "missing") {
-      return this.forgetMissingSandbox(sandboxId, deletedPath, fate);
+      log.debug("Daytona sandbox already gone, skipping SSH cleanup", { sandboxId });
+      // Still drop the token and include block of a sandbox no other workspace uses.
+      return this.settleSandbox(sandboxId, { success: true, deletedPath }, undefined);
     }
     // A forced delete still tries the SSH cleanup; a normal one never skips the checks.
     if (prepared !== "ready" && !force) {
       return { success: false, error: prepared.error };
     }
-    return this.deleteAfterChecks(sandboxId, await sshDelete(), fate);
+    // A failed check (dirty or unpushed work) keeps the workspace and its sandbox.
+    const sshResult = await sshDelete();
+    if (!sshResult.success) return sshResult;
+    return this.settleSandbox(sandboxId, sshResult, "SSH delete succeeded, but ");
+  }
+
+  /** The force path's sandbox delete, when this is the last workspace on a sandbox Xum created. */
+  private forceDeleteLastReference(
+    sandboxId: string,
+    deletedPath: string
+  ): Promise<DeleteResult | undefined> {
+    return this.daytonaService.withSandboxRemovalLock(sandboxId, async () => {
+      if (this.sandboxFateOnDelete(sandboxId) !== "delete") return undefined;
+      const result = await this.deleteOwnedSandbox(sandboxId, deletedPath, undefined);
+      // Forced: the workspace goes whether or not the sandbox delete worked.
+      this.recordRemoval(sandboxId);
+      return result;
+    });
+  }
+
+  private recordRemoval(sandboxId: string): void {
+    if (this.workspaceId) this.daytonaService.recordWorkspaceRemoval(sandboxId, this.workspaceId);
   }
 
   private sandboxFateOnDelete(sandboxId: string): SandboxFate {
@@ -821,29 +895,30 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     return super.checkWorkspaceDeletable(resolvedPath, force, trusted, abortSignal);
   }
 
-  private forgetMissingSandbox(
+  /**
+   * Decide the sandbox's fate and act on it, one removal of this sandbox at a time: two
+   * workspaces removed together (a workspace and its fork) would otherwise each see the other
+   * and both keep it. Only a removal that got here (its checks passed and its checkout is
+   * gone) is recorded, so a dirty, refused removal still holds the sandbox.
+   */
+  private settleSandbox(
     sandboxId: string,
-    deletedPath: string,
-    fate: SandboxFate
+    result: { success: true; deletedPath: string },
+    errorPrefix: string | undefined
   ): Promise<DeleteResult> {
-    log.debug("Daytona sandbox already gone, skipping SSH cleanup", { sandboxId });
-    // Still drop the token and include block of a sandbox no other workspace uses.
-    return this.settleSandbox(sandboxId, { success: true, deletedPath }, fate, undefined);
+    return this.daytonaService.withSandboxRemovalLock(sandboxId, async () => {
+      const settled = await this.applySandboxFate(
+        sandboxId,
+        result,
+        this.sandboxFateOnDelete(sandboxId),
+        errorPrefix
+      );
+      if (settled.success) this.recordRemoval(sandboxId);
+      return settled;
+    });
   }
 
-  /** A failed check (dirty or unpushed work) keeps the workspace and its sandbox. */
-  private deleteAfterChecks(
-    sandboxId: string,
-    sshResult: DeleteResult,
-    fate: SandboxFate
-  ): Promise<DeleteResult> {
-    if (!sshResult.success) {
-      return Promise.resolve(sshResult);
-    }
-    return this.settleSandbox(sandboxId, sshResult, fate, "SSH delete succeeded, but ");
-  }
-
-  private async settleSandbox(
+  private async applySandboxFate(
     sandboxId: string,
     result: { success: true; deletedPath: string },
     fate: SandboxFate,
@@ -876,11 +951,25 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       return "ready";
     } catch (error) {
       if (error instanceof DaytonaApiError && error.kind === "not_found") return "missing";
+      // A sandbox on its way out (a failed setup deleting it) has no work left to check.
+      if (await this.isBeingDestroyed(sandboxId)) return "missing";
       return {
         error:
           `Could not start Daytona sandbox "${sandboxId}" to check for uncommitted work: ` +
           `${getErrorMessage(error)}`,
       };
+    }
+  }
+
+  private async isBeingDestroyed(sandboxId: string): Promise<boolean> {
+    try {
+      return await this.daytonaService.waitUntilDestroyed(sandboxId);
+    } catch (error) {
+      log.warn("Could not read Daytona sandbox state before a delete", {
+        sandboxId,
+        error: getErrorMessage(error),
+      });
+      return false;
     }
   }
 
@@ -900,6 +989,8 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         error: errorPrefix
           ? `${errorPrefix}failed to delete Daytona sandbox: ${message}`
           : `Failed to delete Daytona sandbox: ${message}`,
+        // A forced removal goes on without it: remove shows this as a warning to act on.
+        leftoverPaths: [`Daytona sandbox "${sandboxId}"`],
       };
     }
   }

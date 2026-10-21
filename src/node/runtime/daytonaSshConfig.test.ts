@@ -89,6 +89,20 @@ describe("DaytonaSshConfigWriter", () => {
     expect(afterRemove).toContain("Host sb-2.xum--daytona");
   });
 
+  it("reads back the tokens the include file holds, for a later Xum process", async () => {
+    const later = new DaytonaSshConfigWriter({ xumHome, sshConfigPath });
+    expect(await later.readTokens()).toEqual([]);
+
+    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxId: "sb-2", token: "tokenB", gateway: GATEWAY });
+    await writer.updateToken({ sandboxId: "sb-1", token: "tokenA2", gateway: GATEWAY });
+
+    expect(await later.readTokens()).toEqual([
+      { sandboxId: "sb-1", token: "tokenA2" },
+      { sandboxId: "sb-2", token: "tokenB" },
+    ]);
+  });
+
   it("refuses control-plane values that would inject ssh directives", async () => {
     for (const input of [
       { sandboxId: "sb-1", token: "tok\n  ProxyCommand touch /tmp/pwned" },

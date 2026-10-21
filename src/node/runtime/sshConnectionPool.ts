@@ -452,6 +452,13 @@ export class SSHConnectionPool {
     }
   }
 
+  /** The credentials changed (a replaced Daytona token): drop the backoff, probe at once. */
+  forgetHealth(config: SSHConnectionConfig): void {
+    const key = makeConnectionKey(config);
+    this.health.delete(key);
+    this.clearReadyControlPaths(key);
+  }
+
   /**
    * Mark connection as healthy by key (internal use)
    */

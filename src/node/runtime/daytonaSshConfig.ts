@@ -254,6 +254,19 @@ export class DaytonaSshConfigWriter {
     });
   }
 
+  /** The sandbox ids and tokens the include file holds (written by this or an earlier process). */
+  async readTokens(): Promise<Array<{ sandboxId: string; token: string }>> {
+    const suffix = `.${XUM_DAYTONA_HOST_SUFFIX}`;
+    const tokens: Array<{ sandboxId: string; token: string }> = [];
+    for (const [alias, block] of await this.readBlocks()) {
+      const token = /^\s*User\s+(\S+)\s*$/m.exec(block)?.[1];
+      if (alias.endsWith(suffix) && token) {
+        tokens.push({ sandboxId: alias.slice(0, -suffix.length), token });
+      }
+    }
+    return tokens;
+  }
+
   private upsertBlock(input: {
     sandboxId: string;
     token: string;

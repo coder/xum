@@ -189,6 +189,7 @@ describe("DaytonaService", () => {
       writeSandbox: () => Promise.resolve(),
       updateToken: () => Promise.resolve(),
       removeSandbox: () => Promise.resolve(),
+      readTokens: () => Promise.resolve([]),
       verifyResolvedUser: () =>
         shadowed ? Promise.reject(new Error("ssh config shadows User")) : Promise.resolve(),
     };
@@ -208,6 +209,44 @@ describe("DaytonaService", () => {
     await withWriter.ensureSshAccess("sb-1");
     expect(plane.calls.filter((call) => call === "POST /sandbox/sb-1/ssh-access")).toHaveLength(1);
     expect(plane.revoked).toEqual([]);
+  });
+
+  it("revokes the tokens an earlier process left in the include file once it replaces them", async () => {
+    // The include file, shared by every Xum process (a restart is a new service).
+    const includeFile = new Map([["sb-1", "earlier-process-token"]]);
+    const store = (input: { sandboxId: string; token: string }) => {
+      includeFile.set(input.sandboxId, input.token);
+      return Promise.resolve();
+    };
+    const writer = {
+      writeSandbox: store,
+      updateToken: store,
+      removeSandbox: () => Promise.resolve(),
+      readTokens: () =>
+        Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
+      verifyResolvedUser: () => Promise.resolve(),
+    };
+    const startProcess = async () => {
+      const started = new DaytonaService({
+        credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
+        rootDir,
+        fetch: plane.fetch,
+        now: () => clock,
+        sshConfigWriter: writer,
+      });
+      await started.loadPersistedTokens();
+      return started;
+    };
+
+    // The file has no expiry, so the first ssh access replaces the loaded token.
+    await (await startProcess()).ensureSshAccess("sb-1");
+    const minted = includeFile.get("sb-1");
+    expect(minted).not.toBe("earlier-process-token");
+    expect(plane.revoked).toEqual(["earlier-process-token"]);
+
+    // After another restart, a settings change revokes what it loaded.
+    await (await startProcess()).setConfig({ target: "eu" });
+    expect(plane.revoked).toEqual(["earlier-process-token", minted ?? ""]);
   });
 
   it("reports test-connection failures as typed results", async () => {
