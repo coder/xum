@@ -512,6 +512,56 @@ jobs:
             exit 1
           fi
 
+  dry:
+    name: Quality / DRY
+    # Near-duplicate functions that the PR makes (scripts/dry/). Informational
+    # only: scripts/dry/ci.ts always exits 0, every step is soft, and Required
+    # does not list this job. It needs no test results, so it starts at once.
+    needs: [changes]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    continue-on-error: true
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          persist-credentials: false
+      # The merge commit's first parent, as in Quality / CRAP above.
+      - name: Fetch the merge base
+        id: base
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          sha=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)
+          git fetch --no-tags --depth=1 origin "$sha"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@b7a1c7ccf290d58743029c4f6903da283811b979 # v2.1.0
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          bun-version: 1.4.3
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          enable-cache: false
+      - name: DRY report
+        continue-on-error: true
+        timeout-minutes: 6
+        env:
+          BASE_REF: ${{ steps.base.outputs.sha }}
+        run: |
+          if ! command -v bun >/dev/null; then
+            echo "::warning title=DRY::bun setup failed, so no DRY report"
+            exit 0
+          fi
+          bun scripts/dry/ci.ts
+
   test-storybook:
     name: Test / Storybook
     needs: [changes]

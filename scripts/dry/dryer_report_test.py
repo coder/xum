@@ -1,0 +1,106 @@
+"""Tests of the rule that decides which duplicate pairs a diff made.
+
+Run through `make test-dry-scripts`, which supplies dryer, Crapper and pytest.
+Fingerprints here are small hand-made sets, so each score is easy to count.
+"""
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from dryer_report import Form, keyed, new_pairs  # noqa: E402
+
+SHAPE = frozenset("abcdefghij")  # 10 fingerprints
+NEAR = frozenset("abcdefghi") | {"z"}  # 9 shared of 11: score 0.818, below 0.82
+OTHER = frozenset("klmnopqrst")
+
+
+def form(path, name, start, fingerprints):
+    return Form(path, name, start, start + 5, fingerprints)
+
+
+def run(head, base, changed_paths, spans):
+    return new_pairs(keyed(head), keyed(base), set(changed_paths), spans, 0.82)
+
+
+def names(pairs):
+    return sorted(tuple(sorted((p["left"]["name"], p["right"]["name"]))) for p in pairs)
+
+
+def test_a_new_copy_of_old_code_is_reported():
+    old = form("src/a.ts", "cents", 1, SHAPE)
+    copy = form("src/b.ts", "fee", 1, SHAPE)
+    pairs = run([old, copy], [], ["src/b.ts"], {"src/b.ts": [[1, 6]]})
+    assert names(pairs) == [("cents", "fee")]
+    assert pairs[0]["left"]["name"] == "fee"  # the changed side comes first
+
+
+def test_an_edit_to_one_side_of_an_old_pair_is_quiet():
+    cents = form("src/a.ts", "cents", 1, SHAPE)
+    count = form("src/a.ts", "count", 10, SHAPE)
+    base_cents = form("src/a.ts", "cents", 1, SHAPE)
+    base_count = form("src/a.ts", "count", 10, SHAPE)
+    pairs = run([cents, count], [base_cents, base_count], ["src/a.ts"], {"src/a.ts": [[2, 2]]})
+    assert pairs == []
+
+
+def test_an_edit_that_makes_a_new_match_is_reported():
+    # At the base, `fee` had another shape. The edit turned it into a copy.
+    fee = form("src/b.ts", "fee", 1, SHAPE)
+    cents = form("src/a.ts", "cents", 1, SHAPE)
+    pairs = run([fee, cents], [form("src/b.ts", "fee", 1, OTHER)], ["src/b.ts"], {"src/b.ts": [[3, 3]]})
+    assert names(pairs) == [("cents", "fee")]
+
+
+def test_a_pair_below_the_threshold_is_quiet():
+    pairs = run(
+        [form("src/a.ts", "cents", 1, SHAPE), form("src/b.ts", "fee", 1, NEAR)],
+        [],
+        ["src/b.ts"],
+        {"src/b.ts": [[1, 6]]},
+    )
+    assert pairs == []
+
+
+def test_a_pair_with_two_changed_sides_is_reported_once():
+    one = form("src/a.ts", "one", 1, SHAPE)
+    two = form("src/a.ts", "two", 10, SHAPE)
+    pairs = run([one, two], [], ["src/a.ts"], {"src/a.ts": [[1, 20]]})
+    assert names(pairs) == [("one", "two")]
+
+
+def test_an_untouched_function_in_a_changed_file_does_not_start_a_pair():
+    # Only `edited` changed. `a` and `b` are an old pair in the same file.
+    a = form("src/a.ts", "a", 1, SHAPE)
+    b = form("src/a.ts", "b", 10, SHAPE)
+    edited = form("src/a.ts", "edited", 20, OTHER)
+    base = [form("src/a.ts", "a", 1, SHAPE), form("src/a.ts", "b", 10, SHAPE), form("src/a.ts", "edited", 20, OTHER)]
+    assert run([a, b, edited], base, ["src/a.ts"], {"src/a.ts": [[21, 21]]}) == []
+
+
+def test_the_script_names_functions_after_crapper(tmp_path):
+    # End to end through dryer and Crapper: two real TypeScript copies.
+    body = '  if (n === 0) return "0";\n  if (n < 100) return "1-99";\n  if (n < 1000) return "100-999";\n  return "1000+";\n}\n'
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.ts").write_text(f"export function cents(n: number): string {{\n{body}")
+    (src / "b.ts").write_text(f"export function fee(n: number): string {{\n{body}")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    base = tmp_path / "base"
+    base.mkdir()
+    changes = tmp_path / "changes.json"
+    changes.write_text(json.dumps({"files": [{"basePath": None, "headPath": "src/b.ts"}], "spans": {"src/b.ts": [[1, 6]]}}))
+    script = Path(__file__).resolve().parent / "dryer_report.py"
+    out = subprocess.run(
+        [sys.executable, str(script), "--root", str(tmp_path), "--base-root", str(base), "--changes", str(changes)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    report = json.loads(out)
+    assert report["changedFunctions"] == 1
+    assert [(p["left"]["name"], p["right"]["name"]) for p in report["pairs"]] == [("fee", "cents")]

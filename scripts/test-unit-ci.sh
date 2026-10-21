@@ -251,7 +251,8 @@ done
 # guard) and tooling tests under scripts/. check-startup-imports.test.ts and
 # check-test-seam-comments.test.ts are excluded because their static-check make
 # targets run them right before the guard itself; crap/check.test.ts and
-# crap/agentGate.test.ts need uv (make test-crap-scripts runs them); orpcConnection.integration.test.ts
+# crap/agentGate.test.ts need uv (make test-crap-scripts runs them), as does
+# dry/check.test.ts (make test-dry-scripts); orpcConnection.integration.test.ts
 # needs a live xum server (see scripts/check-test-routing.sh for every file run
 # outside this lane).
 #
@@ -271,6 +272,7 @@ done < <(
     ! -path ./scripts/check-test-seam-comments.test.ts \
     ! -path ./scripts/crap/check.test.ts \
     ! -path ./scripts/crap/agentGate.test.ts \
+    ! -path ./scripts/dry/check.test.ts \
     ! -path ./vscode/src/api/orpcConnection.integration.test.ts \
     "${find_excludes[@]}" | LC_ALL=C sort
 )
