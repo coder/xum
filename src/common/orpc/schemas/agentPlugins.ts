@@ -232,6 +232,56 @@ export const AgentPluginInstallPreviewSchema = z.object({
   consentDigest: z.string(),
 });
 
+/** One plugin entry of a Claude Code marketplace listing. */
+export const AgentPluginMarketplaceEntrySchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  /** The entry `source` kind; "relative" is a folder of the marketplace repository. */
+  sourceKind: z.enum([
+    "relative",
+    "github",
+    "git-subdir",
+    "url",
+    "npm",
+    "archive",
+    "command",
+    "unknown",
+  ]),
+  /** Display form of the source: a folder ("./" for the root) or a repository URL. */
+  source: z.string(),
+  /**
+   * Absent when the entry lists no `skills` paths. For an entry in the marketplace repository,
+   * the skills its preview accepts; for an entry in another repository, the number of paths.
+   */
+  skillCount: z.number().int().nonnegative().optional(),
+  installable: z.boolean(),
+  /** Why the entry cannot install (present exactly when `installable` is false). */
+  reason: z.string().optional(),
+});
+
+/** A repository whose only package is a Claude Code marketplace: the user picks one entry. */
+export const AgentPluginMarketplaceListingSchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  owner: z.string().optional(),
+  /** The marketplace repository, resolved like a plugin source. */
+  source: AgentPluginGitSourceSchema,
+  lockedSha: z.string(),
+  entries: z.array(AgentPluginMarketplaceEntrySchema),
+  /**
+   * Other methods that fit the repository root (Skills when it has SKILL.md files), so the user
+   * can install the whole repository instead of one entry.
+   */
+  methods: z.array(AgentPluginInstallMethodSchema),
+  warnings: z.array(z.string()),
+});
+
+/** What a preview found: a plugin to review, or a marketplace to pick an entry from. */
+export const AgentPluginSourcePreviewSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("plugin"), preview: AgentPluginInstallPreviewSchema }),
+  z.object({ kind: z.literal("marketplace"), marketplace: AgentPluginMarketplaceListingSchema }),
+]);
+
 export const AgentPluginListItemSchema = z.object({
   name: z.string(),
   /** True when a registry entry exists; unmanaged dirs found by discovery are read-only. */
@@ -354,6 +404,9 @@ export type AgentPluginHook = z.infer<typeof AgentPluginHookSchema>;
 export type AgentPluginHooks = z.infer<typeof AgentPluginHooksSchema>;
 export type AgentPluginManifestSummary = z.infer<typeof AgentPluginManifestSummarySchema>;
 export type AgentPluginInstallPreview = z.infer<typeof AgentPluginInstallPreviewSchema>;
+export type AgentPluginMarketplaceEntry = z.infer<typeof AgentPluginMarketplaceEntrySchema>;
+export type AgentPluginMarketplaceListing = z.infer<typeof AgentPluginMarketplaceListingSchema>;
+export type AgentPluginSourcePreview = z.infer<typeof AgentPluginSourcePreviewSchema>;
 export type AgentPluginListItem = z.infer<typeof AgentPluginListItemSchema>;
 export type AgentPluginPendingSignOuts = z.infer<typeof AgentPluginPendingSignOutsSchema>;
 export type AgentPluginUpdateCheck = z.infer<typeof AgentPluginUpdateCheckSchema>;
