@@ -38,6 +38,7 @@ const LONG_CONTEXT_RATE_CLASSES = [
   "cache_creation_input_token_cost",
   "cache_read_input_token_cost",
 ] as const;
+export type LongContextRateClass = (typeof LONG_CONTEXT_RATE_CLASSES)[number];
 
 /**
  * A long-context rate, which LiteLLM names after its threshold in thousands of prompt
@@ -110,7 +111,7 @@ export function hasUsableTokenLimits(data: RawModelData): boolean {
  */
 function extractModelStats(data: RawModelData): ModelStats {
   const thresholdK = findLongContextThresholdK(data);
-  const aboveThreshold = (rateClass: (typeof LONG_CONTEXT_RATE_CLASSES)[number]) =>
+  const aboveThreshold = (rateClass: LongContextRateClass) =>
     thresholdK === undefined
       ? undefined
       : parseOptionalNumber(data[`${rateClass}_above_${thresholdK}k_tokens`]);

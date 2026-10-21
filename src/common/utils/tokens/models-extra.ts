@@ -5,11 +5,8 @@
  * Retired entries stay: they price usage recorded before the model was retired.
  */
 
-type LongContextRateClass =
-  | "input_cost_per_token"
-  | "output_cost_per_token"
-  | "cache_creation_input_token_cost"
-  | "cache_read_input_token_cost";
+import type { LongContextRateClass } from "./modelStats";
+
 // Long-context rates use LiteLLM's names, which carry the provider's published threshold
 // in thousands of prompt tokens: `input_cost_per_token_above_272k_tokens`.
 type LongContextRates = Partial<Record<`${LongContextRateClass}_above_${number}k_tokens`, number>>;
