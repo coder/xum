@@ -83,7 +83,9 @@ describe("agent-home seeding", () => {
       const files = await collectAgentHomeSeedFiles({ xumHome: hostXum, home: hostHome }, "~/.mux");
 
       expect(files).toEqual([]);
-      expect(readFile.mock.calls.map(([file]) => String(file))).not.toContain(huge);
+      expect(
+        readFile.mock.calls.map(([file]) => (typeof file === "string" ? file : ""))
+      ).not.toContain(huge);
     } finally {
       readFile.mockRestore();
     }
