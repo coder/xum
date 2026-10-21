@@ -2490,25 +2490,28 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
     });
   });
 
-  // A refused layout write (here localStorage is full, with no caches to evict) changes nothing
-  // on screen, so a focus request would move focus to the tab the focused pane showed before.
-  test("a refused layout write sends no focus request", async () => {
+  // A refused layout write (localStorage full, or setItem throwing) changes nothing on screen, so
+  // a focus request would move focus to the tab the focused pane showed before. A request that
+  // the old layout already shows still gets focus.
+  test("a refused layout write sends a focus request only when the screen already shows it", async () => {
     await withTestWindow(async () => {
-      // Exactly full: an expanded chat with a terminal session to focus behind the Stats tab.
       const layoutKey = getRightSidebarLayoutKey("w1");
+      // Every layout write throws, like setItem when storage is blocked (SecurityError).
+      class LayoutRefusingStorage extends QuotaLimitedStorage {
+        override setItem(key: string, value: string): void {
+          if (key === layoutKey)
+            throw new DOMException("The operation is insecure.", "SecurityError");
+          super.setItem(key, value);
+        }
+      }
+      const storage = new LayoutRefusingStorage(Number.POSITIVE_INFINITY);
+      // A terminal session to focus, behind the Stats tab.
       const before = selectOrAddTab(
         getDefaultRightSidebarLayoutState("terminal:session-1"),
         "costs"
       );
-      const seeded: Array<[string, string]> = [
-        [layoutKey, JSON.stringify(before)],
-        [getRightSidebarCollapsedKey("w1"), JSON.stringify(false)],
-      ];
-      const full = new QuotaLimitedStorage(
-        seeded.reduce((used, [key, value]) => used + key.length + value.length, 0)
-      );
-      for (const [key, value] of seeded) full.seed(key, value);
-      Object.defineProperty(window, "localStorage", { configurable: true, value: full });
+      storage.seed(layoutKey, JSON.stringify(before));
+      Object.defineProperty(window, "localStorage", { configurable: true, value: storage });
 
       const requests: unknown[] = [];
       const record = (event: Event) => requests.push((event as CustomEvent).detail);
@@ -2517,13 +2520,20 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
       try {
         const actions = getActions();
         const find = (id: string) => actions.find((entry) => entry.id === id)!;
+        const addTool = (tool: string) =>
+          find(CommandIds.navRightSidebarAddTool()).prompt!.onSubmit({ tool });
         await find(CommandIds.navRightSidebarSplitVertical()).run();
-        await find(CommandIds.navRightSidebarAddTool()).prompt!.onSubmit({ tool: "review" });
+        await addTool("review");
         await find(CommandIds.navRightSidebarFocusTerminal()).run();
-        // Every write was refused: the layout is the one from before.
-        expect(full.setItemCalls).toContain(layoutKey);
+        // Nothing was stored, and none of these three would have shown its target.
         expect(readRightSidebarLayout("w1")).toEqual(before);
         expect(requests).toEqual([]);
+
+        // Stats is already the focused pane's tab: the request still gets focus there.
+        await addTool("costs");
+        expect(requests).toEqual([
+          { workspaceId: "w1", tabsetId: before.focusedTabsetId, tab: "costs" },
+        ]);
       } finally {
         consoleError.mockRestore();
         window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);

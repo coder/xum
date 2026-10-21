@@ -16,11 +16,19 @@ import {
   RIGHT_SIDEBAR_TAB_KEY,
 } from "@/common/constants/storage";
 
-/** Returns false when the layout write was refused (see updateRightSidebarLayout). */
-export function focusRightSidebarTab(workspaceId: string, tab: TabType): boolean {
+export function focusRightSidebarTab(workspaceId: string, tab: TabType): void {
   // Explicit navigation must reveal the requested tool even though chats start collapsed.
   updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
-  return updateRightSidebarLayout(workspaceId, (state) => selectOrAddTab(state, tab));
+  updateRightSidebarLayout(workspaceId, (state) => selectOrAddTab(state, tab));
+}
+
+/**
+ * The command palette's "Right Sidebar: Focus Terminal" (and Add Tool > Terminal): select the
+ * tab, then give it the keyboard.
+ */
+export function focusRightSidebarTabWithKeyboard(workspaceId: string, tab: TabType): void {
+  updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
+  updateLayoutThenFocus(workspaceId, (state) => selectOrAddTab(state, tab));
 }
 
 /**
@@ -32,9 +40,7 @@ export function splitRightSidebarPane(
   direction: "horizontal" | "vertical"
 ): void {
   updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
-  if (updateRightSidebarLayout(workspaceId, (state) => splitFocusedTabset(state, direction))) {
-    requestFocusedTabFocus(workspaceId);
-  }
+  updateLayoutThenFocus(workspaceId, (state) => splitFocusedTabset(state, direction));
 }
 
 /**
@@ -44,10 +50,9 @@ export function splitRightSidebarPane(
  */
 export function openRightSidebarTool(workspaceId: string, tool: TabType): void {
   updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
-  const stored = updateRightSidebarLayout(workspaceId, (state) =>
+  updateLayoutThenFocus(workspaceId, (state) =>
     openToolFromNewTab(state, state.focusedTabsetId, tool)
   );
-  if (stored) requestFocusedTabFocus(workspaceId);
 }
 
 /**
@@ -55,10 +60,8 @@ export function openRightSidebarTool(workspaceId: string, tool: TabType): void {
  * Ask the workspace's sidebar to focus the tab its focused pane now shows, as "Right Sidebar: New
  * Tab" focuses its launcher. Only focus travels by event: the layout is already stored, so a
  * sidebar that is not mounted (the shell's loading placeholder) still shows it once it mounts.
- * Callers skip it when the layout write was refused: nothing changed on screen, and focus would
- * jump to the tab that the focused pane showed before.
  */
-export function requestFocusedTabFocus(workspaceId: string): void {
+function requestFocusedTabFocus(workspaceId: string): void {
   const layout = readRightSidebarLayout(workspaceId);
   window.dispatchEvent(
     createCustomEvent(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, {
@@ -66,6 +69,28 @@ export function requestFocusedTabFocus(workspaceId: string): void {
       tabsetId: layout.focusedTabsetId,
       tab: getFocusedActiveTab(layout, NEW_TAB),
     })
+  );
+}
+
+/**
+ * Store the updated layout, then ask for focus on its focused tab. A refused write leaves the old
+ * layout on screen: then ask only when that already shows the requested tab (the request was a
+ * no-op), because otherwise focus would jump to the tab that the focused pane showed before.
+ */
+function updateLayoutThenFocus(
+  workspaceId: string,
+  updater: (state: RightSidebarLayoutState) => RightSidebarLayoutState
+): void {
+  const before = readRightSidebarLayout(workspaceId);
+  if (updateRightSidebarLayout(workspaceId, updater) || showsSameTab(before, updater(before))) {
+    requestFocusedTabFocus(workspaceId);
+  }
+}
+
+function showsSameTab(a: RightSidebarLayoutState, b: RightSidebarLayoutState): boolean {
+  return (
+    a.focusedTabsetId === b.focusedTabsetId &&
+    getFocusedActiveTab(a, NEW_TAB) === getFocusedActiveTab(b, NEW_TAB)
   );
 }
 

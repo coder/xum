@@ -199,10 +199,9 @@ import {
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import {
-  focusRightSidebarTab,
+  focusRightSidebarTabWithKeyboard,
   openRightSidebarTool,
   readRightSidebarLayout,
-  requestFocusedTabFocus,
   splitRightSidebarPane,
   updateRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
@@ -435,9 +434,8 @@ const findFirstTerminalSessionTab = (
 
 function focusExistingTerminalTab(workspaceId: string): void {
   const found = findFirstTerminalSessionTab(readRightSidebarLayout(workspaceId).root);
-  // "Focus Terminal" and Add Tool > Terminal: the terminal takes the keyboard, like other tools,
-  // unless the layout write was refused (see requestFocusedTabFocus).
-  if (found && focusRightSidebarTab(workspaceId, found.tab)) requestFocusedTabFocus(workspaceId);
+  // "Focus Terminal" and Add Tool > Terminal: the terminal takes the keyboard, like other tools.
+  if (found) focusRightSidebarTabWithKeyboard(workspaceId, found.tab);
 }
 
 /**

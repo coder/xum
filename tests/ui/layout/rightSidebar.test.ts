@@ -167,6 +167,9 @@ describeIntegration("RightSidebar (UI)", () => {
 
   async function setupRightSidebarView(beforeRender?: () => void) {
     const cleanupDom = installDom();
+    // Tutorial popovers take focus when their targets appear (the launcher's Terminal row, the
+    // immersive review button), so they made this file's focus checks flaky.
+    disableTutorial();
     // Most tests exercise open tools; individual tests can clear this to cover the default.
     updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
     beforeRender?.();
@@ -180,9 +183,17 @@ describeIntegration("RightSidebar (UI)", () => {
         "RightSidebar not found",
         10_000
       );
-      return { view, sidebar, cleanup: () => cleanupView(view, cleanupDom) };
+      return {
+        view,
+        sidebar,
+        cleanup: async () => {
+          await cleanupView(view, cleanupDom);
+          globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = undefined;
+        },
+      };
     } catch (error) {
       await cleanupView(view, cleanupDom);
+      globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = undefined;
       throw error;
     }
   }
@@ -1259,16 +1270,6 @@ describeIntegration("RightSidebar (UI)", () => {
   // The palette's split and Add Tool must not move focus into a sidebar that cannot be seen. In
   // a real browser focus() on a hidden element does nothing, but happy-dom moves focus anyway,
   // so these fail if the sidebar stops checking (usePaletteTabFocus's isSidebarShown).
-  // Tutorial popovers take focus when their targets appear (the launcher's Terminal row, the
-  // immersive review button), which would hide what these focus tests check.
-  const withoutTutorials = (beforeRender: () => void) => () => {
-    disableTutorial();
-    beforeRender();
-  };
-  const restoreTutorials = () => {
-    globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = undefined;
-  };
-
   // Boolean checks: a failed toBe() on two DOM elements makes this jest setup fail while it prints
   // them ("Cannot assign to read only property 'versions'"), which hides the real failure.
   const expectPaletteKeepsFocusOutOf = async (sidebar: HTMLElement, outside: HTMLElement) => {
@@ -1285,9 +1286,7 @@ describeIntegration("RightSidebar (UI)", () => {
   };
 
   test("the palette keeps focus out of the sidebar while the narrow layout hides it", async () => {
-    const { sidebar, cleanup } = await setupRightSidebarView(
-      withoutTutorials(() => seedLayout(["costs"]))
-    );
+    const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs"]));
     const outside = document.body.appendChild(document.createElement("button"));
     try {
       await findSidebarTab(sidebar, "costs");
@@ -1297,7 +1296,6 @@ describeIntegration("RightSidebar (UI)", () => {
       await expectPaletteKeepsFocusOutOf(sidebar, outside);
     } finally {
       outside.remove();
-      restoreTutorials();
       await cleanup();
     }
   }, 60_000);
@@ -1321,12 +1319,10 @@ describeIntegration("RightSidebar (UI)", () => {
       },
       focusedTabsetId: "tabset-stats",
     };
-    const { sidebar, cleanup } = await setupRightSidebarView(
-      withoutTutorials(() => {
-        updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
-        updatePersistedState(getReviewImmersiveKey(workspaceId), true);
-      })
-    );
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
+      updatePersistedState(getReviewImmersiveKey(workspaceId), true);
+    });
     const outside = document.body.appendChild(document.createElement("button"));
     try {
       await findSidebarTab(sidebar, "review");
@@ -1339,7 +1335,6 @@ describeIntegration("RightSidebar (UI)", () => {
       await expectPaletteKeepsFocusOutOf(sidebar, outside);
     } finally {
       outside.remove();
-      restoreTutorials();
       await cleanup();
     }
   }, 60_000);
@@ -1371,7 +1366,7 @@ describeIntegration("RightSidebar (UI)", () => {
         },
         focusedTabsetId: "tabset-a",
       };
-      const { sidebar, cleanup } = await setupRightSidebarView(withoutTutorials(() => undefined));
+      const { sidebar, cleanup } = await setupRightSidebarView();
       const outside = document.body.appendChild(document.createElement("button"));
       const panelOf = (tabsetId: string) =>
         sidebar.querySelector<HTMLElement>(`[id$="-${tabsetId}-panel-${tool}"]`);
@@ -1424,7 +1419,6 @@ describeIntegration("RightSidebar (UI)", () => {
         await expectFocusInFirstPane();
       } finally {
         outside.remove();
-        restoreTutorials();
         await cleanup();
         if (tool === "artifacts") {
           await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.ARTIFACTS, enabled: null });
