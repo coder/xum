@@ -41,6 +41,8 @@ const ctx: CommentContext = {
   sourceSha: "b".repeat(40),
   runId: "99",
   runAttempt: "2",
+  // The lane ran in attempt 1; only the comment job was rerun (attempt 2).
+  reportsArtifact: "stories-reports-1",
   model: "anthropic:claude-haiku-5-5",
 };
 
@@ -149,7 +151,8 @@ test("three full pages fit in one comment: passing jobs fold first, then the res
   expect(body.match(/^Spend: /gm)?.length).toBe(3);
   // Every fold the clip cut open is closed again.
   expect(body.match(/<details>/g)?.length).toBe(body.match(/<\/details>/g)?.length);
-  expect(body).toContain("`stories-reports-2`, folder `first-try`");
+  // The lane's own artifact, not one named after the comment job's attempt.
+  expect(body).toContain("`stories-reports-1`, folder `first-try`");
 });
 
 test("a test title with a mention and an issue number renders as code, not a link", () => {

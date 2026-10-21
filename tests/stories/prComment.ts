@@ -8,7 +8,7 @@
  * artifact `stories-reports-<attempt>` (the checkout's job outputs, and `first-try/` after the
  * lane's 5xx retry). `--dry-run` prints the body and calls nothing. Else it reads GITHUB_TOKEN,
  * GITHUB_API_URL, GITHUB_SERVER_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT,
- * PR_NUMBER and HEAD_SHA, and BUGBASH_MODEL for the titles.
+ * PR_NUMBER, HEAD_SHA, SOURCE_SHA and REPORTS_ARTIFACT, and BUGBASH_MODEL for the titles.
  *
  * The write token never meets PR code from the checkout: the job runs this file from the PR's
  * base commit, and the reports are data that the PR's tests wrote. The e2e renderer escapes their
@@ -43,6 +43,12 @@ export interface CommentContext {
   sourceSha: string;
   runId: string;
   runAttempt: string;
+  /**
+   * The artifact the reports came from: the lane job's upload (stories.yml reports_artifact).
+   * A rerun of only the comment job has a newer run_attempt than that upload (Codex review of
+   * #7140), so the retry note names this, not stories-reports-<runAttempt>.
+   */
+  reportsArtifact: string;
   model?: string;
 }
 
@@ -70,7 +76,7 @@ export function commentBody(root: string, ctx: CommentContext): string {
   const retried = fs.existsSync(path.join(root, "first-try"));
   const note = retried
     ? `\nRetried once: the first run got a provider 5xx. Its reports are in the artifact ` +
-      `\`stories-reports-${ctx.runAttempt}\`, folder \`first-try\`.\n`
+      `\`${ctx.reportsArtifact}\`, folder \`first-try\`.\n`
     : "";
   const head = `${MARKER}\n`;
   const body = `${head}${storyPage(sections, MAX_BODY_CHARS - head.length - note.length)}${note}`;
@@ -175,6 +181,7 @@ function contextFromEnv(env: NodeJS.ProcessEnv, dryRun: boolean): CommentContext
     sourceSha: need("SOURCE_SHA", local("HEAD")),
     runId: need("GITHUB_RUN_ID", local("0")),
     runAttempt: need("GITHUB_RUN_ATTEMPT", local("1")),
+    reportsArtifact: env.REPORTS_ARTIFACT || `stories-reports-${env.GITHUB_RUN_ATTEMPT ?? "1"}`,
     // Unset, or empty when the lane left no output: the titles then name no model.
     model: env.BUGBASH_MODEL === "" ? undefined : env.BUGBASH_MODEL,
   };

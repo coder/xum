@@ -912,6 +912,8 @@ jobs:
           # The merge commit the lane checked out and tested: the source links point there.
           SOURCE_SHA: ${{ github.sha }}
           BUGBASH_MODEL: ${{ needs.stories-pr.outputs.model }}
+          # The retry note names the artifact the lane uploaded (a comment-only rerun has a newer attempt).
+          REPORTS_ARTIFACT: ${{ needs.stories-pr.outputs.reports_artifact }}
         run: bun tests/stories/prComment.ts "$RUNNER_TEMP/stories-reports"
 
   build-linux:
