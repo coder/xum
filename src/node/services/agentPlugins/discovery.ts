@@ -260,7 +260,7 @@ export interface AgentPluginInfo {
    * Canonical skills roots in declared order (`skills/` by default, or `contributes.skills`).
    * Each one exists, is a directory, and stays inside the root (§6.2). Absent when none does.
    */
-  skillsDirs?: string[];
+  skillsDirs?: PluginSkillsRoot[];
   /** Canonical `mcp.json` path; present only when it exists, is a regular file, and stays inside the root (§6.2). */
   mcpConfigPath?: string;
   /** "codex": the MCP file is in the Codex `.mcp.json` dialect (see loadPluginMcpServers). */
@@ -276,6 +276,20 @@ export interface AgentPluginInfo {
    * scripts resolvable as `plugin://<name>/...`). Same §6.2 component rules as skills/. */
   workflowsDir?: string;
 }
+
+/**
+ * One resolved skills root of a plugin. Claude Code rule: a skills path that holds SKILL.md
+ * itself is ONE skill, so plugins that point `skills` at a single skill folder (or at the
+ * plugin root) load as they do in Claude Code. Every scan site branches on `single`.
+ */
+export type PluginSkillsRoot =
+  /** Holds `<name>/SKILL.md` skill folders. */
+  | { dir: string; single?: undefined }
+  /**
+   * Holds SKILL.md itself. `name` is the folder name as declared, or the plugin name when the
+   * path is the plugin root. It is not validated here: scan sites reject an invalid skill name.
+   */
+  | { dir: string; single: true; name: string };
 
 export interface AgentPluginDiagnostic {
   /** Path of the plugin directory (or offending component path) the diagnostic refers to. */
@@ -432,15 +446,33 @@ async function readManifestCandidate(
 }
 
 /** Resolve each declared skills root (default `skills/`), dropping missing, invalid and repeated ones. */
-async function resolveSkillsRoots(
-  declared: string | string[] | undefined,
-  resolveComponent: (relativePath: string, expectKind: "directory") => Promise<string | undefined>
-): Promise<string[]> {
-  const roots: string[] = [];
+async function resolveSkillsRoots(args: {
+  declared: string | string[] | undefined;
+  rootReal: string;
+  pluginName: string;
+  resolveComponent: (relativePath: string, expectKind: "directory") => Promise<string | undefined>;
+}): Promise<PluginSkillsRoot[]> {
+  const roots: PluginSkillsRoot[] = [];
+  const declared = args.declared;
   for (const relative of typeof declared === "string" ? [declared] : (declared ?? ["skills"])) {
-    const canonical = await resolveComponent(relative, "directory");
+    const canonical = await args.resolveComponent(relative, "directory");
     // Two spellings (or a symlink) can name one directory: scan it once.
-    if (canonical !== undefined && !roots.includes(canonical)) roots.push(canonical);
+    if (canonical === undefined || roots.some((root) => root.dir === canonical)) continue;
+    // lstat: a SKILL.md symlink still marks the folder as one skill, so the scan sites'
+    // containment checks refuse an escaping link instead of this folder being read as a
+    // container of skill folders.
+    const skillFile = await fsPromises.lstat(path.join(canonical, "SKILL.md")).catch(() => null);
+    if (skillFile?.isFile() !== true && skillFile?.isSymbolicLink() !== true) {
+      roots.push({ dir: canonical });
+      continue;
+    }
+    // The declared folder name, not the canonical one: a contained symlink keeps the name the
+    // author wrote. The plugin root has no folder name of its own, so it takes the plugin's.
+    const name =
+      canonical === args.rootReal
+        ? args.pluginName
+        : path.basename(path.join(args.rootReal, relative));
+    roots.push({ dir: canonical, single: true, name });
   }
   return roots;
 }
@@ -564,7 +596,12 @@ async function discoverPluginAt(args: {
       ...(options?.maxBytes !== undefined ? { maxBytes: options.maxBytes } : {}),
     });
 
-  const skillsDirs = await resolveSkillsRoots(contributes?.skills, resolveComponent);
+  const skillsDirs = await resolveSkillsRoots({
+    declared: contributes?.skills,
+    rootReal,
+    pluginName: validation.manifest.name,
+    resolveComponent,
+  });
   // Codex packages ship `.mcp.json`; it is the default only when `mcp.json` is
   // absent (an invalid `mcp.json` still reports its own diagnostic).
   const defaultMcpPath = (await fsPromises.lstat(path.join(rootReal, "mcp.json")).catch(() => null))

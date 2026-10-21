@@ -1547,6 +1547,59 @@ describe("agentSkillsService agent plugins", () => {
     ).toBe("from extra");
   });
 
+  test("a skills path that holds SKILL.md serves one skill; the first root still wins a name", async () => {
+    using tmp = new DisposableTempDir("plugin-single-skill");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "solo");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: "solo", skills: ["./lone", "./more", ".", "./leaky", "./linked"] })
+    );
+    await writeSkill(pluginDir, "lone", "single folder");
+    await writeSkill(path.join(pluginDir, "more"), "lone", "from more");
+    await writeSkill(path.join(pluginDir, "more"), "extra", "from more");
+    // The plugin root itself is a skill folder: it loads under the plugin name.
+    await writeSkill(container, "solo", "plugin root");
+    // Escapes: a SKILL.md that links outside, and a skill folder that links outside.
+    await writeSkill(tmp.path, "outside", "outside the plugin");
+    await fs.mkdir(path.join(pluginDir, "leaky"));
+    await fs.symlink(
+      path.join(tmp.path, "outside", "SKILL.md"),
+      path.join(pluginDir, "leaky", "SKILL.md")
+    );
+    await fs.symlink(path.join(tmp.path, "outside"), path.join(pluginDir, "linked"));
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+
+    const { skills, invalidSkills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+
+    const pluginSkills = skills.filter((skill) => skill.pluginName === "solo");
+    expect(pluginSkills.map((skill) => [skill.name, skill.description])).toEqual([
+      ["extra", "from more"],
+      ["lone", "single folder"],
+      ["solo", "plugin root"],
+    ]);
+    const pluginIssues = invalidSkills.filter((issue) => issue.scope === "global");
+    expect(pluginIssues.map((issue) => issue.directoryName)).toEqual(["leaky"]);
+    expect(pluginIssues[0].message).toContain("escapes the plugin root");
+
+    const read = async (name: string) =>
+      readAgentSkill(runtime, tmp.path, SkillNameSchema.parse(name), { roots });
+    expect((await read("lone")).package.frontmatter.description).toBe("single folder");
+    const root = await read("solo");
+    expect(root.skillDir).toBe(await fs.realpath(pluginDir));
+    expect(root.package.frontmatter.description).toBe("plugin root");
+    for (const name of ["leaky", "linked"]) {
+      await expect(read(name)).rejects.toThrow("not found");
+    }
+  });
+
   test("managed imports gate enumeration and direct reads without shadowing allowed same-name fallbacks", async () => {
     using tmp = new DisposableTempDir("plugin-selected-skills");
     const container = path.join(tmp.path, "plugins");

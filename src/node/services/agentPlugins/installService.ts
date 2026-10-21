@@ -81,6 +81,7 @@ import {
   type AgentPluginContainer,
   type AgentPluginDiagnostic,
   type AgentPluginInfo,
+  type PluginSkillsRoot,
 } from "./discovery";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
 import { listPluginAgentFiles, type PluginAgentFile } from "./agentFiles";
@@ -1178,8 +1179,16 @@ function displayNameWarnings(
 ): string[] {
   if (displayName === undefined) return [];
   return [
-    `${label}/${dirName}: SKILL.md name '${displayName}' is not the directory name; it loads as '${dirName}'`,
+    `${label}: SKILL.md name '${displayName}' is not the directory name; it loads as '${dirName}'`,
   ];
+}
+
+/** A preview warning's plugin-relative name for skill `name` of `skillsRoot`. */
+function skillReviewLabel(pluginRoot: string, skillsRoot: PluginSkillsRoot, name: string): string {
+  const relativeRoot = path.relative(pluginRoot, skillsRoot.dir);
+  // A single skill folder is the skill itself; at the plugin root it has no relative path.
+  if (skillsRoot.single) return relativeRoot === "" ? "." : relativeRoot;
+  return `${relativeRoot}/${name}`;
 }
 
 function shortenHome(absPath: string): string {
@@ -2911,13 +2920,13 @@ export class AgentPluginInstallService {
     warnings: string[]
   ): Promise<CollectedPluginSkill[]> {
     const skills: CollectedPluginSkill[] = [];
-    for (const skillsDir of plugin.skillsDirs ?? []) {
-      for (const skill of await this.collectSkills(plugin.rootPath, skillsDir, warnings)) {
+    for (const skillsRoot of plugin.skillsDirs ?? []) {
+      for (const skill of await this.collectSkills(plugin.rootPath, skillsRoot, warnings)) {
         // Runtime discovery keeps the first skill of a name (roots in declared order), so the
         // preview must not promise the later one (#6121).
         if (skills.some((earlier) => earlier.name === skill.name)) {
           warnings.push(
-            `${path.relative(plugin.rootPath, skillsDir)}/${skill.name}: an earlier skills root has a skill with this name; it will not load`
+            `${skillReviewLabel(plugin.rootPath, skillsRoot, skill.name)}: an earlier skills root has a skill with this name; it will not load`
           );
           continue;
         }
@@ -2930,25 +2939,31 @@ export class AgentPluginInstallService {
   /** One skills root of collectSkillsFromRoots. Warnings name the root by its plugin-relative path. */
   private async collectSkills(
     pluginRoot: string,
-    skillsDir: string,
+    skillsRoot: PluginSkillsRoot,
     warnings: string[]
   ): Promise<CollectedPluginSkill[]> {
-    const label = path.relative(pluginRoot, skillsDir);
     const skills: CollectedPluginSkill[] = [];
     let entries: string[] = [];
-    try {
-      // Include symlinked skill dirs, matching runtime discovery
-      // (listSkillDirectoriesFromLocalFs): a symlinked skill activates after
-      // install, so it MUST appear in the consent preview.
-      entries = (await fsPromises.readdir(skillsDir, { withFileTypes: true }))
-        .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-        .map((entry) => entry.name)
-        .sort((a, b) => a.localeCompare(b));
-    } catch {
-      return [];
+    if (skillsRoot.single) {
+      // The root is one skill folder; runtime discovery loads it under this name.
+      entries = [skillsRoot.name];
+    } else {
+      try {
+        // Include symlinked skill dirs, matching runtime discovery
+        // (listSkillDirectoriesFromLocalFs): a symlinked skill activates after
+        // install, so it MUST appear in the consent preview.
+        entries = (await fsPromises.readdir(skillsRoot.dir, { withFileTypes: true }))
+          .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+          .map((entry) => entry.name)
+          .sort((a, b) => a.localeCompare(b));
+      } catch {
+        return [];
+      }
     }
     for (const dirName of entries) {
-      const skillPath = path.join(skillsDir, dirName, "SKILL.md");
+      const label = skillReviewLabel(pluginRoot, skillsRoot, dirName);
+      const skillDir = skillsRoot.single ? skillsRoot.dir : path.join(skillsRoot.dir, dirName);
+      const skillPath = path.join(skillDir, "SKILL.md");
       // Spec §4.1 containment anchored at the plugin root, mirroring runtime
       // component checks: a symlink escaping the plugin is surfaced as a
       // warning instead of silently ignored.
@@ -2963,7 +2978,7 @@ export class AgentPluginInstallService {
       } catch (error) {
         if (!hasErrorCode(error, "ENOENT")) {
           warnings.push(
-            `${label}/${dirName}: ${error instanceof PluginGitPathError ? "resolves into the plugin's .git directory" : "resolves outside the plugin root"}; it will not load`
+            `${label}: ${error instanceof PluginGitPathError ? "resolves into the plugin's .git directory" : "resolves outside the plugin root"}; it will not load`
           );
         }
         // ENOENT (unresolvable path) → not a skill dir; skip silently.
@@ -2984,7 +2999,7 @@ export class AgentPluginInstallService {
       // never-loading skill as a capability addition.
       const dirNameParsed = SkillNameSchema.safeParse(dirName);
       if (!dirNameParsed.success) {
-        warnings.push(`${label}/${dirName}: invalid skill directory name; it will not load`);
+        warnings.push(`${label}: invalid skill directory name; it will not load`);
         continue;
       }
       // Size-check BEFORE reading (mirroring runtime discovery): the parse
@@ -2992,7 +3007,7 @@ export class AgentPluginInstallService {
       // identical guard in collectAgentFiles.
       if (stat.size > MAX_FILE_SIZE) {
         warnings.push(
-          `${label}/${dirName}: SKILL.md is too large (${stat.size} bytes; max ${MAX_FILE_SIZE}); it will not load`
+          `${label}: SKILL.md is too large (${stat.size} bytes; max ${MAX_FILE_SIZE}); it will not load`
         );
         continue;
       }
@@ -3006,7 +3021,7 @@ export class AgentPluginInstallService {
           allowDisplayName: true,
         });
         warnings.push(...displayNameWarnings(label, dirName, parsed.displayName));
-        const relativeDir = path.relative(pluginRoot, path.join(skillsDir, dirName));
+        const relativeDir = path.relative(pluginRoot, skillDir);
         skills.push({
           name: parsed.frontmatter.name,
           ...skillConsentFields({
@@ -3031,7 +3046,7 @@ export class AgentPluginInstallService {
           paths: resolveSkillPaths(parsed.frontmatter),
         });
       } catch (error) {
-        warnings.push(`${label}/${dirName}: ${getErrorMessage(error)}`);
+        warnings.push(`${label}: ${getErrorMessage(error)}`);
       }
     }
     return skills;

@@ -2,6 +2,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 import { SkillNameSchema } from "@/common/orpc/schemas";
+import type { PluginSkillsRoot } from "./discovery";
 
 /**
  * Top-level `*.js` entries of a plugin workflows/ dir, files and symlinks, sorted. The one lister
@@ -41,7 +42,10 @@ export const SKILL_WORKFLOW_ENTRY = "workflow.js";
  */
 export function pluginSkillScriptKey(pluginRoot: string, scriptPath: string): string {
   // Only the platform separator becomes `/`: on POSIX a backslash is a literal name character.
-  return path.relative(pluginRoot, scriptPath).split(path.sep).join("/");
+  const key = path.relative(pluginRoot, scriptPath).split(path.sep).join("/");
+  // A single skill at the plugin root (PluginSkillsRoot `single`) puts its script directly in
+  // the root. `./` keeps that key out of the bare-name space of top-level workflows.
+  return key.includes("/") ? key : `./${key}`;
 }
 
 /**
@@ -52,15 +56,21 @@ export function pluginSkillScriptKey(pluginRoot: string, scriptPath: string): st
  */
 export async function listPluginSkillScripts(plugin: {
   rootPath: string;
-  skillsDirs?: string[];
+  skillsDirs?: PluginSkillsRoot[];
 }): Promise<Array<{ file: string; filePath: string }>> {
   const scripts: Array<{ file: string; filePath: string }> = [];
-  for (const skillsDir of plugin.skillsDirs ?? []) {
-    for (const dirName of await listSubdirectories(skillsDir)) {
+  for (const skillsRoot of plugin.skillsDirs ?? []) {
+    const skillFolders = skillsRoot.single
+      ? [{ name: skillsRoot.name, dir: skillsRoot.dir }]
+      : (await listSubdirectories(skillsRoot.dir)).map((name) => ({
+          name,
+          dir: path.join(skillsRoot.dir, name),
+        }));
+    for (const { name, dir } of skillFolders) {
       // Only a folder the runtime loads as a skill: a valid skill name with a SKILL.md.
-      if (!SkillNameSchema.safeParse(dirName).success) continue;
-      if (!(await isFileOrLink(path.join(skillsDir, dirName, "SKILL.md")))) continue;
-      const filePath = path.join(skillsDir, dirName, SKILL_WORKFLOW_ENTRY);
+      if (!SkillNameSchema.safeParse(name).success) continue;
+      if (!(await isFileOrLink(path.join(dir, "SKILL.md")))) continue;
+      const filePath = path.join(dir, SKILL_WORKFLOW_ENTRY);
       if (!(await isFileOrLink(filePath))) continue;
       scripts.push({ file: pluginSkillScriptKey(plugin.rootPath, filePath), filePath });
     }

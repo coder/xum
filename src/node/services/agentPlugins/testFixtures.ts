@@ -75,13 +75,15 @@ export async function reviewedComponentConsent(args: {
     agents: {},
     slashCommands: {},
   };
-  for (const skillsDir of plugin.skillsDirs ?? []) {
-    for (const dirName of await fs.readdir(skillsDir)) {
+  for (const skillsRoot of plugin.skillsDirs ?? []) {
+    const dirNames = skillsRoot.single ? [skillsRoot.name] : await fs.readdir(skillsRoot.dir);
+    for (const dirName of dirNames) {
       const directoryName = SkillNameSchema.safeParse(dirName);
       if (!directoryName.success) continue;
+      const skillDir = skillsRoot.single ? skillsRoot.dir : path.join(skillsRoot.dir, dirName);
       let content: string;
       try {
-        content = await fs.readFile(path.join(skillsDir, dirName, "SKILL.md"), "utf8");
+        content = await fs.readFile(path.join(skillDir, "SKILL.md"), "utf8");
       } catch {
         continue;
       }
@@ -94,7 +96,7 @@ export async function reviewedComponentConsent(args: {
       });
       // The scan keeps the first skill of a name, in declared root order.
       consent.skills[parsed.frontmatter.name] ??= skillConsentFingerprint({
-        relativeDir: path.relative(plugin.rootPath, path.join(skillsDir, dirName)),
+        relativeDir: path.relative(plugin.rootPath, skillDir),
         frontmatter: skillConsentFrontmatter(parsed),
         body: parsed.body,
       });

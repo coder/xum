@@ -379,6 +379,56 @@ describe("agent_skill_list", () => {
     });
   });
 
+  it("lists a plugin skills path that holds SKILL.md as one skill", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-single-home");
+    using project = new TestTempDir("test-agent-skill-list-single-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-single-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        const pluginDir = path.join(xumHomeDir.path, "plugins", "solo");
+        await fs.mkdir(pluginDir, { recursive: true });
+        await fs.writeFile(
+          path.join(pluginDir, "plugin.json"),
+          JSON.stringify({
+            $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+            name: "solo",
+            contributes: { skills: ["lone", ".", "leaky"] },
+          })
+        );
+        await writeSkill(pluginDir, "lone", { description: "single folder" });
+        // The plugin root is a skill folder too: it lists under the plugin name.
+        await writeSkill(path.dirname(pluginDir), "solo", { description: "plugin root" });
+        // A single skill folder whose SKILL.md links outside the plugin is refused.
+        await writeSkill(homeDir.path, "leaky", { description: "outside" });
+        await fs.mkdir(path.join(pluginDir, "leaky"));
+        await fs.symlink(
+          path.join(homeDir.path, "leaky", "SKILL.md"),
+          path.join(pluginDir, "leaky", "SKILL.md")
+        );
+
+        const tool = createAgentSkillListTool(
+          createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          })
+        );
+        const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(result.skills.map((skill) => [skill.name, skill.description])).toEqual([
+          ["lone", "single folder"],
+          ["solo", "plugin root"],
+        ]);
+      });
+    });
+  });
+
   it("lists only imported plugin skills and refreshes additions without hiding fallback sources", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-imports-home");
     using project = new TestTempDir("test-agent-skill-list-imports-project");

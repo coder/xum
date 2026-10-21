@@ -121,7 +121,7 @@ async function readContainedSkillFile(
 }
 
 async function readSkillDescriptor(
-  skillsRoot: string,
+  skillDir: string,
   directoryNameRaw: string,
   scope: "global" | "project",
   containmentRoot: string,
@@ -129,14 +129,11 @@ async function readSkillDescriptor(
 ): Promise<AgentSkillDescriptor | null> {
   const parsedDirectoryName = SkillNameSchema.safeParse(directoryNameRaw);
   if (!parsedDirectoryName.success) {
-    log.warn(
-      `Skipping invalid ${scope} skill directory name '${directoryNameRaw}' in ${skillsRoot}`
-    );
+    log.warn(`Skipping invalid ${scope} skill directory name '${directoryNameRaw}' at ${skillDir}`);
     return null;
   }
 
   const directoryName = parsedDirectoryName.data;
-  const skillDir = path.join(skillsRoot, directoryName);
   const file = await readContainedSkillFile(skillDir, directoryName, scope, containmentRoot);
   if (file === null) return null;
 
@@ -263,6 +260,8 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           scope: "global" | "project";
           importedSkills?: readonly string[];
           skillConsent?: PluginSkillConsentGate;
+          /** Plugin roots only: the root is this one skill (PluginSkillsRoot `single`). */
+          singleSkillName?: string;
         }> = [
           {
             skillsRoot: path.join(xumScope.xumHome, "skills"),
@@ -348,18 +347,26 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           const skillConsent = pluginSkillConsentGate(plugin);
           roots.push(
             ...plugin.skillsDirs.map((skillsRoot) => ({
-              skillsRoot,
+              skillsRoot: skillsRoot.dir,
               containmentRoot: plugin.rootPath,
               scope: plugin.scope,
               importedSkills,
               skillConsent,
+              ...(skillsRoot.single ? { singleSkillName: skillsRoot.name } : {}),
             }))
           );
         }
 
         const skills: AgentSkillDescriptor[] = [];
         const seenByScope = new Set<string>();
-        for (const { skillsRoot, containmentRoot, scope, importedSkills, skillConsent } of roots) {
+        for (const {
+          skillsRoot,
+          containmentRoot,
+          scope,
+          importedSkills,
+          skillConsent,
+          singleSkillName,
+        } of roots) {
           let skillsRootReal: string;
           try {
             skillsRootReal = await fsPromises.realpath(skillsRoot);
@@ -379,7 +386,10 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             continue;
           }
 
-          const directoryNames = await listSkillDirectories(skillsRootReal);
+          const directoryNames =
+            singleSkillName != null
+              ? [singleSkillName]
+              : await listSkillDirectories(skillsRootReal);
           for (const directoryName of directoryNames) {
             // Skipped plugin skills must not claim a same-named fallback in this manual scan.
             if (importedSkills != null && !importedSkills.includes(directoryName)) continue;
@@ -388,7 +398,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             // entries resolving outside the containment root. This matches the
             // posture of stream discovery and plugin roots.
             const descriptor = await readSkillDescriptor(
-              skillsRootReal,
+              singleSkillName != null ? skillsRootReal : path.join(skillsRootReal, directoryName),
               directoryName,
               scope,
               containmentRoot,

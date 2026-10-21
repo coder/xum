@@ -246,6 +246,11 @@ interface AgentSkillScanCandidate {
   pluginRoot?: string;
   /** Agent Plugins only: contributing plugin name for descriptor attribution. */
   pluginName?: string;
+  /**
+   * Agent Plugins only: `root` holds SKILL.md itself and is this one skill
+   * (PluginSkillsRoot `single`), instead of a folder of skill folders.
+   */
+  singleSkillName?: string;
   importedSkills?: string[];
   /** Managed plugins only: the reviewed skill fingerprints (#6498). */
   skillConsent?: PluginSkillConsentGate;
@@ -317,10 +322,11 @@ async function buildPluginScanCandidates(args: {
     candidates.push(
       ...plugin.skillsDirs.map((root) => ({
         scope: args.scope,
-        root,
+        root: root.dir,
         runtime: localRuntime,
         pluginRoot: plugin.rootPath,
         pluginName: plugin.name,
+        ...(root.single ? { singleSkillName: root.name } : {}),
         importedSkills,
         skillConsent,
         pluginConsent: plugin.componentConsent,
@@ -561,6 +567,17 @@ class ShadowedPluginSkills {
       ),
     };
   }
+}
+
+/** The folder of skill `name` in a scan root: the root itself when it is a single skill. */
+function candidateSkillDir(
+  candidate: Pick<AgentSkillScanCandidate, "runtime" | "singleSkillName">,
+  resolvedRoot: string,
+  name: SkillName
+): string {
+  return candidate.singleSkillName != null
+    ? resolvedRoot
+    : candidate.runtime.normalizePath(name, resolvedRoot);
 }
 
 async function listSkillDirectoriesFromLocalFs(root: string): Promise<string[]> {
@@ -872,9 +889,13 @@ export async function discoverAgentSkills(
   const scanRoot = async (scan: AgentSkillScanCandidate): Promise<void> => {
     const resolvedRoot = await scan.runtime.resolvePath(scan.root);
     const directoryNames =
-      scan.runtime instanceof RemoteRuntime
-        ? await listSkillDirectoriesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
-        : await listSkillDirectoriesFromLocalFs(resolvedRoot);
+      scan.singleSkillName != null
+        ? [scan.singleSkillName]
+        : scan.runtime instanceof RemoteRuntime
+          ? await listSkillDirectoriesFromRuntime(scan.runtime, resolvedRoot, {
+              cwd: workspacePath,
+            })
+          : await listSkillDirectoriesFromLocalFs(resolvedRoot);
 
     for (const directoryNameRaw of directoryNames) {
       const nameParsed = SkillNameSchema.safeParse(directoryNameRaw);
@@ -901,7 +922,7 @@ export async function discoverAgentSkills(
       const diagnostics: { invalidSkills: AgentSkillIssue[]; skillWarnings: AgentSkillIssue[] } =
         shadowed ? { invalidSkills: [], skillWarnings: [] } : { invalidSkills, skillWarnings };
 
-      const skillDir = scan.runtime.normalizePath(directoryName, resolvedRoot);
+      const skillDir = candidateSkillDir(scan, resolvedRoot, directoryName);
       const skillFilePath = scan.runtime.normalizePath("SKILL.md", skillDir);
       const pushInvalidSkill = (message: string, hint: string): void => {
         diagnostics.invalidSkills.push({
@@ -1168,7 +1189,9 @@ async function readCandidateSkill(
     return null;
   }
 
-  const skillDir = candidate.runtime.normalizePath(name, resolvedRoot);
+  // A single-skill root serves only its own name.
+  if (candidate.singleSkillName != null && candidate.singleSkillName !== name) return null;
+  const skillDir = candidateSkillDir(candidate, resolvedRoot, name);
   const skillFilePath = candidate.runtime.normalizePath("SKILL.md", skillDir);
 
   const contained = await isCandidateSkillContained({

@@ -2575,6 +2575,105 @@ describe("AgentPluginInstallService", () => {
     );
   });
 
+  test("consent preview and install treat a skills path that holds SKILL.md as one skill", async () => {
+    await fsPromises.rm(path.join(remoteDir, "plugin.json"));
+    await fsPromises.mkdir(path.join(remoteDir, ".codex-plugin"));
+    await fsPromises.writeFile(
+      path.join(remoteDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: "demo-plugin", skills: ["./solo", ".", "./skills/", "./leaky"] })
+    );
+    const writeSkillFile = async (dir: string, name: string, description: string) => {
+      await fsPromises.mkdir(path.join(remoteDir, dir), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(remoteDir, dir, "SKILL.md"),
+        `---\nname: ${name}\ndescription: ${description}\n---\n\nBody.\n`
+      );
+    };
+    await writeSkillFile("solo", "solo", "One folder");
+    // The plugin root is a skill folder too: it loads under the plugin name.
+    await writeSkillFile(".", "demo-plugin", "Plugin root");
+    // ./solo comes first, so this one never loads and is not offered.
+    await writeSkillFile(path.join("skills", "solo"), "solo", "Shadowed");
+    await fsPromises.mkdir(path.join(remoteDir, "leaky"));
+    await fsPromises.symlink("/etc/hostname", path.join(remoteDir, "leaky", "SKILL.md"));
+    await commitAll(remoteDir, "single skill folders");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.skills).toEqual([
+      { name: "solo", description: "One folder" },
+      { name: "demo-plugin", description: "Plugin root" },
+      { name: "greet", description: "Greets people" },
+    ]);
+    expect(preview.warnings.filter((warning) => warning.startsWith("skills/solo:"))).toHaveLength(
+      1
+    );
+    expect(
+      preview.warnings.some((warning) => warning.startsWith("leaky: resolves outside the plugin"))
+    ).toBe(true);
+
+    // The install records consent for what the preview showed, so each one loads (#6498).
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const { skills } = await discoverAgentSkills(new LocalRuntime(muxRoot), muxRoot, {
+      roots: {
+        projectRoot: "",
+        globalRoot: path.join(muxRoot, "skills"),
+        universalRoot: "",
+        globalPluginRoots: [pluginsDir()],
+      },
+    });
+    expect(
+      skills
+        .filter((skill) => skill.pluginName === "demo-plugin")
+        .map((skill) => [skill.name, skill.description])
+    ).toEqual([
+      ["demo-plugin", "Plugin root"],
+      ["greet", "Greets people"],
+      ["solo", "One folder"],
+    ]);
+  });
+
+  test("a plugin-root skill's workflow script and a same-named top-level workflow are reviewed apart", async () => {
+    // A Codex package has no workflows component, so this one uses the Agent Plugins manifest.
+    await fsPromises.writeFile(
+      path.join(remoteDir, "plugin.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "demo-plugin",
+        contributes: { skills: "." },
+      })
+    );
+    await fsPromises.writeFile(
+      path.join(remoteDir, "SKILL.md"),
+      "---\nname: demo-plugin\ndescription: Plugin root\n---\n\nBody.\n"
+    );
+    await fsPromises.writeFile(path.join(remoteDir, "workflow.js"), "'root skill';\n");
+    await fsPromises.mkdir(path.join(remoteDir, "workflows"));
+    await fsPromises.writeFile(path.join(remoteDir, "workflows", "workflow.js"), "'top level';\n");
+    await commitAll(remoteDir, "root skill workflow");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.reviewedComponents.map((row) => row.name).sort()).toEqual([
+      "./workflow.js",
+      "workflow.js",
+    ]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const resolve = (scriptPath: string) =>
+      resolveWorkflowScript({
+        scriptPath,
+        runtime: new LocalRuntime(muxRoot),
+        workspacePath: muxRoot,
+        projectTrusted: false,
+        roots: {
+          projectRoot: "",
+          globalRoot: path.join(muxRoot, "skills"),
+          universalRoot: "",
+          globalPluginRoots: [pluginsDir()],
+        },
+      });
+    expect((await resolve("skill://demo-plugin/workflow.js")).source).toBe("'root skill';\n");
+    expect((await resolve("plugin://demo-plugin/workflow.js")).source).toBe("'top level';\n");
+  });
+
   test("a hooks.js or skill symlinked into the staged clone's .git is refused (#6161)", async () => {
     // The staged clone keeps .git, whose config can carry the remote's credentials; a link
     // into it passes plain realpath containment.

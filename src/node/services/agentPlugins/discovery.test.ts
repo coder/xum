@@ -88,7 +88,7 @@ describe("discoverAgentPlugins", () => {
     expect(plugin.name).toBe("hello-plugin");
     expect(plugin.scope).toBe("global");
     expect(plugin.rootPath).toBe(await fs.realpath(path.join(container, "hello-plugin")));
-    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
+    expect(plugin.skillsDirs).toEqual([{ dir: path.join(plugin.rootPath, "skills") }]);
     expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, "mcp.json"));
     expect(result.diagnostics).toEqual([]);
   });
@@ -944,7 +944,7 @@ describe("discoverAgentPlugins", () => {
 
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
-    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "lib", "skills")]);
+    expect(plugin.skillsDirs).toEqual([{ dir: path.join(plugin.rootPath, "lib", "skills") }]);
     expect(plugin.workflowsDir).toBe(path.join(plugin.rootPath, "scripts"));
     expect(plugin.agentsDir).toBeUndefined();
   });
@@ -972,11 +972,44 @@ describe("discoverAgentPlugins", () => {
     const plugin = result.plugins[0];
     // Declared roots replace the default skills/ (as in Codex), in declared order.
     expect(plugin.skillsDirs).toEqual([
-      path.join(plugin.rootPath, "core"),
-      path.join(plugin.rootPath, "extra"),
+      { dir: path.join(plugin.rootPath, "core") },
+      { dir: path.join(plugin.rootPath, "extra") },
     ]);
     expect(result.diagnostics).toHaveLength(1);
     expect(result.diagnostics[0].message).toContain("outside/ resolves outside the plugin root");
+  });
+
+  test("a skills path that holds SKILL.md is one skill named after the declared folder", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "solo", {
+      manifest: {
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "solo",
+        contributes: { skills: ["one-skill", "alias", ".", "skills"] },
+      },
+      skills: ["nested"],
+    });
+    for (const dir of ["one-skill", path.join("impl", "real")]) {
+      await fs.mkdir(path.join(pluginDir, dir), { recursive: true });
+      await fs.writeFile(path.join(pluginDir, dir, "SKILL.md"), "---\nname: x\n---\n", "utf8");
+    }
+    // A contained symlink keeps the name the author wrote, not the target's.
+    await fs.symlink(path.join("impl", "real"), path.join(pluginDir, "alias"));
+    await fs.writeFile(path.join(pluginDir, "SKILL.md"), "---\nname: solo\n---\n", "utf8");
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const plugin = result.plugins[0];
+    expect(plugin.skillsDirs).toEqual([
+      { dir: path.join(plugin.rootPath, "one-skill"), single: true, name: "one-skill" },
+      { dir: path.join(plugin.rootPath, "impl", "real"), single: true, name: "alias" },
+      // The plugin root has no folder name of its own: it takes the plugin name.
+      { dir: plugin.rootPath, single: true, name: "solo" },
+      // A folder without SKILL.md still holds skill folders.
+      { dir: path.join(plugin.rootPath, "skills") },
+    ]);
+    expect(result.diagnostics).toEqual([]);
   });
 
   test("discovers a manifest-only plugin without components", async () => {
@@ -1033,7 +1066,7 @@ describe("discoverAgentPlugins", () => {
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
     expect(plugin.name).toBe("figma");
-    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
+    expect(plugin.skillsDirs).toEqual([{ dir: path.join(plugin.rootPath, "skills") }]);
     expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, ".mcp.json"));
     // Parsed and exposed only: no hook component resolves from the legacy key.
     expect(plugin.hooksPath).toBeUndefined();
@@ -1093,7 +1126,7 @@ describe("discoverAgentPlugins", () => {
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
     expect(plugin.codexFallback).toBe(true);
-    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
+    expect(plugin.skillsDirs).toEqual([{ dir: path.join(plugin.rootPath, "skills") }]);
     expect(plugin.hooksPath).toBeUndefined();
     expect(plugin.agentsDir).toBeUndefined();
     expect(plugin.workflowsDir).toBeUndefined();
