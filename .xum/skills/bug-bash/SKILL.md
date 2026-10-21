@@ -174,11 +174,17 @@ queue. Fork and Dependabot PRs skip it. `Required` counts that result only when 
 `STORIES_PR_MODE` is `block`: warn until 50 PR runs with less than 5% failures. When
 every failed job's proxy record holds a provider 5xx (`bun tests/stories/summary.ts
 --upstream-fault`), the workflow runs `make test-stories` once more. It restores the seed with actions/cache
-(this ref's newest, else main's), writes a table of the tests, their cache outcomes and each
-job's spend to the job summary, and, except in the merge queue, saves the next seed: `bun
+(this ref's newest, else main's), writes e2e's page of each job with its spend to the job
+summary (`bun tests/stories/summary.ts`), uploads each job's `report.json` and `.spend.json` as the
+artifact `stories-reports-<attempt>` and, on a failure, the `results/` folders as
+`stories-evidence-<attempt>` (both kept 7 days), and, except in the merge queue, saves the next seed: `bun
 tests/stories/summary.ts --next-seed <dir>` (the caches of the newest web and Electron story
 jobs, less the seed entries either one deleted, at most 1000 entries and 128 MiB). GitHub scopes a saved cache to its ref, and a queue ref is temporary, so a
 merge-queue run saves none. Only the nightly and on-demand runs on main change what main replays. A PR that changes the sandbox image inputs fails there until main publishes the image.
+After the PR lane, pr.yml's `Test / Stories (Haiku) comment` job posts the same page as one PR
+comment, which each push edits (`tests/stories/prComment.ts`; `--dry-run` prints the body). It
+runs the base commit's copy with no install scripts, writes only while the run's commit is still
+the PR head, and is not in `Required`.
 To check state across a server restart, a story imports `test` from `tests/stories/fixtures.ts`
 and calls `xum.restartServer()` (same port and XUM_ROOT), then `app.open()`: e2e's
 `app.restart()` only opens a new page.

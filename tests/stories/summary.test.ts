@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { checkSeed, MAX_SEED_BYTES } from "../bugbash/sandbox/cacheSeed";
-import { nextSeed, summarize, upstreamFault } from "./summary";
+import { jobSections, nextSeed, NO_OUTPUT_NOTE, storyPage, upstreamFault } from "./summary";
 
 let root = "";
 beforeEach(() => {
@@ -17,114 +17,64 @@ const write = (rel: string, data: unknown) => {
   fs.writeFileSync(file, typeof data === "string" ? data : JSON.stringify(data));
   return file;
 };
-const agentStep = (mode: string, calls = 0) => ({
-  kind: "agent",
-  cache: { mode, replayedActions: 0 },
-  model: { calls },
-});
-/** The table row whose Test cell is `title`, split into cells. */
-const row = (summary: string, title: string) =>
-  summary
-    .split("\n")
-    .find((line) => line.split(" | ")[1] === title)
-    ?.split(" | ")
-    .map((c) => c.replace(/^\| | \|$/g, ""));
 const entry = (n: number) => `${n.toString(16).padStart(64, "0")}.json`;
+// Real reports of `make test-stories` under Haiku, trimmed (prComment.test.ts uses them too).
+const fixture = (name: string) =>
+  fs.readFileSync(path.join(import.meta.dir, "testdata", `${name}.report.json`), "utf8");
+const headlines = (page: string) => page.split("\n").filter((line) => line.startsWith("### "));
 
-test("a row per selected test with its cache outcomes and model calls, then each job's spend", () => {
-  const job = "tests/stories/.e2e/stories-20261019T100000Z-1";
-  write(`${job}/report.json`, {
-    run: {
-      status: "failed",
-      results: [
-        {
-          titlePath: ["smoke", "opens a workspace"],
-          status: "passed",
-          selected: true,
-          attempts: [
-            {
-              durationMs: 1500,
-              steps: [agentStep("self-finalized"), agentStep("missed", 3), { kind: "expect" }],
-            },
-          ],
-        },
-        {
-          titlePath: ["restart", "keeps | trust"],
-          status: "failed",
-          selected: true,
-          attempts: [
-            { durationMs: 1000, steps: [agentStep("agent-concluded", 4)] },
-            { durationMs: 2000, steps: [agentStep("agent-concluded", 5)] },
-          ],
-        },
-        { titlePath: ["known", "bug"], status: "skipped", selected: false, attempts: [] },
-      ],
-    },
-  });
-  write(`${job}.spend.json`, { spentUsd: 0.2712, capUsd: 3, settled: 12, refused: 0 });
-  write("tests/stories/.e2e/stories-preflight/report.json", { run: { results: [] } });
-  const repros = "tests/bugbash/.e2e/agent-repros-20261019T100500Z-2";
-  write(`${repros}/report.json`, { run: { status: "passed", results: [] } });
-  write(`${repros}.spend.json`, {
-    spentUsd: 3,
+test("a section per job in run order, each with its spend under the headline", () => {
+  const web = "tests/stories/.e2e/stories-20261019T100000Z-1";
+  write(`${web}/report.json`, fixture("red"));
+  write(`${web}.spend.json`, {
+    spentUsd: 0.2712,
     capUsd: 3,
-    settled: 9,
+    settled: 12,
     refused: 2,
     refusedBy: { budget: 2 },
   });
+  // The web kind's prefix also starts the Electron folder names: each job shows once.
+  write("tests/stories/.e2e/stories-electron-20261019T100100Z-1/report.json", fixture("green"));
+  write("tests/stories/.e2e/stories-preflight/report.json", { run: { results: [] } });
+  write("tests/stories/.e2e/stories-electron-preflight/report.json", { run: { results: [] } });
 
-  const summary = summarize(root);
-  expect(row(summary, "smoke › opens a workspace")).toEqual([
-    "`stories-20261019T100000Z-1`",
-    "smoke › opens a workspace",
-    "passed",
-    "1.5 s",
-    "1 / 0 / 1",
-    "3",
+  const page = storyPage(jobSections(root, { model: "anthropic:claude-sonnet-5-5" }));
+  expect(headlines(page)).toEqual([
+    "### 🔴 e2e stories (Sonnet): 1 failed, 1 passed",
+    "### 🟢 e2e Electron stories (Sonnet): 3 passed",
   ]);
-  // Every attempt counts: a retried test spent both attempts' time and calls.
-  expect(row(summary, "restart › keeps \\| trust")?.slice(2)).toEqual([
-    "failed (2 attempts)",
-    "3.0 s",
-    "0 / 2 / 0",
-    "9",
-  ]);
-  // A test the selection left out did not run, and the preflight is not a job.
-  expect(summary).not.toContain("known › bug");
-  expect(summary).not.toContain("stories-preflight");
-  expect(row(summary, "(no test selected)")?.[0]).toBe("`agent-repros-20261019T100500Z-2`");
-  expect(summary).toContain(
-    "- `stories-20261019T100000Z-1`: e2e failed. $0.27 spent of the $3.00 cap, 12 calls settled, 0 refused."
+  // Each spend line is in its job's head, the part a passing job folds to in the PR comment.
+  const [stories, electron] = jobSections(root);
+  expect(stories.head.split("\n").at(-1)).toBe(
+    'Spend: $0.27 of the $3.00 cap (proxy ledger), 2 calls refused {"budget":2}'
   );
-  expect(summary).toContain(
-    '- `agent-repros-20261019T100500Z-2`: e2e passed. $3.00 spent of the $3.00 cap, 9 calls settled, 2 refused {"budget":2}.'
-  );
+  expect(electron.head.split("\n").at(-1)).toBe("Spend: no record (spend.json missing)");
+  expect(stories.rest).toContain("ASSERTION_FAILED");
+  expect(page).not.toContain("preflight");
 });
 
-test("a missing, cut-off or foreign report prints a row that says so", () => {
+test("a missing, cut-off or foreign report gets a red headline that says so", () => {
   fs.mkdirSync(path.join(root, "tests/stories/.e2e/stories-20261019T100000Z-1"), {
     recursive: true,
   });
   write("tests/stories/.e2e/stories-20261019T100100Z-2/report.json", '{"run": {"results": [');
   write("tests/stories/.e2e/stories-20261019T100200Z-3/report.json", { schemaVersion: "x" });
+  // The right version, a shape e2e cannot render (no serialGroups, no summary).
   write("tests/stories/.e2e/stories-20261019T100300Z-4/report.json", {
+    schemaVersion: "report-1",
     run: { results: [{ titlePath: ["half"], attempts: [{ steps: "?" }, null] }] },
   });
 
-  const summary = summarize(root);
-  expect(row(summary, "(report.json missing)")?.[0]).toBe("`stories-20261019T100000Z-1`");
-  expect(row(summary, "(report.json not valid JSON (cut off?))")?.[0]).toBe(
-    "`stories-20261019T100100Z-2`"
-  );
-  expect(row(summary, "(report.json has no run.results)")?.[0]).toBe(
-    "`stories-20261019T100200Z-3`"
-  );
-  expect(row(summary, "half")?.slice(2)).toEqual(["unknown", "0.0 s", "0 / 0 / 0", "-"]);
-  expect(summary).toContain("- `stories-20261019T100000Z-1`: no e2e status. spend.json missing.");
+  expect(headlines(storyPage(jobSections(root)))).toEqual([
+    "### 🔴 e2e stories: report.json missing",
+    "### 🔴 e2e stories: report.json not valid JSON (cut off?)",
+    "### 🔴 e2e stories: report.json is not an e2e report-1 document",
+    "### 🔴 e2e stories: report.json could not be rendered",
+  ]);
 });
 
 test("no job output says that make test-stories stopped before its first job", () => {
-  expect(summarize(root)).toContain("stopped before its first job");
+  expect(storyPage(jobSections(root))).toBe(`${NO_OUTPUT_NOTE}\n`);
 });
 
 test("the next seed is the newest job's cache: valid entries only, at most 1000, newest kept", () => {
@@ -182,32 +132,6 @@ test("with no recorded entry the seed stays as it was", () => {
   expect(nextSeed(root, seed)).toBeNull();
   expect(fs.readdirSync(seed)).toEqual([entry(1)]);
   expect(fs.readFileSync(path.join(seed, entry(1)), "utf8")).toBe("old seed");
-});
-
-test("the Electron story job gets its own rows and spend line", () => {
-  const web = "tests/stories/.e2e/stories-20261019T100000Z-1";
-  const electron = "tests/stories/.e2e/stories-electron-20261019T100100Z-1";
-  const result = (title: string) => ({
-    titlePath: [title],
-    status: "passed",
-    attempts: [{ durationMs: 1000, steps: [] }],
-  });
-  write(`${web}/report.json`, { run: { status: "passed", results: [result("web smoke")] } });
-  write(`${electron}/report.json`, {
-    run: { status: "passed", results: [result("electron smoke")] },
-  });
-  write(`${electron}.spend.json`, { spentUsd: 0.5, capUsd: 3, settled: 4, refused: 0 });
-  write("tests/stories/.e2e/stories-electron-preflight/report.json", { run: { results: [] } });
-
-  const summary = summarize(root);
-  expect(row(summary, "web smoke")?.[0]).toBe("`stories-20261019T100000Z-1`");
-  expect(row(summary, "electron smoke")?.[0]).toBe("`stories-electron-20261019T100100Z-1`");
-  // Each job once: the web kind's prefix also starts the Electron folder names.
-  expect(summary.split("\n").filter((line) => line.includes("electron smoke")).length).toBe(1);
-  expect(summary).not.toContain("stories-electron-preflight");
-  expect(summary).toContain(
-    "- `stories-electron-20261019T100100Z-1`: e2e passed. $0.50 spent of the $3.00 cap, 4 calls settled, 0 refused."
-  );
 });
 
 test("the next seed merges both story jobs' caches, less what either deleted", () => {

@@ -27,6 +27,10 @@ on:
     secrets:
       ANTHROPIC_API_KEY:
         required: true
+    # The model the jobs ran, for the titles of pr.yml's PR comment (stories-pr-comment).
+    outputs:
+      model:
+        value: ${{ jobs.stories.outputs.model }}
   # One run a night on main: it keeps main's replay cache warm (GitHub evicts a cache that no
   # run reads for 7 days). A merge-queue run saves under its own queue ref, which no run
   # restores, so this run is the one that every other run restores first.
@@ -66,6 +70,11 @@ jobs:
       # The cache key's ref: the PR branch on pull_request, else the ref name (a branch, or
       # gh-readonly-queue/main/pr-<n>-<sha> in the merge queue). In env, not inline in run:.
       CACHE_REF: ${{ github.head_ref || github.ref_name }}
+      # The model of every job, and the pages' titles (summary.ts). schedule and
+      # workflow_dispatch have no inputs: Sonnet 5.5.
+      BUGBASH_MODEL: ${{ inputs.model || 'anthropic:claude-sonnet-5-5' }}
+    outputs:
+      model: ${{ env.BUGBASH_MODEL }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -113,14 +122,53 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_BASE_URL: https://api.anthropic.com
           BUGBASH_AI: mock
-          # The model of every job. schedule and workflow_dispatch have no inputs: Sonnet 5.5.
-          BUGBASH_MODEL: ${{ inputs.model || 'anthropic:claude-sonnet-5-5' }}
           # The cap per job, so one run spends at most three times this, six with the retry. $3
           # unless the caller passes budget_usd ($1 for the PR lane).
           BUGBASH_BUDGET_USD: ${{ inputs.budget_usd || '3' }}
+      # The e2e page of each job, as in the PR comment (summary.ts).
       - name: Summary
         if: always()
         run: bun tests/stories/summary.ts >> "$GITHUB_STEP_SUMMARY"
+      # Each job's report.json and spend.json, for pr.yml's PR comment (stories-pr-comment), and
+      # the first run's under first-try/ after the 5xx retry. The proxy records too: a job that
+      # its probe's 5xx refused has no report, only its record (summary.ts --upstream-fault).
+      # Copied into one folder first: the first run's outputs are outside the checkout, and
+      # upload-artifact would root the artifact at the folder above both. The attempt in the
+      # name: a re-run uploads its own.
+      - name: Collect the reports
+        if: ${{ !cancelled() }}
+        run: |
+          shopt -s nullglob
+          collect() (
+            cd "$1" || exit 0
+            files=(tests/stories/.e2e/stories-*/report.json tests/stories/.e2e/stories-*.{spend.json,proxy.jsonl}
+              tests/bugbash/.e2e/agent-repros-*/report.json tests/bugbash/.e2e/agent-repros-*.{spend.json,proxy.jsonl})
+            mkdir -p "$2"
+            if ((${#files[@]})); then cp --parents "${files[@]}" "$2"; fi
+          )
+          collect . "$RUNNER_TEMP/stories-reports"
+          if [[ -d "$RUNNER_TEMP/first-try" ]]; then
+            collect "$RUNNER_TEMP/first-try" "$RUNNER_TEMP/stories-reports/first-try"
+          fi
+      - name: Upload the reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: stories-reports-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stories-reports
+          if-no-files-found: ignore
+          retention-days: 7
+      # The screenshots, logs and traces the failure blocks link to (the run's #artifacts).
+      - name: Upload the evidence
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: stories-evidence-${{ github.run_attempt }}
+          path: |
+            tests/stories/.e2e/stories-*/results
+            tests/bugbash/.e2e/agent-repros-*/results
+          if-no-files-found: ignore
+          retention-days: 7
       # Every run saves its seed, a failed one too: e2e (read-write mode) saves a recording only
       # once a check after it passed, and deletes an entry that replayed into a failure. When no
       # job recorded an entry, the restored seed is saved again as it is. Not in the merge queue:
