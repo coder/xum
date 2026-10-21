@@ -581,6 +581,47 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     }
   });
 
+  it("keeps a sandbox its failed setup could not delete for the workspace removal to delete", async () => {
+    const sshDelete = spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
+      success: true,
+      deletedPath: "/path",
+    });
+    try {
+      // A setup error that persists blocks the removal's checks, so only a forced one goes.
+      for (const [sandboxId, force] of [
+        ["xum-transient", false],
+        ["xum-persistent", true],
+      ] as const) {
+        rig.writer.verifyError = new Error("Your ssh config sets User");
+        rig.plane.failingRoutes.add(`DELETE /sandbox/${sandboxId}`);
+        const daytona = { sandboxId, shared: false, ...SMALL };
+
+        // eslint-disable-next-line @typescript-eslint/await-thenable
+        await expect(makeRuntime(daytona).postCreateSetup(initParams())).rejects.toThrow(
+          "setup failed"
+        );
+        expect(rig.plane.find(sandboxId)).toBeDefined();
+
+        // The persisted workspace still names the sandbox; removing it deletes the sandbox.
+        rig.plane.failingRoutes.clear();
+        if (!force) rig.writer.verifyError = undefined;
+        rig.workspaces.splice(0, rig.workspaces.length, {
+          workspaceId: "ws-1",
+          runtimeConfig: sshDaytonaConfig(daytona),
+        });
+        const removal = await makeRuntime(daytona).deleteWorkspace(
+          "/home/me/project",
+          "feature",
+          force
+        );
+        expect(removal.success).toBe(true);
+        expect(rig.plane.find(sandboxId)).toBeUndefined();
+      }
+    } finally {
+      sshDelete.mockRestore();
+    }
+  });
+
   it("refuses a settings change while it creates a sandbox, and takes one afterwards", async () => {
     const newAccount = rig.addAccount("new-key");
     // The user saves another account's key while the create request is in flight.

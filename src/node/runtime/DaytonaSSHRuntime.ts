@@ -406,8 +406,8 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     return {
       ready: false,
       error:
-        `Daytona sandbox setup failed: ${setupFailure}. Xum deleted the sandbox it had ` +
-        `created; delete this workspace and create a new one.`,
+        `Daytona sandbox setup failed: ${setupFailure}. Delete this workspace (which deletes ` +
+        `any sandbox its setup left) and create a new one.`,
       errorType: "runtime_not_ready",
     };
   }
@@ -918,13 +918,17 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       initLogger.logStep(`Deleting the sandbox "${sandboxId}" this setup created...`);
       await this.daytonaService.deleteSandbox(sandboxId, create.account);
     } catch (error) {
-      // The reconciler stops labeled, unreferenced sandboxes, so a leak here is bounded.
+      // The persisted workspace still names the sandbox, so the reconciler leaves it alone;
+      // removing the workspace deletes it.
       const message = getErrorMessage(error);
       log.error("Failed to delete a Daytona sandbox after setup failed", {
         sandboxId,
         error: message,
       });
-      initLogger.logStderr(`Failed to delete Daytona sandbox "${sandboxId}": ${message}`);
+      initLogger.logStderr(
+        `Failed to delete Daytona sandbox "${sandboxId}": ${message}. The sandbox is kept; ` +
+          "removing this workspace deletes it."
+      );
     }
   }
 
