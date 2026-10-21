@@ -27,13 +27,15 @@ import {
   readOpenAIExtension,
   type OpenAIPluginExtension,
 } from "./openaiExtension";
+import { normalizeClaudeManifest, type ClaudePluginComponents } from "./claudeManifest";
 
 /**
  * Agent Plugins 1.0.0 discovery (§4, §6).
  *
  * A plugin is an immediate child directory of a configured container directory
  * that holds a regular `plugin.json` file (or, for Codex-scaffolded packages,
- * only `.codex-plugin/plugin.json`). Entries without either manifest are
+ * only `.codex-plugin/plugin.json`, or for Claude Code plugins only
+ * `.claude-plugin/plugin.json`). Entries without any manifest are
  * skipped silently (containers may hold unrelated files, e.g. Codex drops
  * `marketplace.json` into `~/.agents/plugins`). Failure isolation is per §11.3:
  * one broken plugin never affects sibling plugins, and one broken component
@@ -63,6 +65,11 @@ export const UNIVERSAL_AGENT_PLUGINS_CONTAINER = "~/.agents/plugins";
 export const PLUGIN_MANIFEST_RELATIVE_PATH = "plugin.json";
 /** Codex compatibility manifest, read only when the root plugin.json is absent. */
 export const CODEX_PLUGIN_MANIFEST_RELATIVE_PATH = path.join(".codex-plugin", "plugin.json");
+/**
+ * Claude Code manifest, read only when neither manifest above exists. A repository that has
+ * both keeps its Agent Plugin or Codex reading.
+ */
+export const CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH = path.join(".claude-plugin", "plugin.json");
 /** Codex MCP config, the default only when the root mcp.json is absent. */
 export const CODEX_MCP_CONFIG_RELATIVE_PATH = ".mcp.json";
 
@@ -249,6 +256,14 @@ export interface AgentPluginInfo {
    * commands or `extensions.mux`).
    */
   codexFallback?: true;
+  /**
+   * Found through `.claude-plugin/plugin.json`: skills, agents and MCP are honored, hooks are
+   * listed but never run, and there is no hooks.js, workflows/, slash command or
+   * `extensions.mux` (see normalizeClaudeManifest's SECURITY AUDIT).
+   */
+  claudeFallback?: true;
+  /** Claude components without a `contributes` member (claudeFallback only). */
+  claude?: ClaudePluginComponents;
   /** Validated `extensions["com.openai"]` (parsed and exposed only; nothing consumes it yet). */
   openai?: OpenAIPluginExtension;
   /**
@@ -263,8 +278,11 @@ export interface AgentPluginInfo {
   skillsDirs?: PluginSkillsRoot[];
   /** Canonical `mcp.json` path; present only when it exists, is a regular file, and stays inside the root (§6.2). */
   mcpConfigPath?: string;
-  /** "codex": the MCP file is in the Codex `.mcp.json` dialect (see loadPluginMcpServers). */
-  mcpConfigDialect?: "codex";
+  /**
+   * "codex": the MCP file is in the Codex `.mcp.json` dialect. "claude": the Codex dialect plus
+   * the `${CLAUDE_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_DATA}` names (see loadPluginMcpServers).
+   */
+  mcpConfigDialect?: "codex" | "claude";
   /** Canonical `hooks.js` path (Tier-1 sandboxed plugin hooks); present only
    * when it exists, is a regular file, and stays inside the root. Resolved
    * with the same §6.2 component rules as mcp.json. */
@@ -536,13 +554,17 @@ async function discoverPluginAt(args: {
     return null;
   }
 
-  // Root plugin.json wins; Codex-scaffolded packages ship only the
-  // compatibility manifest, which goes through the same caps and containment.
+  // Root plugin.json wins, then the Codex and the Claude Code manifests. Each one goes through
+  // the same caps and containment.
   let manifestRelative = PLUGIN_MANIFEST_RELATIVE_PATH;
   let manifestPath = path.join(rootReal, manifestRelative);
   let rawManifest: unknown;
   let found = false;
-  for (const candidate of [PLUGIN_MANIFEST_RELATIVE_PATH, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH]) {
+  for (const candidate of [
+    PLUGIN_MANIFEST_RELATIVE_PATH,
+    CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+    CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
+  ]) {
     manifestRelative = candidate;
     manifestPath = path.join(rootReal, candidate);
     const read = await readManifestCandidate(rootReal, candidate);
@@ -561,9 +583,12 @@ async function discoverPluginAt(args: {
   }
 
   const codexFallback = manifestRelative === CODEX_PLUGIN_MANIFEST_RELATIVE_PATH;
+  const claudeFallback = manifestRelative === CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH;
   const normalized = codexFallback
-    ? normalizeCodexManifest(rawManifest)
-    : { manifest: rawManifest, warnings: [] };
+    ? { ...normalizeCodexManifest(rawManifest), claude: undefined }
+    : claudeFallback
+      ? normalizeClaudeManifest(rawManifest)
+      : { manifest: rawManifest, warnings: [], claude: undefined };
   const validation = validatePluginManifest(normalized.manifest);
   if (!validation.ok) {
     const label =
@@ -585,7 +610,13 @@ async function discoverPluginAt(args: {
   let openaiSource: Pick<AgentPluginManifest, "extensions"> = validation.manifest;
   let openaiPath = manifestPath;
   let openaiManifestPath = manifestRelative;
-  if (!codexFallback && !isPlainObject(validation.manifest.extensions?.["com.openai"])) {
+  // A Claude package has no extensions (normalizeClaudeManifest drops them), so it gets no
+  // overlay either.
+  if (
+    !codexFallback &&
+    !claudeFallback &&
+    !isPlainObject(validation.manifest.extensions?.["com.openai"])
+  ) {
     const overlayPath = path.join(rootReal, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH);
     const overlay = await readManifestCandidate(rootReal, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH);
     if (overlay.status === "invalid") {
@@ -639,30 +670,39 @@ async function discoverPluginAt(args: {
     resolveComponent,
   });
   // Codex packages ship `.mcp.json`; it is the default only when `mcp.json` is
-  // absent (an invalid `mcp.json` still reports its own diagnostic).
-  const defaultMcpPath = (await fsPromises.lstat(path.join(rootReal, "mcp.json")).catch(() => null))
-    ? "mcp.json"
-    : CODEX_MCP_CONFIG_RELATIVE_PATH;
+  // absent (an invalid `mcp.json` still reports its own diagnostic). Claude Code reads only
+  // `.mcp.json`, so a Claude package never falls back to `mcp.json`.
+  const defaultMcpPath =
+    !claudeFallback && (await fsPromises.lstat(path.join(rootReal, "mcp.json")).catch(() => null))
+      ? "mcp.json"
+      : CODEX_MCP_CONFIG_RELATIVE_PATH;
   const mcpConfigPath = await resolveComponent(contributes?.mcp ?? defaultMcpPath, "file");
-  // Lexical, before canonicalization: a Codex package's MCP file, or the
-  // `.mcp.json` default, is in the Codex dialect.
-  const mcpConfigDialect =
-    codexFallback || (contributes?.mcp === undefined && defaultMcpPath !== "mcp.json")
+  // Lexical, before canonicalization: a Claude package's MCP file is in the Claude dialect; a
+  // Codex package's MCP file, or the `.mcp.json` default, is in the Codex dialect.
+  const mcpConfigDialect = claudeFallback
+    ? "claude"
+    : codexFallback || (contributes?.mcp === undefined && defaultMcpPath !== "mcp.json")
       ? "codex"
       : undefined;
-  // A Codex-fallback package gets skills, MCP and com.openai only: no Xum
-  // executable components (see normalizeCodexManifest's SECURITY AUDIT).
-  const hooksPath = codexFallback
-    ? undefined
-    : await resolveComponent(contributes?.hooks ?? "hooks.js", "file", {
-        maxBytes: MAX_PLUGIN_HOOK_SOURCE_BYTES,
-      });
+  // A package that was not written for Xum ("foreign") gets no Xum executable code: no
+  // hooks.js and no workflows/. Today that is a Claude package; the seam is one boolean so a
+  // plugin.json that Xum generated for a foreign package can join it. A Codex-fallback package
+  // gets skills, MCP and com.openai only: no agents/ either (see normalizeCodexManifest's
+  // SECURITY AUDIT). A Claude package keeps agents/ (Claude-format agents, reviewed as usual).
+  const foreign = claudeFallback;
+  const hooksPath =
+    codexFallback || foreign
+      ? undefined
+      : await resolveComponent(contributes?.hooks ?? "hooks.js", "file", {
+          maxBytes: MAX_PLUGIN_HOOK_SOURCE_BYTES,
+        });
   const agentsDir = codexFallback
     ? undefined
     : await resolveComponent(contributes?.agents ?? "agents", "directory");
-  const workflowsDir = codexFallback
-    ? undefined
-    : await resolveComponent(contributes?.workflows ?? "workflows", "directory");
+  const workflowsDir =
+    codexFallback || foreign
+      ? undefined
+      : await resolveComponent(contributes?.workflows ?? "workflows", "directory");
 
   return {
     name: validation.manifest.name,
@@ -672,6 +712,7 @@ async function discoverPluginAt(args: {
     dirName: args.dirName,
     manifest: validation.manifest,
     ...(codexFallback ? { codexFallback: true } : {}),
+    ...(claudeFallback ? { claudeFallback: true, claude: normalized.claude ?? {} } : {}),
     ...(openai.extension !== undefined ? { openai: openai.extension, openaiManifestPath } : {}),
     ...(skillsDirs.length > 0 ? { skillsDirs } : {}),
     ...(mcpConfigPath !== undefined ? { mcpConfigPath } : {}),

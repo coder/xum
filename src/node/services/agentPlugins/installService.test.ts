@@ -2929,6 +2929,59 @@ describe("AgentPluginInstallService", () => {
     }
   });
 
+  test("a Claude Code plugin repo installs with its skills, agents and MCP, and no Xum executables", async () => {
+    // Claude layout: .claude-plugin/plugin.json and .mcp.json, no root plugin.json.
+    await fsPromises.rm(path.join(remoteDir, "plugin.json"));
+    await fsPromises.rm(path.join(remoteDir, "mcp.json"));
+    const files: Record<string, string> = {
+      ".claude-plugin/plugin.json": JSON.stringify({
+        name: "demo-plugin",
+        version: "1.4.0",
+        lspServers: "./.lsp.json",
+      }),
+      ".mcp.json": JSON.stringify({
+        mcpServers: { echo: { command: "node", args: ["${CLAUDE_PLUGIN_ROOT}/server.js"] } },
+      }),
+      "agents/reviewer.md": "---\nname: Reviewer\n---\nReview the diff.\n",
+      "hooks/hooks.json": JSON.stringify({
+        hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "x.sh" }] }] },
+      }),
+      // Present, but a Claude package never loads them.
+      "hooks.js": "export default {};\n",
+      "workflows/release.js": "// wf\n",
+    };
+    for (const [relative, content] of Object.entries(files)) {
+      await fsPromises.mkdir(path.dirname(path.join(remoteDir, relative)), { recursive: true });
+      await fsPromises.writeFile(path.join(remoteDir, relative), content);
+    }
+    await commitAll(remoteDir, "claude layout");
+
+    const preview = await service.preview({ input: remoteDir });
+
+    expect(preview.manifest).toMatchObject({ name: "demo-plugin", version: "1.4.0" });
+    expect(preview.skills.map((skill) => skill.name)).toEqual(["greet"]);
+    expect(preview.mcpServers.map((server) => server.serverName)).toEqual(["echo"]);
+    expect(preview.agents).toEqual(["reviewer.md"]);
+    expect(preview.hook).toBeUndefined();
+    expect(preview.workflows).toEqual([]);
+    expect(preview.codexHooks.map((hook) => [hook.event, hook.status])).toEqual([
+      ["PreToolUse", "claude-plugin"],
+    ]);
+    expect(preview.warnings.join("\n")).toContain("'lspServers'");
+
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const { plugins } = await discoverAgentPlugins([
+      { path: pluginsDir(), scope: "global", registryPath: registryFile() },
+    ]);
+    expect(plugins.map((plugin) => [plugin.name, plugin.claudeFallback])).toEqual([
+      ["demo-plugin", true],
+    ]);
+    const { servers } = await loadPluginMcpServers(plugins[0], { xumHome: muxRoot });
+    const echo = Object.values(servers)[0];
+    assert(echo?.transport === "stdio", "the Claude MCP server loads as stdio");
+    expect(echo.args).toEqual([path.join(plugins[0].rootPath, "server.js")]);
+  });
+
   test("never overwrites: registry and directory collisions are clear errors", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
@@ -7939,11 +7992,13 @@ describe("AgentPluginInstallService", () => {
       await commitAll(notPlugin, "init");
       await expect(service.preview({ input: notPlugin })).rejects.toThrow(/No plugin\.json/);
 
-      // Claude Code collection → clear message naming the limitation.
+      // A Claude Code marketplace without a plugin manifest → clear message naming the limitation.
       await fsPromises.mkdir(path.join(notPlugin, ".claude-plugin"), { recursive: true });
-      await fsPromises.writeFile(path.join(notPlugin, ".claude-plugin", "plugin.json"), "{}");
-      await commitAll(notPlugin, "claude");
-      await expect(service.preview({ input: notPlugin })).rejects.toThrow(/Claude Code/);
+      await fsPromises.writeFile(path.join(notPlugin, ".claude-plugin", "marketplace.json"), "{}");
+      await commitAll(notPlugin, "claude marketplace");
+      await expect(service.preview({ input: notPlugin })).rejects.toThrow(
+        /Claude Code plugin marketplace .* does not install marketplaces/
+      );
     } finally {
       await fsPromises.rm(notPlugin, { recursive: true, force: true });
     }

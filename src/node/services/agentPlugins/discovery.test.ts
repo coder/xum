@@ -1760,3 +1760,133 @@ describe("plugin .git containment (#6161)", () => {
     );
   });
 });
+
+describe("Claude Code plugin discovery", () => {
+  /** Write files (relative path → content) under a new plugin folder. */
+  async function writeTree(pluginDir: string, files: Record<string, string>): Promise<void> {
+    for (const [relative, content] of Object.entries(files)) {
+      await fs.mkdir(path.dirname(path.join(pluginDir, relative)), { recursive: true });
+      await fs.writeFile(path.join(pluginDir, relative), content, "utf8");
+    }
+  }
+  const claudeManifest = (manifest: unknown) => ({
+    ".claude-plugin/plugin.json": JSON.stringify(manifest),
+  });
+
+  test("maps the Claude manifest: skills add to skills/, one agents folder, ignored keys warn", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "review-kit");
+    await writeTree(pluginDir, {
+      ...claudeManifest({
+        $schema: "https://json.schemastore.org/claude-code-plugin.json",
+        name: "review-kit",
+        version: "1.4.0",
+        description: "Review tools",
+        author: { name: "Example", email: "dev@example.com", team: "x" },
+        metadata: { catalogId: "c" },
+        skills: ["./extra-skills/"],
+        agents: ["./custom-agents/reviewer.md", "./custom-agents/tester.md"],
+        mcpServers: "./config/servers.json",
+        lspServers: "./.lsp.json",
+        userConfig: { token: { type: "string" } },
+        contributes: { slashCommands: [{ name: "x", expansion: "y" }] },
+        extensions: { mux: { hooks: { tools: ["bash"] } } },
+      }),
+      "skills/a/SKILL.md": "---\nname: a\ndescription: A\n---\n",
+      "extra-skills/b/SKILL.md": "---\nname: b\ndescription: B\n---\n",
+      "custom-agents/reviewer.md": "---\nname: reviewer\ndescription: R\n---\n",
+      "config/servers.json": "{}",
+      ".mcp.json": "{}",
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toHaveLength(1);
+    const plugin = result.plugins[0];
+    expect(plugin.claudeFallback).toBe(true);
+    expect(plugin.manifest).toMatchObject({
+      name: "review-kit",
+      version: "1.4.0",
+      description: "Review tools",
+      author: { name: "Example", email: "dev@example.com" },
+    });
+    expect(plugin.manifest.extensions).toBeUndefined();
+    expect(plugin.manifest.contributes?.slashCommands).toBeUndefined();
+    expect(resolvePluginHookGrants(plugin.manifest).bridgeTools.allow).toEqual([]);
+    expect(plugin.skillsDirs).toEqual([
+      { dir: path.join(plugin.rootPath, "skills") },
+      { dir: path.join(plugin.rootPath, "extra-skills") },
+    ]);
+    expect(plugin.agentsDir).toBe(path.join(plugin.rootPath, "custom-agents"));
+    expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, "config", "servers.json"));
+    expect(plugin.mcpConfigDialect).toBe("claude");
+    expect(result.diagnostics.map((d) => d.severity)).not.toContain("error");
+    const messages = result.diagnostics.map((d) => d.message).join("\n");
+    for (const key of ["author.team", "lspServers", "userConfig", "contributes", "extensions"]) {
+      expect(messages).toContain(`'${key}'`);
+    }
+    // Keys Claude Code itself ignores at load time do not warn.
+    expect(messages).not.toContain("'metadata'");
+    expect(messages).not.toContain("'$schema'");
+  });
+
+  test("agents spread over two folders fall back to agents/ with a warning", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "spread");
+    await writeTree(pluginDir, {
+      ...claudeManifest({ name: "spread", agents: ["./one/a.md", "./two/b.md"] }),
+      "agents/c.md": "---\nname: c\ndescription: C\n---\n",
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins[0].agentsDir).toBe(path.join(result.plugins[0].rootPath, "agents"));
+    expect(result.diagnostics.map((d) => d.message).join("\n")).toContain("'agents'");
+  });
+
+  test("a Claude package gets agents/ but no hooks.js and no workflows/", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "gated");
+    await writeTree(pluginDir, {
+      ...claudeManifest({ name: "gated" }),
+      "hooks.js": "export default {};",
+      "workflows/run.js": "export {};",
+      "agents/helper.md": "---\nname: helper\ndescription: H\n---\n",
+      // Claude Code reads only .mcp.json, so a Claude package never falls back to mcp.json.
+      "mcp.json": "{}",
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toHaveLength(1);
+    const plugin = result.plugins[0];
+    expect(plugin.hooksPath).toBeUndefined();
+    expect(plugin.workflowsDir).toBeUndefined();
+    expect(plugin.agentsDir).toBe(path.join(plugin.rootPath, "agents"));
+    expect(plugin.mcpConfigPath).toBeUndefined();
+  });
+
+  test("plugin.json beats .codex-plugin/plugin.json, which beats .claude-plugin/plugin.json", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const claude = claudeManifest({ name: "from-claude" });
+    const codex = { ".codex-plugin/plugin.json": JSON.stringify({ name: "from-codex" }) };
+    const root = {
+      "plugin.json": JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "from-root" }),
+    };
+    await writeTree(path.join(container, "a"), { ...claude, ...codex, ...root });
+    await writeTree(path.join(container, "b"), { ...claude, ...codex });
+    await writeTree(path.join(container, "c"), claude);
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins.map((p) => [p.dirName, p.name, p.claudeFallback === true])).toEqual([
+      ["a", "from-root", false],
+      ["b", "from-codex", false],
+      ["c", "from-claude", true],
+    ]);
+  });
+});

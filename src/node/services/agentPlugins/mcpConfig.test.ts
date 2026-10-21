@@ -266,6 +266,81 @@ describe("loadPluginMcpServers", () => {
     ]);
   });
 
+  test("the Claude dialect expands and exports ${CLAUDE_PLUGIN_*} and maps a root-anchored command", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin: AgentPluginInfo = {
+      ...(await makePlugin(
+        tmp.path,
+        "claude",
+        {
+          local: {
+            command: "${CLAUDE_PLUGIN_ROOT}/bin/tool",
+            args: ["${CLAUDE_PLUGIN_ROOT}/server.js", "${CLAUDE_PLUGIN_DATA}/d", "${PLUGIN_ROOT}"],
+            env: { CONFIG: "${CLAUDE_PLUGIN_ROOT}/config.json" },
+            cwd: "${CLAUDE_PLUGIN_DATA}/work",
+          },
+        },
+        { fileName: ".mcp.json" }
+      )),
+      mcpConfigDialect: "claude",
+    };
+    await fs.mkdir(path.join(plugin.rootPath, "bin"));
+    await fs.writeFile(path.join(plugin.rootPath, "bin", "tool"), "#!/bin/sh\n", { mode: 0o755 });
+
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+
+    expect(diagnostics).toEqual([]);
+    const dataPath = getPluginDataPath(tmp.path, computePluginInstanceId(plugin.rootPath));
+    const info = Object.values(servers)[0] as MCPStdioServerInfo;
+    expect(info.command).toBe(path.join(plugin.rootPath, "bin", "tool"));
+    expect(info.args).toEqual([`${plugin.rootPath}/server.js`, `${dataPath}/d`, plugin.rootPath]);
+    expect(info.cwd).toBe(path.join(dataPath, "work"));
+    expect(info.env).toEqual({
+      CONFIG: `${plugin.rootPath}/config.json`,
+      PLUGIN_ROOT: plugin.rootPath,
+      PLUGIN_DATA: dataPath,
+      CLAUDE_PLUGIN_ROOT: plugin.rootPath,
+      CLAUDE_PLUGIN_DATA: dataPath,
+    });
+  });
+
+  test("the Claude dialect refuses every other command form and its reserved env names", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    // An executable next to the plugin: a parent path must not reach it.
+    await fs.writeFile(path.join(tmp.path, "outside"), "#!/bin/sh\n", { mode: 0o755 });
+    const servers = {
+      absolute: { command: "/usr/bin/env" },
+      parent: { command: "../outside" },
+      rootParent: { command: "${CLAUDE_PLUGIN_ROOT}/../outside" },
+      quoted: { command: '"${CLAUDE_PLUGIN_ROOT}"/bin/tool' },
+      bareRoot: { command: "${CLAUDE_PLUGIN_ROOT}/" },
+      reservedEnv: { command: "node", env: { CLAUDE_PLUGIN_ROOT: "/elsewhere" } },
+    };
+    const claude: AgentPluginInfo = {
+      ...(await makePlugin(tmp.path, "claude", servers, { fileName: ".mcp.json" })),
+      mcpConfigDialect: "claude",
+    };
+    // The Codex dialect has no Claude names: the same command is refused there.
+    const codex = await makePlugin(
+      tmp.path,
+      "codex",
+      { local: { command: "${CLAUDE_PLUGIN_ROOT}/bin/tool" } },
+      { fileName: ".mcp.json" }
+    );
+    await fs.mkdir(path.join(codex.rootPath, "bin"));
+    await fs.writeFile(path.join(codex.rootPath, "bin", "tool"), "#!/bin/sh\n", { mode: 0o755 });
+
+    const claudeResult = await loadPluginMcpServers(claude, { xumHome: tmp.path });
+    const codexResult = await loadPluginMcpServers(codex, { xumHome: tmp.path });
+
+    expect(claudeResult.servers).toEqual({});
+    expect(claudeResult.diagnostics.map((d) => d.message.split(":")[0])).toEqual(
+      Object.keys(servers).map((name) => `.mcp.json server '${name}'`)
+    );
+    expect(codexResult.servers).toEqual({});
+    expect(codexResult.diagnostics[0].message).toContain("executable token");
+  });
+
   test("the Codex dialect forwards only the host variables that env_vars names", async () => {
     using tmp = new DisposableTempDir("plugin-mcp");
     const plugin = await makePlugin(

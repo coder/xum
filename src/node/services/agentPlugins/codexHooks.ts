@@ -9,6 +9,9 @@
  * - Only `mcp_tool` handlers on the four mapped events can run (in a later change). `command`,
  *   `prompt` and `agent` handlers are parsed and never run; other Codex events are parsed and
  *   ignored. Both are listed so the user sees what the plugin declares.
+ * - Claude Code plugins use the same file shape (`hooks/hooks.json`, plus the manifest's `hooks`
+ *   files). Xum lists their hooks on every Claude event and never runs any of them, `mcp_tool`
+ *   included: Claude matchers name Claude tools, and Xum maps only Codex tool names.
  * - Trust: Codex trusts each hook by the hash of its exact definition, so a new or changed hook
  *   is skipped until the user trusts it. `hash` is that key (see pluginHookTrust.ts).
  *
@@ -57,6 +60,37 @@ const IGNORED_CODEX_HOOK_EVENTS = new Set([
   "SessionStart",
   "SessionEnd",
   "Interrupt",
+]);
+
+/**
+ * Claude Code hook events (https://code.claude.com/docs/en/hooks.md). A Claude package's hooks on
+ * these events are listed and never run.
+ */
+const CLAUDE_HOOK_EVENTS = new Set([
+  ...Object.keys(MAPPED_CODEX_HOOK_EVENTS),
+  ...IGNORED_CODEX_HOOK_EVENTS,
+  "PostToolUseFailure",
+  "PostToolBatch",
+  "PermissionDenied",
+  "Notification",
+  "UserPromptExpansion",
+  "MessageDisplay",
+  "TaskCreated",
+  "TaskCompleted",
+  "StopFailure",
+  "TeammateIdle",
+  "ConfigChange",
+  "CwdChanged",
+  "DirectoryAdded",
+  "FileChanged",
+  "WorktreeCreate",
+  "WorktreeRemove",
+  "PreModelSwitch",
+  "PostModelSwitch",
+  "Setup",
+  "InstructionsLoaded",
+  "Elicitation",
+  "ElicitationResult",
 ]);
 
 /** Codex ignores the matcher on these events (codex-rs/hooks/src/events/common.rs). */
@@ -109,7 +143,8 @@ export interface PluginHooksLoadResult {
 
 /**
  * Read and parse a plugin's Codex hooks. An explicit `com.openai` pointer replaces the default
- * `hooks/hooks.json`; it never adds to it.
+ * `hooks/hooks.json`; it never adds to it. A Claude package's manifest `hooks` files add to the
+ * default (the Claude rule), and every one of its hooks gets the `claude-plugin` status.
  *
  * The pointer is the `com.openai` extension discovery selected (root `plugin.json`, a Codex-only
  * `.codex-plugin/plugin.json`, or the overlay next to a root manifest without one), already
@@ -118,7 +153,10 @@ export interface PluginHooksLoadResult {
  * (PRRT_kwDOPxxmWM6r2kUY).
  */
 export async function loadPluginCodexHooks(
-  plugin: Pick<AgentPluginInfo, "rootPath" | "openai" | "openaiManifestPath">
+  plugin: Pick<
+    AgentPluginInfo,
+    "rootPath" | "openai" | "openaiManifestPath" | "claudeFallback" | "claude"
+  >
 ): Promise<PluginHooksLoadResult> {
   const warnings = new HookWarnings();
   const hooks: PluginHookDefinition[] = [];
@@ -129,13 +167,23 @@ export async function loadPluginCodexHooks(
       `'extensions["com.openai"].hooks' has ${pointer.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
     );
   }
-  const entries = pointer?.slice(0, MAX_HOOK_POINTER_ENTRIES) ?? [DEFAULT_HOOKS_FILE];
+  const claude = plugin.claudeFallback === true;
+  // A Claude package has no com.openai pointer (discovery drops its extensions).
+  const entries = pointer?.slice(0, MAX_HOOK_POINTER_ENTRIES) ?? [
+    DEFAULT_HOOKS_FILE,
+    ...(claude ? (plugin.claude?.hooks ?? []) : []),
+  ];
   const seenFiles = new Set<string>();
   const inlineSource = path.normalize(plugin.openaiManifestPath ?? PLUGIN_MANIFEST_RELATIVE_PATH);
-  for (const entry of entries) {
+  for (const [index, entry] of entries.entries()) {
     if (hooks.length > MAX_PLUGIN_HOOKS) break;
     if (typeof entry !== "string") {
-      parseHooksDocument(entry.inline, `${inlineSource}#hooks[${entry.index}]`, hooks, warnings);
+      parseHooksDocument(
+        entry.inline,
+        { source: `${inlineSource}#hooks[${entry.index}]`, claude },
+        hooks,
+        warnings
+      );
       continue;
     }
     // A hook key is `<source>#<event>[group][handler]`, and an inline source is
@@ -150,7 +198,9 @@ export async function loadPluginCodexHooks(
       continue;
     }
     seenFiles.add(path.normalize(entry));
-    const content = await readHooksFile(plugin.rootPath, entry, pointer == null, warnings);
+    // Only the default file is optional: a listed file that is missing is a plugin bug.
+    const isDefault = pointer == null && index === 0;
+    const content = await readHooksFile(plugin.rootPath, entry, isDefault, warnings);
     if (content === undefined) continue;
     let document: unknown;
     try {
@@ -159,7 +209,7 @@ export async function loadPluginCodexHooks(
       warnings.push(`${entry} is not valid JSON; ignoring it: ${getErrorMessage(error)}`);
       continue;
     }
-    parseHooksDocument(document, path.normalize(entry), hooks, warnings);
+    parseHooksDocument(document, { source: path.normalize(entry), claude }, hooks, warnings);
   }
   const list = warnings.list();
   if (hooks.length > MAX_PLUGIN_HOOKS) {
@@ -204,23 +254,28 @@ function getErrorCode(error: unknown): unknown {
 
 function parseHooksDocument(
   document: unknown,
-  source: string,
+  where: { source: string; claude: boolean },
   out: PluginHookDefinition[],
   warnings: HookWarnings
 ): void {
+  const { source, claude } = where;
   if (!isPlainObject(document) || !isPlainObject(document.hooks)) {
     warnings.push(`${source}: expected { "hooks": { <Event>: [...] } }; ignoring it`);
     return;
   }
   for (const [event, value] of Object.entries(document.hooks)) {
-    const groups = readEventGroups(event, value, source, warnings);
+    const groups = readEventGroups(event, value, where, warnings);
     if (groups === undefined) continue;
-    const mapped = Object.hasOwn(MAPPED_CODEX_HOOK_EVENTS, event);
+    const status: PluginHookStatus | undefined = claude
+      ? "claude-plugin"
+      : Object.hasOwn(MAPPED_CODEX_HOOK_EVENTS, event)
+        ? undefined
+        : "ignored-event";
     for (const [groupIndex, group] of groups.entries()) {
       // The plugin's hook budget is checked inside each document too (PRRT_kwDOPxxmWM6rRIkV).
       if (out.length > MAX_PLUGIN_HOOKS) return;
       const groupKey = `${source}#${event}[${groupIndex}]`;
-      parseMatcherGroup(group, { source, groupKey, event, mapped }, out, warnings);
+      parseMatcherGroup(group, { source, groupKey, event, status }, out, warnings);
     }
   }
 }
@@ -229,10 +284,14 @@ function parseHooksDocument(
 function readEventGroups(
   event: string,
   groups: unknown,
-  source: string,
+  where: { source: string; claude: boolean },
   warnings: HookWarnings
 ): unknown[] | undefined {
-  if (!Object.hasOwn(MAPPED_CODEX_HOOK_EVENTS, event) && !IGNORED_CODEX_HOOK_EVENTS.has(event)) {
+  const { source } = where;
+  const known = where.claude
+    ? CLAUDE_HOOK_EVENTS.has(event)
+    : Object.hasOwn(MAPPED_CODEX_HOOK_EVENTS, event) || IGNORED_CODEX_HOOK_EVENTS.has(event);
+  if (!known) {
     warnings.push(`${source}: unknown hook event '${event}'; ignoring it`);
     return undefined;
   }
@@ -246,11 +305,17 @@ function readEventGroups(
 
 function parseMatcherGroup(
   group: unknown,
-  where: { source: string; groupKey: string; event: string; mapped: boolean },
+  where: {
+    source: string;
+    groupKey: string;
+    event: string;
+    /** Fixed status of every hook in the group; undefined: decided by the handler type. */
+    status: PluginHookStatus | undefined;
+  },
   out: PluginHookDefinition[],
   warnings: HookWarnings
 ): void {
-  const { source, groupKey, event, mapped } = where;
+  const { source, groupKey, event } = where;
   if (!isPlainObject(group) || !Array.isArray(group.hooks)) {
     warnings.push(`${source}: a '${event}' matcher group needs a "hooks" array; ignoring it`);
     return;
@@ -269,11 +334,8 @@ function parseMatcherGroup(
       warnings.push(`${source}: '${event}': ${getErrorMessage(error)}; ignoring a handler`);
       continue;
     }
-    const status: PluginHookStatus = !mapped
-      ? "ignored-event"
-      : handler.type === "mcp_tool"
-        ? "runnable"
-        : "unsupported-handler";
+    const status: PluginHookStatus =
+      where.status ?? (handler.type === "mcp_tool" ? "runnable" : "unsupported-handler");
     out.push({
       key: `${groupKey}[${handlerIndex}]`,
       hash,

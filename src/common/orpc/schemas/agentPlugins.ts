@@ -73,9 +73,15 @@ export const PluginHookHandlerSchema = z.discriminatedUnion("type", [
 
 /**
  * `runnable`: an mcp_tool handler on a mapped event. `unsupported-handler`: a command, prompt or
- * agent handler. `ignored-event`: a Codex event Xum does not map.
+ * agent handler. `ignored-event`: a Codex event Xum does not map. `claude-plugin`: any hook of a
+ * Claude Code plugin (Xum lists them and never runs them).
  */
-export const PluginHookStatusSchema = z.enum(["runnable", "unsupported-handler", "ignored-event"]);
+export const PluginHookStatusSchema = z.enum([
+  "runnable",
+  "unsupported-handler",
+  "ignored-event",
+  "claude-plugin",
+]);
 
 /**
  * Trust review state, keyed by the hook's location and checked against its hash (Codex trust):

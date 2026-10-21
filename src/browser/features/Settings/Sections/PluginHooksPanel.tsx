@@ -88,6 +88,7 @@ export const PLUGIN_HOOK_STATUS_NOTE: Record<PluginHookStatus, string | null> = 
   runnable: null,
   "unsupported-handler": "Never runs: Xum runs only mcp_tool hooks.",
   "ignored-event": "Never runs: Xum does not use this event.",
+  "claude-plugin": "Never runs: Xum does not run Claude Code plugin hooks.",
 };
 
 const REVIEW_LABEL: Record<PluginHookReviewState, { text: string; className: string }> = {

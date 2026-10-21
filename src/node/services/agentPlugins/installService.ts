@@ -69,6 +69,7 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
+  CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
   CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
   readPluginFileWithinRootCapped,
   discoverAgentPluginAt,
@@ -2513,7 +2514,7 @@ export class AgentPluginInstallService {
   /**
    * Run the exact runtime validation (manifest + component discovery) against
    * a staged clone. Throws user-facing errors for non-plugins, including a
-   * clear message for Claude Code plugin/marketplace repos (explicit non-goal).
+   * clear message for a Claude Code marketplace repo (not installable yet).
    */
   private async validateStagedClone(
     stagedDir: string,
@@ -2522,24 +2523,26 @@ export class AgentPluginInstallService {
     plugin: AgentPluginInfo;
     warnings: string[];
   }> {
-    // Discovery reads `.codex-plugin/plugin.json` when the root manifest is
-    // absent; both live in the staged tree the consent receipt hashes.
-    const hasManifest =
-      (await pathExists(path.join(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH))) ||
-      (await pathExists(path.join(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH)));
+    // Discovery reads `.codex-plugin/plugin.json`, then `.claude-plugin/plugin.json`, when the
+    // root manifest is absent; all of them live in the staged tree the consent receipt hashes.
+    let hasManifest = false;
+    for (const manifest of [
+      PLUGIN_MANIFEST_RELATIVE_PATH,
+      CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+      CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
+    ]) {
+      if (await pathExists(path.join(stagedDir, manifest))) hasManifest = true;
+    }
     if (!hasManifest) {
-      if (
-        (await pathExists(path.join(stagedDir, ".claude-plugin", "plugin.json"))) ||
-        (await pathExists(path.join(stagedDir, ".claude-plugin", "marketplace.json")))
-      ) {
+      if (await pathExists(path.join(stagedDir, ".claude-plugin", "marketplace.json"))) {
         throw new Error(
-          "This repository is a Claude Code plugin or marketplace (found .claude-plugin/). Mux implements the vendor-neutral Agent Plugins 1.0.0 format and cannot install Claude Code collections. If an Agent Plugin lives in one of its folders, install it as owner/repo/path/to/plugin."
+          "This repository is a Claude Code plugin marketplace (found .claude-plugin/marketplace.json). Xum does not install marketplaces yet. Install one of its plugins by its folder, as owner/repo/path/to/plugin."
         );
       }
       throw new Error(
         subpath === undefined
-          ? "No plugin.json (or .codex-plugin/plugin.json) found at the repository root. The repo is not an Agent Plugin — if the plugin lives in a subdirectory, install it as owner/repo/path/to/plugin."
-          : `No plugin.json (or .codex-plugin/plugin.json) found in '${subpath}'. The folder is not an Agent Plugin.`
+          ? "No plugin.json (or .codex-plugin/plugin.json or .claude-plugin/plugin.json) found at the repository root. The repo is not a plugin — if the plugin lives in a subdirectory, install it as owner/repo/path/to/plugin."
+          : `No plugin.json (or .codex-plugin/plugin.json or .claude-plugin/plugin.json) found in '${subpath}'. The folder is not a plugin.`
       );
     }
 
