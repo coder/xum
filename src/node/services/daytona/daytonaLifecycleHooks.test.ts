@@ -75,6 +75,29 @@ describe("createDaytonaArchiveHook", () => {
     expect(rig.plane.find("sb-delete")).toBeUndefined();
   });
 
+  it("lets a start in flight finish before it stops the sandbox and releases access", async () => {
+    rig.plane.addSandbox({ id: "sb-waking", state: "stopped" });
+    let startReached!: () => void;
+    const reached = new Promise<void>((resolve) => (startReached = resolve));
+    let answerStart!: () => void;
+    const startAnswered = new Promise<void>((resolve) => (answerStart = resolve));
+    rig.plane.onRequest.set("POST /sandbox/sb-waking/start", () => {
+      startReached();
+      return startAnswered;
+    });
+
+    const ready = rig.service.ensureSandboxReady("sb-waking");
+    await reached;
+    const archived = archive({ sandboxId: "sb-waking", shared: false }, "stop");
+    answerStart();
+    await ready;
+
+    expect((await archived).success).toBe(true);
+    // Neither the start nor its token outlives the archive.
+    expect(rig.plane.find("sb-waking")?.state).toBe("stopped");
+    expect(rig.writer.tokens.has("sb-waking")).toBe(false);
+  });
+
   it("never stops or deletes an attached or shared sandbox", async () => {
     rig.plane.addSandbox({ id: "sb-users" });
 

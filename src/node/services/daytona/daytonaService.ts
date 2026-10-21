@@ -1178,8 +1178,27 @@ export class DaytonaService {
     return this.tokens.has(sandboxId) && this.tokenNeedsRefresh(sandboxId);
   }
 
+  /**
+   * Settle the readiness request in flight for this sandbox, if any. Its start and mint would
+   * otherwise land after a stop or a release and undo it. Bounded by the start timeout; its
+   * failure belongs to its own callers, so it is only logged here.
+   */
+  async waitForSandboxReadiness(sandboxId: string): Promise<void> {
+    const request = this.readyRequests.get(sandboxId);
+    if (!request) return;
+    try {
+      await request.promise;
+    } catch (error) {
+      log.warn("Daytona sandbox readiness failed while another operation waited for it", {
+        sandboxId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
   /** Revoke the token and remove the sandbox's include block. */
   async releaseSshAccess(sandboxId: string): Promise<void> {
+    await this.waitForSandboxReadiness(sandboxId);
     // A mint in flight sees the bump and drops its token instead of writing it back.
     this.accessReleases.set(sandboxId, (this.accessReleases.get(sandboxId) ?? 0) + 1);
     this.sshConfigured.delete(sandboxId);

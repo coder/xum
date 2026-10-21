@@ -25,6 +25,7 @@ export interface DaytonaArchiveHookOptions {
     | "sandboxUseElsewhere"
     | "isAliasStoredElsewhere"
     | "releaseSshAccess"
+    | "waitForSandboxReadiness"
     | "withAccountLease"
   >;
   getArchiveBehavior: () => CoderWorkspaceArchiveBehavior;
@@ -62,6 +63,8 @@ async function archiveSandbox(
     return Ok(undefined);
   }
 
+  // A start in flight would restart the sandbox after the stop below.
+  await options.daytonaService.waitForSandboxReadiness(sandboxId);
   // Only archived workspaces left on it: nobody works there now, so the policy applies, for
   // this workspace's own sandbox or for one whose archived owner deferred it to this archive.
   const owned =
