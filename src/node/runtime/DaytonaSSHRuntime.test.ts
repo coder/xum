@@ -339,6 +339,17 @@ describe("DaytonaSSHRuntime Windows sandboxes", () => {
     expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
   });
 
+  it("refuses a Windows deployment default when no snapshot is chosen", async () => {
+    rig.plane.snapshots.push({ name: "windows-default", sandboxClass: "windows" });
+    rig.plane.defaultSnapshot = "windows-default";
+    const runtime = makeRuntime({});
+    const finalized = await runtime.finalizeConfig("b", sshDaytonaConfig({}));
+    if (!finalized.success) throw new Error(finalized.error);
+    const refused = await runtime.validateBeforePersist("b", finalized.data);
+    expect(refused.success ? "" : refused.error).toContain('"windows-default" creates Windows');
+    expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
+  });
+
   it("offers neither Windows snapshots nor Windows sandboxes", async () => {
     rig.plane.addSandbox({ id: "sb-win", sandboxClass: "windows" });
     rig.plane.addSandbox({ id: "sb-linux", sandboxClass: "linux-vm" });

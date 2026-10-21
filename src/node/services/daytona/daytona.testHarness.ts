@@ -40,6 +40,8 @@ export class FakeDaytonaControlPlane {
   readonly revokedTokens: string[] = [];
   /** The organization's snapshots; `listedOnly` ones only come with the list, not by name. */
   readonly snapshots: Array<{ name: string; sandboxClass?: string; listedOnly?: boolean }> = [];
+  /** The snapshot GET /config advertises as the deployment default; unset advertises none. */
+  defaultSnapshot?: string;
   /** Answer POST /sandbox with 400 when it carries cpu/memory/disk (fixed-resource snapshot). */
   rejectCreateResources = false;
   /** Resources a sandbox gets when created without any. */
@@ -106,6 +108,7 @@ export class FakeDaytonaControlPlane {
         sshGatewayHost: "ssh.daytona.test",
         sshGatewayPort: 22,
         sshGatewayHostKeys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey"],
+        ...(this.defaultSnapshot ? { defaultSnapshot: this.defaultSnapshot } : {}),
       });
     }
     if (route === "GET /sandbox") {

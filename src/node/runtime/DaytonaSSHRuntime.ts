@@ -85,6 +85,7 @@ export type DaytonaRuntimeService = Pick<
   | "replaceRejectedSshToken"
   | "sshTokenGeneration"
   | "findSnapshot"
+  | "getGatewayConfig"
   | "sandboxReferencesElsewhere"
   | "isAliasStoredElsewhere"
   | "withSandboxRemovalLock"
@@ -671,8 +672,28 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   ): Promise<Result<void, string>> {
     if (!findDaytonaSizePreset(daytona)) return Err(invalidSizeError());
     const identity = await this.checkSandboxIdentity(sandboxId, false);
-    if (!identity.success || !daytona.snapshot) return identity;
-    return this.checkSnapshotClass(daytona.snapshot);
+    if (!identity.success) return identity;
+    return daytona.snapshot
+      ? this.checkSnapshotClass(daytona.snapshot)
+      : this.checkDefaultSnapshotClass();
+  }
+
+  /**
+   * "Daytona default" creates from the snapshot the deployment advertises, so a Windows default
+   * is refused like a chosen one. A default the organization cannot look up is Daytona's to
+   * resolve at create time, as when none is advertised.
+   */
+  private async checkDefaultSnapshotClass(): Promise<Result<void, string>> {
+    let snapshot: string | undefined;
+    let found: { windows: boolean } | undefined;
+    try {
+      snapshot = (await this.daytonaService.getGatewayConfig()).defaultSnapshot;
+      found = snapshot ? await this.daytonaService.findSnapshot(snapshot) : undefined;
+    } catch (error) {
+      return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
+    }
+    if (!found?.windows) return Ok(undefined);
+    return Err(`Daytona snapshot "${snapshot}" creates Windows sandboxes. ${LINUX_ONLY}`);
   }
 
   /**
