@@ -509,8 +509,7 @@ async function classifySkillsRoot(args: {
   // Decide "root" from the declared path, not the canonical one: `alias -> .` is still
   // the folder the author named `alias`.
   const declaredPath = path.resolve(args.rootReal, args.relative);
-  const name =
-    declaredPath === args.rootReal ? args.pluginName : path.basename(declaredPath);
+  const name = declaredPath === args.rootReal ? args.pluginName : path.basename(declaredPath);
   return { dir: args.canonical, single: true, name };
 }
 
