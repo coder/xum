@@ -18,6 +18,7 @@
 
 import * as fs from "fs";
 import * as path from "path";
+import { fileURLToPath } from "url";
 import chalk from "chalk";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { parseBoolEnv } from "@/common/utils/env";
@@ -435,35 +436,21 @@ function getTimestamp(): string {
   return `${hours}:${mm}.${ms}${ampm}`;
 }
 
-interface ParsedStackFrame {
-  filePath: string;
-  lineNum: string;
-}
-
-function parseStackFrame(stackLine: string): ParsedStackFrame | null {
-  const match = /\((.+):(\d+):\d+\)$/.exec(stackLine) ?? /at (.+):(\d+):\d+$/.exec(stackLine);
-  if (!match) {
-    return null;
-  }
-
-  const [, filePath, lineNum] = match;
-  return { filePath, lineNum };
-}
-
-function isLoggerStackFrame(stackLine: string, filePath: string): boolean {
+function isLoggerStackFrame(functionName: string, filePath: string): boolean {
   const normalizedPath = filePath.replace(/\\/g, "/");
 
+  // Raw call sites name the compiled file (dist/node/services/log.js), not the mapped source.
   if (
-    normalizedPath.endsWith("/src/node/services/log.ts") ||
-    normalizedPath.endsWith("/src/node/services/log.js")
+    normalizedPath.endsWith("/node/services/log.ts") ||
+    normalizedPath.endsWith("/node/services/log.js")
   ) {
     return true;
   }
 
   return (
-    stackLine.includes("getCallerLocation") ||
-    stackLine.includes("safePipeLog") ||
-    stackLine.includes("formatLogLine")
+    functionName.includes("getCallerLocation") ||
+    functionName.includes("safePipeLog") ||
+    functionName.includes("formatLogLine")
   );
 }
 
@@ -484,6 +471,29 @@ function formatCallerLocation(filePath: string, lineNum: string): string {
 }
 
 /**
+ * The current stack as raw V8 call sites. `new Error().stack` would run the global
+ * Error.prepareStackTrace, which source-map-support replaces (desktop/main.ts, cli/server.ts):
+ * it maps every frame, and the first frame from a file parses that file's whole source map on
+ * this thread (#6556: about 50 ms for workspaceService.js on each desktop start, hundreds of ms
+ * over a server start). So the hook is swapped out for this one capture. The cost: in dist
+ * builds (also `make dev`) the location is the compiled .js line, not the .ts line. Logged
+ * Error objects and uncaught exceptions keep their source-mapped stacks.
+ */
+function rawCallSites(): NodeJS.CallSite[] {
+  const previous = Error.prepareStackTrace;
+  try {
+    Error.prepareStackTrace = (_error, callSites) => callSites;
+    const holder: { stack?: unknown } = {};
+    Error.captureStackTrace(holder, rawCallSites);
+    // Read inside the override: V8 formats the stack on first access.
+    const stack = holder.stack;
+    return Array.isArray(stack) ? (stack as NodeJS.CallSite[]) : [];
+  } finally {
+    Error.prepareStackTrace = previous;
+  }
+}
+
+/**
  * Get the first non-logger caller frame from the stack trace.
  *
  * We intentionally scan frames instead of using a fixed stack index because
@@ -491,23 +501,23 @@ function formatCallerLocation(filePath: string, lineNum: string): string {
  * logger wrapper (e.g. log.ts:488) instead of the real call site.
  */
 function getCallerLocation(): string {
-  const stackLines = new Error().stack?.split("\n").slice(1) ?? [];
-
-  for (const stackLine of stackLines) {
-    const parsedFrame = parseStackFrame(stackLine);
-    if (!parsedFrame) {
+  for (const callSite of rawCallSites()) {
+    const fileName = callSite.getFileName();
+    const lineNumber = callSite.getLineNumber();
+    if (!fileName || lineNumber === null) {
       continue;
     }
 
-    if (parsedFrame.filePath.startsWith("node:")) {
+    if (fileName.startsWith("node:")) {
       continue;
     }
 
-    if (isLoggerStackFrame(stackLine, parsedFrame.filePath)) {
+    const filePath = fileName.startsWith("file:") ? fileURLToPath(fileName) : fileName;
+    if (isLoggerStackFrame(callSite.getFunctionName() ?? "", filePath)) {
       continue;
     }
 
-    return formatCallerLocation(parsedFrame.filePath, parsedFrame.lineNum);
+    return formatCallerLocation(filePath, String(lineNumber));
   }
 
   return "unknown:0";
