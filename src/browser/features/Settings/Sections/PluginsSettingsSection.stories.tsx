@@ -1534,11 +1534,23 @@ const entryPreview = (name: string, skills: string[]): AgentPluginInstallPreview
   targetPath: `~/.mux/plugins/${name}`,
 });
 
-function marketplaceOptions(): MockORPCClientOptions {
+/**
+ * The first entry has a long name without a break point: entry names have no length limit, and
+ * the "Preview <name>" action must still fit the card at phone width.
+ */
+const LONG_NAME_LISTING: AgentPluginMarketplaceListing = {
+  ...MARKETPLACE_LISTING,
+  entries: [
+    { ...MARKETPLACE_LISTING.entries[0], name: "documentskillsforexcelwordpowerpointandpdffiles" },
+    ...MARKETPLACE_LISTING.entries.slice(1),
+  ],
+};
+
+function marketplaceOptions(listing = MARKETPLACE_LISTING): MockORPCClientOptions {
   return {
     agentPlugins: {
       items: [],
-      marketplace: MARKETPLACE_LISTING,
+      marketplace: listing,
       previewsByEntry: {
         "document-skills": entryPreview("document-skills", ["docx", "pdf", "pptx", "xlsx"]),
         "example-skills": entryPreview("example-skills", ["frontend-design", "skill-creator"]),
@@ -1612,7 +1624,7 @@ export const AddPluginMarketplacePhoneViewport: Story = {
     },
   },
   render: () => (
-    <PluginsSectionStoryShell options={marketplaceOptions()}>
+    <PluginsSectionStoryShell options={marketplaceOptions(LONG_NAME_LISTING)}>
       {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
       <div style={{ width: 390 }}>
         <PluginsSettingsSection />

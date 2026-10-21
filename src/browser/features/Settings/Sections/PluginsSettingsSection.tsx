@@ -549,6 +549,12 @@ const AddPluginPanel: React.FC<{
   });
   /** The "Skills CLI" choice of the Install as picker: not a managed install. */
   const [cliChosen, setCliChosen] = useState(false);
+  /**
+   * The marketplace entry of the current preview, if any. Its plugin can live in another
+   * repository or folder than the typed source, which the Skills CLI would install from, so an
+   * entry preview offers no Skills CLI choice. Back to the list picks this entry again.
+   */
+  const [previewedEntry, setPreviewedEntry] = useState<string | null>(null);
 
   /** `method`: the Install as choice; null takes the first method that fits. */
   const handlePreview = async (method: AgentPluginInstallMethod | null) => {
@@ -569,6 +575,7 @@ const AddPluginPanel: React.FC<{
       } else {
         const next = result.data.preview;
         setPreview(next);
+        setPreviewedEntry(method?.kind === "claude-marketplace" ? method.entry : null);
         // An accepted preview starts a new consent decision; failed attempts retain choices.
         setSelected({
           skills: next.skills.map((skill) => skill.name),
@@ -627,8 +634,10 @@ const AddPluginPanel: React.FC<{
           listing={marketplace}
           busy={busy}
           error={error}
+          initialEntry={previewedEntry}
           onBack={() => {
             setMarketplace(null);
+            setPreviewedEntry(null);
             setError(null);
           }}
           onPickEntry={() => setError(null)}
@@ -712,7 +721,10 @@ const AddPluginPanel: React.FC<{
         <>
           <InstallMethodPicker
             preview={preview}
-            cliOffered={offersSkillsCli({ input, ref, subpath, skills: preview.skillsCliSkills })}
+            cliOffered={
+              previewedEntry === null &&
+              offersSkillsCli({ input, ref, subpath, skills: preview.skillsCliSkills })
+            }
             cliChosen={cliChosen}
             disabled={busy}
             onPickCurrent={() => {

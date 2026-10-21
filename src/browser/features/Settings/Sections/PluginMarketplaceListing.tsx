@@ -21,6 +21,8 @@ export const MarketplaceListing: React.FC<{
   busy: boolean;
   error: string | null;
   onBack: () => void;
+  /** The entry to pick first: the one previewed before Back, else the first installable one. */
+  initialEntry?: string | null;
   /** Another entry is picked: the error of the previous preview no longer applies. */
   onPickEntry: () => void;
   onPreviewEntry: (entry: string) => void;
@@ -31,7 +33,11 @@ export const MarketplaceListing: React.FC<{
   // rows and refuses the later one), and two radios must never both be checked. Only an
   // installable row can be picked, and the backend resolves a name to its first (installable) row.
   const [pickedIndex, setPickedIndex] = useState<number | null>(() => {
-    const index = props.listing.entries.findIndex((entry) => entry.installable);
+    const entries = props.listing.entries;
+    const again = entries.findIndex(
+      (entry) => entry.installable && entry.name === props.initialEntry
+    );
+    const index = again !== -1 ? again : entries.findIndex((entry) => entry.installable);
     return index === -1 ? null : index;
   });
   const picked = pickedIndex === null ? null : (props.listing.entries[pickedIndex]?.name ?? null);
@@ -130,10 +136,13 @@ const EntryRow: React.FC<{
         entry.installable ? "cursor-pointer" : "opacity-60"
       )}
     >
+      {/* The list mounts after the source form's Preview button or the preview's Back button
+          unmounts, so the picked entry takes the focus: the arrow keys work at once. */}
       <input
         type="radio"
         name="marketplace-entry"
         value={entry.name}
+        autoFocus={props.checked}
         checked={props.checked}
         disabled={!entry.installable}
         onChange={props.onPick}
@@ -165,6 +174,9 @@ const PreviewEntryButton: React.FC<{
   return (
     <Button
       size="sm"
+      // An entry name has no length limit and may have no break point: let it wrap inside the
+      // card instead of widening the action row past a phone screen.
+      className="h-auto min-h-8 max-w-full py-1 text-left break-all whitespace-normal"
       onClick={() => {
         if (picked !== null) props.onPreview(picked);
       }}
