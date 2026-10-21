@@ -1541,7 +1541,10 @@ const entryPreview = (name: string, skills: string[]): AgentPluginInstallPreview
 const LONG_NAME_LISTING: AgentPluginMarketplaceListing = {
   ...MARKETPLACE_LISTING,
   entries: [
-    { ...MARKETPLACE_LISTING.entries[0], name: "documentskillsforexcelwordpowerpointandpdffiles" },
+    {
+      ...MARKETPLACE_LISTING.entries[0],
+      name: "documentskillsforexcelwordpowerpointandpdffilesandmoredocumentskills",
+    },
     ...MARKETPLACE_LISTING.entries.slice(1),
   ],
 };
