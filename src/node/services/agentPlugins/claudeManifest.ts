@@ -159,6 +159,64 @@ function readAuthor(value: unknown, warnings: string[]): unknown {
   return author;
 }
 
+/** Keys normalizeClaudeManifest maps; every other key warns unless Claude Code ignores it too. */
+const HANDLED_CLAUDE_KEYS = new Set<string>([
+  ...CLAUDE_METADATA_KEYS,
+  "author",
+  "skills",
+  "agents",
+  "mcpServers",
+  "commands",
+  "hooks",
+]);
+
+/** The metadata half of the manifest (with a synthesized `$schema`), warning on unknown keys. */
+function readMetadata(raw: Record<string, unknown>, warnings: string[]): Record<string, unknown> {
+  const manifest: Record<string, unknown> = { $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0 };
+  for (const key of CLAUDE_METADATA_KEYS) {
+    if (raw[key] !== undefined) manifest[key] = raw[key];
+  }
+  if (raw.author !== undefined) manifest.author = readAuthor(raw.author, warnings);
+  for (const key of Object.keys(raw)) {
+    if (HANDLED_CLAUDE_KEYS.has(key) || SILENT_CLAUDE_KEYS.has(key)) continue;
+    warnings.push(`'${key}' is not supported in .claude-plugin/plugin.json; ignoring`);
+  }
+  return manifest;
+}
+
+/**
+ * Claude `skills` adds to the default skills/ scan (Codex replaces it), so the default is listed
+ * first. Without a usable entry, the default applies on its own.
+ */
+function skillsRoots(value: unknown, warnings: string[]): { skills?: string[] } {
+  if (value === undefined) return {};
+  const extra = readPathList("skills", value, MAX_SKILLS_ROOTS - 1, warnings).filter(
+    (root) => root !== "skills"
+  );
+  return extra.length > 0 ? { skills: ["skills", ...extra] } : {};
+}
+
+/**
+ * `commands` and `hooks` paths. A `commands` object map warns and is ignored; like any
+ * `commands` value it still replaces the default commands/ (the Claude rule).
+ */
+function readClaudeComponents(
+  raw: Record<string, unknown>,
+  warnings: string[]
+): ClaudePluginComponents {
+  const claude: ClaudePluginComponents = {};
+  if (isPlainObject(raw.commands)) {
+    warnings.push("An object map in 'commands' is not supported; ignoring it");
+    claude.commands = [];
+  } else if (raw.commands !== undefined) {
+    claude.commands = readPathList("commands", raw.commands, MAX_SKILLS_ROOTS, warnings);
+  }
+  if (raw.hooks !== undefined) {
+    claude.hooks = readPathList("hooks", raw.hooks, MAX_HOOK_POINTER_ENTRIES, warnings);
+  }
+  return claude;
+}
+
 /**
  * Rewrite a `.claude-plugin/plugin.json` document into the Agent Plugins 1.0.0 shape. Used ONLY
  * for that fallback file: the root `plugin.json` parse stays strict.
@@ -178,49 +236,11 @@ function readAuthor(value: unknown, warnings: string[]): unknown {
 export function normalizeClaudeManifest(raw: unknown): NormalizedClaudeManifest {
   const warnings: string[] = [];
   if (!isPlainObject(raw)) return { manifest: raw, warnings, claude: {} };
-
-  const manifest: Record<string, unknown> = { $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0 };
-  for (const key of CLAUDE_METADATA_KEYS) {
-    if (raw[key] !== undefined) manifest[key] = raw[key];
-  }
-  if (raw.author !== undefined) manifest.author = readAuthor(raw.author, warnings);
-
-  const handled = new Set<string>([
-    ...CLAUDE_METADATA_KEYS,
-    "author",
-    "skills",
-    "agents",
-    "mcpServers",
-    "commands",
-    "hooks",
-  ]);
-  for (const key of Object.keys(raw)) {
-    if (handled.has(key) || SILENT_CLAUDE_KEYS.has(key)) continue;
-    warnings.push(`'${key}' is not supported in .claude-plugin/plugin.json; ignoring`);
-  }
-
-  // Claude `skills` adds to the default skills/ scan, so the default is listed first.
-  const skills =
-    raw.skills === undefined
-      ? []
-      : readPathList("skills", raw.skills, MAX_SKILLS_ROOTS - 1, warnings);
+  const manifest = readMetadata(raw, warnings);
   manifest.contributes = {
-    ...(skills.length > 0 ? { skills: ["skills", ...skills.filter((s) => s !== "skills")] } : {}),
+    ...skillsRoots(raw.skills, warnings),
     ...agentsFolder(raw.agents, warnings),
     ...mcpFile(raw.mcpServers, warnings),
   };
-
-  const claude: ClaudePluginComponents = {};
-  if (raw.commands !== undefined) {
-    if (isPlainObject(raw.commands)) {
-      warnings.push("An object map in 'commands' is not supported; ignoring it");
-      claude.commands = [];
-    } else {
-      claude.commands = readPathList("commands", raw.commands, MAX_SKILLS_ROOTS, warnings);
-    }
-  }
-  if (raw.hooks !== undefined) {
-    claude.hooks = readPathList("hooks", raw.hooks, MAX_HOOK_POINTER_ENTRIES, warnings);
-  }
-  return { manifest, warnings, claude };
+  return { manifest, warnings, claude: readClaudeComponents(raw, warnings) };
 }

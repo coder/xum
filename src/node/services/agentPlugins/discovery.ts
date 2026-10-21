@@ -531,6 +531,75 @@ async function classifySkillsRoot(args: {
   return { dir: args.canonical, single: true, name };
 }
 
+/**
+ * OpenAI settings: root `extensions["com.openai"]` when it is an object; otherwise (`overlay`) a
+ * `.codex-plugin/plugin.json` next to it supplies them (the two are never merged). The overlay
+ * contributes nothing else.
+ */
+async function selectOpenAISource(args: {
+  rootReal: string;
+  manifest: AgentPluginManifest;
+  manifestRelative: string;
+  overlay: boolean;
+  scope: AgentPluginScope;
+  diagnostics: AgentPluginDiagnostic[];
+}): Promise<{
+  openaiSource: Pick<AgentPluginManifest, "extensions">;
+  openaiPath: string;
+  openaiManifestPath: string;
+}> {
+  const { rootReal, scope, diagnostics } = args;
+  const own = {
+    openaiSource: args.manifest,
+    openaiPath: path.join(rootReal, args.manifestRelative),
+    openaiManifestPath: args.manifestRelative,
+  };
+  if (!args.overlay) return own;
+  const overlayPath = path.join(rootReal, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH);
+  const overlay = await readManifestCandidate(rootReal, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH);
+  if (overlay.status === "invalid") {
+    diagnostics.push({ path: overlayPath, scope, severity: "warning", message: overlay.message });
+    return own;
+  }
+  if (overlay.status !== "ok") return own;
+  const overlayManifest = normalizeCodexManifest(overlay.raw).manifest;
+  const extensions = isPlainObject(overlayManifest) ? overlayManifest.extensions : undefined;
+  if (!isPlainObject(extensions) || extensions["com.openai"] === undefined) return own;
+  return {
+    openaiSource: { extensions: { "com.openai": extensions["com.openai"] } },
+    openaiPath: overlayPath,
+    openaiManifestPath: CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+  };
+}
+
+/**
+ * The plugin's MCP file and its dialect. Codex packages ship `.mcp.json`; it is the default only
+ * when `mcp.json` is absent (an invalid `mcp.json` still reports its own diagnostic). Claude Code
+ * reads only `.mcp.json`, so a Claude package never falls back to `mcp.json`.
+ */
+async function resolvePluginMcpConfig(args: {
+  rootReal: string;
+  declared: string | undefined;
+  /** The MCP dialect of a Codex or Claude manifest; undefined for a root plugin.json. */
+  manifestDialect: AgentPluginInfo["mcpConfigDialect"];
+  resolveComponent: (relativePath: string, expectKind: "file") => Promise<string | undefined>;
+}): Promise<Pick<AgentPluginInfo, "mcpConfigPath" | "mcpConfigDialect">> {
+  const rootMcpJson =
+    args.manifestDialect !== "claude" &&
+    (await fsPromises.lstat(path.join(args.rootReal, "mcp.json")).catch(() => null)) !== null;
+  const defaultMcpPath = rootMcpJson ? "mcp.json" : CODEX_MCP_CONFIG_RELATIVE_PATH;
+  const mcpConfigPath = await args.resolveComponent(args.declared ?? defaultMcpPath, "file");
+  if (mcpConfigPath === undefined) return {};
+  // Lexical, before canonicalization: a Codex or Claude package's MCP file is in its
+  // manifest's dialect, and the `.mcp.json` default of a root manifest is in the Codex dialect.
+  if (args.manifestDialect !== undefined) {
+    return { mcpConfigPath, mcpConfigDialect: args.manifestDialect };
+  }
+  return args.declared === undefined && !rootMcpJson
+    ? { mcpConfigPath, mcpConfigDialect: "codex" }
+    : { mcpConfigPath };
+}
+
 async function discoverPluginAt(args: {
   pluginDir: string;
   containerPath: string;
@@ -604,33 +673,19 @@ async function discoverPluginAt(args: {
     diagnostics.push({ path: manifestPath, scope, severity: "warning", message: warning });
   }
 
-  // OpenAI settings: root `extensions["com.openai"]` when it is an object;
-  // otherwise a `.codex-plugin/plugin.json` next to it supplies them (the two
-  // are never merged). The overlay contributes nothing else.
-  let openaiSource: Pick<AgentPluginManifest, "extensions"> = validation.manifest;
-  let openaiPath = manifestPath;
-  let openaiManifestPath = manifestRelative;
-  // A Claude package has no extensions (normalizeClaudeManifest drops them), so it gets no
-  // overlay either.
-  if (
-    !codexFallback &&
-    !claudeFallback &&
-    !isPlainObject(validation.manifest.extensions?.["com.openai"])
-  ) {
-    const overlayPath = path.join(rootReal, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH);
-    const overlay = await readManifestCandidate(rootReal, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH);
-    if (overlay.status === "invalid") {
-      diagnostics.push({ path: overlayPath, scope, severity: "warning", message: overlay.message });
-    } else if (overlay.status === "ok") {
-      const overlayManifest = normalizeCodexManifest(overlay.raw).manifest;
-      const extensions = isPlainObject(overlayManifest) ? overlayManifest.extensions : undefined;
-      if (isPlainObject(extensions) && extensions["com.openai"] !== undefined) {
-        openaiSource = { extensions: { "com.openai": extensions["com.openai"] } };
-        openaiPath = overlayPath;
-        openaiManifestPath = CODEX_PLUGIN_MANIFEST_RELATIVE_PATH;
-      }
-    }
-  }
+  const { openaiSource, openaiPath, openaiManifestPath } = await selectOpenAISource({
+    rootReal,
+    manifest: validation.manifest,
+    manifestRelative,
+    // A Claude package has no extensions (normalizeClaudeManifest drops them), so it gets no
+    // overlay either.
+    overlay:
+      !codexFallback &&
+      !claudeFallback &&
+      !isPlainObject(validation.manifest.extensions?.["com.openai"]),
+    scope,
+    diagnostics,
+  });
   const openai = readOpenAIExtension(openaiSource);
   for (const warning of openai.warnings) {
     log.debug(`Agent plugin ${pluginDir}: ${warning}`);
@@ -669,21 +724,12 @@ async function discoverPluginAt(args: {
     pluginName: validation.manifest.name,
     resolveComponent,
   });
-  // Codex packages ship `.mcp.json`; it is the default only when `mcp.json` is
-  // absent (an invalid `mcp.json` still reports its own diagnostic). Claude Code reads only
-  // `.mcp.json`, so a Claude package never falls back to `mcp.json`.
-  const defaultMcpPath =
-    !claudeFallback && (await fsPromises.lstat(path.join(rootReal, "mcp.json")).catch(() => null))
-      ? "mcp.json"
-      : CODEX_MCP_CONFIG_RELATIVE_PATH;
-  const mcpConfigPath = await resolveComponent(contributes?.mcp ?? defaultMcpPath, "file");
-  // Lexical, before canonicalization: a Claude package's MCP file is in the Claude dialect; a
-  // Codex package's MCP file, or the `.mcp.json` default, is in the Codex dialect.
-  const mcpConfigDialect = claudeFallback
-    ? "claude"
-    : codexFallback || (contributes?.mcp === undefined && defaultMcpPath !== "mcp.json")
-      ? "codex"
-      : undefined;
+  const mcp = await resolvePluginMcpConfig({
+    rootReal,
+    declared: contributes?.mcp,
+    manifestDialect: claudeFallback ? "claude" : codexFallback ? "codex" : undefined,
+    resolveComponent,
+  });
   // A package that was not written for Xum ("foreign") gets no Xum executable code: no
   // hooks.js and no workflows/. Today that is a Claude package; the seam is one boolean so a
   // plugin.json that Xum generated for a foreign package can join it. A Codex-fallback package
@@ -715,8 +761,7 @@ async function discoverPluginAt(args: {
     ...(claudeFallback ? { claudeFallback: true, claude: normalized.claude ?? {} } : {}),
     ...(openai.extension !== undefined ? { openai: openai.extension, openaiManifestPath } : {}),
     ...(skillsDirs.length > 0 ? { skillsDirs } : {}),
-    ...(mcpConfigPath !== undefined ? { mcpConfigPath } : {}),
-    ...(mcpConfigPath !== undefined && mcpConfigDialect !== undefined ? { mcpConfigDialect } : {}),
+    ...mcp,
     ...(hooksPath !== undefined ? { hooksPath } : {}),
     ...(agentsDir !== undefined ? { agentsDir } : {}),
     ...(workflowsDir !== undefined ? { workflowsDir } : {}),

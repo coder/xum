@@ -294,15 +294,23 @@ interface NormalizeContext {
 }
 
 /**
- * Claude Code names for PLUGIN_ROOT and PLUGIN_DATA. A Claude-dialect server gets them in its
- * environment too, so they are reserved there like the Agent Plugins names.
+ * The variables Xum supplies to a plugin server's environment: the placeholder names of its
+ * dialect (PLUGIN_ROOT and PLUGIN_DATA, plus the two Claude names for a Claude `.mcp.json`,
+ * because Claude Code exports them and Claude servers read them).
  */
-const CLAUDE_ENV_NAMES = new Set(["CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA"]);
+function suppliedPluginEnv(vars: PluginPlaceholderValues): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(vars).filter((entry): entry is [string, string] => entry[1] !== undefined)
+  );
+}
 
 /** The first problem of a stdio entry's `env` object, or undefined when it is valid. */
-function stdioEnvError(env: Record<string, unknown>, claudeDialect: boolean): string | undefined {
+function stdioEnvError(
+  env: Record<string, unknown>,
+  supplied: Record<string, string>
+): string | undefined {
   for (const [key, value] of Object.entries(env)) {
-    if (isReservedPluginEnvName(key) || (claudeDialect && CLAUDE_ENV_NAMES.has(envNameKey(key)))) {
+    if (isReservedPluginEnvName(key) || Object.hasOwn(supplied, envNameKey(key))) {
       // §9.2: reserved names in `env` make the entry invalid; the client
       // supplies these variables itself.
       return `'env' must not contain reserved variable '${key}'`;
@@ -324,26 +332,45 @@ function stdioEnvError(env: Record<string, unknown>, claudeDialect: boolean): st
   return undefined;
 }
 
+const CLAUDE_ROOT_COMMAND_PREFIX = "${CLAUDE_PLUGIN_ROOT}/";
+
 /**
- * Claude dialect: a command of exactly `${CLAUDE_PLUGIN_ROOT}/<path>` means `./<path>`, so it
- * goes through the same `./` checks (containment, a file, executable). Every other form,
- * including a quoted or absolute one, is left unchanged and refused by classifyCommandToken.
+ * A Claude-dialect stdio entry in Xum's spelling:
+ * - A command of exactly `${CLAUDE_PLUGIN_ROOT}/<path>` becomes `./<path>`, so it goes through
+ *   the same `./` checks (containment, a file, executable). Every other form, including a quoted
+ *   or absolute one, stays unchanged and classifyCommandToken refuses it.
+ * - A cwd anchored at `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_PLUGIN_DATA}` is anchored at the
+ *   matching Xum name, so the cwd form and containment checks apply unchanged.
+ * Args and env values expand the Claude names through the placeholder values instead.
  */
-function rewriteClaudeRootCommand(command: unknown): unknown {
-  const prefix = "${CLAUDE_PLUGIN_ROOT}/";
-  return typeof command === "string" && command.startsWith(prefix) && command.length > prefix.length
-    ? `./${command.slice(prefix.length)}`
-    : command;
+function claudeStdioEntry(entry: Record<string, unknown>): Record<string, unknown> {
+  const { command, cwd } = entry;
+  const rewritten = { ...entry };
+  if (
+    typeof command === "string" &&
+    command.startsWith(CLAUDE_ROOT_COMMAND_PREFIX) &&
+    command.length > CLAUDE_ROOT_COMMAND_PREFIX.length
+  ) {
+    rewritten.command = `./${command.slice(CLAUDE_ROOT_COMMAND_PREFIX.length)}`;
+  }
+  if (typeof cwd === "string") {
+    rewritten.cwd = cwd.replace(
+      /^\$\{CLAUDE_(PLUGIN_(?:ROOT|DATA))\}(?=\/|$)/,
+      (_match, name: string) => `\${${name}}`
+    );
+  }
+  return rewritten;
 }
 
-/** Claude dialect: a cwd anchored at a Claude name is anchored at the matching Xum name. */
-function rewriteClaudeCwdAnchor(cwd: string | undefined): string | undefined {
-  return cwd !== undefined
-    ? cwd.replace(
-        /^\$\{CLAUDE_(PLUGIN_(?:ROOT|DATA))\}(?=\/|$)/,
-        (_match, name: string) => `\${${name}}`
-      )
-    : cwd;
+/** Placeholder values for a plugin's MCP file: the Claude names expand only in its dialect. */
+function pluginPlaceholderValues(
+  plugin: AgentPluginInfo,
+  dataPath: string
+): PluginPlaceholderValues {
+  const vars = { PLUGIN_ROOT: plugin.rootPath, PLUGIN_DATA: dataPath };
+  return plugin.mcpConfigDialect === "claude"
+    ? { ...vars, CLAUDE_PLUGIN_ROOT: plugin.rootPath, CLAUDE_PLUGIN_DATA: dataPath }
+    : vars;
 }
 
 /** Validate + normalize one stdio entry; returns null (with error) when invalid. */
@@ -357,8 +384,7 @@ async function normalizeStdioEntry(
     }
   }
 
-  const claudeDialect = ctx.plugin.mcpConfigDialect === "claude";
-  const command = claudeDialect ? rewriteClaudeRootCommand(entry.command) : entry.command;
+  const command = entry.command;
   if (typeof command !== "string" || classifyCommandToken(command) === null) {
     return {
       error:
@@ -384,13 +410,14 @@ async function normalizeStdioEntry(
     return { error: "'env' must be an object of strings" };
   }
   const env = entry.env ?? {};
-  const envError = stdioEnvError(env, claudeDialect);
+  const supplied = suppliedPluginEnv(ctx.vars);
+  const envError = stdioEnvError(env, supplied);
   if (envError !== undefined) return { error: envError };
 
   if (entry.cwd !== undefined && typeof entry.cwd !== "string") {
     return { error: "'cwd' must be a string" };
   }
-  const cwd = claudeDialect ? rewriteClaudeCwdAnchor(entry.cwd) : entry.cwd;
+  const cwd = entry.cwd;
   if (cwd !== undefined && !CWD_FORM_PATTERN.test(cwd)) {
     return {
       error: "'cwd' must be './…', '${PLUGIN_ROOT}[/…]', or '${PLUGIN_DATA}[/…]'",
@@ -502,15 +529,7 @@ async function normalizeStdioEntry(
       args: expandedArgs,
       // §9.1 overlay order: configured env first, reserved variables last so
       // they can never be shadowed.
-      env: {
-        ...expandedEnv,
-        PLUGIN_ROOT: rootPath,
-        PLUGIN_DATA: ctx.dataPath,
-        // Claude Code exports these to plugin MCP servers, and Claude servers read them.
-        ...(claudeDialect
-          ? { CLAUDE_PLUGIN_ROOT: rootPath, CLAUDE_PLUGIN_DATA: ctx.dataPath }
-          : {}),
-      },
+      env: { ...expandedEnv, ...supplied },
       cwd: resolvedCwd,
       disabled: true,
       plugin: {
@@ -623,7 +642,10 @@ async function normalizeServerEntry(
     return normalizeRemoteEntry(entry, ctx);
   if (entry.type !== "stdio")
     return { error: `unknown server 'type' ${JSON.stringify(entry.type)}` };
-  const result = await normalizeStdioEntry(entry, ctx);
+  const result = await normalizeStdioEntry(
+    ctx.plugin.mcpConfigDialect === "claude" ? claudeStdioEntry(entry) : entry,
+    ctx
+  );
   if ("info" in result && translated.forwardEnv !== undefined)
     result.info.forwardEnv = translated.forwardEnv;
   return result;
@@ -716,8 +738,8 @@ export async function loadPluginMcpServers(
   // from the lexical selection (a contained symlink keeps the dialect); a
   // root mcp.json stays strict. A Claude `.mcp.json` has the Codex shape, plus
   // the Claude names for the two plugin variables (normalizeStdioEntry).
-  const claudeDialect = plugin.mcpConfigDialect === "claude";
-  const codexDialect = plugin.mcpConfigDialect === "codex" || claudeDialect;
+  // Both dialects ("codex" and "claude") have the Codex shape.
+  const codexDialect = plugin.mcpConfigDialect !== undefined;
   // Codex also accepts a flat `{ "<server>": {...} }` map without `mcpServers`.
   const doc: Record<string, unknown> =
     codexDialect && !("mcpServers" in raw)
@@ -753,14 +775,7 @@ export async function loadPluginMcpServers(
   const normalizeCtx: NormalizeContext = {
     plugin,
     dataPath,
-    vars: {
-      PLUGIN_ROOT: plugin.rootPath,
-      PLUGIN_DATA: dataPath,
-      // Claude names for the same values: args, env and cwd expand them.
-      ...(claudeDialect
-        ? { CLAUDE_PLUGIN_ROOT: plugin.rootPath, CLAUDE_PLUGIN_DATA: dataPath }
-        : {}),
-    },
+    vars: pluginPlaceholderValues(plugin, dataPath),
   };
 
   for (const [serverName, rawEntryValue] of Object.entries(doc.mcpServers)) {

@@ -39,7 +39,7 @@ import {
   type AgentPluginInfo,
 } from "./discovery";
 import { isPlainObject } from "./manifest";
-import { MAX_HOOK_POINTER_ENTRIES } from "./openaiExtension";
+import { MAX_HOOK_POINTER_ENTRIES, type OpenAIPluginHooksEntry } from "./openaiExtension";
 
 /** Codex events Xum maps to its own hook points. */
 export const MAPPED_CODEX_HOOK_EVENTS = {
@@ -160,19 +160,8 @@ export async function loadPluginCodexHooks(
 ): Promise<PluginHooksLoadResult> {
   const warnings = new HookWarnings();
   const hooks: PluginHookDefinition[] = [];
-  const pointer = plugin.openai?.hooks;
-  // Discovery already caps the entries; this guards any other caller of the loader.
-  if (pointer !== undefined && pointer.length > MAX_HOOK_POINTER_ENTRIES) {
-    warnings.push(
-      `'extensions["com.openai"].hooks' has ${pointer.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
-    );
-  }
+  const { entries, defaultFileListed } = listHookEntries(plugin, warnings);
   const claude = plugin.claudeFallback === true;
-  // A Claude package has no com.openai pointer (discovery drops its extensions).
-  const entries = pointer?.slice(0, MAX_HOOK_POINTER_ENTRIES) ?? [
-    DEFAULT_HOOKS_FILE,
-    ...(claude ? (plugin.claude?.hooks ?? []) : []),
-  ];
   const seenFiles = new Set<string>();
   const inlineSource = path.normalize(plugin.openaiManifestPath ?? PLUGIN_MANIFEST_RELATIVE_PATH);
   for (const [index, entry] of entries.entries()) {
@@ -199,7 +188,7 @@ export async function loadPluginCodexHooks(
     }
     seenFiles.add(path.normalize(entry));
     // Only the default file is optional: a listed file that is missing is a plugin bug.
-    const isDefault = pointer == null && index === 0;
+    const isDefault = defaultFileListed && index === 0;
     const content = await readHooksFile(plugin.rootPath, entry, isDefault, warnings);
     if (content === undefined) continue;
     let document: unknown;
@@ -217,6 +206,29 @@ export async function loadPluginCodexHooks(
     hooks.length = MAX_PLUGIN_HOOKS;
   }
   return { hooks, warnings: list };
+}
+
+/**
+ * The hook sources to read, in order: the com.openai pointer, or the default file followed by a
+ * Claude package's manifest `hooks` files. A Claude package has no com.openai pointer (discovery
+ * drops its extensions). `defaultFileListed`: the first entry is the optional default file.
+ */
+function listHookEntries(
+  plugin: Pick<AgentPluginInfo, "openai" | "claudeFallback" | "claude">,
+  warnings: HookWarnings
+): { entries: OpenAIPluginHooksEntry[]; defaultFileListed: boolean } {
+  const pointer = plugin.openai?.hooks;
+  if (pointer == null) {
+    const claudeFiles = plugin.claudeFallback === true ? (plugin.claude?.hooks ?? []) : [];
+    return { entries: [DEFAULT_HOOKS_FILE, ...claudeFiles], defaultFileListed: true };
+  }
+  // Discovery already caps the entries; this guards any other caller of the loader.
+  if (pointer.length > MAX_HOOK_POINTER_ENTRIES) {
+    warnings.push(
+      `'extensions["com.openai"].hooks' has ${pointer.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
+    );
+  }
+  return { entries: pointer.slice(0, MAX_HOOK_POINTER_ENTRIES), defaultFileListed: false };
 }
 
 async function readHooksFile(
