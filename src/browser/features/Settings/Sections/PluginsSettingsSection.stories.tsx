@@ -11,6 +11,7 @@ import { PIXEL_DISABLED } from "@/browser/stories/meta";
 import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
 import type {
   AgentPluginHooks,
+  AgentPluginInstallPreview,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
 } from "@/common/orpc/schemas/agentPlugins";
@@ -1171,5 +1172,191 @@ export const ComponentReviewIntentWaitsForLiveConnection: Story = {
     const canvas = within(canvasElement);
     await userEvent.click(await canvas.findByRole("button", { name: "Connect" }));
     await canvas.findByText(/Skill 'grilling' needs review/);
+  },
+};
+
+const SKILLS_REPO_SOURCE = {
+  type: "git" as const,
+  url: "https://github.com/acme/review-kit.git",
+  ref: "main",
+  refType: "branch" as const,
+};
+
+/** A repository with a Claude manifest and a skills/ folder: three ways to install it. */
+const CLAUDE_REPO_PREVIEW: AgentPluginInstallPreview = {
+  source: SKILLS_REPO_SOURCE,
+  method: { kind: "claude-plugin" },
+  methods: [{ kind: "claude-plugin" }, { kind: "skills" }],
+  lockedSha: "3f2a9c1e0b7d4a5f6e7d8c9b0a1f2e3d4c5b6a79",
+  manifest: { name: "review-kit", version: "1.4.0", description: "Review tools" },
+  skills: [
+    { name: "frontend-design", description: "Design production-grade frontends." },
+    { name: "pdf", description: "Read and fill PDF files." },
+    { name: "skill-creator", description: "Create new skills." },
+  ],
+  mcpServers: [{ serverName: "review-db", transport: "stdio", summary: "node ./bin/db.js" }],
+  agents: ["reviewer.md"],
+  workflows: [],
+  slashCommands: [],
+  reviewedComponents: [],
+  codexHooks: [],
+  warnings: [],
+  targetPath: "~/.mux/plugins/review-kit",
+  consentDigest: "c".repeat(64),
+};
+
+/** The same repository previewed as Skills: Xum generated its plugin.json. */
+const SKILLS_PREVIEW: AgentPluginInstallPreview = {
+  ...CLAUDE_REPO_PREVIEW,
+  method: { kind: "skills" },
+  manifest: { name: "review-kit", description: "Skills from github.com/acme/review-kit" },
+  mcpServers: [],
+  agents: [],
+  consentDigest: "d".repeat(64),
+};
+
+function installAsOptions(
+  overrides: NonNullable<MockORPCClientOptions["agentPlugins"]> = {}
+): MockORPCClientOptions {
+  return {
+    agentPlugins: {
+      items: [],
+      preview: CLAUDE_REPO_PREVIEW,
+      previewsByMethod: { "claude-plugin": CLAUDE_REPO_PREVIEW, skills: SKILLS_PREVIEW },
+      ...overrides,
+    },
+  };
+}
+
+async function openInstallAs(canvasElement: HTMLElement, source = "acme/review-kit") {
+  const canvas = within(canvasElement);
+  await userEvent.click(await canvas.findByRole("button", { name: /Add plugin/ }));
+  await userEvent.type(await canvas.findByLabelText(/Git URL or owner\/repo/), source);
+  await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
+  await canvas.findByRole("group", { name: "Install as" });
+  return canvas;
+}
+
+/**
+ * Two methods fit (a Claude manifest and SKILL.md folders): the preview shows "Install as". The keyboard moves between choices, and Space previews again.
+ */
+export const AddPluginInstallAs: Story = {
+  render: () => (
+    <PluginsSectionStoryShell options={installAsOptions()}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openInstallAs(canvasElement);
+    const claude = await canvas.findByRole("radio", { name: "Claude Code plugin" });
+    await expect(claude).toHaveAttribute("aria-checked", "true");
+    await canvas.findByText("Agents (1)");
+    // The preview badge names the method.
+    await expect(canvas.getAllByText("Claude Code plugin", { selector: "span" })).toHaveLength(1);
+
+    // Keyboard: focus the checked choice, move right, pick it with Space.
+    claude.focus();
+    await userEvent.keyboard("{ArrowRight}");
+    const skills = canvas.getByRole("radio", { name: "Skills" });
+    await expect(skills).toHaveFocus();
+    await userEvent.keyboard(" ");
+    await waitFor(() => expect(skills).toHaveAttribute("aria-checked", "true"));
+    await canvas.findByText("Skills from github.com/acme/review-kit");
+    // The pick previews again; the choice keeps focus, so the arrow keys still work.
+    await expect(skills).toHaveFocus();
+    await expect(canvas.queryByText("Agents (1)")).toBeNull();
+    await expect(canvas.getAllByText("Skills", { selector: "span" })).toHaveLength(1);
+  },
+};
+
+/** The picker at phone width: choices wrap and nothing overflows the card. */
+export const AddPluginInstallAsPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={installAsOptions()}>
+      {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openInstallAs(canvasElement);
+    const group = canvas.getByRole("group", { name: "Install as" });
+    const card = group.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) throw new Error("Add panel card not found");
+    if (card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("The Install as choice overflows the card at phone width");
+    }
+  },
+};
+
+/** Only Claude Code plugin hooks: the note says they never run, not "until you trust". */
+export const AddPluginClaudeHooksNeverRun: Story = {
+  render: () => (
+    <PluginsSectionStoryShell
+      options={installAsOptions({
+        preview: {
+          ...CLAUDE_REPO_PREVIEW,
+          codexHooks: [
+            {
+              key: "hooks/hooks.json#PreToolUse[0][0]",
+              hash: "4".repeat(64),
+              event: "PreToolUse",
+              handler: { type: "command", summary: "node ${CLAUDE_PLUGIN_ROOT}/hooks/check.js" },
+              status: "claude-plugin",
+              source: "hooks/hooks.json",
+            },
+          ],
+        },
+      })}
+    >
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openInstallAs(canvasElement);
+    await canvas.findByText("hooks.json hooks (1)");
+    await canvas.findByText("Xum never runs these hooks.");
+    await expect(canvas.queryByText(/until you trust/)).toBeNull();
+  },
+};
+
+const NAME_TAKEN = "A managed plugin named 'review-kit' is already installed. Uninstall it first.";
+
+/**
+ * A managed plugin of the same name is installed: Install is blocked for each method, but the
+ * preview keeps the Install as choice.
+ */
+export const AddPluginInstallBlockedByName: Story = {
+  render: () => (
+    <PluginsSectionStoryShell
+      options={installAsOptions({
+        preview: { ...CLAUDE_REPO_PREVIEW, installBlockedReason: NAME_TAKEN },
+        previewsByMethod: {
+          "claude-plugin": { ...CLAUDE_REPO_PREVIEW, installBlockedReason: NAME_TAKEN },
+          skills: { ...SKILLS_PREVIEW, installBlockedReason: NAME_TAKEN },
+        },
+      })}
+    >
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openInstallAs(canvasElement);
+    await canvas.findByText(/Xum cannot install this as Claude Code plugin\. A managed plugin/);
+    await expect(canvas.getByRole("button", { name: "Install" })).toBeDisabled();
+
+    await userEvent.click(canvas.getByRole("radio", { name: "Skills" }));
+    await canvas.findByText(/Xum cannot install this as Skills\. A managed plugin/);
+    await expect(canvas.getByRole("button", { name: "Install" })).toBeDisabled();
   },
 };

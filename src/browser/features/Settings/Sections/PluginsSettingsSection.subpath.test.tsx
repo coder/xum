@@ -89,6 +89,8 @@ test("the installed row and the consent preview show the monorepo plugin folder"
       input: "https://gitlab.com/acme/mono.git",
       ref: null,
       subpath: "packages/pstack",
+      // No "Install as" choice yet: the first method that fits.
+      method: null,
     })
   );
   await waitFor(() =>

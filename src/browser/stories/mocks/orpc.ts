@@ -58,6 +58,7 @@ import type { NameGenerationError } from "@/common/types/errors";
 import type { Secret } from "@/common/types/secrets";
 import type { MCPHttpServerInfo, MCPServerIdentity, MCPServerInfo } from "@/common/types/mcp";
 import type {
+  AgentPluginInstallMethod,
   AgentPluginInstallPreview,
   AgentPluginListItem,
   AgentPluginUpdateCheck,
@@ -160,6 +161,8 @@ export interface MockORPCClientOptions {
     updateChecks?: AgentPluginUpdateCheck[];
     /** Returned by agentPlugins.preview; omit to make preview fail. */
     preview?: AgentPluginInstallPreview;
+    /** Returned by agentPlugins.preview for an "Install as" method; others get `preview`. */
+    previewsByMethod?: Partial<Record<AgentPluginInstallMethod["kind"], AgentPluginInstallPreview>>;
     /** Returned by agentPlugins.previewUpdate for the named plugin; omit to make it fail. */
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
@@ -1424,10 +1427,17 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       checkUpdates: () =>
         Promise.resolve({ success: true, data: agentPluginsMock?.updateChecks ?? [] }),
-      preview: () =>
-        agentPluginsMock?.preview
-          ? Promise.resolve({ success: true, data: agentPluginsMock.preview })
-          : Promise.resolve({ success: false, error: "No preview configured in this story" }),
+      preview: (input: { method?: AgentPluginInstallMethod | null }) => {
+        const preview =
+          (input.method != null ? agentPluginsMock?.previewsByMethod?.[input.method.kind] : null) ??
+          agentPluginsMock?.preview;
+        return preview
+          ? Promise.resolve({ success: true as const, data: preview })
+          : Promise.resolve({
+              success: false as const,
+              error: "No preview configured in this story",
+            });
+      },
       install: (input: { source: AgentPluginInstallPreview["source"]; expectedSha: string }) =>
         Promise.resolve({
           success: true,
