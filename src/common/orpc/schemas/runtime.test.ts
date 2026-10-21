@@ -87,7 +87,16 @@ describe("RuntimeConfigSchema ssh backends", () => {
   const ssh = { type: "ssh", host: "sb-1.xum--daytona", srcBaseDir: "~/xum" } as const;
 
   test("keeps the daytona sub-config through a persist round-trip", () => {
-    const daytona = { sandboxId: "sb-1", cpu: 2, memoryGiB: 4, diskGiB: 10, shared: true };
+    const daytona = {
+      sandboxId: "sb-1",
+      snapshot: "node-22",
+      cpu: 2,
+      memoryGiB: 4,
+      diskGiB: 10,
+      target: "eu",
+      shared: false,
+      forked: true,
+    };
     expect(RuntimeConfigSchema.parse({ ...ssh, daytona })).toEqual({ ...ssh, daytona });
   });
 

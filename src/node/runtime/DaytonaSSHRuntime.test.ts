@@ -127,11 +127,17 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
 
   it("shares one start between concurrent checks", async () => {
     rig.plane.addSandbox({ id: "sb-archived", state: "archived" });
-    const results = await Promise.all([
-      makeRuntime({ sandboxId: "sb-archived" }).ensureReady(),
-      makeRuntime({ sandboxId: "sb-archived" }).ensureReady(),
-    ]);
+    const phases: string[][] = [[], []];
+    const results = await Promise.all(
+      phases.map((seen) =>
+        makeRuntime({ sandboxId: "sb-archived" }).ensureReady({
+          statusSink: (event) => seen.push(event.phase),
+        })
+      )
+    );
     expect(results).toEqual([{ ready: true }, { ready: true }]);
+    // The second check joins the first one's start, so it reports that start too.
+    expect(phases.map((seen) => seen.includes("starting"))).toEqual([true, true]);
     expect(rig.plane.countCalls("POST /sandbox/sb-archived/start")).toBe(1);
     expect(rig.plane.countCalls("POST /sandbox/sb-archived/ssh-access")).toBe(1);
   });
@@ -326,6 +332,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     );
 
     expect(result.success).toBe(true);
+    expect(sshDeleteSpy).toHaveBeenCalledTimes(1);
     expect(rig.plane.find("sb-clean")).toBeUndefined();
     expect(rig.writer.removed).toContain("sb-clean");
     expect(rig.plane.revokedTokens).toHaveLength(1);
@@ -619,7 +626,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
 
     // A UI or background runtime never starts the (billed) sandbox.
     const background = makeRuntime({ sandboxId: "sb-nap" }, rig, { transport });
-    expect(background.exec("echo ok", { cwd: "/tmp", timeout: 10 })).rejects.toThrow(
+    await expect(background.exec("echo ok", { cwd: "/tmp", timeout: 10 })).rejects.toThrow(
       "Connection closed"
     );
     expect(rig.plane.countCalls("POST /sandbox/sb-nap/start")).toBe(0);
