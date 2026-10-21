@@ -1016,6 +1016,10 @@ export class DaytonaService {
     this.readyAt.delete(sandboxId);
     await this.forgetSshToken(sandboxId);
     await this.sshConfigWriter.removeSandbox(sandboxId);
+    // A revoked token does not end sessions it opened: pooled connections and the bash AI
+    // proxy's reverse forward would keep reaching the sandbox. Retired only once the include
+    // block is gone, so nothing reconnects from it.
+    await this.retirePooledSsh([sandboxId]);
   }
 
   tokenNeedsRefresh(sandboxId: string): boolean {

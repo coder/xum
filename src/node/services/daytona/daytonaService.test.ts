@@ -283,6 +283,8 @@ describe("DaytonaService", () => {
     const writes: string[] = [];
     /** Sandboxes whose pooled ssh connections were retired. */
     const retired: string[] = [];
+    /** Include block removals and retirements, in order. */
+    const order: string[] = [];
     const record = (input: { token: string; gateway: { host: string; hostKeys: string[] } }) => {
       writes.push(`${input.token}@${input.gateway.host} ${input.gateway.hostKeys.join(",")}`);
       return Promise.resolve();
@@ -295,16 +297,20 @@ describe("DaytonaService", () => {
       sshConfigWriter: {
         writeSandbox: record,
         updateToken: record,
-        removeSandbox: () => Promise.resolve(),
+        removeSandbox: (sandboxId) => {
+          order.push(`remove ${sandboxId}`);
+          return Promise.resolve();
+        },
         readTokens: () => Promise.resolve([]),
         verifyResolvedConfig: () => Promise.resolve(),
       },
       retireSshConnections: (sandboxId) => {
         retired.push(sandboxId);
+        order.push(`retire ${sandboxId}`);
         return Promise.resolve();
       },
     });
-    return { service: recording, writes, retired };
+    return { service: recording, writes, retired, order };
   }
 
   it("refuses a settings change while it looks up the gateway for a token", async () => {
@@ -376,6 +382,17 @@ describe("DaytonaService", () => {
     await changing.setConfig({ target: "eu" });
 
     expect(retired).toEqual(["sb-1"]);
+  });
+
+  it("retires a released sandbox's ssh connections once its include block is gone", async () => {
+    const { service: releasing, order } = serviceRecordingWrites();
+    await releasing.ensureSshAccess("sb-1");
+
+    await releasing.releaseSshAccess("sb-1");
+
+    // Pooled sessions and reverse forwards stay authenticated after the token is revoked; a
+    // retirement before the block is gone could reconnect from it.
+    expect(order).toEqual(["remove sb-1", "retire sb-1"]);
   });
 
   it("revokes a token minted across a release, keeping the access released", async () => {
