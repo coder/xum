@@ -1168,6 +1168,13 @@ body,
   display: none;
 }
 
+/* The closed sidebar (RightSidebar marks it) is a 0px box around the card, so it shows only with
+   the card (below): elsewhere assistive tech would find an empty "Workspace insights" landmark.
+   The full-screen view keeps its header and its close button. */
+.mobile-hide-right-sidebar[data-right-sidebar-phase="closed"]:not(.right-sidebar-fullscreen) {
+  visibility: hidden;
+}
+
 .right-sidebar-toggle {
   display: none;
 }
@@ -1189,16 +1196,24 @@ body,
 @container workspace-shell (width >= 66.625rem) {
   [data-workspace-shell]:not([data-transcript-full-width])
     > .mobile-hide-right-sidebar
-    > .right-sidebar-overview-card {
+    > .right-sidebar-overview-card,
+  [data-workspace-shell]:not([data-transcript-full-width])
+    > .mobile-hide-right-sidebar[data-right-sidebar-phase="closed"]:not(
+      :has(> .right-sidebar-overview-card > :empty)
+    ) {
     visibility: visible;
   }
 
   /* Keyed on the collapsed state (WorkspaceShell), not on the card element, which mounts only
-     once the lazy sidebar chunk loads: the transcript must not shift when it does. A chunk that
-     failed to load shows docked instead, with no card, so nothing is reserved then. Not on the
-     sidebar itself: a side chat's transcript in its sliding panel must not inherit it. */
+     once the lazy sidebar chunk loads: the transcript must not shift when it does. Nothing is
+     reserved where no card shows: a chunk that failed to load shows docked instead, and a card
+     with nothing to summarize is hidden (above), so the transcript widens once that card mounts.
+     Not on the sidebar itself: a side chat's transcript in its sliding panel must not inherit it. */
   [data-workspace-shell][data-right-sidebar-collapsed]:not([data-transcript-full-width]):not(
-      :has(> [data-right-sidebar-load-failed])
+      :has(
+        > [data-right-sidebar-load-failed],
+        > .mobile-hide-right-sidebar > .right-sidebar-overview-card > :empty
+      )
     )
     > :not(.mobile-hide-right-sidebar) {
     --chat-reserved-inline-end: calc(var(--overview-card-width) + var(--overview-card-inset));

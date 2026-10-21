@@ -29,14 +29,25 @@ import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
-import type { MockSessionUsage } from "@/browser/stories/mocks/orpc";
+import { createMockORPCClient, type MockSessionUsage } from "@/browser/stories/mocks/orpc";
 import { AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
 import { blurActiveElement, openSidebarNewTab } from "@/browser/stories/storyPlayHelpers";
-import { setupSimpleChatStory, setupStreamingChatStory } from "@/browser/stories/helpers/chatSetup";
+import {
+  createOnChatAdapter,
+  setupSimpleChatStory,
+  setupStreamingChatStory,
+} from "@/browser/stories/helpers/chatSetup";
+import { createStaticChatHandler } from "@/browser/stories/mocks/chatHandlers";
 import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { setHunkFirstSeen } from "@/browser/stories/helpers/reviews";
-import { collapseLeftSidebar, expandRightSidebar } from "@/browser/stories/helpers/uiState";
+import {
+  collapseLeftSidebar,
+  collapseRightSidebar,
+  expandRightSidebar,
+  selectWorkspace,
+} from "@/browser/stories/helpers/uiState";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
   RIGHT_SIDEBAR_COLLAPSED_KEY,
@@ -1939,8 +1950,130 @@ export const CollapsedOverviewYieldsToTranscript: Story = {
     await expect(getComputedStyle(card).visibility).toBe("hidden");
     // The layout still shows the (zero-width) sidebar, so its shortcuts keep expanding it
     // rather than taking the narrow-layout fallbacks.
-    const sidebar = canvas.getByRole("complementary", { name: "Workspace insights" });
-    await expect(getComputedStyle(sidebar).display).not.toBe("none");
+    const sidebar = canvasElement.querySelector<HTMLElement>('[aria-label="Workspace insights"]');
+    await expect(sidebar).not.toBeNull();
+    await expect(getComputedStyle(sidebar!).display).not.toBe("none");
+    // Without its card the sidebar is no landmark: assistive tech would find it empty.
+    await expect(canvas.queryByRole("complementary", { name: "Workspace insights" })).toBeNull();
+  },
+};
+
+/**
+ * Sliding out, the panel stays painted but takes no focus: Tab right after collapsing does not
+ * land on a control that unmounts when the slide ends. The 1000px workspace hides the card, so
+ * nothing else in the sidebar can take that focus.
+ */
+export const CollapsingPanelTakesNoFocus: Story = {
+  ...CollapsedOverviewYieldsToTranscript,
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggle = await canvas.findByRole(
+      "button",
+      { name: "Expand right sidebar" },
+      { timeout: 15_000 }
+    );
+    toggle.focus();
+    await userEvent.keyboard("{Enter}");
+    const sidebar = await canvas.findByRole("complementary", { name: "Workspace insights" });
+    await waitFor(() => {
+      if (sidebar.querySelector('[role="tablist"]') == null || sidebar.getAnimations().length > 0) {
+        throw new Error("The sidebar is still sliding open");
+      }
+    });
+
+    await userEvent.keyboard("{Enter}");
+    await expect(toggle).toHaveAccessibleName("Expand right sidebar");
+    await userEvent.tab();
+    // Still sliding out after the Tab, so the panel was there to tab into.
+    await expect(sidebar.querySelector('[role="tablist"]')).not.toBeNull();
+    await expect(sidebar.contains(document.activeElement)).toBe(false);
+  },
+};
+
+/** A scratch workspace's side chat with no usage yet: its collapsed sidebar has nothing to show. */
+function setupEmptyOverview(): APIClient {
+  const scratchWorkspace = (id: string, title: string) => {
+    const path = `/home/user/.mux/scratch/${id}`;
+    return {
+      ...createWorkspace({
+        id,
+        name: `scratch-${id}`,
+        projectName: "Scratch",
+        projectPath: path,
+        title,
+        runtimeConfig: { type: "local" },
+      }),
+      kind: "scratch" as const,
+      namedWorkspacePath: path,
+    };
+  };
+  const parent = scratchWorkspace("scratch-parent", "Scratch");
+  const sideChat = {
+    ...scratchWorkspace("scratch-side-chat", "Side question"),
+    sideChatParentWorkspaceId: parent.id,
+  };
+  const workspaces = [parent, sideChat];
+  selectWorkspace(sideChat);
+  collapseLeftSidebar();
+  collapseRightSidebar();
+  return createMockORPCClient({
+    projects: new Map([
+      [
+        SCRATCH_PROJECT_CONFIG_KEY,
+        {
+          projectKind: "system",
+          trusted: true,
+          workspaces: workspaces.map((workspace) => ({
+            kind: "scratch" as const,
+            path: workspace.namedWorkspacePath,
+            id: workspace.id,
+            name: workspace.name,
+            runtimeConfig: { type: "local" as const },
+          })),
+        },
+      ],
+    ]),
+    workspaces,
+    onChat: createOnChatAdapter(
+      new Map([
+        [
+          sideChat.id,
+          createStaticChatHandler([
+            createUserMessage("msg-1", "What does the hedger do?", { historySequence: 1 }),
+            createAssistantMessage("msg-2", "It offsets the open position.", {
+              historySequence: 2,
+            }),
+          ]),
+        ],
+      ])
+    ),
+  });
+}
+
+/**
+ * A collapsed sidebar with nothing to summarize shows no card, so the transcript takes the room
+ * a card would have had, and no empty landmark is left in its place.
+ */
+export const CollapsedEmptyOverviewReservesNothing: Story = {
+  globals: { viewport: { value: "desktop", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={setupEmptyOverview} />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByRole("button", { name: "Expand right sidebar" }, { timeout: 15_000 });
+    const card = await waitFor(
+      () => {
+        const element = canvasElement.querySelector<HTMLElement>(".right-sidebar-overview-card");
+        if (!element) throw new Error("Overview card not mounted yet");
+        return element;
+      },
+      { timeout: 15_000 }
+    );
+    await expect(getComputedStyle(card).display).toBe("none");
+    // The 1600px workspace has room for a card, but reserves none for this one.
+    await expect(getPaddingRight(getChatScrollport(canvasElement))).toBe(15);
+    await expect(canvas.queryByRole("complementary", { name: "Workspace insights" })).toBeNull();
   },
 };
 

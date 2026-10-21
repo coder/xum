@@ -273,7 +273,7 @@ function useSidebarSlidePhase(
   return { phase, sliding };
 }
 
-/** Marks the container inert while immersive review covers it. */
+/** Marks the element inert while `inert` holds (React 18 has no `inert` prop). */
 function useInertWhile(ref: React.RefObject<HTMLElement>, inert: boolean): void {
   React.useEffect(() => {
     const element = ref.current;
@@ -323,9 +323,14 @@ const SidebarPanelFrame: React.FC<{
   width: string;
   render: () => React.ReactNode;
 }> = (props) => {
+  const frameRef = React.useRef<HTMLDivElement>(null);
+  // Sliding out, it stays painted but takes no focus: Tab must not land on a control that
+  // unmounts when the slide ends, which would drop focus to the page body.
+  useInertWhile(frameRef, props.phase === "closing");
   if (props.phase === "closed") return null;
   return (
     <div
+      ref={frameRef}
       className={cn(
         "bg-surface-primary flex min-h-0 min-w-0 flex-1 flex-row",
         !props.fullscreen && "border-border-light border-l",
@@ -365,6 +370,7 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({ containerRef, ...pr
   const immersiveHidden = props.immersiveHidden === true;
   const { phase, sliding } = useSidebarSlidePhase(props.collapsed, containerRef);
   const animating = sliding && !props.isResizing;
+  // Immersive review covers it.
   useInertWhile(containerRef, immersiveHidden);
 
   return (
@@ -373,6 +379,9 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({ containerRef, ...pr
       aria-hidden={immersiveHidden || undefined}
       // globals.css eases the chat's room for the overview card only while this is set.
       data-right-sidebar-animating={animating || undefined}
+      // globals.css hides the closed (0px) sidebar wherever its card does not show, so assistive
+      // tech finds no empty landmark there.
+      data-right-sidebar-phase={phase}
       className={cn(
         "bg-surface-primary flex flex-shrink-0 flex-col",
         // While sliding: clip, not hidden (the panel is wider than this box then, and focus() or
