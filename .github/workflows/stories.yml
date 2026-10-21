@@ -156,6 +156,9 @@ jobs:
         with:
           name: stories-reports-${{ github.run_attempt }}
           path: ${{ runner.temp }}/stories-reports
+          # The job folders sit under .e2e/, and upload-artifact skips hidden paths by default:
+          # without this the artifact is empty (seen on #7140's own run).
+          include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
       # The screenshots, logs and traces the failure blocks link to (the run's #artifacts).
@@ -167,6 +170,7 @@ jobs:
           path: |
             tests/stories/.e2e/stories-*/results
             tests/bugbash/.e2e/agent-repros-*/results
+          include-hidden-files: true # the results sit under .e2e/ (see the reports upload)
           if-no-files-found: ignore
           retention-days: 7
       # Every run saves its seed, a failed one too: e2e (read-write mode) saves a recording only
