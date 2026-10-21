@@ -66,8 +66,10 @@ function setWorkflowRuns(authoritative: boolean, activeWorkflowRunCount: number)
   workflowRuns = { authoritative, sidebarState: { activeWorkflowRunCount } };
   act(() => workflowRunListeners.forEach((listener) => listener()));
 }
-// The workflow-run baseline the stub sidebar received when it mounted.
+// The workflow-run baseline and the collapsed state from before the load that the stub sidebar
+// received when it mounted.
 let mountedWorkflowRunBaseline: number | null | undefined;
+let mountedCollapsedBeforeLoad: boolean | undefined;
 // What the stub sidebar's own window listeners received, in order.
 const sidebarInput: string[] = [];
 const SIDEBAR_EVENT_TYPES = [
@@ -144,6 +146,7 @@ void mock.module("@/browser/features/RightSidebar/RightSidebar", () => ({
   RightSidebar: (props: {
     addTerminalRef: MutableRefObject<(() => void) | null>;
     workflowRunBaseline?: number | null;
+    collapsedBeforeLoad?: boolean;
     fullscreen?: boolean;
     onCloseFullscreen?: () => void;
   }) => {
@@ -155,8 +158,9 @@ void mock.module("@/browser/features/RightSidebar/RightSidebar", () => ({
     props.addTerminalRef.current = addTerminalMock;
     // Like RightSidebar, it subscribes to its shortcuts and events in an effect.
     useEffect(() => {
-      // Like RightSidebar, it reads the baseline in its first effect.
+      // Like RightSidebar, it reads the baseline and the earlier collapsed state in its first effect.
       mountedWorkflowRunBaseline = props.workflowRunBaseline;
+      mountedCollapsedBeforeLoad = props.collapsedBeforeLoad;
       const onKey = (e: KeyboardEvent) => {
         if (e.ctrlKey || e.shiftKey) sidebarInput.push(`key:${e.ctrlKey ? "ctrl+" : ""}${e.key}`);
       };
@@ -167,7 +171,7 @@ void mock.module("@/browser/features/RightSidebar/RightSidebar", () => ({
         window.removeEventListener("keydown", onKey);
         for (const type of SIDEBAR_EVENT_TYPES) window.removeEventListener(type, onEvent);
       };
-    }, [props.workflowRunBaseline]);
+    }, [props.workflowRunBaseline, props.collapsedBeforeLoad]);
     return (
       <div
         data-testid="right-sidebar"
@@ -322,6 +326,7 @@ describe("WorkspaceShell loading placeholders", () => {
     sidebarInput.length = 0;
     workflowRuns = { authoritative: true, sidebarState: { activeWorkflowRunCount: 0 } };
     mountedWorkflowRunBaseline = undefined;
+    mountedCollapsedBeforeLoad = undefined;
   });
 
   it("keeps the chat pane mounted during hydration in web mode", () => {
@@ -577,6 +582,19 @@ describe("WorkspaceShell loading placeholders", () => {
 
       expect(box()?.style.width).not.toBe("0px");
       expect(view.getByRole("button", { name: "Collapse right sidebar" })).toBeTruthy();
+    });
+
+    // RightSidebar hands a terminal the keyboard when it sees the sidebar expand. This expand
+    // happened before it mounted, so the shell tells it the sidebar was collapsed until then.
+    it("tells the sidebar it was collapsed when the toggle expands it before the chunk loads", async () => {
+      const gate = gateSidebar();
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      fireEvent.click(view.getByRole("button", { name: "Expand right sidebar" }));
+
+      await gate.load();
+
+      expect(mountedCollapsedBeforeLoad).toBe(true);
     });
 
     it("shows a loading sidebar full-screen on phones, closable with Close and Escape", () => {

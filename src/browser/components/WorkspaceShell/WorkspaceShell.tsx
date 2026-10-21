@@ -211,6 +211,7 @@ function LazyRightSidebar(
   const { held, collapsed, ...sidebarProps } = props;
   // Per workspace: the shell keys this component by workspace.
   const [workflowRunBaseline, setWorkflowRunBaseline] = useState<number | null>(null);
+  const [collapsedBeforeLoad] = useState(collapsed);
   // The failure state takes the expanded width even when collapsed: it needs room for its Reload
   // button, and the card is part of the sidebar that failed to load (globals.css hides the toggle
   // then, since there is no sidebar to toggle). The empty loading box keeps its element (not
@@ -252,7 +253,11 @@ function LazyRightSidebar(
   );
   return (
     <LazyFeature name="Sidebar" frame={frame} fallback={pending}>
-      <RightSidebar {...sidebarProps} workflowRunBaseline={workflowRunBaseline} />
+      <RightSidebar
+        {...sidebarProps}
+        workflowRunBaseline={workflowRunBaseline}
+        collapsedBeforeLoad={collapsedBeforeLoad}
+      />
       <SidebarInput held={held} mode="replay" />
     </LazyFeature>
   );

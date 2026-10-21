@@ -455,6 +455,11 @@ interface RightSidebarProps {
    * loaded (#6208), or null. A run that started meanwhile still switches to the Workflows tab.
    */
   workflowRunBaseline?: number | null;
+  /**
+   * Whether the sidebar was collapsed when WorkspaceShell started loading this lazy chunk. The
+   * shell's toggle can expand it meanwhile, and that expand still hands a terminal the keyboard.
+   */
+  collapsedBeforeLoad?: boolean;
 }
 
 /**
@@ -1270,6 +1275,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   onCloseFullscreen,
   onRequestFullscreen,
   workflowRunBaseline = null,
+  collapsedBeforeLoad,
 }) => {
   // Trigger for focusing Review panel (preserves hunk selection)
   const [focusTrigger, _setFocusTrigger] = React.useState(0);
@@ -1650,8 +1656,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // the toggle, a typed command reaches the chat's plain-key shortcuts (`a`/`i` focus the
   // composer) and is sent as a message. Not in full screen, where a touch keyboard would pop up.
   // An effect, not a state adjusted during render: a render-phase update here left this
-  // component's persisted `collapsed` subscription deaf to later toggles.
-  const wasCollapsedRef = React.useRef(collapsed);
+  // component's persisted `collapsed` subscription deaf to later toggles. It starts from the state
+  // shown while the chunk loaded, so an expand from the shell's toggle meanwhile counts too;
+  // without that prop, false acts as `collapsed` would: the first run has nothing to act on.
+  const wasCollapsedRef = React.useRef(collapsedBeforeLoad === true);
   React.useLayoutEffect(() => {
     if (wasCollapsedRef.current && !collapsed && !fullscreen) focusActiveTerminal(layout);
     wasCollapsedRef.current = collapsed;

@@ -1,6 +1,8 @@
 // #5681, #5687, #5688, #5693: keyboard focus, labels and shortcut feedback. Each test fails on
 // the old code.
+import type { Browser } from "@e2e-dev/web";
 import { test } from "@e2e-dev/web";
+import type { Screen } from "e2e";
 import { expect } from "e2e";
 import { KNOWN_MODELS } from "../../../src/common/constants/knownModels";
 import { formatModelDisplayName } from "../../../src/common/utils/ai/modelDisplay";
@@ -61,6 +63,40 @@ test(
   }
 );
 
+/** What has keyboard focus: "terminal", or the focused control's label or tag. */
+function focusOwner(browser: Browser) {
+  return browser.evaluate(() => {
+    const el = document.activeElement;
+    if (el?.closest(".terminal-view")) return "terminal";
+    return el?.getAttribute("aria-label") ?? el?.tagName ?? "none";
+  });
+}
+
+/**
+ * Runs `body`, then closes the terminal session it opened, also after a failure. Every repro in a
+ * run shares one backend: a later repro whose sidebar opens onto a leftover terminal can lose its
+ * menu, since the terminal takes focus after it mounts and the focus move closes the menu (#7099).
+ */
+async function closingTheTerminal(screen: Screen, body: () => Promise<void>) {
+  const closeTerminal = async () => {
+    const expand = screen.getByRole("button", "Expand right sidebar");
+    if (await expand.isVisible()) await expand.tap();
+    const close = screen.getByRole("button", "Close terminal");
+    await close.tap();
+    await expect(close).toBeHidden();
+  };
+  try {
+    await body();
+  } catch (error) {
+    // Report the test's own error, not a cleanup error it caused.
+    await closeTerminal().catch((cleanupError: unknown) => {
+      console.error("Could not close the terminal after the test failed:", cleanupError);
+    });
+    throw error;
+  }
+  await closeTerminal();
+}
+
 // A command typed right after the toggle expands the sidebar onto a terminal runs in the
 // terminal. Left on the toggle, its `a` hit the chat's plain-key focus shortcut and the rest of
 // the line was sent as a chat message.
@@ -74,23 +110,8 @@ test(
     const expand = screen.getByRole("button", "Expand right sidebar");
     await expand.tap();
     await screen.getByRole("button", "New terminal").tap();
-    const focusOwner = () =>
-      browser.evaluate(() => {
-        const el = document.activeElement;
-        if (el?.closest(".terminal-view")) return "terminal";
-        return el?.getAttribute("aria-label") ?? el?.tagName ?? "none";
-      });
-    // Every repro in a run shares one backend, so close the terminal session, also after a
-    // failure. A later repro whose sidebar opens onto a leftover terminal can lose its menu: the
-    // terminal takes focus after it mounts, and the focus move closes the menu (#7099).
-    const closeTerminal = async () => {
-      if (await expand.isVisible()) await expand.tap();
-      const close = screen.getByRole("button", "Close terminal");
-      await close.tap();
-      await expect(close).toBeHidden();
-    };
-    try {
-      await expect.poll(focusOwner, { timeout: 15_000 }).toBe("terminal");
+    await closingTheTerminal(screen, async () => {
+      await expect.poll(() => focusOwner(browser), { timeout: 15_000 }).toBe("terminal");
 
       await screen.getByRole("button", "Collapse right sidebar").tap();
       // Closed: the slide is over and the terminal unmounted with the panel.
@@ -98,18 +119,54 @@ test(
         .poll(() => browser.evaluate(() => document.querySelector(".terminal-view") === null))
         .toBe(true);
       await expand.tap();
-      await expect.poll(focusOwner, { timeout: 15_000 }).toBe("terminal");
+      await expect.poll(() => focusOwner(browser), { timeout: 15_000 }).toBe("terminal");
       await browser.keyboard.type("cat README.md");
 
-      expect(await focusOwner()).toBe("terminal");
-    } catch (error) {
-      // Report the test's own error, not a cleanup error it caused.
-      await closeTerminal().catch((cleanupError: unknown) => {
-        console.error("Could not close the terminal after the test failed:", cleanupError);
+      expect(await focusOwner(browser)).toBe("terminal");
+    });
+  }
+);
+
+// The toggle sits outside the lazy-loaded sidebar, so it can expand the sidebar while the
+// sidebar's code still loads. The sidebar then mounted expanded, saw no expand, and left the
+// keyboard on the toggle.
+// mock-only: real AI mode turns terminals off (XUM_DISABLE_TERMINALS, startApp.ts).
+test(
+  "Expanding the right sidebar while its code loads still hands a terminal the keyboard",
+  { tags: ["bugbash", "right-sidebar-toggle", "mock-only"] },
+  async ({ app, screen, browser }) => {
+    // A service worker fetches the sidebar's code itself, past the route that holds it below.
+    await browser.addInitScript(() => Reflect.deleteProperty(Navigator.prototype, "serviceWorker"));
+    await browser.setViewport({ width: 1600, height: 900 });
+    await openPlayground(app, screen, browser);
+    const expand = screen.getByRole("button", "Expand right sidebar");
+    await expand.tap();
+    await screen.getByRole("button", "New terminal").tap();
+    await closingTheTerminal(screen, async () => {
+      await expect.poll(() => focusOwner(browser), { timeout: 15_000 }).toBe("terminal");
+      await screen.getByRole("button", "Collapse right sidebar").tap();
+      await expect(expand).toBeVisible();
+      let held = false;
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      await browser.route(/\/RightSidebar-[\w-]+\.js$/, async (route) => {
+        held = true;
+        await released;
+        await route.continue();
       });
-      throw error;
-    }
-    await closeTerminal();
+      try {
+        // Not `load`: the held code may delay it.
+        await browser.goto(await browser.url(), { waitUntil: "domcontentloaded" });
+        await expect.poll(() => held, { timeout: 15_000 }).toBe(true);
+
+        await expand.tap();
+      } finally {
+        // Also after a failure: closing the terminal needs the sidebar.
+        release();
+      }
+
+      await expect.poll(() => focusOwner(browser), { timeout: 15_000 }).toBe("terminal");
+    });
   }
 );
 
