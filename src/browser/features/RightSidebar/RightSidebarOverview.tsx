@@ -496,15 +496,12 @@ function useHeartbeatDeadline(
   React.useEffect(() => {
     if (api == null) return;
     const controller = new AbortController();
+    const settle = (atMs: number | null) => {
+      if (!controller.signal.aborted) setRead({ workspaceId, atMs, readAtMs: Date.now() });
+    };
     api.workspace.heartbeat
       .next({ workspaceId }, { signal: controller.signal })
-      .then(
-        (atMs) => atMs,
-        () => null
-      )
-      .then((atMs) => {
-        if (!controller.signal.aborted) setRead({ workspaceId, atMs, readAtMs: Date.now() });
-      });
+      .then(settle, () => settle(null));
     return () => controller.abort();
   }, [api, workspaceId, readKey]);
 
