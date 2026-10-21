@@ -203,11 +203,6 @@ export function appShellRef(element: HTMLElement | null): void {
   );
 }
 
-/**
- * The page column. While a page chunk loads or after it fails, it holds the page's one `main`.
- * `pageKey` names the kind of page: a new kind gets a fresh boundary, so a page that failed to load
- * or render does not keep its failure state over the next page.
- */
 const MAX_ARCHIVE_MERGED_ISSUES_TO_SHOW = 5;
 
 function formatArchiveMergedIssues(heading: string, lines: string[]): string {
@@ -249,6 +244,11 @@ function describeArchiveMergedIssues(data: {
   return `${title}\n\n${counts}${errorList}${warningList}`;
 }
 
+/**
+ * The page column. While a page chunk loads or after it fails, it holds the page's one `main`.
+ * `pageKey` names the kind of page: a new kind gets a fresh boundary, so a page that failed to load
+ * or render does not keep its failure state over the next page.
+ */
 function PageArea(props: { pageKey: string; children: React.ReactNode }) {
   const frame = (state: React.ReactNode) => (
     <main className="mobile-layout flex min-w-0 flex-1 items-center justify-center overflow-hidden">
