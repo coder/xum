@@ -2144,6 +2144,12 @@ export const workspace = {
             error: z.string(),
           })
         ),
+        warnings: z.array(
+          z.object({
+            workspaceId: z.string(),
+            warning: z.string(),
+          })
+        ),
       }),
       z.string()
     ),

@@ -208,6 +208,47 @@ export function appShellRef(element: HTMLElement | null): void {
  * `pageKey` names the kind of page: a new kind gets a fresh boundary, so a page that failed to load
  * or render does not keep its failure state over the next page.
  */
+const MAX_ARCHIVE_MERGED_ISSUES_TO_SHOW = 5;
+
+function formatArchiveMergedIssues(heading: string, lines: string[]): string {
+  if (lines.length === 0) return "";
+  const shown = lines
+    .slice(0, MAX_ARCHIVE_MERGED_ISSUES_TO_SHOW)
+    .map((line) => `- ${line}`)
+    .join("\n");
+  const remainingCount = Math.max(0, lines.length - MAX_ARCHIVE_MERGED_ISSUES_TO_SHOW);
+  const remainingSuffix = remainingCount > 0 ? `\n… and ${remainingCount} more.` : "";
+  return `\n\n${heading}:\n${shown}${remainingSuffix}`;
+}
+
+/** The alert after archiving merged workspaces, or null when nothing needs the user's attention. */
+function describeArchiveMergedIssues(data: {
+  archivedWorkspaceIds: string[];
+  skippedWorkspaceIds: string[];
+  errors: Array<{ workspaceId: string; error: string }>;
+  warnings: Array<{ workspaceId: string; warning: string }>;
+}): string | null {
+  const errorCount = data.errors.length;
+  const warningCount = data.warnings.length;
+  if (errorCount === 0 && warningCount === 0) return null;
+  const counts = [
+    `Archived: ${data.archivedWorkspaceIds.length}`,
+    `Skipped: ${data.skippedWorkspaceIds.length}`,
+    ...(errorCount > 0 ? [`Errors: ${errorCount}`] : []),
+    ...(warningCount > 0 ? [`Warnings: ${warningCount}`] : []),
+  ].join("\n");
+  const title = `Archived merged workspaces with some ${errorCount > 0 ? "errors" : "warnings"}.`;
+  const errorList = formatArchiveMergedIssues(
+    "Errors",
+    data.errors.map((e) => `${e.workspaceId}: ${e.error}`)
+  );
+  const warningList = formatArchiveMergedIssues(
+    "Warnings",
+    data.warnings.map((w) => `${w.workspaceId}: ${w.warning}`)
+  );
+  return `${title}\n\n${counts}${errorList}${warningList}`;
+}
+
 function PageArea(props: { pageKey: string; children: React.ReactNode }) {
   const frame = (state: React.ReactNode) => (
     <main className="mobile-layout flex min-w-0 flex-1 items-center justify-center overflow-hidden">
@@ -883,24 +924,9 @@ function AppInner() {
           return;
         }
 
-        const errorCount = result.data.errors.length;
-        if (errorCount > 0) {
-          const archivedCount = result.data.archivedWorkspaceIds.length;
-          const skippedCount = result.data.skippedWorkspaceIds.length;
-
-          const MAX_ERRORS_TO_SHOW = 5;
-          const shownErrors = result.data.errors
-            .slice(0, MAX_ERRORS_TO_SHOW)
-            .map((e) => `- ${e.workspaceId}: ${e.error}`)
-            .join("\n");
-          const remainingCount = Math.max(0, errorCount - MAX_ERRORS_TO_SHOW);
-          const remainingSuffix = remainingCount > 0 ? `\n… and ${remainingCount} more.` : "";
-
-          if (typeof window !== "undefined") {
-            window.alert(
-              `Archived merged workspaces with some errors.\n\nArchived: ${archivedCount}\nSkipped: ${skippedCount}\nErrors: ${errorCount}\n\nErrors:\n${shownErrors}${remainingSuffix}`
-            );
-          }
+        const summary = describeArchiveMergedIssues(result.data);
+        if (summary && typeof window !== "undefined") {
+          window.alert(summary);
         }
       } catch (error) {
         const message = getErrorMessage(error);

@@ -2363,7 +2363,9 @@ describe("WorkspaceService archiveMergedInProject", () => {
     }
   ) => Promise<Result<BashToolResult>>;
 
-  type ArchiveFn = (workspaceId: string) => Promise<Result<{ kind: "archived" }>>;
+  type ArchiveFn = (
+    workspaceId: string
+  ) => Promise<Result<{ kind: "archived"; warnings?: string[] }>>;
 
   function archiveSuccess(): Promise<Result<{ kind: "archived" }>> {
     return Promise.resolve(Ok({ kind: "archived" }));
@@ -2495,6 +2497,35 @@ describe("WorkspaceService archiveMergedInProject", () => {
     expect(archiveMock).toHaveBeenCalledWith("ws-merged");
 
     expect(executeBashMock).toHaveBeenCalledTimes(3);
+  });
+
+  test("reports the warnings of archives that kept a sandbox", async () => {
+    const allMetadata: FrontendWorkspaceMetadata[] = [
+      createMetadata("ws-kept"),
+      createMetadata("ws-clean"),
+    ];
+
+    const { workspaceService } = await createServiceHarness(
+      allMetadata,
+      () => Promise.resolve(bashOk('{"state":"MERGED"}')),
+      (workspaceId) =>
+        workspaceId === "ws-kept"
+          ? Promise.resolve(Ok({ kind: "archived", warnings: ["Sandbox kept: dirty checkout"] }))
+          : archiveSuccess()
+    );
+
+    const result = await workspaceService.archiveMergedInProject(TARGET_PROJECT_PATH);
+
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      return;
+    }
+
+    expect(result.data.archivedWorkspaceIds).toEqual(["ws-clean", "ws-kept"]);
+    expect(result.data.errors).toEqual([]);
+    expect(result.data.warnings).toEqual([
+      { workspaceId: "ws-kept", warning: "Sandbox kept: dirty checkout" },
+    ]);
   });
 
   test("skips no_pr and non-merged states", async () => {

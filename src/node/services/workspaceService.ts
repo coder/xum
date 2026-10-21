@@ -1339,6 +1339,7 @@ interface ArchiveMergedInProjectResult {
   archivedWorkspaceIds: string[];
   skippedWorkspaceIds: string[];
   errors: Array<{ workspaceId: string; error: string }>;
+  warnings: Array<{ workspaceId: string; warning: string }>;
 }
 
 interface ProjectGitStatusResult {
@@ -14043,6 +14044,7 @@ export class WorkspaceService
     const archivedWorkspaceIds: string[] = [];
     const skippedWorkspaceIds: string[] = [];
     const errors: Array<{ workspaceId: string; error: string }> = [];
+    const warnings: Array<{ workspaceId: string; warning: string }> = [];
 
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -14137,16 +14139,21 @@ export class WorkspaceService
           continue;
         }
         archivedWorkspaceIds.push(workspaceId);
+        for (const warning of result.data.warnings ?? []) {
+          warnings.push({ workspaceId, warning });
+        }
       }
 
       archivedWorkspaceIds.sort();
       skippedWorkspaceIds.sort();
       errors.sort((a, b) => a.workspaceId.localeCompare(b.workspaceId));
+      warnings.sort((a, b) => a.workspaceId.localeCompare(b.workspaceId));
 
       return Ok({
         archivedWorkspaceIds,
         skippedWorkspaceIds,
         errors,
+        warnings,
       });
     } catch (error) {
       const message = getErrorMessage(error);
