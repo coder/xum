@@ -20,7 +20,7 @@ import {
   type ComponentConsent,
 } from "./componentConsent";
 import { updateApprovedCopies, type ApprovedCopies } from "./approvedCopies";
-import { discoverAgentPluginAt, type AgentPluginScope } from "./discovery";
+import { discoverAgentPluginAt, listPluginSkillFolders, type AgentPluginScope } from "./discovery";
 import { getPluginDataPath, loadPluginMcpServers, resolvePluginInstanceId } from "./mcpConfig";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
 import { listPluginAgentFiles } from "./agentFiles";
@@ -76,11 +76,9 @@ export async function reviewedComponentConsent(args: {
     slashCommands: {},
   };
   for (const skillsRoot of plugin.skillsDirs ?? []) {
-    const dirNames = skillsRoot.single ? [skillsRoot.name] : await fs.readdir(skillsRoot.dir);
-    for (const dirName of dirNames) {
+    for (const { name: dirName, dir: skillDir } of await listPluginSkillFolders(skillsRoot)) {
       const directoryName = SkillNameSchema.safeParse(dirName);
       if (!directoryName.success) continue;
-      const skillDir = skillsRoot.single ? skillsRoot.dir : path.join(skillsRoot.dir, dirName);
       let content: string;
       try {
         content = await fs.readFile(path.join(skillDir, "SKILL.md"), "utf8");

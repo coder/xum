@@ -81,6 +81,7 @@ import {
   type AgentPluginContainer,
   type AgentPluginDiagnostic,
   type AgentPluginInfo,
+  listPluginSkillFolders,
   type PluginSkillsRoot,
 } from "./discovery";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
@@ -2943,26 +2944,10 @@ export class AgentPluginInstallService {
     warnings: string[]
   ): Promise<CollectedPluginSkill[]> {
     const skills: CollectedPluginSkill[] = [];
-    let entries: string[] = [];
-    if (skillsRoot.single) {
-      // The root is one skill folder; runtime discovery loads it under this name.
-      entries = [skillsRoot.name];
-    } else {
-      try {
-        // Include symlinked skill dirs, matching runtime discovery
-        // (listSkillDirectoriesFromLocalFs): a symlinked skill activates after
-        // install, so it MUST appear in the consent preview.
-        entries = (await fsPromises.readdir(skillsRoot.dir, { withFileTypes: true }))
-          .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-          .map((entry) => entry.name)
-          .sort((a, b) => a.localeCompare(b));
-      } catch {
-        return [];
-      }
-    }
-    for (const dirName of entries) {
+    // Includes symlinked skill dirs, matching runtime discovery: a symlinked
+    // skill activates after install, so it MUST appear in the consent preview.
+    for (const { name: dirName, dir: skillDir } of await listPluginSkillFolders(skillsRoot)) {
       const label = skillReviewLabel(pluginRoot, skillsRoot, dirName);
-      const skillDir = skillsRoot.single ? skillsRoot.dir : path.join(skillsRoot.dir, dirName);
       const skillPath = path.join(skillDir, "SKILL.md");
       // Spec §4.1 containment anchored at the plugin root, mirroring runtime
       // component checks: a symlink escaping the plugin is surfaced as a

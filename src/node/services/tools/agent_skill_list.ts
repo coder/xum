@@ -57,6 +57,18 @@ async function listSkillDirectories(skillsRoot: string): Promise<string[]> {
   }
 }
 
+/** The skill folders of a skills root: the root itself for a single-skill plugin root. */
+async function listSkillFolders(
+  skillsRoot: string,
+  singleSkillName: string | undefined
+): Promise<Array<{ name: string; dir: string }>> {
+  if (singleSkillName != null) return [{ name: singleSkillName, dir: skillsRoot }];
+  return (await listSkillDirectories(skillsRoot)).map((name) => ({
+    name,
+    dir: path.join(skillsRoot, name),
+  }));
+}
+
 /** Read `skillDir`'s SKILL.md when it is a contained regular file of allowed size; else log and null. */
 async function readContainedSkillFile(
   skillDir: string,
@@ -352,7 +364,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               scope: plugin.scope,
               importedSkills,
               skillConsent,
-              ...(skillsRoot.single ? { singleSkillName: skillsRoot.name } : {}),
+              singleSkillName: skillsRoot.name,
             }))
           );
         }
@@ -386,11 +398,10 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             continue;
           }
 
-          const directoryNames =
-            singleSkillName != null
-              ? [singleSkillName]
-              : await listSkillDirectories(skillsRootReal);
-          for (const directoryName of directoryNames) {
+          for (const { name: directoryName, dir: skillDir } of await listSkillFolders(
+            skillsRootReal,
+            singleSkillName
+          )) {
             // Skipped plugin skills must not claim a same-named fallback in this manual scan.
             if (importedSkills != null && !importedSkills.includes(directoryName)) continue;
             // SECURITY: symlinked skill directories are allowed only through
@@ -398,7 +409,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             // entries resolving outside the containment root. This matches the
             // posture of stream discovery and plugin roots.
             const descriptor = await readSkillDescriptor(
-              singleSkillName != null ? skillsRootReal : path.join(skillsRootReal, directoryName),
+              skillDir,
               directoryName,
               scope,
               containmentRoot,

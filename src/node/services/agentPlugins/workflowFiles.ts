@@ -2,7 +2,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 import { SkillNameSchema } from "@/common/orpc/schemas";
-import type { PluginSkillsRoot } from "./discovery";
+import { listPluginSkillFolders, type PluginSkillsRoot } from "./discovery";
 
 /**
  * Top-level `*.js` entries of a plugin workflows/ dir, files and symlinks, sorted. The one lister
@@ -60,13 +60,7 @@ export async function listPluginSkillScripts(plugin: {
 }): Promise<Array<{ file: string; filePath: string }>> {
   const scripts: Array<{ file: string; filePath: string }> = [];
   for (const skillsRoot of plugin.skillsDirs ?? []) {
-    const skillFolders = skillsRoot.single
-      ? [{ name: skillsRoot.name, dir: skillsRoot.dir }]
-      : (await listSubdirectories(skillsRoot.dir)).map((name) => ({
-          name,
-          dir: path.join(skillsRoot.dir, name),
-        }));
-    for (const { name, dir } of skillFolders) {
+    for (const { name, dir } of await listPluginSkillFolders(skillsRoot)) {
       // Only a folder the runtime loads as a skill: a valid skill name with a SKILL.md.
       if (!SkillNameSchema.safeParse(name).success) continue;
       if (!(await isFileOrLink(path.join(dir, "SKILL.md")))) continue;
@@ -76,18 +70,6 @@ export async function listPluginSkillScripts(plugin: {
     }
   }
   return scripts;
-}
-
-async function listSubdirectories(dir: string): Promise<string[]> {
-  try {
-    const entries = await fsPromises.readdir(dir, { withFileTypes: true });
-    return entries
-      .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-      .map((entry) => entry.name)
-      .sort((a, b) => a.localeCompare(b));
-  } catch {
-    return [];
-  }
 }
 
 async function isFileOrLink(filePath: string): Promise<boolean> {

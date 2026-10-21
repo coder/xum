@@ -284,12 +284,33 @@ export interface AgentPluginInfo {
  */
 export type PluginSkillsRoot =
   /** Holds `<name>/SKILL.md` skill folders. */
-  | { dir: string; single?: undefined }
+  | { dir: string; single?: undefined; name?: undefined }
   /**
    * Holds SKILL.md itself. `name` is the folder name as declared, or the plugin name when the
    * path is the plugin root. It is not validated here: scan sites reject an invalid skill name.
    */
   | { dir: string; single: true; name: string };
+
+/**
+ * The skill folders of one skills root, sorted: the root itself when it is a single skill, else
+ * its subfolders, symlinks included (runtime discovery follows them, so consent must list them).
+ * Names are not validated: callers report an invalid one.
+ */
+export async function listPluginSkillFolders(
+  root: PluginSkillsRoot
+): Promise<Array<{ name: string; dir: string }>> {
+  if (root.single) return [{ name: root.name, dir: root.dir }];
+  try {
+    const entries = await fsPromises.readdir(root.dir, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b))
+      .map((name) => ({ name, dir: path.join(root.dir, name) }));
+  } catch {
+    return [];
+  }
+}
 
 export interface AgentPluginDiagnostic {
   /** Path of the plugin directory (or offending component path) the diagnostic refers to. */
@@ -458,23 +479,32 @@ async function resolveSkillsRoots(args: {
     const canonical = await args.resolveComponent(relative, "directory");
     // Two spellings (or a symlink) can name one directory: scan it once.
     if (canonical === undefined || roots.some((root) => root.dir === canonical)) continue;
-    // lstat: a SKILL.md symlink still marks the folder as one skill, so the scan sites'
-    // containment checks refuse an escaping link instead of this folder being read as a
-    // container of skill folders.
-    const skillFile = await fsPromises.lstat(path.join(canonical, "SKILL.md")).catch(() => null);
-    if (skillFile?.isFile() !== true && skillFile?.isSymbolicLink() !== true) {
-      roots.push({ dir: canonical });
-      continue;
-    }
-    // The declared folder name, not the canonical one: a contained symlink keeps the name the
-    // author wrote. The plugin root has no folder name of its own, so it takes the plugin's.
-    const name =
-      canonical === args.rootReal
-        ? args.pluginName
-        : path.basename(path.join(args.rootReal, relative));
-    roots.push({ dir: canonical, single: true, name });
+    roots.push(await classifySkillsRoot({ ...args, relative, canonical }));
   }
   return roots;
+}
+
+/** A resolved skills root is one skill when it holds SKILL.md itself (PluginSkillsRoot). */
+async function classifySkillsRoot(args: {
+  relative: string;
+  canonical: string;
+  rootReal: string;
+  pluginName: string;
+}): Promise<PluginSkillsRoot> {
+  // lstat: a SKILL.md symlink still marks the folder as one skill, so the scan sites'
+  // containment checks refuse an escaping link instead of this folder being read as a
+  // container of skill folders.
+  const skillFile = await fsPromises.lstat(path.join(args.canonical, "SKILL.md")).catch(() => null);
+  if (skillFile?.isFile() !== true && skillFile?.isSymbolicLink() !== true) {
+    return { dir: args.canonical };
+  }
+  // The declared folder name, not the canonical one: a contained symlink keeps the name the
+  // author wrote. The plugin root has no folder name of its own, so it takes the plugin's.
+  const name =
+    args.canonical === args.rootReal
+      ? args.pluginName
+      : path.basename(path.join(args.rootReal, args.relative));
+  return { dir: args.canonical, single: true, name };
 }
 
 async function discoverPluginAt(args: {

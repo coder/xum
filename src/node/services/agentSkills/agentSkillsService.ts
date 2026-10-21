@@ -326,7 +326,7 @@ async function buildPluginScanCandidates(args: {
         runtime: localRuntime,
         pluginRoot: plugin.rootPath,
         pluginName: plugin.name,
-        ...(root.single ? { singleSkillName: root.name } : {}),
+        singleSkillName: root.name,
         importedSkills,
         skillConsent,
         pluginConsent: plugin.componentConsent,
@@ -578,6 +578,18 @@ function candidateSkillDir(
   return candidate.singleSkillName != null
     ? resolvedRoot
     : candidate.runtime.normalizePath(name, resolvedRoot);
+}
+
+/** The skill folder names of a scan root: its own name when it is a single skill. */
+async function listCandidateSkillNames(
+  candidate: Pick<AgentSkillScanCandidate, "runtime" | "singleSkillName">,
+  resolvedRoot: string,
+  workspacePath: string
+): Promise<string[]> {
+  if (candidate.singleSkillName != null) return [candidate.singleSkillName];
+  return candidate.runtime instanceof RemoteRuntime
+    ? listSkillDirectoriesFromRuntime(candidate.runtime, resolvedRoot, { cwd: workspacePath })
+    : listSkillDirectoriesFromLocalFs(resolvedRoot);
 }
 
 async function listSkillDirectoriesFromLocalFs(root: string): Promise<string[]> {
@@ -888,14 +900,7 @@ export async function discoverAgentSkills(
 
   const scanRoot = async (scan: AgentSkillScanCandidate): Promise<void> => {
     const resolvedRoot = await scan.runtime.resolvePath(scan.root);
-    const directoryNames =
-      scan.singleSkillName != null
-        ? [scan.singleSkillName]
-        : scan.runtime instanceof RemoteRuntime
-          ? await listSkillDirectoriesFromRuntime(scan.runtime, resolvedRoot, {
-              cwd: workspacePath,
-            })
-          : await listSkillDirectoriesFromLocalFs(resolvedRoot);
+    const directoryNames = await listCandidateSkillNames(scan, resolvedRoot, workspacePath);
 
     for (const directoryNameRaw of directoryNames) {
       const nameParsed = SkillNameSchema.safeParse(directoryNameRaw);
