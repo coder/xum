@@ -16,9 +16,8 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { APIClient } from "@/browser/contexts/API";
 
-import { installDom } from "../dom";
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
-import { cleanupView, disableTutorial, setupWorkspaceView } from "../helpers";
+import { cleanupView, setupTestDom, setupWorkspaceView } from "../helpers";
 import { ChatHarness } from "./chatHarness";
 
 async function waitForWorkspaceChatToRender(container: HTMLElement): Promise<void> {
@@ -93,16 +92,8 @@ export async function createAppHarness(options?: {
     workspaceId = createResult.metadata.id;
     metadata = createResult.metadata;
 
-    const restoreDom = installDom();
-    // Like setupTestDom: the workspace tutorial opens 300 ms after a workspace view mounts and
-    // moves focus into its bubble, so focus assertions would race it (#7120). Cleanup restores
-    // the flag, so later renders in the same test file keep their own tutorial setting.
-    const previousTutorialOptIn = globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__;
-    disableTutorial();
-    cleanupDom = () => {
-      restoreDom();
-      globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = previousTutorialOptIn;
-    };
+    // setupTestDom turns tutorials off: their bubble would take focus (#7120).
+    cleanupDom = setupTestDom();
     options?.beforeRender?.(workspaceId);
     view = renderApp({ apiClient: options?.wrapApiClient?.(env.orpc) ?? env.orpc, metadata });
 
