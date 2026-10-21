@@ -168,3 +168,10 @@ test("a source link encodes each path segment, under the job's e2e project", () 
   expect(body).toContain(`(${blob}/tests/stories/my%20dir/a%23b%3F.e2e.ts#L19)`);
   expect(body).toContain(`(${blob}/tests/bugbash/repros/100%25.e2e.ts#L19)`);
 });
+
+test("a source link escapes a parenthesis, which would end the markdown link early", () => {
+  job(WEB, RED.replaceAll('"smoke.e2e.ts"', '"case).e2e.ts"'));
+  const body = commentBody(root, ctx);
+  const blob = `https://github.test/coder/xum/blob/${ctx.sourceSha}`;
+  expect(body).toContain(`(${blob}/tests/stories/case%29.e2e.ts#L19)`);
+});

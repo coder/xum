@@ -31,6 +31,9 @@ on:
     outputs:
       model:
         value: ${{ jobs.stories.outputs.model }}
+      # The reports artifact of the attempt that ran the lane (pr.yml's comment job downloads it).
+      reports_artifact:
+        value: ${{ jobs.stories.outputs.reports_artifact }}
   # One run a night on main: it keeps main's replay cache warm (GitHub evicts a cache that no
   # run reads for 7 days). A merge-queue run saves under its own queue ref, which no run
   # restores, so this run is the one that every other run restores first.
@@ -75,6 +78,7 @@ jobs:
       BUGBASH_MODEL: ${{ inputs.model || 'anthropic:claude-sonnet-5-5' }}
     outputs:
       model: ${{ env.BUGBASH_MODEL }}
+      reports_artifact: stories-reports-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -145,6 +149,11 @@ jobs:
               tests/bugbash/.e2e/agent-repros-*/report.json tests/bugbash/.e2e/agent-repros-*.{spend.json,proxy.jsonl})
             mkdir -p "$2"
             if ((${#files[@]})); then cp --parents "${files[@]}" "$2"; fi
+            # Every job folder, also one without report.json (a job that stopped before it wrote
+            # one): the page then says the report is missing, not that no job ran (Codex review).
+            for dir in tests/stories/.e2e/stories-*/ tests/bugbash/.e2e/agent-repros-*/; do
+              mkdir -p "$2/$dir"
+            done
           )
           collect . "$RUNNER_TEMP/stories-reports"
           # Always one file, so the artifact exists even when no job left output: the comment job

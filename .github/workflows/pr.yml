@@ -844,9 +844,12 @@ jobs:
     # (each PR where the Haiku lane runs, one comment with a section per sandbox job). The job
     # summary shows the same page (stories.yml's Summary step). The lane's sandbox has no
     # network and no token, so this job posts it after the lane, from the reports it uploaded.
-    # The write token never meets PR code (the user's rule): the job checks out the PR's base
-    # commit (a branch of this repo: the guard below skips forks), installs with no lifecycle
-    # scripts, and reads the reports only as data. The renderer escapes their text.
+    # The write token never meets PR code from the checkout (the user's rule): the job checks out
+    # the PR's base commit, installs with no lifecycle scripts, and reads the reports only as
+    # data, which the renderer escapes. The job's own steps come from the PR's pr.yml, as for
+    # every pull_request job: the guard below admits only branches of this repo, whose authors
+    # can push here already, so the token gives them nothing new. Forks get no job (Codex review
+    # of #7140; a workflow_run design would also cover a pr.yml edit).
     # Not in Required: a comment that fails to post never blocks a merge.
     needs: [changes, stories-pr]
     # stories-pr's guard, so a PR without a lane run gets no comment. !cancelled(): a failed lane
@@ -895,7 +898,9 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         continue-on-error: true
         with:
-          name: stories-reports-${{ github.run_attempt }}
+          # The lane job's own artifact name: a rerun of only this job has a new run_attempt,
+          # but the lane's upload keeps the attempt it ran in (Codex review of #7140).
+          name: ${{ needs.stories-pr.outputs.reports_artifact }}
           path: ${{ runner.temp }}/stories-reports
       - name: Post the comment
         if: steps.base.outputs.ready == 'true' && steps.download.outcome == 'success'

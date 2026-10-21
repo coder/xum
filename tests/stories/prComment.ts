@@ -10,8 +10,9 @@
  * GITHUB_API_URL, GITHUB_SERVER_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT,
  * PR_NUMBER and HEAD_SHA, and BUGBASH_MODEL for the titles.
  *
- * The write token never meets PR code: the job runs this file from the PR's base commit, and the
- * reports are data that the PR's tests wrote. The e2e renderer escapes their text.
+ * The write token never meets PR code from the checkout: the job runs this file from the PR's
+ * base commit, and the reports are data that the PR's tests wrote. The e2e renderer escapes their
+ * text. (The job's steps come from the PR's pr.yml, as for any pull_request job: see pr.yml.)
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -47,7 +48,13 @@ export interface CommentContext {
 
 /** A link to `file` (from the checkout root) at the tested commit, each path segment encoded. */
 export function sourceUrl(ctx: CommentContext, file: string, line: number): string {
-  const segments = file.split("/").map(encodeURIComponent).join("/");
+  // encodeURIComponent leaves ( ) ! * ' as they are, and a ")" ends a markdown link early.
+  const encode = (part: string) =>
+    encodeURIComponent(part).replace(
+      /[()!*']/g,
+      (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`
+    );
+  const segments = file.split("/").map(encode).join("/");
   return `${ctx.serverUrl}/${ctx.repository}/blob/${ctx.sourceSha}/${segments}#L${line}`;
 }
 
