@@ -7,6 +7,8 @@ interface FakeCgroup {
   controllers?: string;
   subtreeControl?: string;
   procs?: string[];
+  /** The `cgroup.type`. Without it the file is missing, which the code reads as a domain. */
+  type?: string;
 }
 
 export interface FakeCgroupTree {
@@ -68,6 +70,9 @@ export async function createFakeCgroupTree(options: {
       path.join(dirOf(cgroup), "cgroup.procs"),
       (spec.procs ?? []).map((pid) => `${pid}\n`).join("")
     );
+    if (spec.type !== undefined) {
+      await fs.writeFile(path.join(dirOf(cgroup), "cgroup.type"), `${spec.type}\n`);
+    }
   };
   for (const [cgroup, spec] of Object.entries(options.cgroups)) {
     await createCgroup(cgroup, spec);

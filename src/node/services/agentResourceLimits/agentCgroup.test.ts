@@ -84,22 +84,33 @@ describe("applyAgentCgroupLimits", () => {
     expect(await tree.read("xum/xum-agents", "cpu.max")).toBe("3000000 100000");
   });
 
-  it("turns other threaded controllers back on after the repair", async () => {
-    // An admin's pids controller, left on in the populated cgroup, also makes it a thread root.
-    tree = await createFakeCgroupTree({
-      own: "/xum",
-      cgroups: {
-        xum: { controllers: "cpu memory pids", subtreeControl: "pids", procs: ["101"] },
-      },
+  describe("leaves a populated cgroup alone when undoing its controllers would reset settings", () => {
+    it.each<[string, Parameters<typeof createFakeCgroupTree>[0]["cgroups"], string]>([
+      [
+        "another threaded controller, such as an admin's pids",
+        { xum: { controllers: "cpu memory pids", subtreeControl: "pids", procs: ["101"] } },
+        "pids",
+      ],
+      [
+        "cpu with a threaded child, whose cpu limits may be in use",
+        {
+          xum: { controllers: "cpu memory", subtreeControl: "cpu", procs: ["101"] },
+          "xum/worker": { type: "threaded" },
+        },
+        "cpu",
+      ],
+    ])("%s", async (_name, cgroups, enabled) => {
+      tree = await createFakeCgroupTree({ own: "/xum", cgroups });
+
+      const result = await applyAgentCgroupLimits({ cpuCores: 2 }, tree.host);
+
+      expect(result.status).toEqual({
+        state: "unavailable",
+        reason: `Could not set up cgroup /xum/xum-agents: ${path.join(tree.root, "xum")} holds processes and enables ${enabled} for its children, so xum cannot move the processes without resetting those settings.`,
+      });
+      expect(tree.writes).toEqual([]);
+      expect(await tree.read("xum", "cgroup.procs")).toBe("101\n");
     });
-
-    const result = await applyAgentCgroupLimits({ cpuCores: 2 }, tree.host);
-
-    expect(result.status).toEqual({ state: "active", cgroup: "/xum/xum-agents" });
-    expect((await tree.read("xum", "cgroup.subtree_control")).trim().split(" ").sort()).toEqual([
-      "cpu",
-      "pids",
-    ]);
   });
 
   it("uses the parent cgroup once xum runs in xum-app", async () => {
