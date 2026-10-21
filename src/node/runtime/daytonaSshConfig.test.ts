@@ -190,27 +190,44 @@ describe("DaytonaSshConfigWriter", () => {
     expect(await Bun.file(sshConfigPath).exists()).toBe(false);
   });
 
-  it.each(["xum%d", "xum*", "xum?", "xum[abc]"])(
-    "refuses a Xum root that ssh would read as a token or glob (%s), writing nothing",
-    async (root) => {
-      const tokenWriter = new DaytonaSshConfigWriter({
-        xumHome: path.join(tempDir, root),
-        sshConfigPath,
-      });
-      const input = { sandboxId: "sb-1", token: "tok", gateway: GATEWAY };
-      for (const update of [
-        () => tokenWriter.writeSandbox(input),
-        () => tokenWriter.updateToken(input),
-        () => tokenWriter.repointGateway(GATEWAY),
-      ]) {
-        // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
-        await expect(update()).rejects.toThrow(
-          `Daytona ssh setup cannot use ${tokenWriter.paths.dir}`
-        );
-      }
-      expect(await fs.readdir(tempDir)).toEqual([]);
+  it.each([
+    "xum%d",
+    "xum*",
+    "xum?",
+    "xum[abc]",
+    "xum's",
+    'xum"q',
+    "xum$HOME",
+    "xum#1",
+    // A path separator on Windows.
+    ...(process.platform === "win32" ? [] : ["xum\\b"]),
+  ])("refuses a Xum root that ssh would not read literally (%s), writing nothing", async (root) => {
+    const tokenWriter = new DaytonaSshConfigWriter({
+      xumHome: path.join(tempDir, root),
+      sshConfigPath,
+    });
+    const input = { sandboxId: "sb-1", token: "tok", gateway: GATEWAY };
+    for (const update of [
+      () => tokenWriter.writeSandbox(input),
+      () => tokenWriter.updateToken(input),
+      () => tokenWriter.repointGateway(GATEWAY),
+    ]) {
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+      await expect(update()).rejects.toThrow(
+        `Daytona ssh setup cannot use ${tokenWriter.paths.dir}`
+      );
     }
-  );
+    expect(await fs.readdir(tempDir)).toEqual([]);
+  });
+
+  it("accepts a Xum root with a space and non-ASCII letters", async () => {
+    const spacedWriter = new DaytonaSshConfigWriter({
+      xumHome: path.join(tempDir, "José Smith", ".xum"),
+      sshConfigPath,
+    });
+    await spacedWriter.writeSandbox({ sandboxId: "sb-1", token: "tok", gateway: GATEWAY });
+    expect(await spacedWriter.readTokens()).toEqual([{ sandboxId: "sb-1", token: "tok" }]);
+  });
 
   it("writes a self-hosted IPv6 gateway as OpenSSH resolves it, refusing zone ids", async () => {
     const gateway = { ...GATEWAY, host: "2001:db8::10", port: 2222 };

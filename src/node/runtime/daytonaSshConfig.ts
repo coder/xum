@@ -91,6 +91,13 @@ function validateGateway(gateway: DaytonaSshGateway): void {
   }
 }
 
+// Letters (with combining marks, as macOS may store them decomposed), digits, a few punctuation
+// marks and the platform's separators; Windows paths also carry `\` and the drive's `:`.
+const SSH_LITERAL_PATH_CHAR =
+  process.platform === "win32"
+    ? /^[\p{L}\p{M}\p{N} ._\-+@,=~/\\:]$/u
+    : /^[\p{L}\p{M}\p{N} ._\-+@,=~/]$/u;
+
 function quoteConfigPath(filePath: string): string {
   if (/["\r\n]/.test(filePath)) {
     throw new DaytonaSshConfigError(`Unsupported characters in path for ssh config: ${filePath}`);
@@ -315,16 +322,17 @@ export class DaytonaSshConfigWriter {
   }
 
   /**
-   * The Include and UserKnownHostsFile paths go into ssh config, where OpenSSH expands `%`
-   * tokens and Include globs `*`, `?` and `[`. Escaping is not an option: older OpenSSH reads
-   * Include paths literally, so `%%` would break there.
+   * The Include and UserKnownHostsFile paths go into ssh config, where OpenSSH reads `%` as a
+   * token, globs Include paths and parses quotes and backslashes. Escaping is not an option:
+   * OpenSSH versions disagree on it (older ones read Include paths without token expansion), so
+   * only characters every version reads literally are allowed.
    */
   private assertPathsReadLiterallyBySsh(): void {
-    if (/[%*?[]/.test(this.paths.dir)) {
+    const offending = [...this.paths.dir].find((char) => !SSH_LITERAL_PATH_CHAR.test(char));
+    if (offending !== undefined) {
       throw new DaytonaSshConfigError(
-        `Daytona ssh setup cannot use ${this.paths.dir}: ssh reads "%" in config paths as a ` +
-          `token and "*", "?" or "[" as a pattern. Use a Xum root (XUM_ROOT) and home ` +
-          `directory without these characters.`
+        `Daytona ssh setup cannot use ${this.paths.dir}: ssh does not read ${JSON.stringify(offending)} ` +
+          `in config paths literally. Use a Xum root (XUM_ROOT) and home directory without it.`
       );
     }
   }
