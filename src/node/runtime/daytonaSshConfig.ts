@@ -9,6 +9,7 @@ import {
   XUM_DAYTONA_SSH_BLOCK_START,
   toXumDaytonaHost,
 } from "@/common/constants/daytona";
+import { getXumHome } from "@/common/constants/paths";
 import { getErrorMessage } from "@/common/utils/errors";
 import { ensureManagedSSHConfigBlock } from "@/node/runtime/muxSshConfigWriter";
 import { log } from "@/node/services/log";
@@ -49,6 +50,19 @@ export function getDaytonaSshPaths(xumHome: string): DaytonaSshPaths {
     includePath: path.join(dir, "daytona.conf"),
     knownHostsPath: path.join(dir, "daytona_known_hosts"),
   };
+}
+
+// The include file of the writer this backend built last (its DaytonaService's, which may use
+// a root other than getXumHome()).
+let activeIncludePath: string | undefined;
+
+/**
+ * The only ssh config a Daytona alias is resolved from, by OpenSSH (`-F`) and ssh2 alike. A user
+ * entry matching the alias (a `Host *` KnownHostsCommand, `Match exec`, ProxyCommand) would run
+ * a local command that gets the token as `%r`, and `-o` cannot override a Match exec.
+ */
+export function getDaytonaSshConfigPath(): string {
+  return activeIncludePath ?? getDaytonaSshPaths(getXumHome()).includePath;
 }
 
 export class DaytonaSshConfigError extends Error {
@@ -226,6 +240,7 @@ export class DaytonaSshConfigWriter {
 
   constructor(options: DaytonaSshConfigWriterOptions) {
     this.paths = getDaytonaSshPaths(options.xumHome);
+    activeIncludePath = this.paths.includePath;
     this.sshConfigPath = options.sshConfigPath;
     this.sshBinary = options.sshBinary ?? "ssh";
   }

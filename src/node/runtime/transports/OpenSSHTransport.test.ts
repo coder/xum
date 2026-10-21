@@ -7,6 +7,7 @@ import { toXumDaytonaHost } from "@/common/constants/daytona";
 import * as ptySpawn from "../ptySpawn";
 import { RuntimeError, isRuntimeTransportError } from "../Runtime";
 import { sshConnectionPool } from "../sshConnectionPool";
+import { getDaytonaSshConfigPath } from "../daytonaSshConfig";
 import { OpenSSHTransport, retireOpenSSHMasters } from "./OpenSSHTransport";
 
 const BACKOFF_MESSAGE =
@@ -54,7 +55,7 @@ describe("OpenSSHTransport connection acquisition failures", () => {
 });
 
 describe("OpenSSHTransport terminals on a Daytona alias", () => {
-  it("force strict host key checking, as every other ssh call to the alias does", async () => {
+  it("read only Xum's include file, as every other ssh call to the alias does", async () => {
     spyOn(sshConnectionPool, "acquireConnection").mockResolvedValue(undefined);
     const spawnPty = spyOn(ptySpawn, "spawnPtyProcess").mockReturnValue({} as IPty);
     const host = toXumDaytonaHost("sb-1");
@@ -66,12 +67,10 @@ describe("OpenSSHTransport terminals on a Daytona alias", () => {
     });
 
     const args = spawnPty.mock.calls[0][0].args;
-    // Command-line options beat a user `Host *` entry with `StrictHostKeyChecking no`.
-    const strict = args.findIndex(
-      (arg, i) => args[i - 1] === "-o" && arg === "StrictHostKeyChecking=yes"
-    );
-    expect(strict).toBeGreaterThan(-1);
-    expect(strict).toBeLessThan(args.indexOf(host));
+    const configFile = args.indexOf("-F");
+    expect(args[configFile + 1]).toBe(getDaytonaSshConfigPath());
+    expect(configFile).toBeGreaterThan(-1);
+    expect(configFile).toBeLessThan(args.indexOf(host));
   });
 });
 

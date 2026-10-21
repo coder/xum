@@ -2132,7 +2132,7 @@ export class SSHRuntime extends RemoteRuntime {
     args.push("-o", "ServerAliveCountMax=2");
 
     // Match the runtime's host key policy (permissive in headless mode).
-    appendOpenSSHHostKeyPolicyArgs(args, config.host);
+    appendOpenSSHHostKeyPolicyArgs(args, config.host, q);
 
     return args.join(" ");
   }

@@ -29,6 +29,7 @@ import {
 } from "./sshBackoff";
 import { isPermanentSSHFailure } from "./Runtime";
 import { isXumDaytonaHost } from "@/common/constants/daytona";
+import { getDaytonaSshConfigPath } from "./daytonaSshConfig";
 
 /**
  * Daytona aliases pin the gateway key in Xum's own known_hosts (UserKnownHostsFile in the
@@ -85,13 +86,9 @@ function createHostVerifier(
     : Promise.resolve(() => true);
 }
 
-/**
- * A Daytona alias connects straight to its pinned gateway: an inherited ProxyCommand (a user
- * `Host *` entry) would get the token as `%r` and could route the connection anywhere. The
- * parser reads no ProxyJump, so ssh2 never follows one.
- */
-function withoutInheritedProxy(host: string, resolved: ResolvedSSHConfig): ResolvedSSHConfig {
-  return isXumDaytonaHost(host) ? { ...resolved, proxyCommand: undefined } : resolved;
+/** As OpenSSH's `-F` (appendDaytonaOpenSSHArgs): a Daytona alias reads Xum's include file alone. */
+function sshConfigFileFor(host: string): string | undefined {
+  return isXumDaytonaHost(host) ? getDaytonaSshConfigPath() : undefined;
 }
 
 let sshPromptService: SshPromptService | undefined;
@@ -705,7 +702,7 @@ export class SSH2ConnectionPool {
     const key = makeConnectionKey(config);
     const retirement = this.retirementOf(key);
     try {
-      const resolved = withoutInheritedProxy(config.host, await resolveSSHConfig(config.host));
+      const resolved = await resolveSSHConfig(config.host, sshConfigFileFor(config.host));
       const resolvedConfig: ResolvedSSHConfig = {
         ...resolved,
         port: config.port ?? resolved.port,

@@ -32,6 +32,7 @@ import {
 } from "./sshBackoff";
 import { isPermanentSSHFailure } from "./Runtime";
 import { isXumDaytonaHost } from "@/common/constants/daytona";
+import { getDaytonaSshConfigPath } from "./daytonaSshConfig";
 import { redactDaytonaHostStderr } from "./daytonaTokenRedaction";
 
 export type OpenSSHHostKeyPolicyMode = "strict" | "headless-fallback";
@@ -52,47 +53,29 @@ export function isInteractiveHostKeyApprovalAvailable(): boolean {
 }
 
 /**
- * A Daytona alias's include block pins the gateway key, but OpenSSH keeps the first value it
- * reads, so a user `Host *` entry above Xum's block with `StrictHostKeyChecking no` would win and
- * hand the token (the ssh user name) to any server. Command-line options beat every config file,
- * so force strict checking: if an earlier entry also points UserKnownHostsFile elsewhere, the
- * gateway key is unknown and ssh refuses before it sends the user name.
- *
- * The sandbox is not trusted either: a user `Host *` entry's agent, X11 or port forwards would
- * let its processes use the local agent, display or ports, so those are forced off too. The
- * bash AI proxy's reverse forward adds its `-R` through a control client that skips this.
- *
- * Nor may an inherited entry run a local command (which would get the token as `%r`) or route
- * the connection past the pinned gateway: ProxyCommand, ProxyJump and LocalCommand are off.
- * ProxyCommand goes first: OpenSSH applies only the first of the two it reads, so
- * `ProxyJump=none` is inert on clients that predate it. KnownHostsCommand is left alone:
- * OpenSSH before 8.5 refuses the option name, which would fail every connection.
+ * A Daytona alias is resolved from Xum's include file alone (getDaytonaSshConfigPath), never
+ * from ~/.ssh/config or /etc/ssh/ssh_config: no user entry can shadow the pinned gateway, run a
+ * local command with the token or forward anything into the untrusted sandbox. `quote` renders
+ * the path for a shell command string (GIT_SSH_COMMAND).
  */
-export function appendDaytonaOpenSSHArgs(args: string[], host: string): void {
+export function appendDaytonaOpenSSHArgs(
+  args: string[],
+  host: string,
+  quote: (value: string) => string = (value) => value
+): void {
   if (isXumDaytonaHost(host)) {
-    args.push(
-      "-o",
-      "StrictHostKeyChecking=yes",
-      "-o",
-      "ForwardAgent=no",
-      "-o",
-      "ForwardX11=no",
-      "-o",
-      "ClearAllForwardings=yes",
-      "-o",
-      "ProxyCommand=none",
-      "-o",
-      "ProxyJump=none",
-      "-o",
-      "PermitLocalCommand=no"
-    );
+    args.push("-F", quote(getDaytonaSshConfigPath()));
   }
 }
 
 /** Daytona aliases never get the headless fallback, which would accept any gateway key. */
-export function appendOpenSSHHostKeyPolicyArgs(args: string[], host: string): void {
+export function appendOpenSSHHostKeyPolicyArgs(
+  args: string[],
+  host: string,
+  quote?: (value: string) => string
+): void {
   if (isXumDaytonaHost(host)) {
-    appendDaytonaOpenSSHArgs(args, host);
+    appendDaytonaOpenSSHArgs(args, host, quote);
     return;
   }
   if (hostKeyPolicyMode === "strict") {

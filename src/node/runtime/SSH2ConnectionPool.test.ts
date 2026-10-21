@@ -14,6 +14,7 @@ import {
 } from "./SSH2ConnectionPool";
 import type { SSHConnectionConfig } from "./sshConnectionPool";
 import { SSH2Transport } from "./transports/SSH2Transport";
+import { DaytonaSshConfigWriter } from "./daytonaSshConfig";
 
 const PROXY_TOKENS = { host: "example.test", port: 2222, user: "alice" };
 
@@ -178,6 +179,38 @@ describe.skipIf(process.platform === "win32")(
       expect(waits.length).toBeGreaterThan(0);
     });
 
+    const publicKeyLine = (privateKey: string) => {
+      const parsed = utils.parseKey(privateKey);
+      if (parsed instanceof Error) throw parsed;
+      return `${parsed.type} ${parsed.getPublicSSH().toString("base64")}`;
+    };
+
+    /** A home whose ssh config is `userConfig` plus Xum's Daytona block for sb-1 at `port`. */
+    async function withDaytonaHome(
+      userConfig: string,
+      fn: (writer: DaytonaSshConfigWriter, home: string) => Promise<void>
+    ): Promise<void> {
+      const home = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh2-daytona-home-"));
+      // The ssh config parser reads USERPROFILE first (sshConfigParser.test.ts does the same).
+      const originalUserProfile = process.env.USERPROFILE;
+      process.env.USERPROFILE = home;
+      try {
+        const sshConfigPath = path.join(home, ".ssh", "config");
+        await fs.mkdir(path.dirname(sshConfigPath));
+        await fs.writeFile(sshConfigPath, userConfig);
+        // A space, as in "/Users/John Smith": daytonaSshConfig quotes the paths.
+        const writer = new DaytonaSshConfigWriter({
+          xumHome: path.join(home, "John Smith", ".xum"),
+          sshConfigPath,
+        });
+        await fn(writer, home);
+      } finally {
+        if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = originalUserProfile;
+        await fs.rm(home, { recursive: true, force: true });
+      }
+    }
+
     // ssh2 reads no known_hosts: without this check a Daytona alias accepted any gateway key.
     it("connects to a Daytona alias only when the gateway key matches the pinned one", async () => {
       const hostKey = newPrivateKey();
@@ -185,37 +218,18 @@ describe.skipIf(process.platform === "win32")(
         conn.on("authentication", (ctx) => ctx.accept());
         conn.on("error", () => undefined);
       }, hostKey);
-      const home = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh2-daytona-home-"));
-      // The ssh config parser reads USERPROFILE first (sshConfigParser.test.ts does the same).
-      const originalUserProfile = process.env.USERPROFILE;
-      process.env.USERPROFILE = home;
-      try {
-        // A space, as in "/Users/John Smith": daytonaSshConfig quotes the path.
-        const knownHostsPath = path.join(home, "John Smith", "daytona_known_hosts");
-        await fs.mkdir(path.dirname(knownHostsPath));
-        await fs.mkdir(path.join(home, ".ssh"));
-        await fs.writeFile(
-          path.join(home, ".ssh", "config"),
-          [
-            "Host sb-1.xum--daytona",
-            "  HostName 127.0.0.1",
-            `  Port ${String(config.port)}`,
-            "  HostKeyAlias gateway.test",
-            `  UserKnownHostsFile "${knownHostsPath}"`,
-            "  StrictHostKeyChecking yes",
-          ].join("\n")
-        );
-        const pinLine = (privateKey: string) => {
-          const parsed = utils.parseKey(privateKey);
-          if (parsed instanceof Error) throw parsed;
-          return `gateway.test ${parsed.type} ${parsed.getPublicSSH().toString("base64")}\n`;
-        };
+      await withDaytonaHome("", async (writer) => {
+        const gateway = { host: "127.0.0.1", port: config.port ?? 22 };
         const daytona: SSHConnectionConfig = {
           host: "sb-1.xum--daytona",
           identityFile: config.identityFile,
         };
 
-        await fs.writeFile(knownHostsPath, pinLine(newPrivateKey()));
+        await writer.writeSandbox({
+          sandboxId: "sb-1",
+          token: "tokenA",
+          gateway: { ...gateway, hostKeys: [publicKeyLine(newPrivateKey())] },
+        });
         const refused = await new SSH2ConnectionPool()
           .acquireConnection(daytona, { maxWaitMs: 0 })
           .then(
@@ -224,76 +238,61 @@ describe.skipIf(process.platform === "win32")(
           );
         expect(String(refused)).toContain("Host denied");
 
-        await fs.writeFile(knownHostsPath, pinLine(hostKey));
+        await writer.repointGateway({ ...gateway, hostKeys: [publicKeyLine(hostKey)] });
         const entry = await new SSH2ConnectionPool().acquireConnection(daytona, { maxWaitMs: 0 });
         entry.client.end();
-      } finally {
-        if (originalUserProfile === undefined) delete process.env.USERPROFILE;
-        else process.env.USERPROFILE = originalUserProfile;
-        await fs.rm(home, { recursive: true, force: true });
-      }
+      });
     });
 
-    // The command would get the token as %r and could route the connection anywhere.
-    it("runs no inherited ProxyCommand for a Daytona alias, only for other hosts", async () => {
+    // A user directive with %r would get the token, and ProxyCommand could route anywhere.
+    it("runs no user ssh config directive for a Daytona alias, only for other hosts", async () => {
       const hostKey = newPrivateKey();
       const { config } = await startServer((conn) => {
         conn.on("authentication", (ctx) => ctx.accept());
         conn.on("error", () => undefined);
       }, hostKey);
-      const home = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh2-daytona-proxy-"));
-      const originalUserProfile = process.env.USERPROFILE;
-      process.env.USERPROFILE = home;
-      try {
-        const knownHostsPath = path.join(home, "daytona_known_hosts");
-        const marker = path.join(home, "proxy-ran");
-        const parsed = utils.parseKey(hostKey);
-        if (parsed instanceof Error) throw parsed;
-        await fs.writeFile(
-          knownHostsPath,
-          `gateway.test ${parsed.type} ${parsed.getPublicSSH().toString("base64")}\n`
-        );
-        await fs.mkdir(path.join(home, ".ssh"));
-        await fs.writeFile(
-          path.join(home, ".ssh", "config"),
-          [
-            "Host *",
-            `  ProxyCommand sh -c 'echo %r >> ${marker}; exit 1'`,
-            "Host sb-1.xum--daytona",
-            "  HostName 127.0.0.1",
-            `  Port ${String(config.port)}`,
-            "  User tokenA",
-            "  HostKeyAlias gateway.test",
-            `  UserKnownHostsFile ${knownHostsPath}`,
-            "Host plain-host",
-            "  HostName 127.0.0.1",
-            `  Port ${String(config.port)}`,
-            "  User plainuser",
-          ].join("\n")
-        );
+      const marker = path.join(os.tmpdir(), `xum-ssh2-ran-${String(process.pid)}-${Date.now()}`);
+      const plainHost = [
+        "Host plain-host",
+        "  HostName 127.0.0.1",
+        `  Port ${String(config.port)}`,
+        "  User plainuser",
+        "",
+      ].join("\n");
+      for (const userConfig of [
+        `Host *\n  ProxyCommand sh -c 'echo %r >> ${marker}; exit 1'\n${plainHost}`,
+        `Match host 127.0.0.1 !exec "echo %r >> ${marker}"\n${plainHost}`,
+      ]) {
+        await withDaytonaHome(userConfig, async (writer) => {
+          await writer.writeSandbox({
+            sandboxId: "sb-1",
+            token: "tokenA",
+            gateway: {
+              host: "127.0.0.1",
+              port: config.port ?? 22,
+              hostKeys: [publicKeyLine(hostKey)],
+            },
+          });
 
-        const entry = await new SSH2ConnectionPool().acquireConnection(
-          { host: "sb-1.xum--daytona", identityFile: config.identityFile },
-          { maxWaitMs: 0 }
-        );
-        entry.client.end();
-        expect(await Bun.file(marker).exists()).toBe(false);
-
-        const plain = await new SSH2ConnectionPool()
-          .acquireConnection(
-            { host: "plain-host", identityFile: config.identityFile },
+          const entry = await new SSH2ConnectionPool().acquireConnection(
+            { host: "sb-1.xum--daytona", identityFile: config.identityFile },
             { maxWaitMs: 0 }
-          )
-          .then(
-            () => new Error("acquisition unexpectedly succeeded"),
-            (error: unknown) => error
           );
-        expect(plain).toBeInstanceOf(Error);
-        expect(await fs.readFile(marker, "utf8")).toContain("plainuser");
-      } finally {
-        if (originalUserProfile === undefined) delete process.env.USERPROFILE;
-        else process.env.USERPROFILE = originalUserProfile;
-        await fs.rm(home, { recursive: true, force: true });
+          entry.client.end();
+          expect(await Bun.file(marker).exists()).toBe(false);
+
+          await new SSH2ConnectionPool()
+            .acquireConnection(
+              { host: "plain-host", identityFile: config.identityFile },
+              { maxWaitMs: 0 }
+            )
+            .then(
+              (plain) => plain.client.end(),
+              () => undefined
+            );
+          expect(await fs.readFile(marker, "utf8")).toContain("plainuser");
+          await fs.rm(marker);
+        });
       }
     });
 

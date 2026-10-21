@@ -315,35 +315,58 @@ describe("DaytonaSshConfigWriter", () => {
     await writer.verifyResolvedConfig("sb-1", "tokenA");
   });
 
-  it.skipIf(!hasOpenSsh)(
-    "runs no inherited ProxyCommand, ProxyJump or LocalCommand for a Daytona alias",
-    async () => {
-      await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
-      const resolve = (host: string) => {
-        const args = ["-G", "-F", sshConfigPath];
-        appendOpenSSHHostKeyPolicyArgs(args, host);
-        return spawnSync("ssh", [...args, host]).stdout.toString();
-      };
-      for (const [routing, resolvedLine] of [
-        ["ProxyCommand nc %r %h %p", "\nproxycommand nc %r %h %p\n"],
-        ["ProxyJump jump.example.com", "\nproxyjump jump.example.com\n"],
-      ]) {
-        await fs.writeFile(
-          sshConfigPath,
-          `Host *\n  ${routing}\n  PermitLocalCommand yes\n  LocalCommand echo %r\n`,
-          "utf8"
-        );
-        await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+  // Any user directive with %r would get the token (the ssh user name), and `-o` cannot
+  // override a Match exec, so ssh reads only Xum's include file for a Daytona alias.
+  it.skipIf(!hasOpenSsh)("runs no user ssh config directive for a Daytona alias", async () => {
+    await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
+    const markers = path.join(tempDir, "markers");
+    await fs.mkdir(markers);
+    const resolve = (host: string) => {
+      const args = ["-G", "-F", sshConfigPath];
+      appendOpenSSHHostKeyPolicyArgs(args, host);
+      return spawnSync("ssh", [...args, host]).stdout.toString();
+    };
+    for (const [routing, resolvedLine] of [
+      ["ProxyCommand nc %r %h %p", "\nproxycommand nc %r %h %p\n"],
+      ["ProxyJump jump.example.com", "\nproxyjump jump.example.com\n"],
+    ]) {
+      await fs.writeFile(
+        sshConfigPath,
+        [
+          `Match exec "touch ${markers}/%r"`,
+          "Host *",
+          "  KnownHostsCommand /bin/echo %r",
+          `  ${routing}`,
+          "  PermitLocalCommand yes",
+          "  LocalCommand echo %r",
+          // Forwards would hand the untrusted sandbox the local agent, display or ports.
+          "  ForwardAgent yes",
+          "  ForwardX11 yes",
+          "  RemoteForward 6000 localhost:6000",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
 
-        const daytona = resolve(toXumDaytonaHost("sb-1"));
-        expect(daytona).not.toContain(resolvedLine);
-        expect(daytona).not.toMatch(/\nproxy(command|jump) /);
-        expect(daytona).toContain("\npermitlocalcommand no\n");
-        // Other hosts keep the user's settings.
-        expect(resolve("other.example.com")).toContain(resolvedLine);
-      }
+      const daytona = resolve(toXumDaytonaHost("sb-1"));
+      expect(daytona).toMatch(/^user tokenA$/m);
+      expect(daytona).not.toContain("knownhostscommand");
+      expect(daytona).not.toMatch(/\nproxy(command|jump) /);
+      expect(daytona).toContain("\npermitlocalcommand no\n");
+      expect(daytona).toContain("\nforwardagent no\n");
+      expect(daytona).toContain("\nforwardx11 no\n");
+      expect(daytona).not.toContain("remoteforward");
+      expect(await fs.readdir(markers)).toEqual([]);
+      // Other hosts keep the user's settings.
+      const other = resolve("other.example.com");
+      expect(other).toContain(resolvedLine);
+      expect(other).toContain("\nknownhostscommand /bin/echo %r\n");
+      expect((await fs.readdir(markers)).length).toBe(1);
+      await fs.rm(markers, { recursive: true });
+      await fs.mkdir(markers);
     }
-  );
+  });
 
   describe("a user Host * entry that weakens host key checking", () => {
     const WEAKENING_CONFIG = "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n";

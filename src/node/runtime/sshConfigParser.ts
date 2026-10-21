@@ -599,9 +599,9 @@ async function expandIncludes(
 }
 
 /** The user's ssh config with its Includes expanded for `host`. */
-async function loadSSHConfig(host: string): Promise<SSHConfig | null> {
+async function loadSSHConfig(host: string, configFile?: string): Promise<SSHConfig | null> {
   const homeDir = getHomeDir();
-  const configPath = path.join(homeDir, ".ssh", "config");
+  const configPath = configFile ?? path.join(homeDir, ".ssh", "config");
 
   try {
     const content = await fs.readFile(configPath, "utf8");
@@ -618,11 +618,15 @@ async function loadSSHConfig(host: string): Promise<SSHConfig | null> {
   }
 }
 
-export async function resolveSSHConfig(host: string): Promise<ResolvedSSHConfig> {
+/** `configFile` replaces ~/.ssh/config, as OpenSSH's `-F` does. */
+export async function resolveSSHConfig(
+  host: string,
+  configFile?: string
+): Promise<ResolvedSSHConfig> {
   const { host: hostAlias, user: userOverride } = parseHostAndUser(host);
   const homeDir = getHomeDir();
 
-  const config = await loadSSHConfig(hostAlias);
+  const config = await loadSSHConfig(hostAlias, configFile);
   const computed = config
     ? userOverride
       ? config.compute({ Host: hostAlias, User: userOverride })
