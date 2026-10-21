@@ -1200,22 +1200,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       const disowned = await this.disownSandbox(sandboxId, errorPrefix);
       if (disowned) return disowned;
     }
-    // Access is per stored string (a sandbox's name or its id): a kept sandbox keeps it only
-    // while another workspace stores the same one.
-    const releases =
-      fate === "release" ||
-      !this.daytonaService.isAliasStoredElsewhere(sandboxId, this.workspaceId);
-    if (releases) {
-      try {
-        await this.daytonaService.releaseSshAccess(sandboxId);
-      } catch (error) {
-        // The token expires within the hour; the workspace is gone either way.
-        log.warn("Failed to release Daytona ssh access after deleting a workspace", {
-          sandboxId,
-          error: getErrorMessage(error),
-        });
-      }
-    }
+    await this.releaseAccessOnDelete(sandboxId, fate);
     if (fate !== "handOff") return result;
     const notice =
       `Daytona sandbox "${sandboxId}" was kept for a workspace that attached it. Xum never ` +
@@ -1223,6 +1208,26 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       "in Daytona when you no longer need it.";
     log.info(notice, { workspaceId: this.workspaceId });
     return { ...result, notice: result.notice ? `${result.notice} ${notice}` : notice };
+  }
+
+  /**
+   * Access is per stored string (a sandbox's name or its id): a kept sandbox keeps it only
+   * while another workspace stores the same one.
+   */
+  private async releaseAccessOnDelete(sandboxId: string, fate: SandboxFate): Promise<void> {
+    const releases =
+      fate === "release" ||
+      !this.daytonaService.isAliasStoredElsewhere(sandboxId, this.workspaceId);
+    if (!releases) return;
+    try {
+      await this.daytonaService.releaseSshAccess(sandboxId);
+    } catch (error) {
+      // The token expires within the hour; the workspace is gone either way.
+      log.warn("Failed to release Daytona ssh access after deleting a workspace", {
+        sandboxId,
+        error: getErrorMessage(error),
+      });
+    }
   }
 
   /**
