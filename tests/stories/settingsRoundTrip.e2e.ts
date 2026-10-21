@@ -29,9 +29,10 @@ test(
     await agent.act(`send the chat message '${MESSAGE}' and wait for the reply`);
     await expect(transcript).toContainText(REPLY, { timeout: 30_000 });
 
-    await agent.act(
-      "open Settings, open its Models section, then its Providers section, then close Settings"
-    );
+    // Two agent steps, not one: as one step, Haiku 5.5 ran out of turns (TEST_SETUP_FAILED).
+    await agent.act("open Settings, then open its Models section");
+    await expect(settings).toBeVisible();
+    await agent.act("open the Providers section of Settings, then close Settings");
     await expect(settings).not.toBeVisible();
     // The button names of SettingsButton.tsx and SettingsPage.tsx.
     for (let i = 0; i < 3; i++) {
