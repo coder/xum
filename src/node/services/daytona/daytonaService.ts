@@ -214,12 +214,7 @@ export interface DaytonaServiceOptions {
   /** Defaults to a writer for the real `~/.ssh/config`; tests pass one aimed at a temp dir. */
   sshConfigWriter?: Pick<
     DaytonaSshConfigWriter,
-    | "writeSandbox"
-    | "updateToken"
-    | "repointGateway"
-    | "removeSandbox"
-    | "verifyResolvedConfig"
-    | "readTokens"
+    "writeSandbox" | "updateToken" | "repointGateway" | "removeSandbox" | "readTokens"
   >;
   fetch?: typeof fetch;
   now?: () => number;
@@ -1221,8 +1216,7 @@ export class DaytonaService {
 
   /**
    * A valid token in the include file for this sandbox. The first write in this process also
-   * writes known_hosts and the `~/.ssh/config` block and checks that ssh resolves the token as
-   * the user; a refresh rewrites only the include file.
+   * writes known_hosts and the `~/.ssh/config` block; a refresh rewrites only the include file.
    */
   ensureSshAccess(sandboxId: string): Promise<void> {
     return this.withAccountLease(async () => {
@@ -1230,7 +1224,7 @@ export class DaytonaService {
       // Fails before a mint when the control plane cannot say where the gateway is.
       await this.getGatewayConfig();
       // A cached token was written by the mint that produced it, so only a mint writes files.
-      const access = await this.getSshToken(sandboxId, {
+      await this.getSshToken(sandboxId, {
         onNewToken: async ({ token }) => {
           // Looked up after the mint, so a settings change before it cannot pair this token with
           // the old deployment's gateway; one after it makes the mint start over.
@@ -1242,10 +1236,6 @@ export class DaytonaService {
           await this.sshConfigWriter.writeSandbox({ sandboxId, token, gateway });
         },
       });
-      if (this.sshConfigured.has(sandboxId)) return;
-      // Outside the mint: when the user's ssh config shadows the token, a retry after they fix it
-      // reuses this token (already written) instead of minting another one.
-      await this.sshConfigWriter.verifyResolvedConfig(sandboxId, access.token);
       this.sshConfigured.add(sandboxId);
     });
   }

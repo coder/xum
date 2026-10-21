@@ -561,7 +561,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
   });
 
   it("deletes the sandbox it created when setup fails afterwards", async () => {
-    rig.writer.verifyError = new Error("Your ssh config sets User");
+    rig.writer.writeError = new Error("No space left on device");
     const params = initParams();
 
     const failure = await makeRuntime({ sandboxId: "xum-doomed", shared: false, ...SMALL })
@@ -572,7 +572,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
       );
 
     expect(failure).toBeInstanceOf(Error);
-    expect(String(failure)).toContain("Your ssh config sets User");
+    expect(String(failure)).toContain("No space left on device");
 
     expect(rig.plane.countCalls("POST /sandbox")).toBe(1);
     expect(rig.plane.find("xum-doomed")).toBeUndefined();
@@ -586,7 +586,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     expect(ready.ready).toBe(false);
     if (!ready.ready) {
       expect(ready.error).toContain("setup failed");
-      expect(ready.error).toContain("Your ssh config sets User");
+      expect(ready.error).toContain("No space left on device");
     }
   });
 
@@ -601,7 +601,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
         ["xum-transient", false],
         ["xum-persistent", true],
       ] as const) {
-        rig.writer.verifyError = new Error("Your ssh config sets User");
+        rig.writer.writeError = new Error("No space left on device");
         rig.plane.failingRoutes.add(`DELETE /sandbox/${sandboxId}`);
         const daytona = { sandboxId, shared: false, ...SMALL };
 
@@ -613,7 +613,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
 
         // The persisted workspace still names the sandbox; removing it deletes the sandbox.
         rig.plane.failingRoutes.clear();
-        if (!force) rig.writer.verifyError = undefined;
+        if (!force) rig.writer.writeError = undefined;
         rig.workspaces.splice(0, rig.workspaces.length, {
           workspaceId: "ws-1",
           runtimeConfig: sshDaytonaConfig(daytona),

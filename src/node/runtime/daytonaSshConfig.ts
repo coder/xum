@@ -1,8 +1,6 @@
-import { execFile } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
-import { promisify } from "node:util";
 import {
   XUM_DAYTONA_HOST_SUFFIX,
   XUM_DAYTONA_SSH_BLOCK_END,
@@ -10,15 +8,12 @@ import {
   toXumDaytonaHost,
 } from "@/common/constants/daytona";
 import { getXumHome } from "@/common/constants/paths";
-import { getErrorMessage } from "@/common/utils/errors";
 import { ensureManagedSSHConfigBlock } from "@/node/runtime/muxSshConfigWriter";
 import { log } from "@/node/services/log";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
-
-const execFileAsync = promisify(execFile);
 
 /**
  * SSH plumbing for Daytona sandboxes, reached through Daytona's SSH gateway where the access
@@ -230,19 +225,16 @@ export interface DaytonaSshConfigWriterOptions {
   xumHome: string;
   /** Defaults to `~/.ssh/config`; tests point it at a temp file. */
   sshConfigPath?: string;
-  sshBinary?: string;
 }
 
 export class DaytonaSshConfigWriter {
   readonly paths: DaytonaSshPaths;
   private readonly sshConfigPath?: string;
-  private readonly sshBinary: string;
 
   constructor(options: DaytonaSshConfigWriterOptions) {
     this.paths = getDaytonaSshPaths(options.xumHome);
     activeIncludePath = this.paths.includePath;
     this.sshConfigPath = options.sshConfigPath;
-    this.sshBinary = options.sshBinary ?? "ssh";
   }
 
   /** First write for a sandbox: known_hosts, its include block, and the managed ssh block. */
@@ -390,86 +382,4 @@ export class DaytonaSshConfigWriter {
       mode: 0o600,
     });
   }
-
-  /**
-   * OpenSSH keeps the first value it sees, so a user `Host *` entry above Xum's managed block
-   * silently replaces what the alias's block sets: the token (`User`), the gateway (`HostName`,
-   * `Port`, `HostKeyAlias`) or the pinned known_hosts file. Resolve the alias with `ssh -G`,
-   * compare every directive the include file holds for it, and fail with a clear message instead
-   * of an opaque auth, routing or host key failure. The token is never printed. Skipped when no
-   * OpenSSH client is installed (the ssh2 path parses the config itself).
-   */
-  async verifyResolvedConfig(sandboxId: string, token: string): Promise<void> {
-    const alias = toXumDaytonaHost(sandboxId);
-    const args = ["-G", ...(this.sshConfigPath ? ["-F", this.sshConfigPath] : []), alias];
-    let stdout: string;
-    try {
-      ({ stdout } = await execFileAsync(this.sshBinary, args, { timeout: 10_000 }));
-    } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) {
-        log.debug("Skipping Daytona ssh user check: no OpenSSH client found");
-        return;
-      }
-      throw new DaytonaSshConfigError(
-        `Could not check the ssh config for ${alias} with ssh -G (${getErrorMessage(error).split("\n")[0]})`
-      );
-    }
-    const block = (await this.readBlocks()).get(alias);
-    if (!block) {
-      throw new DaytonaSshConfigError(
-        `Xum's ssh settings for ${alias} are missing from ${this.paths.includePath}`
-      );
-    }
-    const shadowed = shadowedDirectives(block, token, stdout);
-    if (shadowed.length > 0) {
-      const one = shadowed.length === 1;
-      throw new DaytonaSshConfigError(
-        `Your ssh config sets ${shadowed.join(", ")} for ${alias} before Xum's Daytona block ` +
-          `(often in a "Host *" entry), and OpenSSH keeps the first value. Move ` +
-          `${one ? "that line" : "those lines"} below the "${XUM_DAYTONA_SSH_BLOCK_START}" ` +
-          `block in ~/.ssh/config or scope ${one ? "it" : "them"} to specific hosts.`
-      );
-    }
-  }
-}
-
-// Every OpenSSH call forces it on the command line (appendDaytonaOpenSSHArgs) and the ssh2
-// transport always checks the pinned key, so a user value for it changes nothing.
-const UNVERIFIED_DIRECTIVES = new Set(["stricthostkeychecking"]);
-
-/** The directives of a rendered host block that `ssh -G` (its `stdout`) resolves differently. */
-function shadowedDirectives(block: string, token: string, stdout: string): string[] {
-  const resolved = new Map<string, string>();
-  for (const line of stdout.split("\n")) {
-    const space = line.indexOf(" ");
-    if (space > 0) resolved.set(line.slice(0, space), line.slice(space + 1).trim());
-  }
-  return hostBlockDirectives(block)
-    .filter(([name]) => !UNVERIFIED_DIRECTIVES.has(name.toLowerCase()))
-    .filter(([name, value]) => {
-      const key = name.toLowerCase();
-      return !resolvesTo(key, key === "user" ? token : value, resolved.get(key));
-    })
-    .map(([name]) => name);
-}
-
-/** The `Key value` lines of a rendered host block, in order, with quoted values unquoted. */
-function hostBlockDirectives(block: string): Array<[string, string]> {
-  return block
-    .split("\n")
-    .slice(1)
-    .flatMap((line): Array<[string, string]> => {
-      const match = /^\s+(\S+)\s+(.+?)\s*$/.exec(line);
-      return match ? [[match[1], match[2].replace(/^"(.*)"$/, "$1")]] : [];
-    });
-}
-
-/** Whether `ssh -G` printed `expected` for `key`, given how it normalizes the value. */
-function resolvesTo(key: string, expected: string, resolved: string | undefined): boolean {
-  if (key === "hostname" || key === "hostkeyalias") {
-    return resolved?.toLowerCase() === expected.toLowerCase();
-  }
-  // ssh -G prints every known_hosts file on one line, separated by spaces.
-  if (key === "userknownhostsfile") return ` ${resolved ?? ""} `.includes(` ${expected} `);
-  return resolved === expected;
 }

@@ -346,35 +346,6 @@ describe("DaytonaService", () => {
     expect((await service.getAccount()).generation).toBe(before + 1);
   });
 
-  it("reuses one token while the user fixes an ssh config that shadows it", async () => {
-    let shadowed = true;
-    const writer = {
-      writeSandbox: () => Promise.resolve(),
-      updateToken: () => Promise.resolve(),
-      removeSandbox: () => Promise.resolve(),
-      readTokens: () => Promise.resolve([]),
-      verifyResolvedConfig: () =>
-        shadowed ? Promise.reject(new Error("ssh config shadows User")) : Promise.resolve(),
-      repointGateway: () => Promise.resolve(),
-    };
-    const withWriter = new DaytonaService({
-      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
-      rootDir,
-      fetch: plane.fetch,
-      now: () => clock,
-      sshConfigWriter: writer,
-    });
-    for (let attempt = 0; attempt < 2; attempt++) {
-      expect(await withWriter.ensureSshAccess("sb-1").catch((e: unknown) => e)).toBeInstanceOf(
-        Error
-      );
-    }
-    shadowed = false;
-    await withWriter.ensureSshAccess("sb-1");
-    expect(plane.calls.filter((call) => call === "POST /sandbox/sb-1/ssh-access")).toHaveLength(1);
-    expect(plane.revoked).toEqual([]);
-  });
-
   /** A service whose first token mint waits until `releaseMint`; `includeFile` is its writer. */
   function serviceWithHeldMint() {
     let mintStarted!: () => void;
@@ -412,7 +383,6 @@ describe("DaytonaService", () => {
           return Promise.resolve();
         },
         readTokens: () => Promise.resolve([]),
-        verifyResolvedConfig: () => Promise.resolve(),
       },
     });
     return { service: heldService, started, releaseMint, written, includeFile };
@@ -476,7 +446,6 @@ describe("DaytonaService", () => {
         },
         readTokens: () =>
           Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
-        verifyResolvedConfig: () => Promise.resolve(),
       },
       retireSshConnections: (sandboxId) => {
         retired.push(sandboxId);
@@ -648,7 +617,6 @@ describe("DaytonaService", () => {
       removeSandbox: () => Promise.resolve(),
       readTokens: () =>
         Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
-      verifyResolvedConfig: () => Promise.resolve(),
       repointGateway: () => Promise.resolve(),
     };
     const startProcess = async () => {
@@ -684,7 +652,6 @@ describe("DaytonaService", () => {
         failedReads-- > 0
           ? Promise.reject(new Error("EIO: i/o error, read"))
           : Promise.resolve([{ sandboxId: "sb-1", token: "earlier-process-token" }]),
-      verifyResolvedConfig: () => Promise.resolve(),
       repointGateway: () => Promise.resolve(),
     };
     service = new DaytonaService({

@@ -269,20 +269,17 @@ export class FakeDaytonaControlPlane {
 /** Records ssh config writes instead of touching `~/.ssh/config`. */
 export class FakeDaytonaSshConfigWriter implements Pick<
   DaytonaSshConfigWriter,
-  | "writeSandbox"
-  | "updateToken"
-  | "repointGateway"
-  | "removeSandbox"
-  | "verifyResolvedConfig"
-  | "readTokens"
+  "writeSandbox" | "updateToken" | "repointGateway" | "removeSandbox" | "readTokens"
 > {
   /** Current token per sandbox alias, as the include file would hold it. */
   readonly tokens = new Map<string, string>();
   readonly fullWrites: string[] = [];
   readonly removed: string[] = [];
-  verifyError?: Error;
+  /** Fails every first write of a sandbox (a setup failure after the sandbox exists). */
+  writeError?: Error;
 
   writeSandbox(input: { sandboxId: string; token: string }): Promise<void> {
+    if (this.writeError) return Promise.reject(this.writeError);
     this.fullWrites.push(input.sandboxId);
     this.tokens.set(input.sandboxId, input.token);
     return Promise.resolve();
@@ -305,10 +302,6 @@ export class FakeDaytonaSshConfigWriter implements Pick<
 
   readTokens(): Promise<Array<{ sandboxId: string; token: string }>> {
     return Promise.resolve([...this.tokens].map(([sandboxId, token]) => ({ sandboxId, token })));
-  }
-
-  verifyResolvedConfig(): Promise<void> {
-    return this.verifyError ? Promise.reject(this.verifyError) : Promise.resolve();
   }
 }
 

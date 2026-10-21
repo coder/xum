@@ -270,49 +270,17 @@ describe("DaytonaSshConfigWriter", () => {
     );
   });
 
-  it.skipIf(!hasOpenSsh)("resolves the token as the ssh user through OpenSSH", async () => {
+  // What an editor's Remote-SSH resolves for the workspace's host, through ~/.ssh/config.
+  it.skipIf(!hasOpenSsh)("resolves the alias through the managed ssh config block", async () => {
     await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
     await fs.writeFile(sshConfigPath, "Host other\n  User someone\n", "utf8");
     await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
 
-    await writer.verifyResolvedConfig("sb-1", "tokenA");
-
+    const alias = spawnSync("ssh", ["-G", "-F", sshConfigPath, toXumDaytonaHost("sb-1")]);
+    expect(alias.stdout.toString()).toMatch(/^user tokenA$/m);
     // The included Host block must not leak to unrelated hosts.
     const other = spawnSync("ssh", ["-G", "-F", sshConfigPath, "unrelated.example.com"]);
     expect(other.stdout.toString()).not.toContain("user tokenA");
-  });
-
-  it.skipIf(!hasOpenSsh)("fails clearly when a user Host * User setting wins", async () => {
-    await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
-    await fs.writeFile(sshConfigPath, "Host *\n  User me\n", "utf8");
-    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
-
-    const error = await writer.verifyResolvedConfig("sb-1", "tokenA").catch((e: unknown) => e);
-    expect((error as Error).message).toContain('"Host *"');
-    expect((error as Error).message).not.toContain("tokenA");
-  });
-
-  it.skipIf(!hasOpenSsh)("fails clearly when a user Host * routing setting wins", async () => {
-    await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
-    for (const [setting, line] of [
-      ["Port", "Port 2222"],
-      ["HostName", "HostName elsewhere.example.com"],
-      ["HostKeyAlias", "HostKeyAlias elsewhere.example.com"],
-    ]) {
-      await fs.writeFile(sshConfigPath, `Host *\n  ${line}\n`, "utf8");
-      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
-
-      const error = await writer.verifyResolvedConfig("sb-1", "tokenA").catch((e: unknown) => e);
-      expect(String(error)).toContain(`sets ${setting} for`);
-    }
-    // The block's own values (a mixed-case gateway host included) pass as ssh -G prints them.
-    await fs.writeFile(sshConfigPath, "Host other\n  Port 2222\n", "utf8");
-    await writer.writeSandbox({
-      sandboxId: "sb-1",
-      token: "tokenA",
-      gateway: { ...GATEWAY, host: "SSH.Daytona.test", port: 2200 },
-    });
-    await writer.verifyResolvedConfig("sb-1", "tokenA");
   });
 
   // Any user directive with %r would get the token (the ssh user name), and `-o` cannot
@@ -381,15 +349,6 @@ describe("DaytonaSshConfigWriter", () => {
       const resolved = spawnSync("ssh", [...args, toXumDaytonaHost("sb-1")]).stdout.toString();
 
       expect(resolved).toContain("\nstricthostkeychecking true\n");
-    });
-
-    it.skipIf(!hasOpenSsh)("fails the ssh config check, naming the setting", async () => {
-      await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
-      await fs.writeFile(sshConfigPath, WEAKENING_CONFIG, "utf8");
-      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
-
-      const error = await writer.verifyResolvedConfig("sb-1", "tokenA").catch((e: unknown) => e);
-      expect((error as Error).message).toContain("sets UserKnownHostsFile");
     });
   });
 });
