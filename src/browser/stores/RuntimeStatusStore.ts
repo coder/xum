@@ -153,9 +153,21 @@ export class RuntimeStatusStore {
     if (event.source !== "runtime" || !this.tracksRuntimeStart(event)) {
       return;
     }
+    this.refreshIfDisplayed(event.workspaceId);
+  }
+
+  /**
+   * Opening a terminal brings a stopped Daytona sandbox up first (the backend runs ensureReady),
+   * outside any turn and so without runtime-status events: refetch a displayed one.
+   */
+  refreshAfterTerminalOpen(workspaceId: string): void {
+    this.refreshIfDisplayed(workspaceId);
+  }
+
+  private refreshIfDisplayed(workspaceId: string): void {
     if (
-      hasRuntimeStatus(this.workspaceMetadata.get(event.workspaceId)?.runtimeConfig) &&
-      this.statuses.hasKeySubscribers(event.workspaceId)
+      hasRuntimeStatus(this.workspaceMetadata.get(workspaceId)?.runtimeConfig) &&
+      this.statuses.hasKeySubscribers(workspaceId)
     ) {
       this.refreshController.requestImmediate();
     }
@@ -226,7 +238,8 @@ export class RuntimeStatusStore {
 
 let runtimeStatusStoreInstance: RuntimeStatusStore | null = null;
 
-function getRuntimeStatusStoreInstance(): RuntimeStatusStore {
+/** The shared store, for non-React callers (useRuntimeStatusStoreRaw in components). */
+export function getRuntimeStatusStoreInstance(): RuntimeStatusStore {
   runtimeStatusStoreInstance ??= new RuntimeStatusStore();
   return runtimeStatusStoreInstance;
 }

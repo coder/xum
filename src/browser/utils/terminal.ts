@@ -11,6 +11,7 @@ import type { AppRouter } from "@/node/orpc/router";
 import { isIosStandaloneWebApp } from "@/browser/utils/env";
 import { resolveBrowserAssetUrl } from "@/browser/utils/frontendBasePath";
 import { showTerminalDialog } from "@/browser/utils/terminalDialogStore";
+import { getRuntimeStatusStoreInstance } from "@/browser/stores/RuntimeStatusStore";
 
 type APIClient = RouterClient<AppRouter>;
 
@@ -122,10 +123,12 @@ export async function createTerminalSession(
   workspaceId: string,
   options?: TerminalSessionCreateOptions
 ): Promise<{ sessionId: string; workspaceId: string; cols: number; rows: number }> {
-  return api.terminal.create({
+  const session = await api.terminal.create({
     workspaceId,
     cols: DEFAULT_TERMINAL_SIZE.cols,
     rows: DEFAULT_TERMINAL_SIZE.rows,
     initialCommand: options?.initialCommand,
   });
+  getRuntimeStatusStoreInstance().refreshAfterTerminalOpen(workspaceId);
+  return session;
 }
