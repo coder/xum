@@ -47,7 +47,7 @@ import {
 } from "@/browser/utils/rightSidebarLayout";
 import type { TabType } from "@/browser/types/rightSidebar";
 import { openRightSidebarTool, splitRightSidebarPane } from "@/browser/utils/rightSidebarTabFocus";
-import { BROWSER_VIEWPORT_ATTR } from "@/browser/utils/ui/keybinds";
+import { BROWSER_VIEWPORT_ATTR, TERMINAL_CONTAINER_ATTR } from "@/browser/utils/ui/keybinds";
 
 const RIGHT_SIDEBAR_SELECTOR = '[role="complementary"][aria-label="Workspace insights"]';
 
@@ -571,6 +571,43 @@ describeIntegration("RightSidebar (UI)", () => {
       await waitFor(() => {
         const tablist = sidebar.querySelector('[role="tablist"]');
         if (!tablist) throw new Error("Tablist should be visible after expand");
+      });
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("Ctrl+Shift+B collapses and expands the sidebar, but not from a terminal", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
+    });
+    const tablist = () => sidebar.querySelector('[role="tablist"]');
+
+    try {
+      await waitFor(() => {
+        if (!tablist()) throw new Error("Tablist should be visible when expanded");
+      });
+
+      const chord = { key: "B", code: "KeyB", ctrlKey: true, shiftKey: true };
+      fireEvent.keyDown(window, chord);
+      await waitFor(() => {
+        if (tablist()) throw new Error("Ctrl+Shift+B should collapse the sidebar");
+      });
+
+      // A focused terminal keeps the key: the sidebar stays collapsed.
+      const terminal = document.createElement("div");
+      terminal.setAttribute(TERMINAL_CONTAINER_ATTR, "");
+      document.body.append(terminal);
+      try {
+        fireEvent.keyDown(terminal, chord);
+      } finally {
+        terminal.remove();
+      }
+      expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), false)).toBe(true);
+
+      fireEvent.keyDown(window, chord);
+      await waitFor(() => {
+        if (!tablist()) throw new Error("Ctrl+Shift+B should expand the sidebar again");
       });
     } finally {
       await cleanup();

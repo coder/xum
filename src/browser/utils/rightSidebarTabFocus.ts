@@ -13,8 +13,11 @@ import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
   getRightSidebarLayoutKey,
   getRightSidebarCollapsedKey,
+  getReviewImmersiveKey,
   RIGHT_SIDEBAR_TAB_KEY,
 } from "@/common/constants/storage";
+import { RIGHT_SIDEBAR_DEFAULT_COLLAPSED } from "@/constants/layout";
+import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 
 export function focusRightSidebarTab(workspaceId: string, tab: TabType): void {
   // Explicit navigation must reveal the requested tool even though chats start collapsed.
@@ -63,6 +66,23 @@ export function requestFocusedTabFocus(workspaceId: string): void {
       tab: getFocusedActiveTab(layout, NEW_TAB),
     })
   );
+}
+
+/**
+ * Collapses or expands the right sidebar (the TOGGLE_RIGHT_SIDEBAR key and its palette command).
+ * Returns false, and changes nothing, while the sidebar is not on screen: a narrow window or
+ * immersive review hides it, so a flip there would be invisible until later. Immersive review
+ * also hides the header toggle (ShellRightSidebarToggle), so the key and the button agree.
+ */
+export function toggleRightSidebarCollapsed(workspaceId: string, shell: Element | null): boolean {
+  if (isWorkspaceRightSidebarHidden(shell)) return false;
+  if (readPersistedState(getReviewImmersiveKey(workspaceId), false)) return false;
+  updatePersistedState<boolean>(
+    getRightSidebarCollapsedKey(workspaceId),
+    (prev) => !prev,
+    RIGHT_SIDEBAR_DEFAULT_COLLAPSED
+  );
+  return true;
 }
 
 export function readRightSidebarLayout(workspaceId: string): RightSidebarLayoutState {

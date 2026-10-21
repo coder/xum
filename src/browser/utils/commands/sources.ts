@@ -204,6 +204,7 @@ import {
   readRightSidebarLayout,
   requestFocusedTabFocus,
   splitRightSidebarPane,
+  toggleRightSidebarCollapsed,
   updateRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
 
@@ -1036,7 +1037,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       },
       {
         id: CommandIds.navToggleSidebar(),
-        title: "Toggle Sidebar",
+        title: "Toggle Left Sidebar",
         section: section.navigation,
         shortcutHint: formatKeybind(KEYBINDS.TOGGLE_SIDEBAR),
         run: () => p.onToggleSidebar(),
@@ -1149,6 +1150,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             ]
           : []),
         ...mcpAppNavigationActions(p, wsId, section.navigation),
+        {
+          id: CommandIds.navRightSidebarToggle(),
+          title: "Right Sidebar: Toggle",
+          section: section.navigation,
+          shortcutHint: formatKeybind(KEYBINDS.TOGGLE_RIGHT_SIDEBAR),
+          // Same helper as the key: it does nothing while the layout hides the sidebar.
+          run: () => {
+            toggleRightSidebarCollapsed(wsId, document.querySelector("[data-workspace-shell]"));
+          },
+        },
         {
           id: CommandIds.navRightSidebarFocusTerminal(),
           title: "Right Sidebar: Focus Terminal",

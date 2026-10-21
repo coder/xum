@@ -16,6 +16,15 @@ import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFul
 import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { guardSidebarKeys, holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
+import {
+  isBrowserViewportFocused,
+  isDesktopViewportFocused,
+  isDialogOpen,
+  isTerminalFocused,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
+import { toggleRightSidebarCollapsed } from "@/browser/utils/rightSidebarTabFocus";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
@@ -322,6 +331,35 @@ const WorkspacePlaceholder: React.FC<{
   </main>
 );
 
+/**
+ * The right sidebar had no hotkey (user request). It lives in WorkspaceShell, outside the lazy
+ * sidebar, so it works while the sidebar chunk loads, like the header toggle. It also works from
+ * the chat input: Ctrl+Shift+B types nothing there, like Ctrl+P for the left sidebar.
+ */
+function useRightSidebarToggleKey(
+  workspaceId: string,
+  shellRef: React.RefObject<HTMLDivElement | null>
+) {
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!matchesKeybind(e, KEYBINDS.TOGGLE_RIGHT_SIDEBAR) || isDialogOpen()) return;
+      // Terminals, browser and desktop viewports own their keystrokes.
+      if (
+        isTerminalFocused(e.target) ||
+        isBrowserViewportFocused(e.target) ||
+        isDesktopViewportFocused(e.target)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      // A held key would flip the sidebar on every repeat.
+      if (!e.repeat) toggleRightSidebarCollapsed(workspaceId, shellRef.current);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [workspaceId, shellRef]);
+}
+
 export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   const shellRef = useRef<HTMLDivElement>(null);
   const shellSize = useResizeObserver(shellRef);
@@ -464,6 +502,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   // Layer 1: the full-screen sidebar is drawn above the narrow-screen drawer (layer 0), so it
   // answers Escape first when both are open.
   useEscapeToDismiss(sidebarFullscreen, closeSidebarFullscreen, 1);
+  useRightSidebarToggleKey(props.workspaceId, shellRef);
   // The Timeline's "Reveal in transcript" scrolls to and highlights a message in the chat behind
   // the view, so close the view to show it (the phone Timeline dialog did the same).
   useEffect(() => {
