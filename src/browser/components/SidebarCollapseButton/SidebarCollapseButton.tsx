@@ -135,9 +135,9 @@ export function LeftSidebarToggleBarSpacer(props: { showNewChat: boolean }) {
   );
 }
 
-// Shared by the right toggle bar and its spacers. `right-sidebar-toggle` (globals.css) shows them
-// only where the docked right sidebar can show; the inset matches the header's collapsed padding
-// and the tab strip's, so the spacers under the bar line up with it.
+// Shared by the right toggle bar and its title bar hole. `right-sidebar-toggle` (globals.css)
+// shows them only where the docked right sidebar can show; the inset matches the header's
+// collapsed padding and the tab strip's, so the spacers under the bar line up with it.
 const RIGHT_BAR_LAYOUT_CLASS =
   "right-sidebar-toggle titlebar-safe-right titlebar-safe-right-gutter-2 items-center";
 
@@ -203,5 +203,33 @@ export function RightSidebarToggleSpacer(props: { className?: string }) {
       tabIndex={-1}
       className={cn(ICON_BUTTON_CLASS, "invisible", props.className)}
     />
+  );
+}
+
+/**
+ * A no-drag box under {@link RightSidebarToggle}'s button, which WorkspaceShell mounts after the
+ * sidebar. Electron drags the window where the last app-region rect in DOM order under the pointer
+ * is drag, and the toggle comes before the sidebar (for Tab order), so the sidebar's tab strip
+ * covers it, also on every frame of the width slide, when the strip's room is not under it.
+ * Transparent, not `invisible`: an `invisible` box reports no region.
+ */
+export function RightSidebarToggleHole() {
+  if (!isDesktopMode()) return null;
+  return (
+    <div
+      aria-hidden
+      className={cn(
+        RIGHT_BAR_LAYOUT_CLASS,
+        "pointer-events-none absolute top-0 right-0 pb-px opacity-0",
+        DESKTOP_TITLEBAR_HEIGHT_CLASS
+      )}
+    >
+      <Button
+        variant="ghost"
+        size="icon"
+        tabIndex={-1}
+        className={cn(ICON_BUTTON_CLASS, "titlebar-no-drag")}
+      />
+    </div>
   );
 }

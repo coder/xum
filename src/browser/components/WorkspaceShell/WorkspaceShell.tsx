@@ -43,7 +43,10 @@ import {
   RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
 } from "@/constants/layout";
 import { ChatPane } from "../ChatPane/ChatPane";
-import { RightSidebarToggle } from "../SidebarCollapseButton/SidebarCollapseButton";
+import {
+  RightSidebarToggle,
+  RightSidebarToggleHole,
+} from "../SidebarCollapseButton/SidebarCollapseButton";
 
 // ChatPane uses tailwind `min-w-96`.
 const CHAT_PANE_MIN_WIDTH_PX = 384;
@@ -557,6 +560,9 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         onCloseFullscreen={closeSidebarFullscreen}
         onRequestFullscreen={handleRequestSidebarFullscreen}
       />
+
+      {/* After the sidebar in DOM order: see RightSidebarToggleHole. */}
+      <RightSidebarToggleHole />
 
       {/* Portal target for immersive review mode overlay */}
       <div

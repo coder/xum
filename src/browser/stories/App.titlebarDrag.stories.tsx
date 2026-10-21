@@ -9,13 +9,16 @@
  *
  * WorkspaceCollapsed: the page header spans the window under the toggle bar, and its gap still
  * drags while the bar's buttons do not. The header's title edit field (F2) stays clickable.
+ *
+ * RightSidebarToggle: the right sidebar's toggle stays clickable over the sidebar's tab strip
+ * (expanded) and over the workspace header (collapsed).
  */
 
-import { expect, userEvent, within } from "storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
-import { collapseLeftSidebar, expandLeftSidebar } from "./helpers/uiState";
+import { collapseLeftSidebar, expandLeftSidebar, expandRightSidebar } from "./helpers/uiState";
 import { windowDragsAt, withDesktopTitlebar } from "./helpers/windowDrag";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
@@ -67,6 +70,26 @@ async function expectWorkspaceHeaderGapDrags(canvasElement: HTMLElement) {
   await expect(windowDragsAt((gapLeft + gapRight) / 2, y), "workspace header gap drags").toBe(true);
   await expectDrags(info, "Workspace details button", false);
   await expectDrags(bell, "Notifications button", false);
+}
+
+/** On every animation frame while `act` runs: does the window drag at the element's center? */
+async function sampleDragFrames(element: Element, act: () => Promise<void>) {
+  const result = { frames: 0, dragging: 0 };
+  let sampling = true;
+  const sample = () => {
+    if (!sampling) return;
+    result.frames++;
+    const point = center(element);
+    if (windowDragsAt(point.x, point.y)) result.dragging++;
+    requestAnimationFrame(sample);
+  };
+  sample();
+  try {
+    await act();
+  } finally {
+    sampling = false;
+  }
+  return result;
 }
 
 const desktopStory = (story: Pick<AppStory, "render" | "play">): AppStory => ({
@@ -148,5 +171,52 @@ export const WorkspaceCollapsed = desktopStory({
       "Title edit field",
       false
     );
+  },
+});
+
+export const RightSidebarToggle = desktopStory({
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const client = setupWorkspace();
+        expandRightSidebar();
+        return client;
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggle = await canvas.findByRole(
+      "button",
+      { name: "Collapse right sidebar" },
+      { timeout: 15_000 }
+    );
+    const strip = () => canvas.queryByRole("tablist", { name: "Sidebar views" });
+    // The toggle renders before the lazy sidebar: wait for the strip that comes after it.
+    await waitFor(() => expect(strip()).toBeInTheDocument(), { timeout: 15_000 });
+    await expectDrags(toggle, "Collapse right sidebar button", false);
+
+    // The strip slides under the toggle while the sidebar's width animates.
+    const collapsing = await sampleDragFrames(toggle, async () => {
+      await userEvent.click(toggle);
+      await waitFor(() => expect(strip()).not.toBeInTheDocument());
+    });
+    await expect(collapsing.frames).toBeGreaterThan(2);
+    await expect(collapsing.dragging, "frames the toggle drags in while collapsing").toBe(0);
+    await expect(toggle).toHaveAccessibleName("Expand right sidebar");
+    await expectDrags(toggle, "Expand right sidebar button", false);
+    await expectWorkspaceHeaderGapDrags(canvasElement);
+
+    const expanding = await sampleDragFrames(toggle, async () => {
+      await userEvent.click(toggle);
+      await waitFor(() => {
+        const sidebar = canvas.getByRole("complementary", { name: "Workspace insights" });
+        if (strip() == null || sidebar.getAnimations().length > 0) {
+          throw new Error("The sidebar is still sliding open");
+        }
+      });
+    });
+    await expect(expanding.frames).toBeGreaterThan(2);
+    await expect(expanding.dragging, "frames the toggle drags in while expanding").toBe(0);
   },
 });

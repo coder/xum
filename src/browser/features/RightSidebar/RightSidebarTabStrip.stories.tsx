@@ -388,6 +388,7 @@ async function checkStripDragRegions(canvasElement: HTMLElement) {
   const row = canvas.getByRole("tablist").getBoundingClientRect();
   const strip = stripOf(canvas.getByRole("tablist")).getBoundingClientRect();
   const standIn = canvas.getByTestId("header-stand-in").getBoundingClientRect();
+  // The toggle's room drags here: WorkspaceShell keeps the toggle over it clickable.
   const buttons = [canvas.getByRole("button", { name: "All tabs" }).getBoundingClientRect()];
   const y = strip.top + strip.height / 2;
   const dead: number[] = [];
