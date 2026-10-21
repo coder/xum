@@ -167,7 +167,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 import { isRightSidebarResponsivelyHidden } from "./rightSidebarVisibility";
-import { usePaletteSidebarRequests } from "./usePaletteSidebarRequests";
+import { usePaletteTabFocus } from "./usePaletteTabFocus";
 import { SideChatPanel } from "./SideChatPanel";
 import { NewTabLauncher } from "./NewTabLauncher";
 import { RightSidebarOverview } from "./RightSidebarOverview";
@@ -2291,16 +2291,20 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // reach the layout after the count), so the Terminals row opens only once a tab exists for it.
   const overviewTerminalTab = collectAllTabs(layout.root).find(isTerminalTab);
 
+  // Same follow-ups as opening these tabs by shortcut: panels with keyboard navigation take focus
+  // because the user just picked them; other tools focus their tab.
+  const focusPickedTool = React.useCallback((tool: TabType) => {
+    if (tool === "review") _setFocusTrigger((prev) => prev + 1);
+    else if (tool === "artifacts") setAutoFocusArtifacts(true);
+    else setTabToFocus(tool);
+  }, []);
+
   const handleOpenToolFromNewTab = React.useCallback(
     (tabsetId: string, tool: BaseTabType) => {
-      // Same follow-ups as opening these tabs by shortcut: panels with keyboard navigation
-      // take focus because the user just picked them.
-      if (tool === "review") _setFocusTrigger((prev) => prev + 1);
-      if (tool === "artifacts") setAutoFocusArtifacts(true);
-      if (tool !== "review" && tool !== "artifacts") setTabToFocus(tool);
+      focusPickedTool(tool);
       setLayout((prev) => openToolFromNewTab(prev, tabsetId, tool));
     },
-    [setLayout]
+    [focusPickedTool, setLayout]
   );
 
   // A strip's "+" button (tabsetId) or the shortcut (focused tabset): show that tabset's New
@@ -2353,16 +2357,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, handler);
   }, [handleAddNewTab, workspaceId]);
 
-  usePaletteSidebarRequests({
+  usePaletteTabFocus({
     workspaceId,
     sidebarContainerRef,
-    getBaseLayout,
-    setLayout,
-    setCollapsed,
     focusLauncher: setLauncherAutoFocusTabsetId,
     focusTerminalTab,
-    focusTab: setTabToFocus,
-    openToolWithFocus: handleOpenToolFromNewTab,
+    focusTool: focusPickedTool,
   });
 
   // Tools the New tab launcher offers. Unavailable ones are left out rather than shown

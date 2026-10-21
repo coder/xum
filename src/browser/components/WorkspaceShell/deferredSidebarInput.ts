@@ -17,8 +17,7 @@ export type HeldSidebarInput = () => void;
 const SIDEBAR_EVENTS = [
   CUSTOM_EVENTS.OPEN_GOAL_TAB,
   CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
-  CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE,
-  CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL,
+  CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB,
   CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
   CUSTOM_EVENTS.OPEN_ARTIFACT,
   CUSTOM_EVENTS.OPEN_REVIEW_IMMERSIVE,
@@ -77,9 +76,6 @@ function holdEventInto(held: HeldSidebarInput[]): (e: Event) => void {
       isWorkspaceRightSidebarHidden(document.querySelector("[data-workspace-shell]"))
     )
       return;
-    // Claimed for the sidebar, which acts on the replay: a cancelable sender (the palette's split
-    // and Add Tool) then knows it need not act itself.
-    e.preventDefault();
     e.stopImmediatePropagation();
     const detail: unknown = e instanceof window.CustomEvent ? e.detail : undefined;
     held.push(() => window.dispatchEvent(new window.CustomEvent(e.type, { detail })));

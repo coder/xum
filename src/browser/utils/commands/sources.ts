@@ -25,11 +25,7 @@ import {
 } from "@/common/utils/thinking/policy";
 import assert from "@/common/utils/assert";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
-import {
-  CUSTOM_EVENTS,
-  createCustomEvent,
-  type CustomEventPayloads,
-} from "@/common/constants/events";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
   getRightSidebarCollapsedKey,
   normalizeTerminalBadgeConfig,
@@ -205,14 +201,14 @@ import { serverPathLabel } from "@/common/utils/paths";
 import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLayouts";
 import {
   hasTab,
-  openToolFromNewTab,
-  splitFocusedTabset,
   toggleTab,
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import {
   focusRightSidebarTab,
+  openRightSidebarTool,
   readRightSidebarLayout,
+  splitRightSidebarPane,
   updateRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
 
@@ -452,34 +448,6 @@ const findFirstTerminalSessionTab = (
     findFirstTerminalSessionTab(node.children[0]) ?? findFirstTerminalSessionTab(node.children[1])
   );
 };
-
-/**
- * Asks the workspace's right sidebar to act on a palette request. False when nothing claimed it:
- * no sidebar is mounted (the shell shows a placeholder while the workspace loads), and the caller
- * then changes the stored layout itself so the sidebar shows it once it mounts.
- */
-function requestRightSidebar<
-  K extends typeof CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE | typeof CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL,
->(eventName: K, detail: CustomEventPayloads[K]): boolean {
-  return !window.dispatchEvent(new CustomEvent(eventName, { detail, cancelable: true }));
-}
-
-/**
- * "Right Sidebar: Split Horizontally/Vertically". The sidebar splits, like it opens the New tab for
- * "Right Sidebar: New Tab", so focus moves into the new pane.
- */
-function splitSidebarPane(workspaceId: string, direction: "horizontal" | "vertical"): void {
-  if (requestRightSidebar(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, { workspaceId, direction })) return;
-  updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
-  updateRightSidebarLayout(workspaceId, (s) => splitFocusedTabset(s, direction));
-}
-
-/** "Right Sidebar: Add Tool…" for a tool other than Terminal. */
-function openSidebarTool(workspaceId: string, tool: TabType): void {
-  if (requestRightSidebar(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, { workspaceId, tool })) return;
-  updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
-  updateRightSidebarLayout(workspaceId, (s) => openToolFromNewTab(s, s.focusedTabsetId, tool));
-}
 
 function focusExistingTerminalTab(workspaceId: string): void {
   const found = findFirstTerminalSessionTab(readRightSidebarLayout(workspaceId).root);
@@ -1204,13 +1172,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           id: CommandIds.navRightSidebarSplitHorizontal(),
           title: "Right Sidebar: Split Horizontally",
           section: section.navigation,
-          run: () => splitSidebarPane(wsId, "horizontal"),
+          run: () => splitRightSidebarPane(wsId, "horizontal"),
         },
         {
           id: CommandIds.navRightSidebarSplitVertical(),
           title: "Right Sidebar: Split Vertically",
           section: section.navigation,
-          run: () => splitSidebarPane(wsId, "vertical"),
+          run: () => splitRightSidebarPane(wsId, "vertical"),
         },
         {
           id: CommandIds.navRightSidebarNewTab(),
@@ -1273,10 +1241,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 return;
               }
 
-              // Same as picking the tool in the focused pane's New tab: it takes the New tab's
-              // place, or is selected where it is already open. The sidebar does it, so focus
-              // follows into the tool as from the launcher.
-              openSidebarTool(wsId, tool);
+              // Same as picking the tool in the focused pane's New tab, focus included.
+              openRightSidebarTool(wsId, tool);
               // While the sidebar is hidden (phones) that tab cannot be seen, so WorkspaceMenuBar
               // shows it in the full-screen sidebar; with the sidebar visible it ignores the event.
               // "costs" is the Stats tab's id.

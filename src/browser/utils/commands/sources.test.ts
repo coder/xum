@@ -2466,39 +2466,29 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
     });
   });
 
-  // A mounted sidebar claims these requests, then reveals itself and moves focus
-  // (tests/ui/layout/rightSidebar.test.ts): the palette leaves the stored state alone.
-  test("Add Tool and the splits ask the workspace's sidebar", async () => {
+  // The sidebar moves focus there (tests/ui/layout/rightSidebar.test.ts).
+  test("Add Tool and the splits ask the sidebar to focus the tab they showed", async () => {
     await withTestWindow(async () => {
       const requests: unknown[] = [];
-      const claim = (event: Event) => {
-        event.preventDefault();
-        requests.push((event as CustomEvent).detail);
-      };
-      window.addEventListener(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, claim);
-      window.addEventListener(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, claim);
+      const record = (event: Event) => requests.push((event as CustomEvent).detail);
+      window.addEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
       try {
         const actions = getActions();
         const find = (id: string) => actions.find((entry) => entry.id === id)!;
-        await find(CommandIds.navRightSidebarAddTool()).prompt!.onSubmit({ tool: "review" });
-        await find(CommandIds.navRightSidebarSplitHorizontal()).run();
         await find(CommandIds.navRightSidebarSplitVertical()).run();
+        // The split's new pane holds a New tab, which Add Tool then replaces with the tool.
+        const newPane = readRightSidebarLayout("w1").focusedTabsetId;
+        await find(CommandIds.navRightSidebarAddTool()).prompt!.onSubmit({ tool: "review" });
         expect(requests).toEqual([
-          { workspaceId: "w1", tool: "review" },
-          { workspaceId: "w1", direction: "horizontal" },
-          { workspaceId: "w1", direction: "vertical" },
+          { workspaceId: "w1", tabsetId: newPane, tab: "new" },
+          { workspaceId: "w1", tabsetId: newPane, tab: "review" },
         ]);
-        expect(readPersistedState(getRightSidebarCollapsedKey("w1"), null)).toBeNull();
-        expect(readPersistedState(getRightSidebarLayoutKey("w1"), null)).toBeNull();
       } finally {
-        window.removeEventListener(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, claim);
-        window.removeEventListener(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, claim);
+        window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
       }
     });
   });
 
-  // Without a mounted sidebar (the shell shows a placeholder while the workspace loads), the
-  // palette changes the stored state, so the sidebar shows the result once it mounts.
   test.each([null, true])("Add Tool opens with collapse preference %s", async (collapsed) => {
     await withTestWindow(async () => {
       updatePersistedState(getRightSidebarCollapsedKey("w1"), collapsed);

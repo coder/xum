@@ -46,6 +46,7 @@ import {
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import type { TabType } from "@/browser/types/rightSidebar";
+import { openRightSidebarTool, splitRightSidebarPane } from "@/browser/utils/rightSidebarTabFocus";
 import { BROWSER_VIEWPORT_ATTR } from "@/browser/utils/ui/keybinds";
 
 const RIGHT_SIDEBAR_SELECTOR = '[role="complementary"][aria-label="Workspace insights"]';
@@ -1206,15 +1207,14 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
-  test("the palette's split requests reveal the sidebar and move focus into the new pane", async () => {
+  test("the palette's splits reveal the sidebar and move focus into the new pane", async () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
       seedLayout(["costs", "goal"]);
       updatePersistedState(getRightSidebarCollapsedKey(workspaceId), true);
     });
+    // What the palette's "Right Sidebar: Split Horizontally/Vertically" runs.
     const split = (direction: "horizontal" | "vertical") =>
-      window.dispatchEvent(
-        createCustomEvent(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, { workspaceId, direction })
-      );
+      splitRightSidebarPane(workspaceId, direction);
 
     try {
       // From two tabs, the split moves the shown one (Stats) to the new pane: focus follows it.
@@ -1238,15 +1238,14 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
-  test("the palette's Add Tool request reveals the sidebar with focus on the tool's tab", async () => {
+  test("the palette's Add Tool reveals the sidebar with focus on the tool's tab", async () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
       updatePersistedState(getRightSidebarCollapsedKey(workspaceId), true);
     });
 
     try {
-      window.dispatchEvent(
-        createCustomEvent(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, { workspaceId, tool: "costs" })
-      );
+      // What the palette's "Right Sidebar: Add Tool…" runs for Stats.
+      openRightSidebarTool(workspaceId, "costs");
       const statsTab = await findSidebarTab(sidebar, "costs");
       await waitFor(() => expect(document.activeElement).toBe(statsTab));
       expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), true)).toBe(false);

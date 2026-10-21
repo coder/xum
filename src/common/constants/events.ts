@@ -150,18 +150,11 @@ export const CUSTOM_EVENTS = {
   OPEN_NEW_SIDEBAR_TAB: "mux:openNewSidebarTab",
 
   /**
-   * Split the focused right-sidebar pane and move focus into the new pane (the command palette's
-   * "Right Sidebar: Split Horizontally/Vertically").
-   * Detail: { workspaceId: string, direction: "horizontal" | "vertical" }
+   * Move keyboard focus to a right-sidebar tab that the command palette just showed (its
+   * "Split Horizontally/Vertically" and "Add Tool…" change the stored layout, then send this).
+   * Detail: { workspaceId: string, tabsetId: string, tab: string }
    */
-  SPLIT_SIDEBAR_PANE: "mux:splitSidebarPane",
-
-  /**
-   * Open a tool in the focused right-sidebar pane, as picking it in that pane's New tab does,
-   * focus included (the command palette's "Right Sidebar: Add Tool…").
-   * Detail: { workspaceId: string, tool: string } (a base tab id)
-   */
-  OPEN_SIDEBAR_TOOL: "mux:openSidebarTool",
+  FOCUS_SIDEBAR_TAB: "mux:focusSidebarTab",
 
   /**
    * Start a new chat the way the left sidebar's "New chat" button does. Sent by the app shell's
@@ -300,14 +293,12 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB]: {
     workspaceId: string;
   };
-  [CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE]: {
+  [CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB]: {
     workspaceId: string;
-    direction: "horizontal" | "vertical";
-  };
-  [CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL]: {
-    workspaceId: string;
-    /** A base tab id (BaseTabType, a browser type); the sidebar ignores anything else. */
-    tool: string;
+    /** The pane that shows the tab. */
+    tabsetId: string;
+    /** A TabType (a browser type); the sidebar ignores anything else. */
+    tab: string;
   };
   [CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB]: {
     /** The main chat whose right sidebar shows the tab. */
