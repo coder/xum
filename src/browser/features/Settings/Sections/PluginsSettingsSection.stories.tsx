@@ -1388,6 +1388,8 @@ export const AddPluginClaudeHooksNeverRun: Story = {
 
 /** A local source: the backend's Skills CLI refuses it, so the choice is not offered. */
 export const AddPluginInstallAsLocalSource: Story = {
+  // Play-only contract: AddPluginSkillsCliRun snapshots the Skills CLI panel (Pixel budget).
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => (
     <PluginsSectionStoryShell options={installAsOptions()}>
       <PluginsSettingsSection />
@@ -1440,6 +1442,8 @@ export const AddPluginInstallBlockedByName: Story = {
 
 /** Skills CLI without Node.js: Xum shows the command to run, with a copy button. */
 export const AddPluginSkillsCliUnavailable: Story = {
+  // Play-only contract: AddPluginSkillsCliRun snapshots the Skills CLI panel (Pixel budget).
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => (
     <PluginsSectionStoryShell
       options={installAsOptions({
