@@ -3,6 +3,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
+import { log } from "@/node/services/log";
 import { DaytonaApiError } from "./daytonaClient";
 import {
   DAYTONA_BUSY_MESSAGE,
@@ -17,6 +18,8 @@ class FakeControlPlane {
   states: string[] = [];
   exists = true;
   errorReason?: string;
+  /** A proxy that echoes the request URI and its Authorization header in a failed revoke. */
+  revokeEchoesRequest = false;
   readonly calls: string[] = [];
   private tokenCounter = 0;
   readonly revoked: string[] = [];
@@ -63,6 +66,10 @@ class FakeControlPlane {
       });
     }
     if (route === "DELETE /sandbox/sb-1/ssh-access") {
+      if (this.revokeEchoesRequest) {
+        const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
+        return json(500, { message: `Revoke failed for ${url.toString()} (${auth})` });
+      }
       this.revoked.push(url.searchParams.get("token") ?? "");
       return json(200, {});
     }
@@ -187,6 +194,21 @@ describe("DaytonaService", () => {
     expect(plane.revoked).toEqual([held.token]);
     // The next request mints a fresh token instead of reusing the revoked one.
     expect((await service.getSshToken("sb-1")).token).not.toBe(held.token);
+  });
+
+  it("logs a failed revoke without the token or the API key the response echoes", async () => {
+    const held = await service.getSshToken("sb-1");
+    plane.revokeEchoesRequest = true;
+    const warn = spyOn(log, "warn");
+    try {
+      await service.setConfig({ target: "eu" });
+      const logged = JSON.stringify(warn.mock.calls);
+      expect(logged).toContain("Failed to revoke a Daytona SSH token");
+      expect(logged).not.toContain(held.token);
+      expect(logged).not.toContain("Bearer k");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("mints under credentials another Xum process saved, and not after its own change", async () => {

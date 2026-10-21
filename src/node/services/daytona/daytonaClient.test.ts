@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
 import { DaytonaApiError, DaytonaClient } from "./daytonaClient";
 
 const API_URL = "https://daytona.test/api";
@@ -68,6 +69,47 @@ describe("DaytonaClient", () => {
       expect(error.message).not.toContain(API_KEY);
       expect(error.message).not.toContain("secret-ssh-token");
     }
+  });
+
+  it("redacts the request's secrets that a failed response or fetch error echoes", async () => {
+    // Characters a query string encodes, so an echoed request URI carries the token encoded.
+    const token = "secret/ssh+token value";
+    const echo = (request: RecordedRequest) =>
+      `${request.method} ${request.url.toString()} ${request.headers.Authorization} ${token}`;
+    const responses = [
+      (request: RecordedRequest) => jsonResponse(400, { message: `Invalid: ${echo(request)}` }),
+      (request: RecordedRequest) => new Response(`<p>${echo(request)}</p>`, { status: 502 }),
+      (request: RecordedRequest) => jsonResponse(500, { message: [echo(request), "again"] }),
+    ];
+    const secrets = [token, encodeURIComponent(token), "secret%2Fssh%2Btoken+value", API_KEY];
+    for (const respond of responses) {
+      const { fetch } = fakeFetch(respond);
+      const client = new DaytonaClient({ apiUrl: API_URL, apiKey: API_KEY, fetch });
+      const error = await captureError(client.revokeSshAccess("sb-1", token));
+      for (const secret of secrets) {
+        expect(error.message).not.toContain(secret);
+        expect(error.serverMessage ?? "").not.toContain(secret);
+      }
+      expect(error.message).toContain("DELETE /sandbox/sb-1/ssh-access");
+    }
+
+    // A fetch failure that names the request URL.
+    const failingFetch = ((input: URL) =>
+      Promise.reject(new TypeError(`fetch failed for ${input.href}`))) as typeof fetch;
+    const failing = new DaytonaClient({ apiUrl: API_URL, apiKey: API_KEY, fetch: failingFetch });
+    const transport = await captureError(failing.revokeSshAccess("sb-1", token));
+    expect(transport.kind).toBe("unreachable");
+    for (const secret of secrets) expect(transport.message).not.toContain(secret);
+
+    // Any endpoint: a token minted earlier that another call's error echoes.
+    rememberDaytonaToken("minted-earlier-token-q7z");
+    const other = new DaytonaClient({
+      apiUrl: API_URL,
+      apiKey: API_KEY,
+      fetch: fakeFetch(() => jsonResponse(500, { message: "user minted-earlier-token-q7z" })).fetch,
+    });
+    const otherError = await captureError(other.getSandbox("sb-1"));
+    expect(otherError.message).not.toContain("minted-earlier-token-q7z");
   });
 
   it("reduces an HTML error page or a long message to a short plain-text excerpt", async () => {

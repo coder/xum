@@ -1,6 +1,10 @@
 import { z } from "zod";
 import type { DaytonaErrorKind } from "@/common/orpc/schemas/daytona";
 import { getErrorMessage } from "@/common/utils/errors";
+import {
+  DAYTONA_TOKEN_PLACEHOLDER,
+  redactDaytonaTokens,
+} from "@/node/runtime/daytonaTokenRedaction";
 import { linkAbortSignal } from "@/node/utils/abort";
 
 /**
@@ -9,7 +13,9 @@ import { linkAbortSignal } from "@/node/utils/abort";
  * pulls in aws-sdk, OpenTelemetry, axios and socket.io for the dozen calls Xum needs.
  *
  * Security: the API key and SSH tokens never appear in errors or logs. Error messages name the
- * method and path only, never the query string (revoke passes the token there).
+ * method and path only, never the query string (revoke passes the token there). A control plane
+ * or proxy may echo the request (its URI, its Authorization header) in an error body or a fetch
+ * error: every diagnostic kept from a failed request goes through that request's redactor.
  */
 
 const DAYTONA_REQUEST_TIMEOUT_MS = 15_000;
@@ -149,6 +155,38 @@ interface RequestOptions {
   body?: unknown;
   auth?: boolean;
   signal?: AbortSignal;
+  /** Values this request sends that are secrets (in the query or the body), besides the key. */
+  secrets?: string[];
+}
+
+const DAYTONA_API_KEY_PLACEHOLDER = "<daytona-api-key>";
+
+type Redact = (text: string) => string;
+
+/** A secret as an echo may carry it: raw, or encoded as a path or query component. */
+function encodedForms(secret: string): string[] {
+  const queryForm = new URLSearchParams({ s: secret }).toString().slice("s=".length);
+  // Encoded forms first: raw text left in one would otherwise survive as a partial match.
+  return [...new Set([queryForm, encodeURIComponent(secret), secret])];
+}
+
+function createRedactor(apiKey: string | undefined, secrets: string[]): Redact {
+  const replacements: Array<[string, string]> = [];
+  for (const secret of secrets) {
+    if (!secret) continue;
+    for (const form of encodedForms(secret)) replacements.push([form, DAYTONA_TOKEN_PLACEHOLDER]);
+  }
+  if (apiKey) {
+    for (const form of encodedForms(apiKey)) replacements.push([form, DAYTONA_API_KEY_PLACEHOLDER]);
+  }
+  return (text) => {
+    let redacted = text;
+    for (const [secret, placeholder] of replacements) {
+      redacted = redacted.replaceAll(secret, placeholder);
+    }
+    // Any token minted earlier, which an error of another request may still carry.
+    return redactDaytonaTokens(redacted);
+  };
 }
 
 // Pagination guard: a control plane that keeps returning a cursor must not loop forever.
@@ -161,8 +199,9 @@ const MAX_SERVER_MESSAGE_CHARS = 200;
  * Error text ends up in toasts and turn errors: a proxy or a non-Daytona URL can answer with a
  * whole HTML page, so drop tags, collapse whitespace and keep a short excerpt.
  */
-function toPlainExcerpt(text: string): string | undefined {
-  const plain = text
+function toPlainExcerpt(text: string, redact: Redact): string | undefined {
+  // Redacted before the cut, so a truncated secret cannot survive as a prefix.
+  const plain = redact(text)
     .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
     .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ")
@@ -173,20 +212,20 @@ function toPlainExcerpt(text: string): string | undefined {
     : plain;
 }
 
-function extractServerMessage(bodyText: string): string | undefined {
+function extractServerMessage(bodyText: string, redact: Redact): string | undefined {
   if (!bodyText) return undefined;
   let parsed: unknown;
   try {
     parsed = JSON.parse(bodyText);
   } catch {
     // Not JSON (proxy error page etc.): keep a short plain-text excerpt instead.
-    return toPlainExcerpt(bodyText);
+    return toPlainExcerpt(bodyText, redact);
   }
   if (parsed && typeof parsed === "object" && "message" in parsed) {
     const message = parsed.message;
-    if (typeof message === "string") return toPlainExcerpt(message);
+    if (typeof message === "string") return toPlainExcerpt(message, redact);
     if (Array.isArray(message)) {
-      return toPlainExcerpt(message.filter((m) => typeof m === "string").join("; "));
+      return toPlainExcerpt(message.filter((m) => typeof m === "string").join("; "), redact);
     }
   }
   return undefined;
@@ -220,9 +259,14 @@ function buildUrl(apiUrl: string, pathName: string, query: RequestOptions["query
   return url;
 }
 
-function httpError(status: number, bodyText: string, label: string): DaytonaApiError {
+function httpError(
+  status: number,
+  bodyText: string,
+  label: string,
+  redact: Redact
+): DaytonaApiError {
   const kind = kindForStatus(status);
-  const serverMessage = extractServerMessage(bodyText);
+  const serverMessage = extractServerMessage(bodyText, redact);
   const base = `${describeStatus(kind, status)} for ${label}`;
   return new DaytonaApiError(
     kind,
@@ -240,6 +284,7 @@ function transportError(
     timeoutMs: number;
     timedOut: boolean;
     cancelled: boolean;
+    redact: Redact;
   }
 ): DaytonaApiError {
   if (context.timedOut) {
@@ -253,7 +298,7 @@ function transportError(
   }
   return new DaytonaApiError(
     "unreachable",
-    `Could not reach Daytona at ${context.origin} (${getErrorMessage(error)})`
+    `Could not reach Daytona at ${context.origin} (${context.redact(getErrorMessage(error))})`
   );
 }
 
@@ -277,13 +322,14 @@ export class DaytonaClient {
   ): Promise<unknown> {
     const label = `${method} ${pathName}`;
     const url = buildUrl(this.apiUrl, pathName, options.query);
-    const { response, bodyText } = await this.send(url, label, {
+    const redact = createRedactor(this.apiKey, options.secrets ?? []);
+    const { response, bodyText } = await this.send(url, label, redact, {
       method,
       headers: this.buildHeaders(options),
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
       callerSignal: options.signal,
     });
-    if (!response.ok) throw httpError(response.status, bodyText, label);
+    if (!response.ok) throw httpError(response.status, bodyText, label, redact);
     if (!bodyText) return undefined;
     try {
       return JSON.parse(bodyText) as unknown;
@@ -308,6 +354,7 @@ export class DaytonaClient {
   private async send(
     url: URL,
     label: string,
+    redact: Redact,
     init: {
       method: string;
       headers: Record<string, string>;
@@ -341,6 +388,7 @@ export class DaytonaClient {
         timeoutMs: this.timeoutMs,
         timedOut,
         cancelled: callerSignal?.aborted === true,
+        redact,
       });
     } finally {
       clearTimeout(timer);
@@ -458,6 +506,7 @@ export class DaytonaClient {
   async revokeSshAccess(id: string, token: string, signal?: AbortSignal): Promise<void> {
     await this.request("DELETE", `/sandbox/${encodeURIComponent(id)}/ssh-access`, {
       query: { token },
+      secrets: [token],
       signal,
     });
   }
