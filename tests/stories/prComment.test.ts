@@ -38,6 +38,7 @@ const ctx: CommentContext = {
   repository: "coder/xum",
   pullRequest: 7,
   headSha: "a".repeat(40),
+  sourceSha: "b".repeat(40),
   runId: "99",
   runAttempt: "2",
   model: "anthropic:claude-haiku-5-5",
@@ -163,7 +164,7 @@ test("a source link encodes each path segment, under the job's e2e project", () 
   job(WEB, RED.replaceAll('"smoke.e2e.ts"', '"my dir/a#b?.e2e.ts"'));
   job(REPROS, RED.replaceAll('"smoke.e2e.ts"', '"repros/100%.e2e.ts"'));
   const body = commentBody(root, ctx);
-  const blob = `https://github.test/coder/xum/blob/${ctx.headSha}`;
+  const blob = `https://github.test/coder/xum/blob/${ctx.sourceSha}`;
   expect(body).toContain(`(${blob}/tests/stories/my%20dir/a%23b%3F.e2e.ts#L19)`);
   expect(body).toContain(`(${blob}/tests/bugbash/repros/100%25.e2e.ts#L19)`);
 });

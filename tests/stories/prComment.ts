@@ -32,17 +32,23 @@ export interface CommentContext {
   serverUrl: string;
   repository: string;
   pullRequest: number;
-  /** The PR head commit the run tested (the event's head.sha, not the merge commit). */
+  /** The PR head commit (the event's head.sha): the comment is written only while it is the head. */
   headSha: string;
+  /**
+   * The commit the lane checked out and tested: the PR merge commit (github.sha). Source links
+   * point here, so their lines match the report even when the branch is behind its base (Codex
+   * review of #7140).
+   */
+  sourceSha: string;
   runId: string;
   runAttempt: string;
   model?: string;
 }
 
-/** A link to `file` (from the checkout root) at the PR head, each path segment encoded. */
+/** A link to `file` (from the checkout root) at the tested commit, each path segment encoded. */
 export function sourceUrl(ctx: CommentContext, file: string, line: number): string {
   const segments = file.split("/").map(encodeURIComponent).join("/");
-  return `${ctx.serverUrl}/${ctx.repository}/blob/${ctx.headSha}/${segments}#L${line}`;
+  return `${ctx.serverUrl}/${ctx.repository}/blob/${ctx.sourceSha}/${segments}#L${line}`;
 }
 
 /** The comment body: the marker, then the page of every job under `root`. */
@@ -159,6 +165,7 @@ function contextFromEnv(env: NodeJS.ProcessEnv, dryRun: boolean): CommentContext
     repository: need("GITHUB_REPOSITORY", local("coder/xum")),
     pullRequest,
     headSha: need("HEAD_SHA", local("HEAD")),
+    sourceSha: need("SOURCE_SHA", local("HEAD")),
     runId: need("GITHUB_RUN_ID", local("0")),
     runAttempt: need("GITHUB_RUN_ATTEMPT", local("1")),
     // Unset, or empty when the lane left no output: the titles then name no model.

@@ -147,6 +147,9 @@ jobs:
             if ((${#files[@]})); then cp --parents "${files[@]}" "$2"; fi
           )
           collect . "$RUNNER_TEMP/stories-reports"
+          # Always one file, so the artifact exists even when no job left output: the comment job
+          # then says so, and treats a failed download as a download error (pr.yml).
+          echo "${{ github.run_id }}-${{ github.run_attempt }}" > "$RUNNER_TEMP/stories-reports/collected"
           if [[ -d "$RUNNER_TEMP/first-try" ]]; then
             collect "$RUNNER_TEMP/first-try" "$RUNNER_TEMP/stories-reports/first-try"
           fi
