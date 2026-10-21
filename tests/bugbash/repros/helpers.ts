@@ -54,6 +54,26 @@ export async function todoNudgeToolPolicies(app: {
   });
 }
 
+/** Turns heartbeats on for the seeded workspace, so the overview card shows its Heartbeat row. */
+export async function enablePlaygroundHeartbeat(
+  app: { baseUrl: string | undefined },
+  intervalMs: number
+): Promise<void> {
+  const client = appClient(app);
+  const playground = (await client.workspace.list()).filter(
+    (workspace) => workspace.title === WORKSPACE_TITLE
+  );
+  if (playground.length !== 1) {
+    throw new Error(`expected one '${WORKSPACE_TITLE}' workspace, found ${playground.length}`);
+  }
+  const result = await client.workspace.heartbeat.set({
+    workspaceId: playground[0].id,
+    enabled: true,
+    intervalMs,
+  });
+  if (!result.success) throw new Error(`heartbeat.set failed: ${result.error}`);
+}
+
 /**
  * Switches tutorials off on the server before the page loads (one would show over the
  * workspace). The preference follows the user, so it stays off for the rest of the run.

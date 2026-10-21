@@ -32,6 +32,7 @@ import {
   formatGoalTurns,
 } from "@/browser/features/Tools/Goal/goalToolUtils";
 import { useGitStatus } from "@/browser/stores/GitStatusStore";
+import { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import {
   useOptionalWorkspaceSidebarState,
   useWorkspaceUsage,
@@ -198,6 +199,8 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
   const showActivity = workflowRuns > 0 || terminals > 0 || heartbeat != null;
   // The Heartbeat row opens the workspace's heartbeat settings: it has no sidebar tab to open.
   const [heartbeatModalOpen, setHeartbeatModalOpen] = React.useState(false);
+  // Recorded here, not in the dialog: it loads on its first open, after the row took focus.
+  const heartbeatFocusReturn = useModalFocusReturn(heartbeatModalOpen);
 
   return (
     <>
@@ -346,6 +349,7 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
           workspaceId={props.workspaceId}
           open={heartbeatModalOpen}
           onOpenChange={setHeartbeatModalOpen}
+          focusReturn={heartbeatFocusReturn}
         />
       </LazySettingsModal>
     </>
