@@ -190,7 +190,7 @@ describe("DaytonaService", () => {
       updateToken: () => Promise.resolve(),
       removeSandbox: () => Promise.resolve(),
       readTokens: () => Promise.resolve([]),
-      verifyResolvedUser: () =>
+      verifyResolvedConfig: () =>
         shadowed ? Promise.reject(new Error("ssh config shadows User")) : Promise.resolve(),
     };
     const withWriter = new DaytonaService({
@@ -224,7 +224,7 @@ describe("DaytonaService", () => {
       removeSandbox: () => Promise.resolve(),
       readTokens: () =>
         Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
-      verifyResolvedUser: () => Promise.resolve(),
+      verifyResolvedConfig: () => Promise.resolve(),
     };
     const startProcess = async () => {
       const started = new DaytonaService({

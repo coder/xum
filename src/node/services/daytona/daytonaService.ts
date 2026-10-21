@@ -132,7 +132,7 @@ export interface DaytonaServiceOptions {
   /** Defaults to a writer for the real `~/.ssh/config`; tests pass one aimed at a temp dir. */
   sshConfigWriter?: Pick<
     DaytonaSshConfigWriter,
-    "writeSandbox" | "updateToken" | "removeSandbox" | "verifyResolvedUser" | "readTokens"
+    "writeSandbox" | "updateToken" | "removeSandbox" | "verifyResolvedConfig" | "readTokens"
   >;
   fetch?: typeof fetch;
   now?: () => number;
@@ -632,7 +632,7 @@ export class DaytonaService {
     if (this.sshConfigured.has(sandboxId)) return;
     // Outside the mint: when the user's ssh config shadows the token, a retry after they fix it
     // reuses this token (already written) instead of minting another one.
-    await this.sshConfigWriter.verifyResolvedUser(sandboxId, access.token);
+    await this.sshConfigWriter.verifyResolvedConfig(sandboxId, access.token);
     this.sshConfigured.add(sandboxId);
   }
 

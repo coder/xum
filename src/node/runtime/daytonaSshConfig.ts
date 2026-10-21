@@ -281,12 +281,14 @@ export class DaytonaSshConfigWriter {
   }
 
   /**
-   * OpenSSH keeps the first value it sees, so a user `Host *` entry with `User` above Xum's
-   * managed block silently replaces the token. Resolve the alias with `ssh -G` and fail with a
-   * clear message instead of an opaque auth failure. Neither value is ever printed.
+   * OpenSSH keeps the first value it sees, so a user `Host *` entry above Xum's managed block
+   * silently replaces the token (`User`) or the pinned known_hosts file (`UserKnownHostsFile`).
+   * Resolve the alias with `ssh -G` and fail with a clear message instead of an opaque auth or
+   * host key failure. The token is never printed. A shadowed StrictHostKeyChecking needs no check
+   * here: every OpenSSH invocation forces it on the command line (appendDaytonaHostKeyPinArgs).
    * Skipped when no OpenSSH client is installed (the ssh2 path parses the config itself).
    */
-  async verifyResolvedUser(sandboxId: string, token: string): Promise<void> {
+  async verifyResolvedConfig(sandboxId: string, token: string): Promise<void> {
     const alias = toXumDaytonaHost(sandboxId);
     const args = ["-G", ...(this.sshConfigPath ? ["-F", this.sshConfigPath] : []), alias];
     let stdout: string;
@@ -301,14 +303,26 @@ export class DaytonaSshConfigWriter {
         `Could not check the ssh config for ${alias} with ssh -G (${getErrorMessage(error).split("\n")[0]})`
       );
     }
-    const userLine = stdout.split("\n").find((line) => line.startsWith("user "));
-    const resolvedUser = userLine?.slice("user ".length).trim();
-    if (resolvedUser !== token) {
-      throw new DaytonaSshConfigError(
-        `Your ssh config sets User for ${alias} before Xum's Daytona block (often a "Host *" ` +
-          `entry with User), and OpenSSH keeps the first value. Move that User line below the ` +
-          `"${XUM_DAYTONA_SSH_BLOCK_START}" block in ~/.ssh/config or scope it to specific hosts.`
+    const resolved = (key: string) =>
+      stdout
+        .split("\n")
+        .find((line) => line.startsWith(`${key} `))
+        ?.slice(key.length + 1)
+        .trim();
+    const shadowedBy = (setting: string) =>
+      new DaytonaSshConfigError(
+        `Your ssh config sets ${setting} for ${alias} before Xum's Daytona block (often a ` +
+          `"Host *" entry with ${setting}), and OpenSSH keeps the first value. Move that ` +
+          `${setting} line below the "${XUM_DAYTONA_SSH_BLOCK_START}" block in ~/.ssh/config or ` +
+          `scope it to specific hosts.`
       );
+    if (resolved("user") !== token) {
+      throw shadowedBy("User");
+    }
+    // ssh -G prints every known_hosts file on one line, separated by spaces.
+    const knownHostsFiles = ` ${resolved("userknownhostsfile") ?? ""} `;
+    if (!knownHostsFiles.includes(` ${this.paths.knownHostsPath} `)) {
+      throw shadowedBy("UserKnownHostsFile");
     }
   }
 }

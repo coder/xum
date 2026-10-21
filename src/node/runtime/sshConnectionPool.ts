@@ -52,12 +52,25 @@ export function isInteractiveHostKeyApprovalAvailable(): boolean {
 }
 
 /**
- * Daytona aliases are exempt from the headless fallback: their include block pins the gateway
- * key (StrictHostKeyChecking yes, Xum's own known_hosts), and a command-line `-o` would
- * override it and accept any key.
+ * A Daytona alias's include block pins the gateway key, but OpenSSH keeps the first value it
+ * reads, so a user `Host *` entry above Xum's block with `StrictHostKeyChecking no` would win and
+ * hand the token (the ssh user name) to any server. Command-line options beat every config file,
+ * so force strict checking: if an earlier entry also points UserKnownHostsFile elsewhere, the
+ * gateway key is unknown and ssh refuses before it sends the user name.
  */
+export function appendDaytonaHostKeyPinArgs(args: string[], host: string): void {
+  if (isXumDaytonaHost(host)) {
+    args.push("-o", "StrictHostKeyChecking=yes");
+  }
+}
+
+/** Daytona aliases never get the headless fallback, which would accept any gateway key. */
 export function appendOpenSSHHostKeyPolicyArgs(args: string[], host: string): void {
-  if (hostKeyPolicyMode === "strict" || isXumDaytonaHost(host)) {
+  if (isXumDaytonaHost(host)) {
+    appendDaytonaHostKeyPinArgs(args, host);
+    return;
+  }
+  if (hostKeyPolicyMode === "strict") {
     return;
   }
 

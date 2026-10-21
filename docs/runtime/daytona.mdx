@@ -77,7 +77,7 @@ Xum writes the SSH settings for its sandboxes to `~/.xum/ssh/daytona.conf` and a
 
 Xum pins the gateway's host keys in `~/.xum/ssh/daytona_known_hosts` and refuses a gateway whose key does not match, with OpenSSH and with the built-in SSH2 transport alike. This holds for `xum server` too, which otherwise skips host key checks for SSH hosts.
 
-OpenSSH uses the first `User` value that matches a host. If your `~/.ssh/config` has a `Host *` entry with a `User` line above Xum's block, connections to sandboxes fail. Xum checks for this and reports it; move the `User` line into a narrower `Host` entry, or below Xum's block.
+OpenSSH uses the first value it finds for each setting. If your `~/.ssh/config` has a `Host *` entry with a `User` or `UserKnownHostsFile` line above Xum's block, connections to sandboxes fail. Xum checks for this and reports it; move the line into a narrower `Host` entry, or below Xum's block. A `StrictHostKeyChecking` line there has no effect: Xum always runs `ssh` with strict host key checking for sandboxes.
 
 ## Notes
 

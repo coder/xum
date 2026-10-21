@@ -3,8 +3,13 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { XUM_DAYTONA_SSH_BLOCK_END, XUM_DAYTONA_SSH_BLOCK_START } from "@/common/constants/daytona";
+import {
+  XUM_DAYTONA_SSH_BLOCK_END,
+  XUM_DAYTONA_SSH_BLOCK_START,
+  toXumDaytonaHost,
+} from "@/common/constants/daytona";
 import { DaytonaSshConfigWriter, renderDaytonaKnownHosts } from "./daytonaSshConfig";
+import { appendOpenSSHHostKeyPolicyArgs } from "./sshConnectionPool";
 
 const GATEWAY = {
   host: "ssh.daytona.test",
@@ -131,7 +136,7 @@ describe("DaytonaSshConfigWriter", () => {
     await fs.writeFile(sshConfigPath, "Host other\n  User someone\n", "utf8");
     await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
 
-    await writer.verifyResolvedUser("sb-1", "tokenA");
+    await writer.verifyResolvedConfig("sb-1", "tokenA");
 
     // The included Host block must not leak to unrelated hosts.
     const other = spawnSync("ssh", ["-G", "-F", sshConfigPath, "unrelated.example.com"]);
@@ -143,8 +148,33 @@ describe("DaytonaSshConfigWriter", () => {
     await fs.writeFile(sshConfigPath, "Host *\n  User me\n", "utf8");
     await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
 
-    const error = await writer.verifyResolvedUser("sb-1", "tokenA").catch((e: unknown) => e);
+    const error = await writer.verifyResolvedConfig("sb-1", "tokenA").catch((e: unknown) => e);
     expect((error as Error).message).toContain('"Host *"');
     expect((error as Error).message).not.toContain("tokenA");
+  });
+
+  describe("a user Host * entry that weakens host key checking", () => {
+    const WEAKENING_CONFIG = "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n";
+
+    it.skipIf(!hasOpenSsh)("cannot turn off strict checking for Xum's ssh calls", async () => {
+      await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
+      await fs.writeFile(sshConfigPath, WEAKENING_CONFIG, "utf8");
+      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+
+      const args = ["-G", "-F", sshConfigPath];
+      appendOpenSSHHostKeyPolicyArgs(args, toXumDaytonaHost("sb-1"));
+      const resolved = spawnSync("ssh", [...args, toXumDaytonaHost("sb-1")]).stdout.toString();
+
+      expect(resolved).toContain("\nstricthostkeychecking true\n");
+    });
+
+    it.skipIf(!hasOpenSsh)("fails the ssh config check, naming the setting", async () => {
+      await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
+      await fs.writeFile(sshConfigPath, WEAKENING_CONFIG, "utf8");
+      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+
+      const error = await writer.verifyResolvedConfig("sb-1", "tokenA").catch((e: unknown) => e);
+      expect((error as Error).message).toContain("sets UserKnownHostsFile");
+    });
   });
 });
