@@ -199,8 +199,11 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
   const showActivity = workflowRuns > 0 || terminals > 0 || heartbeat != null;
   // The Heartbeat row opens the workspace's heartbeat settings: it has no sidebar tab to open.
   const [heartbeatModalOpen, setHeartbeatModalOpen] = React.useState(false);
-  // Recorded here, not in the dialog: it loads on its first open, after the row took focus.
+  // Recorded here, not in the dialog: it loads on its first open, after the row took focus. The
+  // loading dialog gets its own copy: its close (also when the chunk arrives) consumes the
+  // recorded opener, which the real dialog's close still needs.
   const heartbeatFocusReturn = useModalFocusReturn(heartbeatModalOpen);
+  const heartbeatLoadingFocusReturn = useModalFocusReturn(heartbeatModalOpen);
 
   return (
     <>
@@ -344,6 +347,7 @@ export const RightSidebarOverview: React.FC<RightSidebarOverviewProps> = (props)
         name="Heartbeat settings"
         open={heartbeatModalOpen}
         onClose={() => setHeartbeatModalOpen(false)}
+        focusReturn={heartbeatLoadingFocusReturn}
       >
         <WorkspaceHeartbeatModal
           workspaceId={props.workspaceId}
@@ -447,21 +451,17 @@ function formatHeartbeatCountdown(remainingMs: number): string {
 
 /**
  * The scheduler's next heartbeat deadline and the time it is measured against, or null while it
- * reports none. Asked again when `scheduleKey` changes and on each clock tick past the deadline:
- * a fired or skipped slot moves the deadline without any event the renderer sees.
+ * reports none. Read again when `scheduleKey` changes (at once) and on every clock tick: the
+ * scheduler also moves the deadline on events the renderer does not see (a fired or skipped
+ * slot, any activity for an idle trigger, and its first tracking a minute after startup). The
+ * read is an in-memory lookup, so a tick costs one cheap call while the row shows.
  */
 function useNextHeartbeat(
   workspaceId: string,
   scheduleKey: string
 ): { atMs: number; nowMs: number } | null {
   const clockMs = useClock(HEARTBEAT_COUNTDOWN_TICK_MS);
-  // The clock tick the deadline was last re-read on, set during render (the reset-on-change
-  // pattern, no effect) so each later tick past the deadline asks once.
-  const [dueReadMs, setDueReadMs] = React.useState(clockMs);
-  const deadline = useHeartbeatDeadline(workspaceId, `${scheduleKey}|${dueReadMs}`);
-  if (deadline?.atMs != null && clockMs >= deadline.atMs && dueReadMs !== clockMs) {
-    setDueReadMs(clockMs);
-  }
+  const deadline = useHeartbeatDeadline(workspaceId, `${scheduleKey}|${clockMs}`);
   return deadline?.atMs != null
     ? { atMs: deadline.atMs, nowMs: Math.max(clockMs, deadline.readAtMs) }
     : null;

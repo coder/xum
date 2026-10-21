@@ -793,8 +793,8 @@ describe("RightSidebarOverview", () => {
     expect(nextCalls).toEqual([WORKSPACE_ID, WORKSPACE_ID]);
   });
 
-  test("a clock tick past the deadline asks the scheduler again", async () => {
-    // Captures the countdown's timer so the test fires its tick, with the clock moved past it.
+  test("each clock tick reads the deadline again, so it follows moves the renderer cannot see", async () => {
+    // Captures the countdown's timer so the test fires its ticks, with the clock moved along.
     const realSetInterval = globalThis.setInterval;
     const ticks: Array<() => void> = [];
     const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation(((
@@ -805,32 +805,38 @@ describe("RightSidebarOverview", () => {
       return realSetInterval(handler, ms);
     }) as typeof setInterval);
     const startMs = Date.now();
-    const answers = [startMs + 1000, startMs + 2 * 60 * 60 * 1000];
+    // The scheduler does not track the workspace yet (its first minute), then reports a
+    // deadline, then moves it (an idle trigger's reset on activity the card does not show).
+    const answers = [null, startMs + 10 * 60_000, startMs + 2 * 60 * 60_000];
     let calls = 0;
+    const tick = (atMs: number) => {
+      const dateSpy = spyOn(Date, "now").mockReturnValue(atMs);
+      try {
+        act(() => ticks.forEach((fire) => fire()));
+      } finally {
+        dateSpy.mockRestore();
+      }
+    };
     try {
       const { view } = renderOverview(
         [workspace({ id: WORKSPACE_ID, heartbeat: { enabled: true, intervalMs: 300_000 } })],
         {
           client: createTestApiClient({
             workspace: {
-              heartbeat: { next: () => Promise.resolve(answers[Math.min(calls++, 1)]) },
+              heartbeat: { next: () => Promise.resolve(answers[Math.min(calls++, 2)]) },
             },
           }),
         }
       );
       const activity = view.getByRole("region", { name: "Activity" });
-      await waitFor(() => expect(activity.textContent).toContain("Next in 1m"));
-      expect(calls).toBe(1);
+      await waitFor(() => expect(calls).toBe(1));
+      expect(activity.textContent).not.toContain("Next in");
 
-      // The slot fired (or was skipped) without any event the renderer sees.
-      const dateSpy = spyOn(Date, "now").mockReturnValue(startMs + 30_000);
-      try {
-        act(() => ticks.forEach((tick) => tick()));
-        await waitFor(() => expect(activity.textContent).toContain("Next in 2h"));
-        expect(calls).toBe(2);
-      } finally {
-        dateSpy.mockRestore();
-      }
+      tick(startMs + 1000);
+      await waitFor(() => expect(activity.textContent).toContain("Next in 10m"));
+      tick(startMs + 2000);
+      await waitFor(() => expect(activity.textContent).toContain("Next in 2h"));
+      expect(calls).toBe(3);
     } finally {
       setIntervalSpy.mockRestore();
     }
