@@ -13,6 +13,7 @@ import * as path from "node:path";
 
 import {
   AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+  INERT_COMPONENT_PATH,
   MAX_SKILLS_ROOTS,
   isPlainObject,
   isSafeContributesPath,
@@ -222,7 +223,10 @@ function skillsRoots(
 ): { skills?: string[] } {
   if (value === undefined) return {};
   if (options.replaceDefaultSkills) {
-    return { skills: readPathList("skills", value, MAX_SKILLS_ROOTS, warnings, options.label) };
+    const roots = readPathList("skills", value, MAX_SKILLS_ROOTS, warnings, options.label);
+    // An empty list means "no skills", but validation drops an empty list and discovery would
+    // then scan the default skills/. The inert path keeps the set empty.
+    return { skills: roots.length > 0 ? roots : [INERT_COMPONENT_PATH] };
   }
   const extra = readPathList("skills", value, MAX_SKILLS_ROOTS - 1, warnings, options.label).filter(
     (root) => root !== "skills"

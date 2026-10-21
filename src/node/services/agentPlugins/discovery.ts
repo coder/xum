@@ -23,6 +23,7 @@ import { noComponentConsent, type ComponentConsent } from "./componentConsent";
 import type { ApprovedCopiesSource } from "./approvedCopies";
 import {
   hasGeneratedFromMarker,
+  INERT_COMPONENT_PATH,
   readGeneratedFrom,
   isPlainObject,
   isValidAgentPluginName,
@@ -819,12 +820,16 @@ function skillsOnlyManifest(manifest: AgentPluginManifest): AgentPluginManifest 
  */
 function claudeMarketplaceManifest(manifest: AgentPluginManifest): AgentPluginManifest {
   const { contributes, extensions, ...metadata } = manifest;
-  // Absent members stay undefined, which every reader treats as "not declared".
+  // Absent members stay undefined, which every reader treats as "not declared". The generator
+  // writes the inert path for an agents or MCP path the entry did not declare (downgrade
+  // safety, inertGeneratedComponents), so it reads as "not declared" too: the Claude defaults.
   const { skills, agents, mcp } = contributes ?? {};
+  const declared = (value: string | undefined) =>
+    value === INERT_COMPONENT_PATH ? undefined : value;
   const mux = extensions?.mux;
   return {
     ...metadata,
-    contributes: { skills, agents, mcp },
+    contributes: { skills, agents: declared(agents), mcp: declared(mcp) },
     extensions: { mux: { generatedFrom: isPlainObject(mux) ? mux.generatedFrom : undefined } },
   };
 }
@@ -859,8 +864,10 @@ function packageRules(args: {
       manifest: claudeMarketplaceManifest(args.manifest),
       skillsOnly: false,
       claudePackage: true,
-      claudeComponents:
-        generatedFrom.commands !== undefined ? { commands: generatedFrom.commands } : {},
+      claudeComponents: {
+        ...(generatedFrom.commands !== undefined ? { commands: generatedFrom.commands } : {}),
+        ...(generatedFrom.agentFiles !== undefined ? { agentFiles: generatedFrom.agentFiles } : {}),
+      },
     };
   }
   const skillsOnly = hasGeneratedFromMarker(args.manifest);
@@ -1063,7 +1070,7 @@ async function discoverPluginAt(args: {
   const skillsDirs = await resolveSkillsRoots({
     declared:
       contributes?.skills ??
-      (claudeFallback && (await isClaudeRootSkill(rootReal)) ? ["."] : undefined),
+      (claudePackage && (await isClaudeRootSkill(rootReal)) ? ["."] : undefined),
     rootReal,
     pluginName: manifest.name,
     resolveComponent,
@@ -1097,7 +1104,7 @@ async function discoverPluginAt(args: {
   });
   const agentsDir = await keepDeclaredAgentsOnly({
     agentsDir: resolvedAgentsDir,
-    declaredFiles: claudeFallback ? normalized.claude?.agentFiles : undefined,
+    declaredFiles: claudePackage ? claudeComponents?.agentFiles : undefined,
     warn: (message) => {
       log.debug(`Agent plugin ${pluginDir}: ${message}`);
       diagnostics.push({ path: rootReal, scope, severity: "warning", message });

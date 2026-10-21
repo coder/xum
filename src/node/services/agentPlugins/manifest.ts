@@ -261,14 +261,43 @@ export interface AgentPluginManifest {
 }
 
 /**
+ * SECURITY AUDIT (downgrade): a build that predates `generatedFrom` reads a generated plugin.json
+ * as an ordinary Agent Plugin and fills in the default component paths: hooks.js, agents/,
+ * workflows/, mcp.json or .mcp.json (`contributes`), and hooks/hooks.json (Codex hooks, which an
+ * `extensions["com.openai"].hooks` list replaces). So the generated manifest names each of them
+ * explicitly: `contributes` paths point into `.git`, which no commit can create (git refuses to
+ * track a `.git` path), so they never resolve, and an empty Codex hooks list turns the default
+ * file off. Those builds then load only the skills roots the manifest lists. Builds before
+ * `contributes` existed (#3872, the experimental flag) read only skills/ and mcp.json.
+ */
+export const INERT_COMPONENT_PATH = ".git/xum-generated-no-component";
+
+/** The `contributes` and `extensions["com.openai"]` members that keep older builds inert. */
+export function inertGeneratedComponents(): {
+  contributes: Record<"hooks" | "agents" | "workflows" | "mcp", string>;
+  openai: { hooks: [] };
+} {
+  return {
+    contributes: {
+      hooks: INERT_COMPONENT_PATH,
+      agents: INERT_COMPONENT_PATH,
+      workflows: INERT_COMPONENT_PATH,
+      mcp: INERT_COMPONENT_PATH,
+    },
+    openai: { hooks: [] },
+  };
+}
+
+/**
  * `extensions.mux.generatedFrom`: Xum wrote this plugin.json for a repository that had none
  * (installMethods.ts). Update reads it from the installed tree to regenerate with the same
  * method. `claude-marketplace` names the marketplace entry, and carries the entry's `commands`
- * paths: a Claude component without a `contributes` member.
+ * paths (a Claude component without a `contributes` member) and the agent file names that its
+ * `agents` lists (ClaudePluginComponents.agentFiles).
  */
 export type GeneratedFrom =
   | { kind: "skills" }
-  | { kind: "claude-marketplace"; entry: string; commands?: string[] };
+  | { kind: "claude-marketplace"; entry: string; commands?: string[]; agentFiles?: string[] };
 
 function generatedFromValue(manifest: Pick<AgentPluginManifest, "extensions">): unknown {
   const mux = manifest.extensions?.mux;
@@ -309,10 +338,29 @@ export function readGeneratedFrom(
   if (value.kind === "skills") return { kind: "skills" };
   if (value.kind !== "claude-marketplace") return undefined;
   if (typeof value.entry !== "string" || !isValidAgentPluginName(value.entry)) return undefined;
-  if (value.commands === undefined) return { kind: "claude-marketplace", entry: value.entry };
-  return isMarkerCommandList(value.commands)
-    ? { kind: "claude-marketplace", entry: value.entry, commands: value.commands }
-    : undefined;
+  if (value.commands !== undefined && !isMarkerCommandList(value.commands)) return undefined;
+  if (value.agentFiles !== undefined && !isMarkerAgentFileList(value.agentFiles)) return undefined;
+  return {
+    kind: "claude-marketplace",
+    entry: value.entry,
+    ...(value.commands !== undefined ? { commands: value.commands } : {}),
+    ...(value.agentFiles !== undefined ? { agentFiles: value.agentFiles } : {}),
+  };
+}
+
+/** `agentFiles` of a claude-marketplace marker: `.md` file names without a folder. */
+function isMarkerAgentFileList(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        typeof item === "string" &&
+        item.endsWith(".md") &&
+        isSafeContributesPath(item) &&
+        !item.includes("/") &&
+        !item.includes("\\")
+    )
+  );
 }
 
 export type PluginManifestValidation =

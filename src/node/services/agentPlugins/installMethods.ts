@@ -47,6 +47,7 @@ import {
 import {
   AGENT_PLUGIN_SCHEMA_ID_1_0_0,
   MAX_SKILLS_ROOTS,
+  inertGeneratedComponents,
   isPlainObject,
   readGeneratedFrom,
   type GeneratedFrom,
@@ -396,34 +397,6 @@ export interface MarketplaceEntryContext {
 }
 
 /**
- * SECURITY AUDIT (downgrade): a build that predates `generatedFrom` reads a generated plugin.json
- * as an ordinary Agent Plugin and fills in the default component paths: hooks.js, agents/,
- * workflows/, mcp.json or .mcp.json (`contributes`), and hooks/hooks.json (Codex hooks, which an
- * `extensions["com.openai"].hooks` list replaces). So the generated manifest names each of them
- * explicitly: `contributes` paths point into `.git`, which no commit can create (git refuses to
- * track a `.git` path), so they never resolve, and an empty Codex hooks list turns the default
- * file off. Those builds then load only the skills roots the manifest lists. Builds before
- * `contributes` existed (#3872, the experimental flag) read only skills/ and mcp.json.
- */
-export const INERT_COMPONENT_PATH = ".git/xum-generated-no-component";
-
-/** The `contributes` and `extensions["com.openai"]` members that keep older builds inert. */
-export function inertGeneratedComponents(): {
-  contributes: Record<"hooks" | "agents" | "workflows" | "mcp", string>;
-  openai: { hooks: [] };
-} {
-  return {
-    contributes: {
-      hooks: INERT_COMPONENT_PATH,
-      agents: INERT_COMPONENT_PATH,
-      workflows: INERT_COMPONENT_PATH,
-      mcp: INERT_COMPONENT_PATH,
-    },
-    openai: { hooks: [] },
-  };
-}
-
-/**
  * The methods of a marketplace entry's folder: its own manifest when it has one; else the entry
  * as the manifest, for a relative source only (an update must find the entry again in the same
  * repository); else Skills for a remote repository of SKILL.md files. A manifest plus entry
@@ -592,14 +565,33 @@ export function marketplaceManifest(ctx: MarketplaceEntryContext): {
     replaceDefaultSkills: ctx.rootSource,
   });
   assert(isPlainObject(normalized.manifest), "marketplaceManifest: the entry is an object");
-  const commands = normalized.claude.commands;
+  const { commands, agentFiles } = normalized.claude;
   const generatedFrom: GeneratedFrom = {
     kind: "claude-marketplace",
     entry: ctx.entry.name,
     ...(commands !== undefined ? { commands } : {}),
+    ...(agentFiles !== undefined ? { agentFiles } : {}),
   };
+  const contributes = isPlainObject(normalized.manifest.contributes)
+    ? normalized.manifest.contributes
+    : {};
+  // Downgrade safety (inertGeneratedComponents): an older build reads this file as a plain
+  // plugin.json, so every component the entry does not declare points at the inert path. This
+  // build reads an inert agents or MCP path as "not declared" (claudeMarketplaceManifest), so
+  // the Claude defaults (agents/, .mcp.json) still apply here.
+  const inert = inertGeneratedComponents();
   return {
-    manifest: { ...normalized.manifest, extensions: { mux: { generatedFrom } } },
+    manifest: {
+      ...normalized.manifest,
+      contributes: {
+        ...contributes,
+        hooks: inert.contributes.hooks,
+        workflows: inert.contributes.workflows,
+        agents: contributes.agents ?? inert.contributes.agents,
+        mcp: contributes.mcp ?? inert.contributes.mcp,
+      },
+      extensions: { mux: { generatedFrom }, "com.openai": inert.openai },
+    },
     warnings: [...warnings, ...normalized.warnings],
   };
 }

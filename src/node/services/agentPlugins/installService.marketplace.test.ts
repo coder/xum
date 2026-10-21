@@ -258,6 +258,65 @@ describe("AgentPluginInstallService Claude marketplaces", () => {
     ).toBeNull();
   });
 
+  test("a generated entry loads only its listed agents, and older builds only its components", async () => {
+    const agent = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\n`;
+    await writeFiles(marketDir, {
+      ".claude-plugin/marketplace.json": marketplace([
+        { name: "kit", source: "./plugins/kit", agents: ["./agents/a.md", "./agents/b.md"] },
+        { name: "partial", source: "./plugins/kit", agents: ["./agents/a.md"] },
+      ]),
+      "plugins/kit/skills/lint/SKILL.md": skillMd("lint"),
+      "plugins/kit/agents/a.md": agent("a"),
+      "plugins/kit/agents/b.md": agent("b"),
+      "plugins/kit/hooks.js": "export default {};",
+      "plugins/kit/workflows/w.js": "export default async () => {};",
+      "plugins/kit/mcp.json": "{}",
+      "plugins/kit/.mcp.json": JSON.stringify({ mcpServers: {} }),
+      "plugins/kit/hooks/hooks.json": JSON.stringify({ hooks: {} }),
+    });
+    await commit(marketDir, "kit");
+    const partial = await previewEntry("partial");
+    expect(partial.agents).toEqual([]);
+    expect(partial.warnings.some((warning) => warning.includes("b.md"))).toBe(true);
+
+    const kit = await previewEntry("kit");
+    expect(kit.agents).toEqual(["a.md", "b.md"]);
+    await install(kit);
+    const installed = path.join(xumRoot, "plugins", "kit");
+    const current = (await discoverAgentPluginAt({ pluginDir: installed, scope: "global" })).plugin;
+    // This build: the Claude default .mcp.json, no hooks.js or workflows/.
+    expect(current?.mcpConfigPath).toBe(path.join(current?.rootPath ?? "", ".mcp.json"));
+    expect(current?.hooksPath).toBeUndefined();
+
+    // An older build reads the marker as opaque: drop it to read the file as such a build does.
+    const manifestPath = path.join(installed, "plugin.json");
+    const manifest = JSON.parse(await fsPromises.readFile(manifestPath, "utf8")) as {
+      extensions: Record<string, unknown>;
+    };
+    delete manifest.extensions.mux;
+    await fsPromises.writeFile(manifestPath, JSON.stringify(manifest));
+    const older = (await discoverAgentPluginAt({ pluginDir: installed, scope: "global" })).plugin;
+    expect(older?.hooksPath).toBeUndefined();
+    expect(older?.workflowsDir).toBeUndefined();
+    expect(older?.mcpConfigPath).toBeUndefined();
+    expect(older?.openai?.hooks).toEqual([]);
+    // The entry declared these agents, and the user reviewed them.
+    expect(older?.agentsDir).toBe(path.join(older?.rootPath ?? "", "agents"));
+  });
+
+  test("a root entry with an empty skills list installs no skills", async () => {
+    await writeFiles(marketDir, {
+      ".claude-plugin/marketplace.json": marketplace([
+        { name: "none", source: "./", strict: false, skills: [] },
+      ]),
+    });
+    await commit(marketDir, "none");
+    const listed = await service.previewSource({ input: marketDir });
+    if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
+    expect(listed.marketplace.entries.map((entry) => entry.skillCount)).toEqual([0]);
+    expect((await previewEntry("none")).skills).toEqual([]);
+  });
+
   test("an entry with its own plugin manifest uses it; strict entry components only warn", async () => {
     await writeFiles(marketDir, {
       ".claude-plugin/marketplace.json": marketplace([
