@@ -606,8 +606,8 @@ export function TerminalView({
             textarea.focus();
           }
         } else {
-          // Blur immediately
           const termToBlur = terminal;
+          // Blur immediately
           blurAndRestoreFocus(termToBlur, containerEl, focusBeforeOpen);
           // Counter the delayed focus() in ghostty-web
           setTimeout(() => {
