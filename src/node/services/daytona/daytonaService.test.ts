@@ -447,6 +447,7 @@ describe("DaytonaService", () => {
       readTokens: () =>
         Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
       verifyResolvedConfig: () => Promise.resolve(),
+      repointGateway: () => Promise.resolve(),
     };
     const startProcess = async () => {
       const started = new DaytonaService({
