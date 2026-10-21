@@ -414,6 +414,24 @@ export class DaytonaService {
     return aliases === undefined || others.some((stored) => aliases.has(stored));
   }
 
+  /**
+   * Whether the sandbox carries this install's label, so Xum created it. False when it is gone
+   * or the lookup fails: then it is only released, never deleted.
+   */
+  async isCreatedByThisInstall(sandboxId: string): Promise<boolean> {
+    try {
+      const { sandbox } = await this.getSandboxState(sandboxId);
+      const instance = sandbox?.labels?.[DAYTONA_LABEL_INSTANCE];
+      return instance !== undefined && instance === (await this.getInstanceId());
+    } catch (error) {
+      log.warn("Could not look up a Daytona sandbox's labels; keeping it", {
+        sandboxId,
+        error: getErrorMessage(error),
+      });
+      return false;
+    }
+  }
+
   /** What the other workspaces (removals in flight excluded) store as their sandbox. */
   private sandboxIdsStoredElsewhere(refs: DaytonaWorkspaceRef[], workspaceId: string): string[] {
     return refs.flatMap((ref) => {

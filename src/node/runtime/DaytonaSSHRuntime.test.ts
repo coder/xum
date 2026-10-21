@@ -10,7 +10,10 @@ import {
   localShellTransport,
   type DaytonaTestRig,
 } from "@/node/services/daytona/daytona.testHarness";
-import { DAYTONA_READY_CACHE_MS } from "@/node/services/daytona/daytonaService";
+import {
+  DAYTONA_LABEL_INSTANCE,
+  DAYTONA_READY_CACHE_MS,
+} from "@/node/services/daytona/daytonaService";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import { DaytonaSSHRuntime } from "./DaytonaSSHRuntime";
 import type { InitLogger, RuntimeStatusEvent, WorkspaceInitParams } from "./Runtime";
@@ -701,6 +704,43 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     );
 
     expect(result).toMatchObject({ success: false, leftoverPaths: ['Daytona sandbox "sb-stuck"'] });
+  });
+
+  it("deletes a sandbox Xum created with its last workspace, even one that attached it", async () => {
+    const labels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.getInstanceId() };
+    const owner = (sandboxId: string) => ({ sandboxId, shared: false, ...SMALL });
+    const attached = (sandboxId: string) => ({ sandboxId, shared: true });
+    const remove = (workspaceId: string, daytona: DaytonaSandboxConfig) =>
+      makeRuntime(daytona, rig, { workspaceId }).deleteWorkspace(
+        "/home/me/project",
+        workspaceId,
+        false
+      );
+    const deletes = () =>
+      rig.plane.calls.filter((call) => /^DELETE \/sandbox\/[^/]+$/.test(call)).length;
+    // Each sandbox: the owner stores its name, another workspace attached it by its id.
+    rig.plane.addSandbox({ id: "sb-1", name: "xum-owner-first", labels });
+    rig.plane.addSandbox({ id: "sb-2", name: "xum-attached-first", labels });
+    rig.workspaces.push(
+      { workspaceId: "ws-o1", runtimeConfig: sshDaytonaConfig(owner("xum-owner-first")) },
+      { workspaceId: "ws-t1", runtimeConfig: sshDaytonaConfig(attached("sb-1")) },
+      { workspaceId: "ws-o2", runtimeConfig: sshDaytonaConfig(owner("xum-attached-first")) },
+      { workspaceId: "ws-t2", runtimeConfig: sshDaytonaConfig(attached("sb-2")) }
+    );
+
+    // The owner goes first: the attached workspace's removal deletes it.
+    expect((await remove("ws-o1", owner("xum-owner-first"))).success).toBe(true);
+    expect(rig.plane.find("sb-1")).toBeDefined();
+    expect((await remove("ws-t1", attached("sb-1"))).success).toBe(true);
+    expect(rig.plane.find("sb-1")).toBeUndefined();
+    expect(deletes()).toBe(1);
+
+    // The attached workspace goes first: the owner's removal deletes it.
+    expect((await remove("ws-t2", attached("sb-2"))).success).toBe(true);
+    expect(rig.plane.find("sb-2")).toBeDefined();
+    expect((await remove("ws-o2", owner("xum-attached-first"))).success).toBe(true);
+    expect(rig.plane.find("sb-2")).toBeUndefined();
+    expect(deletes()).toBe(2);
   });
 
   it("never deletes an attached sandbox, even with its last workspace", async () => {

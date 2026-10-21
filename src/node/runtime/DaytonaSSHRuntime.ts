@@ -83,6 +83,7 @@ export type DaytonaRuntimeService = Pick<
   | "invalidateSandboxReady"
   | "replaceRejectedSshToken"
   | "isSandboxReferencedElsewhere"
+  | "isCreatedByThisInstall"
   | "withSandboxRemovalLock"
   | "waitUntilDestroyed"
   | "recordWorkspaceRemoval"
@@ -1008,7 +1009,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     if (await this.daytonaService.isSandboxReferencedElsewhere(sandboxId, this.workspaceId)) {
       return "keep";
     }
-    return this.daytonaConfig.shared === true ? "release" : "delete";
+    if (this.daytonaConfig.shared !== true) return "delete";
+    // Attached to a sandbox Xum created for another workspace, which was removed first: this
+    // is its last workspace, so it goes as it would with its owner.
+    return (await this.daytonaService.isCreatedByThisInstall(sandboxId)) ? "delete" : "release";
   }
 
   /**
