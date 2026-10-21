@@ -257,6 +257,7 @@ export class DaytonaSshConfigWriter {
     edit: (blocks: Map<string, string>) => void
   ): Promise<void> {
     const knownHosts = renderDaytonaKnownHosts(gateway);
+    this.assertPathsHaveNoSshTokens();
     await this.withIncludeFileLock(async () => {
       await writeFileAtomic(this.paths.knownHostsPath, knownHosts, {
         encoding: "utf-8",
@@ -303,6 +304,7 @@ export class DaytonaSshConfigWriter {
     token: string;
     gateway: DaytonaSshGateway;
   }): Promise<void> {
+    this.assertPathsHaveNoSshTokens();
     const block = this.renderBlock(input);
     const alias = toXumDaytonaHost(input.sandboxId);
     return this.withIncludeFileLock(async () => {
@@ -310,6 +312,19 @@ export class DaytonaSshConfigWriter {
       blocks.set(alias, block);
       await this.writeBlocks(blocks);
     });
+  }
+
+  /**
+   * The Include and UserKnownHostsFile paths go into ssh config, where OpenSSH expands `%`
+   * tokens. Escaping as `%%` is not an option: older OpenSSH reads Include paths literally.
+   */
+  private assertPathsHaveNoSshTokens(): void {
+    if (this.paths.dir.includes("%")) {
+      throw new DaytonaSshConfigError(
+        `Daytona ssh setup cannot use ${this.paths.dir}: ssh treats "%" in config paths as a ` +
+          `token. Use a Xum root (XUM_ROOT) and home directory without "%".`
+      );
+    }
   }
 
   /**
