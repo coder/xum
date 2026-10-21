@@ -72,6 +72,18 @@ function assertTerminalsEnabled(): void {
   }
 }
 
+/**
+ * A Daytona sandbox may be stopped, or its token (the ssh user name) due for refresh: bring it
+ * up before a native emulator runs ssh. The user asked for this terminal, so starting it is fine.
+ */
+async function ensureDaytonaSandboxUp(
+  workspace: Parameters<typeof createRuntimeForWorkspace>[0]
+): Promise<void> {
+  if (!isSSHRuntime(workspace.runtimeConfig) || !workspace.runtimeConfig.daytona) return;
+  const ready = await createRuntimeForWorkspace(workspace).ensureReady();
+  if (!ready.ready) throw new Error(ready.error);
+}
+
 export class TerminalService {
   private readonly config: Config;
   private readonly ptyService: PTYService;
@@ -799,12 +811,7 @@ export class TerminalService {
         );
       }
 
-      // A Daytona sandbox may be stopped, or its token (the ssh user name) due for refresh:
-      // bring it up before the emulator runs ssh. The user asked for this terminal.
-      if (isSSHRuntime(workspace.runtimeConfig) && workspace.runtimeConfig.daytona) {
-        const ready = await createRuntimeForWorkspace(workspace).ensureReady();
-        if (!ready.ready) throw new Error(ready.error);
-      }
+      await ensureDaytonaSandboxUp(workspace);
 
       // Before any durable effect: one share per workspace is kept, after a failed launch too
       // (fail closed; see nativeTerminalUseLeases), and a refusal above releases this open's.
