@@ -88,4 +88,32 @@ describe("agent-home seeding", () => {
       readFile.mockRestore();
     }
   });
+
+  it("follows symlinks only inside the skill being copied, except a linked skill itself", async () => {
+    const secrets = path.join(hostHome, ".ssh");
+    await fs.mkdir(secrets, { recursive: true });
+    await fs.writeFile(path.join(secrets, "id_ed25519"), "PRIVATE KEY\n");
+    const skill = path.join(hostXum, "skills", "deploy");
+    await fs.mkdir(skill, { recursive: true });
+    await fs.writeFile(path.join(skill, "SKILL.md"), "# deploy\n");
+    // Links that escape the skill: a directory and a file.
+    await fs.symlink(secrets, path.join(skill, "creds"));
+    await fs.symlink(path.join(secrets, "id_ed25519"), path.join(skill, "key"));
+    // A link that stays inside the skill.
+    await fs.symlink(path.join(skill, "SKILL.md"), path.join(skill, "README.md"));
+    // A skill directory linked into the skills root, as plugin installs and users do.
+    const linkedTarget = path.join(root, "plugins", "lint");
+    await fs.mkdir(linkedTarget, { recursive: true });
+    await fs.writeFile(path.join(linkedTarget, "SKILL.md"), "# lint\n");
+    await fs.symlink(linkedTarget, path.join(hostXum, "skills", "lint"));
+
+    const files = await collectAgentHomeSeedFiles({ xumHome: hostXum, home: hostHome }, "~/.mux");
+
+    expect(files.map((file) => file.remotePath).sort()).toEqual([
+      "~/.mux/skills/deploy/README.md",
+      "~/.mux/skills/deploy/SKILL.md",
+      "~/.mux/skills/lint/SKILL.md",
+    ]);
+    expect(files.some((file) => file.content.toString().includes("PRIVATE KEY"))).toBe(false);
+  });
 });

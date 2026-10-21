@@ -98,50 +98,93 @@ async function readDirectory(hostDir: string): Promise<string[] | null> {
   }
 }
 
-async function collectDirectory(
-  files: AgentHomeSeedFile[],
-  budget: SeedBudget,
-  hostDir: string,
-  remoteDir: string,
-  depth: number
-): Promise<void> {
-  if (depth > MAX_SKILL_DIR_DEPTH || budget.exhausted) return;
-  const entries = await readDirectory(hostDir);
-  if (!entries) return;
-  for (const entry of entries) {
-    await collectEntry(
-      files,
-      budget,
-      path.join(hostDir, entry),
-      path.posix.join(remoteDir, entry),
-      depth
-    );
-  }
-}
-
-async function collectEntry(
-  files: AgentHomeSeedFile[],
-  budget: SeedBudget,
-  hostPath: string,
-  remotePath: string,
-  depth: number
-): Promise<void> {
-  let stat: Awaited<ReturnType<typeof fs.stat>>;
+/** The real path and its stat (links followed); null for a broken link or a missing path. */
+async function resolveEntry(
+  hostPath: string
+): Promise<{ real: string; stat: Awaited<ReturnType<typeof fs.stat>> } | null> {
   try {
-    stat = await fs.stat(hostPath);
+    const real = await fs.realpath(hostPath);
+    return { real, stat: await fs.stat(real) };
   } catch (error) {
     // Broken symlinks are common in skill directories; skip them.
     log.debug("Skipping a missing path while seeding a Daytona sandbox", {
       hostPath,
       error: getErrorMessage(error),
     });
-    return;
+    return null;
   }
-  if (stat.isDirectory()) {
-    await collectDirectory(files, budget, hostPath, remotePath, depth + 1);
-    return;
+}
+
+function isInside(realPath: string, realRoot: string): boolean {
+  const relative = path.relative(realRoot, realPath);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/**
+ * A skills root (`~/.xum/skills`, `~/.agents/skills`). Each skill directory in it may be a
+ * symlink (users and plugin installs link skills, and skill discovery follows them); inside a
+ * skill, links are followed only while they stay within that skill's real directory, so a
+ * link to `~/.ssh` is never copied into the sandbox.
+ */
+async function collectSkillsRoot(
+  files: AgentHomeSeedFile[],
+  budget: SeedBudget,
+  hostRoot: string,
+  remoteRoot: string
+): Promise<void> {
+  const entries = await readDirectory(hostRoot);
+  const root = entries ? await resolveEntry(hostRoot) : null;
+  if (!entries || !root) return;
+  for (const entry of entries) {
+    if (budget.exhausted) return;
+    const resolved = await resolveEntry(path.join(hostRoot, entry));
+    if (!resolved) continue;
+    const remotePath = path.posix.join(remoteRoot, entry);
+    if (resolved.stat.isDirectory()) {
+      await collectDirectory(files, budget, resolved.real, remotePath, 1, resolved.real);
+    } else if (isInside(resolved.real, root.real)) {
+      await collectFile(files, budget, resolved, remotePath);
+    }
   }
-  const file = stat.isFile() ? await readRegularFile(hostPath, budget) : null;
+}
+
+async function collectDirectory(
+  files: AgentHomeSeedFile[],
+  budget: SeedBudget,
+  hostDir: string,
+  remoteDir: string,
+  depth: number,
+  skillRoot: string
+): Promise<void> {
+  if (depth > MAX_SKILL_DIR_DEPTH || budget.exhausted) return;
+  const entries = await readDirectory(hostDir);
+  if (!entries) return;
+  for (const entry of entries) {
+    const resolved = await resolveEntry(path.join(hostDir, entry));
+    if (!resolved) continue;
+    if (!isInside(resolved.real, skillRoot)) {
+      log.warn("Skipping a symlink that leaves its skill while seeding a Daytona sandbox", {
+        hostPath: path.join(hostDir, entry),
+      });
+      continue;
+    }
+    const remotePath = path.posix.join(remoteDir, entry);
+    if (resolved.stat.isDirectory()) {
+      await collectDirectory(files, budget, resolved.real, remotePath, depth + 1, skillRoot);
+    } else {
+      await collectFile(files, budget, resolved, remotePath);
+    }
+  }
+}
+
+async function collectFile(
+  files: AgentHomeSeedFile[],
+  budget: SeedBudget,
+  resolved: { real: string; stat: Awaited<ReturnType<typeof fs.stat>> },
+  remotePath: string
+): Promise<void> {
+  if (!resolved.stat.isFile()) return;
+  const file = await readRegularFile(resolved.real, budget);
   if (file) addFile(files, budget, remotePath, file);
 }
 
@@ -156,19 +199,17 @@ export async function collectAgentHomeSeedFiles(
     const file = await readRegularFile(path.join(sources.xumHome, name), budget);
     if (file) addFile(files, budget, path.posix.join(remoteXumHome, name), file);
   }
-  await collectDirectory(
+  await collectSkillsRoot(
     files,
     budget,
     path.join(sources.xumHome, "skills"),
-    path.posix.join(remoteXumHome, "skills"),
-    0
+    path.posix.join(remoteXumHome, "skills")
   );
-  await collectDirectory(
+  await collectSkillsRoot(
     files,
     budget,
     path.join(sources.home, ".agents", "skills"),
-    "~/.agents/skills",
-    0
+    "~/.agents/skills"
   );
   if (budget.exhausted) {
     log.warn("Daytona agent-home seed hit its size limit; some files were not copied", {
