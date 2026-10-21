@@ -2175,9 +2175,10 @@ export const StripReachableUnderToggleBar: Story = {
       await canvas.findByRole("button", { name: "Expand right sidebar" }, { timeout: 15_000 })
     );
     const allTabs = await canvas.findByRole("button", { name: "All tabs" }, { timeout: 15_000 });
-    // Like Playwright: bring it into view (the 1600px frame can be wider than the window).
-    allTabs.scrollIntoView({ block: "nearest", inline: "nearest" });
     await waitFor(() => {
+      // Like Playwright: bring it into view (the 1600px frame can be wider than the window),
+      // again on each retry, since it mounts while the panel is still sliding in.
+      allTabs.scrollIntoView({ block: "nearest", inline: "nearest" });
       if (!isHitTarget(allTabs)) throw new Error("All tabs is not under the pointer");
     });
   },

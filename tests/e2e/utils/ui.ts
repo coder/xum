@@ -540,7 +540,9 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
       const expandButton = page.getByRole("button", { name: "Expand right sidebar", exact: true });
       await expect
-        .poll(async () => (await sidebar.isVisible()) || (await expandButton.isVisible()))
+        .poll(async () => (await sidebar.isVisible()) || (await expandButton.isVisible()), {
+          message: "neither the expanded right sidebar nor its Expand toggle is visible",
+        })
         .toBe(true);
     },
 

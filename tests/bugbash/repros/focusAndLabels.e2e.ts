@@ -80,6 +80,15 @@ test(
         if (el?.closest(".terminal-view")) return "terminal";
         return el?.getAttribute("aria-label") ?? el?.tagName ?? "none";
       });
+    // Every repro in a run shares one backend, so close the terminal session, also after a
+    // failure. A later repro whose sidebar opens onto a leftover terminal can lose its menu: the
+    // terminal takes focus after it mounts, and the focus move closes the menu (#7099).
+    const closeTerminal = async () => {
+      if (await expand.isVisible()) await expand.tap();
+      const close = screen.getByRole("button", "Close terminal");
+      await close.tap();
+      await expect(close).toBeHidden();
+    };
     try {
       await expect.poll(focusOwner, { timeout: 15_000 }).toBe("terminal");
 
@@ -93,15 +102,14 @@ test(
       await browser.keyboard.type("cat README.md");
 
       expect(await focusOwner()).toBe("terminal");
-    } finally {
-      // Every repro in a run shares one backend, so close the terminal session, also after a
-      // failure. A later repro whose sidebar opens onto a leftover terminal can lose its menu:
-      // the terminal takes focus after it mounts, and the focus move closes the menu (#7099).
-      if (await expand.isVisible()) await expand.tap();
-      const close = screen.getByRole("button", "Close terminal");
-      await close.tap();
-      await expect(close).toBeHidden();
+    } catch (error) {
+      // Report the test's own error, not a cleanup error it caused.
+      await closeTerminal().catch((cleanupError: unknown) => {
+        console.error("Could not close the terminal after the test failed:", cleanupError);
+      });
+      throw error;
     }
+    await closeTerminal();
   }
 );
 
