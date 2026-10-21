@@ -73,7 +73,14 @@ describe("DaytonaCredentialsStore", () => {
 
   it("rejects an API URL that is not plain http(s)", async () => {
     const store = new DaytonaCredentialsStore(rootDir, {});
-    for (const apiUrl of ["not a url", "file:///etc/passwd", "https://user:pw@example.com/api"]) {
+    for (const apiUrl of [
+      "not a url",
+      "file:///etc/passwd",
+      "https://user:pw@example.com/api",
+      // WHATWG URL parsing reads these as host "api".
+      "http:///api",
+      "https:api",
+    ]) {
       // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
       await expect(store.update({ apiUrl })).rejects.toThrow(/Daytona API URL/);
     }

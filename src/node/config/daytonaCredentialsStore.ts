@@ -52,7 +52,8 @@ export class DaytonaConfigError extends Error {
   }
 }
 
-function normalizeApiUrl(value: string): string {
+/** An http(s) URL with a host the user wrote. */
+function parseApiUrl(value: string): URL {
   let parsed: URL;
   try {
     parsed = new URL(value);
@@ -62,6 +63,15 @@ function normalizeApiUrl(value: string): string {
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
     throw new DaytonaConfigError("Daytona API URL must use http or https");
   }
+  // `new URL` turns "http:///api" and "https:api" into host "api": require a written host.
+  if (!/^https?:\/\/[^/?#\\]/i.test(value)) {
+    throw new DaytonaConfigError(`Daytona API URL has no host: ${value}`);
+  }
+  return parsed;
+}
+
+function normalizeApiUrl(value: string): string {
+  const parsed = parseApiUrl(value);
   if (parsed.username || parsed.password || parsed.search || parsed.hash) {
     throw new DaytonaConfigError(
       "Daytona API URL must not contain credentials, a query or a fragment"
