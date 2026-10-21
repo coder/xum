@@ -13,7 +13,8 @@
  */
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
-import { disableTutorials, WORKSPACE_TITLE } from "../bugbash/repros/helpers";
+import { disableTutorials, sendMessage } from "../bugbash/repros/helpers";
+import { openPlayground } from "./helpers";
 
 // The mock AI's error prompts and the error texts it replies with (mockAiRouter.ts).
 const ERRORS = [
@@ -37,19 +38,17 @@ const REPLY = `Mock response: ${MESSAGE}`;
 test(
   "stream errors show in the chat, and the chat recovers",
   { tags: ["story"], timeout: 600_000 },
-  async ({ app, agent, browser }) => {
+  async ({ app, agent, browser, screen }) => {
     // e2e has no `log` role query, so CSS: the transcript is ChatPane's role="log" element.
     const transcript = browser.locator('[role="log"][aria-label="Conversation transcript"]');
 
     await disableTutorials(app);
     await app.open();
-    await agent.act(`open the '${WORKSPACE_TITLE}' workspace in the left sidebar`);
+    // exact step: Haiku 5.5 missed this step in 10 of 14 cold failures (Phase 5)
+    await openPlayground(screen);
     for (const [prompt, error] of ERRORS) {
-      await agent.act(
-        "send the chat message {prompt} exactly as written, and wait until the chat shows an " +
-          "error for it",
-        { params: { prompt } }
-      );
+      // exact send: Haiku 5.5 did not send an error prompt in 4 of 14 cold failures (Phase 5)
+      await sendMessage(screen, prompt);
       await expect(transcript).toContainText(error, { timeout: 30_000 });
     }
 

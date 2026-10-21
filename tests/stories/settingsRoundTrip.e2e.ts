@@ -10,6 +10,7 @@
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
 import { disableTutorials, WORKSPACE_TITLE } from "../bugbash/repros/helpers";
+import { openPlayground } from "./helpers";
 
 const MESSAGE = "water the herbs";
 // The mock AI's default reply (mockAiRouter.ts).
@@ -25,7 +26,8 @@ test(
 
     await disableTutorials(app);
     await app.open();
-    await agent.act(`open the '${WORKSPACE_TITLE}' workspace in the left sidebar`);
+    // exact step: Haiku 5.5 missed this step in 10 of 14 cold failures (Phase 5)
+    await openPlayground(screen);
     await agent.act(`send the chat message '${MESSAGE}' and wait for the reply`);
     await expect(transcript).toContainText(REPLY, { timeout: 30_000 });
 
