@@ -87,6 +87,41 @@ describe("DaytonaCredentialsStore", () => {
     );
   });
 
+  it("accepts plain http only for a loopback host, where no network sees the key", async () => {
+    const store = new DaytonaCredentialsStore(rootDir, {});
+    for (const apiUrl of ["http://byoc.example.com/api", "http://10.0.0.5/api"]) {
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+      await expect(store.update({ apiUrl })).rejects.toThrow(/https/);
+    }
+    for (const apiUrl of [
+      "http://127.0.0.1:3000/api",
+      "http://localhost/api",
+      "http://[::1]:8080/api",
+    ]) {
+      await store.update({ apiUrl });
+      expect((await store.read()).apiUrl).toBe(apiUrl);
+    }
+  });
+
+  it("ignores a stored non-loopback http URL, and refuses one from DAYTONA_API_URL", async () => {
+    await fs.writeFile(
+      path.join(rootDir, "daytona.json"),
+      JSON.stringify({ apiKey: KEY, apiUrl: "http://byoc.example.com/api" }),
+      "utf-8"
+    );
+    expect((await new DaytonaCredentialsStore(rootDir, {}).resolve())?.apiUrl).toBe(
+      DAYTONA_DEFAULT_API_URL
+    );
+
+    // The environment names the deployment, so another one must not get the key instead.
+    const fromEnv = new DaytonaCredentialsStore(rootDir, {
+      DAYTONA_API_URL: "http://byoc.example.com/api",
+    });
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+    await expect(fromEnv.resolve()).rejects.toThrow(/DAYTONA_API_URL/);
+    expect((await fromEnv.getPublicConfig()).apiUrl).toBe("http://byoc.example.com/api");
+  });
+
   it("rejects an API URL that is not plain http(s)", async () => {
     const store = new DaytonaCredentialsStore(rootDir, {});
     for (const apiUrl of [

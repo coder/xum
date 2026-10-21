@@ -5,6 +5,7 @@ import { DAYTONA_DEFAULT_API_URL } from "@/common/constants/daytona";
 import type { DaytonaApiKeySource, DaytonaPublicConfig } from "@/common/orpc/schemas/daytona";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isPlainObject } from "@/common/utils/isPlainObject";
+import { isLoopbackHost } from "@/common/utils/loopbackHost";
 import { log } from "@/node/services/log";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
@@ -67,6 +68,13 @@ function parseApiUrl(value: string): URL {
   // `new URL` turns "http:///api" and "https:api" into host "api": require a written host.
   if (!/^https?:\/\/[^/?#\\]/i.test(value)) {
     throw new DaytonaConfigError(`Daytona API URL has no host: ${value}`);
+  }
+  // Every authenticated call sends the API key as a bearer token: over plain http anyone on
+  // the network path could read it. Only a loopback host keeps it on this machine.
+  if (parsed.protocol === "http:" && !isLoopbackHost(parsed.hostname)) {
+    throw new DaytonaConfigError(
+      "Daytona API URL must use https (http is accepted only for localhost and 127.0.0.1)"
+    );
   }
   return parsed;
 }
@@ -183,6 +191,14 @@ export class DaytonaCredentialsStore {
     const envKey = nonEmpty(this.env.DAYTONA_API_KEY);
     const apiKey = stored.apiKey ?? envKey;
     if (!apiKey) return null;
+    // The environment names the deployment to use: falling back to the default one would send
+    // the key to a deployment the operator did not pick, so it stays unusable until fixed.
+    if (this.insecureEnvApiUrl(stored)) {
+      throw new DaytonaConfigError(
+        "DAYTONA_API_URL must use https (http is accepted only for localhost and 127.0.0.1); " +
+          "fix it, or set the API URL in Settings > Runtimes"
+      );
+    }
     return {
       apiKey,
       apiKeySource: stored.apiKey ? "settings" : "env",
@@ -203,12 +219,24 @@ export class DaytonaCredentialsStore {
     };
   }
 
-  /** A stored or env URL that does not validate is ignored (self-healing), as if unset. */
+  /**
+   * A stored or env URL that does not validate is ignored (self-healing), as if unset, except
+   * an env URL that only fails for plain http: that one is shown, and resolve refuses it.
+   */
   private resolveApiUrl(stored: DaytonaStoredCredentials): string {
     return (
       validApiUrl(stored.apiUrl, "the stored Daytona API URL") ??
+      this.insecureEnvApiUrl(stored) ??
       validApiUrl(nonEmpty(this.env.DAYTONA_API_URL), "DAYTONA_API_URL") ??
       DAYTONA_DEFAULT_API_URL
     );
+  }
+
+  /** DAYTONA_API_URL when it would be used and is http to a host that is not loopback. */
+  private insecureEnvApiUrl(stored: DaytonaStoredCredentials): string | undefined {
+    const envUrl = nonEmpty(this.env.DAYTONA_API_URL);
+    if (!envUrl || validApiUrl(stored.apiUrl, "the stored Daytona API URL")) return undefined;
+    const parsed = URL.canParse(envUrl) ? new URL(envUrl) : undefined;
+    return parsed?.protocol === "http:" && !isLoopbackHost(parsed.hostname) ? envUrl : undefined;
   }
 }

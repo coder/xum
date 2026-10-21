@@ -446,6 +446,21 @@ describe("DaytonaService", () => {
     expect(await unconfigured.checkAvailability()).toMatchObject({ available: false });
   });
 
+  it("never sends the key to a non-loopback http DAYTONA_API_URL", async () => {
+    const insecure = makeService({ DAYTONA_API_KEY: "k", DAYTONA_API_URL: "http://byoc.test/api" });
+
+    expect(await insecure.testConnection()).toMatchObject({
+      ok: false,
+      kind: "not_configured",
+      error: expect.stringContaining("DAYTONA_API_URL") as unknown,
+    });
+    expect(await insecure.checkAvailability()).toMatchObject({
+      available: false,
+      reason: expect.stringContaining("https") as unknown,
+    });
+    expect(plane.calls).toEqual([]);
+  });
+
   it("labels sandboxes with an instance id that is stable across service instances", async () => {
     const labels = await service.buildLabels({
       workspaceId: "ws-1",

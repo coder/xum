@@ -1,32 +1,7 @@
 import { randomBytes } from "crypto";
+import { isLoopbackHost } from "@/common/utils/loopbackHost";
 
-/**
- * Check if a host string is a literal loopback address.
- *
- * Only matches literal IPv4/IPv6 loopback addresses and "localhost".
- * Hostnames that happen to start with "127." (e.g., "127.example.com") are
- * NOT treated as loopback — this matters for auth-token generation policy.
- */
-export function isLoopbackHost(host: string): boolean {
-  const normalized = host.trim().toLowerCase();
-
-  // Strip IPv6 brackets if present (e.g., "[::1]" → "::1").
-  const bare =
-    normalized.startsWith("[") && normalized.endsWith("]") ? normalized.slice(1, -1) : normalized;
-
-  if (bare === "localhost" || bare === "::1") return true;
-
-  // Match 127.x.y.z only for literal IPv4 addresses (4 numeric octets, 0-255).
-  // This prevents hostnames like "127.example.com" from being misclassified.
-  if (bare.startsWith("127.")) {
-    const parts = bare.split(".");
-    if (parts.length === 4 && parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255)) {
-      return true;
-    }
-  }
-
-  return false;
-}
+export { isLoopbackHost } from "@/common/utils/loopbackHost";
 
 export interface ResolvedAuthToken {
   /** The token to use (undefined = no auth required). */

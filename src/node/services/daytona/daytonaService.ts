@@ -457,7 +457,13 @@ export class DaytonaService {
   }
 
   async checkAvailability(): Promise<DaytonaAvailability> {
-    const credentials = await this.credentialsStore.resolve();
+    let credentials: DaytonaResolvedCredentials | null;
+    try {
+      credentials = await this.resolveCredentials();
+    } catch (error) {
+      if (!(error instanceof DaytonaApiError)) throw error;
+      return { available: false, reason: error.message };
+    }
     if (!credentials) {
       return {
         available: false,
@@ -467,9 +473,21 @@ export class DaytonaService {
     return { available: true };
   }
 
+  /** Unusable settings (an http DAYTONA_API_URL) throw a `not_configured` DaytonaApiError. */
+  private async resolveCredentials(): Promise<DaytonaResolvedCredentials | null> {
+    try {
+      return await this.credentialsStore.resolve();
+    } catch (error) {
+      if (error instanceof DaytonaConfigError) {
+        throw new DaytonaApiError("not_configured", error.message);
+      }
+      throw error;
+    }
+  }
+
   /** Throws a `not_configured` DaytonaApiError when no API key is set. */
   async getClient(): Promise<{ client: DaytonaClient; credentials: DaytonaResolvedCredentials }> {
-    const credentials = await this.credentialsStore.resolve();
+    const credentials = await this.resolveCredentials();
     if (!credentials) {
       throw new DaytonaApiError(
         "not_configured",
@@ -682,7 +700,7 @@ export class DaytonaService {
 
   /** The default target (region) from Settings > Runtimes, if one is set. */
   async getDefaultTarget(): Promise<string | undefined> {
-    return (await this.credentialsStore.resolve())?.target;
+    return (await this.resolveCredentials())?.target;
   }
 
   async createSandbox(
