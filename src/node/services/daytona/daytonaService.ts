@@ -81,7 +81,9 @@ export const DAYTONA_GATEWAY_CONFIG_TTL_MS = 5 * 60_000;
 /** How long a delete waits for a sandbox Daytona is already destroying to go away. */
 export const DAYTONA_DESTROY_WAIT_MS = 60_000;
 
-const DESTROYING_STATES = new Set(["destroying", "destroyed"]);
+// Daytona documents "deleting" and "deleted"; "destroying" and "destroyed" are older spellings.
+const DESTROYING_STATE_NAMES = ["deleting", "deleted", "destroying", "destroyed"] as const;
+const DESTROYING_STATES = new Set<string>(DESTROYING_STATE_NAMES);
 
 type ObservedSandboxState = Exclude<DaytonaSandboxState, "missing">;
 
@@ -106,9 +108,8 @@ const RAW_STATE_MAP: Record<string, ObservedSandboxState> = {
   archived: "archived",
   error: "error",
   build_failed: "error",
-  destroyed: "error",
-  destroying: "error",
   unknown: "error",
+  ...Object.fromEntries(DESTROYING_STATE_NAMES.map((state) => [state, "error" as const])),
 };
 
 /** Only an active snapshot creates sandboxes; one with no reported state is taken as active. */

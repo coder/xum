@@ -1026,18 +1026,24 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     });
   });
 
-  it("waits for a sandbox Daytona is already destroying instead of refusing the delete", async () => {
+  it("waits for a sandbox Daytona is already deleting instead of refusing the delete", async () => {
     // A failed setup deletes the sandbox it created while the workspace's removal runs.
-    rig.plane.addSandbox({ id: "sb-going", state: "destroying", pendingPolls: 2 });
+    // Daytona's documented state is "deleting"; "destroying" is the older spelling.
+    for (const [sandboxId, state] of [
+      ["sb-going", "deleting"],
+      ["sb-going-old", "destroying"],
+    ] as const) {
+      rig.plane.addSandbox({ id: sandboxId, state, pendingPolls: 2 });
 
-    const result = await makeRuntime({ sandboxId: "sb-going", shared: false }).deleteWorkspace(
-      "/home/me/project",
-      "feature",
-      false
-    );
+      const result = await makeRuntime({ sandboxId, shared: false }).deleteWorkspace(
+        "/home/me/project",
+        "feature",
+        false
+      );
 
-    expect(result.success).toBe(true);
-    expect(rig.plane.find("sb-going")).toBeUndefined();
+      expect(result.success).toBe(true);
+      expect(rig.plane.find(sandboxId)).toBeUndefined();
+    }
   });
 
   it("names the sandbox left behind when a forced delete cannot delete it", async () => {

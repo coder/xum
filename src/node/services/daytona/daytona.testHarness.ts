@@ -26,7 +26,7 @@ export interface FakeSandbox {
   memory: number;
   disk: number;
   labels: Record<string, string>;
-  /** GETs left before a transitional state settles (creating/starting -> started, destroying -> gone). */
+  /** GETs left before a transitional state settles (creating/starting -> started, deleting -> gone). */
   pendingPolls: number;
   /** Daytona's sandboxClass ("linux-vm", "container", "windows"); unset like an older API. */
   sandboxClass?: string;
@@ -179,7 +179,8 @@ export class FakeDaytonaControlPlane {
     if (!sandbox) return fail(404, "Sandbox not found");
 
     if (method === "GET" && !action) {
-      if (sandbox.state === "destroying" && sandbox.pendingPolls === 0) {
+      const goingAway = sandbox.state === "deleting" || sandbox.state === "destroying";
+      if (goingAway && sandbox.pendingPolls === 0) {
         this.sandboxes.delete(sandbox.id);
         return fail(404, "Sandbox not found");
       }
