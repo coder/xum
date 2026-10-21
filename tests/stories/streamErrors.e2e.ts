@@ -52,7 +52,11 @@ test(
       await expect(transcript).toContainText(error, { timeout: 30_000 });
     }
 
-    await agent.act(`send the chat message '${MESSAGE}' and wait for the reply`);
+    // exact send: Haiku 5.5 sent this while a network-error retry streamed, so it stayed
+    // "Queued" (PR lane, runs 39656243674 and 39670600164). The countdown (RetryBarrier.tsx)
+    // shows only between attempts, when no stream runs, and the send cancels that retry.
+    await expect(screen.getByText(/Retrying in/)).toBeVisible({ timeout: 30_000 });
+    await sendMessage(screen, MESSAGE);
     await expect(transcript).toContainText(REPLY, { timeout: 30_000 });
     await agent.assert(
       `the chat shows the reply '${REPLY}' after the earlier errors, and no error follows it`

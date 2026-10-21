@@ -54,10 +54,12 @@ test(
 
     await xum.restartServer();
     await app.open();
-    await agent.act(
-      "open Settings > Plugins and open the hook review of the hook-guard plugin. Only look: do " +
-        "not click Trust, Turn off or any other button in the review."
-    );
+    // exact steps: the replay ran its taps, its end-state check misread the open review, and
+    // Haiku 5.5 then toggled the review closed (PR lane, runs 39656243674; #7070: 3 of 10 warm).
+    // The button names of SettingsButton.tsx, SettingsPage.tsx and PluginsSettingsSection.tsx.
+    await screen.getByTestId("settings-button").tap();
+    await settings.getByRole("button", "Plugins").tap();
+    await settings.getByRole("button", "Review hooks for hook-guard").tap();
     // The exact checks first, then the judge: the judge sees one screen.
     await expectTrusted();
     // Only what the screen shows now. A claim about a later prompt ("does not ask again") made
