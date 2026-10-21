@@ -44,7 +44,11 @@ export function isWorkspaceRightSidebarHidden(shell: Element | null | undefined)
  * keep its Reload button on screen, so a flip there would only surface after a reload.
  */
 export function canToggleRightSidebar(workspaceId: string, shell: Element | null): boolean {
-  if (shell?.querySelector(".right-sidebar-fullscreen, [data-right-sidebar-load-failed]") != null) {
+  // No mounted shell (AIView's incompatible-runtime screen, a loading placeholder): no sidebar.
+  if (
+    shell == null ||
+    shell.querySelector(".right-sidebar-fullscreen, [data-right-sidebar-load-failed]") != null
+  ) {
     return false;
   }
   if (isWorkspaceRightSidebarHidden(shell)) return false;

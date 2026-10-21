@@ -73,6 +73,10 @@ describe("canToggleRightSidebar", () => {
     expect(canToggleRightSidebar(workspaceId, shell())).toBe(true);
   });
 
+  test("without a mounted workspace shell there is no sidebar to toggle", () => {
+    expect(canToggleRightSidebar(workspaceId, null)).toBe(false);
+  });
+
   test("the phone full-screen view and a failed load refuse the toggle", () => {
     expect(canToggleRightSidebar(workspaceId, shell("fullscreen"))).toBe(false);
     expect(canToggleRightSidebar(workspaceId, shell("load-failed"))).toBe(false);
