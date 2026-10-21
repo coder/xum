@@ -1032,6 +1032,27 @@ describe("discoverAgentPlugins", () => {
     ]);
   });
 
+  test.each([".", "./"])(
+    "a Codex skills path %p names the plugin root as one skill",
+    async (skills) => {
+      using tmp = new DisposableTempDir("agent-plugins");
+      const container = path.join(tmp.path, "plugins");
+      const pluginDir = path.join(container, "solo");
+      await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+      await fs.writeFile(
+        path.join(pluginDir, ".codex-plugin", "plugin.json"),
+        JSON.stringify({ name: "solo", skills })
+      );
+      await fs.writeFile(path.join(pluginDir, "SKILL.md"), "---\nname: solo\n---\n", "utf8");
+
+      const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+      expect(result.plugins[0].skillsDirs).toEqual([
+        { dir: result.plugins[0].rootPath, single: true, name: "solo" },
+      ]);
+    }
+  );
+
   test("the default skills/ holds skill folders even when it has a SKILL.md", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");
