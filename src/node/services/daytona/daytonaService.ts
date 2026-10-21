@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import * as path from "path";
 import type {
   DaytonaListSandboxesResult,
@@ -274,6 +275,14 @@ function toSshGateway(config: DaytonaGatewayConfig) {
   };
 }
 
+/** The account credentials select, hashed so this cache holds no key; "" when none is set. */
+function fingerprintAccount(credentials: DaytonaResolvedCredentials | null): string {
+  if (!credentials) return "";
+  return createHash("sha256")
+    .update(JSON.stringify([credentials.apiUrl, credentials.apiKey]))
+    .digest("hex");
+}
+
 /** What the ssh setup depends on; key order from Daytona is not significant. */
 function gatewayIdentity(config: DaytonaGatewayConfig): string {
   const { host, port, hostKeys } = toSshGateway(config);
@@ -304,6 +313,12 @@ export class DaytonaService {
   private readonly tokenRequests = new Map<string, Promise<DaytonaSshAccess>>();
   /** Bumped by every settings change, so a mint that spans one can tell. */
   private credentialsGeneration = 0;
+  /**
+   * A hash of the account (API URL and key) last resolved. Another Xum process sharing this
+   * root may save other credentials; the store's lock does not tell this one, so a resolve
+   * that sees another account retires what this process cached for the old one.
+   */
+  private accountFingerprint?: string;
   /** Operations running under withAccountLease; setConfig refuses while any runs. */
   private accountLeases = 0;
   /** The settings change being saved; new leases wait for it. */
@@ -399,17 +414,10 @@ export class DaytonaService {
   private async applyConfig(patch: DaytonaCredentialsPatch): Promise<DaytonaPublicConfig> {
     const previousClient = await this.getClientIfConfigured();
     await this.credentialsStore.update(patch);
-    // A mint in flight finishes under the old settings: it sees the bump and starts over.
-    this.credentialsGeneration++;
-    // Tokens and gateway data belong to the old account or deployment. Revoke the tokens with
-    // the old credentials, which may not work for the new ones.
-    const tokens = [...this.tokens];
-    const connected = this.sandboxesWithSsh();
-    this.gatewayCache = undefined;
-    this.tokens.clear();
-    this.sshConfigured.clear();
-    this.readyAt.clear();
-    await this.retirePooledSsh(connected);
+    this.accountFingerprint = await this.readAccountFingerprint();
+    // Revoke the old account's tokens with the old credentials, which may not work for the
+    // new ones.
+    const tokens = await this.retireAccountCaches();
     if (previousClient) {
       await Promise.all(
         tokens.map(([sandboxId, access]) =>
@@ -418,6 +426,45 @@ export class DaytonaService {
       );
     }
     return this.credentialsStore.getPublicConfig();
+  }
+
+  /**
+   * Tokens and gateway data belong to the old account or deployment. A mint in flight
+   * finishes under the old settings: it sees the bump and starts over. Returns the tokens
+   * dropped, for the caller to revoke.
+   */
+  private async retireAccountCaches(): Promise<Array<[string, DaytonaSshAccess]>> {
+    this.credentialsGeneration++;
+    const tokens = [...this.tokens];
+    const connected = this.sandboxesWithSsh();
+    this.gatewayCache = undefined;
+    this.tokens.clear();
+    this.sshConfigured.clear();
+    this.readyAt.clear();
+    await this.retirePooledSsh(connected);
+    return tokens;
+  }
+
+  private async readAccountFingerprint(): Promise<string | undefined> {
+    try {
+      return fingerprintAccount(await this.credentialsStore.resolve());
+    } catch (error) {
+      log.debug("Could not read the saved Daytona settings", { error: getErrorMessage(error) });
+      return undefined;
+    }
+  }
+
+  /**
+   * Another Xum process saved credentials of another account: drop this process's caches of
+   * the old one. Its tokens are not revoked: they expire, and the old key may be gone.
+   */
+  private async noticeAccount(credentials: DaytonaResolvedCredentials | null): Promise<void> {
+    const fingerprint = fingerprintAccount(credentials);
+    const previous = this.accountFingerprint;
+    this.accountFingerprint = fingerprint;
+    if (previous === undefined || previous === fingerprint) return;
+    log.info("Daytona settings changed in another Xum process; dropping cached SSH access");
+    await this.retireAccountCaches();
   }
 
   private async getClientIfConfigured(): Promise<DaytonaClient | undefined> {
@@ -584,7 +631,9 @@ export class DaytonaService {
   /** Unusable settings (an http DAYTONA_API_URL) throw a `not_configured` DaytonaApiError. */
   private async resolveCredentials(): Promise<DaytonaResolvedCredentials | null> {
     try {
-      return await this.credentialsStore.resolve();
+      const credentials = await this.credentialsStore.resolve();
+      await this.noticeAccount(credentials);
+      return credentials;
     } catch (error) {
       if (error instanceof DaytonaConfigError) {
         throw new DaytonaApiError("not_configured", error.message);
@@ -1096,6 +1145,8 @@ export class DaytonaService {
     sandboxId: string,
     options: DaytonaSshTokenOptions = {}
   ): Promise<DaytonaSshAccess> {
+    // Read first: another Xum process may have saved another account's credentials.
+    await this.resolveCredentials();
     const cached = this.tokens.get(sandboxId);
     if (cached && !this.tokenNeedsRefresh(sandboxId)) return cached;
     const inFlight = this.tokenRequests.get(sandboxId);

@@ -189,6 +189,38 @@ describe("DaytonaService", () => {
     expect((await service.getSshToken("sb-1")).token).not.toBe(held.token);
   });
 
+  it("mints under credentials another Xum process saved, and not after its own change", async () => {
+    const mintKeys: string[] = [];
+    service = new DaytonaService({
+      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
+      rootDir,
+      fetch: ((input: string | URL | Request, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : input.toString();
+        if (init?.method === "POST" && url.includes("/ssh-access")) {
+          mintKeys.push((init.headers as Record<string, string>).Authorization);
+        }
+        return plane.fetch(input, init);
+      }) as typeof fetch,
+      now: () => clock,
+    });
+    const before = await service.getAccount();
+    const held = await service.getSshToken("sb-1");
+
+    // Another backend sharing this root saves another key.
+    await new DaytonaCredentialsStore(rootDir, {}).update({ apiKey: "other" });
+
+    expect((await service.getSshToken("sb-1")).token).not.toBe(held.token);
+    expect(mintKeys).toEqual(["Bearer k", "Bearer other"]);
+    expect(service.isAccountCurrent(before)).toBe(false);
+
+    // This process's own change is not taken for another one.
+    await service.setConfig({ apiKey: "third" });
+    const after = await service.getAccount();
+    await service.getSshToken("sb-1");
+    expect(service.isAccountCurrent(after)).toBe(true);
+    expect(mintKeys).toEqual(["Bearer k", "Bearer other", "Bearer third"]);
+  });
+
   it("reuses one token while the user fixes an ssh config that shadows it", async () => {
     let shadowed = true;
     const writer = {
