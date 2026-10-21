@@ -88,6 +88,7 @@ import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles
 import {
   chooseInstallMethod,
   detectInstallMethods,
+  methodLabel,
   installMethodRequest,
   noInstallMethodMessage,
   readInstalledGeneratedFrom,
@@ -2551,6 +2552,13 @@ export class AgentPluginInstallService {
           "This repository is a Claude Code plugin marketplace (found .claude-plugin/marketplace.json). Xum does not install marketplaces yet. Install one of its plugins by its folder, as owner/repo/path/to/plugin."
         );
       }
+      if (request.mode === "update" && detected.methods.length > 0) {
+        // The installed plugin.json is the repository's own, or a Claude one: Xum does not turn
+        // it into a generated skills install on update (installMethods.ts, InstallMethodRequest).
+        throw new Error(
+          `The repository no longer has the manifest this plugin was installed from; it fits: ${detected.methods.map(methodLabel).join(", ")}. Uninstall the plugin and install it again to choose a method.`
+        );
+      }
       throw new Error(noInstallMethodMessage(source.subpath));
     }
 
@@ -2586,9 +2594,25 @@ export class AgentPluginInstallService {
     });
     if (!plugin) {
       const reasons = diagnostics.map((d) => d.message);
-      throw new Error(
-        reasons.length > 0 ? `Invalid plugin: ${reasons.join("; ")}` : "Invalid plugin manifest."
-      );
+      const problem =
+        reasons.length > 0 ? `Invalid plugin: ${reasons.join("; ")}` : "Invalid plugin manifest.";
+      // A preview without a method must still reach the "Install as" choice: when the first
+      // method's manifest is invalid (a broken .claude-plugin/plugin.json next to valid skill
+      // folders), preview the next method and name the problem. No file was written: only
+      // `skills` generates one, and it is always the last method.
+      const next = detected.methods[detected.methods.indexOf(method) + 1];
+      if (request.mode === "first" && next !== undefined) {
+        assert(method.kind !== "skills", "validateStagedClone: skills must be the last method");
+        const fallback = await this.validateStagedClone(stagedDir, source, {
+          mode: "exact",
+          method: next,
+        });
+        return {
+          ...fallback,
+          warnings: [`${methodLabel(method)}: ${problem}`, ...fallback.warnings],
+        };
+      }
+      throw new Error(problem);
     }
     return {
       plugin,

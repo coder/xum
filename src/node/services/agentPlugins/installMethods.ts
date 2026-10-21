@@ -268,7 +268,7 @@ function sameInstallMethod(a: AgentPluginInstallMethod, b: AgentPluginInstallMet
   }
 }
 
-function methodLabel(method: AgentPluginInstallMethod): string {
+export function methodLabel(method: AgentPluginInstallMethod): string {
   return AGENT_PLUGIN_INSTALL_METHOD_LABELS[method.kind];
 }
 
@@ -360,6 +360,34 @@ export function skillsCliSkillNames(
 }
 
 /**
+ * SECURITY AUDIT (downgrade): a build that predates `generatedFrom` reads a generated plugin.json
+ * as an ordinary Agent Plugin and fills in the default component paths: hooks.js, agents/,
+ * workflows/, mcp.json or .mcp.json (`contributes`), and hooks/hooks.json (Codex hooks, which an
+ * `extensions["com.openai"].hooks` list replaces). So the generated manifest names each of them
+ * explicitly: `contributes` paths point into `.git`, which no commit can create (git refuses to
+ * track a `.git` path), so they never resolve, and an empty Codex hooks list turns the default
+ * file off. Those builds then load only the skills roots the manifest lists. Builds before
+ * `contributes` existed (#3872, the experimental flag) read only skills/ and mcp.json.
+ */
+export const INERT_COMPONENT_PATH = ".git/xum-generated-no-component";
+
+/** The `contributes` and `extensions["com.openai"]` members that keep older builds inert. */
+export function inertGeneratedComponents(): {
+  contributes: Record<"hooks" | "agents" | "workflows" | "mcp", string>;
+  openai: { hooks: [] };
+} {
+  return {
+    contributes: {
+      hooks: INERT_COMPONENT_PATH,
+      agents: INERT_COMPONENT_PATH,
+      workflows: INERT_COMPONENT_PATH,
+      mcp: INERT_COMPONENT_PATH,
+    },
+    openai: { hooks: [] },
+  };
+}
+
+/**
  * Write the plugin.json of a `skills` install into the staged tree and return preview warnings.
  * The file is part of the tree that the receipts hash and that install promotes, and preview and
  * install generate it from the same commit, so their consent digests match. Callers run it only
@@ -379,12 +407,16 @@ export async function writeGeneratedManifest(
   const dropped = roots
     .slice(MAX_SKILLS_ROOTS)
     .flatMap((root) => root.skills.map((skill) => `${root.root}/${skill}`));
+  const inert = inertGeneratedComponents();
   const manifest = {
     $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
     name: generatedPluginName(source),
     description: `Skills from ${displayRepoUrl(source.url)}${source.subpath !== undefined ? `/${source.subpath}` : ""}`,
-    contributes: { skills: kept.map((root) => root.root) },
-    extensions: { mux: { generatedFrom: { kind: method.kind } satisfies GeneratedFrom } },
+    contributes: { skills: kept.map((root) => root.root), ...inert.contributes },
+    extensions: {
+      mux: { generatedFrom: { kind: method.kind } satisfies GeneratedFrom },
+      "com.openai": inert.openai,
+    },
   };
   // "wx": fail instead of replacing an entry. A dangling symlink at plugin.json would otherwise
   // redirect the write outside the staged tree.

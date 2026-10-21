@@ -1355,6 +1355,8 @@ export const AddPluginSkillsCliRun: Story = {
 
 /** Only Claude Code plugin hooks: the note says they never run, not "until you trust". */
 export const AddPluginClaudeHooksNeverRun: Story = {
+  // Play-only contract: AddPluginInstallAs already snapshots this panel (Pixel budget).
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => (
     <PluginsSectionStoryShell
       options={installAsOptions({
@@ -1405,6 +1407,8 @@ const NAME_TAKEN = "A managed plugin named 'review-kit' is already installed. Un
  * but the preview keeps the Install as choice and the Skills CLI choice stays usable.
  */
 export const AddPluginInstallBlockedByName: Story = {
+  // Play-only contract: AddPluginInstallAs already snapshots this panel (Pixel budget).
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => (
     <PluginsSectionStoryShell
       options={installAsOptions({
