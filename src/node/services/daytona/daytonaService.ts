@@ -41,6 +41,16 @@ interface StoredSandboxRef {
   attached: boolean;
 }
 
+/**
+ * Daytona's sandboxClass of a Windows sandbox (and of the snapshots that create one). Xum
+ * provisions and runs workspaces over ssh with POSIX shell commands, which cmd.exe and
+ * PowerShell do not run, so it never offers, creates or attaches one.
+ */
+export const DAYTONA_WINDOWS_SANDBOX_CLASS = "windows";
+
+const isWindowsClass = (item: { sandboxClass?: string | null }) =>
+  item.sandboxClass === DAYTONA_WINDOWS_SANDBOX_CLASS;
+
 export const DAYTONA_LABEL_INSTANCE = "xum.instance";
 export const DAYTONA_LABEL_WORKSPACE_ID = "xum.workspaceId";
 export const DAYTONA_LABEL_PROJECT = "xum.project";
@@ -661,7 +671,9 @@ export class DaytonaService {
       return {
         ok: true,
         sandboxes: sandboxes
-          .filter((sandbox) => !DESTROYING_STATES.has(sandbox.state ?? ""))
+          .filter(
+            (sandbox) => !DESTROYING_STATES.has(sandbox.state ?? "") && !isWindowsClass(sandbox)
+          )
           .map(toSummary),
       };
     } catch (error) {
@@ -672,9 +684,24 @@ export class DaytonaService {
   async listSnapshots(): Promise<DaytonaListSnapshotsResult> {
     try {
       const { client } = await this.getClient();
-      return { ok: true, snapshots: await client.listSnapshots() };
+      const snapshots = await client.listSnapshots();
+      return {
+        ok: true,
+        snapshots: snapshots.filter((s) => !isWindowsClass(s)).map(({ name }) => ({ name })),
+      };
     } catch (error) {
       return toResultError(error);
+    }
+  }
+
+  /** Whether the snapshot creates Windows sandboxes; false for one Daytona does not find. */
+  async isWindowsSnapshot(name: string): Promise<boolean> {
+    const { client } = await this.getClient();
+    try {
+      return isWindowsClass(await client.getSnapshot(name));
+    } catch (error) {
+      if (isDaytonaNotFound(error)) return false;
+      throw error;
     }
   }
 

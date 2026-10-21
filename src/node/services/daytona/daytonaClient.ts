@@ -58,6 +58,8 @@ const SandboxSchema = z.object({
   labels: z.record(z.string(), z.string()).nullish(),
   lastActivityAt: z.string().nullish(),
   errorReason: z.string().nullish(),
+  /** "linux-vm", "container" or "windows"; older control planes omit it. */
+  sandboxClass: z.string().nullish(),
 });
 
 export type DaytonaSandbox = z.infer<typeof SandboxSchema>;
@@ -67,8 +69,25 @@ const SandboxPageSchema = z.object({
   nextCursor: z.string().nullish(),
 });
 
+const SnapshotSchema = z.object({
+  name: z.string(),
+  /** The class of the sandboxes the snapshot creates, as on a sandbox. */
+  sandboxClass: z.string().nullish(),
+});
+
+export interface DaytonaSnapshot {
+  name: string;
+  sandboxClass?: string;
+}
+
+function toSnapshot(item: z.infer<typeof SnapshotSchema>): DaytonaSnapshot {
+  return item.sandboxClass
+    ? { name: item.name, sandboxClass: item.sandboxClass }
+    : { name: item.name };
+}
+
 const SnapshotPageSchema = z.object({
-  items: z.array(z.object({ name: z.string() })),
+  items: z.array(SnapshotSchema),
   page: z.number().optional(),
   totalPages: z.number().optional(),
 });
@@ -437,15 +456,20 @@ export class DaytonaClient {
     await this.request("POST", `/sandbox/${encodeURIComponent(id)}/last-activity`, { signal });
   }
 
-  async listSnapshots(signal?: AbortSignal): Promise<Array<{ name: string }>> {
-    const snapshots: Array<{ name: string }> = [];
+  async getSnapshot(name: string, signal?: AbortSignal): Promise<DaytonaSnapshot> {
+    const raw = await this.request("GET", `/snapshots/${encodeURIComponent(name)}`, { signal });
+    return toSnapshot(this.parse(SnapshotSchema, raw, "GET /snapshots/{id}"));
+  }
+
+  async listSnapshots(signal?: AbortSignal): Promise<DaytonaSnapshot[]> {
+    const snapshots: DaytonaSnapshot[] = [];
     for (let page = 1; page <= MAX_PAGES; page++) {
       const raw = await this.request("GET", "/snapshots", {
         query: { page, limit: PAGE_LIMIT },
         signal,
       });
       const parsed = this.parse(SnapshotPageSchema, raw, "GET /snapshots");
-      snapshots.push(...parsed.items.map((item) => ({ name: item.name })));
+      snapshots.push(...parsed.items.map(toSnapshot));
       if (parsed.items.length === 0 || parsed.totalPages === undefined) return snapshots;
       if (page >= parsed.totalPages) return snapshots;
     }

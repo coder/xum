@@ -292,6 +292,55 @@ describe("DaytonaSSHRuntime.finalizeConfig and validateBeforePersist", () => {
   });
 });
 
+describe("DaytonaSSHRuntime Windows sandboxes", () => {
+  // Xum provisions over ssh with POSIX commands; a Windows sandbox runs cmd.exe or PowerShell.
+  it("refuses to attach a Windows sandbox or create from a Windows snapshot before persisting", async () => {
+    rig.plane.addSandbox({ id: "sb-win", sandboxClass: "windows" });
+    rig.plane.addSandbox({ id: "sb-linux", sandboxClass: "linux-vm" });
+    rig.plane.snapshots.push(
+      { name: "windows-small", sandboxClass: "windows" },
+      { name: "daytona-small", sandboxClass: "container" }
+    );
+    const runtime = makeRuntime({});
+    const validate = async (daytona: DaytonaSandboxConfig) => {
+      const finalized = await runtime.finalizeConfig("b", sshDaytonaConfig(daytona));
+      if (!finalized.success) return finalized;
+      return runtime.validateBeforePersist("b", finalized.data);
+    };
+
+    const attached = await validate({ sandboxId: "sb-win" });
+    expect(attached.success ? "" : attached.error).toContain("Windows");
+    const created = await validate({ snapshot: "windows-small" });
+    expect(created.success ? "" : created.error).toContain("Windows");
+
+    expect((await validate({ sandboxId: "sb-linux" })).success).toBe(true);
+    expect((await validate({ snapshot: "daytona-small" })).success).toBe(true);
+    // A snapshot Daytona does not list by that name: Daytona's create decides, as before.
+    expect((await validate({ snapshot: "unlisted" })).success).toBe(true);
+    expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
+  });
+
+  it("offers neither Windows snapshots nor Windows sandboxes", async () => {
+    rig.plane.addSandbox({ id: "sb-win", sandboxClass: "windows" });
+    rig.plane.addSandbox({ id: "sb-linux", sandboxClass: "linux-vm" });
+    rig.plane.addSandbox({ id: "sb-older" });
+    rig.plane.snapshots.push(
+      { name: "windows-small", sandboxClass: "windows" },
+      { name: "daytona-small", sandboxClass: "container" },
+      { name: "older" }
+    );
+
+    const snapshots = await rig.service.listSnapshots();
+    const sandboxes = await rig.service.listSandboxes();
+
+    expect(snapshots.ok && snapshots.snapshots.map((s) => s.name)).toEqual([
+      "daytona-small",
+      "older",
+    ]);
+    expect(sandboxes.ok && sandboxes.sandboxes.map((s) => s.id)).toEqual(["sb-linux", "sb-older"]);
+  });
+});
+
 describe("DaytonaSSHRuntime.postCreateSetup", () => {
   it("creates the sandbox with preset resources, labels and lifecycle intervals", async () => {
     await makeRuntime({ sandboxId: "xum-new", shared: false, ...SMALL }).postCreateSetup(

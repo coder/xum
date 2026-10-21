@@ -28,6 +28,8 @@ export interface FakeSandbox {
   labels: Record<string, string>;
   /** GETs left before a transitional state settles (creating/starting -> started, destroying -> gone). */
   pendingPolls: number;
+  /** Daytona's sandboxClass ("linux-vm", "container", "windows"); unset like an older API. */
+  sandboxClass?: string;
 }
 
 export class FakeDaytonaControlPlane {
@@ -36,6 +38,8 @@ export class FakeDaytonaControlPlane {
   readonly calls: string[] = [];
   readonly createBodies: Array<Record<string, unknown>> = [];
   readonly revokedTokens: string[] = [];
+  /** The organization's snapshots, by name. */
+  readonly snapshots: Array<{ name: string; sandboxClass?: string }> = [];
   /** Answer POST /sandbox with 400 when it carries cpu/memory/disk (fixed-resource snapshot). */
   rejectCreateResources = false;
   /** Resources a sandbox gets when created without any. */
@@ -138,6 +142,20 @@ export class FakeDaytonaControlPlane {
       return json(200, this.view(sandbox));
     }
 
+    if (route === "GET /snapshots") {
+      return json(200, {
+        items: this.snapshots,
+        total: this.snapshots.length,
+        page: 1,
+        totalPages: 1,
+      });
+    }
+    const snapshotMatch = /^GET \/snapshots\/([^/]+)$/.exec(route);
+    if (snapshotMatch) {
+      const snapshot = this.snapshots.find((s) => s.name === decodeURIComponent(snapshotMatch[1]));
+      return snapshot ? json(200, snapshot) : fail(404, "Snapshot not found");
+    }
+
     const match = /^(GET|POST|DELETE) \/sandbox\/([^/]+)(?:\/(.+))?$/.exec(route);
     if (!match) return fail(500, `unexpected ${route}`);
     const [, method, rawId, action] = match;
@@ -218,6 +236,7 @@ export class FakeDaytonaControlPlane {
       memory: sandbox.memory,
       disk: sandbox.disk,
       labels: sandbox.labels,
+      ...(sandbox.sandboxClass ? { sandboxClass: sandbox.sandboxClass } : {}),
     };
   }
 }

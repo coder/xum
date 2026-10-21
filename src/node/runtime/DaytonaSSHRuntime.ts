@@ -49,6 +49,7 @@ import {
   DAYTONA_LABEL_INSTANCE,
   DAYTONA_LABEL_WORKSPACE_ID,
   DAYTONA_START_TIMEOUT_MS,
+  DAYTONA_WINDOWS_SANDBOX_CLASS,
   type DaytonaAccount,
   type DaytonaService,
 } from "@/node/services/daytona/daytonaService";
@@ -83,6 +84,7 @@ export type DaytonaRuntimeService = Pick<
   | "invalidateSandboxReady"
   | "replaceRejectedSshToken"
   | "sshTokenGeneration"
+  | "isWindowsSnapshot"
   | "sandboxReferencesElsewhere"
   | "isAliasStoredElsewhere"
   | "withSandboxRemovalLock"
@@ -115,6 +117,8 @@ const DAYTONA_AUTO_DELETE_DISABLED = -1;
 const SANDBOX_NAME_MAX_BRANCH_LENGTH = 40;
 const SETTINGS_CHANGED_DURING_SETUP =
   "Daytona settings changed while the sandbox was set up; create the workspace again";
+const LINUX_ONLY =
+  "Xum sets up and runs a workspace over SSH with Linux shell commands, so it needs a Linux sandbox.";
 
 /** `xum-<branch>-<random>`: unique per creation, and readable in the Daytona dashboard. */
 export function buildDaytonaSandboxName(branchName: string): string {
@@ -655,23 +659,39 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     if (!sandboxId) {
       return Err("Daytona sandbox id is required (should be set by finalizeConfig)");
     }
-    const attaching = daytona.shared === true;
-    if (!attaching && !findDaytonaSizePreset(daytona)) {
-      return Err(invalidSizeError());
-    }
-    return this.checkSandboxIdentity(sandboxId, attaching);
+    return daytona.shared === true
+      ? this.checkSandboxIdentity(sandboxId, true)
+      : this.checkNewSandbox(sandboxId, daytona);
   }
 
-  /** The sandbox to attach must exist; the name for a new one must be free. */
+  /** A sandbox Xum creates: a preset size, a free name, and a snapshot that is not Windows. */
+  private async checkNewSandbox(
+    sandboxId: string,
+    daytona: DaytonaSandboxConfig
+  ): Promise<Result<void, string>> {
+    if (!findDaytonaSizePreset(daytona)) return Err(invalidSizeError());
+    const identity = await this.checkSandboxIdentity(sandboxId, false);
+    if (!identity.success || !daytona.snapshot) return identity;
+    return this.checkSnapshotClass(daytona.snapshot);
+  }
+
+  /**
+   * The sandbox to attach must exist and run Linux (Xum's setup and commands are POSIX shell
+   * over ssh); the name for a new one must be free.
+   */
   private async checkSandboxIdentity(
     sandboxId: string,
     attaching: boolean
   ): Promise<Result<void, string>> {
-    let exists: boolean;
+    let found: Awaited<ReturnType<DaytonaRuntimeService["getSandboxState"]>>;
     try {
-      exists = (await this.daytonaService.getSandboxState(sandboxId)).state !== "missing";
+      found = await this.daytonaService.getSandboxState(sandboxId);
     } catch (error) {
       return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
+    }
+    const exists = found.state !== "missing";
+    if (attaching && found.sandbox?.sandboxClass === DAYTONA_WINDOWS_SANDBOX_CLASS) {
+      return Err(`Daytona sandbox "${sandboxId}" is a Windows sandbox. ${LINUX_ONLY}`);
     }
     if (attaching === exists) return Ok(undefined);
     return Err(
@@ -679,6 +699,16 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         ? `Daytona sandbox "${sandboxId}" was not found`
         : `A Daytona sandbox named "${sandboxId}" already exists`
     );
+  }
+
+  /** Refused before any sandbox is created: a Windows snapshot makes a billed box setup fails on. */
+  private async checkSnapshotClass(snapshot: string): Promise<Result<void, string>> {
+    try {
+      if (!(await this.daytonaService.isWindowsSnapshot(snapshot))) return Ok(undefined);
+    } catch (error) {
+      return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
+    }
+    return Err(`Daytona snapshot "${snapshot}" creates Windows sandboxes. ${LINUX_ONLY}`);
   }
 
   /** The sandbox may not exist yet, so only compute the path (as Coder does). */

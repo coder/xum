@@ -10011,7 +10011,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "- A Daytona account and an API key from the Daytona dashboard",
       "- `ssh` installed on the machine running Xum",
-      "- A snapshot (or Daytona's default) with git and your toolchain",
+      "- A Linux snapshot (or Daytona's default) with git and your toolchain. Xum runs Linux shell commands over SSH, so it does not offer Windows snapshots or Windows sandboxes, and refuses one before it creates or attaches a sandbox.",
       "",
       "## Set up access",
       "",
