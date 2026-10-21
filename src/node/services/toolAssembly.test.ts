@@ -453,9 +453,9 @@ describe("turn-end todo nudge execution gate", () => {
     expect(calls).toEqual(["todo_write"]);
   });
 
-  // A provider-executed tool has no local execute to refuse. Native searches take a query and
-  // stay; native fetches (and any tool the gate does not know) could send data to a URL the
-  // model picks, so they are omitted.
+  // A provider-executed tool has no local execute to refuse. Query-only searches stay; native
+  // fetches, searches that open live pages (OpenAI, xAI web_search) and any tool the gate does
+  // not know could send data to a URL the model picks, so they are omitted.
   test("keeps native searches and omits native fetches and unknown provider tools", async () => {
     const searches = {
       web_search: providerTool("anthropic.web_search_20250305"),
@@ -467,6 +467,9 @@ describe("turn-end todo nudge execution gate", () => {
         ...searches,
         web_fetch: providerTool("anthropic.web_fetch_20250910"),
         url_context: providerTool("google.url_context"),
+        // These searches can also open a live page the model picks.
+        openai_search: providerTool("openai.web_search"),
+        xai_search: providerTool("xai.web_search"),
         unknown_native: providerTool("test.unknown"),
         todo_write: executableTool("Update the list"),
       },

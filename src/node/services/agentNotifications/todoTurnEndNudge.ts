@@ -29,20 +29,21 @@ export const TODO_TURN_END_NUDGE_EXECUTION_GATE = {
   refusal: (toolName: string) =>
     `Tool '${toolName}' is not allowed in the turn-end todo nudge. Only todo_write runs in this turn.`,
   /**
-   * The provider-executed tools a nudge turn keeps: native searches. The provider runs them,
-   * so the gate cannot refuse them, but they take a query, not a URL the model picks, so they
-   * cannot send chat or source data to an attacker's server. Every other provider-executed
-   * tool is omitted, unknown ones included (fail closed). That drops native fetches, Anthropic
-   * web_fetch and Google url_context: they fetch any URL server-side, past local tool hooks,
-   * so a prompt injection could make the todo-only turn send data out. They exist only where
-   * hooks cannot run, so only there does a nudge cost a cache miss; trusted projects use Xum's
-   * local web_fetch, which the gate refuses like any local tool.
+   * The provider-executed tools a nudge turn keeps: searches that only take a query. The
+   * provider runs them, so the gate cannot refuse them, but a query goes to a search index,
+   * not to a URL the model picks, so they cannot send chat or source data to an attacker's
+   * server. Every other provider-executed tool is omitted, unknown ones included (fail
+   * closed). That drops native fetches (Anthropic web_fetch, Google url_context) and the
+   * searches that also open live pages the model picks: OpenAI web_search (its open_page
+   * action) and xAI web_search ("browse web pages"). Each can run past local tool hooks, so a
+   * prompt injection could make the todo-only turn send data out. Native fetches exist only
+   * where hooks cannot run; OpenAI and xAI searches exist on every project, so a nudge on
+   * those providers costs one cache miss. Trusted Anthropic/Google projects keep a
+   * byte-identical tools block: Xum's local web_fetch is refused like any local tool.
    */
   keptProviderToolIds: new Set([
     "anthropic.web_search_20250305",
     "google.google_search",
-    "openai.web_search",
-    "xai.web_search",
     "xai.x_search",
   ]),
 };
