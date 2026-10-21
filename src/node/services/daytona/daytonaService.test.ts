@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -219,6 +219,49 @@ describe("DaytonaService", () => {
     await service.getSshToken("sb-1");
     expect(service.isAccountCurrent(after)).toBe(true);
     expect(mintKeys).toEqual(["Bearer k", "Bearer other", "Bearer third"]);
+  });
+
+  it("leaves a resolve during its own settings save to that save", async () => {
+    const revokeKeys: string[] = [];
+    const store = new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" });
+    service = new DaytonaService({
+      credentialsStore: store,
+      rootDir,
+      fetch: ((input: string | URL | Request, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : input.toString();
+        if (init?.method === "DELETE" && url.includes("/ssh-access")) {
+          revokeKeys.push((init.headers as Record<string, string>).Authorization);
+        }
+        return plane.fetch(input, init);
+      }) as typeof fetch,
+      now: () => clock,
+    });
+    const held = await service.getSshToken("sb-1");
+    const before = (await service.getAccount()).generation;
+    // Hold the save after the new key is on disk, before setConfig goes on.
+    let releaseSave = () => undefined as void;
+    const saveGate = new Promise<void>((resolve) => (releaseSave = resolve));
+    let saved = () => undefined as void;
+    const savedOnDisk = new Promise<void>((resolve) => (saved = resolve));
+    const realUpdate = store.update.bind(store);
+    spyOn(store, "update").mockImplementation(async (patch) => {
+      const result = await realUpdate(patch);
+      saved();
+      await saveGate;
+      return result;
+    });
+
+    const change = service.setConfig({ apiKey: "new-key" });
+    await savedOnDisk;
+    const token = service.getSshToken("sb-1");
+    await service.checkAvailability();
+    releaseSave();
+    await change;
+    await token;
+
+    expect(plane.revoked).toEqual([held.token]);
+    expect(revokeKeys).toEqual(["Bearer k"]);
+    expect((await service.getAccount()).generation).toBe(before + 1);
   });
 
   it("reuses one token while the user fixes an ssh config that shadows it", async () => {

@@ -459,6 +459,8 @@ export class DaytonaService {
    * the old one. Its tokens are not revoked: they expire, and the old key may be gone.
    */
   private async noticeAccount(credentials: DaytonaResolvedCredentials | null): Promise<void> {
+    // This process's own save sets the fingerprint and retires (and revokes) itself.
+    if (this.settingsChange) return;
     const fingerprint = fingerprintAccount(credentials);
     const previous = this.accountFingerprint;
     this.accountFingerprint = fingerprint;
