@@ -735,21 +735,18 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   }
 
   /**
-   * "Daytona default" creates from the snapshot the deployment advertises, so a Windows default
-   * is refused like a chosen one. A default the organization cannot look up is Daytona's to
-   * resolve at create time, as when none is advertised.
+   * "Daytona default" creates from the snapshot the deployment advertises, so a Windows or
+   * inactive default is refused like a chosen one. A default the organization cannot look up
+   * is Daytona's to resolve at create time, as when none is advertised.
    */
   private async checkDefaultSnapshotClass(): Promise<Result<void, string>> {
     let snapshot: string | undefined;
-    let found: { windows: boolean } | undefined;
     try {
       snapshot = (await this.daytonaService.getGatewayConfig()).defaultSnapshot;
-      found = snapshot ? await this.daytonaService.findSnapshot(snapshot) : undefined;
     } catch (error) {
       return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
     }
-    if (!snapshot || !found?.windows) return Ok(undefined);
-    return Err(`Daytona snapshot "${snapshot}" creates Windows sandboxes. ${LINUX_ONLY}`);
+    return snapshot ? this.checkSnapshotClass(snapshot, { missingOk: true }) : Ok(undefined);
   }
 
   /**
@@ -780,7 +777,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   }
 
   /** Refused before any sandbox is created: a Windows snapshot makes a billed box setup fails on. */
-  private async checkSnapshotClass(snapshot: string): Promise<Result<void, string>> {
+  private async checkSnapshotClass(
+    snapshot: string,
+    options?: { missingOk: boolean }
+  ): Promise<Result<void, string>> {
     let found: Awaited<ReturnType<DaytonaRuntimeService["findSnapshot"]>>;
     try {
       found = await this.daytonaService.findSnapshot(snapshot);
@@ -788,7 +788,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
     }
     // A stale choice (deleted after it was saved as a default) would fail every setup retry.
-    if (!found) return Err(`Daytona snapshot "${snapshot}" was not found; pick another snapshot`);
+    if (!found) {
+      if (options?.missingOk) return Ok(undefined);
+      return Err(`Daytona snapshot "${snapshot}" was not found; pick another snapshot`);
+    }
     if (found.windows) {
       return Err(`Daytona snapshot "${snapshot}" creates Windows sandboxes. ${LINUX_ONLY}`);
     }

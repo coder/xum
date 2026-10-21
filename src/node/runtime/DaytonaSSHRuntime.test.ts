@@ -340,16 +340,22 @@ describe("DaytonaSSHRuntime Windows sandboxes", () => {
     expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
   });
 
-  it("refuses a Windows deployment default when no snapshot is chosen", async () => {
-    rig.plane.snapshots.push({ name: "windows-default", sandboxClass: "windows" });
-    rig.plane.defaultSnapshot = "windows-default";
-    const runtime = makeRuntime({});
-    const finalized = await runtime.finalizeConfig("b", sshDaytonaConfig({}));
-    if (!finalized.success) throw new Error(finalized.error);
-    const refused = await runtime.validateBeforePersist("b", finalized.data);
-    expect(refused.success ? "" : refused.error).toContain('"windows-default" creates Windows');
-    expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
-  });
+  it.each([
+    [{ name: "default-snap", sandboxClass: "windows" }, '"default-snap" creates Windows'],
+    [{ name: "default-snap", state: "inactive" }, '"default-snap" is inactive'],
+  ])(
+    "refuses a deployment default Xum cannot use when no snapshot is chosen (%o)",
+    async (snapshot, refusal) => {
+      rig.plane.snapshots.push(snapshot);
+      rig.plane.defaultSnapshot = "default-snap";
+      const runtime = makeRuntime({});
+      const finalized = await runtime.finalizeConfig("b", sshDaytonaConfig({}));
+      if (!finalized.success) throw new Error(finalized.error);
+      const refused = await runtime.validateBeforePersist("b", finalized.data);
+      expect(refused.success ? "" : refused.error).toContain(refusal);
+      expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
+    }
+  );
 
   it("neither offers nor attaches a sandbox in an error state", async () => {
     rig.plane.addSandbox({ id: "sb-broken", state: "build_failed" });
