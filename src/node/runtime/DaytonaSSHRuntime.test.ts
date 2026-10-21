@@ -961,6 +961,23 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(rig.writer.removed).toContain("sb-users");
   });
 
+  it("says where a forced removal left the checkout of a sandbox that was not running", async () => {
+    rig.plane.addSandbox({ id: "sb-users", state: "archived" });
+    const attached = { sandboxId: "sb-users", shared: true };
+    const forced = await makeRuntime(attached).deleteWorkspace("/home/me/project", "feature", true);
+    if (!forced.success) throw new Error(forced.error);
+    expect(forced.notice).toContain(forced.deletedPath);
+    expect(forced.notice).toContain('"sb-users"');
+
+    // Gone: no checkout was left anywhere.
+    const gone = await makeRuntime({ sandboxId: "sb-gone", shared: true }).deleteWorkspace(
+      "/home/me/project",
+      "feature",
+      true
+    );
+    expect(gone).toEqual({ success: true, deletedPath: expect.any(String) as string });
+  });
+
   it("drops the removed workspace's ssh access to a sandbox another workspace keeps", async () => {
     const labels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.getInstanceId() };
     rig.plane.addSandbox({ id: "sb-7", name: "xum-owner-abc123", labels });

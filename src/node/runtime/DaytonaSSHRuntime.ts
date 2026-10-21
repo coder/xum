@@ -300,15 +300,19 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   }
 
   private async isSandboxStarted(sandboxId: string): Promise<boolean> {
+    return (await this.readSandboxState(sandboxId)) === "started";
+  }
+
+  /** Undefined when the state cannot be read: callers treat that as not running. */
+  private async readSandboxState(sandboxId: string): Promise<string | undefined> {
     try {
-      const { state } = await this.daytonaService.getSandboxState(sandboxId);
-      return state === "started";
+      return (await this.daytonaService.getSandboxState(sandboxId)).state;
     } catch (error) {
       log.warn("Could not read Daytona sandbox state; treating it as not running", {
         sandboxId,
         error: getErrorMessage(error),
       });
-      return false;
+      return undefined;
     }
   }
 
@@ -1048,8 +1052,14 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     if (deleted) return deleted;
     // A forced removal skips the checks, so it never starts a stopped (billed) sandbox for
     // them: its checkout stays on the sandbox, which this removal keeps or releases.
-    if (await this.isSandboxStarted(sandboxId)) return undefined;
-    return this.settleSandbox(sandboxId, { success: true, deletedPath }, undefined);
+    const state = await this.readSandboxState(sandboxId);
+    if (state === "started") return undefined;
+    const notice =
+      state === "missing"
+        ? undefined
+        : `Daytona sandbox "${sandboxId}" was not running, so the checkout ${deletedPath} ` +
+          "was left on it; delete it there if you no longer need it.";
+    return this.settleSandbox(sandboxId, { success: true, deletedPath, notice }, undefined);
   }
 
   /** The force path's sandbox delete, when this is the last workspace on a sandbox Xum created. */
@@ -1158,7 +1168,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    */
   private settleSandbox(
     sandboxId: string,
-    result: { success: true; deletedPath: string },
+    result: { success: true; deletedPath: string; notice?: string },
     errorPrefix: string | undefined
   ): Promise<DeleteResult> {
     return this.daytonaService.withSandboxRemovalLock(async () => {
@@ -1175,7 +1185,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
 
   private async applySandboxFate(
     sandboxId: string,
-    result: { success: true; deletedPath: string },
+    result: { success: true; deletedPath: string; notice?: string },
     fate: SandboxFate,
     errorPrefix: string | undefined
   ): Promise<DeleteResult> {
@@ -1208,7 +1218,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       "deletes an attached sandbox, so it stays when that workspace is removed too; delete it " +
       "in Daytona when you no longer need it.";
     log.info(notice, { workspaceId: this.workspaceId });
-    return { ...result, notice };
+    return { ...result, notice: result.notice ? `${result.notice} ${notice}` : notice };
   }
 
   /**
