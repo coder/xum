@@ -2711,14 +2711,36 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       set: (limits: AgentResourceLimits) => {
         agentResourceLimitsState = mockAgentResourceLimitsState(
           agentResourceLimitsState.enabled,
-          limits
+          limits,
+          agentResourceLimitsState.projects
         );
         return Promise.resolve(agentResourceLimitsState);
       },
       setEnabled: ({ enabled }: { enabled: boolean }) => {
         agentResourceLimitsState = mockAgentResourceLimitsState(
           enabled,
-          agentResourceLimitsState.limits
+          agentResourceLimitsState.limits,
+          agentResourceLimitsState.projects
+        );
+        return Promise.resolve(agentResourceLimitsState);
+      },
+      setProject: ({
+        projectPath,
+        limits,
+      }: {
+        projectPath: string;
+        limits: AgentResourceLimits;
+      }) => {
+        const projects = { ...agentResourceLimitsState.projects };
+        if (limits.cpuCores === undefined && limits.memoryGiB === undefined) {
+          delete projects[projectPath];
+        } else {
+          projects[projectPath] = { limits };
+        }
+        agentResourceLimitsState = mockAgentResourceLimitsState(
+          agentResourceLimitsState.enabled,
+          agentResourceLimitsState.limits,
+          projects
         );
         return Promise.resolve(agentResourceLimitsState);
       },
@@ -2791,13 +2813,25 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
 function mockAgentResourceLimitsState(
   enabled: boolean,
-  limits: AgentResourceLimits
+  limits: AgentResourceLimits,
+  savedProjects: AgentResourceLimitsState["projects"] = {}
 ): AgentResourceLimitsState {
-  const limited = enabled && (limits.cpuCores !== undefined || limits.memoryGiB !== undefined);
+  const limited =
+    enabled &&
+    (limits.cpuCores !== undefined ||
+      limits.memoryGiB !== undefined ||
+      Object.keys(savedProjects).length > 0);
+  // Like the backend: a project's cgroup shows only while the limits are active.
+  const projects: AgentResourceLimitsState["projects"] = {};
+  for (const [projectPath, project] of Object.entries(savedProjects)) {
+    projects[projectPath] = limited
+      ? { limits: project.limits, cgroup: `/xum/xum-agents/p-${projectPath.length}` }
+      : { limits: project.limits };
+  }
   return {
     enabled,
     limits,
-    projects: {},
+    projects,
     status: limited ? { state: "active", cgroup: "/xum/xum-agents" } : { state: "off" },
     support: { state: "ready", cgroup: "/xum" },
   };
