@@ -105,4 +105,41 @@ describe("retireOpenSSHMasters", () => {
       await fs.rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("never sends a later command to a master that was still connecting at the retirement", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-fake-ssh-"));
+    const calls = path.join(dir, "calls");
+    await fs.writeFile(path.join(dir, "ssh"), `#!/bin/sh\necho "$@" >> ${calls}\n`, {
+      mode: 0o755,
+    });
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${dir}:${originalPath ?? ""}`;
+    spyOn(sshConnectionPool, "acquireConnection").mockResolvedValue(undefined);
+    const config = { host: toXumDaytonaHost("sb-connecting") };
+    const base = sshConnectionPool.getControlPath(config);
+    const oldPaths = [base, ...Array.from({ length: 8 }, (_, shard) => `${base}-${shard}`)];
+    try {
+      // No socket yet: a master is still authenticating with the old credentials.
+      await retireOpenSSHMasters(config);
+      // It finishes after the retirement and listens at its old path.
+      for (const oldPath of oldPaths) await fs.writeFile(oldPath, "");
+
+      const transport = new OpenSSHTransport(config);
+      for (let i = 0; i < 8; i++) {
+        const { process: child } = await transport.spawnRemoteProcess("true", {});
+        await new Promise((resolve) => child.once("close", resolve));
+      }
+
+      const used = (await fs.readFile(calls, "utf-8"))
+        .trim()
+        .split("\n")
+        .map((line) => /ControlPath=(\S+)/.exec(line)?.[1]);
+      expect(used).toHaveLength(8);
+      for (const controlPath of used) expect(oldPaths).not.toContain(controlPath);
+    } finally {
+      process.env.PATH = originalPath;
+      for (const oldPath of oldPaths) await fs.rm(oldPath, { force: true });
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
 });

@@ -11,6 +11,7 @@ import { redactDaytonaHostStderr } from "../daytonaTokenRedaction";
 import {
   appendDaytonaHostKeyPinArgs,
   appendOpenSSHHostKeyPolicyArgs,
+  retireControlPath,
   sshConnectionPool,
   type SSHConnectionConfig,
 } from "../sshConnectionPool";
@@ -61,8 +62,10 @@ function getShardedControlPath(config: SSHConnectionConfig): string {
  * ones finish. Reverse forwards keep their own connections.
  */
 export async function retireOpenSSHMasters(config: SSHConnectionConfig): Promise<void> {
-  sshConnectionPool.forgetHealth(config);
   const base = sshConnectionPool.getControlPath(config);
+  // Before stopping: a command spawned meanwhile, or a master still connecting, is never shared.
+  retireControlPath(config);
+  sshConnectionPool.forgetHealth(config);
   const shards = Array.from({ length: OPENSSH_EXEC_SHARD_COUNT }, (_, shard) => `${base}-${shard}`);
   await Promise.all(
     [base, ...shards].map(async (controlPath) => {

@@ -363,10 +363,20 @@ async function resolvePrivateKeys(identityFiles: string[]): Promise<Buffer[]> {
   return keys;
 }
 
+/** A pooled connect whose host was retired (retireConnection) before it finished. */
+class RetiredConnectError extends Error {
+  constructor(key: string) {
+    super(`SSH connection ${key} was retired while it connected`);
+    this.name = "RetiredConnectError";
+  }
+}
+
 export class SSH2ConnectionPool {
   private health = new Map<string, ConnectionHealth>();
   private inflight = new Map<string, Promise<SSH2ConnectionEntry>>();
   private connections = new Map<string, SSH2ConnectionEntry>();
+  /** Bumped by retireConnection: a connect that started before then is never pooled. */
+  private retirements = new Map<string, number>();
   private idleTimeoutMs = IDLE_TIMEOUT_MS;
 
   async acquireConnection(
@@ -430,20 +440,11 @@ export class SSH2ConnectionPool {
         throw budgetExceeded;
       }
 
-      let inflight = this.inflight.get(key);
-      if (!inflight) {
-        // The connect is shared, so it takes no caller's abort signal: one caller aborting
-        // must not fail every waiter (#5101). Each caller races only its own wait against its
-        // abort and budget below. A connect nobody waits for any more still finishes (bounded
-        // by readyTimeout) and is cached, then closes after the idle timeout like any other.
-        inflight = this.connect(config, timeoutMs);
-        this.inflight.set(key, inflight);
-        // Attach no-op catch to prevent unhandled rejection when singleflighted
-        // promise rejects before any caller awaits it. Actual errors are
-        // propagated to callers via the await below.
-        // eslint-disable-next-line @typescript-eslint/no-empty-function
-        void inflight.catch(() => {}).finally(() => this.inflight.delete(key));
-      }
+      // The connect is shared, so it takes no caller's abort signal: one caller aborting
+      // must not fail every waiter (#5101). Each caller races only its own wait against its
+      // abort and budget below. A connect nobody waits for any more still finishes (bounded
+      // by readyTimeout) and is cached, then closes after the idle timeout like any other.
+      const inflight = this.inflight.get(key) ?? this.startConnect(key, config, timeoutMs);
 
       try {
         const entry = await waitForAbortable(
@@ -607,12 +608,50 @@ export class SSH2ConnectionPool {
   retireConnection(config: SSHConnectionConfig): void {
     const key = makeConnectionKey(config);
     this.health.delete(key);
+    // A connect in flight may authenticate with the old credentials: it closes instead of
+    // joining the pool, and its waiters get a fresh one (startConnect).
+    this.retirements.set(key, this.retirementOf(key) + 1);
     const entry = this.connections.get(key);
     if (!entry) return;
     this.connections.delete(key);
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
     entry.retired = true;
     if (entry.openChannels === 0) this.endClient(entry);
+  }
+
+  /** The shared connect of `key`, connecting once more for its waiters if a retirement overtook it. */
+  private startConnect(
+    key: string,
+    config: SSHConnectionConfig,
+    timeoutMs: number
+  ): Promise<SSH2ConnectionEntry> {
+    const started = this.connect(config, timeoutMs).catch((error: unknown) => {
+      if (error instanceof RetiredConnectError) return this.connect(config, timeoutMs);
+      throw error;
+    });
+    this.inflight.set(key, started);
+    // Attach no-op catch to prevent unhandled rejection when singleflighted
+    // promise rejects before any caller awaits it. Actual errors are
+    // propagated to callers via the await in acquireConnection.
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    void started.catch(() => {}).finally(() => this.inflight.delete(key));
+    return started;
+  }
+
+  private retirementOf(key: string): number {
+    return this.retirements.get(key) ?? 0;
+  }
+
+  /** A connect that started before its host was retired closes instead of joining the pool. */
+  private throwIfRetiredSince(key: string, retirement: number, entry: SSH2ConnectionEntry): void {
+    if (this.retirementOf(key) === retirement) return;
+    this.endClient(entry);
+    throw new RetiredConnectError(key);
+  }
+
+  /** A retired connect says nothing about the host's health. */
+  private reportConnectFailure(config: SSHConnectionConfig, error: unknown): void {
+    if (!(error instanceof RetiredConnectError)) this.reportFailure(config, getErrorMessage(error));
   }
 
   private endClient(entry: SSH2ConnectionEntry): void {
@@ -655,6 +694,7 @@ export class SSH2ConnectionPool {
     mode: "pooled" | "dedicated" = "pooled"
   ): Promise<SSH2ConnectionEntry> {
     const key = makeConnectionKey(config);
+    const retirement = this.retirementOf(key);
     try {
       const resolved = await resolveSSHConfig(config.host);
       const resolvedConfig: ResolvedSSHConfig = {
@@ -860,6 +900,7 @@ export class SSH2ConnectionPool {
           // `registered` also keeps a dedicated client's later errors out of the host health.
           registered = true;
           if (mode === "dedicated") return entry;
+          this.throwIfRetiredSince(key, retirement, entry);
           this.connections.set(key, entry);
           entry.idleTimer = setTimeout(() => {
             this.closeIdleConnection(key, entry);
@@ -896,7 +937,7 @@ export class SSH2ConnectionPool {
       const agentForFallback = shouldTryAgentOnly ? undefined : agent;
       return await attemptConnection(fallbackIdentityFiles, agentForFallback);
     } catch (error) {
-      this.reportFailure(config, getErrorMessage(error));
+      this.reportConnectFailure(config, error);
       throw error;
     }
   }

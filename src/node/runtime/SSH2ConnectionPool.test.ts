@@ -258,6 +258,44 @@ describe.skipIf(process.platform === "win32")(
       second.client.end();
     });
 
+    it("never pools a connection that was still connecting when its host was retired", async () => {
+      // The first connection's authentication waits until the test lets it through.
+      let releaseFirst!: () => void;
+      const firstAuth = new Promise<void>((resolve) => (releaseFirst = resolve));
+      const serverConns: Array<{ closed: boolean }> = [];
+      const { config } = await startServer((conn) => {
+        const record = { closed: false };
+        serverConns.push(record);
+        const held = serverConns.length === 1 ? firstAuth : Promise.resolve();
+        conn.on("authentication", (ctx) => void held.then(() => ctx.accept()));
+        conn.on("close", () => (record.closed = true));
+        conn.on("error", () => undefined);
+      });
+      const pool = new SSH2ConnectionPool();
+
+      // Joined by both waiters, then retired (a settings change) before it authenticates.
+      const waiters = [
+        pool.acquireConnection(config),
+        pool.acquireConnection(config, { maxWaitMs: 0 }),
+      ];
+      const settle = async (done: () => boolean) => {
+        for (let i = 0; i < 400 && !done(); i++) await new Promise((r) => setTimeout(r, 5));
+      };
+      await settle(() => serverConns.length > 0);
+      pool.retireConnection(config);
+      releaseFirst();
+      const [a, b] = await Promise.all(waiters);
+
+      // Both got the connection made after the retirement; the old one was closed.
+      expect(a).toBe(b);
+      expect(serverConns).toHaveLength(2);
+      await settle(() => serverConns[0].closed);
+      expect(serverConns[0].closed).toBe(true);
+      expect(serverConns[1].closed).toBe(false);
+      expect(await pool.acquireConnection(config)).toBe(a);
+      a.client.end();
+    });
+
     it("a retired client's late error does not put the host into backoff", async () => {
       const { config } = await startServer((conn) => {
         conn.on("authentication", (ctx) => ctx.accept());
