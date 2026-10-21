@@ -115,7 +115,7 @@ function agentsFolder(value: unknown, warnings: string[]): { agents?: string } {
   const folders = new Set<string>();
   for (const entry of asList(value)) {
     const normalized = claudeComponentPath(entry);
-    if (normalized === undefined || !normalized.endsWith(".md")) {
+    if (!normalized?.endsWith(".md")) {
       folders.clear();
       break;
     }
@@ -136,7 +136,7 @@ function agentsFolder(value: unknown, warnings: string[]): { agents?: string } {
 function mcpFile(value: unknown, warnings: string[]): { mcp?: string } {
   if (value === undefined) return {};
   const normalized = typeof value === "string" ? claudeComponentPath(value) : undefined;
-  if (normalized === undefined || !normalized.endsWith(".json")) {
+  if (!normalized?.endsWith(".json")) {
     warnings.push(
       "'mcpServers' must be one .json file path inside the plugin; ignoring it (reading .mcp.json)"
     );
