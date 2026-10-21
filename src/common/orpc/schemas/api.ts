@@ -185,6 +185,11 @@ import {
 } from "./agentDefinition";
 import { PluginSlashCommandDescriptorSchema, WorkspaceCompositionSchema } from "./agentPlugins";
 import {
+  SkillsCliInstallInputSchema,
+  SkillsCliRunSchema,
+  SkillsCliStatusSchema,
+} from "./skillsCli";
+import {
   MCPAddGlobalParamsSchema,
   MCPAddParamsSchema,
   MCPListParamsSchema,
@@ -1299,6 +1304,19 @@ export const agentPlugins = {
       method: AgentPluginInstallMethodSchema.nullish(),
     }),
     output: ResultSchema(AgentPluginInstallPreviewSchema, z.string()),
+  },
+  /** Whether Xum can run the pinned skills CLI (Node.js on PATH), for the "Skills CLI" method. */
+  skillsCliStatus: {
+    input: z.void(),
+    output: SkillsCliStatusSchema,
+  },
+  /**
+   * Run the pinned skills CLI into ~/.agents/skills (unmanaged: no registry
+   * entry). The error branch is invalid input; a failed run is `ok: false`.
+   */
+  installWithSkillsCli: {
+    input: SkillsCliInstallInputSchema,
+    output: ResultSchema(SkillsCliRunSchema, z.string()),
   },
   /** Fetch the consented SHA, promote into ~/.mux/plugins, write the registry entry. */
   install: {

@@ -47,6 +47,7 @@ test("the installed row and the consent preview show the monorepo plugin folder"
         source: monorepoSource,
         method: { kind: "agent-plugin" },
         methods: [{ kind: "agent-plugin" }],
+        skillsCliSkills: [],
         lockedSha: "b".repeat(40),
         manifest: { name: "pstack-next" },
         skills: [],

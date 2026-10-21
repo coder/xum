@@ -182,8 +182,13 @@ export const AgentPluginInstallPreviewSchema = z.object({
   /** Every method that fits the repository, in order: agent-plugin, claude-plugin, skills. */
   methods: z.array(AgentPluginInstallMethodSchema),
   /**
+   * Skill folder names found with the skills CLI rules, for the "Skills CLI" choice (empty when
+   * the repository has no SKILL.md files). Independent of `method`.
+   */
+  skillsCliSkills: z.array(z.string()),
+  /**
    * Why Install refuses this method: a plugin or folder of the same name exists. The preview
-   * still lists every method.
+   * still lists every method and the Skills CLI choice (it creates no managed plugin).
    */
   installBlockedReason: z.string().optional(),
   /** Commit SHA the preview was computed from; install verifies it gets the same tree. */

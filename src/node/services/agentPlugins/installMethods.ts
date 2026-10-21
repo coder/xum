@@ -15,6 +15,7 @@ import * as path from "node:path";
 
 import { AGENT_PLUGIN_INSTALL_METHOD_LABELS } from "@/common/constants/agentPluginInstallMethods";
 import type { AgentPluginGitSource } from "@/common/config/schemas/agentPluginInstalls";
+import { SkillNameSchema } from "@/common/orpc/schemas";
 import type { AgentPluginInstallMethod } from "@/common/orpc/schemas/agentPlugins";
 import {
   AGENT_PLUGIN_NAME_MAX_LENGTH,
@@ -217,6 +218,8 @@ async function entryExists(dir: string, relative: string): Promise<boolean> {
 export interface DetectedInstallMethods {
   /** Every method that fits, in order: agent-plugin, claude-plugin, skills. */
   methods: AgentPluginInstallMethod[];
+  /** The skills CLI view of the tree (empty without SKILL.md), for the "Skills CLI" choice. */
+  skillsRoots: SkillsPackageRoot[];
 }
 
 /** The install methods that fit a staged tree (see the module comment for the rules). */
@@ -225,13 +228,14 @@ export async function detectInstallMethods(stagedDir: string): Promise<DetectedI
   const ownManifest =
     (await entryExists(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH)) ||
     (await entryExists(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH));
-  if (ownManifest) return { methods: [{ kind: "agent-plugin" }] };
+  const skillsRoots = await findSkillsPackageRoots(stagedDir);
+  if (ownManifest) return { methods: [{ kind: "agent-plugin" }], skillsRoots };
   const methods: AgentPluginInstallMethod[] = [];
   if (await entryExists(stagedDir, CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH)) {
     methods.push({ kind: "claude-plugin" });
   }
-  if ((await findSkillsPackageRoots(stagedDir)).length > 0) methods.push({ kind: "skills" });
-  return { methods };
+  if (skillsRoots.length > 0) methods.push({ kind: "skills" });
+  return { methods, skillsRoots };
 }
 
 /** Which method a staged clone must use. */
@@ -337,6 +341,22 @@ export function generatedPluginName(source: Pick<AgentPluginGitSource, "url" | "
   return toPluginName(
     source.subpath !== undefined ? path.posix.basename(source.subpath) : repositoryName(source.url)
   );
+}
+
+/** Skill names for the skills CLI's `--skill` (valid skill names only, no repeats). */
+export function skillsCliSkillNames(
+  roots: SkillsPackageRoot[],
+  source: Pick<AgentPluginGitSource, "url" | "subpath">
+): string[] {
+  const names = roots.flatMap((root) => {
+    if (root.root !== ".") return root.skills;
+    try {
+      return [generatedPluginName(source)];
+    } catch {
+      return [];
+    }
+  });
+  return [...new Set(names)].filter((name) => SkillNameSchema.safeParse(name).success);
 }
 
 /**

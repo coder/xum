@@ -100,7 +100,10 @@ describe("detectInstallMethods", () => {
     for (const manifest of ["plugin.json", ".codex-plugin/plugin.json"]) {
       const own = path.join(tmp.path, manifest.replaceAll("/", "-"));
       await writeTree(own, ["skills/a"], { [manifest]: "{}" });
-      expect((await detectInstallMethods(own)).methods).toEqual([{ kind: "agent-plugin" }]);
+      const detected = await detectInstallMethods(own);
+      expect(detected.methods).toEqual([{ kind: "agent-plugin" }]);
+      // The Skills CLI choice still sees the skills.
+      expect(detected.skillsRoots).toEqual([{ root: "skills", skills: ["a"] }]);
     }
 
     const nothing = path.join(tmp.path, "nothing");

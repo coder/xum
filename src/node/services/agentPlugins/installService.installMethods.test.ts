@@ -99,6 +99,7 @@ describe("AgentPluginInstallService install methods", () => {
     const preview = await service.preview({ input: remoteDir });
     expect(preview.method).toEqual({ kind: "skills" });
     expect(preview.methods).toEqual([{ kind: "skills" }]);
+    expect(preview.skillsCliSkills).toEqual(["alpha", "beta"]);
     expect(preview.manifest.name).toBe("acme-skills");
     expect(preview.skills.map((skill) => skill.name)).toEqual(["alpha", "beta"]);
     expect(preview.hook).toBeUndefined();
@@ -117,10 +118,11 @@ describe("AgentPluginInstallService install methods", () => {
       extensions: { mux: { generatedFrom: { kind: "skills" } } },
     });
 
-    // The generated name collides like any plugin name: the preview names the collision, and
-    // install refuses it.
+    // The generated name collides like any plugin name, but only the managed install: the
+    // preview still lists the method and the Skills CLI names (the CLI creates no plugin).
     const again = await service.preview({ input: remoteDir });
     expect(again.methods).toEqual([{ kind: "skills" }]);
+    expect(again.skillsCliSkills).toEqual(["alpha", "beta"]);
     expect(again.installBlockedReason).toBe(
       "A managed plugin named 'acme-skills' is already installed. Uninstall it first."
     );
@@ -169,6 +171,8 @@ describe("AgentPluginInstallService install methods", () => {
     await commit("own manifest");
     const own = await service.preview({ input: remoteDir });
     expect(own.methods).toEqual([{ kind: "agent-plugin" }]);
+    // The Skills CLI choice still gets the skill names.
+    expect(own.skillsCliSkills).toEqual(["alpha", "beta"]);
   });
 
   test("an update regenerates the manifest and reviews a new skill", async () => {

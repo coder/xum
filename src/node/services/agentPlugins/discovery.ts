@@ -533,6 +533,34 @@ async function resolveSkillsRoots(args: {
   return roots;
 }
 
+/**
+ * The skills roots that a manifest `skills` value names in `pluginDir`, resolved as discovery
+ * resolves them (containment, and a path that holds SKILL.md is one skill). For callers that
+ * count skills without a plugin manifest on disk (the Skills CLI names).
+ */
+export async function resolveDeclaredSkillsRoots(args: {
+  pluginDir: string;
+  declared: string | string[] | undefined;
+  pluginName: string;
+}): Promise<PluginSkillsRoot[]> {
+  const rootReal = await fsPromises.realpath(args.pluginDir);
+  const diagnostics: AgentPluginDiagnostic[] = [];
+  return resolveSkillsRoots({
+    declared: args.declared,
+    rootReal,
+    pluginName: args.pluginName,
+    resolveComponent: (relativePath, expectKind) =>
+      resolveComponentPath({
+        rootReal,
+        relativePath,
+        expectKind,
+        componentLabel: `${relativePath}/`,
+        scope: "global",
+        diagnostics,
+      }),
+  });
+}
+
 /** A declared skills root is one skill when it holds SKILL.md itself (PluginSkillsRoot). */
 async function classifySkillsRoot(args: {
   relative: string;
