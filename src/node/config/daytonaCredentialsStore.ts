@@ -81,6 +81,16 @@ function normalizeApiUrl(value: string): string {
   return parsed.toString().replace(/\/+$/, "");
 }
 
+function validApiUrl(value: string | undefined, source: string): string | undefined {
+  if (!value) return undefined;
+  try {
+    return normalizeApiUrl(value);
+  } catch (error) {
+    log.warn(`Ignoring invalid ${source}`, { error: getErrorMessage(error) });
+    return undefined;
+  }
+}
+
 const CREDENTIAL_FIELDS = ["apiKey", "apiUrl", "target"] as const;
 
 /** The non-empty string fields of a credentials file, or undefined when it is not an object. */
@@ -193,16 +203,12 @@ export class DaytonaCredentialsStore {
     };
   }
 
+  /** A stored or env URL that does not validate is ignored (self-healing), as if unset. */
   private resolveApiUrl(stored: DaytonaStoredCredentials): string {
-    if (stored.apiUrl) return stored.apiUrl;
-    const envUrl = nonEmpty(this.env.DAYTONA_API_URL);
-    if (envUrl) {
-      try {
-        return normalizeApiUrl(envUrl);
-      } catch (error) {
-        log.warn("Ignoring invalid DAYTONA_API_URL", { error: getErrorMessage(error) });
-      }
-    }
-    return DAYTONA_DEFAULT_API_URL;
+    return (
+      validApiUrl(stored.apiUrl, "the stored Daytona API URL") ??
+      validApiUrl(nonEmpty(this.env.DAYTONA_API_URL), "DAYTONA_API_URL") ??
+      DAYTONA_DEFAULT_API_URL
+    );
   }
 }

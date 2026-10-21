@@ -71,6 +71,22 @@ describe("DaytonaCredentialsStore", () => {
     expect((await store.resolve())?.apiKey).toBe(KEY);
   });
 
+  it("ignores a stored API URL that does not validate, like an invalid DAYTONA_API_URL", async () => {
+    await fs.writeFile(
+      path.join(rootDir, "daytona.json"),
+      JSON.stringify({ apiKey: KEY, apiUrl: "not a url" }),
+      "utf-8"
+    );
+    const withEnvUrl = new DaytonaCredentialsStore(rootDir, {
+      DAYTONA_API_URL: "https://env.example.com/api/",
+    });
+    expect((await withEnvUrl.resolve())?.apiUrl).toBe("https://env.example.com/api");
+    expect((await withEnvUrl.getPublicConfig()).apiUrl).toBe("https://env.example.com/api");
+    expect((await new DaytonaCredentialsStore(rootDir, {}).resolve())?.apiUrl).toBe(
+      DAYTONA_DEFAULT_API_URL
+    );
+  });
+
   it("rejects an API URL that is not plain http(s)", async () => {
     const store = new DaytonaCredentialsStore(rootDir, {});
     for (const apiUrl of [
