@@ -211,7 +211,8 @@ describe("DaytonaService", () => {
     expect(plane.revoked).toEqual([]);
   });
 
-  it("revokes a token minted across a settings change instead of writing or caching it", async () => {
+  /** A service whose first token mint waits until `releaseMint`; `includeFile` is its writer. */
+  function serviceWithHeldMint() {
     let mintStarted!: () => void;
     const started = new Promise<void>((resolve) => (mintStarted = resolve));
     let releaseMint!: () => void;
@@ -227,11 +228,13 @@ describe("DaytonaService", () => {
       return plane.fetch(input, init);
     }) as typeof fetch;
     const written: string[] = [];
-    const store = (input: { token: string }) => {
+    const includeFile = new Map<string, string>();
+    const store = (input: { sandboxId: string; token: string }) => {
       written.push(input.token);
+      includeFile.set(input.sandboxId, input.token);
       return Promise.resolve();
     };
-    const withHeldMint = new DaytonaService({
+    const heldService = new DaytonaService({
       credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
       rootDir,
       fetch: fetchHoldingFirstMint,
@@ -239,22 +242,46 @@ describe("DaytonaService", () => {
       sshConfigWriter: {
         writeSandbox: store,
         updateToken: store,
-        removeSandbox: () => Promise.resolve(),
+        removeSandbox: (sandboxId: string) => {
+          includeFile.delete(sandboxId);
+          return Promise.resolve();
+        },
         readTokens: () => Promise.resolve([]),
         verifyResolvedConfig: () => Promise.resolve(),
       },
     });
+    return { service: heldService, started, releaseMint, written, includeFile };
+  }
 
-    const access = withHeldMint.ensureSshAccess("sb-1");
-    await started;
-    await withHeldMint.setConfig({ target: "eu" });
-    releaseMint();
+  it("revokes a token minted across a settings change instead of writing or caching it", async () => {
+    const held = serviceWithHeldMint();
+
+    const access = held.service.ensureSshAccess("sb-1");
+    await held.started;
+    await held.service.setConfig({ target: "eu" });
+    held.releaseMint();
     await access;
 
     // tok1 was minted under the old settings: revoked, never written or kept.
     expect(plane.revoked).toEqual(["tok1"]);
-    expect(written).not.toContain("tok1");
-    expect((await withHeldMint.getSshToken("sb-1")).token).not.toBe("tok1");
+    expect(held.written).not.toContain("tok1");
+    expect((await held.service.getSshToken("sb-1")).token).not.toBe("tok1");
+  });
+
+  it("revokes a token minted across a release, keeping the access released", async () => {
+    const held = serviceWithHeldMint();
+
+    const access = held.service.ensureSshAccess("sb-1").catch((error: unknown) => error);
+    await held.started;
+    await held.service.releaseSshAccess("sb-1");
+    held.releaseMint();
+
+    // The caller asked for access the release took away: it fails instead of minting again.
+    expect(String(await access)).toContain("released");
+    expect(plane.revoked).toEqual(["tok1"]);
+    expect(held.includeFile.has("sb-1")).toBe(false);
+    expect(held.service.hasExpiringSshToken("sb-1")).toBe(false);
+    expect(plane.calls.filter((call) => call === "POST /sandbox/sb-1/ssh-access")).toHaveLength(1);
   });
 
   it("revokes the tokens an earlier process left in the include file once it replaces them", async () => {

@@ -99,6 +99,19 @@ function sandboxStateError(sandboxId: string, sandbox: DaytonaSandbox): DaytonaA
   );
 }
 
+interface MintStamp {
+  generation: number;
+  release: number;
+}
+
+interface OutdatedMintInput {
+  client: DaytonaClient;
+  sandboxId: string;
+  access: DaytonaSshAccess;
+  stamp: MintStamp;
+  options: DaytonaSshTokenOptions;
+}
+
 function startTimeoutError(sandboxId: string, sandbox: DaytonaSandbox): DaytonaApiError {
   return new DaytonaApiError(
     "timeout",
@@ -210,6 +223,8 @@ export class DaytonaService {
   private readonly tokenRequests = new Map<string, Promise<DaytonaSshAccess>>();
   /** Bumped by every settings change, so a mint that spans one can tell. */
   private credentialsGeneration = 0;
+  /** Per sandbox: bumped by every release of its SSH access, so a mint that spans one can tell. */
+  private readonly accessReleases = new Map<string, number>();
   private readonly sshConfigWriter: NonNullable<DaytonaServiceOptions["sshConfigWriter"]>;
   /** Sandboxes whose include block and `~/.ssh/config` block this process has written. */
   private readonly sshConfigured = new Set<string>();
@@ -663,6 +678,8 @@ export class DaytonaService {
 
   /** Revoke the token and remove the sandbox's include block. */
   async releaseSshAccess(sandboxId: string): Promise<void> {
+    // A mint in flight sees the bump and drops its token instead of writing it back.
+    this.accessReleases.set(sandboxId, (this.accessReleases.get(sandboxId) ?? 0) + 1);
     this.sshConfigured.delete(sandboxId);
     this.readyAt.delete(sandboxId);
     await this.forgetSshToken(sandboxId);
@@ -704,13 +721,13 @@ export class DaytonaService {
     previous: DaytonaSshAccess | undefined,
     options: DaytonaSshTokenOptions
   ): Promise<DaytonaSshAccess> {
-    const generation = this.credentialsGeneration;
+    const stamp = this.accessStamp(sandboxId);
     const { client } = await this.getClient();
     const access = await client.createSshAccess(sandboxId, DAYTONA_SSH_TOKEN_TTL_MINUTES);
     rememberDaytonaToken(access.token);
-    if (generation !== this.credentialsGeneration) {
-      return this.remintAfterSettingsChange(client, sandboxId, access, options);
-    }
+    const mint = { client, sandboxId, access, stamp, options };
+    const outdated = this.settleOutdatedMint(mint, false);
+    if (outdated) return outdated;
     try {
       await options.onNewToken?.(access);
     } catch (error) {
@@ -718,10 +735,8 @@ export class DaytonaService {
       await this.revokeQuietly(client, sandboxId, access.token);
       throw error;
     }
-    if (generation !== this.credentialsGeneration) {
-      // The retry's onNewToken overwrites what this one wrote.
-      return this.remintAfterSettingsChange(client, sandboxId, access, options);
-    }
+    const outdatedAfterWrite = this.settleOutdatedMint(mint, true);
+    if (outdatedAfterWrite) return outdatedAfterWrite;
     this.tokens.set(sandboxId, access);
     if (previous && previous.token !== access.token) {
       await this.revokeQuietly(client, sandboxId, previous.token);
@@ -729,19 +744,48 @@ export class DaytonaService {
     return access;
   }
 
+  /** What a mint must still match when it completes: the settings and the sandbox's access. */
+  private accessStamp(sandboxId: string): MintStamp {
+    return {
+      generation: this.credentialsGeneration,
+      release: this.accessReleases.get(sandboxId) ?? 0,
+    };
+  }
+
   /**
-   * The settings changed while this token was minted: it belongs to the old account, which
-   * setConfig already revoked everything else of. Revoke it with the client that minted it,
-   * never cache it, and mint again with the new settings for the waiting callers.
+   * Undefined while the mint is current. A mint that spans a settings change or a release of
+   * the sandbox's access is never cached or kept in the include file: its token is revoked
+   * with the client that minted it. After a settings change it mints again under the new
+   * settings; after a release it fails, since the caller's access was taken away.
    */
-  private async remintAfterSettingsChange(
+  private settleOutdatedMint(
+    mint: OutdatedMintInput,
+    wroteIncludeFile: boolean
+  ): Promise<DaytonaSshAccess> | undefined {
+    const { client, sandboxId, access, stamp, options } = mint;
+    if ((this.accessReleases.get(sandboxId) ?? 0) !== stamp.release) {
+      return this.discardReleasedMint(client, sandboxId, access, wroteIncludeFile);
+    }
+    if (this.credentialsGeneration !== stamp.generation) {
+      // The retry's onNewToken overwrites whatever this one wrote.
+      return this.revokeQuietly(client, sandboxId, access.token).then(() =>
+        this.mintSshToken(sandboxId, undefined, options)
+      );
+    }
+    return undefined;
+  }
+
+  private async discardReleasedMint(
     client: DaytonaClient,
     sandboxId: string,
-    stale: DaytonaSshAccess,
-    options: DaytonaSshTokenOptions
-  ): Promise<DaytonaSshAccess> {
-    await this.revokeQuietly(client, sandboxId, stale.token);
-    return this.mintSshToken(sandboxId, undefined, options);
+    access: DaytonaSshAccess,
+    wroteIncludeFile: boolean
+  ): Promise<never> {
+    await this.revokeQuietly(client, sandboxId, access.token);
+    if (wroteIncludeFile) await this.sshConfigWriter.removeSandbox(sandboxId);
+    throw new Error(
+      `Xum released its SSH access to Daytona sandbox "${sandboxId}" while a token was minted`
+    );
   }
 
   /** Revoke and forget the cached token (workspace deleted or sandbox detached). */
