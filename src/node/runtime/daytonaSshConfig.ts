@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import * as fs from "node:fs/promises";
+import * as net from "node:net";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import {
@@ -69,8 +70,21 @@ function assertValid(value: string, pattern: RegExp, what: string): void {
   }
 }
 
+/**
+ * A DNS name or an IP literal: self-hosted deployments may advertise an IPv6 gateway, which
+ * OpenSSH takes in HostName and HostKeyAlias. A zone id (`%eth0`) is refused: ssh config
+ * would expand its `%` as a token.
+ */
+function isGatewayHost(host: string): boolean {
+  return HOSTNAME_PATTERN.test(host) || (net.isIPv6(host) && !host.includes("%"));
+}
+
 function validateGateway(gateway: DaytonaSshGateway): void {
-  assertValid(gateway.host, HOSTNAME_PATTERN, "gateway host");
+  if (!isGatewayHost(gateway.host)) {
+    throw new DaytonaSshConfigError(
+      "Refusing to write an invalid Daytona gateway host to ssh config"
+    );
+  }
   if (!Number.isInteger(gateway.port) || gateway.port < 1 || gateway.port > 65535) {
     throw new DaytonaSshConfigError("Refusing to write an invalid Daytona gateway port");
   }

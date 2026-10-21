@@ -156,6 +156,37 @@ describe("DaytonaSshConfigWriter", () => {
     expect(await Bun.file(sshConfigPath).exists()).toBe(false);
   });
 
+  it("writes a self-hosted IPv6 gateway as OpenSSH resolves it, refusing zone ids", async () => {
+    const gateway = { ...GATEWAY, host: "2001:db8::10", port: 2222 };
+    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway });
+
+    expect(await fs.readFile(writer.paths.knownHostsPath, "utf8")).toBe(
+      [
+        "2001:db8::10 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGatewayKey",
+        "[2001:db8::10]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGatewayKey",
+        "",
+      ].join("\n")
+    );
+    if (hasOpenSsh) {
+      const resolved = spawnSync("ssh", ["-G", "-F", sshConfigPath, "sb-1.xum--daytona"], {
+        encoding: "utf8",
+      }).stdout;
+      for (const line of ["hostname 2001:db8::10", "port 2222", "hostkeyalias 2001:db8::10"]) {
+        expect(resolved.split("\n")).toContain(line);
+      }
+    }
+
+    // A zone id carries `%`, which ssh config expands as a token.
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+    await expect(
+      writer.writeSandbox({
+        sandboxId: "sb-2",
+        token: "t",
+        gateway: { ...gateway, host: "fe80::1%eth0" },
+      })
+    ).rejects.toThrow(/Refusing to write an invalid Daytona gateway host/);
+  });
+
   it("port-qualifies known_hosts entries for a gateway off port 22", () => {
     expect(renderDaytonaKnownHosts({ ...GATEWAY, port: 2222 })).toBe(
       [
