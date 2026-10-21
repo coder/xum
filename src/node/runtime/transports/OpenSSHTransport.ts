@@ -8,6 +8,7 @@ import { cdThenExecShell, runInPosixShell } from "../streamUtils";
 import { expandTildeForSSH } from "../tildeExpansion";
 import { redactDaytonaHostStderr } from "../daytonaTokenRedaction";
 import {
+  appendDaytonaHostKeyPinArgs,
   appendOpenSSHHostKeyPolicyArgs,
   sshConnectionPool,
   type SSHConnectionConfig,
@@ -151,6 +152,8 @@ export class OpenSSHTransport implements SSHTransport {
     args.push("-o", "ServerAliveInterval=5");
     args.push("-o", "ServerAliveCountMax=2");
     args.push("-t");
+    // Not the full host key policy: a terminal on another host may ask about an unknown key.
+    appendDaytonaHostKeyPinArgs(args, this.config.host);
     args.push(this.config.host);
 
     // expandTildeForSSH already returns a quoted string (e.g., "$HOME/path")
