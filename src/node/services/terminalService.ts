@@ -799,6 +799,13 @@ export class TerminalService {
         );
       }
 
+      // A Daytona sandbox may be stopped, or its token (the ssh user name) due for refresh:
+      // bring it up before the emulator runs ssh. The user asked for this terminal.
+      if (isSSHRuntime(workspace.runtimeConfig) && workspace.runtimeConfig.daytona) {
+        const ready = await createRuntimeForWorkspace(workspace).ensureReady();
+        if (!ready.ready) throw new Error(ready.error);
+      }
+
       // Before any durable effect: one share per workspace is kept, after a failed launch too
       // (fail closed; see nativeTerminalUseLeases), and a refusal above releases this open's.
       if (this.nativeTerminalUseLeases.has(workspaceId)) {

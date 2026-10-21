@@ -13,6 +13,8 @@ import type { TerminalCreateParams } from "@/common/types/terminal";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import * as childProcess from "child_process";
 import * as fs from "fs/promises";
+import type { Runtime } from "@/node/runtime/Runtime";
+import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
 
 // Unique per test run: native-terminal markers persist on disk, so a shared path would leak
 // sticky state across runs and flake the "not yet opened" assertions.
@@ -1882,6 +1884,48 @@ describe("TerminalService.openNative", () => {
   describe("Linux", () => {
     beforeEach(() => {
       setPlatform("linux");
+    });
+
+    it("brings a Daytona sandbox up before launching its terminal, and stops if it cannot", async () => {
+      const daytonaConfig = {
+        ...configWithSSHWorkspace,
+        getAllWorkspaceMetadata: mock(() =>
+          Promise.resolve([
+            {
+              id: "ws-ssh",
+              projectPath: "/home/user/project",
+              name: "feature",
+              namedWorkspacePath: "~/src/project/feature",
+              runtimeConfig: {
+                type: "ssh",
+                host: "sb-1.xum--daytona",
+                srcBaseDir: "~/src",
+                daytona: { sandboxId: "sb-1" },
+              },
+            },
+          ])
+        ),
+      } as unknown as Config;
+      const ensureReady = mock(() =>
+        Promise.resolve({
+          ready: false as const,
+          error: 'Daytona sandbox "sb-1" no longer exists',
+          errorType: "runtime_not_ready" as const,
+        })
+      );
+      const createRuntime = spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue({
+        ensureReady,
+      } as unknown as Runtime);
+      try {
+        service = new TerminalService(daytonaConfig, mockPTYService, mockSecretsStore);
+
+        // eslint-disable-next-line @typescript-eslint/await-thenable
+        await expect(service.openNative("ws-ssh")).rejects.toThrow("no longer exists");
+        expect(ensureReady).toHaveBeenCalledTimes(1);
+        expect(spawnSpy).not.toHaveBeenCalled();
+      } finally {
+        createRuntime.mockRestore();
+      }
     });
 
     it("should try terminal emulators in order of preference", async () => {

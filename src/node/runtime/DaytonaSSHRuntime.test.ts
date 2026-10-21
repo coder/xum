@@ -164,6 +164,46 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
   });
 });
 
+describe("DaytonaSSHRuntime integrated terminals", () => {
+  it("start a stopped sandbox before the terminal's ssh session opens", async () => {
+    const sandbox = rig.plane.addSandbox({ id: "sb-term", state: "stopped" });
+    let stateWhenOpened: string | undefined;
+    const runtime = makeRuntime({ sandboxId: "sb-term" }, rig, {
+      transport: {
+        ...localShellTransport(rig.rootDir),
+        createPtySession: () => {
+          stateWhenOpened = sandbox.state;
+          return Promise.resolve({} as Awaited<ReturnType<SSHTransport["createPtySession"]>>);
+        },
+      },
+    });
+
+    await runtime.createPtySession({ workspacePath: "~/src/project/feature", cols: 80, rows: 24 });
+
+    expect(rig.plane.countCalls("POST /sandbox/sb-term/start")).toBe(1);
+    expect(stateWhenOpened).toBe("started");
+  });
+
+  it("report a sandbox that cannot be brought up instead of opening ssh", async () => {
+    let opened = false;
+    const runtime = makeRuntime({ sandboxId: "sb-gone" }, rig, {
+      transport: {
+        ...localShellTransport(rig.rootDir),
+        createPtySession: () => {
+          opened = true;
+          return Promise.resolve({} as Awaited<ReturnType<SSHTransport["createPtySession"]>>);
+        },
+      },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      runtime.createPtySession({ workspacePath: "~/src/project/feature", cols: 80, rows: 24 })
+    ).rejects.toThrow("no longer exists");
+    expect(opened).toBe(false);
+  });
+});
+
 describe("DaytonaSSHRuntime.finalizeConfig and validateBeforePersist", () => {
   it("names a new sandbox before persist and fills the default size", async () => {
     const runtime = makeRuntime({});

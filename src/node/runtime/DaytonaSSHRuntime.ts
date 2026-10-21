@@ -29,7 +29,7 @@ import type {
 import { isPermanentSSHFailure, isRuntimeTransportError, RuntimeError } from "./Runtime";
 import type { SpawnResult } from "./RemoteRuntime";
 import { SSHRuntime, type SSHRuntimeConfig } from "./SSHRuntime";
-import type { SSHTransport } from "./transports";
+import type { PtyHandle, PtySessionParams, SSHTransport } from "./transports";
 import {
   DAYTONA_DEFAULT_SIZE_PRESET_ID,
   DAYTONA_SIZE_PRESETS,
@@ -487,6 +487,17 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       });
       return undefined;
     }
+  }
+
+  /**
+   * A terminal goes straight to ssh, so it brings the sandbox up first (a stopped or archived
+   * sandbox starts, an expiring token is replaced). The user opened it, so starting the
+   * billed sandbox is expected, as for a turn.
+   */
+  override async createPtySession(params: PtySessionParams): Promise<PtyHandle> {
+    const ready = await this.ensureReady();
+    if (!ready.ready) throw new Error(ready.error);
+    return super.createPtySession(params);
   }
 
   /** Init output (sync, git push, hook) can quote ssh's stderr, so it is redacted too. */
