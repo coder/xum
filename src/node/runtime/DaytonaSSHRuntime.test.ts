@@ -949,6 +949,29 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(rig.plane.find("sb-1")?.labels).toEqual({});
   });
 
+  it("warns a forced removal that could not hand off its sandbox, and releases its access", async () => {
+    const labels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.getInstanceId() };
+    rig.plane.addSandbox({ id: "sb-1", name: "xum-owner", labels, state: "stopped" });
+    const owner = { sandboxId: "xum-owner", shared: false, ...SMALL };
+    rig.workspaces.push(
+      { workspaceId: "ws-o", runtimeConfig: sshDaytonaConfig(owner) },
+      { workspaceId: "ws-t", runtimeConfig: sshDaytonaConfig({ sandboxId: "sb-1", shared: true }) }
+    );
+    claimRemovals();
+    rig.plane.failingRoutes.add("PUT /sandbox/xum-owner/labels");
+
+    const forced = await makeRuntime(owner, rig, { workspaceId: "ws-o" }).deleteWorkspace(
+      "/home/me/project",
+      "ws-o",
+      true
+    );
+
+    // A forced removal goes on, so the warning is the user's only cue to drop the label.
+    expect(forced.success ? forced.notice : forced.error).toContain(DAYTONA_LABEL_INSTANCE);
+    expect(forced.success).toBe(true);
+    expect(rig.writer.removed).toContain("xum-owner");
+  });
+
   it("counts a workspace whose removal failed after its checkout step as a reference again", async () => {
     rig.plane.addSandbox({ id: "sb-kept", state: "stopped" });
     const owner = { sandboxId: "sb-kept", shared: false, ...SMALL };
