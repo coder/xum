@@ -85,6 +85,15 @@ function createHostVerifier(
     : Promise.resolve(() => true);
 }
 
+/**
+ * A Daytona alias connects straight to its pinned gateway: an inherited ProxyCommand (a user
+ * `Host *` entry) would get the token as `%r` and could route the connection anywhere. The
+ * parser reads no ProxyJump, so ssh2 never follows one.
+ */
+function withoutInheritedProxy(host: string, resolved: ResolvedSSHConfig): ResolvedSSHConfig {
+  return isXumDaytonaHost(host) ? { ...resolved, proxyCommand: undefined } : resolved;
+}
+
 let sshPromptService: SshPromptService | undefined;
 
 export function setSshPromptService(svc: SshPromptService): void {
@@ -696,7 +705,7 @@ export class SSH2ConnectionPool {
     const key = makeConnectionKey(config);
     const retirement = this.retirementOf(key);
     try {
-      const resolved = await resolveSSHConfig(config.host);
+      const resolved = withoutInheritedProxy(config.host, await resolveSSHConfig(config.host));
       const resolvedConfig: ResolvedSSHConfig = {
         ...resolved,
         port: config.port ?? resolved.port,

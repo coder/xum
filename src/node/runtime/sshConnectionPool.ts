@@ -61,6 +61,12 @@ export function isInteractiveHostKeyApprovalAvailable(): boolean {
  * The sandbox is not trusted either: a user `Host *` entry's agent, X11 or port forwards would
  * let its processes use the local agent, display or ports, so those are forced off too. The
  * bash AI proxy's reverse forward adds its `-R` through a control client that skips this.
+ *
+ * Nor may an inherited entry run a local command (which would get the token as `%r`) or route
+ * the connection past the pinned gateway: ProxyCommand, ProxyJump and LocalCommand are off.
+ * ProxyCommand goes first: OpenSSH applies only the first of the two it reads, so
+ * `ProxyJump=none` is inert on clients that predate it. KnownHostsCommand is left alone:
+ * OpenSSH before 8.5 refuses the option name, which would fail every connection.
  */
 export function appendDaytonaOpenSSHArgs(args: string[], host: string): void {
   if (isXumDaytonaHost(host)) {
@@ -72,7 +78,13 @@ export function appendDaytonaOpenSSHArgs(args: string[], host: string): void {
       "-o",
       "ForwardX11=no",
       "-o",
-      "ClearAllForwardings=yes"
+      "ClearAllForwardings=yes",
+      "-o",
+      "ProxyCommand=none",
+      "-o",
+      "ProxyJump=none",
+      "-o",
+      "PermitLocalCommand=no"
     );
   }
 }

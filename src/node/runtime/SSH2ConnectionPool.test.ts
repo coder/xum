@@ -234,6 +234,69 @@ describe.skipIf(process.platform === "win32")(
       }
     });
 
+    // The command would get the token as %r and could route the connection anywhere.
+    it("runs no inherited ProxyCommand for a Daytona alias, only for other hosts", async () => {
+      const hostKey = newPrivateKey();
+      const { config } = await startServer((conn) => {
+        conn.on("authentication", (ctx) => ctx.accept());
+        conn.on("error", () => undefined);
+      }, hostKey);
+      const home = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh2-daytona-proxy-"));
+      const originalUserProfile = process.env.USERPROFILE;
+      process.env.USERPROFILE = home;
+      try {
+        const knownHostsPath = path.join(home, "daytona_known_hosts");
+        const marker = path.join(home, "proxy-ran");
+        const parsed = utils.parseKey(hostKey);
+        if (parsed instanceof Error) throw parsed;
+        await fs.writeFile(
+          knownHostsPath,
+          `gateway.test ${parsed.type} ${parsed.getPublicSSH().toString("base64")}\n`
+        );
+        await fs.mkdir(path.join(home, ".ssh"));
+        await fs.writeFile(
+          path.join(home, ".ssh", "config"),
+          [
+            "Host *",
+            `  ProxyCommand sh -c 'echo %r >> ${marker}; exit 1'`,
+            "Host sb-1.xum--daytona",
+            "  HostName 127.0.0.1",
+            `  Port ${String(config.port)}`,
+            "  User tokenA",
+            "  HostKeyAlias gateway.test",
+            `  UserKnownHostsFile ${knownHostsPath}`,
+            "Host plain-host",
+            "  HostName 127.0.0.1",
+            `  Port ${String(config.port)}`,
+            "  User plainuser",
+          ].join("\n")
+        );
+
+        const entry = await new SSH2ConnectionPool().acquireConnection(
+          { host: "sb-1.xum--daytona", identityFile: config.identityFile },
+          { maxWaitMs: 0 }
+        );
+        entry.client.end();
+        expect(await Bun.file(marker).exists()).toBe(false);
+
+        const plain = await new SSH2ConnectionPool()
+          .acquireConnection(
+            { host: "plain-host", identityFile: config.identityFile },
+            { maxWaitMs: 0 }
+          )
+          .then(
+            () => new Error("acquisition unexpectedly succeeded"),
+            (error: unknown) => error
+          );
+        expect(plain).toBeInstanceOf(Error);
+        expect(await fs.readFile(marker, "utf8")).toContain("plainuser");
+      } finally {
+        if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = originalUserProfile;
+        await fs.rm(home, { recursive: true, force: true });
+      }
+    });
+
     it("a retired connection carries no new work and closes once its channels do", async () => {
       const { config } = await startServer((conn) => {
         conn.on("authentication", (ctx) => ctx.accept());

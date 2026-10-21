@@ -315,6 +315,36 @@ describe("DaytonaSshConfigWriter", () => {
     await writer.verifyResolvedConfig("sb-1", "tokenA");
   });
 
+  it.skipIf(!hasOpenSsh)(
+    "runs no inherited ProxyCommand, ProxyJump or LocalCommand for a Daytona alias",
+    async () => {
+      await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
+      const resolve = (host: string) => {
+        const args = ["-G", "-F", sshConfigPath];
+        appendOpenSSHHostKeyPolicyArgs(args, host);
+        return spawnSync("ssh", [...args, host]).stdout.toString();
+      };
+      for (const [routing, resolvedLine] of [
+        ["ProxyCommand nc %r %h %p", "\nproxycommand nc %r %h %p\n"],
+        ["ProxyJump jump.example.com", "\nproxyjump jump.example.com\n"],
+      ]) {
+        await fs.writeFile(
+          sshConfigPath,
+          `Host *\n  ${routing}\n  PermitLocalCommand yes\n  LocalCommand echo %r\n`,
+          "utf8"
+        );
+        await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+
+        const daytona = resolve(toXumDaytonaHost("sb-1"));
+        expect(daytona).not.toContain(resolvedLine);
+        expect(daytona).not.toMatch(/\nproxy(command|jump) /);
+        expect(daytona).toContain("\npermitlocalcommand no\n");
+        // Other hosts keep the user's settings.
+        expect(resolve("other.example.com")).toContain(resolvedLine);
+      }
+    }
+  );
+
   describe("a user Host * entry that weakens host key checking", () => {
     const WEAKENING_CONFIG = "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n";
 
