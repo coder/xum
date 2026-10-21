@@ -1389,6 +1389,41 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
     expect(String(error)).not.toContain(stale);
     expect(String(error)).toContain(`${DAYTONA_TOKEN_PLACEHOLDER}@127.0.0.1: Permission denied`);
   });
+
+  it("runs no ssh command before the include file's tokens are loaded, retrying a failed load", async () => {
+    const stale = "earlier-process-token-unloaded-9c1d";
+    rig.plane.addSandbox({ id: "sb-old" });
+    rig.writer.tokens.set("sb-old", stale);
+    const readTokens = spyOn(rig.writer, "readTokens").mockRejectedValueOnce(
+      new Error("EIO: i/o error, read")
+    );
+    // Startup goes on without them.
+    let startupLoad: unknown;
+    await rig.service.loadPersistedTokens().catch((error: unknown) => (startupLoad = error));
+    expect(startupLoad).toBeInstanceOf(Error);
+
+    let readsWhenSpawned: number | undefined;
+    // A UI runtime: its commands never run ensureReady first.
+    const runtime = makeRuntime({ sandboxId: "sb-old" }, rig, {
+      transport: {
+        ...localShellTransport(rig.rootDir),
+        spawnRemoteProcess: () => {
+          readsWhenSpawned = readTokens.mock.calls.length;
+          return Promise.reject(
+            new RuntimeError(`${stale}@127.0.0.1: Permission denied (publickey).`, "network")
+          );
+        },
+      },
+    });
+
+    const error = await runtime.exec("true", { cwd: "/tmp", timeout: 10 }).then(
+      () => new Error("exec unexpectedly succeeded"),
+      (rejection: unknown) => rejection
+    );
+    expect(readsWhenSpawned).toBe(2);
+    expect(String(error)).not.toContain(stale);
+    expect(String(error)).toContain(`${DAYTONA_TOKEN_PLACEHOLDER}@127.0.0.1: Permission denied`);
+  });
 });
 
 describe("DaytonaSSHRuntime reconnect after a stop", () => {

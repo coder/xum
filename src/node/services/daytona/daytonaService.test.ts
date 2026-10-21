@@ -665,6 +665,38 @@ describe("DaytonaService", () => {
     expect(plane.revoked).toEqual(["earlier-process-token", minted ?? ""]);
   });
 
+  it("loads the include file's tokens before ssh access when the startup load failed", async () => {
+    let failedReads = 1;
+    const writer = {
+      writeSandbox: () => Promise.resolve(),
+      updateToken: () => Promise.resolve(),
+      removeSandbox: () => Promise.resolve(),
+      readTokens: () =>
+        failedReads-- > 0
+          ? Promise.reject(new Error("EIO: i/o error, read"))
+          : Promise.resolve([{ sandboxId: "sb-1", token: "earlier-process-token" }]),
+      verifyResolvedConfig: () => Promise.resolve(),
+      repointGateway: () => Promise.resolve(),
+    };
+    service = new DaytonaService({
+      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
+      rootDir,
+      fetch: plane.fetch,
+      now: () => clock,
+      sshConfigWriter: writer,
+    });
+    expect(
+      await service.loadPersistedTokens().then(
+        () => "loaded",
+        () => "failed"
+      )
+    ).toBe("failed");
+
+    // The retry knows the earlier token, so the new one replaces and revokes it.
+    await service.ensureSshAccess("sb-1");
+    expect(plane.revoked).toEqual(["earlier-process-token"]);
+  });
+
   it("reports test-connection failures as typed results", async () => {
     expect(await service.testConnection()).toEqual({ ok: true });
 

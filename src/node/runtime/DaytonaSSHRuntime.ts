@@ -86,6 +86,7 @@ export type DaytonaRuntimeService = Pick<
   | "invalidateSandboxReady"
   | "replaceRejectedSshToken"
   | "sshTokenGeneration"
+  | "loadPersistedTokens"
   | "findSnapshot"
   | "getGatewayConfig"
   | "sandboxReferencesElsewhere"
@@ -450,6 +451,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   ): Promise<SpawnResult> {
     let result: SpawnResult;
     const sandboxId = this.daytonaConfig.sandboxId;
+    // ssh may send a token an earlier process left in the include file: the redactor must
+    // know it before ssh can quote it. Not every command runs after ensureReady.
+    if (sandboxId) await this.daytonaService.loadPersistedTokens();
     // Before the attempt: a refusal replaces only the token this command used.
     const tokenGeneration = sandboxId ? this.daytonaService.sshTokenGeneration(sandboxId) : 0;
     try {

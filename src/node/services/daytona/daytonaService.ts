@@ -353,6 +353,8 @@ export class DaytonaService {
   /** Sandboxes whose include block and `~/.ssh/config` block this process has written. */
   private readonly sshConfigured = new Set<string>();
   private readonly readyAt = new Map<string, number>();
+  private persistedTokensLoad?: Promise<void>;
+  private persistedTokensLoaded = false;
   private readonly readyRequests = new Map<string, SandboxReadyRequest>();
   /** Why the setup of a sandbox Xum created (and then deleted) failed, for later turns. */
   private readonly setupFailures = new Map<string, string>();
@@ -389,9 +391,28 @@ export class DaytonaService {
    * Tokens an earlier Xum process wrote to the include file. ssh keeps sending them until Xum
    * replaces them, so the redactor must know them; holding them also lets a replacement, a
    * settings change or an archive revoke them. The file has no expiry, so they are due for
-   * refresh at once. Startup calls this before any ssh runs.
+   * refresh at once. Startup starts this load but goes on when it fails or is slow, so every
+   * ssh to a sandbox (ensureSshAccess, the runtime's commands) waits for it first. Loads once;
+   * a failed read is logged and retried by the next caller. A missing file loads nothing.
    */
-  async loadPersistedTokens(): Promise<void> {
+  loadPersistedTokens(): Promise<void> {
+    if (this.persistedTokensLoaded) return Promise.resolve();
+    this.persistedTokensLoad ??= this.readPersistedTokens().then(
+      () => {
+        this.persistedTokensLoaded = true;
+      },
+      (error: unknown) => {
+        this.persistedTokensLoad = undefined;
+        log.warn("Could not read the Daytona ssh tokens an earlier Xum process left", {
+          error: getErrorMessage(error),
+        });
+        throw error;
+      }
+    );
+    return this.persistedTokensLoad;
+  }
+
+  private async readPersistedTokens(): Promise<void> {
     for (const { sandboxId, token } of await this.sshConfigWriter.readTokens()) {
       rememberDaytonaToken(token);
       if (!this.tokens.has(sandboxId)) {
@@ -1146,6 +1167,7 @@ export class DaytonaService {
    */
   ensureSshAccess(sandboxId: string): Promise<void> {
     return this.withAccountLease(async () => {
+      await this.loadPersistedTokens();
       // Fails before a mint when the control plane cannot say where the gateway is.
       await this.getGatewayConfig();
       // A cached token was written by the mint that produced it, so only a mint writes files.
