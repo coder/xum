@@ -130,16 +130,28 @@ function useDaytonaAccessDrafts(config: DaytonaPublicConfig | null) {
     setApiUrl(null);
     setTarget(null);
   };
-  return { apiKey, apiUrl, target, setApiKey, setApiUrl, setTarget, isDirty, reset };
+  // An unedited URL may come from DAYTONA_API_URL or the default: saving it would pin it in
+  // daytona.json, where it beats later changes to either. So only an edit is sent.
+  const edited = (draft: string | null, savedValue: string) =>
+    draft !== null && draft.trim() !== savedValue ? draft.trim() : undefined;
+  const changes = {
+    apiUrl: edited(apiUrlDraft, saved.apiUrl),
+    target: edited(targetDraft, saved.target),
+  };
+  return { apiKey, apiUrl, target, changes, setApiKey, setApiUrl, setTarget, isDirty, reset };
 }
 
-/** A blank key field means "keep the saved key", so it is left out of the update. */
-function toAccessInput(drafts: { apiKey: string; apiUrl: string; target: string }) {
+/** A blank key field means "keep the saved key"; unedited fields are left out too. */
+function toAccessInput(drafts: {
+  apiKey: string;
+  changes: { apiUrl?: string; target?: string };
+}): DaytonaAccessInput {
   const apiKey = drafts.apiKey.trim();
+  const { apiUrl, target } = drafts.changes;
   return {
     ...(apiKey ? { apiKey } : {}),
-    apiUrl: drafts.apiUrl.trim(),
-    target: drafts.target.trim(),
+    ...(apiUrl !== undefined ? { apiUrl } : {}),
+    ...(target !== undefined ? { target } : {}),
   };
 }
 
