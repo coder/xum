@@ -2,16 +2,28 @@ name: Stories
 
 # The agentic story lane (`make test-stories`): the story tests, the Electron stories and the
 # agent-tagged repros, each as a model-driven job in the bug-bash sandbox. pr.yml calls it in the
-# merge queue (its `stories` job), and Required counts its result only when the repo variable
-# STORIES_MODE is "block". Unset is warn mode: a failure shows in the queue but blocks no merge.
+# merge queue (its `stories` job, Sonnet 5.5), and Required counts its result only when the repo
+# variable STORIES_MODE is "block". Unset is warn mode: a failure shows in the queue but blocks no
+# merge. pr.yml also calls it on each push to a PR that is not a draft (its `stories-pr` job):
+# Haiku on PRs, Sonnet in the queue. Required counts that result only when STORIES_PR_MODE is
+# "block".
 #
 # Triggers: change only this block to pick when it runs. The job below works unchanged under
 # pull_request, merge_group (called from pr.yml), schedule and workflow_dispatch.
 on:
-  # From pr.yml's merge_group run, once for each PR in the merge queue: the user's pick over every
-  # PR push (about $500 against $1,700 a month at Phase 2 prices). No merge_group trigger of its
-  # own, else each queue entry runs it twice. The caller passes the key by name.
+  # From pr.yml's merge_group run, once for each PR in the merge queue (Sonnet 5.5, $3 a job), and
+  # from its pull_request run on each push to a PR that is not a draft (Haiku 5.5, $1 a job). No
+  # trigger of its own for either, else each runs it twice. The caller passes the key by name.
   workflow_call:
+    inputs:
+      # The explorer and judge model of every job (launch.ts reads BUGBASH_MODEL). Unset: Sonnet.
+      model:
+        type: string
+        required: false
+      # The cap per job at list price, in $. Unset: 3.
+      budget_usd:
+        type: string
+        required: false
     secrets:
       ANTHROPIC_API_KEY:
         required: true
@@ -24,7 +36,8 @@ on:
   workflow_dispatch: {}
 
 # One run per PR (or per ref for the other events: a merge-queue entry has its own ref), and a
-# new push cancels the old run, so its model calls stop too. A fixed prefix, not
+# new push cancels the old run, so its model calls stop too. A ref starts with refs/, so a PR
+# run's group never equals a queue, nightly or dispatched run's group. A fixed prefix, not
 # github.workflow: a called workflow sees the caller's name ("PR"), and a group equal to
 # pr.yml's would cancel the caller's run or be cancelled with it.
 concurrency:
@@ -36,9 +49,11 @@ permissions:
 
 jobs:
   stories:
-    # pr.yml's caller job is "Test / Stories", so the queue shows "Test / Stories / make test-stories".
+    # pr.yml's caller jobs are "Test / Stories" (queue) and "Test / Stories (Haiku)" (PR), so the
+    # checks read "Test / Stories / make test-stories" and "Test / Stories (Haiku) / make test-stories".
     name: make test-stories
-    # Only for pull_request (off now, see on:): fork and Dependabot PRs get no Actions secrets.
+    # For pull_request (pr.yml's stories-pr, which has the same guard): fork and Dependabot PRs
+    # get no Actions secrets.
     if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
     runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
     # In the merge queue: under the ruleset's 60 minutes for checks, so a hung run fails here
@@ -98,8 +113,11 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_BASE_URL: https://api.anthropic.com
           BUGBASH_AI: mock
-          # The cap per job, so one run spends at most three times this, six with the retry.
-          BUGBASH_BUDGET_USD: "3"
+          # The model of every job. schedule and workflow_dispatch have no inputs: Sonnet 5.5.
+          BUGBASH_MODEL: ${{ inputs.model || 'anthropic:claude-sonnet-5-5' }}
+          # The cap per job, so one run spends at most three times this, six with the retry. $3
+          # unless the caller passes budget_usd ($1 for the PR lane).
+          BUGBASH_BUDGET_USD: ${{ inputs.budget_usd || '3' }}
       - name: Summary
         if: always()
         run: bun tests/stories/summary.ts >> "$GITHUB_STEP_SUMMARY"
