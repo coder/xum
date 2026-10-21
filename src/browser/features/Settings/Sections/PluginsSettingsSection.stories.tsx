@@ -1301,6 +1301,8 @@ export const AddPluginInstallAsPhoneViewport: Story = {
 
 /** Only Claude Code plugin hooks: the note says they never run, not "until you trust". */
 export const AddPluginClaudeHooksNeverRun: Story = {
+  // Play-only contract: AddPluginInstallAs already snapshots this panel (Pixel budget).
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => (
     <PluginsSectionStoryShell
       options={installAsOptions({
@@ -1337,6 +1339,8 @@ const NAME_TAKEN = "A managed plugin named 'review-kit' is already installed. Un
  * preview keeps the Install as choice.
  */
 export const AddPluginInstallBlockedByName: Story = {
+  // Play-only contract: AddPluginInstallAs already snapshots this panel (Pixel budget).
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => (
     <PluginsSectionStoryShell
       options={installAsOptions({
