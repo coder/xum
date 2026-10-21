@@ -693,7 +693,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     } catch (error) {
       return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
     }
-    if (!found?.windows) return Ok(undefined);
+    if (!snapshot || !found?.windows) return Ok(undefined);
     return Err(`Daytona snapshot "${snapshot}" creates Windows sandboxes. ${LINUX_ONLY}`);
   }
 
