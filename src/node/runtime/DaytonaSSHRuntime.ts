@@ -84,6 +84,7 @@ export type DaytonaRuntimeService = Pick<
   | "replaceRejectedSshToken"
   | "isSandboxReferencedElsewhere"
   | "isCreatedByThisInstall"
+  | "isAliasStoredElsewhere"
   | "withSandboxRemovalLock"
   | "waitUntilDestroyed"
   | "recordWorkspaceRemoval"
@@ -308,7 +309,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   /** Keep cleanup hooks from starting a stopped (billed) sandbox through SSH. */
   async isRunningWithoutStart(_abortSignal: AbortSignal): Promise<boolean> {
     const sandboxId = this.daytonaConfig.sandboxId;
-    if (!sandboxId) return false;
+    return sandboxId ? this.isSandboxStarted(sandboxId) : false;
+  }
+
+  private async isSandboxStarted(sandboxId: string): Promise<boolean> {
     try {
       const { state } = await this.daytonaService.getSandboxState(sandboxId);
       return state === "started";
@@ -970,6 +974,11 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     // yet, so delete it without SSH. A kept sandbox only loses this workspace's checkout.
     const forced = force ? await this.forceDeleteLastReference(sandboxId, deletedPath) : undefined;
     if (forced) return forced;
+    // A forced removal skips the checks, so it never starts a stopped (billed) sandbox for
+    // them: its checkout stays on the sandbox, which this removal keeps or releases.
+    if (force && !(await this.isSandboxStarted(sandboxId))) {
+      return this.settleSandbox(sandboxId, { success: true, deletedPath }, undefined);
+    }
 
     const prepared = await this.startForDeleteChecks(sandboxId, abortSignal);
     if (prepared === "missing") {
@@ -1114,7 +1123,12 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     if (fate === "delete") {
       return this.deleteOwnedSandbox(sandboxId, result.deletedPath, errorPrefix);
     }
-    if (fate === "release") {
+    // Access is per stored string (a sandbox's name or its id): a kept sandbox keeps it only
+    // while another workspace stores the same one.
+    const releases =
+      fate === "release" ||
+      !this.daytonaService.isAliasStoredElsewhere(sandboxId, this.workspaceId);
+    if (releases) {
       try {
         await this.daytonaService.releaseSshAccess(sandboxId);
       } catch (error) {

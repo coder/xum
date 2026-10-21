@@ -432,6 +432,16 @@ export class DaytonaService {
     }
   }
 
+  /**
+   * Whether a workspace other than `workspaceId` stores exactly this string as its sandbox:
+   * Xum's ssh access (token, include block) is per stored string. True (keep the access) when
+   * the workspace list or the caller's id is unavailable.
+   */
+  isAliasStoredElsewhere(alias: string, workspaceId: string | undefined): boolean {
+    if (!this.listWorkspaces || !workspaceId) return true;
+    return this.sandboxIdsStoredElsewhere(this.listWorkspaces(), workspaceId).includes(alias);
+  }
+
   /** What the other workspaces (removals in flight excluded) store as their sandbox. */
   private sandboxIdsStoredElsewhere(refs: DaytonaWorkspaceRef[], workspaceId: string): string[] {
     return refs.flatMap((ref) => {

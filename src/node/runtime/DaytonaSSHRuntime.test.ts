@@ -458,7 +458,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       expect(result.success).toBe(true);
       expect(rig.plane.find("sb-7")).toBeDefined();
     }
-    expect(rig.plane.calls.filter((call) => call.startsWith("DELETE /sandbox/"))).toEqual([]);
+    expect(rig.plane.calls.filter((call) => /^DELETE \/sandbox\/[^/]+$/.test(call))).toEqual([]);
   });
 
   it("refuses a settings change between its checks and the sandbox delete", async () => {
@@ -741,6 +741,57 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect((await remove("ws-o2", owner("xum-attached-first"))).success).toBe(true);
     expect(rig.plane.find("sb-2")).toBeUndefined();
     expect(deletes()).toBe(2);
+  });
+
+  it("never starts a stopped sandbox for the checks a forced removal skips", async () => {
+    rig.plane.addSandbox({ id: "sb-users", state: "stopped" });
+    rig.workspaces.push({
+      workspaceId: "ws-1",
+      runtimeConfig: sshDaytonaConfig({ sandboxId: "sb-users", shared: true }),
+    });
+
+    const result = await makeRuntime({ sandboxId: "sb-users", shared: true }).deleteWorkspace(
+      "/home/me/project",
+      "feature",
+      true
+    );
+
+    expect(result.success).toBe(true);
+    expect(rig.plane.find("sb-users")?.state).toBe("stopped");
+    expect(rig.plane.calls.filter((call) => call.startsWith("POST /sandbox/sb-users/"))).toEqual(
+      []
+    );
+    expect(rig.writer.removed).toContain("sb-users");
+  });
+
+  it("drops the removed workspace's ssh access to a sandbox another workspace keeps", async () => {
+    const labels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.getInstanceId() };
+    rig.plane.addSandbox({ id: "sb-7", name: "xum-owner-abc123", labels });
+    const owner = { sandboxId: "xum-owner-abc123", shared: false, ...SMALL };
+    const attached = { sandboxId: "sb-7", shared: true };
+    rig.workspaces.push(
+      { workspaceId: "ws-owner", runtimeConfig: sshDaytonaConfig(owner) },
+      { workspaceId: "ws-fork", runtimeConfig: sshDaytonaConfig({ ...owner, forked: true }) },
+      { workspaceId: "ws-attached", runtimeConfig: sshDaytonaConfig(attached) }
+    );
+    // Tokens and include blocks are per stored string: the name and the id.
+    await rig.service.ensureSshAccess("xum-owner-abc123");
+    await rig.service.ensureSshAccess("sb-7");
+    const remove = (workspaceId: string, daytona: DaytonaSandboxConfig) =>
+      makeRuntime(daytona, rig, { workspaceId }).deleteWorkspace(
+        "/home/me/project",
+        workspaceId,
+        false
+      );
+
+    // The fork still uses the name: its access stays.
+    expect((await remove("ws-owner", owner)).success).toBe(true);
+    expect(rig.writer.removed).toEqual([]);
+    // The fork was the last one to use the name.
+    expect((await remove("ws-fork", { ...owner, forked: true })).success).toBe(true);
+    expect(rig.writer.removed).toEqual(["xum-owner-abc123"]);
+    expect(rig.writer.tokens.has("sb-7")).toBe(true);
+    expect(rig.plane.find("sb-7")).toBeDefined();
   });
 
   it("never deletes an attached sandbox, even with its last workspace", async () => {
