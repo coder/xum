@@ -670,6 +670,21 @@ describe("applyAgentCgroupLimits with project limits", () => {
     expect(await exists(tree, `xum/xum-agents/${PHAROS_CGROUP}`)).toBe(true);
   });
 
+  it("checks the controllers that only a project limit needs", async () => {
+    tree = await createFakeCgroupTree({
+      own: "/xum",
+      cgroups: { xum: { controllers: "memory" } },
+    });
+
+    const support = await checkAgentCgroupSupport({ memoryGiB: 64 }, tree.host, pharosLimits);
+
+    expect(support).toEqual({
+      state: "unavailable",
+      reason:
+        "The cpu controller is not available in cgroup /xum. Enable it in the parent cgroup's cgroup.subtree_control.",
+    });
+  });
+
   it("removes every project limit when no limit applies", async () => {
     tree = await createTree();
     await applyAgentCgroupLimits({ cpuCores: 28 }, tree.host, { projects: pharosLimits });

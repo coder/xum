@@ -226,9 +226,11 @@ export async function applyAgentCgroupLimits(
  */
 export async function checkAgentCgroupSupport(
   limits: AgentResourceLimits,
-  host: AgentCgroupHost
+  host: AgentCgroupHost,
+  projects: ProjectAgentResourceLimits = new Map()
 ): Promise<AgentResourceLimitsSupport> {
-  const needed = neededControllers([limits]);
+  // A project limit can need a controller that the shared limit does not.
+  const needed = neededControllers([limits, ...projects.values()]);
   try {
     const plan = await planAgentCgroup(needed.length > 0 ? needed : ["cpu", "memory"], host);
     return plan.state === "ready" || plan.state === "sudo"

@@ -64,7 +64,7 @@ export class AgentResourceLimitsService {
       limits: setting.limits,
       projects,
       status: this.status,
-      support: await checkAgentCgroupSupport(setting.limits, this.host),
+      support: await checkAgentCgroupSupport(setting.limits, this.host, setting.projects),
     };
   }
 
