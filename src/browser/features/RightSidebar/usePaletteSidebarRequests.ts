@@ -31,8 +31,9 @@ interface PaletteSidebarRequestOptions {
  * "Add Tool…" (OPEN_SIDEBAR_TOOL). The palette row unmounts with the palette, so focus would fall
  * to <body>. Like "Right Sidebar: New Tab", the sidebar acts on them, so focus moves into the new
  * pane (its launcher's first row, or the tab that the split moved there) or into the tool, as
- * picking it in the launcher does. Both reveal a collapsed sidebar. While the narrow layout hides
- * the sidebar, the layout still changes (its full-screen view shows it), but nothing takes focus.
+ * picking it in the launcher does. Both reveal a collapsed sidebar. While the narrow layout or
+ * immersive review hides the sidebar, the layout still changes, but nothing takes focus. The
+ * sidebar claims each request (preventDefault), so the palette knows it acted.
  */
 export function usePaletteSidebarRequests(options: PaletteSidebarRequestOptions): void {
   // A ref, so the listeners subscribe once per workspace and still call the latest callbacks
@@ -45,13 +46,16 @@ export function usePaletteSidebarRequests(options: PaletteSidebarRequestOptions)
   React.useEffect(() => {
     const handleSplit = (event: Event) => {
       const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE>).detail;
-      if (detail?.workspaceId === workspaceId) splitPane(optionsRef.current, detail.direction);
+      if (detail?.workspaceId !== workspaceId) return;
+      // Claimed: the palette changes the stored layout itself only when no sidebar did.
+      event.preventDefault();
+      splitPane(optionsRef.current, detail.direction);
     };
     const handleOpenTool = (event: Event) => {
       const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL>).detail;
-      if (detail?.workspaceId === workspaceId && isBaseTabId(detail.tool)) {
-        openTool(optionsRef.current, detail.tool);
-      }
+      if (detail?.workspaceId !== workspaceId) return;
+      event.preventDefault();
+      if (isBaseTabId(detail.tool)) openTool(optionsRef.current, detail.tool);
     };
     window.addEventListener(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, handleSplit);
     window.addEventListener(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, handleOpenTool);
@@ -84,5 +88,10 @@ function openTool(options: PaletteSidebarRequestOptions, tool: BaseTabType) {
 }
 
 function isSidebarShown(container: HTMLElement | null): boolean {
-  return container == null || !isRightSidebarResponsivelyHidden(container);
+  if (container == null) return true;
+  // Immersive review hides the sidebar too (aria-hidden and inert), which
+  // isRightSidebarResponsivelyHidden does not count: nothing in it can take focus.
+  return (
+    container.getAttribute("aria-hidden") !== "true" && !isRightSidebarResponsivelyHidden(container)
+  );
 }

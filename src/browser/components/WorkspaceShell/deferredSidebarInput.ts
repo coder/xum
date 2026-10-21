@@ -77,6 +77,9 @@ function holdEventInto(held: HeldSidebarInput[]): (e: Event) => void {
       isWorkspaceRightSidebarHidden(document.querySelector("[data-workspace-shell]"))
     )
       return;
+    // Claimed for the sidebar, which acts on the replay: a cancelable sender (the palette's split
+    // and Add Tool) then knows it need not act itself.
+    e.preventDefault();
     e.stopImmediatePropagation();
     const detail: unknown = e instanceof window.CustomEvent ? e.detail : undefined;
     held.push(() => window.dispatchEvent(new window.CustomEvent(e.type, { detail })));

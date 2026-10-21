@@ -2466,14 +2466,17 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
     });
   });
 
-  // The sidebar reveals itself and moves focus (tests/ui/layout/rightSidebar.test.ts): these
-  // palette actions only ask the selected workspace's sidebar.
+  // A mounted sidebar claims these requests, then reveals itself and moves focus
+  // (tests/ui/layout/rightSidebar.test.ts): the palette leaves the stored state alone.
   test("Add Tool and the splits ask the workspace's sidebar", async () => {
     await withTestWindow(async () => {
       const requests: unknown[] = [];
-      const record = (event: Event) => requests.push((event as CustomEvent).detail);
-      window.addEventListener(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, record);
-      window.addEventListener(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, record);
+      const claim = (event: Event) => {
+        event.preventDefault();
+        requests.push((event as CustomEvent).detail);
+      };
+      window.addEventListener(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, claim);
+      window.addEventListener(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, claim);
       try {
         const actions = getActions();
         const find = (id: string) => actions.find((entry) => entry.id === id)!;
@@ -2485,12 +2488,44 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
           { workspaceId: "w1", direction: "horizontal" },
           { workspaceId: "w1", direction: "vertical" },
         ]);
+        expect(readPersistedState(getRightSidebarCollapsedKey("w1"), null)).toBeNull();
+        expect(readPersistedState(getRightSidebarLayoutKey("w1"), null)).toBeNull();
       } finally {
-        window.removeEventListener(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, record);
-        window.removeEventListener(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, record);
+        window.removeEventListener(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, claim);
+        window.removeEventListener(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, claim);
       }
     });
   });
+
+  // Without a mounted sidebar (the shell shows a placeholder while the workspace loads), the
+  // palette changes the stored state, so the sidebar shows the result once it mounts.
+  test.each([null, true])("Add Tool opens with collapse preference %s", async (collapsed) => {
+    await withTestWindow(async () => {
+      updatePersistedState(getRightSidebarCollapsedKey("w1"), collapsed);
+      const action = getActions().find((entry) => entry.id === CommandIds.navRightSidebarAddTool());
+      await action!.prompt!.onSubmit({ tool: "review" });
+      expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
+      const layout = readRightSidebarLayout("w1");
+      expect(layout.root).toMatchObject({ tabs: ["review"], activeTab: "review" });
+    });
+  });
+
+  test.each(["horizontal", "vertical"] as const)(
+    "splitting %s reveals the panes",
+    async (direction) => {
+      await withTestWindow(async () => {
+        const id =
+          direction === "horizontal"
+            ? CommandIds.navRightSidebarSplitHorizontal()
+            : CommandIds.navRightSidebarSplitVertical();
+        await getActions()
+          .find((entry) => entry.id === id)!
+          .run();
+        expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
+        expect(readRightSidebarLayout("w1").root).toMatchObject({ type: "split", direction });
+      });
+    }
+  );
 
   test.each(["focus", "add"])(
     "%s terminal reveals an existing session, but does not create one",
