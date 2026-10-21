@@ -38,6 +38,11 @@ test(
     await expect(transcript).toContainText(
       "Asked the agent to update its TODO list and finish open items"
     );
+    // The file_read row of the nudged turn, by the mock's tool call ID (mockAiRouter.ts), which
+    // MessageRenderer puts on the row. No judge saw a planted bug that hid this tool card.
+    await expect(
+      browser.locator('[data-testid="chat-message"][data-tool-call-id="tool-file-read-verify"]')
+    ).toContainText("README.md");
     await agent.assert(
       "after a row that says Xum asked the agent to update its TODO list and finish open " +
         "items, the agent read a " +
