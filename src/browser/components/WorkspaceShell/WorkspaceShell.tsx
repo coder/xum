@@ -18,6 +18,7 @@ import { guardSidebarKeys, holdSidebarInput, type HeldSidebarInput } from "./def
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import {
   isBrowserViewportFocused,
+  isCommandPaletteTarget,
   isDesktopViewportFocused,
   isDialogOpen,
   isTerminalFocused,
@@ -332,6 +333,34 @@ const WorkspacePlaceholder: React.FC<{
 );
 
 /**
+ * True when a keydown toggles the right sidebar: the TOGGLE_RIGHT_SIDEBAR key, with no dialog open
+ * and focus outside the command palette (not a modal dialog, bug bash RS1) and outside terminals,
+ * browser and desktop viewports, which own their keystrokes.
+ */
+function isRightSidebarToggleKey(e: KeyboardEvent): boolean {
+  return (
+    matchesKeybind(e, KEYBINDS.TOGGLE_RIGHT_SIDEBAR) &&
+    !isDialogOpen() &&
+    !isCommandPaletteTarget(e.target) &&
+    !isTerminalFocused(e.target) &&
+    !isBrowserViewportFocused(e.target) &&
+    !isDesktopViewportFocused(e.target)
+  );
+}
+
+/**
+ * Toggles the right sidebar for its hotkey. A collapse unmounts the focused control, and focus then
+ * fell to <body> (bug bash RS3), so focus moves to the header toggle, where a click on that button
+ * leaves it.
+ */
+function toggleRightSidebarFromKey(workspaceId: string, shell: HTMLElement | null): void {
+  const sidebar = shell?.querySelector(".mobile-hide-right-sidebar");
+  const focusWasInSidebar = sidebar?.contains(document.activeElement) === true;
+  if (!toggleRightSidebarCollapsed(workspaceId, shell) || !focusWasInSidebar) return;
+  shell?.querySelector<HTMLElement>('[data-testid="right-sidebar-toggle-bar"] button')?.focus();
+}
+
+/**
  * The right sidebar had no hotkey (user request). It lives in WorkspaceShell, outside the lazy
  * sidebar, so it works while the sidebar chunk loads, like the header toggle. It also works from
  * the chat input: Ctrl+Shift+B types nothing there, like Ctrl+P for the left sidebar.
@@ -342,18 +371,10 @@ function useRightSidebarToggleKey(
 ) {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (!matchesKeybind(e, KEYBINDS.TOGGLE_RIGHT_SIDEBAR) || isDialogOpen()) return;
-      // Terminals, browser and desktop viewports own their keystrokes.
-      if (
-        isTerminalFocused(e.target) ||
-        isBrowserViewportFocused(e.target) ||
-        isDesktopViewportFocused(e.target)
-      ) {
-        return;
-      }
+      if (!isRightSidebarToggleKey(e)) return;
       e.preventDefault();
       // A held key would flip the sidebar on every repeat.
-      if (!e.repeat) toggleRightSidebarCollapsed(workspaceId, shellRef.current);
+      if (!e.repeat) toggleRightSidebarFromKey(workspaceId, shellRef.current);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);

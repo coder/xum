@@ -73,8 +73,11 @@ export function requestFocusedTabFocus(workspaceId: string): void {
  * Returns false, and changes nothing, while the sidebar is not on screen: a narrow window or
  * immersive review hides it, so a flip there would be invisible until later. Immersive review
  * also hides the header toggle (ShellRightSidebarToggle), so the key and the button agree.
+ * The phone full-screen view shows the narrow layout's sidebar, and a collapse there left a blank
+ * view (bug bash RS2), so it counts as narrow too: its own Close button closes it.
  */
 export function toggleRightSidebarCollapsed(workspaceId: string, shell: Element | null): boolean {
+  if (shell?.querySelector(".right-sidebar-fullscreen") != null) return false;
   if (isWorkspaceRightSidebarHidden(shell)) return false;
   if (readPersistedState(getReviewImmersiveKey(workspaceId), false)) return false;
   updatePersistedState<boolean>(
