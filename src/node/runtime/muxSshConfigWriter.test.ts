@@ -8,7 +8,7 @@ import {
   MUX_CODER_SSH_BLOCK_END,
   MUX_CODER_SSH_BLOCK_START,
 } from "@/constants/coder";
-import { ensureMuxCoderSSHConfigFile } from "./muxSshConfigWriter";
+import { ensureManagedSSHConfigBlock, ensureMuxCoderSSHConfigFile } from "./muxSshConfigWriter";
 
 function renderExpectedMuxBlock(coderBinaryPath: string): string {
   const quotedPath = `"${coderBinaryPath.replaceAll('"', String.raw`\"`)}"`;
@@ -47,6 +47,27 @@ describe("ensureMuxCoderSSHConfigFile", () => {
   afterEach(async () => {
     await Promise.all(tempDirs.map((tempDir) => fs.rm(tempDir, { recursive: true, force: true })));
     tempDirs = [];
+  });
+
+  it("keeps both blocks when two providers write the same config at the same time", async () => {
+    const sshConfigPath = await makeSSHConfigPath();
+    await writeSSHConfig(sshConfigPath, "Host work\n  User me\n");
+    const block = (label: string) => ({
+      markers: { start: `# >>> ${label} >>>`, end: `# <<< ${label} <<<`, label },
+      block: [`# >>> ${label} >>>`, `Host *.${label}`, `# <<< ${label} <<<`].join("\n"),
+      sshConfigPath,
+    });
+
+    // Coder and Daytona setups started together, each a read-modify-rename of the file.
+    await Promise.all([
+      ensureManagedSSHConfigBlock(block("first")),
+      ensureManagedSSHConfigBlock(block("second")),
+    ]);
+
+    const content = await readSSHConfig(sshConfigPath);
+    expect(content).toContain("Host *.first");
+    expect(content).toContain("Host *.second");
+    expect(content).toContain("Host work");
   });
 
   it("creates block from an empty config", async () => {

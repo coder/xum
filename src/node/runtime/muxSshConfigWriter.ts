@@ -7,6 +7,7 @@ import {
   MUX_CODER_SSH_BLOCK_END,
   MUX_CODER_SSH_BLOCK_START,
 } from "@/constants/coder";
+import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 
 interface EnsureMuxCoderSSHConfigFileOptions {
   coderBinaryPath: string;
@@ -208,6 +209,9 @@ async function loadSSHConfigContent(
   }
 }
 
+/** Per resolved ssh config path: serializes each managed block's read-modify-rename. */
+const sshConfigFileLocks = new MutexMap<string>();
+
 /** Collision-proof temp path: UUID nonce ensures uniqueness even when concurrent calls share a PID + timestamp. */
 function makeAtomicTempPath(sshConfigPath: string): string {
   return `${sshConfigPath}.mux-tmp.${process.pid}.${Date.now()}.${crypto.randomUUID()}`;
@@ -249,6 +253,18 @@ export async function ensureManagedSSHConfigBlock(opts: {
 
   await fs.mkdir(sshConfigDir, { recursive: true, mode: 0o700 });
 
+  // Coder and Daytona setups can run at once: without the lock both read the old file and the
+  // last rename drops the other's block. (In this process only, like the include file lock.)
+  await sshConfigFileLocks.withLock(sshConfigPath, () =>
+    writeManagedBlock(sshConfigPath, markers, opts.block)
+  );
+}
+
+async function writeManagedBlock(
+  sshConfigPath: string,
+  markers: ManagedBlockMarkers,
+  block: string
+): Promise<void> {
   const { content: existingContent, mode: existingMode } =
     await loadSSHConfigContent(sshConfigPath);
 
@@ -265,8 +281,8 @@ export async function ensureManagedSSHConfigBlock(opts: {
 
   const nextContent =
     startMarkerCount === 1
-      ? replaceMuxBlock(existingContent, opts.block, markers)
-      : appendMuxBlock(existingContent, opts.block);
+      ? replaceMuxBlock(existingContent, block, markers)
+      : appendMuxBlock(existingContent, block);
 
   await writeConfigAtomically(sshConfigPath, nextContent, existingMode);
 }
