@@ -459,6 +459,41 @@ describe("DaytonaService", () => {
     expect(retired).toEqual(["sb-1"]);
   });
 
+  it("shares one gateway refresh between concurrent lookups, so a stale reply cannot win", async () => {
+    const held: Array<{ run: () => Promise<Response>; resolve: (response: Response) => void }> = [];
+    let holdConfig = false;
+    const fetchImpl = ((input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (!holdConfig || !url.endsWith("/config")) return plane.fetch(input, init);
+      return new Promise<Response>((resolve) => {
+        held.push({ run: () => plane.fetch(input, init), resolve });
+      });
+    }) as typeof fetch;
+    const { service: watching, retired } = serviceRecordingWrites(fetchImpl);
+    await watching.ensureSshAccess("sb-1");
+
+    clock += 6 * 60_000;
+    holdConfig = true;
+    const lookups = Promise.all([watching.getGatewayConfig(), watching.getGatewayConfig()]);
+    while (held.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // During a rollout the last request answers first with the new gateway; earlier ones late.
+    for (let i = held.length - 1; i >= 0; i--) {
+      plane.gatewayHostKeys = i === held.length - 1 ? ["ssh-ed25519 NEW"] : ["ssh-ed25519 AAAA"];
+      held[i].resolve(await held[i].run());
+    }
+    const results = await lookups;
+    holdConfig = false;
+
+    expect(held).toHaveLength(1);
+    expect(results.map((config) => config.sshGatewayHostKeys)).toEqual([
+      ["ssh-ed25519 NEW"],
+      ["ssh-ed25519 NEW"],
+    ]);
+    expect((await watching.getGatewayConfig()).sshGatewayHostKeys).toEqual(["ssh-ed25519 NEW"]);
+    expect(retired).toEqual(["sb-1"]);
+  });
+
   it("installs a moved gateway before retiring the connections to the old one", async () => {
     const { service: watching, order, staleAtRetire } = serviceRecordingWrites();
     await watching.ensureSshAccess("sb-1");

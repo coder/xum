@@ -307,6 +307,11 @@ export class DaytonaService {
     fetchedAt: number;
     config: DaytonaGatewayConfig;
   };
+  private gatewayRequest?: {
+    apiUrl: string;
+    generation: number;
+    promise: Promise<DaytonaGatewayConfig>;
+  };
   private readonly tokens = new Map<string, DaytonaSshAccess>();
   /** Bumped (unique per process) whenever a sandbox's cached token becomes another one. */
   private readonly tokenGenerations = new Map<string, number>();
@@ -690,11 +695,32 @@ export class DaytonaService {
     if (cached && this.now() - cached.fetchedAt < DAYTONA_GATEWAY_CONFIG_TTL_MS) {
       return cached.config;
     }
+    // Concurrent lookups share one refresh: a reply that started earlier and arrived last would
+    // otherwise publish the old gateway over the new one.
+    const inFlight = this.gatewayRequest;
+    if (inFlight?.apiUrl === credentials.apiUrl && inFlight.generation === generation) {
+      return inFlight.promise;
+    }
+    const promise = this.refreshGateway(client, credentials.apiUrl, generation, cached).finally(
+      () => {
+        if (this.gatewayRequest?.promise === promise) this.gatewayRequest = undefined;
+      }
+    );
+    this.gatewayRequest = { apiUrl: credentials.apiUrl, generation, promise };
+    return promise;
+  }
+
+  private async refreshGateway(
+    client: DaytonaClient,
+    apiUrl: string,
+    generation: number,
+    cached: ReturnType<DaytonaService["cachedGateway"]>
+  ): Promise<DaytonaGatewayConfig> {
     const config = await client.getConfig();
     // Fetched across a settings change: never cache it for lookups under the new settings.
     if (this.credentialsGeneration !== generation) return config;
     const moved = cached && gatewayIdentity(cached.config) !== gatewayIdentity(config);
-    this.gatewayCache = { apiUrl: credentials.apiUrl, generation, fetchedAt: this.now(), config };
+    this.gatewayCache = { apiUrl, generation, fetchedAt: this.now(), config };
     if (moved) await this.retireSshSetup(config);
     return config;
   }
