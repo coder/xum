@@ -93,10 +93,16 @@ export async function createAppHarness(options?: {
     workspaceId = createResult.metadata.id;
     metadata = createResult.metadata;
 
-    cleanupDom = installDom();
+    const restoreDom = installDom();
     // Like setupTestDom: the workspace tutorial opens 300 ms after a workspace view mounts and
-    // moves focus into its bubble, so focus assertions would race it (#7120).
+    // moves focus into its bubble, so focus assertions would race it (#7120). Cleanup restores
+    // the flag, so later renders in the same test file keep their own tutorial setting.
+    const previousTutorialOptIn = globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__;
     disableTutorial();
+    cleanupDom = () => {
+      restoreDom();
+      globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = previousTutorialOptIn;
+    };
     options?.beforeRender?.(workspaceId);
     view = renderApp({ apiClient: options?.wrapApiClient?.(env.orpc) ?? env.orpc, metadata });
 
