@@ -1,6 +1,6 @@
 ---
 name: gauntlet
-description: Read and fix DRY gate findings (make dry-check, Quality / DRY). Use when a dry-check report names a new near-duplicate, or before you copy a function and edit the copy.
+description: Read and fix DRY and mutation gate findings (make dry-check, make mutate-check, Quality / DRY, Quality / Mutation). Use when a report names a new near-duplicate or a surviving mutant, or before you copy a function and edit the copy.
 ---
 
 # Gauntlet gates
@@ -41,3 +41,43 @@ warning  new-duplicate score 1.00 src/x.ts:41-46 feeBucket
 
 Never merge two functions only to clear a DRY finding. A wrong abstraction
 costs more than a copy.
+
+## Mutation gate
+
+`make mutate-check` (or `bun scripts/mutate/check.ts --base <ref>`) makes
+small changes ("mutants") in the functions you changed, one at a time: `===`
+to `!==`, `>` to `>=`, `&&` to `||`, `??` to `||`, `true` to `false`, `0` to
+`1`, and more ([mutator](https://github.com/unclebob/mutator)'s rules). For
+each mutant it runs the Bun unit tests that import the file. A mutant that no
+test fails on "survived": no test checks that behaviour.
+
+```
+mutate-check: 2 survived, 7 killed, 0 uncovered, 0 without a test, 0 not run
+  src/x.ts  (tests: src/x.test.ts, src/y.test.ts)
+    survived :61 === -> !==  parseCap
+```
+
+- Tests: the colocated test first, then the nearest other unit tests that
+  import the file directly, at most 10. Each test file runs in its own
+  `bun test` process, in a private copy of the tracked files. The first
+  failing file kills the mutant. A timeout (10x the file's own time, at
+  least 2 s) also kills it.
+- Exit 0 no survivors, 1 survivors, 2 tool error, 3 baseline failure: a test
+  file failed without a mutant, so the run dropped it. Fix that test first.
+- `uncovered`: with `--coverage <lcov>` (CI uses the Test / Unit reports), a
+  site on a line that no test ran does not run. `no-test`: no passing unit
+  test imports the file. `not-run`: the run stopped at its limit (CI: 300
+  mutants or 15 minutes).
+- Locally it runs on 4 workers at most (`--workers N`). Start with a small
+  change: every site in a touched function runs.
+
+### Repair
+
+1. Write a test that fails for the mutant. Assert the behaviour that the
+   mutant breaks (the boundary, the other branch), not the line.
+2. If no input can tell the mutant from the original, it is equivalent. For
+   example, `m[2] ?? ""` and `m[2] || ""` are the same when `m[2]` is never
+   `""`. Say so in the PR and move on.
+
+Never change production code only to kill a mutant, and never add a test
+without a real assertion. The CRAP gate's anti-gaming rules apply here too.

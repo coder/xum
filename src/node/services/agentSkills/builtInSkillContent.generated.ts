@@ -2106,7 +2106,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- Xum sources `.xum/tool_env` before every `bash` tool call; in other harnesses, `source .xum/tool_env` first. Use `run_and_report <step_name> <command...>` when running multiple validation steps in one call.",
       "- Do not pipe/redirect/wrap `run_and_report` output; keep helper markers intact so Xum can show clean step status.",
       "- CRAP gate: `make crap-check` scores the functions you changed. When it (or the report after an agent `git commit`/`git push`) names a function, read the `crap-gate` skill (`.xum/skills/crap-gate/SKILL.md`) before fixing it.",
-      "- DRY gate: `make dry-check` reports near-duplicate functions that your change makes. It only warns. Before you fix a finding, read the `gauntlet` skill (`.xum/skills/gauntlet/SKILL.md`).",
+      "- DRY and mutation gates: `make dry-check` reports near-duplicate functions that your change makes, and `make mutate-check` reports mutants in the functions you changed that the unit tests do not kill. Both only warn. Before you fix a finding, read the `gauntlet` skill (`.xum/skills/gauntlet/SKILL.md`).",
       "- `./scripts/wait_pr_ready.sh <pr_number>` is the preferred tail-end helper after local validation and after you've exhausted useful local work.",
       "- `./scripts/wait_pr_checks.sh <pr_number>` is the checks watcher; `wait_pr_ready.sh` must execute `wait_pr_checks.sh --once` on each loop iteration.",
       "- `./scripts/wait_pr_codex.sh <pr_number>` is the Codex gate used by `wait_pr_ready.sh`.",
