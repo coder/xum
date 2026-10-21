@@ -1163,6 +1163,13 @@ function archivedResult(warnings: string[]): { kind: "archived"; warnings?: stri
   return warnings.length > 0 ? { kind: "archived", warnings } : { kind: "archived" };
 }
 
+function toBulkArchiveWarnings(
+  workspaceId: string,
+  warnings: string[] | undefined
+): Array<{ workspaceId: string; warning: string }> {
+  return (warnings ?? []).map((warning) => ({ workspaceId, warning }));
+}
+
 /**
  * A remote box Xum created for this workspace (not an existing one it connected to): a Coder
  * workspace, or a Daytona sandbox, which reuses the Coder archive behavior (keep, stop, delete).
@@ -14139,9 +14146,7 @@ export class WorkspaceService
           continue;
         }
         archivedWorkspaceIds.push(workspaceId);
-        for (const warning of result.data.warnings ?? []) {
-          warnings.push({ workspaceId, warning });
-        }
+        warnings.push(...toBulkArchiveWarnings(workspaceId, result.data.warnings));
       }
 
       archivedWorkspaceIds.sort();
