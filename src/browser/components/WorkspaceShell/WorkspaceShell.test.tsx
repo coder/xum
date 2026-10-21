@@ -1,5 +1,6 @@
 import "../../../../tests/ui/dom";
 
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { act, cleanup, fireEvent, render as renderUnwrapped } from "@testing-library/react";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -18,6 +19,7 @@ import * as RealOpenTerminalModule from "@/browser/hooks/useOpenTerminal";
 import * as RealReviewsModule from "@/browser/hooks/useReviews";
 import * as RealConnectionStatusToastModule from "@/browser/components/ConnectionStatusToast/ConnectionStatusToast";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import { loadReactCompiledModule } from "../../../../tests/ui/reactCompiledModule";
 
 interface MockWorkspaceState {
   loading?: boolean;
@@ -208,6 +210,20 @@ void mock.module("@/browser/components/ConnectionStatusToast/ConnectionStatusToa
 }));
 
 import { WorkspaceShell, estimateWorkspaceShellFallbackWidthPx } from "./WorkspaceShell";
+
+/**
+ * The shell as production builds it. React Compiler reuses a child's element while the props
+ * it is built from keep their values, and Bun loads sources uncompiled, so only this copy shows a
+ * child that reads shell state behind React's back (a persisted key read during render) going
+ * stale. Loaded per test, after the module mocks above.
+ */
+function loadCompiledWorkspaceShell(): typeof WorkspaceShell {
+  const compiled = loadReactCompiledModule(path.join(import.meta.dir, "WorkspaceShell.tsx"));
+  if (typeof compiled.WorkspaceShell !== "function") {
+    throw new Error("WorkspaceShell.tsx must export WorkspaceShell");
+  }
+  return compiled.WorkspaceShell as typeof WorkspaceShell;
+}
 
 // The app renders the shell inside its TooltipProvider (the right sidebar toggle has a tooltip).
 const render = (ui: ReactElement) => renderUnwrapped(ui, { wrapper: TooltipProvider });
@@ -547,11 +563,13 @@ describe("WorkspaceShell loading placeholders", () => {
     });
 
     // The toggle lives in the shell, not the lazy sidebar, so it already works while the chunk
-    // loads.
+    // loads. Compiled, as it ships: the loading box must follow the shell's state, not a read of
+    // the persisted key that nothing re-renders it for.
     it("expands the loading sidebar from the right sidebar toggle", () => {
+      const CompiledWorkspaceShell = loadCompiledWorkspaceShell();
       gateSidebar();
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
-      const view = render(<WorkspaceShell {...defaultProps} />);
+      const view = render(<CompiledWorkspaceShell {...defaultProps} />);
       const box = () => view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
       expect(box()?.style.width).toBe("0px");
 

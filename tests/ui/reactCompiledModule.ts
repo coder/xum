@@ -10,9 +10,9 @@ import { reactCompilerConfig } from "@/vite/reactCompilerConfig";
  * config from vite. Bun and Jest load sources without the compiler, so a plain test cannot see
  * what the compiler memoizes.
  *
- * The compiled module is evaluated with this file's (Jest) require, with relative imports resolved
- * against the module's own folder. So it shares React, the stores and the contexts with the test,
- * and no global loader or config changes.
+ * The compiled module is evaluated with this file's require (Jest's or Bun's), with relative
+ * imports resolved against the module's own folder. So it shares React, the stores and the
+ * contexts with the test, and no global loader or config changes.
  */
 export function loadReactCompiledModule(modulePath: string): Record<string, unknown> {
   const compiled = transformSync(readFileSync(modulePath, "utf8"), {
@@ -23,6 +23,7 @@ export function loadReactCompiledModule(modulePath: string): Record<string, unkn
     presets: [
       ["@babel/preset-env", { targets: { node: "current" }, modules: "commonjs" }],
       "@babel/preset-typescript",
+      ["@babel/preset-react", { runtime: "automatic" }],
     ],
     plugins: [["babel-plugin-react-compiler", reactCompilerConfig]],
   });
