@@ -174,6 +174,18 @@ function renderIncludeFile(blocks: Map<string, string>): string {
   return `${[INCLUDE_FILE_HEADER, ...blocks.values()].join("\n\n")}\n`;
 }
 
+function tokensIn(blocks: Map<string, string>): Array<{ sandboxId: string; token: string }> {
+  const suffix = `.${XUM_DAYTONA_HOST_SUFFIX}`;
+  const tokens: Array<{ sandboxId: string; token: string }> = [];
+  for (const [alias, block] of blocks) {
+    const token = /^\s*User\s+(\S+)\s*$/m.exec(block)?.[1];
+    if (alias.endsWith(suffix) && token) {
+      tokens.push({ sandboxId: alias.slice(0, -suffix.length), token });
+    }
+  }
+  return tokens;
+}
+
 // One lock per include file across writer instances: blocks of different sandboxes share it.
 const includeFileLocks = new MutexMap<string>();
 
@@ -202,11 +214,21 @@ export class DaytonaSshConfigWriter {
     gateway: DaytonaSshGateway;
   }): Promise<void> {
     await ensurePrivateDir(this.paths.dir);
-    await writeFileAtomic(this.paths.knownHostsPath, renderDaytonaKnownHosts(input.gateway), {
-      encoding: "utf-8",
-      mode: 0o600,
+    const knownHosts = renderDaytonaKnownHosts(input.gateway);
+    await includeFileLocks.withLock(this.paths.includePath, async () => {
+      await writeFileAtomic(this.paths.knownHostsPath, knownHosts, {
+        encoding: "utf-8",
+        mode: 0o600,
+      });
+      // known_hosts is shared by every alias: a gateway change repoints them all (each keeps its
+      // token) in the same step, or another sandbox's turn would dial the old host with new pins.
+      const blocks = await this.readBlocks();
+      for (const other of tokensIn(blocks)) {
+        blocks.set(toXumDaytonaHost(other.sandboxId), this.renderBlock({ ...input, ...other }));
+      }
+      blocks.set(toXumDaytonaHost(input.sandboxId), this.renderBlock(input));
+      await this.writeBlocks(blocks);
     });
-    await this.upsertBlock(input);
     await ensureManagedSSHConfigBlock({
       markers: {
         start: XUM_DAYTONA_SSH_BLOCK_START,
@@ -239,15 +261,11 @@ export class DaytonaSshConfigWriter {
 
   /** The sandbox ids and tokens the include file holds (written by this or an earlier process). */
   async readTokens(): Promise<Array<{ sandboxId: string; token: string }>> {
-    const suffix = `.${XUM_DAYTONA_HOST_SUFFIX}`;
-    const tokens: Array<{ sandboxId: string; token: string }> = [];
-    for (const [alias, block] of await this.readBlocks()) {
-      const token = /^\s*User\s+(\S+)\s*$/m.exec(block)?.[1];
-      if (alias.endsWith(suffix) && token) {
-        tokens.push({ sandboxId: alias.slice(0, -suffix.length), token });
-      }
-    }
-    return tokens;
+    return tokensIn(await this.readBlocks());
+  }
+
+  private renderBlock(input: { sandboxId: string; token: string; gateway: DaytonaSshGateway }) {
+    return renderDaytonaHostBlock({ ...input, knownHostsPath: this.paths.knownHostsPath });
   }
 
   private upsertBlock(input: {
@@ -255,7 +273,7 @@ export class DaytonaSshConfigWriter {
     token: string;
     gateway: DaytonaSshGateway;
   }): Promise<void> {
-    const block = renderDaytonaHostBlock({ ...input, knownHostsPath: this.paths.knownHostsPath });
+    const block = this.renderBlock(input);
     const alias = toXumDaytonaHost(input.sandboxId);
     return includeFileLocks.withLock(this.paths.includePath, async () => {
       const blocks = await this.readBlocks();

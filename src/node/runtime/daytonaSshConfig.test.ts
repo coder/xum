@@ -94,6 +94,35 @@ describe("DaytonaSshConfigWriter", () => {
     expect(afterRemove).toContain("Host sb-2.xum--daytona");
   });
 
+  it("repoints every sandbox at a new gateway in the write that replaces its host keys", async () => {
+    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxId: "sb-2", token: "tokenB", gateway: GATEWAY });
+    const moved = {
+      host: "ssh2.daytona.test",
+      port: 2222,
+      hostKeys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINewGatewayKey"],
+    };
+
+    // sb-1 is refreshed first; sb-2 still has a turn on the shared known_hosts file.
+    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA2", gateway: moved });
+
+    const include = await fs.readFile(writer.paths.includePath, "utf8");
+    expect(include).not.toContain("ssh.daytona.test");
+    expect(include).toContain(
+      [
+        "Host sb-2.xum--daytona",
+        "  HostName ssh2.daytona.test",
+        "  Port 2222",
+        "  User tokenB",
+        "  HostKeyAlias ssh2.daytona.test",
+      ].join("\n")
+    );
+    expect(await writer.readTokens()).toEqual([
+      { sandboxId: "sb-1", token: "tokenA2" },
+      { sandboxId: "sb-2", token: "tokenB" },
+    ]);
+  });
+
   it("reads back the tokens the include file holds, for a later Xum process", async () => {
     const later = new DaytonaSshConfigWriter({ xumHome, sshConfigPath });
     expect(await later.readTokens()).toEqual([]);
