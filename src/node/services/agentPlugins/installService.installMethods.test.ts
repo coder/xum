@@ -171,6 +171,20 @@ describe("AgentPluginInstallService install methods", () => {
     expect(own.methods).toEqual([{ kind: "agent-plugin" }]);
   });
 
+  test("a preview without a method skips an invalid Claude manifest and names it", async () => {
+    await write({ ".claude-plugin/plugin.json": "{ not json" });
+    await commit("broken claude manifest");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.method).toEqual({ kind: "skills" });
+    expect(preview.methods).toEqual([{ kind: "claude-plugin" }, { kind: "skills" }]);
+    expect(preview.warnings.some((warning) => warning.startsWith("Claude Code plugin:"))).toBe(
+      true
+    );
+    await expect(
+      service.preview({ input: remoteDir, method: { kind: "claude-plugin" } })
+    ).rejects.toThrow("Invalid plugin");
+  });
+
   test("an update regenerates the manifest and reviews a new skill", async () => {
     await installAsSkills(["alpha", "beta"]);
     await write({ "skills/gamma/SKILL.md": skillMd("gamma") });
@@ -215,6 +229,14 @@ describe("AgentPluginInstallService install methods", () => {
     expect(manifest.extensions).toBeUndefined();
     const { plugin } = await discoverAgentPluginAt({ pluginDir: installedDir(), scope: "global" });
     expect(plugin?.hooksPath).toBeDefined();
+
+    // Without that plugin.json again, the update names the way out instead of claiming that
+    // the repository has no SKILL.md files.
+    await fsPromises.rm(path.join(remoteDir, "plugin.json"));
+    await commit("drop own manifest");
+    await expect(service.previewUpdate({ name: "acme-skills" })).rejects.toThrow(
+      "it fits: Skills. Uninstall the plugin and install it again"
+    );
   });
 
   test("a folder name that makes no valid plugin name stops the preview", async () => {
