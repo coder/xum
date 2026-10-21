@@ -49,6 +49,7 @@ import {
   DAYTONA_LABEL_INSTANCE,
   DAYTONA_LABEL_WORKSPACE_ID,
   DAYTONA_START_TIMEOUT_MS,
+  notOwnedSandboxNotice,
   unsupportedDaytonaSandboxKind,
   type UnsupportedDaytonaSandboxKind,
   type DaytonaAccount,
@@ -942,7 +943,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         return;
       }
       initLogger.logStep(`Deleting the sandbox "${sandboxId}" this setup created...`);
-      await this.daytonaService.deleteSandbox(sandboxId, create.account);
+      if ((await this.daytonaService.deleteSandbox(sandboxId, create.account)) === "notOwned") {
+        log.warn("Not deleting a Daytona sandbox without this install's label", { sandboxId });
+        initLogger.logStderr(notOwnedSandboxNotice(sandboxId));
+      }
     } catch (error) {
       // The persisted workspace still names the sandbox, so the reconciler leaves it alone;
       // removing the workspace deletes it.
@@ -1179,7 +1183,11 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   ): Promise<DeleteResult | undefined> {
     return this.daytonaService.withSandboxRemovalLock(async () => {
       if ((await this.sandboxFateOnDelete(sandboxId)) !== "delete") return undefined;
-      const result = await this.deleteOwnedSandbox(sandboxId, deletedPath, undefined);
+      const result = await this.deleteOwnedSandbox(
+        sandboxId,
+        { success: true, deletedPath },
+        undefined
+      );
       // Forced: the workspace goes whether or not the sandbox delete worked.
       this.recordRemoval();
       return result;
@@ -1300,7 +1308,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     removal: SandboxRemoval
   ): Promise<DeleteResult> {
     if (fate === "delete") {
-      return this.deleteOwnedSandbox(sandboxId, result.deletedPath, removal.errorPrefix);
+      return this.deleteOwnedSandbox(sandboxId, result, removal.errorPrefix);
     }
     if (fate === "handOff") return this.handOffSandbox(sandboxId, result, removal);
     await this.releaseAccessOnDelete(sandboxId, fate);
@@ -1401,14 +1409,19 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     }
   }
 
+  /** A sandbox without this install's label stays: only Xum's access to it goes. */
   private async deleteOwnedSandbox(
     sandboxId: string,
-    deletedPath: string,
+    result: RemovedCheckout,
     errorPrefix: string | undefined
   ): Promise<DeleteResult> {
     try {
-      await this.daytonaService.deleteSandbox(sandboxId);
-      return { success: true, deletedPath };
+      if ((await this.daytonaService.deleteSandbox(sandboxId)) === "deleted") {
+        return { success: true, deletedPath: result.deletedPath };
+      }
+      await this.releaseAccessOnDelete(sandboxId, "release");
+      const notice = [result.notice, notOwnedSandboxNotice(sandboxId)].filter(Boolean).join(" ");
+      return { ...result, notice };
     } catch (error) {
       const message = getErrorMessage(error);
       log.error("Failed to delete Daytona sandbox", { sandboxId, error: message });

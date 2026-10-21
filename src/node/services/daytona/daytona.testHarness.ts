@@ -6,7 +6,7 @@ import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
 import type { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import type { SSHTransport } from "@/node/runtime/transports";
 import type { DaytonaWorkspaceRef } from "./daytonaReconciler";
-import { DaytonaService } from "./daytonaService";
+import { DAYTONA_LABEL_INSTANCE, DaytonaService } from "./daytonaService";
 
 /**
  * In-memory Daytona control plane for unit tests: enough of the REST API (by id or name, as
@@ -58,6 +58,8 @@ export class FakeDaytonaControlPlane {
   omitCompute = false;
   /** Resources a sandbox gets when created without any. */
   snapshotResources = { cpu: 1, memory: 1, disk: 3 };
+  /** Labels of a sandbox added without any; the rig makes it this install's. */
+  defaultLabels: Record<string, string> = {};
   /** Routes (`METHOD /path`) that never answer, for timeout tests. */
   readonly hangingRoutes = new Set<string>();
   /** Routes (`METHOD /path`) that answer 500. */
@@ -91,7 +93,7 @@ export class FakeDaytonaControlPlane {
       cpu: 2,
       memory: 4,
       disk: 10,
-      labels: {},
+      labels: { ...this.defaultLabels },
       pendingPolls: 0,
       ...partial,
     };
@@ -356,11 +358,16 @@ export async function createDaytonaTestRig(
     },
     listWorkspaces: () => workspaces,
   });
+  // Sandboxes a test adds count as ones Xum created, as most tests need; a foreign one sets
+  // its own labels.
+  const ownLabels = { [DAYTONA_LABEL_INSTANCE]: await service.getInstanceId() };
+  plane.defaultLabels = ownLabels;
   return {
     rootDir,
     plane,
     addAccount: (apiKey) => {
       const account = new FakeDaytonaControlPlane(() => clock.now);
+      account.defaultLabels = ownLabels;
       accounts.set(apiKey, account);
       return account;
     },

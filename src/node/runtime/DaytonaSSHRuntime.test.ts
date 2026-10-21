@@ -712,6 +712,42 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     expect(rig.plane.find("xum-theirs")).toBe(other);
   });
 
+  it("never deletes a sandbox without this install's label when the failed workspace is removed", async () => {
+    const sshDelete = spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
+      success: true,
+      deletedPath: "/path",
+    });
+    try {
+      // The create failed ambiguously while another install's sandbox held the name.
+      rig.plane.failingRoutes.add("POST /sandbox");
+      const other = rig.plane.addSandbox({
+        id: "sb-other",
+        name: "xum-theirs",
+        labels: { "xum.instance": "another-install", "xum.workspaceId": "ws-1" },
+      });
+      const daytona = { sandboxId: "xum-theirs", shared: false, ...SMALL };
+      await makeRuntime(daytona)
+        .postCreateSetup(initParams())
+        .catch(() => undefined);
+      rig.plane.failingRoutes.clear();
+
+      // The persisted workspace still says Xum created it; neither removal deletes it.
+      for (const force of [false, true]) {
+        const removal = await makeRuntime(daytona).deleteWorkspace(
+          "/home/me/project",
+          "feature",
+          force
+        );
+        expect(removal.success).toBe(true);
+        if (removal.success) expect(removal.notice).toContain("xum.instance");
+        expect(rig.plane.find("xum-theirs")).toBe(other);
+      }
+      expect(rig.plane.countCalls("DELETE /sandbox/xum-theirs")).toBe(0);
+    } finally {
+      sshDelete.mockRestore();
+    }
+  });
+
   it("seeds the agent home of a created sandbox but never of an attached one", async () => {
     const hostXum = path.join(rig.rootDir, "host-xum");
     await fs.mkdir(hostXum, { recursive: true });

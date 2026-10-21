@@ -5,7 +5,7 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import type { BeforeArchiveHook } from "@/node/services/workspaceLifecycleHooks";
-import type { DaytonaService } from "./daytonaService";
+import { notOwnedSandboxNotice, type DaytonaService } from "./daytonaService";
 
 const DAYTONA_STOP_TIMEOUT_MS = 60_000;
 
@@ -154,7 +154,10 @@ async function deleteForArchive(
     ? await options.checkSandboxDeletable(args.workspaceMetadata)
     : Err("its worktree could not be checked for uncommitted work");
   if (check.success) {
-    await options.daytonaService.deleteSandbox(sandboxId);
+    // Not Xum's after all (see deleteSandbox): it is neither deleted nor stopped.
+    if ((await options.daytonaService.deleteSandbox(sandboxId)) === "notOwned") {
+      args.reportWarning?.(notOwnedSandboxNotice(sandboxId));
+    }
     return Ok(undefined);
   }
   log.warn("Daytona sandbox kept on archive: the delete checks failed", {

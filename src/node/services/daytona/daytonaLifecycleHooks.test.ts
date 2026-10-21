@@ -98,6 +98,22 @@ describe("createDaytonaArchiveHook", () => {
     expect(rig.writer.tokens.has("sb-waking")).toBe(false);
   });
 
+  it("keeps a sandbox without this install's label on archive delete, and says why", async () => {
+    rig.plane.addSandbox({ id: "sb-foreign", labels: { "xum.instance": "another-install" } });
+    const warnings: string[] = [];
+
+    const result = await archive(
+      { sandboxId: "sb-foreign", shared: false },
+      "delete",
+      cleanCheck,
+      (w) => warnings.push(w)
+    );
+
+    expect(result.success).toBe(true);
+    expect(rig.plane.find("sb-foreign")?.state).toBe("started");
+    expect(warnings.join(" ")).toContain("xum.instance");
+  });
+
   it("never stops or deletes an attached or shared sandbox", async () => {
     rig.plane.addSandbox({ id: "sb-users" });
 

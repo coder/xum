@@ -64,6 +64,14 @@ export function unsupportedDaytonaSandboxKind(item: {
 }
 
 export const DAYTONA_LABEL_INSTANCE = "xum.instance";
+
+/** Why a delete of a sandbox the workspace says Xum created kept it (see deleteSandbox). */
+export function notOwnedSandboxNotice(sandboxId: string): string {
+  return (
+    `Daytona sandbox "${sandboxId}" was kept: it does not carry this Xum install's ` +
+    `"${DAYTONA_LABEL_INSTANCE}" label, so Xum did not create it.`
+  );
+}
 export const DAYTONA_LABEL_WORKSPACE_ID = "xum.workspaceId";
 export const DAYTONA_LABEL_PROJECT = "xum.project";
 
@@ -1087,12 +1095,20 @@ export class DaytonaService {
   }
 
   /**
-   * Delete the sandbox and drop Xum's SSH access to it (token and include block). A sandbox
-   * that is already gone counts as deleted. `account` deletes it in the account it was
+   * Delete a sandbox Xum created and drop Xum's SSH access to it (token and include block). A
+   * sandbox that is already gone counts as deleted. `account` deletes it in the account it was
    * created in, even after the settings changed to another one.
+   *
+   * A workspace's `shared: false` is not proof: a create of unknown outcome may have left it
+   * naming a sandbox someone else holds. So only a sandbox with this install's label is
+   * deleted; "notOwned" leaves it, and its access, to the caller.
    */
-  async deleteSandbox(sandboxId: string, account?: DaytonaAccount): Promise<void> {
+  async deleteSandbox(
+    sandboxId: string,
+    account?: DaytonaAccount
+  ): Promise<"deleted" | "notOwned"> {
     const client = await this.clientOf(account);
+    if (!(await this.carriesInstanceLabel(client, sandboxId))) return "notOwned";
     // Revoke first: Daytona refuses to revoke a token of a sandbox that no longer exists.
     await this.releaseSshAccess(sandboxId);
     try {
@@ -1100,6 +1116,19 @@ export class DaytonaService {
     } catch (error) {
       if (!isDaytonaNotFound(error)) throw error;
     }
+    return "deleted";
+  }
+
+  /** True for a sandbox that is gone: there is nothing left to protect. */
+  private async carriesInstanceLabel(client: DaytonaClient, sandboxId: string): Promise<boolean> {
+    let sandbox: DaytonaSandbox;
+    try {
+      sandbox = await client.getSandbox(sandboxId);
+    } catch (error) {
+      if (isDaytonaNotFound(error)) return true;
+      throw error;
+    }
+    return sandbox.labels?.[DAYTONA_LABEL_INSTANCE] === (await this.getInstanceId());
   }
 
   async refreshActivity(sandboxId: string): Promise<void> {
