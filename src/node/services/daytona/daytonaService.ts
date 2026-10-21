@@ -208,6 +208,8 @@ export class DaytonaService {
   private gatewayCache?: { apiUrl: string; config: DaytonaGatewayConfig };
   private readonly tokens = new Map<string, DaytonaSshAccess>();
   private readonly tokenRequests = new Map<string, Promise<DaytonaSshAccess>>();
+  /** Bumped by every settings change, so a mint that spans one can tell. */
+  private credentialsGeneration = 0;
   private readonly sshConfigWriter: NonNullable<DaytonaServiceOptions["sshConfigWriter"]>;
   /** Sandboxes whose include block and `~/.ssh/config` block this process has written. */
   private readonly sshConfigured = new Set<string>();
@@ -257,6 +259,8 @@ export class DaytonaService {
   async setConfig(patch: DaytonaCredentialsPatch): Promise<DaytonaPublicConfig> {
     const previousClient = await this.getClientIfConfigured();
     await this.credentialsStore.update(patch);
+    // A mint in flight finishes under the old settings: it sees the bump and starts over.
+    this.credentialsGeneration++;
     // Tokens and gateway data belong to the old account or deployment. Revoke the tokens with
     // the old credentials, which may not work for the new ones.
     const tokens = [...this.tokens];
@@ -700,9 +704,13 @@ export class DaytonaService {
     previous: DaytonaSshAccess | undefined,
     options: DaytonaSshTokenOptions
   ): Promise<DaytonaSshAccess> {
+    const generation = this.credentialsGeneration;
     const { client } = await this.getClient();
     const access = await client.createSshAccess(sandboxId, DAYTONA_SSH_TOKEN_TTL_MINUTES);
     rememberDaytonaToken(access.token);
+    if (generation !== this.credentialsGeneration) {
+      return this.remintAfterSettingsChange(client, sandboxId, access, options);
+    }
     try {
       await options.onNewToken?.(access);
     } catch (error) {
@@ -710,11 +718,30 @@ export class DaytonaService {
       await this.revokeQuietly(client, sandboxId, access.token);
       throw error;
     }
+    if (generation !== this.credentialsGeneration) {
+      // The retry's onNewToken overwrites what this one wrote.
+      return this.remintAfterSettingsChange(client, sandboxId, access, options);
+    }
     this.tokens.set(sandboxId, access);
     if (previous && previous.token !== access.token) {
       await this.revokeQuietly(client, sandboxId, previous.token);
     }
     return access;
+  }
+
+  /**
+   * The settings changed while this token was minted: it belongs to the old account, which
+   * setConfig already revoked everything else of. Revoke it with the client that minted it,
+   * never cache it, and mint again with the new settings for the waiting callers.
+   */
+  private async remintAfterSettingsChange(
+    client: DaytonaClient,
+    sandboxId: string,
+    stale: DaytonaSshAccess,
+    options: DaytonaSshTokenOptions
+  ): Promise<DaytonaSshAccess> {
+    await this.revokeQuietly(client, sandboxId, stale.token);
+    return this.mintSshToken(sandboxId, undefined, options);
   }
 
   /** Revoke and forget the cached token (workspace deleted or sandbox detached). */

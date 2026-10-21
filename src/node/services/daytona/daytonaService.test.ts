@@ -211,6 +211,52 @@ describe("DaytonaService", () => {
     expect(plane.revoked).toEqual([]);
   });
 
+  it("revokes a token minted across a settings change instead of writing or caching it", async () => {
+    let mintStarted!: () => void;
+    const started = new Promise<void>((resolve) => (mintStarted = resolve));
+    let releaseMint!: () => void;
+    const released = new Promise<void>((resolve) => (releaseMint = resolve));
+    let held = false;
+    const fetchHoldingFirstMint = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (!held && init?.method === "POST" && url.includes("/ssh-access")) {
+        held = true;
+        mintStarted();
+        await released;
+      }
+      return plane.fetch(input, init);
+    }) as typeof fetch;
+    const written: string[] = [];
+    const store = (input: { token: string }) => {
+      written.push(input.token);
+      return Promise.resolve();
+    };
+    const withHeldMint = new DaytonaService({
+      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
+      rootDir,
+      fetch: fetchHoldingFirstMint,
+      now: () => clock,
+      sshConfigWriter: {
+        writeSandbox: store,
+        updateToken: store,
+        removeSandbox: () => Promise.resolve(),
+        readTokens: () => Promise.resolve([]),
+        verifyResolvedConfig: () => Promise.resolve(),
+      },
+    });
+
+    const access = withHeldMint.ensureSshAccess("sb-1");
+    await started;
+    await withHeldMint.setConfig({ target: "eu" });
+    releaseMint();
+    await access;
+
+    // tok1 was minted under the old settings: revoked, never written or kept.
+    expect(plane.revoked).toEqual(["tok1"]);
+    expect(written).not.toContain("tok1");
+    expect((await withHeldMint.getSshToken("sb-1")).token).not.toBe("tok1");
+  });
+
   it("revokes the tokens an earlier process left in the include file once it replaces them", async () => {
     // The include file, shared by every Xum process (a restart is a new service).
     const includeFile = new Map([["sb-1", "earlier-process-token"]]);
