@@ -11,7 +11,12 @@ import type { AgentPluginImportedComponents } from "@/common/config/schemas/agen
 import { getErrorMessage } from "@/common/utils/errors";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { log } from "@/node/services/log";
-import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import {
+  ensurePathContained,
+  hasErrorCode,
+  SKILL_FILENAME,
+} from "@/node/services/tools/skillFileUtils";
+import { SkillNameSchema } from "@/common/orpc/schemas";
 import { isMutationEpochUnreadable, readContainerMutationState } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginComponentImports } from "./registry";
 import { noComponentConsent, type ComponentConsent } from "./componentConsent";
@@ -28,6 +33,7 @@ import {
   type OpenAIPluginExtension,
 } from "./openaiExtension";
 import { normalizeClaudeManifest, type ClaudePluginComponents } from "./claudeManifest";
+import { pluginSkillFileName } from "./claudeCommands";
 
 /**
  * Agent Plugins 1.0.0 discovery (§4, §6).
@@ -272,8 +278,9 @@ export interface AgentPluginInfo {
    */
   openaiManifestPath?: string;
   /**
-   * Canonical skills roots in declared order (`skills/` by default, or `contributes.skills`).
-   * Each one exists, is a directory, and stays inside the root (§6.2). Absent when none does.
+   * Canonical skills roots in declared order (`skills/` by default, or `contributes.skills`),
+   * then a Claude package's command roots. Each one exists, is a directory, and stays inside
+   * the root (§6.2). Absent when none does.
    */
   skillsDirs?: PluginSkillsRoot[];
   /** Canonical `mcp.json` path; present only when it exists, is a regular file, and stays inside the root (§6.2). */
@@ -302,29 +309,40 @@ export interface AgentPluginInfo {
  */
 export type PluginSkillsRoot =
   /** Holds `<name>/SKILL.md` skill folders. */
-  | { dir: string; single?: undefined; name?: undefined }
+  | { dir: string; single?: undefined; name?: undefined; command?: undefined }
   /**
    * Holds SKILL.md itself. `name` is the folder name as declared, or the plugin name when the
    * path is the plugin root. It is not validated here: scan sites reject an invalid skill name.
+   * `command`: a Claude command instead, the file `<dir>/<name>.md` (claudeCommands.ts). Its
+   * `dir` is the commands folder and its name is valid. Command roots follow every skills root,
+   * so a skill of the same name wins; discovery drops such a command with a warning.
    */
-  | { dir: string; single: true; name: string };
+  | { dir: string; single: true; name: string; command?: true };
 
 /**
  * The skill folders of one skills root, sorted: the root itself when it is a single skill, else
  * its subfolders, symlinks included (runtime discovery follows them, so consent must list them).
- * Names are not validated: callers report an invalid one.
+ * `file` is the skill's Markdown file (SKILL.md, or a command's `<name>.md`). Names are not
+ * validated: callers report an invalid one.
  */
 export async function listPluginSkillFolders(
   root: PluginSkillsRoot
-): Promise<Array<{ name: string; dir: string }>> {
-  if (root.single) return [{ name: root.name, dir: root.dir }];
+): Promise<Array<{ name: string; dir: string; file: string }>> {
+  if (root.single) {
+    const file = path.join(root.dir, pluginSkillFileName(root.name, root.command));
+    return [{ name: root.name, dir: root.dir, file }];
+  }
   try {
     const entries = await fsPromises.readdir(root.dir, { withFileTypes: true });
     return entries
       .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
       .map((entry) => entry.name)
       .sort((a, b) => a.localeCompare(b))
-      .map((name) => ({ name, dir: path.join(root.dir, name) }));
+      .map((name) => ({
+        name,
+        dir: path.join(root.dir, name),
+        file: path.join(root.dir, name, SKILL_FILENAME),
+      }));
   } catch {
     return [];
   }
@@ -531,6 +549,79 @@ async function classifySkillsRoot(args: {
   return { dir: args.canonical, single: true, name };
 }
 
+/** Commands read per plugin: each one is a skills root that every scan site visits. */
+export const MAX_PLUGIN_COMMANDS = 256;
+
+/** The `<name>.md` command files a `commands` path names: one file, or a folder's flat files. */
+async function listCommandFiles(
+  relative: string,
+  resolveComponent: (
+    relativePath: string,
+    expectKind: "file" | "directory"
+  ) => Promise<string | undefined>
+): Promise<Array<{ dir: string; file: string }>> {
+  if (relative.endsWith(".md")) {
+    const canonical = await resolveComponent(relative, "file");
+    return canonical === undefined
+      ? []
+      : [{ dir: path.dirname(canonical), file: path.basename(canonical) }];
+  }
+  const dir = await resolveComponent(relative, "directory");
+  if (dir === undefined) return [];
+  const entries = await fsPromises.readdir(dir, { withFileTypes: true }).catch(() => []);
+  // Symlinks too: every scan site reads them through the contained reader.
+  return entries
+    .filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".md"))
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b))
+    .map((file) => ({ dir, file }));
+}
+
+/** The skill folder names of some skills roots, valid or not. */
+async function listSkillNames(roots: PluginSkillsRoot[]): Promise<Set<string>> {
+  const names = new Set<string>();
+  for (const root of roots) {
+    for (const { name } of await listPluginSkillFolders(root)) names.add(name);
+  }
+  return names;
+}
+
+/**
+ * A Claude package's commands as single command roots (PluginSkillsRoot `command`), from the
+ * manifest's `commands` paths or the default `commands/`. An invalid name, a repeated name and
+ * a name that a skill folder already has are dropped with a warning: in Claude Code a skill wins
+ * over a command of the same name.
+ */
+async function resolveCommandRoots(args: {
+  declared: string[] | undefined;
+  skillsDirs: PluginSkillsRoot[];
+  resolveComponent: (
+    relativePath: string,
+    expectKind: "file" | "directory"
+  ) => Promise<string | undefined>;
+  warn: (message: string) => void;
+}): Promise<PluginSkillsRoot[]> {
+  const taken = await listSkillNames(args.skillsDirs);
+  const roots: PluginSkillsRoot[] = [];
+  for (const relative of args.declared ?? ["commands"]) {
+    for (const { dir, file } of await listCommandFiles(relative, args.resolveComponent)) {
+      const name = file.slice(0, -".md".length);
+      if (!SkillNameSchema.safeParse(name).success) {
+        args.warn(`Command '${file}' has no valid skill name (kebab-case); ignoring it`);
+      } else if (taken.has(name)) {
+        args.warn(`Command '${file}' is ignored: a skill or command named '${name}' comes first`);
+      } else if (roots.length >= MAX_PLUGIN_COMMANDS) {
+        args.warn(`More than ${MAX_PLUGIN_COMMANDS} commands; ignoring the rest`);
+        return roots;
+      } else {
+        taken.add(name);
+        roots.push({ dir, single: true, name, command: true });
+      }
+    }
+  }
+  return roots;
+}
+
 /**
  * OpenAI settings: root `extensions["com.openai"]` when it is an object; otherwise (`overlay`) a
  * `.codex-plugin/plugin.json` next to it supplies them (the two are never merged). The overlay
@@ -724,6 +815,19 @@ async function discoverPluginAt(args: {
     pluginName: validation.manifest.name,
     resolveComponent,
   });
+  // Claude commands load as user-only skills, after every skills root (a skill wins).
+  const commandRoots = claudeFallback
+    ? await resolveCommandRoots({
+        declared: normalized.claude?.commands,
+        skillsDirs,
+        resolveComponent,
+        warn: (message) => {
+          log.debug(`Agent plugin ${pluginDir}: ${message}`);
+          diagnostics.push({ path: rootReal, scope, severity: "warning", message });
+        },
+      })
+    : [];
+  const allSkillsRoots = [...skillsDirs, ...commandRoots];
   const mcp = await resolvePluginMcpConfig({
     rootReal,
     declared: contributes?.mcp,
@@ -760,7 +864,7 @@ async function discoverPluginAt(args: {
     ...(codexFallback ? { codexFallback: true } : {}),
     ...(claudeFallback ? { claudeFallback: true, claude: normalized.claude ?? {} } : {}),
     ...(openai.extension !== undefined ? { openai: openai.extension, openaiManifestPath } : {}),
-    ...(skillsDirs.length > 0 ? { skillsDirs } : {}),
+    ...(allSkillsRoots.length > 0 ? { skillsDirs: allSkillsRoots } : {}),
     ...mcp,
     ...(hooksPath !== undefined ? { hooksPath } : {}),
     ...(agentsDir !== undefined ? { agentsDir } : {}),

@@ -86,6 +86,7 @@ import {
   type PluginSkillsRoot,
 } from "./discovery";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
+import { pluginSkillMarkdown } from "./claudeCommands";
 import { listPluginAgentFiles, type PluginAgentFile } from "./agentFiles";
 import { checkLogoImage } from "./imageHeader";
 import {
@@ -1188,7 +1189,9 @@ function displayNameWarnings(
 /** A preview warning's plugin-relative name for skill `name` of `skillsRoot`. */
 function skillReviewLabel(pluginRoot: string, skillsRoot: PluginSkillsRoot, name: string): string {
   const relativeRoot = path.relative(pluginRoot, skillsRoot.dir);
-  // A single skill folder is the skill itself; at the plugin root it has no relative path.
+  // A command is its file; a single skill folder is the skill itself, and at the plugin root it
+  // has no relative path.
+  if (skillsRoot.command) return path.join(relativeRoot, `${name}.md`);
   if (skillsRoot.single) return relativeRoot === "" ? "." : relativeRoot;
   return `${relativeRoot}/${name}`;
 }
@@ -2949,9 +2952,10 @@ export class AgentPluginInstallService {
     const skills: CollectedPluginSkill[] = [];
     // Includes symlinked skill dirs, matching runtime discovery: a symlinked
     // skill activates after install, so it MUST appear in the consent preview.
-    for (const { name: dirName, dir: skillDir } of await listPluginSkillFolders(skillsRoot)) {
+    for (const { name: dirName, dir: skillDir, file: skillPath } of await listPluginSkillFolders(
+      skillsRoot
+    )) {
       const label = skillReviewLabel(pluginRoot, skillsRoot, dirName);
-      const skillPath = path.join(skillDir, "SKILL.md");
       // Spec §4.1 containment anchored at the plugin root, mirroring runtime
       // component checks: a symlink escaping the plugin is surfaced as a
       // warning instead of silently ignored.
@@ -3000,7 +3004,13 @@ export class AgentPluginInstallService {
         continue;
       }
       try {
-        const content = await fsPromises.readFile(containedSkillPath, "utf8");
+        // A Claude command becomes SKILL.md text first, so its review, fingerprint and approved
+        // copy are a skill's (the copy is that text, which the runtime check parses as is).
+        const content = pluginSkillMarkdown(
+          dirName,
+          await fsPromises.readFile(containedSkillPath, "utf8"),
+          skillsRoot.command
+        );
         const parsed = parseSkillMarkdown({
           content,
           byteSize: stat.size,

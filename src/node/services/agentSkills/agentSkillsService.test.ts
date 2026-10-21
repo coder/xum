@@ -12,6 +12,7 @@ import {
 } from "@/node/services/agentPlugins/testFixtures";
 import type { ComponentConsent } from "@/node/services/agentPlugins/componentConsent";
 import { SkillNameSchema } from "@/common/orpc/schemas";
+import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
@@ -1664,6 +1665,56 @@ describe("agentSkillsService agent plugins", () => {
     for (const name of ["leaky", "linked"]) {
       await expect(read(name)).rejects.toThrow("not found");
     }
+  });
+
+  test("a Claude command loads as a skill only the user invokes; a same-named skill wins", async () => {
+    using tmp = new DisposableTempDir("plugin-claude-commands");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "kit");
+    await fs.mkdir(path.join(pluginDir, ".claude-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".claude-plugin", "plugin.json"),
+      JSON.stringify({ name: "kit" })
+    );
+    await fs.mkdir(path.join(pluginDir, "commands"));
+    // No frontmatter: the description comes from the first body line, as in Claude Code.
+    await fs.writeFile(
+      path.join(pluginDir, "commands", "review.md"),
+      "Review the diff for $ARGUMENTS.\n"
+    );
+    // The model may invoke this one in Claude Code; Xum still keeps it for the user.
+    await fs.writeFile(
+      path.join(pluginDir, "commands", "ship.md"),
+      "---\ndescription: Ship it\nargument-hint: '[env]'\ndisable-model-invocation: false\n---\nShip to $1.\n"
+    );
+    await fs.writeFile(path.join(pluginDir, "commands", "deploy.md"), "Command body\n");
+    await writeSkill(path.join(pluginDir, "skills"), "deploy", "skill wins");
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+
+    const { skills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+
+    const kit = skills.filter((skill) => skill.pluginName === "kit");
+    expect(
+      kit.map((skill) => [skill.name, skill.description, skill.advertise, skill.argumentHint])
+    ).toEqual([
+      ["deploy", "skill wins", undefined, undefined],
+      ["review", "Review the diff for $ARGUMENTS.", false, undefined],
+      ["ship", "Ship it", false, "[env]"],
+    ]);
+    const read = async (name: string) =>
+      readAgentSkill(runtime, tmp.path, SkillNameSchema.parse(name), { roots });
+    const review = await read("review");
+    expect(substituteSkillArguments(review.package.body, "auth.ts").body).toBe(
+      "Review the diff for auth.ts.\n"
+    );
+    expect(review.package.frontmatter["disable-model-invocation"]).toBe(true);
+    expect((await read("deploy")).package.frontmatter.description).toBe("skill wins");
   });
 
   test("managed imports gate enumeration and direct reads without shadowing allowed same-name fallbacks", async () => {

@@ -22,6 +22,10 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
 import { discoverAgentPlugins } from "@/node/services/agentPlugins/discovery";
+import {
+  pluginSkillFileName,
+  pluginSkillMarkdown,
+} from "@/node/services/agentPlugins/claudeCommands";
 import type { PluginSkillConsentGate } from "@/node/services/agentPlugins/componentConsent";
 import {
   consentedPluginSkill,
@@ -68,6 +72,8 @@ interface ListedSkillsRoot {
   skillConsent?: PluginSkillConsentGate;
   /** Plugin roots only: the root is this one skill (PluginSkillsRoot `single`). */
   singleSkillName?: string;
+  /** Plugin roots only: that skill is a Claude command, `<root>/<name>.md` (claudeCommands.ts). */
+  commandSkill?: true | undefined;
 }
 
 /**
@@ -113,14 +119,18 @@ async function listSkillFolders(
   }));
 }
 
-/** Read `skillDir`'s SKILL.md when it is a contained regular file of allowed size; else log and null. */
+/**
+ * Read `skillDir`'s SKILL.md (a Claude command's `<name>.md`) when it is a contained regular file
+ * of allowed size; else log and null.
+ */
 async function readContainedSkillFile(
   skillDir: string,
   directoryName: string,
   scope: "global" | "project",
-  containmentRoot: string
+  containmentRoot: string,
+  fileName: string
 ): Promise<{ content: string; byteSize: number } | null> {
-  const skillFilePath = path.join(skillDir, "SKILL.md");
+  const skillFilePath = path.join(skillDir, fileName);
 
   // SECURITY: validate that BOTH the skill directory and SKILL.md canonical
   // paths stay within the containment root before any read. Checking only the
@@ -181,7 +191,8 @@ async function readSkillDescriptor(
   directoryNameRaw: string,
   scope: "global" | "project",
   containmentRoot: string,
-  skillConsent?: PluginSkillConsentGate
+  skillConsent?: PluginSkillConsentGate,
+  commandSkill?: true
 ): Promise<AgentSkillDescriptor | null> {
   const parsedDirectoryName = SkillNameSchema.safeParse(directoryNameRaw);
   if (!parsedDirectoryName.success) {
@@ -190,7 +201,13 @@ async function readSkillDescriptor(
   }
 
   const directoryName = parsedDirectoryName.data;
-  const file = await readContainedSkillFile(skillDir, directoryName, scope, containmentRoot);
+  const file = await readContainedSkillFile(
+    skillDir,
+    directoryName,
+    scope,
+    containmentRoot,
+    pluginSkillFileName(directoryName, commandSkill)
+  );
   if (file === null) return null;
 
   try {
@@ -199,7 +216,7 @@ async function readSkillDescriptor(
       skillConsent,
       skillDir,
       parseSkillMarkdown({
-        content: file.content,
+        content: pluginSkillMarkdown(directoryName, file.content, commandSkill),
         byteSize: file.byteSize,
         directoryName,
         // Agree with discovery; the display name stays out of this model-facing output.
@@ -385,6 +402,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               importedSkills,
               skillConsent,
               singleSkillName: skillsRoot.name,
+              commandSkill: skillsRoot.command,
             }))
           );
         }
@@ -398,6 +416,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           importedSkills,
           skillConsent,
           singleSkillName,
+          commandSkill,
         } of roots) {
           let skillsRootReal: string;
           try {
@@ -433,7 +452,8 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               directoryName,
               scope,
               containmentRoot,
-              skillConsent
+              skillConsent,
+              commandSkill
             );
             if (!descriptor) {
               continue;

@@ -2982,6 +2982,61 @@ describe("AgentPluginInstallService", () => {
     expect(echo.args).toEqual([path.join(plugins[0].rootPath, "server.js")]);
   });
 
+  test("a Claude command installs as a reviewed skill, and a changed command needs a new review", async () => {
+    await fsPromises.rm(path.join(remoteDir, "plugin.json"));
+    await fsPromises.mkdir(path.join(remoteDir, ".claude-plugin"));
+    await fsPromises.writeFile(
+      path.join(remoteDir, ".claude-plugin", "plugin.json"),
+      JSON.stringify({ name: "demo-plugin" })
+    );
+    await fsPromises.mkdir(path.join(remoteDir, "commands"));
+    const writeCommand = (description: string) =>
+      fsPromises.writeFile(
+        path.join(remoteDir, "commands", "review.md"),
+        `---\ndescription: ${description}\n---\nReview $ARGUMENTS.\n`
+      );
+    await writeCommand("Review a diff");
+    await commitAll(remoteDir, "claude command");
+    const loaded = async () => {
+      const { skills } = await discoverAgentSkills(new LocalRuntime(muxRoot), muxRoot, {
+        roots: {
+          projectRoot: "",
+          globalRoot: path.join(muxRoot, "skills"),
+          universalRoot: "",
+          globalPluginRoots: [pluginsDir()],
+        },
+      });
+      return skills
+        .filter((skill) => skill.pluginName === "demo-plugin")
+        .map((skill) => [skill.name, skill.description, skill.advertise]);
+    };
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.skills.map((skill) => skill.name)).toEqual(["greet", "review"]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect(await loaded()).toEqual([
+      ["greet", "Greets people", undefined],
+      ["review", "Review a diff", false],
+    ]);
+
+    await writeCommand("Review a diff and push it");
+    await commitAll(remoteDir, "change the command");
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const changed = review.changes.flatMap((change) =>
+      change.component ? [change.component] : []
+    );
+    expect(changed.map((component) => [component.kind, component.name])).toEqual([
+      ["skills", "review"],
+    ]);
+    await service.update({
+      name: "demo-plugin",
+      consent: { fromSha: review.fromSha, toSha: review.toSha, reviewed: [] },
+    });
+    // The unreviewed command serves the copy the user approved.
+    expect((await service.list())[0].reviewRequiredCount).toBe(1);
+    expect(await loaded()).toContainEqual(["review", "Review a diff", false]);
+  });
+
   test("never overwrites: registry and directory collisions are clear errors", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });

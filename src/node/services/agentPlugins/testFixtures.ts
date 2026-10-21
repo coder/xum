@@ -21,6 +21,7 @@ import {
 } from "./componentConsent";
 import { updateApprovedCopies, type ApprovedCopies } from "./approvedCopies";
 import { discoverAgentPluginAt, listPluginSkillFolders, type AgentPluginScope } from "./discovery";
+import { pluginSkillMarkdown } from "./claudeCommands";
 import { getPluginDataPath, loadPluginMcpServers, resolvePluginInstanceId } from "./mcpConfig";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
 import { listPluginAgentFiles } from "./agentFiles";
@@ -76,12 +77,12 @@ export async function reviewedComponentConsent(args: {
     slashCommands: {},
   };
   for (const skillsRoot of plugin.skillsDirs ?? []) {
-    for (const { name: dirName, dir: skillDir } of await listPluginSkillFolders(skillsRoot)) {
+    for (const { name: dirName, dir: skillDir, file } of await listPluginSkillFolders(skillsRoot)) {
       const directoryName = SkillNameSchema.safeParse(dirName);
       if (!directoryName.success) continue;
       let content: string;
       try {
-        content = await fs.readFile(path.join(skillDir, "SKILL.md"), "utf8");
+        content = pluginSkillMarkdown(dirName, await fs.readFile(file, "utf8"), skillsRoot.command);
       } catch {
         continue;
       }

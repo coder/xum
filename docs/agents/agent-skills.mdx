@@ -80,6 +80,20 @@ Removing imports does not delete source files, plugin data, or workspace MCP set
 
 Updates preserve explicit selections: newly available skills and MCP servers stay unimported until you add them. Updates still require consent for full-package capability changes, including unimported components. Older managed installs without a saved selection continue importing everything, including new components on update. Unmanaged and project-local plugins are unchanged.
 
+#### Claude Code plugins
+
+Xum also reads a plugin whose only manifest is `.claude-plugin/plugin.json`, and **Settings → Plugins** installs one. A repository with only `.claude-plugin/marketplace.json` is a marketplace: install one of its plugins by its folder (`owner/repo/path/to/plugin`).
+
+| Claude Code component                      | In Xum                                                                                                                                               |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `skills/` and the `skills` paths           | Skills. The `skills` paths add to `skills/`.                                                                                                         |
+| `commands/*.md`, or the `commands` paths   | Skills that only you invoke, as `/name`. The model does not see them. A skill with the same name wins.                                               |
+| `agents/`, or `agents` files in one folder | [Agents](/agents).                                                                                                                                   |
+| `.mcp.json`, or one `mcpServers` JSON file | MCP servers. `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` work in `args`, `env` and `cwd`. A `command` can be `${CLAUDE_PLUGIN_ROOT}/<path>`. |
+| `hooks/hooks.json` and the `hooks` files   | Listed in Settings. They never run. See [Plugin hooks](/hooks/plugins#claude-code-plugin-hooks).                                                     |
+
+Xum reads one MCP file: an `mcpServers` path replaces `.mcp.json` instead of adding to it. Xum ignores every other manifest key with a warning, for example `lspServers`, `outputStyles`, `userConfig`, `settings`, `dependencies` and `workflows`, and also inline `mcpServers`, `hooks` and `commands` objects. A Claude Code plugin runs no Xum code: Xum ignores its `hooks.js`, `workflows/` and `bin/`. Commands get the same [component review](#component-review) as skills.
+
 #### Component review
 
 Xum loads a skill, MCP server, agent or slash command from a managed plugin, or runs one of its workflow scripts, only after you review that exact version of it. Xum records what you approved at install, at each update, and in a component review. If its reviewed definition changes later, or if a newer Xum reads more of the plugin than you saw, it stops loading until you review it again. For a skill, the definition is its folder in the plugin and its `SKILL.md` frontmatter. A change to the skill's instructions (the `SKILL.md` body) does not need a new review. For an MCP server, the definition is everything Xum starts or connects with, such as the command, arguments, environment, URL and OAuth settings. For a workflow script, the definition is the whole script file, because Xum runs it. Any change to the file needs a new review. This includes a skill's `workflow.js` in a managed plugin. Other scripts in a managed plugin's skill folder do not run as workflows. For an agent, the definition is its ID and its frontmatter, such as its name, description, tools and base agent. A change to the agent's instructions (the body) does not need a new review. If two files in a plugin's agents folder claim the same agent ID, such as `Reviewer.md` and `reviewer.md`, Xum loads neither of them and shows a warning in the review. For a slash command, the definition is its name, description and the full text it inserts.

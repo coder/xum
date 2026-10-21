@@ -482,6 +482,48 @@ describe("agent_skill_list", () => {
     });
   });
 
+  it("hides a Claude command from the model and lists it only with includeUnadvertised", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-command-home");
+    using project = new TestTempDir("test-agent-skill-list-command-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-command-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        const pluginDir = path.join(xumHomeDir.path, "plugins", "kit");
+        await fs.mkdir(path.join(pluginDir, ".claude-plugin"), { recursive: true });
+        await fs.writeFile(
+          path.join(pluginDir, ".claude-plugin", "plugin.json"),
+          JSON.stringify({ name: "kit" })
+        );
+        await fs.mkdir(path.join(pluginDir, "commands"));
+        await fs.writeFile(path.join(pluginDir, "commands", "review.md"), "Review $ARGUMENTS\n");
+        await writeSkill(path.join(pluginDir, "skills"), "greet", { description: "Greets" });
+
+        const tool = createAgentSkillListTool(
+          createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          })
+        );
+        const list = async (includeUnadvertised: boolean) => {
+          const result = (await tool.execute!(
+            { includeUnadvertised },
+            mockToolCallOptions
+          )) as AgentSkillListToolResult;
+          expect(result.success).toBe(true);
+          return result.success ? result.skills.map((skill) => skill.name) : [];
+        };
+
+        expect(await list(false)).toEqual(["greet"]);
+        expect(await list(true)).toEqual(["greet", "review"]);
+      });
+    });
+  });
+
   it("lists only imported plugin skills and refreshes additions without hiding fallback sources", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-imports-home");
     using project = new TestTempDir("test-agent-skill-list-imports-project");

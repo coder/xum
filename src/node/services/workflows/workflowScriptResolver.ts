@@ -186,6 +186,12 @@ async function resolveSkillWorkflowScript(
 
   const resolvedSkill = await readWorkflowSkill(input, parsed.skillName);
 
+  // A Claude command's skill directory is its plugin's commands folder: a script there is not
+  // part of the command, and a Claude package runs no Xum workflow code.
+  if (resolvedSkill.commandSkill === true) {
+    throw new Error(`Skill '${parsed.skillName}' is a Claude command and has no workflow scripts`);
+  }
+
   if (resolvedSkill.package.scope === "project" && !input.projectTrusted) {
     throw new Error("Project trust is required to run project skill workflow scripts");
   }

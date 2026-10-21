@@ -60,6 +60,8 @@ export async function listPluginSkillScripts(plugin: {
 }): Promise<Array<{ file: string; filePath: string }>> {
   const scripts: Array<{ file: string; filePath: string }> = [];
   for (const skillsRoot of plugin.skillsDirs ?? []) {
+    // A Claude command's folder is the commands folder, not a skill folder: no script of its own.
+    if (skillsRoot.command) continue;
     for (const { name, dir } of await listPluginSkillFolders(skillsRoot)) {
       // Only a folder the runtime loads as a skill: a valid skill name with a SKILL.md.
       if (!SkillNameSchema.safeParse(name).success) continue;

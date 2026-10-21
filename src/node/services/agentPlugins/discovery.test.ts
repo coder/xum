@@ -1869,6 +1869,44 @@ describe("Claude Code plugin discovery", () => {
     expect(plugin.mcpConfigPath).toBeUndefined();
   });
 
+  test("commands become command roots after the skills roots; bad and taken names warn", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "cmds");
+    await writeTree(pluginDir, {
+      // A manifest `commands` list replaces commands/ (the Claude rule).
+      ...claudeManifest({ name: "cmds", commands: ["./extra/", "./one/solo.md"] }),
+      "commands/ignored.md": "x",
+      "extra/deploy.md": "x",
+      "extra/Bad_Name.md": "x",
+      "extra/notes.txt": "x",
+      "extra/greet.md": "x",
+      "one/solo.md": "x",
+      "skills/greet/SKILL.md": "---\nname: greet\ndescription: G\n---\n",
+    });
+    const objectMap = path.join(container, "map");
+    await writeTree(objectMap, {
+      ...claudeManifest({ name: "map", commands: { about: { content: "x" } } }),
+      "commands/default.md": "x",
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const [cmds, map] = result.plugins;
+    const extra = path.join(cmds.rootPath, "extra");
+    expect(cmds.skillsDirs).toEqual([
+      { dir: path.join(cmds.rootPath, "skills") },
+      { dir: extra, single: true, name: "deploy", command: true },
+      { dir: path.join(cmds.rootPath, "one"), single: true, name: "solo", command: true },
+    ]);
+    // An ignored object map still replaces commands/.
+    expect(map.skillsDirs).toBeUndefined();
+    const messages = result.diagnostics.map((d) => d.message).join("\n");
+    expect(messages).toContain("'Bad_Name.md' has no valid skill name");
+    expect(messages).toContain("'greet.md' is ignored");
+    expect(messages).toContain("object map in 'commands'");
+  });
+
   test("plugin.json beats .codex-plugin/plugin.json, which beats .claude-plugin/plugin.json", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");
