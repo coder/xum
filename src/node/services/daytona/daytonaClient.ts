@@ -475,16 +475,26 @@ export class DaytonaClient {
 
   async listSnapshots(signal?: AbortSignal): Promise<DaytonaSnapshot[]> {
     const snapshots: DaytonaSnapshot[] = [];
+    const seen = new Set<string>();
     for (let page = 1; page <= MAX_PAGES; page++) {
       const raw = await this.request("GET", "/snapshots", {
         query: { page, limit: PAGE_LIMIT },
         signal,
       });
       const parsed = this.parse(SnapshotPageSchema, raw, "GET /snapshots");
-      snapshots.push(...parsed.items.map(toSnapshot));
-      if (parsed.items.length === 0 || parsed.totalPages === undefined) return snapshots;
-      if (page >= parsed.totalPages) return snapshots;
+      // A page with nothing new ends the walk: a server that ignores `page` repeats page 1.
+      const fresh = parsed.items.map(toSnapshot).filter((snapshot) => !seen.has(snapshot.name));
+      for (const snapshot of fresh) seen.add(snapshot.name);
+      snapshots.push(...fresh);
+      if (fresh.length === 0 || isLastPage(parsed, page)) return snapshots;
     }
     return snapshots;
   }
+}
+
+/** totalPages is optional: without it, a page shorter than the limit is the last one. */
+function isLastPage(parsed: { items: unknown[]; totalPages?: number }, page: number): boolean {
+  return parsed.totalPages === undefined
+    ? parsed.items.length < PAGE_LIMIT
+    : page >= parsed.totalPages;
 }

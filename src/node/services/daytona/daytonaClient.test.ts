@@ -180,4 +180,30 @@ describe("DaytonaClient", () => {
     expect(await client.listSnapshots()).toEqual([{ name: "snap-1" }, { name: "snap-2" }]);
     expect(requests).toHaveLength(2);
   });
+
+  it("walks full snapshot pages when the totals are omitted, stopping on a short page", async () => {
+    // 100 per page (the limit Xum asks for), then 3; totalPages is optional in the response.
+    const { fetch, requests } = fakeFetch((request) => {
+      const page = Number(request.url.searchParams.get("page"));
+      const count = page === 1 ? 100 : page === 2 ? 3 : 0;
+      const items = Array.from({ length: count }, (_, i) => ({ name: `snap-${page}-${i}` }));
+      return jsonResponse(200, { items });
+    });
+    const client = new DaytonaClient({ apiUrl: API_URL, apiKey: API_KEY, fetch });
+    const snapshots = await client.listSnapshots();
+    expect(snapshots).toHaveLength(103);
+    expect(snapshots.at(-1)).toEqual({ name: "snap-2-2" });
+    expect(requests).toHaveLength(2);
+  });
+
+  it("stops at a full page that repeats the last one (a server that ignores page)", async () => {
+    const { fetch, requests } = fakeFetch(() =>
+      jsonResponse(200, {
+        items: Array.from({ length: 100 }, (_, i) => ({ name: `snap-${i}` })),
+      })
+    );
+    const client = new DaytonaClient({ apiUrl: API_URL, apiKey: API_KEY, fetch });
+    expect(await client.listSnapshots()).toHaveLength(100);
+    expect(requests).toHaveLength(2);
+  });
 });
