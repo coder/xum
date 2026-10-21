@@ -21,7 +21,7 @@ import { retireSshConnections } from "@/node/runtime/transports";
 import { rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
 import { getDaytonaSandboxId, isDedicatedDaytonaSandbox } from "@/common/types/runtime";
 import { log } from "@/node/services/log";
-import { sleepWithAbort } from "@/node/utils/abort";
+import { raceAbort, sleepWithAbort } from "@/node/utils/abort";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import {
   DaytonaApiError,
@@ -201,6 +201,8 @@ export interface DaytonaStartAndWaitOptions {
 export interface DaytonaEnsureReadyOptions {
   /** Called when the sandbox has to be started (it was stopped or archived). */
   onStarting?: () => void;
+  /** Stops this caller's wait (and its onStarting calls); the shared request goes on. */
+  signal?: AbortSignal;
 }
 
 interface SandboxReadyRequest {
@@ -864,18 +866,21 @@ export class DaytonaService {
    * `onStarting` call. Throws a DaytonaApiError (`not_found` when the sandbox is gone).
    */
   ensureSandboxReady(sandboxId: string, options: DaytonaEnsureReadyOptions = {}): Promise<void> {
-    const existing = this.readyRequests.get(sandboxId);
-    if (existing) {
-      if (options.onStarting) {
-        existing.onStarting.add(options.onStarting);
-        if (existing.starting) options.onStarting();
-      }
-      return existing.promise;
-    }
+    const request = this.readyRequests.get(sandboxId) ?? this.startReadyRequest(sandboxId);
+    const { onStarting, signal } = options;
+    if (!onStarting || signal?.aborted) return raceAbort(request.promise, signal);
+    // Per waiter, so the same callback passed twice is two waiters.
+    const listener = () => onStarting();
+    request.onStarting.add(listener);
+    if (request.starting) listener();
+    // A waiter that stopped waiting (cancelled) hears no later start: nothing would report its end.
+    return raceAbort(request.promise, signal).finally(() => request.onStarting.delete(listener));
+  }
 
+  private startReadyRequest(sandboxId: string): SandboxReadyRequest {
     const request: SandboxReadyRequest = {
       promise: Promise.resolve(),
-      onStarting: new Set(options.onStarting ? [options.onStarting] : []),
+      onStarting: new Set(),
       starting: false,
     };
     request.promise = this.withAccountLease(async () => {
@@ -890,7 +895,7 @@ export class DaytonaService {
       this.readyRequests.delete(sandboxId);
     });
     this.readyRequests.set(sandboxId, request);
-    return request.promise;
+    return request;
   }
 
   /**

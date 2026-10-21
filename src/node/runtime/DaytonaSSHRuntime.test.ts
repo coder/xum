@@ -147,6 +147,36 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
     expect(rig.writer.tokens.get("sb-stopped")).toBeDefined();
   });
 
+  it("never reports a start to a check cancelled while it waited for the shared one", async () => {
+    rig.plane.addSandbox({ id: "sb-slow", state: "stopped" });
+    let releaseState!: () => void;
+    const stateHeld = new Promise<void>((resolve) => (releaseState = resolve));
+    rig.plane.onRequest.set("GET /sandbox/sb-slow", () => {
+      rig.plane.onRequest.delete("GET /sandbox/sb-slow");
+      return stateHeld;
+    });
+    const cancelled: string[] = [];
+    const other: string[] = [];
+    const controller = new AbortController();
+    const cancelledCheck = makeRuntime({ sandboxId: "sb-slow" }).ensureReady({
+      signal: controller.signal,
+      statusSink: (event) => cancelled.push(event.phase),
+    });
+    const otherCheck = makeRuntime({ sandboxId: "sb-slow" }).ensureReady({
+      statusSink: (event) => other.push(event.phase),
+    });
+
+    // Cancelled while the state request is pending; the shared start then finds it stopped.
+    controller.abort();
+    expect((await cancelledCheck).ready).toBe(false);
+    releaseState();
+    expect(await otherCheck).toEqual({ ready: true });
+
+    expect(other).toContain("starting");
+    expect(cancelled).not.toContain("starting");
+    expect(cancelled.at(-1)).toBe("error");
+  });
+
   it("shares one start between concurrent checks", async () => {
     rig.plane.addSandbox({ id: "sb-archived", state: "archived" });
     const phases: string[][] = [[], []];

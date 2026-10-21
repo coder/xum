@@ -1,3 +1,5 @@
+import { getErrorMessage } from "@/common/utils/errors";
+
 /**
  * AbortSignal helpers.
  *
@@ -65,5 +67,25 @@ export async function sleepWithAbort(ms: number, abortSignal?: AbortSignal): Pro
     };
 
     abortSignal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** Resolve with `promise`, or reject as soon as `signal` aborts (the shared work keeps going). */
+export function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new Error("Aborted"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new Error("Aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error instanceof Error ? error : new Error(getErrorMessage(error)));
+      }
+    );
   });
 }

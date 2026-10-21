@@ -164,26 +164,6 @@ interface CreateAttempt {
   account?: DaytonaAccount;
 }
 
-/** Resolve with `promise`, or reject as soon as `signal` aborts (the shared work keeps going). */
-function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(new Error("Aborted"));
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(new Error("Aborted"));
-    signal.addEventListener("abort", onAbort, { once: true });
-    promise.then(
-      (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      (error: unknown) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error instanceof Error ? error : new Error(getErrorMessage(error)));
-      }
-    );
-  });
-}
-
 type DeleteResult =
   | { success: true; deletedPath: string; notice?: string }
   | { success: false; error: string; leftoverPaths?: string[] };
@@ -548,12 +528,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     signal: AbortSignal | undefined
   ): Promise<EnsureReadyResult | undefined> {
     try {
-      await raceAbort(
-        this.daytonaService.ensureSandboxReady(sandboxId, {
-          onStarting: () => emitStatus("starting", "Starting sandbox..."),
-        }),
-        signal
-      );
+      await this.daytonaService.ensureSandboxReady(sandboxId, {
+        onStarting: () => emitStatus("starting", "Starting sandbox..."),
+        signal,
+      });
       return undefined;
     } catch (error) {
       emitStatus("error");
@@ -779,12 +757,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   ): Promise<void> {
     const { initLogger, abortSignal } = params;
     initLogger.logStep("Waiting for the sandbox to start and configuring SSH...");
-    await raceAbort(
-      this.daytonaService.ensureSandboxReady(sandboxId, {
-        onStarting: () => initLogger.logStep("Starting sandbox..."),
-      }),
-      abortSignal
-    );
+    await this.daytonaService.ensureSandboxReady(sandboxId, {
+      onStarting: () => initLogger.logStep("Starting sandbox..."),
+      signal: abortSignal,
+    });
     if (!seed) return;
     initLogger.logStep("Copying agent hooks and global skills into the sandbox...");
     const count = await seedAgentHome(
@@ -1181,7 +1157,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     abortSignal: AbortSignal | undefined
   ): Promise<"ready" | "missing" | { error: string }> {
     try {
-      await raceAbort(this.daytonaService.ensureSandboxReady(sandboxId), abortSignal);
+      await this.daytonaService.ensureSandboxReady(sandboxId, { signal: abortSignal });
       return "ready";
     } catch (error) {
       if (error instanceof DaytonaApiError && error.kind === "not_found") return "missing";
