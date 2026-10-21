@@ -19,7 +19,10 @@ import { expandTildeForSSH } from "./tildeExpansion";
 
 const SEEDED_HOOK_FILES = ["tool_env", "tool_pre", "tool_post"] as const;
 
-/** A box seed is a convenience: past this size the rest is skipped with a warning. */
+/**
+ * A box seed is a convenience: a file larger than what is left of this is skipped, and files
+ * that still fit are copied, so one large file does not drop every later skill.
+ */
 const MAX_SEED_BYTES = 16 * 1024 * 1024;
 const MAX_SKILL_DIR_DEPTH = 8;
 const SEED_TIMEOUT_SECONDS = 120;
@@ -41,7 +44,12 @@ export interface AgentHomeSeedSources {
 
 interface SeedBudget {
   remainingBytes: number;
-  exhausted: boolean;
+  /** A file did not fit. */
+  skipped: boolean;
+}
+
+function isSpent(budget: SeedBudget): boolean {
+  return budget.remainingBytes <= 0;
 }
 
 async function readRegularFile(
@@ -55,7 +63,7 @@ async function readRegularFile(
     // Check before reading: a large file must not be loaded only to be dropped.
     if (stat.size > budget.remainingBytes) {
       log.debug("Skipping a file past the Daytona seed size limit", { filePath, size: stat.size });
-      budget.exhausted = true;
+      budget.skipped = true;
       return null;
     }
     return { content: await fs.readFile(filePath), mode: stat.mode };
@@ -76,7 +84,7 @@ function addFile(
   file: { content: Buffer; mode: number }
 ): void {
   if (file.content.length > budget.remainingBytes) {
-    budget.exhausted = true;
+    budget.skipped = true;
     return;
   }
   budget.remainingBytes -= file.content.length;
@@ -136,7 +144,7 @@ async function collectSkillsRoot(
   const root = entries ? await resolveEntry(hostRoot) : null;
   if (!entries || !root) return;
   for (const entry of entries) {
-    if (budget.exhausted) return;
+    if (isSpent(budget)) return;
     await collectSkillsRootEntry(
       files,
       budget,
@@ -170,7 +178,7 @@ async function collectDirectory(
   depth: number,
   skillRoot: string
 ): Promise<void> {
-  if (depth > MAX_SKILL_DIR_DEPTH || budget.exhausted) return;
+  if (depth > MAX_SKILL_DIR_DEPTH || isSpent(budget)) return;
   const entries = await readDirectory(hostDir);
   if (!entries) return;
   for (const entry of entries) {
@@ -208,7 +216,7 @@ export async function collectAgentHomeSeedFiles(
   remoteXumHome: string
 ): Promise<AgentHomeSeedFile[]> {
   const files: AgentHomeSeedFile[] = [];
-  const budget: SeedBudget = { remainingBytes: MAX_SEED_BYTES, exhausted: false };
+  const budget: SeedBudget = { remainingBytes: MAX_SEED_BYTES, skipped: false };
   for (const name of SEEDED_HOOK_FILES) {
     const file = await readRegularFile(path.join(sources.xumHome, name), budget);
     if (file) addFile(files, budget, path.posix.join(remoteXumHome, name), file);
@@ -225,7 +233,7 @@ export async function collectAgentHomeSeedFiles(
     path.join(sources.home, ".agents", "skills"),
     "~/.agents/skills"
   );
-  if (budget.exhausted) {
+  if (budget.skipped) {
     log.warn("Daytona agent-home seed hit its size limit; some files were not copied", {
       limitBytes: MAX_SEED_BYTES,
     });

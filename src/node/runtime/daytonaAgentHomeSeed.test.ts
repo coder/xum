@@ -72,17 +72,25 @@ describe("agent-home seeding", () => {
     );
   });
 
-  it("never reads a file larger than the remaining seed budget", async () => {
+  it("skips a file larger than the remaining seed budget, unread, and copies the rest", async () => {
     const huge = path.join(hostXum, "skills", "data", "model.bin");
     await fs.mkdir(path.dirname(huge), { recursive: true });
     // Sparse: 64 MiB on paper, no disk used.
     await fs.writeFile(huge, "");
     await fs.truncate(huge, 64 * 1024 * 1024);
+    // Files after the oversized one still fit, in the same root and in the next one.
+    await fs.mkdir(path.join(hostXum, "skills", "deploy"), { recursive: true });
+    await fs.writeFile(path.join(hostXum, "skills", "deploy", "SKILL.md"), "# deploy\n");
+    await fs.mkdir(path.join(hostHome, ".agents", "skills", "lint"), { recursive: true });
+    await fs.writeFile(path.join(hostHome, ".agents", "skills", "lint", "SKILL.md"), "# lint\n");
     const readFile = spyOn(fs, "readFile");
     try {
       const files = await collectAgentHomeSeedFiles({ xumHome: hostXum, home: hostHome }, "~/.mux");
 
-      expect(files).toEqual([]);
+      expect(files.map((file) => file.remotePath)).toEqual([
+        "~/.mux/skills/deploy/SKILL.md",
+        "~/.agents/skills/lint/SKILL.md",
+      ]);
       expect(
         readFile.mock.calls.map(([file]) => (typeof file === "string" ? file : ""))
       ).not.toContain(huge);
