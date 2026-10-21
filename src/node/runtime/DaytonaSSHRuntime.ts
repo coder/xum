@@ -311,8 +311,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   private readonly workspaceId?: string;
   private readonly agentHomeSeedSources?: AgentHomeSeedSources;
   /**
-   * Set once ensureReady passes on this instance. Only such a runtime (a turn's) restarts a
-   * sandbox that stopped under it; UI and background runtimes never start a billed sandbox.
+   * Set once ensureReady runs its checks on this instance. Only such a runtime (a turn's or a
+   * terminal's) restarts a sandbox that stopped under it; UI and background runtimes never
+   * start a billed sandbox.
    */
   private restartsStoppedSandbox = false;
   /** SSHRuntime keeps its own reference private; a replaced token needs its backoff reset. */
@@ -429,9 +430,11 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     options: EnsureReadyOptions | undefined,
     emitStatus: StatusEmitter
   ): Promise<EnsureReadyResult> {
+    // Set before the probe: ensureReady is an explicit action, so a sandbox that stopped
+    // within the cache is started again (recoverForRetry) instead of failing until it expires.
+    this.restartsStoppedSandbox = true;
     const repoFailure = await this.checkRepo(options, emitStatus);
     if (repoFailure) return repoFailure;
-    this.restartsStoppedSandbox = true;
     return { ready: true };
   }
 

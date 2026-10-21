@@ -1420,6 +1420,33 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
     expect(rig.plane.countCalls("POST /sandbox/sb-nap/start")).toBe(1);
   });
 
+  it("starts a sandbox that stopped within the ready cache for a new runtime's ensureReady", async () => {
+    execSpy.mockRestore();
+    const sandbox = rig.plane.addSandbox({ id: "sb-nap3" });
+    const local = localShellTransport(rig.rootDir);
+    const transport: SSHTransport = {
+      ...local,
+      spawnRemoteProcess: (command, options) =>
+        sandbox.state === "started"
+          ? local.spawnRemoteProcess(command, options)
+          : Promise.reject(new RuntimeError("Connection closed by 127.0.0.1 port 22", "network")),
+    };
+    const runtimeFor = () =>
+      makeRuntime({ sandboxId: "sb-nap3" }, rig, {
+        transport,
+        projectPath: "/home/me/project",
+        workspaceName: "ws-a",
+      });
+    const checkout = runtimeFor().getWorkspacePath("/home/me/project", "ws-a");
+    execFileSync("git", ["init", "-q", checkout.replace(/^~/, rig.rootDir)]);
+    expect(await runtimeFor().ensureReady()).toEqual({ ready: true });
+    sandbox.state = "stopped";
+
+    // The next turn or terminal builds a fresh runtime, still within the ready cache.
+    expect(await runtimeFor().ensureReady()).toEqual({ ready: true });
+    expect(rig.plane.countCalls("POST /sandbox/sb-nap3/start")).toBe(1);
+  });
+
   /** The gateway answers a stopped or deleted sandbox with the same refusal as a bad token. */
   function refusingTransportWhile(sandboxId: string, refuses: () => boolean): SSHTransport {
     const local = localShellTransport(rig.rootDir);
