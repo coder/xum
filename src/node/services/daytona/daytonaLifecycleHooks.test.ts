@@ -133,6 +133,34 @@ describe("createDaytonaArchiveHook", () => {
     expect(warnings[0]).toContain("archived workspace");
   });
 
+  it("applies the owner's deferred policy when the attached workspace is archived last", async () => {
+    rig.plane.addSandbox({ id: "sb-shared" });
+    const owner = { sandboxId: "sb-shared", shared: false };
+    const attached = { sandboxId: "sb-shared", shared: true };
+    const ref = (workspaceId: string, daytona: DaytonaSandboxConfig, archived: boolean) => ({
+      workspaceId,
+      runtimeConfig: metadata(daytona).runtimeConfig,
+      archived,
+    });
+
+    // The attached workspace still works there: the owner's archive defers its policy.
+    rig.workspaces.splice(0, rig.workspaces.length, ref("attached", attached, false));
+    expect((await archive(owner, "delete")).success).toBe(true);
+    expect(rig.plane.find("sb-shared")?.state).toBe("started");
+
+    // Archived last, the attached workspace applies it; the owner's checkout was never checked,
+    // so delete stops instead.
+    rig.workspaces.splice(0, rig.workspaces.length, ref("owner", owner, true));
+    expect((await archive(attached, "delete")).success).toBe(true);
+    expect(rig.plane.find("sb-shared")?.state).toBe("stopped");
+
+    // Only attached workspaces on it: the sandbox is the user's, never stopped.
+    rig.plane.find("sb-shared")!.state = "started";
+    rig.workspaces.splice(0, rig.workspaces.length, ref("other-attached", attached, true));
+    expect((await archive(attached, "stop")).success).toBe(true);
+    expect(rig.plane.find("sb-shared")?.state).toBe("started");
+  });
+
   it("leaves a sandbox alone that another workspace attached by its id, or that cannot be looked up", async () => {
     // Created by Xum under a name; the attach picker stored the same sandbox's real id.
     rig.plane.addSandbox({ id: "sb-9", name: "xum-owner-def456" });

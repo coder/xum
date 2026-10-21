@@ -539,20 +539,23 @@ export class DaytonaService {
 
   /**
    * For archive: whether another workspace still works in the sandbox ("active"), only
-   * archived ones reference it ("archived"), or none does. Matched and failing closed (as
-   * "active") like sandboxReferencesElsewhere; removal still counts archived workspaces.
+   * archived ones reference it ("archived", or "archivedOwner" when one of them is a workspace
+   * whose sandbox Xum created, which deferred its archive policy), or none does. Matched and
+   * failing closed (as "active") like sandboxReferencesElsewhere; removal still counts
+   * archived workspaces.
    */
   async sandboxUseElsewhere(
     sandboxId: string,
     workspaceId: string | undefined
-  ): Promise<"none" | "archived" | "active"> {
+  ): Promise<"none" | "archived" | "archivedOwner" | "active"> {
     if (!this.listWorkspaces || !workspaceId) return "active";
     const others = this.refsStoredElsewhere(this.listWorkspaces(), workspaceId);
     if (others.length === 0) return "none";
     const matched = await this.refsMatchingSandbox(sandboxId, others);
     if (!matched) return "active";
     if (matched.length === 0) return "none";
-    return matched.every((ref) => ref.archived) ? "archived" : "active";
+    if (!matched.every((ref) => ref.archived)) return "active";
+    return matched.some((ref) => !ref.attached) ? "archivedOwner" : "archived";
   }
 
   /** The refs that store this sandbox by its name or its id; undefined when the lookup fails. */

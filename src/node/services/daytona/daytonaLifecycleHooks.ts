@@ -62,9 +62,12 @@ async function archiveSandbox(
     return Ok(undefined);
   }
 
-  // Only archived workspaces left on it: nobody works there now, so the policy applies.
-  const result = isDedicatedDaytonaSandbox(args.workspaceMetadata.runtimeConfig)
-    ? await applyArchiveBehavior(options, args, sandboxId, others === "archived")
+  // Only archived workspaces left on it: nobody works there now, so the policy applies, for
+  // this workspace's own sandbox or for one whose archived owner deferred it to this archive.
+  const owned =
+    isDedicatedDaytonaSandbox(args.workspaceMetadata.runtimeConfig) || others === "archivedOwner";
+  const result = owned
+    ? await applyArchiveBehavior(options, args, sandboxId, others !== "none")
     : Ok(undefined);
   if (result.success) await releaseSshAccess(options, sandboxId);
   return result;
