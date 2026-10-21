@@ -292,6 +292,29 @@ describe("DaytonaSshConfigWriter", () => {
     expect((error as Error).message).not.toContain("tokenA");
   });
 
+  it.skipIf(!hasOpenSsh)("fails clearly when a user Host * routing setting wins", async () => {
+    await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
+    for (const [setting, line] of [
+      ["Port", "Port 2222"],
+      ["HostName", "HostName elsewhere.example.com"],
+      ["HostKeyAlias", "HostKeyAlias elsewhere.example.com"],
+    ]) {
+      await fs.writeFile(sshConfigPath, `Host *\n  ${line}\n`, "utf8");
+      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+
+      const error = await writer.verifyResolvedConfig("sb-1", "tokenA").catch((e: unknown) => e);
+      expect(String(error)).toContain(`sets ${setting} for`);
+    }
+    // The block's own values (a mixed-case gateway host included) pass as ssh -G prints them.
+    await fs.writeFile(sshConfigPath, "Host other\n  Port 2222\n", "utf8");
+    await writer.writeSandbox({
+      sandboxId: "sb-1",
+      token: "tokenA",
+      gateway: { ...GATEWAY, host: "SSH.Daytona.test", port: 2200 },
+    });
+    await writer.verifyResolvedConfig("sb-1", "tokenA");
+  });
+
   describe("a user Host * entry that weakens host key checking", () => {
     const WEAKENING_CONFIG = "Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n";
 
