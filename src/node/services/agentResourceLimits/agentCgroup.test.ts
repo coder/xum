@@ -113,6 +113,34 @@ describe("applyAgentCgroupLimits", () => {
     });
   });
 
+  it("gives up when new processes keep starting in xum's cgroup while xum moves them", async () => {
+    tree = await createFakeCgroupTree({
+      own: "/xum",
+      cgroups: { xum: { controllers: "cpu memory", procs: ["101"] } },
+    });
+    // A process forks in the cgroup after every move, so the cgroup is never empty.
+    let nextPid = 200;
+    const fakeTree = tree;
+    const host = {
+      ...tree.host,
+      writeFile: async (file: string, value: string) => {
+        await fakeTree.host.writeFile(file, value);
+        if (file.endsWith(path.join("xum-app", "cgroup.procs"))) {
+          await fakeTree.addProcess("xum", String(nextPid++));
+        }
+      },
+    };
+
+    const result = await applyAgentCgroupLimits({ cpuCores: 2 }, host);
+
+    expect(result.status).toEqual({
+      state: "unavailable",
+      reason: `Could not set up cgroup /xum/xum-agents: New processes kept starting in ${path.join(tree.root, "xum")} while xum moved them.`,
+    });
+    // xum enabled no controller, so the cgroup did not become a thread root.
+    expect(await tree.read("xum", "cgroup.subtree_control")).toBe("\n");
+  });
+
   it("uses the parent cgroup once xum runs in xum-app", async () => {
     tree = await createFakeCgroupTree({
       own: "/xum/xum-app",
