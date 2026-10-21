@@ -279,6 +279,76 @@ describe("resolveSSHConfig", () => {
     });
   });
 
+  test("matches glob(3) named classes in an Include path; an unknown class matches nothing", async () => {
+    await withTempHome(async (homeDir) => {
+      const confDir = path.join(homeDir, ".ssh", "conf.d");
+      await fs.mkdir(confDir);
+      for (const [name, host] of [
+        ["1", "one"],
+        ["a", "letter"],
+      ]) {
+        await fs.writeFile(
+          path.join(confDir, `${name}.conf`),
+          `Host ${host}\n  User user-${host}\n`
+        );
+      }
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        [
+          "Include conf.d/[[:digit:]].conf conf.d/[[:bogus:]a].conf",
+          "Host *",
+          "  User none",
+          "",
+        ].join("\n")
+      );
+
+      expect((await resolveSSHConfig("one")).user).toBe("user-one");
+      expect((await resolveSSHConfig("letter")).user).toBe("none");
+    });
+  });
+
+  test("expands environment variables and local %-tokens in an Include path (OpenSSH 9.9+)", async () => {
+    const variable = "XUM_SSH_CONFIG_TEST_DIR";
+    await withTempHome(async (homeDir) => {
+      const confDir = path.join(homeDir, ".ssh", "conf.d");
+      await fs.mkdir(confDir);
+      process.env[variable] = confDir;
+      const unset = `\${XUM_SSH_CONFIG_TEST_UNSET}`;
+      await fs.mkdir(path.join(confDir, unset));
+      const files = [
+        ["env.conf", "env-host"],
+        ["home.conf", "home-host"],
+        ["named-host.conf", "named-host"],
+        // Only a literal reading of an unset variable or the port token finds these files.
+        [`${unset}/unset.conf`, "unset-host"],
+        ["%p.conf", "port-host"],
+      ];
+      for (const [file, host] of files) {
+        await fs.writeFile(path.join(confDir, file), `Host ${host}\n  User user-${host}\n`);
+      }
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        [
+          `Include \${${variable}}/env.conf %d/.ssh/conf.d/home.conf conf.d/%n.conf`,
+          `Include conf.d/${unset}/unset.conf conf.d/%p.conf`,
+          "Host *",
+          "  User none",
+          "",
+        ].join("\n")
+      );
+
+      try {
+        expect((await resolveSSHConfig("env-host")).user).toBe("user-env-host");
+        expect((await resolveSSHConfig("home-host")).user).toBe("user-home-host");
+        expect((await resolveSSHConfig("named-host")).user).toBe("user-named-host");
+        expect((await resolveSSHConfig("unset-host")).user).toBe("none");
+        expect((await resolveSSHConfig("port-host")).user).toBe("none");
+      } finally {
+        Reflect.deleteProperty(process.env, variable);
+      }
+    });
+  });
+
   test("applies an Include inside a Host block only to the hosts that block matches", async () => {
     await withTempHome(async (homeDir) => {
       const included = path.join(homeDir, ".ssh", "gated.conf");

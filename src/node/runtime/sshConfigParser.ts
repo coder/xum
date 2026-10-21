@@ -269,10 +269,53 @@ function splitIncludeArgs(value: string): string[] {
   return args;
 }
 
-async function resolveIncludePaths(value: string, homeDir: string): Promise<string[]> {
+/**
+ * An Include argument with its `${VAR}` references and %-tokens expanded, as OpenSSH 9.9+
+ * does (readconf.c's percent_dollar_expand). Undefined skips the argument, as OpenSSH does
+ * on an expansion error: an unset variable or an unknown token. The tokens that depend on
+ * options set earlier in the parse (%h after a HostName, %k, %p, %r, %C, %j) are not tracked
+ * by this pass and skip it too: skipping can only miss an option, where a guess could read
+ * another host's file.
+ */
+function expandIncludeArg(arg: string, homeDir: string, host: string): string | undefined {
+  const localHost = os.hostname();
+  const tokens: Record<string, string | undefined> = {
+    "%": "%",
+    d: homeDir,
+    i: process.getuid?.().toString(),
+    L: localHost.split(".")[0],
+    l: localHost,
+    n: host,
+    u: getDefaultUsername(),
+  };
+  let failed = false;
+  // `${NAME}` (an unclosed `${` fails) or `%` and the character after it.
+  const expanded = arg.replace(
+    /\$\{([^}]*)(\})?|%(.?)/gs,
+    (match, name: string | undefined, close: string | undefined, token: string | undefined) => {
+      const variable = close ? process.env[name ?? ""] : undefined;
+      const value = token === undefined ? variable : tokens[token];
+      if (value === undefined) failed = true;
+      return value ?? match;
+    }
+  );
+  if (failed) {
+    log.debug("Skipping an SSH config Include argument that does not expand", { include: arg });
+    return undefined;
+  }
+  return expanded;
+}
+
+async function resolveIncludePaths(
+  value: string,
+  homeDir: string,
+  host: string
+): Promise<string[]> {
   const files: string[] = [];
   for (const arg of splitIncludeArgs(value)) {
-    const expanded = expandHomePath(arg, homeDir);
+    const tokenized = expandIncludeArg(arg, homeDir, host);
+    if (tokenized === undefined) continue;
+    const expanded = expandHomePath(tokenized, homeDir);
     // OpenSSH resolves relative user-config Include paths against ~/.ssh.
     const absolute = path.isAbsolute(expanded) ? expanded : path.join(homeDir, ".ssh", expanded);
     files.push(...(await globPath(absolute)));
@@ -366,18 +409,48 @@ function bracketExpression(
   const negated = segment[start + 1] === "!" || segment[start + 1] === "^";
   let i = start + (negated ? 2 : 1);
   let items = "";
+  let invalid = false;
   // A "]" right after the opening (and its negation) is a member, not the close.
   for (let first = true; i < segment.length && (first || segment[i] !== "]"); first = false) {
     const member = bracketMember(segment, i);
     items += member.source;
+    invalid ||= member.invalid === true;
     i = member.next;
   }
   if (i >= segment.length) return undefined;
-  return { source: `[${negated ? "^" : ""}${items}]`, end: i };
+  return { source: invalid ? "(?!)" : `[${negated ? "^" : ""}${items}]`, end: i };
 }
 
-/** One character or range of a bracket expression, and the index after it. */
-function bracketMember(segment: string, i: number): { source: string; next: number } {
+/** glob(3)'s named classes (`[[:digit:]]`) as RegExp class contents, for the C locale. */
+const NAMED_CLASSES = new Map([
+  ["alnum", "0-9A-Za-z"],
+  ["alpha", "A-Za-z"],
+  ["blank", " \\t"],
+  ["cntrl", "\\x00-\\x1f\\x7f"],
+  ["digit", "0-9"],
+  ["graph", "\\x21-\\x7e"],
+  ["lower", "a-z"],
+  ["print", "\\x20-\\x7e"],
+  ["punct", "!-/:-@\\[-`{-~"],
+  ["space", "\\t-\\r "],
+  ["upper", "A-Z"],
+  ["xdigit", "0-9A-Fa-f"],
+]);
+
+/**
+ * One character, range or named class of a bracket expression, and the index after it. As in
+ * glob(3), `[:` opens a class only when its first `:` is followed by `]`; an unknown class
+ * makes the whole pattern match nothing.
+ */
+function bracketMember(
+  segment: string,
+  i: number
+): { source: string; next: number; invalid?: boolean } {
+  const colon = segment.startsWith("[:", i) ? segment.indexOf(":", i + 2) : -1;
+  if (colon !== -1 && segment[colon + 1] === "]") {
+    const source = NAMED_CLASSES.get(segment.slice(i + 2, colon));
+    return { source: source ?? "", next: colon + 2, invalid: source === undefined };
+  }
   const range = segment[i + 1] === "-" && i + 2 < segment.length && segment[i + 2] !== "]";
   if (!range) return { source: escapeRegExp(segment[i]), next: i + 1 };
   const [low, high] = [segment[i], segment[i + 2]];
@@ -409,7 +482,7 @@ async function readIncludedFiles(
   host: string
 ): Promise<string[]> {
   const contents: string[] = [];
-  for (const file of await resolveIncludePaths(value, homeDir)) {
+  for (const file of await resolveIncludePaths(value, homeDir, host)) {
     try {
       contents.push(await expandIncludes(await fs.readFile(file, "utf8"), homeDir, depth, host));
     } catch (error) {
