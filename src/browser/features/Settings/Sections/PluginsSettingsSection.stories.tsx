@@ -1218,6 +1218,16 @@ const SKILLS_PREVIEW: AgentPluginInstallPreview = {
   consentDigest: "d".repeat(64),
 };
 
+const SKILLS_CLI_OUTPUT = [
+  "$ npx --yes skills@1.7.4 add https://github.com/acme/review-kit.git --skill pdf --global --agent codex --copy --yes",
+  // Taller than the output block, so the play can check that it opens scrolled to the end.
+  ...Array.from({ length: 24 }, (_, index) => `│  Reading skills/${index}/SKILL.md`),
+  "◇  Installed 1 skill",
+  "   ✓ pdf (copied)",
+  "     → ~/.agents/skills/pdf",
+  "└  Done!",
+].join("\n");
+
 function installAsOptions(
   overrides: NonNullable<MockORPCClientOptions["agentPlugins"]> = {}
 ): MockORPCClientOptions {
@@ -1241,7 +1251,8 @@ async function openInstallAs(canvasElement: HTMLElement, source = "acme/review-k
 }
 
 /**
- * Two methods fit (a Claude manifest and SKILL.md folders): the preview shows "Install as". The keyboard moves between choices, and Space previews again.
+ * Two managed methods fit (a Claude manifest and SKILL.md folders), plus the Skills CLI: the
+ * preview shows "Install as". The keyboard moves between choices, and Space previews again.
  */
 export const AddPluginInstallAs: Story = {
   render: () => (
@@ -1253,6 +1264,7 @@ export const AddPluginInstallAs: Story = {
     const canvas = await openInstallAs(canvasElement);
     const claude = await canvas.findByRole("radio", { name: "Claude Code plugin" });
     await expect(claude).toHaveAttribute("aria-checked", "true");
+    await canvas.findByRole("radio", { name: "Skills CLI" });
     await canvas.findByText("Agents (1)");
     // The preview badge names the method.
     await expect(canvas.getAllByText("Claude Code plugin", { selector: "span" })).toHaveLength(1);
@@ -1302,6 +1314,45 @@ export const AddPluginInstallAsPhoneViewport: Story = {
   },
 };
 
+/** Skills CLI with Node.js available: the run output shows in a scrollable block. */
+export const AddPluginSkillsCliRun: Story = {
+  render: () => (
+    <PluginsSectionStoryShell
+      options={installAsOptions({
+        skillsCliStatus: { available: true, nodeVersion: "v22.20.0", package: "skills@1.7.4" },
+        skillsCliRun: {
+          status: "ran",
+          ok: true,
+          exitCode: 0,
+          timedOut: false,
+          output: SKILLS_CLI_OUTPUT,
+          command: "npx --yes skills@1.7.4 add …",
+          missingSkills: [],
+          failure: null,
+        },
+      })}
+    >
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openInstallAs(canvasElement);
+    await userEvent.click(canvas.getByRole("radio", { name: "Skills CLI" }));
+    await canvas.findByText(/Xum does not review, update or remove them/);
+    await canvas.findByText("Xum runs skills@1.7.4 with Node.js v22.20.0.");
+    await userEvent.click(canvas.getByRole("checkbox", { name: "frontend-design" }));
+    await userEvent.click(canvas.getByRole("checkbox", { name: "skill-creator" }));
+    await userEvent.click(canvas.getByRole("button", { name: "Run skills CLI (1)" }));
+    await canvas.findByText("The skills CLI installed the skills.");
+    const output = await canvas.findByText(/✓ pdf \(copied\)/);
+    // The block opens at the end of the output, where the result is.
+    await expect(output.scrollTop).toBeGreaterThan(0);
+    await expect(output.scrollTop + output.clientHeight).toBeGreaterThanOrEqual(
+      output.scrollHeight - 1
+    );
+  },
+};
+
 /** Only Claude Code plugin hooks: the note says they never run, not "until you trust". */
 export const AddPluginClaudeHooksNeverRun: Story = {
   render: () => (
@@ -1333,11 +1384,25 @@ export const AddPluginClaudeHooksNeverRun: Story = {
   },
 };
 
+/** A local source: the backend's Skills CLI refuses it, so the choice is not offered. */
+export const AddPluginInstallAsLocalSource: Story = {
+  render: () => (
+    <PluginsSectionStoryShell options={installAsOptions()}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openInstallAs(canvasElement, "file:///tmp/review-kit");
+    await canvas.findByRole("radio", { name: "Skills" });
+    await expect(canvas.queryByRole("radio", { name: "Skills CLI" })).toBeNull();
+  },
+};
+
 const NAME_TAKEN = "A managed plugin named 'review-kit' is already installed. Uninstall it first.";
 
 /**
- * A managed plugin of the same name is installed: Install is blocked for each method, but the
- * preview keeps the Install as choice.
+ * A managed plugin of the same name is installed: Install is blocked for each managed method,
+ * but the preview keeps the Install as choice and the Skills CLI choice stays usable.
  */
 export const AddPluginInstallBlockedByName: Story = {
   render: () => (
@@ -1361,5 +1426,38 @@ export const AddPluginInstallBlockedByName: Story = {
     await userEvent.click(canvas.getByRole("radio", { name: "Skills" }));
     await canvas.findByText(/Xum cannot install this as Skills\. A managed plugin/);
     await expect(canvas.getByRole("button", { name: "Install" })).toBeDisabled();
+
+    // The Skills CLI creates no managed plugin, so the name does not block it.
+    await userEvent.click(canvas.getByRole("radio", { name: "Skills CLI" }));
+    await expect(canvas.queryByText(/Xum cannot install this/)).toBeNull();
+    await expect(canvas.getByRole("button", { name: "Run skills CLI (3)" })).toBeEnabled();
+  },
+};
+
+/** Skills CLI without Node.js: Xum shows the command to run, with a copy button. */
+export const AddPluginSkillsCliUnavailable: Story = {
+  render: () => (
+    <PluginsSectionStoryShell
+      options={installAsOptions({
+        preview: SKILLS_PREVIEW,
+        previewsByMethod: { skills: SKILLS_PREVIEW },
+        skillsCliRun: {
+          status: "unavailable",
+          reason: "Xum found no Node.js on PATH.",
+          command:
+            "npx --yes skills@1.7.4 add https://github.com/acme/review-kit.git --skill frontend-design --skill pdf --skill skill-creator --global --agent codex --copy --yes",
+        },
+      })}
+    >
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openInstallAs(canvasElement);
+    await userEvent.click(canvas.getByRole("radio", { name: "Skills CLI" }));
+    await canvas.findByText(/Xum found no Node\.js on PATH\. Run shows the command/);
+    await userEvent.click(canvas.getByRole("button", { name: "Run skills CLI (3)" }));
+    await canvas.findByText(/--skill frontend-design --skill pdf/);
+    await canvas.findByRole("button", { name: /copy/i });
   },
 };

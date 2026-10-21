@@ -66,6 +66,7 @@ import type {
   AgentPluginHooks,
   AgentPluginPendingSignOuts,
 } from "@/common/orpc/schemas/agentPlugins";
+import type { SkillsCliRun, SkillsCliStatus } from "@/common/orpc/schemas/skillsCli";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { ChatStats } from "@/common/types/chatStats";
 import {
@@ -163,6 +164,10 @@ export interface MockORPCClientOptions {
     preview?: AgentPluginInstallPreview;
     /** Returned by agentPlugins.preview for an "Install as" method; others get `preview`. */
     previewsByMethod?: Partial<Record<AgentPluginInstallMethod["kind"], AgentPluginInstallPreview>>;
+    /** Returned by agentPlugins.skillsCliStatus; omit for "Node.js not found". */
+    skillsCliStatus?: SkillsCliStatus;
+    /** Returned by agentPlugins.installWithSkillsCli; omit to make the run fail. */
+    skillsCliRun?: SkillsCliRun;
     /** Returned by agentPlugins.previewUpdate for the named plugin; omit to make it fail. */
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
@@ -1438,6 +1443,19 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
               error: "No preview configured in this story",
             });
       },
+      skillsCliStatus: () =>
+        Promise.resolve(
+          agentPluginsMock?.skillsCliStatus ?? {
+            available: false as const,
+            reason: "Xum found no Node.js on PATH.",
+            nodeVersion: null,
+            package: "skills@1.7.4",
+          }
+        ),
+      installWithSkillsCli: () =>
+        agentPluginsMock?.skillsCliRun
+          ? Promise.resolve({ success: true as const, data: agentPluginsMock.skillsCliRun })
+          : Promise.resolve({ success: false as const, error: "No skills CLI run in this story" }),
       install: (input: { source: AgentPluginInstallPreview["source"]; expectedSha: string }) =>
         Promise.resolve({
           success: true,

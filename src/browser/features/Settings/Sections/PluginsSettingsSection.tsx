@@ -46,7 +46,12 @@ import {
   cutReviewText,
   kilobytes,
 } from "./PluginHooksPanel";
-import { InstallMethodPicker, installMethodLabel } from "./PluginInstallMethods";
+import {
+  InstallMethodPicker,
+  SkillsCliInstall,
+  installMethodLabel,
+  offersSkillsCli,
+} from "./PluginInstallMethods";
 
 /**
  * Settings → Plugins (global scope only).
@@ -538,6 +543,8 @@ const AddPluginPanel: React.FC<{
     skills: [],
     mcpServers: [],
   });
+  /** The "Skills CLI" choice of the Install as picker: not a managed install. */
+  const [cliChosen, setCliChosen] = useState(false);
 
   /** `method`: the Install as choice; null takes the first method that fits. */
   const handlePreview = async (method: AgentPluginInstallMethod | null) => {
@@ -575,6 +582,7 @@ const AddPluginPanel: React.FC<{
   const backToSource = () => {
     setPreview(null);
     setError(null);
+    setCliChosen(false);
   };
 
   const handleInstall = async () => {
@@ -683,50 +691,65 @@ const AddPluginPanel: React.FC<{
         <>
           <InstallMethodPicker
             preview={preview}
+            cliOffered={offersSkillsCli({ input, ref, subpath, skills: preview.skillsCliSkills })}
+            cliChosen={cliChosen}
             disabled={busy}
-            onPickMethod={(method) => void handlePreview(method)}
+            onPickCurrent={() => {
+              // A changed method clears the error of the previous one.
+              setError(null);
+              setCliChosen(false);
+            }}
+            onPickMethod={(method) => {
+              setCliChosen(false);
+              void handlePreview(method);
+            }}
+            onPickCli={() => {
+              setError(null);
+              setCliChosen(true);
+            }}
           />
-          <PreviewConsent
-            preview={preview}
-            selected={selected}
-            onSelect={setSelected}
-            busy={busy}
-          />
-          {error && (
-            <div
-              role="alert"
-              className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
-            >
-              <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span className="break-words">{error}</span>
-            </div>
-          )}
+          {cliChosen ? (
+            <SkillsCliInstall
+              source={input.trim()}
+              skills={preview.skillsCliSkills}
+              onBack={backToSource}
+            />
+          ) : (
+            <>
+              <PreviewConsent
+                preview={preview}
+                selected={selected}
+                onSelect={setSelected}
+                busy={busy}
+                error={error}
+              />
+              {/* A name collision blocks only this method; the Install as choice above stays usable. */}
+              {preview.installBlockedReason !== undefined && (
+                <div className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm">
+                  <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span className="break-words">
+                    Xum cannot install this as {installMethodLabel(preview.method)}.{" "}
+                    {preview.installBlockedReason}
+                  </span>
+                </div>
+              )}
 
-          {/* A name collision blocks only this method; the Install as choice above stays usable. */}
-          {preview.installBlockedReason !== undefined && (
-            <div className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm">
-              <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span className="break-words">
-                Xum cannot install this as {installMethodLabel(preview.method)}.{" "}
-                {preview.installBlockedReason}
-              </span>
-            </div>
+              <div className="flex gap-2">
+                <Button variant="ghost" size="sm" onClick={backToSource} disabled={busy}>
+                  <ArrowLeft className="h-3.5 w-3.5" />
+                  Back
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={() => void handleInstall()}
+                  disabled={busy || preview.installBlockedReason !== undefined}
+                >
+                  {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                  {busy ? "Installing…" : "Install"}
+                </Button>
+              </div>
+            </>
           )}
-
-          <div className="flex gap-2">
-            <Button variant="ghost" size="sm" onClick={backToSource} disabled={busy}>
-              <ArrowLeft className="h-3.5 w-3.5" />
-              Back
-            </Button>
-            <Button
-              size="sm"
-              onClick={() => void handleInstall()}
-              disabled={busy || preview.installBlockedReason !== undefined}
-            >
-              {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-              {busy ? "Installing…" : "Install"}
-            </Button>
-          </div>
         </>
       )}
     </div>
@@ -820,6 +843,7 @@ const PreviewConsent: React.FC<{
   selected: AgentPluginImportedComponents;
   onSelect: (selection: AgentPluginImportedComponents) => void;
   busy: boolean;
+  error: string | null;
 }> = (props) => (
   <>
     <PreviewHeader preview={props.preview} />
@@ -851,6 +875,16 @@ const PreviewConsent: React.FC<{
     </p>
 
     <PreviewDisclosures preview={props.preview} />
+
+    {props.error && (
+      <div
+        role="alert"
+        className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
+      >
+        <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+        <span className="break-words">{props.error}</span>
+      </div>
+    )}
   </>
 );
 
