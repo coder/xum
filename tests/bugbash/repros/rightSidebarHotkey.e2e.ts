@@ -1,6 +1,8 @@
-// RS1, RS2 (bug bash 2026-10-21 of the Ctrl+Shift+B right sidebar hotkey). Each test fails on the
+// RS1, RS2, RS3 (bug bash 2026-10-21 of the TOGGLE_RIGHT_SIDEBAR hotkey). Each test fails on the
 // defect the bug bash found: the key acted behind the open command palette (RS1), and in the phone
-// full-screen sidebar it collapsed the sidebar inside the view, which left a blank pane (RS2).
+// full-screen sidebar it collapsed the sidebar inside the view, which left a blank pane (RS2), and a
+// collapse from inside the sidebar left focus on <body> (RS3). The palette command is checked for
+// the same focus rule (Codex review of #7128).
 import type { Browser } from "@e2e-dev/web";
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
@@ -88,5 +90,26 @@ test(
     await expect.poll(() => toggleLabel(browser)).toBe("Expand right sidebar");
     // Before the fix the collapse unmounted the focused control and focus fell to <body>.
     await expect(screen.getByRole("button", "Expand right sidebar")).toBeFocused();
+  }
+);
+
+test(
+  "Right Sidebar: Toggle from the palette leaves focus on the sidebar toggle",
+  { tags: ["bugbash", "RS3"] },
+  async ({ app, screen, browser }) => {
+    await browser.setViewport({ width: 1440, height: 900 });
+    await openPlayground(app, screen, browser);
+    const before = await toggleLabel(browser);
+    await browser.keyboard.press("Control+Shift+P");
+    const palette = screen.getByRole("combobox", "Command palette");
+    await expect(palette).toBeFocused();
+    await palette.fill(">Right Sidebar: Toggle");
+    await expect(screen.getByRole("option", "Right Sidebar: Toggle")).toBeVisible();
+    await browser.keyboard.press("Enter");
+
+    await expect.poll(() => toggleLabel(browser)).not.toBe(before);
+    // The palette closes before the command runs, so focus left with its input.
+    const after = (await toggleLabel(browser)) ?? "";
+    await expect(screen.getByRole("button", after)).toBeFocused();
   }
 );

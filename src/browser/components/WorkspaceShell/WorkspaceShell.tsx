@@ -25,8 +25,12 @@ import {
   KEYBINDS,
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
-import { toggleRightSidebarCollapsed } from "@/browser/utils/rightSidebarTabFocus";
-import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
+
+import {
+  focusRightSidebarToggle,
+  isWorkspaceRightSidebarHidden,
+  toggleRightSidebarCollapsed,
+} from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { PopoverError } from "../PopoverError/PopoverError";
@@ -333,15 +337,12 @@ const WorkspacePlaceholder: React.FC<{
 );
 
 /**
- * True when a keydown toggles the right sidebar: the TOGGLE_RIGHT_SIDEBAR key, with no dialog open
- * and focus outside the command palette (not a modal dialog, bug bash RS1) and outside terminals,
- * browser and desktop viewports, which own their keystrokes.
+ * True for the TOGGLE_RIGHT_SIDEBAR chord outside terminals, browser and desktop viewports, which
+ * own their keystrokes.
  */
-function isRightSidebarToggleKey(e: KeyboardEvent): boolean {
+function isRightSidebarToggleChord(e: KeyboardEvent): boolean {
   return (
     matchesKeybind(e, KEYBINDS.TOGGLE_RIGHT_SIDEBAR) &&
-    !isDialogOpen() &&
-    !isCommandPaletteTarget(e.target) &&
     !isTerminalFocused(e.target) &&
     !isBrowserViewportFocused(e.target) &&
     !isDesktopViewportFocused(e.target)
@@ -350,20 +351,20 @@ function isRightSidebarToggleKey(e: KeyboardEvent): boolean {
 
 /**
  * Toggles the right sidebar for its hotkey. A collapse unmounts the focused control, and focus then
- * fell to <body> (bug bash RS3), so focus moves to the header toggle, where a click on that button
- * leaves it.
+ * fell to <body> (bug bash RS3), so focus moves to the header toggle.
  */
 function toggleRightSidebarFromKey(workspaceId: string, shell: HTMLElement | null): void {
   const sidebar = shell?.querySelector(".mobile-hide-right-sidebar");
   const focusWasInSidebar = sidebar?.contains(document.activeElement) === true;
-  if (!toggleRightSidebarCollapsed(workspaceId, shell) || !focusWasInSidebar) return;
-  shell?.querySelector<HTMLElement>('[data-testid="right-sidebar-toggle-bar"] button')?.focus();
+  if (toggleRightSidebarCollapsed(workspaceId, shell) && focusWasInSidebar) {
+    focusRightSidebarToggle(shell);
+  }
 }
 
 /**
  * The right sidebar had no hotkey (user request). It lives in WorkspaceShell, outside the lazy
  * sidebar, so it works while the sidebar chunk loads, like the header toggle. It also works from
- * the chat input: Ctrl+Shift+B types nothing there, like Ctrl+P for the left sidebar.
+ * the chat input, where the chord types nothing, like TOGGLE_SIDEBAR for the left sidebar.
  */
 function useRightSidebarToggleKey(
   workspaceId: string,
@@ -371,10 +372,14 @@ function useRightSidebarToggleKey(
 ) {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (!isRightSidebarToggleKey(e)) return;
+      if (!isRightSidebarToggleChord(e)) return;
+      // Claim the chord even when an overlay blocks the toggle: in a browser, Chrome binds it to
+      // its bookmarks bar.
       e.preventDefault();
-      // A held key would flip the sidebar on every repeat.
-      if (!e.repeat) toggleRightSidebarFromKey(workspaceId, shellRef.current);
+      // A held key would flip the sidebar on every repeat. The command palette is not a modal
+      // dialog, so check its focus too (bug bash RS1).
+      if (e.repeat || isDialogOpen() || isCommandPaletteTarget(e.target)) return;
+      toggleRightSidebarFromKey(workspaceId, shellRef.current);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);

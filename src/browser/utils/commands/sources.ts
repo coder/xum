@@ -190,7 +190,10 @@ import {
   getTabConfig,
   type BaseTabType,
 } from "@/browser/features/RightSidebar/Tabs/tabConfig";
-import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
+import {
+  isWorkspaceRightSidebarHidden,
+  toggleRightSidebarFromPalette,
+} from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { formatProjectHierarchyLabel, getTopLevelProjectEntries } from "@/common/utils/subProjects";
 import { serverPathLabel } from "@/common/utils/paths";
 import {
@@ -204,7 +207,6 @@ import {
   readRightSidebarLayout,
   requestFocusedTabFocus,
   splitRightSidebarPane,
-  toggleRightSidebarCollapsed,
   updateRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
 
@@ -1155,10 +1157,10 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           title: "Right Sidebar: Toggle",
           section: section.navigation,
           shortcutHint: formatKeybind(KEYBINDS.TOGGLE_RIGHT_SIDEBAR),
-          // Same helper as the key: it does nothing while the layout hides the sidebar.
-          run: () => {
-            toggleRightSidebarCollapsed(wsId, document.querySelector("[data-workspace-shell]"));
-          },
+          // Hidden like the tool commands while the layout hides the sidebar, where the shared
+          // helper (also used by the key) would do nothing.
+          visible: isRightSidebarShown,
+          run: () => toggleRightSidebarFromPalette(wsId),
         },
         {
           id: CommandIds.navRightSidebarFocusTerminal(),

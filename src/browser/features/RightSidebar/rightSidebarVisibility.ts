@@ -1,4 +1,6 @@
-import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getReviewImmersiveKey, getRightSidebarCollapsedKey } from "@/common/constants/storage";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX, RIGHT_SIDEBAR_DEFAULT_COLLAPSED } from "@/constants/layout";
 
 /**
  * True when the right sidebar container is hidden by the responsive (narrow) layout. Immersive
@@ -27,4 +29,51 @@ export function isWorkspaceRightSidebarHidden(shell: Element | null | undefined)
     return isRightSidebarResponsivelyHidden(sidebar);
   }
   return window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
+}
+
+// The toggle helpers live here, not in rightSidebarTabFocus.ts: the VS Code webview bundles that
+// file, and these read desktop-only layout classes (vscode/src/webview/webviewCss.test.ts).
+
+/**
+ * Collapses or expands the right sidebar (the TOGGLE_RIGHT_SIDEBAR key and its palette command).
+ * Returns false, and changes nothing, while the sidebar is not on screen: a narrow window or
+ * immersive review hides it, so a flip there would be invisible until later. Immersive review
+ * also hides the header toggle (ShellRightSidebarToggle), so the key and the button agree.
+ * The phone full-screen view shows the narrow layout's sidebar, and a collapse there left a blank
+ * view (bug bash RS2), so it counts as narrow too: its own Close button closes it. The same holds
+ * while the sidebar chunk failed to load.
+ */
+export function toggleRightSidebarCollapsed(workspaceId: string, shell: Element | null): boolean {
+  // The failed-load frame ignores the collapse state to keep its Reload button on screen, and it
+  // hides the header toggle, so a flip there would only surface after a reload.
+  if (shell?.querySelector(".right-sidebar-fullscreen, [data-right-sidebar-load-failed]") != null) {
+    return false;
+  }
+  if (isWorkspaceRightSidebarHidden(shell)) return false;
+  if (readPersistedState(getReviewImmersiveKey(workspaceId), false)) return false;
+  updatePersistedState<boolean>(
+    getRightSidebarCollapsedKey(workspaceId),
+    (prev) => !prev,
+    RIGHT_SIDEBAR_DEFAULT_COLLAPSED
+  );
+  return true;
+}
+
+/**
+ * Focuses the right sidebar's header toggle. A toggle from the hotkey or the palette can unmount
+ * the control that had focus (a sidebar control, or the closed palette's input), and focus then
+ * fell to <body>. The toggle keeps its place in both states, and a click on it leaves focus there.
+ */
+export function focusRightSidebarToggle(root: ParentNode | null | undefined): void {
+  root?.querySelector<HTMLElement>('[data-testid="right-sidebar-toggle-bar"] button')?.focus();
+}
+
+/**
+ * The command palette's "Right Sidebar: Toggle". The palette closes before its command runs, and
+ * its input took focus with it, so a toggle moves focus to the header toggle.
+ */
+export function toggleRightSidebarFromPalette(workspaceId: string): void {
+  if (toggleRightSidebarCollapsed(workspaceId, document.querySelector("[data-workspace-shell]"))) {
+    focusRightSidebarToggle(document);
+  }
 }

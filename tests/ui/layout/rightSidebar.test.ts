@@ -614,6 +614,29 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
+  test("Ctrl+Shift+B in the command palette is claimed but does not toggle", async () => {
+    const { cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
+    });
+    // Stands in for the palette input: focus inside [cmdk-root] (isCommandPaletteTarget).
+    const palette = document.createElement("div");
+    palette.setAttribute("cmdk-root", "");
+    const input = document.createElement("input");
+    palette.append(input);
+    document.body.append(palette);
+
+    try {
+      const chord = { key: "B", code: "KeyB", ctrlKey: true, shiftKey: true };
+      // fireEvent returns false when a handler called preventDefault: in a browser, the chord
+      // must not fall through to Chrome's bookmarks bar.
+      expect(fireEvent.keyDown(input, chord)).toBe(false);
+      expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), true)).toBe(false);
+    } finally {
+      palette.remove();
+      await cleanup();
+    }
+  }, 60_000);
+
   // The toggle sits over the top pane's strip but acts on the whole sidebar, so expanding
   // returns to the pane the user was in.
   test("collapsing over the top pane keeps the focused pane for Expand", async () => {
