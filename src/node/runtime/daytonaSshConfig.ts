@@ -213,22 +213,9 @@ export class DaytonaSshConfigWriter {
     token: string;
     gateway: DaytonaSshGateway;
   }): Promise<void> {
-    await ensurePrivateDir(this.paths.dir);
-    const knownHosts = renderDaytonaKnownHosts(input.gateway);
-    await includeFileLocks.withLock(this.paths.includePath, async () => {
-      await writeFileAtomic(this.paths.knownHostsPath, knownHosts, {
-        encoding: "utf-8",
-        mode: 0o600,
-      });
-      // known_hosts is shared by every alias: a gateway change repoints them all (each keeps its
-      // token) in the same step, or another sandbox's turn would dial the old host with new pins.
-      const blocks = await this.readBlocks();
-      for (const other of tokensIn(blocks)) {
-        blocks.set(toXumDaytonaHost(other.sandboxId), this.renderBlock({ ...input, ...other }));
-      }
-      blocks.set(toXumDaytonaHost(input.sandboxId), this.renderBlock(input));
-      await this.writeBlocks(blocks);
-    });
+    await this.installGateway(input.gateway, (blocks) =>
+      blocks.set(toXumDaytonaHost(input.sandboxId), this.renderBlock(input))
+    );
     await ensureManagedSSHConfigBlock({
       markers: {
         start: XUM_DAYTONA_SSH_BLOCK_START,
@@ -237,6 +224,35 @@ export class DaytonaSshConfigWriter {
       },
       block: renderDaytonaManagedBlock(this.paths.includePath),
       sshConfigPath: this.sshConfigPath,
+    });
+  }
+
+  /** Daytona moved its gateway: repoint every sandbox's block (keeping its token) and pins. */
+  async repointGateway(gateway: DaytonaSshGateway): Promise<void> {
+    await this.installGateway(gateway, () => undefined);
+  }
+
+  /**
+   * known_hosts is shared by every alias: a gateway change repoints them all (each keeps its
+   * token) in the same step, or another sandbox's turn would dial the old host with new pins.
+   */
+  private async installGateway(
+    gateway: DaytonaSshGateway,
+    edit: (blocks: Map<string, string>) => void
+  ): Promise<void> {
+    await ensurePrivateDir(this.paths.dir);
+    const knownHosts = renderDaytonaKnownHosts(gateway);
+    await includeFileLocks.withLock(this.paths.includePath, async () => {
+      await writeFileAtomic(this.paths.knownHostsPath, knownHosts, {
+        encoding: "utf-8",
+        mode: 0o600,
+      });
+      const blocks = await this.readBlocks();
+      for (const other of tokensIn(blocks)) {
+        blocks.set(toXumDaytonaHost(other.sandboxId), this.renderBlock({ ...other, gateway }));
+      }
+      edit(blocks);
+      await this.writeBlocks(blocks);
     });
   }
 

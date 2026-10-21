@@ -189,7 +189,12 @@ export interface DaytonaServiceOptions {
   /** Defaults to a writer for the real `~/.ssh/config`; tests pass one aimed at a temp dir. */
   sshConfigWriter?: Pick<
     DaytonaSshConfigWriter,
-    "writeSandbox" | "updateToken" | "removeSandbox" | "verifyResolvedConfig" | "readTokens"
+    | "writeSandbox"
+    | "updateToken"
+    | "repointGateway"
+    | "removeSandbox"
+    | "verifyResolvedConfig"
+    | "readTokens"
   >;
   fetch?: typeof fetch;
   now?: () => number;
@@ -603,10 +608,9 @@ export class DaytonaService {
     const config = await client.getConfig();
     // Fetched across a settings change: never cache it for lookups under the new settings.
     if (this.credentialsGeneration !== generation) return config;
-    if (cached && gatewayIdentity(cached.config) !== gatewayIdentity(config)) {
-      await this.retireSshSetup();
-    }
+    const moved = cached && gatewayIdentity(cached.config) !== gatewayIdentity(config);
     this.gatewayCache = { apiUrl: credentials.apiUrl, generation, fetchedAt: this.now(), config };
+    if (moved) await this.retireSshSetup(config);
     return config;
   }
 
@@ -620,14 +624,27 @@ export class DaytonaService {
    * Daytona moved its gateway or rotated its host keys: every include block and the
    * known_hosts pins are stale. Each sandbox's next ssh access mints a token, which rewrites
    * its whole ssh setup and revokes the old token.
+   *
+   * Install first, retire last: a command connecting while the old connections are retired
+   * then reads the new files and caches, so no connection to the old gateway outlives this.
+   * Retiring first left a window in which a turn reconnected from the stale setup.
    */
-  private async retireSshSetup(): Promise<void> {
-    await this.retirePooledSsh(this.sandboxesWithSsh());
+  private async retireSshSetup(config: DaytonaGatewayConfig): Promise<void> {
+    const sandboxIds = this.sandboxesWithSsh();
     this.sshConfigured.clear();
     this.readyAt.clear();
     for (const [sandboxId, access] of this.tokens) {
       this.tokens.set(sandboxId, { ...access, expiresAt: new Date(0).toISOString() });
     }
+    try {
+      await this.sshConfigWriter.repointGateway(toSshGateway(config));
+    } catch (error) {
+      // Each sandbox's next ssh access rewrites its setup anyway.
+      log.warn("Could not repoint the Daytona ssh setup at the moved gateway", {
+        error: getErrorMessage(error),
+      });
+    }
+    await this.retirePooledSsh(sandboxIds);
   }
 
   private sandboxesWithSsh(): string[] {

@@ -248,6 +248,7 @@ describe("DaytonaService", () => {
       sshConfigWriter: {
         writeSandbox: store,
         updateToken: store,
+        repointGateway: () => Promise.resolve(),
         removeSandbox: (sandboxId: string) => {
           includeFile.delete(sandboxId);
           return Promise.resolve();
@@ -283,8 +284,10 @@ describe("DaytonaService", () => {
     const writes: string[] = [];
     /** Sandboxes whose pooled ssh connections were retired. */
     const retired: string[] = [];
-    /** Include block removals and retirements, in order. */
+    /** Include block removals, gateway repoints and retirements, in order. */
     const order: string[] = [];
+    /** Per retirement: whether the sandbox's next ssh access would set it up again. */
+    const staleAtRetire: boolean[] = [];
     const record = (input: { token: string; gateway: { host: string; hostKeys: string[] } }) => {
       writes.push(`${input.token}@${input.gateway.host} ${input.gateway.hostKeys.join(",")}`);
       return Promise.resolve();
@@ -301,16 +304,21 @@ describe("DaytonaService", () => {
           order.push(`remove ${sandboxId}`);
           return Promise.resolve();
         },
+        repointGateway: (gateway) => {
+          order.push(`repoint ${gateway.host} ${gateway.hostKeys.join(",")}`);
+          return Promise.resolve();
+        },
         readTokens: () => Promise.resolve([]),
         verifyResolvedConfig: () => Promise.resolve(),
       },
       retireSshConnections: (sandboxId) => {
         retired.push(sandboxId);
         order.push(`retire ${sandboxId}`);
+        staleAtRetire.push(recording.tokenNeedsRefresh(sandboxId));
         return Promise.resolve();
       },
     });
-    return { service: recording, writes, retired, order };
+    return { service: recording, writes, retired, order, staleAtRetire };
   }
 
   it("refuses a settings change while it looks up the gateway for a token", async () => {
@@ -373,6 +381,20 @@ describe("DaytonaService", () => {
     expect(configFetches()).toBe(3);
     expect(writes).toHaveLength(2);
     expect(retired).toEqual(["sb-1"]);
+  });
+
+  it("installs a moved gateway before retiring the connections to the old one", async () => {
+    const { service: watching, order, staleAtRetire } = serviceRecordingWrites();
+    await watching.ensureSshAccess("sb-1");
+
+    plane.gatewayHostKeys = ["ssh-ed25519 BBBB"];
+    clock += 6 * 60_000;
+    await watching.getGatewayConfig();
+
+    // A connection opened while the old ones are retired reads the new files, and the next
+    // access sets the sandbox up again: nothing reaches the old gateway afterwards.
+    expect(order).toEqual(["repoint ssh.test ssh-ed25519 BBBB", "retire sb-1"]);
+    expect(staleAtRetire).toEqual([true]);
   });
 
   it("retires the pooled ssh connections of its sandboxes on a settings change", async () => {

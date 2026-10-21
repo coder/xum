@@ -121,6 +121,12 @@ describe("DaytonaSshConfigWriter", () => {
       { sandboxId: "sb-1", token: "tokenA2" },
       { sandboxId: "sb-2", token: "tokenB" },
     ]);
+
+    // Moved back without a token refresh: every block follows, tokens kept.
+    await writer.repointGateway(GATEWAY);
+    expect(await fs.readFile(writer.paths.includePath, "utf8")).not.toContain("ssh2.daytona.test");
+    expect(await writer.readTokens()).toHaveLength(2);
+    expect(await fs.readFile(writer.paths.knownHostsPath, "utf8")).toContain("GatewayKey");
   });
 
   it("reads back the tokens the include file holds, for a later Xum process", async () => {
