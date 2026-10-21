@@ -54,7 +54,7 @@ export function openRightSidebarTool(workspaceId: string, tool: TabType): void {
  * Tab" focuses its launcher. Only focus travels by event: the layout is already stored, so a
  * sidebar that is not mounted (the shell's loading placeholder) still shows it once it mounts.
  */
-function requestFocusedTabFocus(workspaceId: string): void {
+export function requestFocusedTabFocus(workspaceId: string): void {
   const layout = readRightSidebarLayout(workspaceId);
   window.dispatchEvent(
     createCustomEvent(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, {

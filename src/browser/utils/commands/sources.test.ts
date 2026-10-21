@@ -2533,17 +2533,31 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
               .prompt!.onSubmit({ tool: "terminal" });
           }
         };
-        await run();
-        // With no session there is nothing to focus: leave the new chat collapsed.
-        expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(true);
-        const layout = selectOrAddTab(
-          getDefaultRightSidebarLayoutState("terminal:session-1"),
-          "costs"
-        );
-        updatePersistedState(getRightSidebarLayoutKey("w1"), layout);
-        await run();
-        expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
-        expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe("terminal:session-1");
+        const focusRequests: unknown[] = [];
+        const record = (event: Event) => focusRequests.push((event as CustomEvent).detail);
+        window.addEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+        try {
+          await run();
+          // With no session there is nothing to focus: leave the new chat collapsed.
+          expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(true);
+          expect(focusRequests).toEqual([]);
+          const layout = selectOrAddTab(
+            getDefaultRightSidebarLayoutState("terminal:session-1"),
+            "costs"
+          );
+          updatePersistedState(getRightSidebarLayoutKey("w1"), layout);
+          await run();
+          expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
+          expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe(
+            "terminal:session-1"
+          );
+          // The sidebar hands the terminal the keyboard.
+          expect(focusRequests).toEqual([
+            { workspaceId: "w1", tabsetId: layout.focusedTabsetId, tab: "terminal:session-1" },
+          ]);
+        } finally {
+          window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+        }
       });
     }
   );
