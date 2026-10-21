@@ -14,8 +14,9 @@ import { log } from "@/node/services/log";
 export const DAYTONA_TOKEN_PLACEHOLDER = "<daytona-token>";
 
 // Tokens are minted for an hour; a revoked or expired one can still show up in a late error.
+// Expiry is by age only: a count cap would drop tokens that are still live. Real mints (one per
+// sandbox per hour or so) bound the growth.
 const REMEMBER_MS = 3 * 60 * 60_000;
-const MAX_REMEMBERED_TOKENS = 256;
 
 /** token -> when it was remembered */
 const rememberedTokens = new Map<string, number>();
@@ -25,8 +26,7 @@ export function rememberDaytonaToken(token: string, now = Date.now()): void {
   rememberedTokens.delete(token);
   rememberedTokens.set(token, now);
   for (const [known, at] of rememberedTokens) {
-    if (rememberedTokens.size <= MAX_REMEMBERED_TOKENS && now - at < REMEMBER_MS) break;
-    rememberedTokens.delete(known);
+    if (now - at >= REMEMBER_MS) rememberedTokens.delete(known);
   }
 }
 
