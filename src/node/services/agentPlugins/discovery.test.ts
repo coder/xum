@@ -1012,6 +1012,32 @@ describe("discoverAgentPlugins", () => {
     expect(result.diagnostics).toEqual([]);
   });
 
+  test("the default skills/ holds skill folders even when it has a SKILL.md", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "implicit", { skills: ["nested"] });
+    await fs.writeFile(path.join(pluginDir, "skills", "SKILL.md"), "---\nname: x\n---\n", "utf8");
+    // The same folder declared in the manifest is one skill.
+    const declaredDir = await writePlugin(container, "declared", {
+      manifest: {
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "declared",
+        contributes: { skills: "skills" },
+      },
+      skills: ["nested"],
+    });
+    await fs.writeFile(path.join(declaredDir, "skills", "SKILL.md"), "---\nname: x\n---\n", "utf8");
+
+    const { plugins } = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const skillsDirs = (name: string) => plugins.find((p) => p.name === name)?.skillsDirs;
+    const root = (name: string) => plugins.find((p) => p.name === name)?.rootPath ?? "";
+    expect(skillsDirs("implicit")).toEqual([{ dir: path.join(root("implicit"), "skills") }]);
+    expect(skillsDirs("declared")).toEqual([
+      { dir: path.join(root("declared"), "skills"), single: true, name: "skills" },
+    ]);
+  });
+
   test("discovers a manifest-only plugin without components", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");

@@ -479,12 +479,18 @@ async function resolveSkillsRoots(args: {
     const canonical = await args.resolveComponent(relative, "directory");
     // Two spellings (or a symlink) can name one directory: scan it once.
     if (canonical === undefined || roots.some((root) => root.dir === canonical)) continue;
-    roots.push(await classifySkillsRoot({ ...args, relative, canonical }));
+    // Only a declared path can name one skill folder (the Claude Code rule). The implicit
+    // default skills/ always holds skill folders, even when it has a SKILL.md of its own.
+    roots.push(
+      declared === undefined
+        ? { dir: canonical }
+        : await classifySkillsRoot({ ...args, relative, canonical })
+    );
   }
   return roots;
 }
 
-/** A resolved skills root is one skill when it holds SKILL.md itself (PluginSkillsRoot). */
+/** A declared skills root is one skill when it holds SKILL.md itself (PluginSkillsRoot). */
 async function classifySkillsRoot(args: {
   relative: string;
   canonical: string;
