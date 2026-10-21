@@ -1,3 +1,4 @@
+import { spawnSync } from "child_process";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -168,7 +169,45 @@ describe("appendOpenSSHHostKeyPolicyArgs", () => {
 
       appendOpenSSHHostKeyPolicyArgs(args, "xum-feature-a1b2c3.xum--daytona");
 
-      expect(args).toEqual(["-T", "-o", "StrictHostKeyChecking=yes"]);
+      expect(args).toContain("StrictHostKeyChecking=yes");
+      expect(args).not.toContain("UserKnownHostsFile=/dev/null");
+    }
+  );
+
+  // The sandbox is not trusted: a user's `Host *` forwards would hand it the local agent, the
+  // X display or local ports. Command-line options beat every config file.
+  test.skipIf(spawnSync("ssh", ["-V"]).status !== 0)(
+    "keeps a user's agent, X11 and port forwards off a Daytona alias",
+    async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-daytona-fwd-"));
+      try {
+        const configPath = path.join(dir, "config");
+        await fs.writeFile(
+          configPath,
+          [
+            "Host *",
+            "  ForwardAgent yes",
+            "  ForwardX11 yes",
+            "  LocalForward 5000 localhost:5000",
+            "  RemoteForward 6000 localhost:6000",
+            "  DynamicForward 7000",
+            "",
+          ].join("\n")
+        );
+        const host = "xum-feature-a1b2c3.xum--daytona";
+        const args: string[] = [];
+        appendOpenSSHHostKeyPolicyArgs(args, host);
+
+        const resolved = spawnSync("ssh", ["-G", "-F", configPath, ...args, host], {
+          encoding: "utf8",
+        }).stdout.split("\n");
+
+        expect(resolved).toContain("forwardagent no");
+        expect(resolved).toContain("forwardx11 no");
+        expect(resolved.filter((line) => /^(local|remote|dynamic)forward /.test(line))).toEqual([]);
+      } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
     }
   );
 

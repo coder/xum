@@ -57,17 +57,30 @@ export function isInteractiveHostKeyApprovalAvailable(): boolean {
  * hand the token (the ssh user name) to any server. Command-line options beat every config file,
  * so force strict checking: if an earlier entry also points UserKnownHostsFile elsewhere, the
  * gateway key is unknown and ssh refuses before it sends the user name.
+ *
+ * The sandbox is not trusted either: a user `Host *` entry's agent, X11 or port forwards would
+ * let its processes use the local agent, display or ports, so those are forced off too. The
+ * bash AI proxy's reverse forward adds its `-R` through a control client that skips this.
  */
-export function appendDaytonaHostKeyPinArgs(args: string[], host: string): void {
+export function appendDaytonaOpenSSHArgs(args: string[], host: string): void {
   if (isXumDaytonaHost(host)) {
-    args.push("-o", "StrictHostKeyChecking=yes");
+    args.push(
+      "-o",
+      "StrictHostKeyChecking=yes",
+      "-o",
+      "ForwardAgent=no",
+      "-o",
+      "ForwardX11=no",
+      "-o",
+      "ClearAllForwardings=yes"
+    );
   }
 }
 
 /** Daytona aliases never get the headless fallback, which would accept any gateway key. */
 export function appendOpenSSHHostKeyPolicyArgs(args: string[], host: string): void {
   if (isXumDaytonaHost(host)) {
-    appendDaytonaHostKeyPinArgs(args, host);
+    appendDaytonaOpenSSHArgs(args, host);
     return;
   }
   if (hostKeyPolicyMode === "strict") {

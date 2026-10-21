@@ -34,7 +34,7 @@ import { workspaceUseLeasesFor, type WorkspaceUseLease } from "@/node/services/w
 import { isCommandAvailable, findAvailableCommand } from "@/node/utils/commandDiscovery";
 import { resolveContainerCli } from "@/node/runtime/containerCli";
 import { sanitizeXumChildEnv } from "@/node/runtime/childProcessEnv";
-import { appendDaytonaHostKeyPinArgs } from "@/node/runtime/sshConnectionPool";
+import { appendDaytonaOpenSSHArgs } from "@/node/runtime/sshConnectionPool";
 import { Terminal } from "@xterm/headless";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { NO_OSC_IDLE_FALLBACK_MS } from "@/constants/terminalActivity";
@@ -1007,7 +1007,7 @@ export class TerminalService {
       }
       // Force pseudo-terminal allocation
       sshArgs.push("-t");
-      appendDaytonaHostKeyPinArgs(sshArgs, config.sshConfig.host);
+      appendDaytonaOpenSSHArgs(sshArgs, config.sshConfig.host);
       // Add host
       sshArgs.push(config.sshConfig.host);
       // Add remote command to cd into directory and start shell

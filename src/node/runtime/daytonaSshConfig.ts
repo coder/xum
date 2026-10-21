@@ -319,7 +319,7 @@ export class DaytonaSshConfigWriter {
    * silently replaces the token (`User`) or the pinned known_hosts file (`UserKnownHostsFile`).
    * Resolve the alias with `ssh -G` and fail with a clear message instead of an opaque auth or
    * host key failure. The token is never printed. A shadowed StrictHostKeyChecking needs no check
-   * here: every OpenSSH invocation forces it on the command line (appendDaytonaHostKeyPinArgs).
+   * here: every OpenSSH invocation forces it on the command line (appendDaytonaOpenSSHArgs).
    * Skipped when no OpenSSH client is installed (the ssh2 path parses the config itself).
    */
   async verifyResolvedConfig(sandboxId: string, token: string): Promise<void> {
