@@ -2,7 +2,7 @@
 // gates (crap/check.ts, dry/check.ts, mutate/check.ts) so they agree on what
 // "changed" means: the working tree against `base`, with renames paired.
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { parseChangedLines, type ChangedLines } from "./policy";
@@ -100,15 +100,21 @@ export function writeBaseTree(
 ): { tree: string; paths: string[] } {
   const tree = mkdtempSync(join(tmpdir(), "gate-base-"));
   const paths: string[] = [];
-  for (const { basePath } of files) {
-    if (basePath === null) continue;
-    mkdirSync(dirname(join(tree, basePath)), { recursive: true });
-    const blob = execFileSync("git", ["show", `${base}:${basePath}`], {
-      cwd: root,
-      maxBuffer: 256 * 1024 * 1024,
-    });
-    writeFileSync(join(tree, basePath), blob);
-    paths.push(basePath);
+  try {
+    for (const { basePath } of files) {
+      if (basePath === null) continue;
+      mkdirSync(dirname(join(tree, basePath)), { recursive: true });
+      const blob = execFileSync("git", ["show", `${base}:${basePath}`], {
+        cwd: root,
+        maxBuffer: 256 * 1024 * 1024,
+      });
+      writeFileSync(join(tree, basePath), blob);
+      paths.push(basePath);
+    }
+  } catch (error) {
+    // The caller owns the tree only once this returns.
+    rmSync(tree, { recursive: true, force: true });
+    throw error;
   }
   return { tree, paths };
 }
