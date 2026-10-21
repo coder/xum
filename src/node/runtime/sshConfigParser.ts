@@ -258,15 +258,63 @@ const SECTION_LINE_PATTERN = /^\s*(?:host|match)(?:\s*=\s*|\s+)\S/i;
 const HOST_LINE_PATTERN = /^\s*host(?:\s*=\s*|\s+)(.+?)\s*$/i;
 const MATCH_ALL_LINE_PATTERN = /^\s*match(?:\s*=\s*|\s+)all\s*$/i;
 
+/**
+ * A config line's arguments, split as OpenSSH 8.6+ does (misc.c's argv_split): quotes may
+ * appear anywhere in an argument, a backslash escapes a quote, a backslash or (unquoted) a
+ * space, and an argument that starts with # ends the line. An unclosed quote makes OpenSSH
+ * reject the line: it yields no arguments here.
+ */
 function splitIncludeArgs(value: string): string[] {
   const args: string[] = [];
-  const pattern = /"([^"]*)"|(\S+)/g;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(value)) !== null) {
-    const arg = match[1] ?? match[2];
-    if (arg) args.push(arg);
+  let index = 0;
+  while (index < value.length) {
+    if (isConfigBlank(value[index])) {
+      index++;
+      continue;
+    }
+    if (value[index] === "#") break;
+    const read = readConfigArg(value, index);
+    if (!read) return [];
+    if (read.arg) args.push(read.arg);
+    index = read.end;
   }
   return args;
+}
+
+function readConfigArg(value: string, start: number): { arg: string; end: number } | undefined {
+  let arg = "";
+  let quote = "";
+  let index = start;
+  while (index < value.length && (quote || !isConfigBlank(value[index]))) {
+    const step = configArgStep(value, index, quote);
+    arg += step.text;
+    quote = step.quote;
+    index += step.length;
+  }
+  return quote ? undefined : { arg, end: index };
+}
+
+/** One character (or escape pair) of an argument: the text it adds and the quote after it. */
+function configArgStep(
+  value: string,
+  index: number,
+  quote: string
+): { text: string; quote: string; length: number } {
+  const char = value[index];
+  const next = value[index + 1];
+  if (char === "\\" && isConfigEscape(next, quote)) return { text: next, quote, length: 2 };
+  if (quote)
+    return { text: char === quote ? "" : char, quote: char === quote ? "" : quote, length: 1 };
+  if (char === '"' || char === "'") return { text: "", quote: char, length: 1 };
+  return { text: char, quote, length: 1 };
+}
+
+function isConfigBlank(char: string): boolean {
+  return char === " " || char === "\t";
+}
+
+function isConfigEscape(next: string | undefined, quote: string): boolean {
+  return next === "'" || next === '"' || next === "\\" || (!quote && next === " ");
 }
 
 /**

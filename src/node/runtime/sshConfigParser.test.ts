@@ -349,6 +349,44 @@ describe("resolveSSHConfig", () => {
     });
   });
 
+  // OpenSSH 8.6+ splits config arguments with argv_split (misc.c): backslash escapes, quotes
+  // anywhere in an argument, and a # that starts an argument ends the line.
+  test("reads Include paths with escaped spaces and quotes as OpenSSH does", async () => {
+    await withTempHome(async (homeDir) => {
+      const sshDir = path.join(homeDir, ".ssh");
+      const files = {
+        a: path.join(sshDir, "conf dir", "a.conf"),
+        b: path.join(sshDir, 'say "hi"', "b.conf"),
+        c: path.join(sshDir, "single dir", "c.conf"),
+      };
+      for (const [host, file] of Object.entries(files)) {
+        await fs.mkdir(path.dirname(file), { recursive: true });
+        await fs.writeFile(file, `Host ${host}\n  User ${host}user\n`, "utf8");
+      }
+      const configPath = path.join(sshDir, "config");
+      await fs.writeFile(
+        configPath,
+        [
+          // Absolute: ssh -G resolves a relative Include against the real ~/.ssh.
+          `Include ${sshDir}/conf\\ dir/a.conf`,
+          `Include "${sshDir}/say \\"hi\\"/b.conf"`,
+          `Include ${sshDir}/'single dir'/c.conf # not a path`,
+          "Host *",
+          "  User fallback",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+
+      for (const host of ["a", "b", "c"]) {
+        expect((await resolveSSHConfig(host)).user).toBe(`${host}user`);
+        if (hasOpenSsh) {
+          expect(opensshUserAndProxy(configPath, host).user).toBe(`${host}user`);
+        }
+      }
+    });
+  });
+
   test("applies an Include inside a Host block only to the hosts that block matches", async () => {
     await withTempHome(async (homeDir) => {
       const included = path.join(homeDir, ".ssh", "gated.conf");
