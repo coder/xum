@@ -30,6 +30,8 @@ export interface FakeSandbox {
   pendingPolls: number;
   /** Daytona's sandboxClass ("linux-vm", "container", "windows"); unset like an older API. */
   sandboxClass?: string;
+  /** GPU units; Daytona's GPU sandboxes carry a positive count. */
+  gpu?: number;
 }
 
 export class FakeDaytonaControlPlane {
@@ -42,6 +44,7 @@ export class FakeDaytonaControlPlane {
   readonly snapshots: Array<{
     name: string;
     sandboxClass?: string;
+    gpu?: number;
     listedOnly?: boolean;
     state?: string;
   }> = [];
@@ -256,6 +259,7 @@ export class FakeDaytonaControlPlane {
       ...(this.omitDisk ? {} : { disk: sandbox.disk }),
       labels: sandbox.labels,
       ...(sandbox.sandboxClass ? { sandboxClass: sandbox.sandboxClass } : {}),
+      ...(sandbox.gpu !== undefined ? { gpu: sandbox.gpu } : {}),
     };
   }
 }

@@ -60,6 +60,8 @@ const SandboxSchema = z.object({
   errorReason: z.string().nullish(),
   /** "linux-vm", "container" or "windows"; older control planes omit it. */
   sandboxClass: z.string().nullish(),
+  /** GPU units; positive on a GPU sandbox (no sandboxClass marks one). */
+  gpu: z.number().nullish(),
 });
 
 export type DaytonaSandbox = z.infer<typeof SandboxSchema>;
@@ -73,6 +75,8 @@ const SnapshotSchema = z.object({
   name: z.string(),
   /** The class of the sandboxes the snapshot creates, as on a sandbox. */
   sandboxClass: z.string().nullish(),
+  /** GPU units of the sandboxes it creates, as on a sandbox. */
+  gpu: z.number().nullish(),
   /** SnapshotState: only "active" creates sandboxes (building, inactive, error, ...). */
   state: z.string().nullish(),
 });
@@ -80,6 +84,7 @@ const SnapshotSchema = z.object({
 export interface DaytonaSnapshot {
   name: string;
   sandboxClass?: string;
+  gpu?: number;
   state?: string;
 }
 
@@ -87,6 +92,7 @@ function toSnapshot(item: z.infer<typeof SnapshotSchema>): DaytonaSnapshot {
   return {
     name: item.name,
     ...(item.sandboxClass ? { sandboxClass: item.sandboxClass } : {}),
+    ...(item.gpu ? { gpu: item.gpu } : {}),
     ...(item.state ? { state: item.state } : {}),
   };
 }

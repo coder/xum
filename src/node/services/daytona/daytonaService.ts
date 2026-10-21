@@ -45,14 +45,23 @@ interface StoredSandboxRef {
 }
 
 /**
- * Daytona's sandboxClass of a Windows sandbox (and of the snapshots that create one). Xum
- * provisions and runs workspaces over ssh with POSIX shell commands, which cmd.exe and
- * PowerShell do not run, so it never offers, creates or attaches one.
+ * Sandboxes (and the snapshots that create them) Xum never offers, creates or attaches:
+ * - "windows" (Daytona's sandboxClass): Xum provisions and runs workspaces over ssh with POSIX
+ *   shell commands, which cmd.exe and PowerShell do not run.
+ * - "gpu" (a positive `gpu` count; Daytona's sandboxClass has no GPU value): Daytona deletes a
+ *   GPU sandbox when it stops, and Xum lets workspaces auto-stop and stops one to grow its
+ *   disk, so the checkout would be lost.
  */
-export const DAYTONA_WINDOWS_SANDBOX_CLASS = "windows";
+export type UnsupportedDaytonaSandboxKind = "windows" | "gpu";
 
-const isWindowsClass = (item: { sandboxClass?: string | null }) =>
-  item.sandboxClass === DAYTONA_WINDOWS_SANDBOX_CLASS;
+export function unsupportedDaytonaSandboxKind(item: {
+  sandboxClass?: string | null;
+  gpu?: number | null;
+}): UnsupportedDaytonaSandboxKind | undefined {
+  if (item.sandboxClass === "windows") return "windows";
+  if ((item.gpu ?? 0) > 0) return "gpu";
+  return undefined;
+}
 
 export const DAYTONA_LABEL_INSTANCE = "xum.instance";
 export const DAYTONA_LABEL_WORKSPACE_ID = "xum.workspaceId";
@@ -821,7 +830,8 @@ export class DaytonaService {
           // Error states (destroyed and destroying included) cannot be started or attached.
           .filter(
             (sandbox) =>
-              mapDaytonaSandboxState(sandbox.state) !== "error" && !isWindowsClass(sandbox)
+              mapDaytonaSandboxState(sandbox.state) !== "error" &&
+              !unsupportedDaytonaSandboxKind(sandbox)
           )
           .map(toSummary),
       };
@@ -837,7 +847,7 @@ export class DaytonaService {
       return {
         ok: true,
         snapshots: snapshots
-          .filter((s) => !isWindowsClass(s) && isActiveSnapshot(s))
+          .filter((s) => !unsupportedDaytonaSandboxKind(s) && isActiveSnapshot(s))
           .map(({ name }) => ({ name })),
       };
     } catch (error) {
@@ -846,11 +856,13 @@ export class DaytonaService {
   }
 
   /**
-   * The snapshot named `name`, with whether it creates Windows sandboxes and its state; undefined when
+   * The snapshot named `name`, with the unsupported kind of sandbox it creates (if any) and its state; undefined when
    * Daytona has none by that name. The list is the fallback for one the lookup does not find
    * by name (it serves the snapshot picker).
    */
-  async findSnapshot(name: string): Promise<{ windows: boolean; state?: string } | undefined> {
+  async findSnapshot(
+    name: string
+  ): Promise<{ unsupported?: UnsupportedDaytonaSandboxKind; state?: string } | undefined> {
     const { client } = await this.getClient();
     let snapshot: DaytonaSnapshot | undefined;
     try {
@@ -861,7 +873,7 @@ export class DaytonaService {
     }
     return (
       snapshot && {
-        windows: isWindowsClass(snapshot),
+        unsupported: unsupportedDaytonaSandboxKind(snapshot),
         ...(snapshot.state ? { state: snapshot.state } : {}),
       }
     );

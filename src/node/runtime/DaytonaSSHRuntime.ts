@@ -49,7 +49,8 @@ import {
   DAYTONA_LABEL_INSTANCE,
   DAYTONA_LABEL_WORKSPACE_ID,
   DAYTONA_START_TIMEOUT_MS,
-  DAYTONA_WINDOWS_SANDBOX_CLASS,
+  unsupportedDaytonaSandboxKind,
+  type UnsupportedDaytonaSandboxKind,
   type DaytonaAccount,
   type DaytonaService,
 } from "@/node/services/daytona/daytonaService";
@@ -120,8 +121,17 @@ const DAYTONA_AUTO_DELETE_DISABLED = -1;
 const SANDBOX_NAME_MAX_BRANCH_LENGTH = 40;
 const SETTINGS_CHANGED_DURING_SETUP =
   "Daytona settings changed while the sandbox was set up; create the workspace again";
-const LINUX_ONLY =
-  "Xum sets up and runs a workspace over SSH with Linux shell commands, so it needs a Linux sandbox.";
+const UNSUPPORTED_SANDBOXES: Record<UnsupportedDaytonaSandboxKind, { label: string; why: string }> =
+  {
+    windows: {
+      label: "Windows",
+      why: "Xum sets up and runs a workspace over SSH with Linux shell commands, so it needs a Linux sandbox.",
+    },
+    gpu: {
+      label: "GPU",
+      why: "GPU sandboxes are ephemeral: Daytona deletes one when it stops, and a workspace's sandbox stops when idle, so its checkout would be lost.",
+    },
+  };
 
 /** `xum-<branch>-<random>`: unique per creation, and readable in the Daytona dashboard. */
 export function buildDaytonaSandboxName(branchName: string): string {
@@ -261,8 +271,10 @@ function attachRefusal(
   state: DaytonaSandboxState,
   sandbox: DaytonaSandbox
 ): string | undefined {
-  if (sandbox.sandboxClass === DAYTONA_WINDOWS_SANDBOX_CLASS) {
-    return `Daytona sandbox "${sandboxId}" is a Windows sandbox. ${LINUX_ONLY}`;
+  const unsupported = unsupportedDaytonaSandboxKind(sandbox);
+  if (unsupported) {
+    const { label, why } = UNSUPPORTED_SANDBOXES[unsupported];
+    return `Daytona sandbox "${sandboxId}" is a ${label} sandbox. ${why}`;
   }
   // Setup's start never brings an error state up, so every retry would fail.
   if (state !== "error") return undefined;
@@ -793,8 +805,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       if (options?.missingOk) return Ok(undefined);
       return Err(`Daytona snapshot "${snapshot}" was not found; pick another snapshot`);
     }
-    if (found.windows) {
-      return Err(`Daytona snapshot "${snapshot}" creates Windows sandboxes. ${LINUX_ONLY}`);
+    if (found.unsupported) {
+      const { label, why } = UNSUPPORTED_SANDBOXES[found.unsupported];
+      return Err(`Daytona snapshot "${snapshot}" creates ${label} sandboxes. ${why}`);
     }
     const refusal = snapshotStateRefusal(snapshot, found.state);
     return refusal ? Err(refusal) : Ok(undefined);

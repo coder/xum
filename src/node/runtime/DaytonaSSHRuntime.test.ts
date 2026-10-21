@@ -330,13 +330,16 @@ describe("DaytonaSSHRuntime.finalizeConfig and validateBeforePersist", () => {
   });
 });
 
-describe("DaytonaSSHRuntime Windows sandboxes", () => {
+describe("DaytonaSSHRuntime Windows and GPU sandboxes", () => {
   // Xum provisions over ssh with POSIX commands; a Windows sandbox runs cmd.exe or PowerShell.
-  it("refuses to attach a Windows sandbox or create from a Windows snapshot before persisting", async () => {
+  // Daytona deletes a GPU sandbox when it stops, and Xum lets workspaces auto-stop.
+  it("refuses to attach a Windows or GPU sandbox or create from such a snapshot before persisting", async () => {
     rig.plane.addSandbox({ id: "sb-win", sandboxClass: "windows" });
-    rig.plane.addSandbox({ id: "sb-linux", sandboxClass: "linux-vm" });
+    rig.plane.addSandbox({ id: "sb-gpu", sandboxClass: "linux-vm", gpu: 1 });
+    rig.plane.addSandbox({ id: "sb-linux", sandboxClass: "linux-vm", gpu: 0 });
     rig.plane.snapshots.push(
       { name: "windows-small", sandboxClass: "windows" },
+      { name: "daytona-gpu", sandboxClass: "linux-vm", gpu: 1 },
       { name: "daytona-small", sandboxClass: "container" }
     );
     const runtime = makeRuntime({});
@@ -350,6 +353,10 @@ describe("DaytonaSSHRuntime Windows sandboxes", () => {
     expect(attached.success ? "" : attached.error).toContain("Windows");
     const created = await validate({ snapshot: "windows-small" });
     expect(created.success ? "" : created.error).toContain("Windows");
+    const attachedGpu = await validate({ sandboxId: "sb-gpu" });
+    expect(attachedGpu.success ? "" : attachedGpu.error).toContain("GPU");
+    const createdGpu = await validate({ snapshot: "daytona-gpu" });
+    expect(createdGpu.success ? "" : createdGpu.error).toContain("GPU");
 
     expect((await validate({ sandboxId: "sb-linux" })).success).toBe(true);
     expect((await validate({ snapshot: "daytona-small" })).success).toBe(true);
@@ -442,12 +449,14 @@ describe("DaytonaSSHRuntime Windows sandboxes", () => {
     expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
   });
 
-  it("offers neither Windows snapshots nor Windows sandboxes", async () => {
+  it("offers neither Windows nor GPU snapshots and sandboxes", async () => {
     rig.plane.addSandbox({ id: "sb-win", sandboxClass: "windows" });
+    rig.plane.addSandbox({ id: "sb-gpu", sandboxClass: "linux-vm", gpu: 1 });
     rig.plane.addSandbox({ id: "sb-linux", sandboxClass: "linux-vm" });
     rig.plane.addSandbox({ id: "sb-older" });
     rig.plane.snapshots.push(
       { name: "windows-small", sandboxClass: "windows" },
+      { name: "daytona-gpu", sandboxClass: "linux-vm", gpu: 1 },
       { name: "daytona-small", sandboxClass: "container" },
       { name: "older" }
     );
