@@ -13,11 +13,7 @@ import { useResizableSidebar } from "@/browser/hooks/useResizableSidebar";
 import { useResizeObserver } from "@/browser/hooks/useResizeObserver";
 import { useOpenTerminal } from "@/browser/hooks/useOpenTerminal";
 import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
-import {
-  readPersistedState,
-  updatePersistedState,
-  usePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { guardSidebarKeys, holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
@@ -202,15 +198,19 @@ function FullscreenSidebarClose(props: { onClose?: () => void }) {
  * loading and failure states stay visible.
  */
 function LazyRightSidebar(
-  props: React.ComponentProps<typeof RightSidebar> & { held: HeldSidebarInput[] }
+  props: React.ComponentProps<typeof RightSidebar> & {
+    held: HeldSidebarInput[];
+    /**
+     * The shell's state, not a read of the persisted key: React Compiler reuses the shell's
+     * element for this component while its props stay the same, so a toggle while the chunk
+     * loads would leave the loading box at its old width under the header.
+     */
+    collapsed: boolean;
+  }
 ) {
-  const { held, ...sidebarProps } = props;
+  const { held, collapsed, ...sidebarProps } = props;
   // Per workspace: the shell keys this component by workspace.
   const [workflowRunBaseline, setWorkflowRunBaseline] = useState<number | null>(null);
-  const collapsed = readPersistedState(
-    RIGHT_SIDEBAR_COLLAPSED_KEY,
-    RIGHT_SIDEBAR_DEFAULT_COLLAPSED
-  );
   // The failure state takes the expanded width even when collapsed: it needs room for its Reload
   // button, and the card is part of the sidebar that failed to load (globals.css hides the toggle
   // then, since there is no sidebar to toggle). The empty loading box keeps its element (not
@@ -545,6 +545,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
 
       <LazyRightSidebar
         held={heldSidebarInput}
+        collapsed={rightSidebarCollapsed}
         key={props.workspaceId}
         workspaceId={props.workspaceId}
         workspacePath={props.namedWorkspacePath}
