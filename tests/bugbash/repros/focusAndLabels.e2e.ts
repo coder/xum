@@ -71,7 +71,8 @@ test(
   async ({ app, screen, browser }) => {
     await browser.setViewport({ width: 1600, height: 900 });
     await openPlayground(app, screen, browser);
-    await screen.getByRole("button", "Expand right sidebar").tap();
+    const expand = screen.getByRole("button", "Expand right sidebar");
+    await expand.tap();
     await screen.getByRole("button", "New terminal").tap();
     const focusOwner = () =>
       browser.evaluate(() => {
@@ -79,18 +80,28 @@ test(
         if (el?.closest(".terminal-view")) return "terminal";
         return el?.getAttribute("aria-label") ?? el?.tagName ?? "none";
       });
-    await expect.poll(focusOwner, { timeout: 15_000 }).toBe("terminal");
+    try {
+      await expect.poll(focusOwner, { timeout: 15_000 }).toBe("terminal");
 
-    await screen.getByRole("button", "Collapse right sidebar").tap();
-    // Closed: the slide is over and the terminal unmounted with the panel.
-    await expect
-      .poll(() => browser.evaluate(() => document.querySelector(".terminal-view") === null))
-      .toBe(true);
-    await screen.getByRole("button", "Expand right sidebar").tap();
-    await expect.poll(focusOwner, { timeout: 15_000 }).toBe("terminal");
-    await browser.keyboard.type("cat README.md");
+      await screen.getByRole("button", "Collapse right sidebar").tap();
+      // Closed: the slide is over and the terminal unmounted with the panel.
+      await expect
+        .poll(() => browser.evaluate(() => document.querySelector(".terminal-view") === null))
+        .toBe(true);
+      await expand.tap();
+      await expect.poll(focusOwner, { timeout: 15_000 }).toBe("terminal");
+      await browser.keyboard.type("cat README.md");
 
-    expect(await focusOwner()).toBe("terminal");
+      expect(await focusOwner()).toBe("terminal");
+    } finally {
+      // Every repro in a run shares one backend, so close the terminal session, also after a
+      // failure. A later repro whose sidebar opens onto a leftover terminal can lose its menu:
+      // the terminal takes focus after it mounts, and the focus move closes the menu (#7099).
+      if (await expand.isVisible()) await expand.tap();
+      const close = screen.getByRole("button", "Close terminal");
+      await close.tap();
+      await expect(close).toBeHidden();
+    }
   }
 );
 

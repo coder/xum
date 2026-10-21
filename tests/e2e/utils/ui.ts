@@ -535,7 +535,13 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
 
   const metaSidebar = {
     async expectVisible(): Promise<void> {
-      await expect(page.getByRole("complementary", { name: "Workspace insights" })).toBeVisible();
+      // Collapsed (a fresh workspace's state), the sidebar is 0px wide and only its toggle shows
+      // (the overview card floats outside the sidebar's box), so either state counts.
+      const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
+      const expandButton = page.getByRole("button", { name: "Expand right sidebar", exact: true });
+      await expect
+        .poll(async () => (await sidebar.isVisible()) || (await expandButton.isVisible()))
+        .toBe(true);
     },
 
     async selectTab(label: string): Promise<void> {
