@@ -7,6 +7,7 @@ import type {
   DaytonaSandboxSummary,
   DaytonaTestConnectionResult,
 } from "@/common/orpc/schemas/daytona";
+import { toXumDaytonaHost } from "@/common/constants/daytona";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   DaytonaConfigError,
@@ -16,6 +17,7 @@ import {
 } from "@/node/config/daytonaCredentialsStore";
 import { loadOrCreateInstallationId } from "@/node/config/installationIdentity";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
+import { retireSshConnections } from "@/node/runtime/transports";
 import { redactDaytonaTokens, rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
 import { getDaytonaSandboxId } from "@/common/types/runtime";
 import { log } from "@/node/services/log";
@@ -180,6 +182,8 @@ export interface DaytonaServiceOptions {
    * with the last workspace that references it. Without it no sandbox counts as unreferenced.
    */
   listWorkspaces?: () => DaytonaWorkspaceRef[];
+  /** Defaults to retiring the pooled OpenSSH and ssh2 connections of the sandbox's alias. */
+  retireSshConnections?: (sandboxId: string) => Promise<void>;
 }
 
 export interface DaytonaStartAndWaitOptions {
@@ -274,6 +278,7 @@ export class DaytonaService {
   /** Per sandbox: bumped by every release of its SSH access, so a mint that spans one can tell. */
   private readonly accessReleases = new Map<string, number>();
   private readonly sshConfigWriter: NonNullable<DaytonaServiceOptions["sshConfigWriter"]>;
+  private readonly retireSshConnections: NonNullable<DaytonaServiceOptions["retireSshConnections"]>;
   /** Sandboxes whose include block and `~/.ssh/config` block this process has written. */
   private readonly sshConfigured = new Set<string>();
   private readonly readyAt = new Map<string, number>();
@@ -301,6 +306,9 @@ export class DaytonaService {
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? sleepWithAbort;
     this.listWorkspaces = options.listWorkspaces;
+    this.retireSshConnections =
+      options.retireSshConnections ??
+      ((sandboxId) => retireSshConnections({ host: toXumDaytonaHost(sandboxId) }));
   }
 
   /**
@@ -360,10 +368,12 @@ export class DaytonaService {
     // Tokens and gateway data belong to the old account or deployment. Revoke the tokens with
     // the old credentials, which may not work for the new ones.
     const tokens = [...this.tokens];
+    const connected = this.sandboxesWithSsh();
     this.gatewayCache = undefined;
     this.tokens.clear();
     this.sshConfigured.clear();
     this.readyAt.clear();
+    await this.retirePooledSsh(connected);
     if (previousClient) {
       await Promise.all(
         tokens.map(([sandboxId, access]) =>
@@ -503,7 +513,7 @@ export class DaytonaService {
     // Fetched across a settings change: never cache it for lookups under the new settings.
     if (this.credentialsGeneration !== generation) return config;
     if (cached && gatewayIdentity(cached.config) !== gatewayIdentity(config)) {
-      this.retireSshSetup();
+      await this.retireSshSetup();
     }
     this.gatewayCache = { apiUrl: credentials.apiUrl, generation, fetchedAt: this.now(), config };
     return config;
@@ -520,12 +530,36 @@ export class DaytonaService {
    * known_hosts pins are stale. Each sandbox's next ssh access mints a token, which rewrites
    * its whole ssh setup and revokes the old token.
    */
-  private retireSshSetup(): void {
+  private async retireSshSetup(): Promise<void> {
+    await this.retirePooledSsh(this.sandboxesWithSsh());
     this.sshConfigured.clear();
     this.readyAt.clear();
     for (const [sandboxId, access] of this.tokens) {
       this.tokens.set(sandboxId, { ...access, expiresAt: new Date(0).toISOString() });
     }
+  }
+
+  private sandboxesWithSsh(): string[] {
+    return [...new Set([...this.tokens.keys(), ...this.sshConfigured])];
+  }
+
+  /**
+   * Pooled ssh connections (OpenSSH ControlMasters, ssh2 clients) outlive the include file
+   * they were opened with: without this, later commands keep reaching the old deployment.
+   */
+  private async retirePooledSsh(sandboxIds: string[]): Promise<void> {
+    await Promise.all(
+      sandboxIds.map(async (sandboxId) => {
+        try {
+          await this.retireSshConnections(sandboxId);
+        } catch (error) {
+          log.warn("Could not retire the pooled ssh connections of a Daytona sandbox", {
+            sandboxId,
+            error: getErrorMessage(error),
+          });
+        }
+      })
+    );
   }
 
   async testConnection(): Promise<DaytonaTestConnectionResult> {

@@ -111,6 +111,8 @@ interface SSH2ConnectionEntry {
   idleTimer?: ReturnType<typeof setTimeout>;
   /** Exec/shell channels still open on this connection (see trackChannel). */
   openChannels: number;
+  /** Out of the pool (retireConnection): it closes when its last channel does. */
+  retired?: boolean;
 }
 
 /**
@@ -561,6 +563,8 @@ export class SSH2ConnectionPool {
       // dead client only held the event loop open until it fired as a no-op (#5507).
       if (entry.openChannels === 0 && this.connections.get(key) === entry) {
         this.touchConnection(entry, key);
+      } else if (entry.openChannels === 0 && entry.retired) {
+        this.endClient(entry);
       }
     };
     return {
@@ -592,18 +596,41 @@ export class SSH2ConnectionPool {
     }
 
     this.connections.delete(key);
+    this.endClient(entry);
+  }
 
+  /**
+   * The host's credentials or gateway changed (Daytona settings, a moved gateway): later
+   * acquires connect anew instead of reusing this client. Commands still running on it finish;
+   * it closes with its last channel.
+   */
+  retireConnection(config: SSHConnectionConfig): void {
+    const key = makeConnectionKey(config);
+    this.health.delete(key);
+    const entry = this.connections.get(key);
+    if (!entry) return;
+    this.connections.delete(key);
+    if (entry.idleTimer) clearTimeout(entry.idleTimer);
+    entry.retired = true;
+    if (entry.openChannels === 0) this.endClient(entry);
+  }
+
+  private endClient(entry: SSH2ConnectionEntry): void {
     try {
       entry.client.end();
-    } catch {
-      // Ignore errors closing the connection
+    } catch (error) {
+      log.debug("Ignoring an error while closing an ssh2 connection", {
+        error: getErrorMessage(error),
+      });
     }
 
     if (entry.proxyProcess?.exitCode === null) {
       try {
         entry.proxyProcess.kill();
-      } catch {
-        // Ignore errors killing proxy
+      } catch (error) {
+        log.debug("Ignoring an error while killing an ssh2 ProxyCommand", {
+          error: getErrorMessage(error),
+        });
       }
     }
   }

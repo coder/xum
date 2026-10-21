@@ -281,6 +281,8 @@ describe("DaytonaService", () => {
   /** A service whose ssh setup writes are recorded as `token@host keys`. */
   function serviceRecordingWrites(fetchImpl: typeof fetch = plane.fetch) {
     const writes: string[] = [];
+    /** Sandboxes whose pooled ssh connections were retired. */
+    const retired: string[] = [];
     const record = (input: { token: string; gateway: { host: string; hostKeys: string[] } }) => {
       writes.push(`${input.token}@${input.gateway.host} ${input.gateway.hostKeys.join(",")}`);
       return Promise.resolve();
@@ -297,8 +299,12 @@ describe("DaytonaService", () => {
         readTokens: () => Promise.resolve([]),
         verifyResolvedConfig: () => Promise.resolve(),
       },
+      retireSshConnections: (sandboxId) => {
+        retired.push(sandboxId);
+        return Promise.resolve();
+      },
     });
-    return { service: recording, writes };
+    return { service: recording, writes, retired };
   }
 
   it("refuses a settings change while it looks up the gateway for a token", async () => {
@@ -334,7 +340,7 @@ describe("DaytonaService", () => {
   });
 
   it("rewrites a sandbox's ssh setup once Daytona moves its gateway keys", async () => {
-    const { service: watching, writes } = serviceRecordingWrites();
+    const { service: watching, writes, retired } = serviceRecordingWrites();
     const configFetches = () => plane.calls.filter((call) => call === "GET /config").length;
 
     await watching.ensureSshAccess("sb-1");
@@ -351,6 +357,8 @@ describe("DaytonaService", () => {
       "tok2@ssh.test ssh-rsa CCCC,ssh-ed25519 BBBB",
     ]);
     expect(plane.revoked).toEqual(["tok1"]);
+    // A pooled connection to the old gateway must not carry later commands.
+    expect(retired).toEqual(["sb-1"]);
 
     // A refetch that finds the same gateway, keys reordered, rewrites nothing.
     plane.gatewayHostKeys = ["ssh-ed25519 BBBB", "ssh-rsa CCCC"];
@@ -358,6 +366,16 @@ describe("DaytonaService", () => {
     await watching.ensureSshAccess("sb-1");
     expect(configFetches()).toBe(3);
     expect(writes).toHaveLength(2);
+    expect(retired).toEqual(["sb-1"]);
+  });
+
+  it("retires the pooled ssh connections of its sandboxes on a settings change", async () => {
+    const { service: changing, retired } = serviceRecordingWrites();
+    await changing.ensureSshAccess("sb-1");
+
+    await changing.setConfig({ target: "eu" });
+
+    expect(retired).toEqual(["sb-1"]);
   });
 
   it("revokes a token minted across a release, keeping the access released", async () => {

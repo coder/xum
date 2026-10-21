@@ -1,5 +1,6 @@
 import { spawn } from "child_process";
 import { randomBytes } from "crypto";
+import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 
@@ -18,6 +19,7 @@ import { RuntimeError } from "../Runtime";
 import { assert } from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import {
   ReverseForwardRefusedError,
   type SSHTransport,
@@ -50,6 +52,40 @@ function getShardedControlPath(config: SSHConnectionConfig): string {
   const nextShard = nextShardByConnection.get(baseControlPath) ?? 0;
   nextShardByConnection.set(baseControlPath, (nextShard + 1) % OPENSSH_EXEC_SHARD_COUNT);
   return `${baseControlPath}-${nextShard}`;
+}
+
+/**
+ * The host's credentials or gateway changed (Daytona settings, a moved gateway): stop its exec
+ * ControlMasters, so the next command connects anew instead of multiplexing onto the old
+ * connection. `-O stop` makes a master remove its socket and refuse new sessions while running
+ * ones finish. Reverse forwards keep their own connections.
+ */
+export async function retireOpenSSHMasters(config: SSHConnectionConfig): Promise<void> {
+  sshConnectionPool.forgetHealth(config);
+  const base = sshConnectionPool.getControlPath(config);
+  const shards = Array.from({ length: OPENSSH_EXEC_SHARD_COUNT }, (_, shard) => `${base}-${shard}`);
+  await Promise.all(
+    [base, ...shards].map(async (controlPath) => {
+      if (!(await pathExists(controlPath))) return;
+      const result = await runSshClient(
+        ["-F", "/dev/null", "-S", controlPath, "-O", "stop", config.host],
+        config.host
+      );
+      if (result.code !== 0) {
+        log.debug("[ssh] could not stop a ControlMaster", { controlPath, stderr: result.stderr });
+      }
+    })
+  );
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.lstat(filePath);
+    return true;
+  } catch (error) {
+    if (isErrnoWithCode(error, "ENOENT")) return false;
+    throw error;
+  }
 }
 
 export class OpenSSHTransport implements SSHTransport {

@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import * as fs from "fs/promises";
+import * as os from "os";
+import * as path from "path";
 import type { IPty } from "@lydell/node-pty";
 import { toXumDaytonaHost } from "@/common/constants/daytona";
 import * as ptySpawn from "../ptySpawn";
 import { RuntimeError, isRuntimeTransportError } from "../Runtime";
 import { sshConnectionPool } from "../sshConnectionPool";
-import { OpenSSHTransport } from "./OpenSSHTransport";
+import { OpenSSHTransport, retireOpenSSHMasters } from "./OpenSSHTransport";
 
 const BACKOFF_MESSAGE =
   "SSH connection to example.test is in backoff for 2s. Last error: Connection refused";
@@ -69,5 +72,37 @@ describe("OpenSSHTransport terminals on a Daytona alias", () => {
     );
     expect(strict).toBeGreaterThan(-1);
     expect(strict).toBeLessThan(args.indexOf(host));
+  });
+});
+
+describe("retireOpenSSHMasters", () => {
+  it("stops every exec ControlMaster of the host that has a socket", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-fake-ssh-"));
+    const calls = path.join(dir, "calls");
+    // A fake ssh on PATH records its arguments, one call per line.
+    await fs.writeFile(path.join(dir, "ssh"), `#!/bin/sh\necho "$@" >> ${calls}\n`, {
+      mode: 0o755,
+    });
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${dir}:${originalPath ?? ""}`;
+    const config = { host: toXumDaytonaHost("sb-retire") };
+    const base = sshConnectionPool.getControlPath(config);
+    // Two masters are up: the default path and one exec shard.
+    await fs.writeFile(base, "");
+    await fs.writeFile(`${base}-2`, "");
+    try {
+      await retireOpenSSHMasters(config);
+
+      const lines = (await fs.readFile(calls, "utf-8")).trim().split("\n").sort();
+      expect(lines).toEqual([
+        `-F /dev/null -S ${base} -O stop ${config.host}`,
+        `-F /dev/null -S ${base}-2 -O stop ${config.host}`,
+      ]);
+    } finally {
+      process.env.PATH = originalPath;
+      await fs.rm(base, { force: true });
+      await fs.rm(`${base}-2`, { force: true });
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });

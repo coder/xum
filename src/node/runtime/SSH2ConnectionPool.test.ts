@@ -232,6 +232,32 @@ describe.skipIf(process.platform === "win32")(
       }
     });
 
+    it("a retired connection carries no new work and closes once its channels do", async () => {
+      const { config } = await startServer((conn) => {
+        conn.on("authentication", (ctx) => ctx.accept());
+        conn.on("error", () => undefined);
+      });
+      const pool = new SSH2ConnectionPool();
+      const first = await pool.acquireConnection(config);
+      const slot = pool.reserveChannel(config, first);
+      let closed = false;
+      const firstClosed = new Promise<void>((resolve) =>
+        first.client.once("close", () => {
+          closed = true;
+          resolve();
+        })
+      );
+
+      pool.retireConnection(config);
+      const second = await pool.acquireConnection(config, { maxWaitMs: 0 });
+      expect(second === first).toBe(false);
+      // A command still running on it keeps it open.
+      expect(closed).toBe(false);
+      slot.release();
+      await firstClosed;
+      second.client.end();
+    });
+
     it("a retired client's late error does not put the host into backoff", async () => {
       const { config } = await startServer((conn) => {
         conn.on("authentication", (ctx) => ctx.accept());

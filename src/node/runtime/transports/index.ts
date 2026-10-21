@@ -1,5 +1,6 @@
+import { ssh2ConnectionPool } from "../SSH2ConnectionPool";
 import type { SSHConnectionConfig } from "../sshConnectionPool";
-import { OpenSSHTransport } from "./OpenSSHTransport";
+import { OpenSSHTransport, retireOpenSSHMasters } from "./OpenSSHTransport";
 import { SSH2Transport } from "./SSH2Transport";
 import type { SSHTransport } from "./SSHTransport";
 
@@ -9,4 +10,10 @@ export { ReverseForwardRefusedError } from "./SSHTransport";
 
 export function createSSHTransport(config: SSHConnectionConfig, useSSH2: boolean): SSHTransport {
   return useSSH2 ? new SSH2Transport(config) : new OpenSSHTransport(config);
+}
+
+/** Retire the host's pooled connections on both transports (credentials or gateway changed). */
+export async function retireSshConnections(config: SSHConnectionConfig): Promise<void> {
+  ssh2ConnectionPool.retireConnection(config);
+  await retireOpenSSHMasters(config);
 }
