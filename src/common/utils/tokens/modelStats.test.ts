@@ -68,9 +68,9 @@ describe("getModelStats", () => {
       expect(grok.input_cost_per_token).toBe(0.000002);
       expect(grok.output_cost_per_token).toBe(0.000006);
       expect(grok.cache_read_input_token_cost).toBe(0.0000005);
-      expect(grok.input_cost_per_token_above_200k_tokens).toBe(0.000004);
-      expect(grok.output_cost_per_token_above_200k_tokens).toBe(0.000012);
-      expect(grok.cache_read_input_token_cost_above_200k_tokens).toBe(0.000001);
+      expect(grok.input_cost_per_token_above_threshold).toBe(0.000004);
+      expect(grok.output_cost_per_token_above_threshold).toBe(0.000012);
+      expect(grok.cache_read_input_token_cost_above_threshold).toBe(0.000001);
     }
 
     // Grok 4.5 keeps its distinct cheaper cache rate.
@@ -103,10 +103,10 @@ describe("getModelStats", () => {
       // input / 1.5x output, with cache writes at 1.25x the active input rate
       // (so 2x their base rate). Assert the multipliers, not fresh constants.
       expect(stats.tiered_pricing_threshold_tokens).toBe(272000);
-      expect(stats.input_cost_per_token_above_200k_tokens).toBeCloseTo(input * 2, 12);
-      expect(stats.output_cost_per_token_above_200k_tokens).toBeCloseTo(output * 1.5, 12);
-      expect(stats.cache_read_input_token_cost_above_200k_tokens).toBeCloseTo(cacheRead * 2, 12);
-      expect(stats.cache_creation_input_token_cost_above_200k_tokens).toBeCloseTo(
+      expect(stats.input_cost_per_token_above_threshold).toBeCloseTo(input * 2, 12);
+      expect(stats.output_cost_per_token_above_threshold).toBeCloseTo(output * 1.5, 12);
+      expect(stats.cache_read_input_token_cost_above_threshold).toBeCloseTo(cacheRead * 2, 12);
+      expect(stats.cache_creation_input_token_cost_above_threshold).toBeCloseTo(
         cacheCreation * 2,
         12
       );
@@ -139,11 +139,11 @@ describe("getModelStats", () => {
     expect(stats.cache_read_input_token_cost).toBe(0.000000075);
   });
 
-  test("defaults tiered pricing threshold to 200K when metadata only ships *_above_200k rates", () => {
+  test("reads the long-context threshold from LiteLLM's *_above_200k_tokens rate names", () => {
     const stats = expectStats("google:gemini-3.1-pro-preview");
     expect(stats.tiered_pricing_threshold_tokens).toBe(200000);
-    expect(stats.input_cost_per_token_above_200k_tokens).toBe(0.000004);
-    expect(stats.output_cost_per_token_above_200k_tokens).toBe(0.000018);
+    expect(stats.input_cost_per_token_above_threshold).toBe(0.000004);
+    expect(stats.output_cost_per_token_above_threshold).toBe(0.000018);
   });
 
   test("normalizes mux-gateway provider/model ids before lookup", () => {

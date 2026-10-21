@@ -198,10 +198,10 @@ function lookupTierFactors(
 
 /** Short-context rate fields paired with their long-context counterparts. */
 const RATE_FIELDS = [
-  ["input_cost_per_token", "input_cost_per_token_above_200k_tokens"],
-  ["output_cost_per_token", "output_cost_per_token_above_200k_tokens"],
-  ["cache_read_input_token_cost", "cache_read_input_token_cost_above_200k_tokens"],
-  ["cache_creation_input_token_cost", "cache_creation_input_token_cost_above_200k_tokens"],
+  ["input_cost_per_token", "input_cost_per_token_above_threshold"],
+  ["output_cost_per_token", "output_cost_per_token_above_threshold"],
+  ["cache_read_input_token_cost", "cache_read_input_token_cost_above_threshold"],
+  ["cache_creation_input_token_cost", "cache_creation_input_token_cost_above_threshold"],
 ] as const;
 
 /**

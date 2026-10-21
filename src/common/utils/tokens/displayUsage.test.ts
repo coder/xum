@@ -339,7 +339,7 @@ describe("createDisplayUsage", () => {
       expect(result!.output.cost_usd).toBeCloseTo(0.03);
     });
 
-    test("falls back to LiteLLM's default 200K threshold for existing tiered models", () => {
+    test("prices Gemini 3.1 Pro above its 200K threshold at the long-context rates", () => {
       const usage: LanguageModelV2Usage = {
         inputTokens: 250000,
         outputTokens: 1000,
