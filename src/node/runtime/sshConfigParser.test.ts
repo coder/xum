@@ -142,6 +142,36 @@ describe("resolveSSHConfig", () => {
     });
   });
 
+  test("keeps a space in a quoted UserKnownHostsFile and splits unquoted files", async () => {
+    await withTempHome(async (homeDir) => {
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.writeFile(
+        configPath,
+        "Host plain\n  UserKnownHostsFile ~/kh1 ~/kh2\n" +
+          'Host quoted-first\n  UserKnownHostsFile "~/J S/kh" ~/kh2\n',
+        "utf8"
+      );
+      // Rendered as daytonaSshConfig does for a home dir like "/Users/John Smith".
+      const writer = new DaytonaSshConfigWriter({
+        xumHome: path.join(homeDir, "John Smith", ".xum"),
+        sshConfigPath: configPath,
+      });
+      await writer.writeSandbox({
+        sandboxId: "sb-1",
+        token: "tokenA",
+        gateway: { host: "ssh.daytona.test", port: 22, hostKeys: ["ssh-ed25519 AAAA"] },
+      });
+
+      expect((await resolveSSHConfig("sb-1.xum--daytona")).userKnownHostsFile).toBe(
+        writer.paths.knownHostsPath
+      );
+      expect((await resolveSSHConfig("plain")).userKnownHostsFile).toBe(path.join(homeDir, "kh1"));
+      expect((await resolveSSHConfig("quoted-first")).userKnownHostsFile).toBe(
+        path.join(homeDir, "J S", "kh")
+      );
+    });
+  });
+
   test("resolves relative and wildcard Includes and keeps later lines in the enclosing block", async () => {
     await withTempHome(async (homeDir) => {
       await fs.mkdir(path.join(homeDir, ".ssh", "conf.d"));

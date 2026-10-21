@@ -190,7 +190,9 @@ describe.skipIf(process.platform === "win32")(
       const originalUserProfile = process.env.USERPROFILE;
       process.env.USERPROFILE = home;
       try {
-        const knownHostsPath = path.join(home, "daytona_known_hosts");
+        // A space, as in "/Users/John Smith": daytonaSshConfig quotes the path.
+        const knownHostsPath = path.join(home, "John Smith", "daytona_known_hosts");
+        await fs.mkdir(path.dirname(knownHostsPath));
         await fs.mkdir(path.join(home, ".ssh"));
         await fs.writeFile(
           path.join(home, ".ssh", "config"),
@@ -199,7 +201,7 @@ describe.skipIf(process.platform === "win32")(
             "  HostName 127.0.0.1",
             `  Port ${String(config.port)}`,
             "  HostKeyAlias gateway.test",
-            `  UserKnownHostsFile ${knownHostsPath}`,
+            `  UserKnownHostsFile "${knownHostsPath}"`,
             "  StrictHostKeyChecking yes",
           ].join("\n")
         );

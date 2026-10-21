@@ -667,11 +667,10 @@ function readHostKeyPinning(
   computed: Parameters<typeof getConfigValue>[0],
   homeDir: string
 ): Pick<ResolvedSSHConfig, "userKnownHostsFile" | "hostKeyAlias"> {
-  const knownHostsValue = toStringValue(getConfigValue(computed, "UserKnownHostsFile"));
-  const userKnownHostsFile = knownHostsValue
-    ? splitIncludeArgs(knownHostsValue)
-        .map((file) => expandHomePath(file, homeDir))
-        .at(0)
+  // ssh-config already splits the files and strips their quotes: a single value is one file.
+  const firstKnownHostsFile = toStringValue(getConfigValue(computed, "UserKnownHostsFile"));
+  const userKnownHostsFile = firstKnownHostsFile
+    ? expandHomePath(firstKnownHostsFile, homeDir)
     : undefined;
   const hostKeyAlias = toStringValue(getConfigValue(computed, "HostKeyAlias"));
   return {
