@@ -412,10 +412,23 @@ const CODEX_CONTRIBUTES_KEYS = [
  * Unsafe paths pass through unchanged so the validator rejects each with its warning.
  */
 function codexComponentPath(codexKey: "skills" | "mcpServers", value: unknown): unknown {
-  const normalize = (entry: unknown): unknown => normalizeOpenAIRelativePath(entry) ?? entry;
+  // normalizeOpenAIRelativePath drops a root token ("./", "./."); a Codex skills path may name
+  // the plugin root itself (one skill), so it becomes ".", which the validator accepts.
+  const normalize = (entry: unknown): unknown =>
+    normalizeOpenAIRelativePath(entry) ??
+    (codexKey === "skills" && isRootToken(entry) ? "." : entry);
   if (codexKey === "skills" && Array.isArray(value)) return value.map(normalize);
   const single: unknown = Array.isArray(value) && value.length === 1 ? value[0] : value;
   return typeof single === "string" ? normalize(single) : undefined;
+}
+
+/** "." spelled with any number of "./" parts, such as "./" or "./.". */
+function isRootToken(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const segments = value.replaceAll("\\", "/").split("/");
+  return (
+    segments.some((segment) => segment === ".") && segments.every((s) => s === "." || s === "")
+  );
 }
 
 /**
