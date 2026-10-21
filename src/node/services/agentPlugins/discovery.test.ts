@@ -18,6 +18,7 @@ import { resolvePluginHookGrants } from "./hookSandbox";
 import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { createTestPluginInstallEntry } from "./testFixtures";
+import { listPluginSkillScripts } from "./workflowFiles";
 
 async function writePlugin(
   containerPath: string,
@@ -2150,6 +2151,7 @@ describe("generatedFrom marker (Claude marketplace packages)", () => {
         },
       }),
       "skills/s/SKILL.md": SKILL,
+      "skills/s/workflow.js": "export default async () => {};",
       "commands/c.md": "Run c\n",
       "hooks.js": "export default {};",
       "hooks/hooks.json": JSON.stringify({
@@ -2182,6 +2184,8 @@ describe("generatedFrom marker (Claude marketplace packages)", () => {
       hookTools: resolvePluginHookGrants(plugin.manifest).bridgeTools.allow.length > 0,
       claude: plugin.claudeFallback === true,
       skillsOnly: plugin.skillsOnly === true,
+      // Skill workflow.js files offered for review (and so runnable once approved).
+      skillScripts: (await listPluginSkillScripts(plugin)).length,
     };
   }
 
@@ -2202,6 +2206,7 @@ describe("generatedFrom marker (Claude marketplace packages)", () => {
       slashCommands: true,
       openai: true,
       hookTools: true,
+      skillScripts: 1,
     });
     expect(marked).toEqual({
       // Commands load as user-only skills: prompt files, which plain can ship as skills too.
@@ -2218,6 +2223,8 @@ describe("generatedFrom marker (Claude marketplace packages)", () => {
       hookTools: false,
       claude: true,
       skillsOnly: false,
+      // A Claude package runs no Xum code: no skill workflow.js either.
+      skillScripts: 0,
     });
   });
 
