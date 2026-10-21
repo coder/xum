@@ -148,7 +148,9 @@ export class DaytonaReconciler {
     for (const ref of refs) {
       await this.keepAlive(ref, sandboxes);
     }
-    await this.stopOrphans(sandboxes, refs);
+    // A creation persists its workspace before it creates the sandbox, so references read
+    // after the list cover every sandbox in it; the first read may predate a creation.
+    await this.stopOrphans(sandboxes, this.collectReferences());
   }
 
   private collectReferences(): DaytonaSandboxRef[] {

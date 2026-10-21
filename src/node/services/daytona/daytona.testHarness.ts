@@ -46,8 +46,8 @@ export class FakeDaytonaControlPlane {
   readonly failingRoutes = new Set<string>();
   /** POST /sandbox creates the sandbox, then answers 500 (the create's outcome looks unknown). */
   failAfterCreate = false;
-  /** Runs once a route (`METHOD /path`) is handled, before its answer reaches the client. */
-  readonly beforeAnswer = new Map<string, () => Promise<unknown>>();
+  /** Runs when a route (`METHOD /path`) is requested; the plane answers once it settles. */
+  readonly onRequest = new Map<string, () => Promise<unknown>>();
   private nextId = 1;
   private nextToken = 1;
 
@@ -62,9 +62,8 @@ export class FakeDaytonaControlPlane {
         init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
       });
     }
-    const response = this.handle(route, url, init);
-    const hook = this.beforeAnswer.get(route);
-    return hook ? hook().then(() => response) : Promise.resolve(response);
+    const hook = this.onRequest.get(route) ?? (() => Promise.resolve());
+    return hook().then(() => this.handle(route, url, init));
   }) as typeof fetch;
 
   addSandbox(partial: Partial<FakeSandbox> & { id: string }): FakeSandbox {

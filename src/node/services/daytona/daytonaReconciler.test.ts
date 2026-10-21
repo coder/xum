@@ -96,6 +96,20 @@ describe("DaytonaReconciler.sweep", () => {
     expect(rig.plane.calls.some((call) => call.startsWith("DELETE /sandbox/"))).toBe(false);
   });
 
+  it("keeps the sandbox of a workspace created while the sandboxes were listed", async () => {
+    const workspaces: Array<{ id: string; runtimeConfig: RuntimeConfig }> = [];
+    // A creation persists its workspace, then creates and starts its sandbox, during the list.
+    rig.plane.onRequest.set("GET /sandbox", () => {
+      workspaces.push({ id: "ws-new", runtimeConfig: daytonaConfig("xum-new") });
+      rig.plane.addSandbox({ id: "sb-new", name: "xum-new", labels: instanceLabels });
+      return Promise.resolve();
+    });
+
+    await makeReconciler(workspaces, []).sweep();
+
+    expect(rig.plane.find("xum-new")?.state).toBe("started");
+  });
+
   it("moves on past a hung control-plane call", async () => {
     rig.plane.addSandbox({ id: "sb-hung", labels: instanceLabels });
     rig.plane.addSandbox({ id: "sb-orphan", labels: instanceLabels });

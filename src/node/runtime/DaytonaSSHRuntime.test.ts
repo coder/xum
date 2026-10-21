@@ -324,8 +324,8 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
 
   it("deletes its sandbox in the account that created it when Settings switch accounts during setup", async () => {
     const newAccount = rig.addAccount("new-key");
-    // The user saves another account's key while the create request is answered.
-    rig.plane.beforeAnswer.set("POST /sandbox", () => rig.service.setConfig({ apiKey: "new-key" }));
+    // The user saves another account's key while the create request is in flight.
+    rig.plane.onRequest.set("POST /sandbox", () => rig.service.setConfig({ apiKey: "new-key" }));
 
     const failure = await makeRuntime({ sandboxId: "xum-moved", shared: false, ...SMALL })
       .postCreateSetup(initParams())
