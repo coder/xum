@@ -171,6 +171,21 @@ const mergeRememberedRuntimeConfig = (
   }
 };
 
+/** The draft's last Daytona choice, else the project's Daytona defaults. */
+function readDraftDaytonaFallback(
+  execution: { lastDaytona?: DaytonaSandboxConfig } | null | undefined,
+  defaults: RuntimeOptionDefaults
+): DaytonaSandboxConfig {
+  return execution?.lastDaytona ?? readDaytonaOptionDefaults(defaults);
+}
+
+/** Only in the draft: an attached sandbox must never become a project default. */
+function rememberedDaytonaPatch(runtime: ParsedRuntime): { lastDaytona?: DaytonaSandboxConfig } {
+  return runtime.mode === RUNTIME_MODE.SSH && runtime.daytona
+    ? { lastDaytona: runtime.daytona }
+    : {};
+}
+
 /** The default runtime-type button: Coder and Daytona are SSH sub-choices. */
 const resolveDefaultRuntimeChoice = (
   settingsDefaultRuntime: RuntimeChoice,
@@ -437,8 +452,7 @@ export function useDraftWorkspaceSettings(
   // useDraftWorkspaceSettings.compiler.test.tsx guards their identity.
   // Uses discriminated union: SSH has host, Docker has image.
   // Parsed into a fresh object, so it too must follow the last hook to keep its identity.
-  const daytonaConfigFallback =
-    execution?.lastDaytona ?? readDaytonaOptionDefaults(lastRuntimeConfigs);
+  const daytonaConfigFallback = readDraftDaytonaFallback(execution, lastRuntimeConfigs);
   const defaultRuntime = buildRuntimeForMode(
     defaultRuntimeMode,
     {
@@ -472,10 +486,7 @@ export function useDraftWorkspaceSettings(
 
     getCreationDraftStore().updateExecution(draftId, {
       runtime: mergedRuntime,
-      // Only in the draft: an attached sandbox must never become a project default.
-      ...(mergedRuntime.mode === RUNTIME_MODE.SSH && mergedRuntime.daytona
-        ? { lastDaytona: mergedRuntime.daytona }
-        : {}),
+      ...rememberedDaytonaPatch(mergedRuntime),
     });
 
     // Persist host/image/coder so they're remembered when switching modes.
