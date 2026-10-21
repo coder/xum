@@ -68,29 +68,55 @@ export interface DaytonaTextRedactor {
   push(text: string): string;
   /** Everything still held, redacted. */
   flush(): string;
+  /** The held text, only while the whole possible token start is shorter than the bound. */
+  releaseShortTail(): string;
   holding(): boolean;
 }
 
+// An accidental match of a token's first chars this short is negligible, and a leaked prefix
+// this short is useless, so it may echo; a longer possible token start waits for more text.
+const RELEASABLE_TAIL_LENGTH = 4;
+
+function commonPrefixLength(a: string, b: string): number {
+  let length = 0;
+  while (length < a.length && a[length] === b[length]) length++;
+  return length;
+}
+
 /**
- * Redact text that arrives in pieces. A token split across pieces is caught by holding back a
- * tail that could start one until the next piece (or the end) arrives. The text is redacted
- * before the tail is chosen, so a whole token whose last chars also start a token is not split.
+ * Redact text that arrives in pieces. A token split across pieces is caught by keeping the tail
+ * that could start one: its held part waits for the next piece (or the end), and its released
+ * part (already published) is redacted again with what follows, so a token whose start was
+ * released is still masked from there on. The text is redacted before the tail is chosen, so a
+ * whole token whose last chars also start a token is not split.
  */
 export function createDaytonaTextRedactor(): DaytonaTextRedactor {
-  let carry = "";
+  let released = "";
+  let held = "";
   return {
     push(text) {
-      const redacted = redactDaytonaTokens(carry + text);
-      const held = tokenPrefixSuffixLength(redacted);
-      carry = redacted.slice(redacted.length - held);
-      return redacted.slice(0, redacted.length - held);
+      const redacted = redactDaytonaTokens(released + held + text);
+      const published = commonPrefixLength(released, redacted);
+      const tailStart = redacted.length - tokenPrefixSuffixLength(redacted);
+      const cut = Math.max(published, tailStart);
+      released = redacted.slice(tailStart, cut);
+      held = redacted.slice(cut);
+      return redacted.slice(published, cut);
     },
     flush() {
-      const rest = carry;
-      carry = "";
+      const rest = held;
+      released = "";
+      held = "";
       return rest;
     },
-    holding: () => carry !== "",
+    releaseShortTail() {
+      if (released.length + held.length >= RELEASABLE_TAIL_LENGTH) return "";
+      const rest = held;
+      released += held;
+      held = "";
+      return rest;
+    },
+    holding: () => held !== "",
   };
 }
 
@@ -113,9 +139,9 @@ export function createDaytonaRedactingStream(): Transform {
   });
 }
 
-// A PTY gives no signal that more output is coming, so a held tail is published after this
-// quiet period. Otherwise a typed char that happens to start a token would not echo until the
-// next output.
+// A PTY gives no signal that more output is coming, so a short held tail is published after
+// this quiet period. Otherwise a typed char that happens to start a token would not echo until
+// the next output.
 const PTY_HOLD_MS = 50;
 
 type CancelTimer = () => void;
@@ -150,10 +176,14 @@ export function redactDaytonaPty(
     stopTimer();
     publish(redactor.flush());
   };
+  const releaseShortTail = () => {
+    cancelTimer = undefined;
+    publish(redactor.releaseShortTail());
+  };
   const onRawData = (data: string) => {
     stopTimer();
     publish(redactor.push(data));
-    if (redactor.holding()) cancelTimer = schedule(flushHeld);
+    if (redactor.holding()) cancelTimer = schedule(releaseShortTail);
   };
   return {
     write: (data) => pty.write(data),

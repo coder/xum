@@ -110,6 +110,29 @@ describe("redactDaytonaPty", () => {
     expect(pty.output.join("")).toBe("$ p");
   });
 
+  it("masks the rest of a token whose short start was echoed after the quiet period", () => {
+    const pty = setup();
+    pty.emit(`login ${TOKEN.slice(0, 2)}`);
+    pty.runPendingTimers();
+    pty.emit(`${TOKEN.slice(2)}@gateway's password: `);
+    const screen = pty.output.join("");
+    expect(screen).not.toContain(TOKEN);
+    expect(screen).toBe(
+      `login ${TOKEN.slice(0, 2)}${DAYTONA_TOKEN_PLACEHOLDER}@gateway's password: `
+    );
+  });
+
+  it("keeps a long possible token start held past the quiet period", () => {
+    const pty = setup();
+    pty.emit(`login ${TOKEN.slice(0, 6)}`);
+    pty.runPendingTimers();
+    expect(pty.output.join("")).toBe("login ");
+    pty.emit(`${TOKEN.slice(6)}@gateway: Permission denied\r\n`);
+    expect(pty.output.join("")).toBe(
+      `login ${DAYTONA_TOKEN_PLACEHOLDER}@gateway: Permission denied\r\n`
+    );
+  });
+
   it("flushes a held tail before reporting exit", () => {
     const pty = setup();
     const events: string[] = [];
