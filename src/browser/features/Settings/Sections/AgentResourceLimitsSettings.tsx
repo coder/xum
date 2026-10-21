@@ -313,7 +313,11 @@ function useAgentResourceLimits() {
     send((client) => client.agentResourceLimits.set(limits));
   const saveProject = (projectPath: string, limits: AgentResourceLimits) =>
     send((client) => client.agentResourceLimits.setProject({ projectPath, limits }));
-  const setScope = (scope: LimitsScope) => setView((current) => withScope(current, scope));
+  // The fields of the new scope show its saved limits, so the old fields' errors no longer apply.
+  const setScope = (scope: LimitsScope) => {
+    setView((current) => withScope(current, scope));
+    setFieldErrors([]);
+  };
   // A separate request, so a save of the fields that is still on its way is not undone.
   const setEnabled = (enabled: boolean) =>
     send((client) => client.agentResourceLimits.setEnabled({ enabled }));

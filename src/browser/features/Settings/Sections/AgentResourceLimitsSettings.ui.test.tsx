@@ -188,6 +188,26 @@ describe("AgentResourceLimitsSettings for one project", () => {
     await view.findByText(/Active: agents of pharos share 14 CPU cores and 32 GiB of memory/);
   });
 
+  test("drops the field errors of the old project when the picker changes", async () => {
+    userProjects = new Map([[PHAROS, { workspaces: [] }]]);
+    const view = renderSettings({
+      enabled: true,
+      limits: { cpuCores: 28 },
+      projects: {},
+      status: ACTIVE,
+      support: READY,
+    });
+    await waitFor(() => expect(view.cpu().value).toBe("28"));
+    view.edit(view.cpu(), "-1");
+    await view.findByText(/CPU limit must be from/);
+
+    pickProject(view, PHAROS);
+
+    await waitFor(() => expect(view.cpu().value).toBe(""));
+    expect(view.queryByText(/CPU limit must be from/)).toBeNull();
+    expect(view.set.mock.calls).toEqual([]);
+  });
+
   test("tells that a project limit above the shared limit does not raise it", async () => {
     userProjects = new Map([[PHAROS, { workspaces: [] }]]);
     const view = renderSettings({
