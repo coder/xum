@@ -874,6 +874,33 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     }
   });
 
+  it("starts a stopped source sandbox before forking, and fails a fork it cannot bring up", async () => {
+    const sandbox = rig.plane.addSandbox({ id: "sb-parent", state: "stopped" });
+    let stateWhenForked: string | undefined;
+    const forkSpy = spyOn(SSHRuntime.prototype, "forkWorkspace").mockImplementation(() => {
+      stateWhenForked = sandbox.state;
+      return Promise.resolve({ success: true, workspacePath: "/fork" });
+    });
+    const forkFrom = (sandboxId: string) =>
+      makeRuntime({ sandboxId, shared: false, ...SMALL }).forkWorkspace({
+        projectPath: "/home/me/project",
+        sourceWorkspaceName: "feature",
+        newWorkspaceName: "feature-fork",
+        initLogger: initParams().initLogger,
+      });
+    try {
+      expect((await forkFrom("sb-parent")).success).toBe(true);
+      expect(stateWhenForked).toBe("started");
+
+      const gone = await forkFrom("sb-gone");
+      expect(gone).toMatchObject({ success: false, failureIsFatal: true });
+      expect(gone.error).toContain("no longer exists");
+      expect(forkSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      forkSpy.mockRestore();
+    }
+  });
+
   it("deletes the sandbox with a fork that outlives its source", async () => {
     rig.plane.addSandbox({ id: "sb-parent" });
     const forkSpy = spyOn(SSHRuntime.prototype, "forkWorkspace").mockResolvedValue({

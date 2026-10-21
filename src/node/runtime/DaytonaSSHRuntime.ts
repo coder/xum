@@ -1019,9 +1019,12 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   /**
    * Keep the inherited worktree fork: the child reuses the parent's sandbox (`forked`, so its
    * setup creates none). Neither workspace is marked attached: deleting either keeps the
-   * sandbox while the other references it, and the last one deletes it.
+   * sandbox while the other references it, and the last one deletes it. The user asked for
+   * the fork, so a stopped or archived source sandbox is started first, as for a terminal.
    */
   override async forkWorkspace(params: WorkspaceForkParams): Promise<WorkspaceForkResult> {
+    const ready = await this.ensureReady();
+    if (!ready.ready) return { success: false, error: ready.error, failureIsFatal: true };
     const result = await super.forkWorkspace(params);
     // Sub-agents must share the parent's sandbox: never fall back to creating a new one.
     if (!result.success) return { ...result, failureIsFatal: true };
