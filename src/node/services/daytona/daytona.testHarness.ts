@@ -161,7 +161,7 @@ export class FakeDaytonaControlPlane {
       return snapshot ? json(200, snapshot) : fail(404, "Snapshot not found");
     }
 
-    const match = /^(GET|POST|DELETE) \/sandbox\/([^/]+)(?:\/(.+))?$/.exec(route);
+    const match = /^(GET|POST|PUT|DELETE) \/sandbox\/([^/]+)(?:\/(.+))?$/.exec(route);
     if (!match) return fail(500, `unexpected ${route}`);
     const [, method, rawId, action] = match;
     const idOrName = decodeURIComponent(rawId);
@@ -206,6 +206,11 @@ export class FakeDaytonaControlPlane {
         return json(200, {});
       case "POST last-activity":
         return json(200, {});
+      case "PUT labels": {
+        const body = JSON.parse(requestBody(init)) as { labels: Record<string, string> };
+        sandbox.labels = body.labels;
+        return json(200, { labels: sandbox.labels });
+      }
       default:
         return fail(500, `unexpected ${route}`);
     }

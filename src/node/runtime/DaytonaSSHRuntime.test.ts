@@ -10,6 +10,7 @@ import {
   localShellTransport,
   type DaytonaTestRig,
 } from "@/node/services/daytona/daytona.testHarness";
+import { DaytonaReconciler } from "@/node/services/daytona/daytonaReconciler";
 import {
   DAYTONA_LABEL_INSTANCE,
   DAYTONA_READY_CACHE_MS,
@@ -857,6 +858,14 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(attachedLast).toEqual({ success: true, deletedPath: expect.any(String) as string });
     expect(rig.plane.find("sb-1")).toBeDefined();
     expect(deletes()).toBe(0);
+    // Handed to the user: no longer labeled as this install's, so no sweep stops it as an orphan.
+    expect(rig.plane.find("sb-1")?.labels).toEqual({});
+    await new DaytonaReconciler({
+      daytonaService: rig.service,
+      listWorkspaces: () => [],
+      isWorkspaceActive: () => Promise.resolve(false),
+    }).sweep();
+    expect(rig.plane.find("sb-1")?.state).toBe("started");
 
     // The attached workspace goes first: the owner's removal deletes it, with nothing to say.
     const attachedFirst = await remove("ws-t2", attached("sb-2"));
@@ -866,6 +875,32 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(ownerLast).toEqual({ success: true, deletedPath: expect.any(String) as string });
     expect(rig.plane.find("sb-2")).toBeUndefined();
     expect(deletes()).toBe(1);
+  });
+
+  it("keeps the owner's workspace when its sandbox cannot be handed off", async () => {
+    const labels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.getInstanceId() };
+    rig.plane.addSandbox({ id: "sb-1", name: "xum-owner", labels });
+    const owner = { sandboxId: "xum-owner", shared: false, ...SMALL };
+    rig.workspaces.push(
+      { workspaceId: "ws-o", runtimeConfig: sshDaytonaConfig(owner) },
+      { workspaceId: "ws-t", runtimeConfig: sshDaytonaConfig({ sandboxId: "sb-1", shared: true }) }
+    );
+    claimRemovals();
+    const remove = () =>
+      makeRuntime(owner, rig, { workspaceId: "ws-o" }).deleteWorkspace(
+        "/home/me/project",
+        "ws-o",
+        false
+      );
+
+    rig.plane.failingRoutes.add("PUT /sandbox/xum-owner/labels");
+    const refused = await remove();
+    expect(refused.success ? "" : refused.error).toContain("Xum-owned");
+    expect(rig.plane.find("sb-1")?.labels).toEqual(labels);
+
+    rig.plane.failingRoutes.clear();
+    expect((await remove()).success).toBe(true);
+    expect(rig.plane.find("sb-1")?.labels).toEqual({});
   });
 
   it("counts a workspace whose removal failed after its checkout step as a reference again", async () => {

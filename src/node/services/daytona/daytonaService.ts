@@ -812,6 +812,18 @@ export class DaytonaService {
     await client.resizeSandbox(sandboxId, request);
   }
 
+  /**
+   * Hand a sandbox Xum created to the user: drop this install's label, which is what makes the
+   * reconciler stop it once no workspace references it.
+   */
+  async disownSandbox(sandboxId: string): Promise<void> {
+    const { client } = await this.getClient();
+    const labels = (await client.getSandbox(sandboxId)).labels ?? {};
+    if (!(DAYTONA_LABEL_INSTANCE in labels)) return;
+    const kept = Object.entries(labels).filter(([key]) => key !== DAYTONA_LABEL_INSTANCE);
+    await client.replaceLabels(sandboxId, Object.fromEntries(kept));
+  }
+
   async stopSandbox(sandboxId: string): Promise<void> {
     const { client } = await this.getClient();
     this.readyAt.delete(sandboxId);

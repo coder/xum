@@ -92,6 +92,7 @@ export type DaytonaRuntimeService = Pick<
   | "waitUntilDestroyed"
   | "recordWorkspaceRemoval"
   | "releaseSshAccess"
+  | "disownSandbox"
   | "recordSetupFailure"
   | "getSetupFailure"
 >;
@@ -1181,6 +1182,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     if (fate === "delete") {
       return this.deleteOwnedSandbox(sandboxId, result.deletedPath, errorPrefix);
     }
+    if (fate === "handOff") {
+      const disowned = await this.disownSandbox(sandboxId, errorPrefix);
+      if (disowned) return disowned;
+    }
     // Access is per stored string (a sandbox's name or its id): a kept sandbox keeps it only
     // while another workspace stores the same one.
     const releases =
@@ -1204,6 +1209,28 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       "in Daytona when you no longer need it.";
     log.info(notice, { workspaceId: this.workspaceId });
     return { ...result, notice };
+  }
+
+  /**
+   * A handed-off sandbox still labeled as this install's would be stopped by the orphan sweep
+   * once its last workspace goes, so a failed relabel fails the removal (a retry relabels it).
+   */
+  private async disownSandbox(
+    sandboxId: string,
+    errorPrefix: string | undefined
+  ): Promise<DeleteResult | undefined> {
+    try {
+      await this.daytonaService.disownSandbox(sandboxId);
+      return undefined;
+    } catch (error) {
+      const message = getErrorMessage(error);
+      log.error("Failed to hand off a Daytona sandbox", { sandboxId, error: message });
+      const failure = `could not mark Daytona sandbox "${sandboxId}" as no longer Xum-owned: ${message}`;
+      return {
+        success: false,
+        error: errorPrefix ? `${errorPrefix}${failure}` : `Xum ${failure}`,
+      };
+    }
   }
 
   /** Start the sandbox (if stopped or archived) so the dirty and unpushed checks can run. */
