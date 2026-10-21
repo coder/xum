@@ -98,17 +98,36 @@ export function LeftSidebarToggleBar(props: LeftSidebarToggleBarProps) {
 }
 
 /**
- * An invisible, inert copy of {@link LeftSidebarToggleBar} for the header the bar covers (the
+ * An inert copy of {@link LeftSidebarToggleBar}, hidden, for the header the bar covers (the
  * sidebar's TitleBar while expanded, the page header while collapsed), so header content starts
  * after the bar. Real buttons, so the coarse-pointer 44px minimum widens them like the bar's.
  */
 export function LeftSidebarToggleBarSpacer(props: { showNewChat: boolean }) {
+  // Electron drags the window where the last app-region rect in DOM order under the pointer is
+  // drag, and the hosting header's drag box comes after the fixed bar, so it covers the bar's
+  // no-drag buttons. The copy's no-drag button slots, later still, punch the holes back. An
+  // `invisible` box reports no region, so desktop hides the copy with opacity instead.
+  const isDesktop = isDesktopMode();
+  const slotClass = isDesktop && "titlebar-no-drag";
   return (
-    <div aria-hidden className={cn(BAR_LAYOUT_CLASS, "invisible")}>
-      <Button variant="ghost" size="icon" tabIndex={-1} className={TOGGLE_BUTTON_CLASS} />
+    <div
+      aria-hidden
+      className={cn(BAR_LAYOUT_CLASS, isDesktop ? "pointer-events-none opacity-0" : "invisible")}
+    >
+      <Button
+        variant="ghost"
+        size="icon"
+        tabIndex={-1}
+        className={cn(TOGGLE_BUTTON_CLASS, slotClass)}
+      />
       {props.showNewChat && (
         <>
-          <Button variant="ghost" size="icon" tabIndex={-1} className={ICON_BUTTON_CLASS} />
+          <Button
+            variant="ghost"
+            size="icon"
+            tabIndex={-1}
+            className={cn(ICON_BUTTON_CLASS, slotClass)}
+          />
           <div className={DIVIDER_CLASS} />
         </>
       )}

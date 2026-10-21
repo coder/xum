@@ -34,6 +34,8 @@ export const BaseProviderConfigSchema = z
     baseUrl: z.string().optional(),
     baseURL: z.string().optional(),
     headers: z.record(z.string(), z.string()).optional(),
+    /** Header name that carries the workspace id on chat requests (see sessionHeader.ts). */
+    sessionHeader: z.string().optional(),
     enabled: z.boolean().optional(),
     providerType: z.enum(CUSTOM_PROVIDER_TYPES).optional(),
     displayName: z.string().min(1).optional(),

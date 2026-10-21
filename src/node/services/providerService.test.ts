@@ -6,6 +6,7 @@ import * as fsPromises from "fs/promises";
 import { writeFile } from "node:fs/promises";
 import * as os from "os";
 import * as path from "path";
+import { buildRequestHeaders, MUX_WORKSPACE_ID_HEADER } from "@/common/utils/ai/providerOptions";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
@@ -965,6 +966,44 @@ describe("ProviderService custom provider mutations", () => {
       expect(
         new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.["local-vllm"]?.baseUrl
       ).toBe(LOCAL_VLLM_BASE_URL);
+    });
+  });
+
+  it("saves a valid session header name and rejects invalid or reserved ones", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        "local-vllm": localVllmConfig(),
+      });
+
+      for (const name of ["Authorization", "x session"]) {
+        const rejected = await service.setConfig("local-vllm", ["sessionHeader"], name);
+        expect(rejected.success).toBe(false);
+      }
+      expect(service.getConfig()["local-vllm"]?.sessionHeader).toBeUndefined();
+
+      const saved = await service.setConfig("local-vllm", ["sessionHeader"], "x-opencode-session");
+      expect(saved.success).toBe(true);
+      expect(service.getConfig()["local-vllm"]?.sessionHeader).toBe("x-opencode-session");
+
+      // An empty value clears the setting, like every other text field.
+      expect((await service.setConfig("local-vllm", ["sessionHeader"], "")).success).toBe(true);
+      expect(service.getConfig()["local-vllm"]?.sessionHeader).toBeUndefined();
+    });
+  });
+
+  // providers.jsonc is hand-editable and loads without schema validation: a
+  // non-string name must be dropped, not reach the request path and throw.
+  it("drops a non-string session header from a hand-edited config", () => {
+    withTempConfig((config, service) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        "local-vllm": { ...localVllmConfig(), sessionHeader: 123 },
+      } as unknown as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
+
+      const providersConfig = service.getConfig();
+      expect(providersConfig["local-vllm"]?.sessionHeader).toBeUndefined();
+      expect(
+        buildRequestHeaders("local-vllm:qwen3-coder", undefined, "ws-1", providersConfig)
+      ).toEqual({ [MUX_WORKSPACE_ID_HEADER]: "ws-1" });
     });
   });
 

@@ -44,6 +44,7 @@ import type {
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import { modelStringStartsWithProvider } from "@/common/utils/providers/modelString";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
+import { sessionHeaderNameError } from "@/common/utils/providers/sessionHeader";
 import {
   baseUrlQueryFragmentError,
   getCustomProviderIds,
@@ -96,6 +97,9 @@ function buildCustomProviderConfigInfo(config: BaseProviderConfig): ProviderConf
     apiKeyFile,
     apiKeySource: apiKeySet ? "config" : apiKeyFile ? "file" : "keyless",
     baseUrl,
+    // providers.jsonc loads without schema validation; a non-string would
+    // throw in the request path (see sessionHeader.ts).
+    sessionHeader: typeof config.sessionHeader === "string" ? config.sessionHeader : undefined,
     models,
     displayName: config.displayName,
     providerType: config.providerType ?? "openai-compatible",
@@ -133,6 +137,23 @@ function googleVertexCredentialStatus(
 }
 
 const DENIED_KEY_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
+
+/** Value-only guards that run before the lock. "" always passes: it clears the key. */
+function configEditValueError(keyPath: string[], value: string | boolean): string | null {
+  if (keyPath.length !== 1 || value === "") return null;
+  const key = keyPath[0];
+  // No SDK adapter survives a query/fragment in its base URL (endpoint paths
+  // are raw-appended). `baseURL` is the legacy SDK-style alias.
+  if (key === "baseUrl" || key === "baseURL") {
+    return typeof value === "string" ? baseUrlQueryFragmentError(value) : null;
+  }
+  if (key === "sessionHeader") {
+    return typeof value === "string"
+      ? sessionHeaderNameError(value)
+      : "Session header must be a header name.";
+  }
+  return null;
+}
 
 type CustomProviderMutationResult<T> = Result<T, CustomProviderMutationError>;
 
@@ -1520,16 +1541,10 @@ export class ProviderService {
         return { success: false as const, error: `Invalid custom provider type: ${String(value)}` };
       }
 
-      // Value-only guard shared by every provider: no SDK adapter survives a
-      // query/fragment in its base URL (endpoint paths are raw-appended).
-      // Empty string falls through: it clears the key.
-      const isBaseUrlEdit =
-        keyPath.length === 1 && (keyPath[0] === "baseUrl" || keyPath[0] === "baseURL");
-      if (isBaseUrlEdit && typeof value === "string" && value !== "") {
-        const queryFragmentError = baseUrlQueryFragmentError(value);
-        if (queryFragmentError != null) {
-          return { success: false as const, error: queryFragmentError };
-        }
+      // Value-only guards shared by every provider (base URL, session header).
+      const valueError = configEditValueError(keyPath, value);
+      if (valueError != null) {
+        return { success: false as const, error: valueError };
       }
 
       // Read-modify-write under the cross-process lock (see setConfigValue).

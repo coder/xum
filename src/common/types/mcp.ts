@@ -1,9 +1,13 @@
 import type { z } from "zod";
 import type {
+  MCPConfigProblemSchema,
   MCPConnectionRefSchema,
   MCPServerIdentitySchema,
   MCPToolCallDisplaySchema,
 } from "@/common/orpc/schemas/mcp";
+
+/** A part of mcp.jsonc that Xum skipped (MCPConfigProblemSchema). */
+export type MCPConfigProblem = z.infer<typeof MCPConfigProblemSchema>;
 
 /** Supported MCP server transports. */
 export type MCPServerTransport = "stdio" | "http" | "sse" | "auto";

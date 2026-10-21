@@ -10,6 +10,11 @@ import {
   type WorkspaceMetadataContextValue,
 } from "@/browser/contexts/WorkspaceContext";
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
+import {
+  rectContains,
+  windowDragsAt,
+  withDesktopTitlebar,
+} from "@/browser/stories/helpers/windowDrag";
 import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import type { TabType } from "@/browser/types/rightSidebar";
 import {
@@ -153,6 +158,10 @@ function rect(element: Element) {
   const { x, y, width, height } = element.getBoundingClientRect();
   return { x, y, width, height };
 }
+/** The strip around a tab row (the row sits in a wrapper that holds its desktop no-drag region). */
+function stripOf(tablist: HTMLElement): HTMLElement {
+  return tablist.parentElement!.parentElement!;
+}
 async function frame() {
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 }
@@ -224,7 +233,7 @@ async function checkAllTabsButton(canvasElement: HTMLElement, overflowing: boole
   const rowRect = row.getBoundingClientRect();
   await expect(row.scrollWidth > row.clientWidth).toBe(overflowing);
   await expect(menu.left - rowRect.right).toBeGreaterThanOrEqual(0);
-  await expect(menu.right).toBeLessThanOrEqual(row.parentElement!.getBoundingClientRect().right);
+  await expect(menu.right).toBeLessThanOrEqual(stripOf(row).getBoundingClientRect().right);
   const hit = document.elementFromPoint(menu.left + menu.width / 2, menu.top + menu.height / 2);
   await expect(hit != null && menuButton.contains(hit)).toBe(true);
   if (!overflowing) {
@@ -325,7 +334,7 @@ export const SingleTab: Story = {
 };
 /** The inert room the strip keeps under WorkspaceShell's right sidebar toggle. */
 function toggleRoom(canvasElement: HTMLElement): HTMLElement {
-  const strip = within(canvasElement).getByRole("tablist").parentElement!;
+  const strip = stripOf(within(canvasElement).getByRole("tablist"));
   return strip.querySelector<HTMLElement>('button[aria-hidden="true"]')!;
 }
 
@@ -339,7 +348,7 @@ export const Wide: Story = {
     // tabs. All tabs is its only button outside the tabs: New tab lives in the All tabs menu.
     const canvas = within(canvasElement);
     const tablist = canvas.getByRole("tablist");
-    const stripButtons = within(tablist.parentElement!)
+    const stripButtons = within(stripOf(tablist))
       .getAllByRole("button")
       .filter((button) => !tablist.contains(button))
       .map((button) => button.getAttribute("aria-label"));
@@ -347,7 +356,7 @@ export const Wide: Story = {
     const row = tablist.getBoundingClientRect();
     const allTabs = canvas.getByRole("button", { name: "All tabs" }).getBoundingClientRect();
     const room = toggleRoom(canvasElement).getBoundingClientRect();
-    const strip = tablist.parentElement!.getBoundingClientRect();
+    const strip = stripOf(tablist).getBoundingClientRect();
     await expect(allTabs.left - row.right).toBeGreaterThan(8);
     await expect(room.left - allTabs.right).toBeGreaterThanOrEqual(0);
     await expect(room.left - allTabs.right).toBeLessThanOrEqual(8);
@@ -360,8 +369,79 @@ export const Cramped: Story = {
   args: { width: 45, reservesToggle: true },
   play: async ({ canvasElement }) => {
     const room = toggleRoom(canvasElement).getBoundingClientRect();
-    const strip = within(canvasElement).getByRole("tablist").parentElement!.getBoundingClientRect();
+    const strip = stripOf(within(canvasElement).getByRole("tablist")).getBoundingClientRect();
     await expect(room.left).toBeGreaterThanOrEqual(strip.left);
     await expect(room.right).toBeLessThanOrEqual(strip.right);
+  },
+};
+
+function center(rect: DOMRect) {
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
+/**
+ * Along the strip's center line, from the header stand-in to the strip's right end, every point
+ * outside the tab row and the strip buttons moves the window, and the controls do not.
+ */
+async function checkStripDragRegions(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  const row = canvas.getByRole("tablist").getBoundingClientRect();
+  const strip = stripOf(canvas.getByRole("tablist")).getBoundingClientRect();
+  const standIn = canvas.getByTestId("header-stand-in").getBoundingClientRect();
+  const buttons = [canvas.getByRole("button", { name: "All tabs" }).getBoundingClientRect()];
+  const y = strip.top + strip.height / 2;
+  const dead: number[] = [];
+  for (let x = Math.ceil(standIn.left); x < strip.right; x += 2) {
+    // The fixture's border between the stand-in and the strip is not part of the title bar.
+    if (!rectContains(standIn, x, y) && !rectContains(strip, x, y)) continue;
+    if ([row, ...buttons].some((rect) => rectContains(rect, x, y))) continue;
+    if (!windowDragsAt(x, y)) dead.push(x);
+  }
+  await expect(dead, "points that do not drag").toEqual([]);
+  const visibleTabs = canvas
+    .getAllByRole("tab")
+    .map((tab) => center(tab.getBoundingClientRect()))
+    .filter((point) => rectContains(row, point.x, point.y));
+  await expect(visibleTabs.length).toBeGreaterThan(0);
+  for (const point of [...visibleTabs, ...buttons.map(center)]) {
+    await expect(windowDragsAt(point.x, point.y)).toBe(false);
+  }
+}
+
+export const DesktopDragRegions: Story = {
+  // In Electron the strip sits after the workspace header in DOM order, and Electron lets the
+  // later region rect win, so a tab scrolled out of the row must not block dragging the header.
+  args: { width: 300, reservesToggle: true },
+  beforeEach: withDesktopTitlebar,
+  render: (args) => (
+    <div className="flex">
+      <div data-testid="header-stand-in" className="titlebar-drag flex-1" />
+      <StripFixture {...args} />
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const row = canvas.getByRole("tablist");
+    const tabs = within(row).getAllByRole("tab");
+    const standIn = canvas.getByTestId("header-stand-in");
+
+    await userEvent.click(tabs[tabs.length - 1]);
+    await waitFor(() =>
+      expect(tabs[0].getBoundingClientRect().right).toBeLessThanOrEqual(
+        row.getBoundingClientRect().left
+      )
+    );
+    const scrolledOut = tabs[0].getBoundingClientRect();
+    await expect(scrolledOut.left).toBeLessThan(standIn.getBoundingClientRect().right);
+    await expect(scrolledOut.right).toBeGreaterThan(standIn.getBoundingClientRect().left);
+    await checkStripDragRegions(canvasElement);
+
+    await userEvent.click(tabs[0]);
+    await waitFor(() =>
+      expect(tabs[tabs.length - 1].getBoundingClientRect().right).toBeGreaterThan(
+        row.getBoundingClientRect().right
+      )
+    );
+    await checkStripDragRegions(canvasElement);
   },
 };

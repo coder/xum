@@ -752,12 +752,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       )}
     >
       <div
-        className={cn(
-          // flex-1 (zero basis) lets a long title truncate instead of pushing the actions
-          // onto a second row on touch phones, where the header wraps.
-          "text-foreground flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden",
-          isDesktop && "titlebar-no-drag"
-        )}
+        // flex-1 (zero basis) lets a long title truncate instead of pushing the actions
+        // onto a second row on touch phones, where the header wraps. That makes the group
+        // span the gap up to the actions, so on desktop it stays draggable and only its
+        // controls are no-drag: the window moves from the whole empty stretch.
+        className="text-foreground flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden"
       >
         {leftSidebarCollapsed && <LeftSidebarToggleBarSpacer showNewChat />}
         <WorkspaceHeaderTitle
@@ -775,7 +774,10 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               <PopoverTrigger asChild>
                 <button
                   type="button"
-                  className="text-muted hover:text-foreground focus-visible:ring-accent flex shrink-0 cursor-pointer items-center border-0 bg-transparent p-0 transition-colors focus-visible:ring-1"
+                  className={cn(
+                    "text-muted hover:text-foreground focus-visible:ring-accent flex shrink-0 cursor-pointer items-center border-0 bg-transparent p-0 transition-colors focus-visible:ring-1",
+                    isDesktop && "titlebar-no-drag"
+                  )}
                   aria-label="Workspace details"
                   onKeyDown={(e) => {
                     // Stop only the keys this button owns: unmodified Enter and Space activate

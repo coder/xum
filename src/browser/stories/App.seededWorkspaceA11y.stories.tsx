@@ -107,7 +107,8 @@ async function expectSeededPageAudits(canvasElement: HTMLElement) {
     .filter((element) => element.closest('[role="tab"]') === null)
     .map((element) => element.getAttribute("aria-label") ?? element.outerHTML.slice(0, 80));
   await expect(nonTabChildren).toEqual([]);
-  const tabStrip = tablist.parentElement;
+  // The row sits in a wrapper that holds its desktop no-drag region.
+  const tabStrip = tablist.parentElement?.parentElement;
   if (!tabStrip) throw new Error("Tab strip not rendered");
   const allTabs = within(tabStrip).getByRole("button", { name: "All tabs" });
   // The sidebar fades in, so wait for it before checking visibility.

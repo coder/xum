@@ -2067,7 +2067,9 @@ export const ToggleStaysPutWhileSliding: Story = {
     // Expanding drops the card at once; the panel slides in.
     await expect(opening.some((frame) => frame.card && frame.panel)).toBe(false);
 
-    const strip = canvas.getByRole("tablist", { name: "Sidebar views" }).parentElement!;
+    // The row sits in a wrapper that holds its desktop no-drag region.
+    const strip = canvas.getByRole("tablist", { name: "Sidebar views" }).parentElement!
+      .parentElement!;
     const stripRoom = strip.querySelector<HTMLElement>('button[aria-hidden="true"]')!;
     await expectSameRect(stripRoom.getBoundingClientRect(), rest);
     await expect(strip.getBoundingClientRect().height).toBe(header.getBoundingClientRect().height);

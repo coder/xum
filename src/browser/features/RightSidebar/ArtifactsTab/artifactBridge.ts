@@ -271,9 +271,11 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  *
  * So a plain left click on a link for this document (`href`, or SVG `xlink:href`, no `download`,
  * no `target` other than `_self`) whose raw value starts with `#` is cancelled, and the script does the browser's fragment steps itself: the target is an id or
- * an `<a name>`, raw first and then percent-decoded, else the top for `#` and `#top`. It is
- * scrolled into view and focused, or, when it cannot take focus, given `tabindex="-1"` until it
- * loses focus, so the next Tab continues after it. A native fragment navigation
+ * an `<a name>`, for the parsed URL's (percent-encoded) fragment first and then its UTF-8
+ * decoding, else the top for `#` and `#top`. Closed `<details>` and `hidden="until-found"`
+ * ancestors are revealed (#6219). The target is scrolled into view and focused, or, when it
+ * cannot take focus, given `tabindex="-1"` until it loses focus, so the next Tab continues
+ * after it. A native fragment navigation
  * (`location.replace("about:srcdoc#x")`, `location.hash`, `<base href="about:srcdoc">`) would
  * do this for free, but WebKit fires the iframe's `load` event for it, which the navigation
  * guard must treat as leaving the document.
@@ -282,12 +284,12 @@ export const ARTIFACT_STATE_POST_INTERVAL_MS = 250;
  * and document handlers, so one of those that calls preventDefault keeps the click. Window
  * listeners the artifact adds itself run after this one, so they see the click already handled. The link is found through
  * composedPath, so links in open shadow roots count too. Annotate mode stops the click in the
- * capture phase first. Known limits (#6219), where the click still leaves the document as
- * before: a handler that stops the click's propagation hides it from window, and a target
- * inside a closed <details> is not revealed first.
+ * capture phase first. Known limit (#6219), where the click still leaves the document as
+ * before: a handler that stops the click's propagation hides it from window.
  *
- * SECURITY AUDIT: it only cancels a navigation and scrolls or focuses inside the document; it
- * never navigates, so both navigation guards stay as they are.
+ * SECURITY AUDIT: it only cancels a navigation and scrolls, focuses or reveals (opens a
+ * `<details>`, removes `hidden`) inside the document; it never navigates, so both navigation
+ * guards stay as they are.
  */
 export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
     var XLINK = "http://www.w3.org/1999/xlink";
@@ -306,9 +308,61 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
         if (href === null) href = node.getAttributeNS(XLINK, "href");
         if (href === null) return null;
         href = href.trim();
-        return href.charAt(0) === "#" ? href.slice(1) : null;
+        if (href.charAt(0) !== "#") return null;
+        // The parsed URL's fragment, as HTML uses: it is percent-encoded ("#a b" -> "a%20b").
+        try {
+          return new URL(href, "about:srcdoc").hash.slice(1);
+        } catch (error) {
+          return href.slice(1);
+        }
       }
       return null;
+    }
+    // URL percent-decoding, then UTF-8 decoding with replacement characters, as HTML decodes a
+    // fragment. A "%" without two hex digits stays as it is.
+    function percentDecode(text) {
+      var bytes = new TextEncoder().encode(text);
+      var out = [];
+      for (var i = 0; i < bytes.length; i++) {
+        var pair = bytes[i] === 0x25 && i + 2 < bytes.length ? String.fromCharCode(bytes[i + 1], bytes[i + 2]) : "";
+        if (/^[0-9A-Fa-f]{2}$/.test(pair)) {
+          out.push(parseInt(pair, 16));
+          i += 2;
+        } else {
+          out.push(bytes[i]);
+        }
+      }
+      return new TextDecoder("utf-8", { ignoreBOM: true }).decode(new Uint8Array(out));
+    }
+    // The parent in the flat tree, where a slotted node renders: its slot, or a shadow root's host.
+    function flatParent(node) {
+      if (node.assignedSlot) return node.assignedSlot;
+      var parent = node.parentNode;
+      return parent && parent.nodeType === 11 ? parent.host : parent;
+    }
+    // HTML's ancestor revealing steps: open each closed <details> the target sits in (outside
+    // its summary, which shows anyway) and reveal each hidden="until-found" ancestor. Like HTML,
+    // it stops when a beforematch handler kept the element hidden or removed it.
+    function reveal(target) {
+      for (var node = target; node && node.nodeType === 1; node = flatParent(node)) {
+        if (isUntilFound(node)) {
+          node.dispatchEvent(new window.Event("beforematch", { bubbles: true }));
+          if (!node.isConnected || !isUntilFound(node)) return;
+          node.removeAttribute("hidden");
+        }
+        var parent = node.parentElement;
+        if (parent && parent.localName === "details" && !parent.hasAttribute("open")) {
+          var summary = null;
+          for (var i = 0; i < parent.children.length && !summary; i++) {
+            if (parent.children[i].localName === "summary") summary = parent.children[i];
+          }
+          if (node !== summary) parent.setAttribute("open", "");
+        }
+      }
+    }
+    function isUntilFound(node) {
+      var hidden = node.getAttribute("hidden");
+      return hidden !== null && hidden.toLowerCase() === "until-found";
     }
     // HTML's "find a potential indicated element": an id first, then an <a name>.
     function findTarget(fragment) {
@@ -320,10 +374,7 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
       return null;
     }
     function jump(raw) {
-      // Like URL percent-decoding: a "%" without two hex digits stays as it is.
-      var decoded = raw.replace(/(?:%[0-9A-Fa-f]{2})+/g, function (run) {
-        try { return decodeURIComponent(run); } catch (error) { return run; }
-      });
+      var decoded = percentDecode(raw);
       var target = findTarget(raw) || findTarget(decoded);
       if (!target) {
         if (raw !== "" && decoded.toLowerCase() !== "top") return;
@@ -331,6 +382,7 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
         window.scrollTo(0, 0);
         return;
       }
+      reveal(target);
       target.scrollIntoView();
       target.focus({ preventScroll: true });
       // tabIndex cannot tell (an <a> without href reports 0), so check whether focus moved.

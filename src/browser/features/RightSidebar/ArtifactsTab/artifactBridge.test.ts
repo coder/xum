@@ -537,6 +537,90 @@ describe("in-page links", () => {
     expect(click("own")).toEqual({ prevented: true, scrolled: [], focused: null });
     await win.happyDOM.close();
   });
+
+  // #6219: the browser's fragment steps that the shim skipped. A target inside a closed
+  // <details> or a hidden="until-found" ancestor is revealed before the scroll. The fragment is
+  // the parsed URL's, so its percent-encoded form is tried first, and it is percent-decoded as
+  // UTF-8 with replacement characters. <area> links count like <a>.
+  test.each([
+    ["HTML artifact bridge", buildArtifactBridgeScript("light")],
+    ["MCP App preamble", mcpAppPreambleScript("00")],
+  ])("%s reveals hidden targets and parses the fragment like a browser", async (_name, script) => {
+    const win = new HappyWindow({ url: "http://localhost/workspace/abc" });
+    const doc = win.document;
+    doc.body.innerHTML = `
+      <a id="to-details" href="#in-details">Details</a>
+      <a id="to-summary" href="#summary">Summary</a>
+      <a id="to-found" href="#found">Found</a>
+      <a id="space" href="#a b">Space</a>
+      <a id="bad-utf8" href="#%E9t%C3%A9">Bad UTF-8</a>
+      <map name="m"><area id="area" href="#intro" shape="rect" coords="0,0,1,1"></map>
+      <h3 id="intro">Intro</h3>
+      <details id="closed"><summary>Closed</summary><div><h3 id="in-details">Inside</h3></div></details>
+      <details id="summary-only"><summary id="summary">Summary</summary><p>Body</p></details>
+      <div id="until-found" hidden="until-found"><h3 id="found">Found it</h3></div>
+      <a id="to-kept" href="#kept">Kept</a>
+      <details id="outer-kept"><div id="keeps" hidden="until-found"><h3 id="kept">Kept</h3></div></details>
+      <a id="to-slotted" href="#slotted">Slotted</a>
+      <div id="host"><h3 id="slotted">In slot</h3></div>
+      <h3 id="a%20b">Encoded</h3><h3 id="a b">Spaced</h3><h3 id="\uFFFDt\u00e9">Replaced</h3>`;
+    const scrolled: string[] = [];
+    for (const element of Array.from(doc.querySelectorAll("h3, summary"))) {
+      element.scrollIntoView = () => scrolled.push(element.textContent);
+    }
+    // A shadow tree that renders the light-DOM target in a slot under a closed <details>.
+    const shadow = doc.getElementById("host")!.attachShadow({ mode: "open" });
+    shadow.innerHTML = `<details id="shadow-details"><summary>S</summary><slot></slot></details>`;
+    // Happy DOM has no assignedSlot; a browser reports the slot the node renders in.
+    Object.defineProperty(doc.getElementById("slotted")!, "assignedSlot", {
+      value: shadow.querySelector("slot"),
+    });
+    const beforematch: string[] = [];
+    doc.body.addEventListener("beforematch", (event) => {
+      if (event.target instanceof win.HTMLElement) beforematch.push(event.target.id);
+      // An artifact that keeps this one hidden: plain hidden, so no reveal goes on.
+      if (event.target instanceof win.HTMLElement && event.target.id === "keeps") {
+        event.target.setAttribute("hidden", "");
+      }
+    });
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
+    const run = new Function("window", "document", "CustomEvent", script) as (
+      window: unknown,
+      document: unknown,
+      customEvent: unknown
+    ) => void;
+    run(win, doc, win.CustomEvent);
+    win.addEventListener("click", (event) => event.preventDefault());
+    const click = (id: string): string[] => {
+      scrolled.length = 0;
+      doc
+        .getElementById(id)!
+        .dispatchEvent(new win.MouseEvent("click", { bubbles: true, cancelable: true }));
+      return [...scrolled];
+    };
+
+    expect(click("to-details")).toEqual(["Inside"]);
+    expect(doc.getElementById("closed")!.hasAttribute("open")).toBe(true);
+    // A summary shows while its <details> is closed, so nothing opens.
+    expect(click("to-summary")).toEqual(["Summary"]);
+    expect(doc.getElementById("summary-only")!.hasAttribute("open")).toBe(false);
+    expect(click("to-found")).toEqual(["Found it"]);
+    expect(doc.getElementById("until-found")!.hasAttribute("hidden")).toBe(false);
+    expect(beforematch).toEqual(["until-found"]);
+    // The handler kept it hidden: the reveal stops there, and no outer <details> opens.
+    click("to-kept");
+    expect(doc.getElementById("keeps")!.getAttribute("hidden")).toBe("");
+    expect(doc.getElementById("outer-kept")!.hasAttribute("open")).toBe(false);
+    // The flat tree: the slotted target's rendered <details> is in the shadow tree.
+    expect(click("to-slotted")).toEqual(["In slot"]);
+    expect(shadow.getElementById("shadow-details")!.hasAttribute("open")).toBe(true);
+    // "#a b" parses to "a%20b", which HTML tries before the decoded "a b".
+    expect(click("space")).toEqual(["Encoded"]);
+    // %E9 alone is not UTF-8: it decodes to U+FFFD, as in a browser.
+    expect(click("bad-utf8")).toEqual(["Replaced"]);
+    expect(click("area")).toEqual(["Intro"]);
+    await win.happyDOM.close();
+  });
 });
 
 /** Minimal event target: the suite may run with Happy DOM's globals installed by other files. */
