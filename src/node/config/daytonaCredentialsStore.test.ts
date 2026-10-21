@@ -3,6 +3,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { DAYTONA_DEFAULT_API_URL } from "@/common/constants/daytona";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { DaytonaCredentialsStore } from "./daytonaCredentialsStore";
 
 const KEY = "test-key-not-real";
@@ -34,6 +35,44 @@ describe("DaytonaCredentialsStore", () => {
     });
     expect(JSON.stringify(publicConfig)).not.toContain(KEY);
     expect((await store.resolve())?.apiKey).toBe(KEY);
+  });
+
+  // Two backends on one Xum root (a desktop app next to `xum server`) each have their own store.
+  it("keeps both of two backends' concurrent saves", async () => {
+    const desktop = new DaytonaCredentialsStore(rootDir, {});
+    const server = new DaytonaCredentialsStore(rootDir, {});
+    await desktop.update({ apiKey: "old-key", apiUrl: "https://old.example.com/api" });
+
+    await Promise.all([
+      desktop.update({ apiKey: KEY }),
+      server.update({ apiUrl: "https://new.example.com/api" }),
+    ]);
+
+    expect(await desktop.read()).toEqual({ apiKey: KEY, apiUrl: "https://new.example.com/api" });
+  });
+
+  it("waits for another process's save before reading the file", async () => {
+    // Held by this process, the file lock looks to the store like another backend mid-save.
+    const release = await acquireCrossProcessLock({
+      lockPath: path.join(rootDir, "daytona.json.lock"),
+      acquireTimeoutMs: 1_000,
+      staleMs: 60_000,
+      timeoutMessage: "test holder",
+    });
+    const store = new DaytonaCredentialsStore(rootDir, {});
+    let settled = false;
+    const saving = store.update({ apiKey: KEY }).finally(() => {
+      settled = true;
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(settled).toBe(false);
+      expect(await store.read()).toEqual({});
+    } finally {
+      await release();
+    }
+    await saving;
+    expect(await store.read()).toEqual({ apiKey: KEY });
   });
 
   it("leaves omitted fields alone and clears fields set to an empty string", async () => {

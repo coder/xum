@@ -8,6 +8,7 @@ import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isLoopbackHost } from "@/common/utils/loopbackHost";
 import { log } from "@/node/services/log";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 /**
@@ -119,6 +120,25 @@ function parseStoredCredentials(raw: string): DaytonaStoredCredentials | undefin
   return stored;
 }
 
+/** `stored` with the patch's fields set; an empty string clears a field. */
+function applyPatch(
+  stored: DaytonaStoredCredentials,
+  patch: DaytonaCredentialsPatch
+): DaytonaStoredCredentials {
+  const next = { ...stored };
+  for (const field of CREDENTIAL_FIELDS) {
+    const value = patch[field];
+    if (value === undefined) continue;
+    const trimmed = nonEmpty(value);
+    if (trimmed === undefined) {
+      delete next[field];
+    } else {
+      next[field] = field === "apiUrl" ? normalizeApiUrl(trimmed) : trimmed;
+    }
+  }
+  return next;
+}
+
 export class DaytonaCredentialsStore {
   readonly filePath: string;
   private readonly rootDir: string;
@@ -164,23 +184,29 @@ export class DaytonaCredentialsStore {
     return run;
   }
 
+  /**
+   * Another backend on this Xum root (a desktop app next to `xum server`) has its own
+   * updateChain: the file lock spans the whole read-modify-write, or one backend's save of the
+   * key could be overwritten by the other's save of the URL, pairing the old key with the new
+   * deployment.
+   */
   private async applyUpdate(patch: DaytonaCredentialsPatch): Promise<void> {
-    const next = await this.read();
-    for (const field of CREDENTIAL_FIELDS) {
-      const value = patch[field];
-      if (value === undefined) continue;
-      const trimmed = nonEmpty(value);
-      if (trimmed === undefined) {
-        delete next[field];
-      } else {
-        next[field] = field === "apiUrl" ? normalizeApiUrl(trimmed) : trimmed;
-      }
-    }
     await ensurePrivateDir(this.rootDir);
-    await writeFileAtomic(this.filePath, JSON.stringify(next, null, 2), {
-      encoding: "utf-8",
-      mode: 0o600,
+    const release = await acquireCrossProcessLock({
+      lockPath: `${this.filePath}.lock`,
+      acquireTimeoutMs: 30_000,
+      staleMs: 60_000,
+      timeoutMessage: "Another Xum process is saving Daytona settings.",
     });
+    try {
+      const next = applyPatch(await this.read(), patch);
+      await writeFileAtomic(this.filePath, JSON.stringify(next, null, 2), {
+        encoding: "utf-8",
+        mode: 0o600,
+      });
+    } finally {
+      await release();
+    }
   }
 
   /**
