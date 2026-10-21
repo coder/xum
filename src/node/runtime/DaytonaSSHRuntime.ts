@@ -451,11 +451,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   ): Promise<SpawnResult> {
     let result: SpawnResult;
     const sandboxId = this.daytonaConfig.sandboxId;
-    // ssh may send a token an earlier process left in the include file: the redactor must
-    // know it before ssh can quote it. Not every command runs after ensureReady.
-    if (sandboxId) await this.daytonaService.loadPersistedTokens();
-    // Before the attempt: a refusal replaces only the token this command used.
-    const tokenGeneration = sandboxId ? this.daytonaService.sshTokenGeneration(sandboxId) : 0;
+    const tokenGeneration = await this.prepareSshAttempt(sandboxId);
     try {
       result = await super.spawnRemoteProcess(fullCommand, options);
     } catch (error) {
@@ -480,6 +476,16 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         onExit?.(exitCode, stderr);
       },
     };
+  }
+
+  /** The token generation a refusal of this command must match. */
+  private async prepareSshAttempt(sandboxId: string | undefined): Promise<number> {
+    if (!sandboxId) return 0;
+    // ssh may send a token an earlier process left in the include file: the redactor must
+    // know it before ssh can quote it. Not every command runs after ensureReady.
+    await this.daytonaService.loadPersistedTokens();
+    // Before the attempt: a refusal replaces only the token this command used.
+    return this.daytonaService.sshTokenGeneration(sandboxId);
   }
 
   /**
