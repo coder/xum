@@ -342,6 +342,8 @@ export class DaytonaService {
   private credentialsSnapshot?: { credentials: DaytonaResolvedCredentials | null };
   /** Operations running under withAccountLease; setConfig refuses while any runs. */
   private accountLeases = 0;
+  /** The settings read a lease claimed while idle runs first. */
+  private idleRefresh?: Promise<void>;
   /** The settings change being saved; new leases wait for it. */
   private settingsChange?: Promise<DaytonaPublicConfig>;
   /** Per sandbox: bumped by every release of its SSH access, so a mint that spans one can tell. */
@@ -409,7 +411,19 @@ export class DaytonaService {
    * settings change; one that starts while a change is saved waits for it. Leases nest.
    */
   async withAccountLease<T>(fn: () => Promise<T>): Promise<T> {
-    while (this.settingsChange) await settled(this.settingsChange);
+    for (;;) {
+      while (this.settingsChange) await settled(this.settingsChange);
+      // A held lease pins the account; the outer one must not pin a stale snapshot, so it
+      // first takes what another Xum process may have saved since this one last read.
+      if (this.accountLeases > 0) break;
+      // Shared, so concurrent claimers resume (and start their operations) in call order.
+      this.idleRefresh ??= this.refreshIdleCredentials().finally(() => {
+        this.idleRefresh = undefined;
+      });
+      await this.idleRefresh;
+      // No await between this check and the claim (as in setConfig).
+      if (!this.settingsChange) break;
+    }
     this.accountLeases++;
     try {
       return await fn();
@@ -659,6 +673,17 @@ export class DaytonaService {
       };
     }
     return { available: true };
+  }
+
+  /** The idle read before a lease; unusable settings fail the lease's own first call instead. */
+  private async refreshIdleCredentials(): Promise<void> {
+    try {
+      await this.resolveCredentials();
+    } catch (error) {
+      log.debug("Could not read the Daytona settings before an operation", {
+        error: getErrorMessage(error),
+      });
+    }
   }
 
   /** Unusable settings (an http DAYTONA_API_URL) throw a `not_configured` DaytonaApiError. */

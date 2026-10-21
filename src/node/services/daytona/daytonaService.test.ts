@@ -276,6 +276,33 @@ describe("DaytonaService", () => {
     expect(await generation()).toBe(before + 1);
   });
 
+  it("takes the account another process saved while idle from a lease's first call", async () => {
+    const lookupKeys: string[] = [];
+    service = new DaytonaService({
+      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
+      rootDir,
+      fetch: ((input: string | URL | Request, init?: RequestInit) => {
+        const url = input instanceof Request ? input.url : input.toString();
+        if ((init?.method ?? "GET") === "GET" && url.endsWith("/sandbox/sb-1")) {
+          lookupKeys.push((init?.headers as Record<string, string>).Authorization);
+        }
+        return plane.fetch(input, init);
+      }) as typeof fetch,
+      now: () => clock,
+    });
+    plane.states = ["started"];
+    await service.getSandboxState("sb-1");
+    const before = (await service.getAccount()).generation;
+
+    // Another backend sharing this root saves another key while no lease runs here.
+    await new DaytonaCredentialsStore(rootDir, {}).update({ apiKey: "other" });
+    await service.withAccountLease(() => service.getSandboxState("sb-1"));
+
+    expect(lookupKeys).toEqual(["Bearer k", "Bearer other"]);
+    await service.getSandboxState("sb-1");
+    expect((await service.getAccount()).generation).toBe(before + 1);
+  });
+
   it("leaves a resolve during its own settings save to that save", async () => {
     const revokeKeys: string[] = [];
     const store = new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" });
