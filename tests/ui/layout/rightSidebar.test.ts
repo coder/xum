@@ -614,25 +614,46 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
-  test("Ctrl+Shift+B in the command palette is claimed but does not toggle", async () => {
+  test("Ctrl+Shift+B over an overlay is claimed but does not toggle", async () => {
     const { cleanup } = await setupRightSidebarView(() => {
       updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
     });
-    // Stands in for the palette input: focus inside [cmdk-root] (isCommandPaletteTarget).
-    const palette = document.createElement("div");
-    palette.setAttribute("cmdk-root", "");
-    const input = document.createElement("input");
-    palette.append(input);
-    document.body.append(palette);
+    // Stand-ins for the overlays that block the toggle. The modal's control stops keydown
+    // propagation, as ConfirmationModal's controls do.
+    const overlays: [string, (root: HTMLElement) => void][] = [
+      ["command palette", (root) => root.setAttribute("cmdk-root", "")],
+      ["popover", (root) => root.setAttribute("data-radix-popper-content-wrapper", "")],
+      [
+        "modal that stops propagation",
+        (root) => {
+          root.setAttribute("role", "dialog");
+          root.setAttribute("aria-modal", "true");
+        },
+      ],
+    ];
 
     try {
-      const chord = { key: "B", code: "KeyB", ctrlKey: true, shiftKey: true };
-      // fireEvent returns false when a handler called preventDefault: in a browser, the chord
-      // must not fall through to Chrome's bookmarks bar.
-      expect(fireEvent.keyDown(input, chord)).toBe(false);
-      expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), true)).toBe(false);
+      for (const [name, mark] of overlays) {
+        const root = document.createElement("div");
+        mark(root);
+        const control = document.createElement("button");
+        control.addEventListener("keydown", (e) => e.stopPropagation());
+        root.append(control);
+        document.body.append(root);
+        try {
+          const chord = { key: "B", code: "KeyB", ctrlKey: true, shiftKey: true };
+          // fireEvent returns false when a handler called preventDefault: in a browser, the
+          // chord must not fall through to Chrome's bookmarks bar.
+          expect({ name, notPrevented: fireEvent.keyDown(control, chord) }).toEqual({
+            name,
+            notPrevented: false,
+          });
+          expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), true)).toBe(false);
+        } finally {
+          root.remove();
+        }
+      }
     } finally {
-      palette.remove();
       await cleanup();
     }
   }, 60_000);

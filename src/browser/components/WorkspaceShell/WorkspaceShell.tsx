@@ -350,6 +350,21 @@ function isRightSidebarToggleChord(e: KeyboardEvent): boolean {
 }
 
 /**
+ * True when an overlay blocks the right sidebar toggle: a modal dialog, the command palette (not a
+ * modal dialog, bug bash RS1), or a focused popover or menu (Radix portals them out of the sidebar,
+ * so a collapse would unmount the control with focus and leave focus on <body>). A held key also
+ * blocks it, or it would flip the sidebar on every repeat.
+ */
+function isRightSidebarToggleBlocked(e: KeyboardEvent): boolean {
+  return (
+    e.repeat ||
+    isDialogOpen() ||
+    isCommandPaletteTarget(e.target) ||
+    (e.target instanceof Element && e.target.closest("[data-radix-popper-content-wrapper]") != null)
+  );
+}
+
+/**
  * Toggles the right sidebar for its hotkey. A collapse unmounts the focused control, and focus then
  * fell to <body> (bug bash RS3), so focus moves to the header toggle.
  */
@@ -376,13 +391,13 @@ function useRightSidebarToggleKey(
       // Claim the chord even when an overlay blocks the toggle: in a browser, Chrome binds it to
       // its bookmarks bar.
       e.preventDefault();
-      // A held key would flip the sidebar on every repeat. The command palette is not a modal
-      // dialog, so check its focus too (bug bash RS1).
-      if (e.repeat || isDialogOpen() || isCommandPaletteTarget(e.target)) return;
+      if (isRightSidebarToggleBlocked(e)) return;
       toggleRightSidebarFromKey(workspaceId, shellRef.current);
     };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
+    // Capture phase: some modal controls stop keydown propagation (stopKeyboardPropagation),
+    // which would hide the chord from a bubble-phase listener before it is claimed.
+    window.addEventListener("keydown", handler, { capture: true });
+    return () => window.removeEventListener("keydown", handler, { capture: true });
   }, [workspaceId, shellRef]);
 }
 
