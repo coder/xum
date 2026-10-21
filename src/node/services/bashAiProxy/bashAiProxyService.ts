@@ -33,6 +33,7 @@ import {
 import type { RuntimeMode } from "@/common/types/runtime";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
+import { onSshHostRetired } from "@/node/runtime/transports";
 import { log } from "@/node/services/log";
 import {
   resolveProviderCredentials,
@@ -263,6 +264,7 @@ export class BashAiProxyService {
   private stopped = false;
   private readonly state: ProxyStateStore;
   private readonly forwards: ReverseForwardManager;
+  private readonly stopRetireListener: () => void;
   /** The forward last saved per SSH host, to skip redundant writes. */
   private readonly savedForwards = new Map<string, PersistedForward>();
   private restoring: Promise<unknown> | undefined;
@@ -282,6 +284,8 @@ export class BashAiProxyService {
       savedRemotePort: (hostKey) => this.savedForwards.get(hostKey)?.remotePort,
       onEstablished: () => undefined, // envFor() records the workspace that uses it
     });
+    // Daytona retires a sandbox alias when its account or gateway changes.
+    this.stopRetireListener = onSshHostRetired((host) => this.forwards.closeHost(host));
   }
 
   /**
@@ -438,6 +442,7 @@ export class BashAiProxyService {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.stopRetireListener();
     const forwardsClosed = this.forwards.closeAll();
     const server = this.server;
     this.server = undefined;

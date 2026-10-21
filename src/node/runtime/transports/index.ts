@@ -12,8 +12,20 @@ export function createSSHTransport(config: SSHConnectionConfig, useSSH2: boolean
   return useSSH2 ? new SSH2Transport(config) : new OpenSSHTransport(config);
 }
 
-/** Retire the host's pooled connections on both transports (credentials or gateway changed). */
+const retiredHostListeners = new Set<(host: string) => void>();
+
+/**
+ * Connections the pools do not hold (a reverse forward opens its own) close through these when
+ * their host is retired. Returns the unsubscribe.
+ */
+export function onSshHostRetired(listener: (host: string) => void): () => void {
+  retiredHostListeners.add(listener);
+  return () => retiredHostListeners.delete(listener);
+}
+
+/** Retire the host's connections on both transports (credentials or gateway changed). */
 export async function retireSshConnections(config: SSHConnectionConfig): Promise<void> {
   ssh2ConnectionPool.retireConnection(config);
+  for (const listener of retiredHostListeners) listener(config.host);
   await retireOpenSSHMasters(config);
 }
