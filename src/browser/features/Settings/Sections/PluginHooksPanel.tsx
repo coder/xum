@@ -102,6 +102,20 @@ const REVIEW_LABEL: Record<PluginHookReviewState, { text: string; className: str
  * Settings review of a managed plugin's Codex-format hooks (hooks.json). Codex trusts each hook
  * by the hash of its exact definition: a hook runs only while trusted and unchanged.
  */
+/**
+ * The review's first line. A Claude Code plugin's hooks never run and offer no trust control, so
+ * the trust promise would be false for every row of such a plugin.
+ */
+function hooksIntro(data: AgentPluginHooks | null): string {
+  const neverRun =
+    data !== null &&
+    data.hooks.length > 0 &&
+    data.hooks.every((hook) => hook.status !== "runnable");
+  return neverRun
+    ? "Hooks from hooks.json. Xum never runs these hooks."
+    : "Hooks from hooks.json. A hook runs only after you trust it, and only while it stays unchanged.";
+}
+
 export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> = (props) => {
   const { api } = useAPI();
   const [data, setData] = useState<AgentPluginHooks | null>(null);
@@ -161,10 +175,7 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
 
   return (
     <div className="border-border-medium bg-background-secondary mt-2 space-y-3 rounded-md border p-3">
-      <p className="text-foreground text-xs">
-        Hooks from hooks.json. A hook runs only after you trust it, and only while it stays
-        unchanged.
-      </p>
+      <p className="text-foreground text-xs">{hooksIntro(data)}</p>
       {busy && (
         <p role="status" className="text-muted text-xs">
           Loading hooks…
