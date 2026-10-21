@@ -156,6 +156,10 @@ interface RightSidebarToggleProps {
  * pb-px: the header and the strip draw a 1px bottom border inside their height, so their content
  * centers 0.5px higher than the bar's full height would.
  * z-20: above the overview card (z-10) and the sliding panel, below immersive review (z-50).
+ * pointer-events-none: the bar's box spans the full title bar inset, but the strip caps its own
+ * (`titlebar-safe-right-capped`), so where the inset passes that cap (a narrow split pane) the
+ * box covers the strip's controls; only the button takes clicks. Electron's drag regions ignore
+ * pointer-events.
  */
 export function RightSidebarToggle(props: RightSidebarToggleProps) {
   const isDesktop = isDesktopMode();
@@ -165,7 +169,7 @@ export function RightSidebarToggle(props: RightSidebarToggleProps) {
       data-testid="right-sidebar-toggle-bar"
       className={cn(
         RIGHT_BAR_LAYOUT_CLASS,
-        "absolute top-0 right-0 z-20 pb-px",
+        "pointer-events-none absolute top-0 right-0 z-20 pb-px",
         isDesktop ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag` : "h-8"
       )}
     >
@@ -176,7 +180,11 @@ export function RightSidebarToggle(props: RightSidebarToggleProps) {
             size="icon"
             onClick={props.onToggle}
             aria-label={label}
-            className={cn(ICON_BUTTON_CLASS, isDesktop && "titlebar-no-drag")}
+            className={cn(
+              ICON_BUTTON_CLASS,
+              "pointer-events-auto",
+              isDesktop && "titlebar-no-drag"
+            )}
           >
             <PanelRight className="h-3.5 w-3.5" />
           </Button>

@@ -2151,3 +2151,34 @@ export const DragCollapseSnapsWithoutSliding: Story = {
     for (const frame of opening) await expect([0, openWidth]).toContain(frame.sidebarWidth);
   },
 };
+
+/**
+ * The shell's toggle bar reserves the full titlebar overlay inset, and the tab strip caps its own
+ * (see TabsReachableUnderWideTitlebarInset), so under a wide inset the bar's box reaches over the
+ * strip. Linux e2e reports 513px: its viewport is wider than the real window. The strip's
+ * controls under the bar must still take clicks.
+ */
+export const StripReachableUnderToggleBar: Story = {
+  ...CollapsedOverview,
+  decorators: [
+    (Story: ComponentType) => (
+      // On a wrapper, not :root, so the override cannot leak into later stories.
+      <div className="contents" style={{ "--titlebar-right-inset": "513px" } as CSSProperties}>
+        <Story />
+      </div>
+    ),
+  ],
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(
+      await canvas.findByRole("button", { name: "Expand right sidebar" }, { timeout: 15_000 })
+    );
+    const allTabs = await canvas.findByRole("button", { name: "All tabs" }, { timeout: 15_000 });
+    // Like Playwright: bring it into view (the 1600px frame can be wider than the window).
+    allTabs.scrollIntoView({ block: "nearest", inline: "nearest" });
+    await waitFor(() => {
+      if (!isHitTarget(allTabs)) throw new Error("All tabs is not under the pointer");
+    });
+  },
+};
