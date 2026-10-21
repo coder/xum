@@ -181,7 +181,11 @@ function contextFromEnv(env: NodeJS.ProcessEnv, dryRun: boolean): CommentContext
     sourceSha: need("SOURCE_SHA", local("HEAD")),
     runId: need("GITHUB_RUN_ID", local("0")),
     runAttempt: need("GITHUB_RUN_ATTEMPT", local("1")),
-    reportsArtifact: env.REPORTS_ARTIFACT || `stories-reports-${env.GITHUB_RUN_ATTEMPT ?? "1"}`,
+    // Empty when the lane job set no output (GitHub passes ""), so not `??`.
+    reportsArtifact:
+      env.REPORTS_ARTIFACT != null && env.REPORTS_ARTIFACT !== ""
+        ? env.REPORTS_ARTIFACT
+        : `stories-reports-${env.GITHUB_RUN_ATTEMPT ?? "1"}`,
     // Unset, or empty when the lane left no output: the titles then name no model.
     model: env.BUGBASH_MODEL === "" ? undefined : env.BUGBASH_MODEL,
   };
