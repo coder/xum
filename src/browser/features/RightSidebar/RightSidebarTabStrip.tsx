@@ -356,7 +356,9 @@ const StripEndControls: React.FC<{
 /**
  * One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges) while the
  * controls after it stay in view. Its wrapper holds the desktop no-drag box over the row's
- * visible part (see the strip's drag regions).
+ * visible part (see the strip's drag regions). `rowRef` is destructured on purpose: React
+ * Compiler rejects reading a ref prop as `props.rowRef` during render ("Cannot access refs
+ * during render") and would leave this row uncompiled.
  */
 const TabScrollRow: React.FC<{
   rowRef: React.RefObject<HTMLDivElement>;
@@ -364,13 +366,13 @@ const TabScrollRow: React.FC<{
   items: RightSidebarTabStripItem[];
   tabsetId: string;
   isDesktop: boolean;
-}> = (props) => (
+}> = ({ rowRef, ...props }) => (
   <div className="relative flex min-w-0">
     {props.isDesktop && (
       <div aria-hidden className="titlebar-no-drag pointer-events-none absolute inset-0" />
     )}
     <div
-      ref={props.rowRef}
+      ref={rowRef}
       data-tab-scroll-row
       role="tablist"
       aria-label={props.ariaLabel}
