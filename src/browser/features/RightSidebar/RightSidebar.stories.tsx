@@ -2092,3 +2092,60 @@ export const ToggleStaysPutWhileSliding: Story = {
     await expect(closing[closing.length - 1].panel).toBe(false);
   },
 };
+
+/**
+ * Dragging the resize handle past the snap point collapses the sidebar, and dragging back
+ * reopens it, at once: the width (and the transcript's room for the card) follows the pointer
+ * instead of sliding behind it.
+ */
+export const DragCollapseSnapsWithoutSliding: Story = {
+  ...CollapsedOverview,
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const sidebar = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    await waitFor(() =>
+      expect(sidebar.querySelector(".right-sidebar-overview-card")).not.toBeNull()
+    );
+    await userEvent.click(canvas.getByRole("button", { name: "Expand right sidebar" }));
+    // Past the toggle's own slide, and the transcript's easing with it.
+    await waitFor(() => {
+      const sliding =
+        sidebar.querySelector(".right-sidebar-overview-card") != null ||
+        sidebar.getAnimations().length > 0 ||
+        getChatScrollport(canvasElement).getAnimations().length > 0;
+      if (sliding) throw new Error("The sidebar is still sliding open");
+    });
+    const openWidth = sidebar.getBoundingClientRect().width;
+    await expect(openWidth).toBeGreaterThan(200);
+    const handle = sidebar.querySelector<HTMLElement>("[data-sidebar-resize-handle]")!;
+    const start = handle.getBoundingClientRect();
+    const pointer = { pointerId: 7, isPrimary: true, bubbles: true, clientY: start.top + 100 };
+    const nextFrame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+    handle.dispatchEvent(new PointerEvent("pointerdown", { ...pointer, clientX: start.left }));
+    await nextFrame();
+
+    const dragTo = (clientX: number) => async () => {
+      document.dispatchEvent(new PointerEvent("pointermove", { ...pointer, clientX }));
+      await nextFrame();
+    };
+    const closing = await sampleToggleFrames(canvasElement, dragTo(start.left + openWidth + 50));
+    await expect(closing[closing.length - 1].sidebarWidth).toBe(0);
+    await expect(closing[closing.length - 1].panel).toBe(false);
+    const reservedPadding = closing[closing.length - 1].chatPadding;
+    await expect(reservedPadding).toBeGreaterThan(100);
+    for (const frame of closing) {
+      await expect([0, openWidth]).toContain(frame.sidebarWidth);
+      await expect([15, reservedPadding]).toContain(frame.chatPadding);
+    }
+
+    const opening = await sampleToggleFrames(canvasElement, dragTo(start.left));
+    document.dispatchEvent(new PointerEvent("pointerup", { ...pointer, clientX: start.left }));
+    await expect(opening[opening.length - 1].sidebarWidth).toBe(openWidth);
+    for (const frame of opening) await expect([0, openWidth]).toContain(frame.sidebarWidth);
+  },
+};

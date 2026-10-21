@@ -425,6 +425,23 @@ describe("WorkspaceShell loading placeholders", () => {
     expect(openTerminalMock).not.toHaveBeenCalled();
   });
 
+  // Immersive review covers the sidebar the toggle acts on.
+  it("drops the right sidebar toggle while immersive review is on", () => {
+    const view = render(<WorkspaceShell {...defaultProps} />);
+    const toggle = /^(Collapse|Expand) right sidebar$/;
+    expect(view.getByRole("button", { name: toggle })).toBeTruthy();
+
+    act(() => {
+      updatePersistedState(getReviewImmersiveKey(defaultProps.workspaceId), true);
+    });
+    expect(view.queryByRole("button", { name: toggle })).toBeNull();
+
+    act(() => {
+      updatePersistedState(getReviewImmersiveKey(defaultProps.workspaceId), false);
+    });
+    expect(view.getByRole("button", { name: toggle })).toBeTruthy();
+  });
+
   describe("full-screen sidebar (phones)", () => {
     it("shows the sidebar full-screen from the menu's Sidebar row", () => {
       rightSidebarDisplay = "none";
@@ -527,6 +544,21 @@ describe("WorkspaceShell loading placeholders", () => {
       expect(view.queryByTestId("right-sidebar")).toBeNull();
       expect(box?.style.width).toBe("0px");
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+    });
+
+    // The toggle lives in the shell, not the lazy sidebar, so it already works while the chunk
+    // loads.
+    it("expands the loading sidebar from the right sidebar toggle", () => {
+      gateSidebar();
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+      const view = render(<WorkspaceShell {...defaultProps} />);
+      const box = () => view.container.querySelector<HTMLElement>(".mobile-hide-right-sidebar");
+      expect(box()?.style.width).toBe("0px");
+
+      fireEvent.click(view.getByRole("button", { name: "Expand right sidebar" }));
+
+      expect(box()?.style.width).not.toBe("0px");
+      expect(view.getByRole("button", { name: "Collapse right sidebar" })).toBeTruthy();
     });
 
     it("shows a loading sidebar full-screen on phones, closable with Close and Escape", () => {
