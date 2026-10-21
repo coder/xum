@@ -160,6 +160,68 @@ describe("resolveSSHConfig", () => {
     });
   });
 
+  // OpenSSH globs an Include's whole pathname (glob(3), sorted), not only its file name.
+  test("reads every file an Include's directory wildcard matches, in sorted order", async () => {
+    await withTempHome(async (homeDir) => {
+      // Written out of order: the sorted first match sets HostName (the first value wins).
+      for (const [dir, hostName] of [
+        ["b", "10.0.0.2"],
+        ["a", "10.0.0.1"],
+      ]) {
+        await fs.mkdir(path.join(homeDir, ".ssh", "conf.d", dir), { recursive: true });
+        await fs.writeFile(
+          path.join(homeDir, ".ssh", "conf.d", dir, "hosts.conf"),
+          `Host box\n  HostName ${hostName}\nHost only-${dir}\n  User user-${dir}\n`,
+          "utf8"
+        );
+      }
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        "Include conf.d/*/hosts.conf\n",
+        "utf8"
+      );
+
+      expect((await resolveSSHConfig("box")).hostName).toBe("10.0.0.1");
+      expect((await resolveSSHConfig("only-a")).user).toBe("user-a");
+      expect((await resolveSSHConfig("only-b")).user).toBe("user-b");
+    });
+  });
+
+  test("expands wildcards in several segments of an absolute Include path", async () => {
+    await withTempHome(async (homeDir) => {
+      const dir = path.join(homeDir, "teams", "team-1", "nested");
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "box.conf"), "Host box\n  User teamuser\n", "utf8");
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        `Include ${path.join(homeDir, "te?ms", "team-*", "nested", "*.conf")}\n`,
+        "utf8"
+      );
+
+      expect((await resolveSSHConfig("box")).user).toBe("teamuser");
+    });
+  });
+
+  test("includes nothing for an Include pattern no path matches", async () => {
+    await withTempHome(async (homeDir) => {
+      await fs.mkdir(path.join(homeDir, ".ssh", "conf.d", "a"), { recursive: true });
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "conf.d", "a", "hosts.conf"),
+        "Host box\n  User wrong\n",
+        "utf8"
+      );
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        ["Include conf.d/*/other.conf missing/*/hosts.conf", "Host box", "  User right", ""].join(
+          "\n"
+        ),
+        "utf8"
+      );
+
+      expect((await resolveSSHConfig("box")).user).toBe("right");
+    });
+  });
+
   test("applies an Include inside a Host block only to the hosts that block matches", async () => {
     await withTempHome(async (homeDir) => {
       const included = path.join(homeDir, ".ssh", "gated.conf");

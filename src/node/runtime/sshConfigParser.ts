@@ -275,28 +275,45 @@ async function resolveIncludePaths(value: string, homeDir: string): Promise<stri
     const expanded = expandHomePath(arg, homeDir);
     // OpenSSH resolves relative user-config Include paths against ~/.ssh.
     const absolute = path.isAbsolute(expanded) ? expanded : path.join(homeDir, ".ssh", expanded);
-    const baseName = path.basename(absolute);
-    if (!/[*?]/.test(baseName)) {
-      files.push(absolute);
-      continue;
-    }
-    // Wildcards are supported in the file name only (OpenSSH globs the whole path).
-    try {
-      const entries = await fs.readdir(path.dirname(absolute));
-      files.push(
-        ...entries
-          .filter((entry) => glob([baseName], entry))
-          .sort()
-          .map((entry) => path.join(path.dirname(absolute), entry))
-      );
-    } catch (error) {
-      log.debug("Failed to expand SSH config Include", {
-        include: absolute,
-        error: getErrorMessage(error),
-      });
-    }
+    files.push(...(INCLUDE_WILDCARD.test(absolute) ? await globPath(absolute) : [absolute]));
   }
   return files;
+}
+
+const INCLUDE_WILDCARD = /[*?]/;
+
+/**
+ * The existing paths `pattern` matches, sorted, as OpenSSH's glob(3) of an Include: any
+ * segment may hold a wildcard, and no match includes nothing.
+ */
+async function globPath(pattern: string): Promise<string[]> {
+  // Normalized so a Windows path split on path.sep keeps its "/" separators apart too.
+  const normalized = path.normalize(pattern);
+  const { root } = path.parse(normalized);
+  let matches = [root];
+  for (const segment of normalized.slice(root.length).split(path.sep).filter(Boolean)) {
+    if (!INCLUDE_WILDCARD.test(segment)) {
+      matches = matches.map((dir) => path.join(dir, segment));
+      continue;
+    }
+    const next: string[][] = [];
+    for (const dir of matches) next.push(await matchingEntries(dir, segment));
+    matches = next.flat();
+  }
+  return matches.sort();
+}
+
+async function matchingEntries(dir: string, segment: string): Promise<string[]> {
+  try {
+    const entries = await fs.readdir(dir);
+    return entries.filter((entry) => glob([segment], entry)).map((entry) => path.join(dir, entry));
+  } catch (error) {
+    log.debug("Failed to expand SSH config Include", {
+      include: path.join(dir, segment),
+      error: getErrorMessage(error),
+    });
+    return [];
+  }
 }
 
 /**
