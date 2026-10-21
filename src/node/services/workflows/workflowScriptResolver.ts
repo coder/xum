@@ -191,6 +191,12 @@ async function resolveSkillWorkflowScript(
   if (resolvedSkill.commandSkill === true) {
     throw new Error(`Skill '${parsed.skillName}' is a Claude command and has no workflow scripts`);
   }
+  // A Skills install loads skills only (installMethods.ts): its skills run no workflow scripts.
+  if (resolvedSkill.skillsOnlyPlugin === true) {
+    throw new Error(
+      `Skill '${parsed.skillName}' comes from a skills-only plugin install and has no workflow scripts`
+    );
+  }
 
   if (resolvedSkill.package.scope === "project" && !input.projectTrusted) {
     throw new Error("Project trust is required to run project skill workflow scripts");
