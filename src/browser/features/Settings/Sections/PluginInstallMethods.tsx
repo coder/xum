@@ -279,7 +279,8 @@ function useSkillsCliRun(source: string) {
         return;
       }
       setRun(result.data);
-      if (result.data.status === "ran" && result.data.ok) {
+      // After every run, also a failed one: the CLI can copy some skills before it fails.
+      if (result.data.status === "ran") {
         // No backend cache: the skill lists re-read ~/.agents/skills, and mounted composers
         // refresh their cached skill descriptors.
         window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED));
