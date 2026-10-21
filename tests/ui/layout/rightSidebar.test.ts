@@ -168,7 +168,12 @@ describeIntegration("RightSidebar (UI)", () => {
   async function setupRightSidebarView(beforeRender?: () => void) {
     const cleanupDom = installDom();
     // Tutorial popovers take focus when their targets appear (the launcher's Terminal row, the
-    // immersive review button), so they made this file's focus checks flaky.
+    // immersive review button), so they made this file's focus checks flaky. Cleanup puts back the
+    // value from before, so later tests keep whatever default the suite set.
+    const tutorialsBefore = globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__;
+    const restoreTutorials = () => {
+      globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = tutorialsBefore;
+    };
     disableTutorial();
     // Most tests exercise open tools; individual tests can clear this to cover the default.
     updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
@@ -188,12 +193,12 @@ describeIntegration("RightSidebar (UI)", () => {
         sidebar,
         cleanup: async () => {
           await cleanupView(view, cleanupDom);
-          globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = undefined;
+          restoreTutorials();
         },
       };
     } catch (error) {
       await cleanupView(view, cleanupDom);
-      globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = undefined;
+      restoreTutorials();
       throw error;
     }
   }

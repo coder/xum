@@ -92,7 +92,10 @@ export async function createAppHarness(options?: {
     workspaceId = createResult.metadata.id;
     metadata = createResult.metadata;
 
-    // setupTestDom turns tutorials off: their bubble would take focus (#7120).
+    // setupTestDom turns the first-run tutorial off: its bubble takes focus ~300 ms after the
+    // workspace header mounts (#7109), so a test that focused a composer in that window lost focus
+    // to it (#7120). No app-harness test covers tutorials; one that does can set the flag in its
+    // beforeRender hook. Cleanup restores the flag.
     cleanupDom = setupTestDom();
     options?.beforeRender?.(workspaceId);
     view = renderApp({ apiClient: options?.wrapApiClient?.(env.orpc) ?? env.orpc, metadata });
