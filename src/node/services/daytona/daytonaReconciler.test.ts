@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { createDaytonaTestRig, type DaytonaTestRig } from "./daytona.testHarness";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import {
   DaytonaReconciler,
   listDaytonaWorkspaceRefs,
@@ -171,6 +171,41 @@ describe("DaytonaReconciler.sweep", () => {
 
     expect(activityChecks).toEqual([]);
     expect(rig.plane.countCalls("POST /sandbox/sb-attached-off/last-activity")).toBe(0);
+  });
+
+  it("stops keeping a sandbox alive once its job probe keeps failing, a success resetting the count", async () => {
+    rig.plane.addSandbox({ id: "sb-1", name: "xum-stuck", labels: instanceLabels });
+    rig.plane.addSandbox({ id: "sb-2", name: "xum-flaky", labels: instanceLabels });
+    // Per sweep: the stuck probe always fails; the flaky one succeeds once between failures.
+    const flaky = [
+      Err("ssh failed"),
+      Err("ssh failed"),
+      Ok(true),
+      Err("ssh failed"),
+      Err("ssh failed"),
+    ];
+    const probed: string[] = [];
+    const reconciler = makeReconciler(
+      [
+        { id: "ws-stuck", runtimeConfig: daytonaConfig("xum-stuck") },
+        { id: "ws-flaky", runtimeConfig: daytonaConfig("xum-flaky") },
+      ],
+      [],
+      undefined,
+      (ref) => {
+        probed.push(ref.workspaceId);
+        return Promise.resolve(
+          ref.workspaceId === "ws-stuck" ? Err("ssh failed") : (flaky.shift() ?? Ok(false))
+        );
+      }
+    );
+
+    for (let sweep = 0; sweep < 5; sweep++) await reconciler.sweep();
+
+    // Two failures still keep it alive (fail closed); the third gives up on the workspace.
+    expect(rig.plane.countCalls("POST /sandbox/sb-1/last-activity")).toBe(2);
+    expect(probed.filter((id) => id === "ws-stuck")).toHaveLength(3);
+    expect(rig.plane.countCalls("POST /sandbox/sb-2/last-activity")).toBe(5);
   });
 
   it("keeps a sandbox alive under jobs that survived a Xum crash, probing a clear one once", async () => {

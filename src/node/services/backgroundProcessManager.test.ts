@@ -4510,6 +4510,26 @@ describe("BackgroundProcessManager", () => {
       }
     });
 
+    it("with liveProcessesOnly, reports only running records with a live PID", async () => {
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      const probe = () =>
+        manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId, {
+          liveProcessesOnly: true,
+        });
+
+      // A leftover claimed dir (no meta.json, no exit marker) and a running record without a
+      // pid prove no job runs: clear with the option, unsettled without it.
+      await fs.mkdir(path.join(workspaceDir, "leftover"), { recursive: true });
+      await writeSpawnRecord("no-pid", JSON.stringify({ status: "running" }));
+      expect(await probe()).toEqual(Ok(false));
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(true)
+      );
+
+      await writeSpawnRecord("live", { pid: process.pid, status: "running" });
+      expect(await probe()).toEqual(Ok(true));
+    });
+
     it("treats running records under extra record dirs as live without host PID probes", async () => {
       // Devcontainer records (passed via extraRecordDirs) carry container-namespace PIDs: a
       // host ESRCH proves nothing about the container process, so a running record without

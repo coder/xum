@@ -481,10 +481,12 @@ export class ServiceContainer {
         this.aiService.isStreaming(workspaceId) ||
         (await this.backgroundProcessManager.hasLiveBackgroundProcesses(workspaceId)),
       // Detached jobs that outlived an unclean exit are in no in-memory list.
+      // Keepalive needs a job proven to run: a leftover record dir must not keep a sandbox up.
       hasUnsettledRemoteJobs: (ref) =>
         this.backgroundProcessManager.hasUnsettledRemoteSpawnRecords(
           createRuntime(ref.runtimeConfig, { workspaceId: ref.workspaceId }),
-          ref.workspaceId
+          ref.workspaceId,
+          { liveProcessesOnly: true }
         ),
     });
   }

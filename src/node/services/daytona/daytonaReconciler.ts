@@ -9,6 +9,8 @@ import { mapDaytonaSandboxState, type DaytonaService } from "./daytonaService";
 export const DAYTONA_RECONCILE_INTERVAL_MS = 60_000;
 /** Each control-plane call gets this long; a hung call is logged and the sweep moves on. */
 export const DAYTONA_RECONCILE_CALL_TIMEOUT_MS = 20_000;
+/** Consecutive failed job probes of one workspace after which keepalive stops waiting on it. */
+export const DAYTONA_JOB_PROBE_FAILURE_LIMIT = 3;
 
 export interface DaytonaWorkspaceRef {
   workspaceId: string;
@@ -102,6 +104,8 @@ export class DaytonaReconciler {
    * counts as activity, so a clear workspace is never probed again.
    */
   private readonly remoteJobsClear = new Set<string>();
+  /** Consecutive failed job probes per workspace; a success resets it. */
+  private readonly probeFailures = new Map<string, number>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private sweeping: Promise<void> | undefined;
 
@@ -198,7 +202,11 @@ export class DaytonaReconciler {
     }
   }
 
-  /** Fails closed (keeps the sandbox alive) when the probe fails or times out. */
+  /**
+   * Fails closed (keeps the sandbox alive) when the probe fails or times out, but only for
+   * DAYTONA_JOB_PROBE_FAILURE_LIMIT sweeps in a row: a probe that never succeeds would keep the
+   * sandbox running forever, so the workspace then counts as clear.
+   */
   private async hasUnsettledRemoteJobs(ref: DaytonaSandboxRef): Promise<boolean> {
     const probe = this.options.hasUnsettledRemoteJobs;
     if (!probe || this.remoteJobsClear.has(ref.workspaceId)) return false;
@@ -213,10 +221,27 @@ export class DaytonaReconciler {
         workspaceId: ref.workspaceId,
         error: result.error,
       });
-      return true;
+      return !this.giveUpAfterProbeFailure(ref.workspaceId);
     }
+    this.probeFailures.delete(ref.workspaceId);
     if (!result.data) this.remoteJobsClear.add(ref.workspaceId);
     return result.data;
+  }
+
+  /** Whether this failure reached the limit: the workspace then counts as clear. */
+  private giveUpAfterProbeFailure(workspaceId: string): boolean {
+    const failures = (this.probeFailures.get(workspaceId) ?? 0) + 1;
+    if (failures < DAYTONA_JOB_PROBE_FAILURE_LIMIT) {
+      this.probeFailures.set(workspaceId, failures);
+      return false;
+    }
+    this.probeFailures.delete(workspaceId);
+    this.remoteJobsClear.add(workspaceId);
+    log.warn("Daytona reconcile: job probe keeps failing; no longer keeping the sandbox alive", {
+      workspaceId,
+      failures,
+    });
+    return true;
   }
 
   /** `storedId` is what the workspace config holds (tokens use it), `realId` the sandbox id. */
