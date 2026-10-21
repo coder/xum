@@ -155,6 +155,8 @@ export class AgentResourceLimitsService {
         const result = await applyAgentCgroupLimits(applied, this.host, {
           trySudo,
           projects: appliedProjects,
+          // Commands started while the apply changes the layout join the new targets.
+          publishEnrollment: setAgentCgroupEnrollmentTargets,
         });
         this.status = result.status;
         this.projectCgroups = result.projectCgroups;

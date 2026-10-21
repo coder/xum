@@ -79,6 +79,8 @@ export interface AgentCgroupResult {
 
 const NO_PROJECT_CGROUPS: ReadonlyMap<string, string> = new Map();
 
+type PublishEnrollment = (targets: AgentCgroupEnrollmentTargets) => void;
+
 export const linuxAgentCgroupHost: AgentCgroupHost = {
   platform: process.platform,
   cgroupRoot: "/sys/fs/cgroup",
@@ -178,13 +180,23 @@ export function parseSelfCgroup(contents: string): string | null {
  *
  * `projects` are the limits of single projects. Each gets its own child of `xum-agents`, so the
  * kernel holds a project to its own limit and to the shared one, whichever is lower.
+ *
+ * `publishEnrollment` gets the targets for new agent commands before a change of the layout makes
+ * the earlier targets refuse them: before a child of `xum-agents` is removed, and before
+ * `xum-agents` enables controllers for its children. A command that cannot join its target runs
+ * in xum's own cgroup, without even the shared limit.
  */
 export async function applyAgentCgroupLimits(
   limits: AgentResourceLimits,
   host: AgentCgroupHost,
-  options: { trySudo?: boolean; projects?: ProjectAgentResourceLimits } = {}
+  options: {
+    trySudo?: boolean;
+    projects?: ProjectAgentResourceLimits;
+    publishEnrollment?: PublishEnrollment;
+  } = {}
 ): Promise<AgentCgroupResult> {
   const projects = options.projects ?? new Map<string, AgentResourceLimits>();
+  const publish: PublishEnrollment = options.publishEnrollment ?? (() => undefined);
   const needed = neededControllers([limits, ...projects.values()]);
   if (needed.length === 0) {
     failedSudoDelegations.delete(host);
@@ -211,7 +223,7 @@ export async function applyAgentCgroupLimits(
   }
   const baseDir = path.join(host.cgroupRoot, plan.base);
   try {
-    return await setUpAgentsCgroup(plan.base, baseDir, limits, needed, projects, host);
+    return await setUpAgentsCgroup(plan.base, baseDir, limits, needed, projects, host, publish);
   } catch (error) {
     return unavailable(
       `Could not set up cgroup ${plan.base}/${AGENTS_CGROUP}: ${getErrorMessage(error)}`
@@ -373,7 +385,8 @@ async function setUpAgentsCgroup(
   limits: AgentResourceLimits,
   needed: Controller[],
   projects: ProjectAgentResourceLimits,
-  host: AgentCgroupHost
+  host: AgentCgroupHost,
+  publish: PublishEnrollment
 ): Promise<AgentCgroupResult> {
   await enableControllers(baseDir, needed, host, APP_CGROUP);
   const agentsDir = path.join(baseDir, AGENTS_CGROUP);
@@ -386,15 +399,15 @@ async function setUpAgentsCgroup(
     await unnestAgentsCgroup(agentsDir, host);
     const procsFile = path.join(agentsDir, "cgroup.procs");
     const problem = await checkEnrollment(procsFile, agentsCgroup, host);
-    return (
-      problem ?? {
-        status,
-        enrollment: { fallback: procsFile, byProject: new Map() },
-        projectCgroups: NO_PROJECT_CGROUPS,
-      }
-    );
+    if (problem !== null) {
+      return problem;
+    }
+    const enrollment = { fallback: procsFile, byProject: new Map<string, string>() };
+    publish(enrollment);
+    await removeEmptyChildren(agentsDir, new Set(), host);
+    return { status, enrollment, projectCgroups: NO_PROJECT_CGROUPS };
   }
-  return setUpProjectCgroups(agentsDir, agentsCgroup, projects, status, host);
+  return setUpProjectCgroups(agentsDir, agentsCgroup, projects, status, host, publish);
 }
 
 /**
@@ -406,9 +419,16 @@ async function setUpProjectCgroups(
   agentsCgroup: string,
   projects: ProjectAgentResourceLimits,
   status: AgentResourceLimitsStatus,
-  host: AgentCgroupHost
+  host: AgentCgroupHost,
+  publish: PublishEnrollment
 ): Promise<AgentCgroupResult> {
   await fs.mkdir(path.join(agentsDir, DEFAULT_CGROUP), { recursive: true });
+  const defaultProcs = path.join(agentsDir, DEFAULT_CGROUP, "cgroup.procs");
+  if (!(await isNested(agentsDir))) {
+    // New commands join xum-agents until now, which refuses them once it enables controllers.
+    // Without project limits until now, no project target is lost.
+    publish({ fallback: defaultProcs, byProject: new Map() });
+  }
   await enableControllers(
     agentsDir,
     neededControllers([...projects.values()]),
@@ -418,7 +438,6 @@ async function setUpProjectCgroups(
   // A controller that only the shared limit needs stays off for the children, and a controller
   // turned on for an earlier project limit stays on; writeLimits writes max for it.
   await writeLimits(agentsDir, DEFAULT_CGROUP, {}, host);
-  const defaultProcs = path.join(agentsDir, DEFAULT_CGROUP, "cgroup.procs");
   const defaultProblem = await checkEnrollment(
     defaultProcs,
     path.posix.join(agentsCgroup, DEFAULT_CGROUP),
@@ -444,8 +463,16 @@ async function setUpProjectCgroups(
     byProject.set(projectPath, procsFile);
     projectCgroups.set(projectPath, cgroup);
   }
+  const enrollment = { fallback: defaultProcs, byProject };
+  publish(enrollment);
   await removeEmptyChildren(agentsDir, keep, host);
-  return { status, enrollment: { fallback: defaultProcs, byProject }, projectCgroups };
+  return { status, enrollment, projectCgroups };
+}
+
+/** Whether `xum-agents` enables a controller for its children, so its commands run in them. */
+async function isNested(agentsDir: string): Promise<boolean> {
+  const enabled = await readSubtreeControl(agentsDir);
+  return enabled.includes("cpu") || enabled.includes("memory");
 }
 
 /** Why a test command did not join `cgroup` through `procsFile`, or null when it did. */
@@ -461,10 +488,10 @@ async function checkEnrollment(
 }
 
 /**
- * Go back to the layout without project limits: write max to the children of `xum-agents`, turn
- * their controllers off, so that the kernel accepts agent commands in `xum-agents` again, and
- * remove the children once they are empty. Commands that still run in a child keep running there
- * without a project limit.
+ * Go back to the layout without project limits: write max to the children of `xum-agents` and turn
+ * their controllers off, so that the kernel accepts agent commands in `xum-agents` again. Commands
+ * that still run in a child keep running there without a project limit. The caller removes the
+ * children once no enrollment target names them.
  */
 async function unnestAgentsCgroup(agentsDir: string, host: AgentCgroupHost): Promise<void> {
   const children = await listAgentChildren(agentsDir);
@@ -480,7 +507,6 @@ async function unnestAgentsCgroup(agentsDir: string, host: AgentCgroupHost): Pro
       enabled.map((controller) => `-${controller}`).join(" ")
     );
   }
-  await removeEmptyChildren(agentsDir, new Set(), host);
 }
 
 /**
@@ -547,6 +573,8 @@ async function clearAgentCgroupLimits(host: AgentCgroupHost): Promise<void> {
   }
   await writeLimits(baseDir, AGENTS_CGROUP, {}, host);
   await unnestAgentsCgroup(path.join(baseDir, AGENTS_CGROUP), host);
+  // No limit applies, so a command that fails to join a removed child loses no limit.
+  await removeEmptyChildren(path.join(baseDir, AGENTS_CGROUP), new Set(), host);
 }
 
 /** xum's own cgroup, and the base cgroup: the same, or its parent once xum moved into `xum-app`. */
@@ -579,11 +607,12 @@ async function findBaseCgroup(
     };
   }
   const name = path.posix.basename(own);
-  if (name === AGENTS_CGROUP) {
+  // With project limits, the outer xum's agent commands run in a child of xum-agents.
+  if (own.split("/").includes(AGENTS_CGROUP)) {
     // Setting up here would move the outer xum's agent processes and break their enrollment.
     return {
       state: "unavailable",
-      reason: `xum runs in cgroup ${own}, the agent cgroup of another xum, whose limits already apply.`,
+      reason: `xum runs in cgroup ${own}, in the agent cgroup of another xum, whose limits already apply.`,
     };
   }
   return { own, base: name === APP_CGROUP ? path.posix.dirname(own) : own };

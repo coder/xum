@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { existsSync, readFileSync } from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
 import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
@@ -431,7 +432,13 @@ describe("applyAgentCgroupLimits", () => {
         "another xum's agent cgroup",
         undefined,
         "/outer/xum-agents",
-        "xum runs in cgroup /outer/xum-agents, the agent cgroup of another xum, whose limits already apply.",
+        "xum runs in cgroup /outer/xum-agents, in the agent cgroup of another xum, whose limits already apply.",
+      ],
+      [
+        "a child of another xum's agent cgroup",
+        undefined,
+        "/outer/xum-agents/default",
+        "xum runs in cgroup /outer/xum-agents/default, in the agent cgroup of another xum, whose limits already apply.",
       ],
     ])("%s", async (_name, platform, own, reason) => {
       tree = await createFakeCgroupTree({
@@ -668,6 +675,53 @@ describe("applyAgentCgroupLimits with project limits", () => {
 
     expect(await exists(tree, `xum/xum-agents/${projectCgroupName(other)}`)).toBe(false);
     expect(await exists(tree, `xum/xum-agents/${PHAROS_CGROUP}`)).toBe(true);
+  });
+
+  it("sends new commands to the new targets before it removes the child they joined", async () => {
+    tree = await createTree();
+    const other = "/home/user/src/other";
+    const otherDir = path.join(tree.root, "xum", "xum-agents", projectCgroupName(other));
+    await applyAgentCgroupLimits({ cpuCores: 28 }, tree.host, {
+      projects: new Map<string, AgentResourceLimits>([[other, { cpuCores: 1 }]]),
+    });
+    const published: Array<{ fallback: string; otherChildExists: boolean }> = [];
+
+    await applyAgentCgroupLimits({ cpuCores: 28 }, tree.host, {
+      projects: new Map(),
+      publishEnrollment: (targets) =>
+        published.push({ fallback: targets.fallback, otherChildExists: existsSync(otherDir) }),
+    });
+
+    // A command started before the removal joins xum-agents, not the removed child.
+    expect(published).toEqual([
+      {
+        fallback: path.join(tree.root, "xum", "xum-agents", "cgroup.procs"),
+        otherChildExists: true,
+      },
+    ]);
+    expect(existsSync(otherDir)).toBe(false);
+  });
+
+  it("sends new commands to default before xum-agents refuses them", async () => {
+    tree = await createTree();
+    const agentsDir = path.join(tree.root, "xum", "xum-agents");
+    const published: Array<{ fallback: string; subtreeControl: string }> = [];
+
+    await applyAgentCgroupLimits({ cpuCores: 28 }, tree.host, {
+      projects: pharosLimits,
+      publishEnrollment: (targets) =>
+        published.push({
+          fallback: targets.fallback,
+          subtreeControl: readFileSync(path.join(agentsDir, "cgroup.subtree_control"), "utf-8"),
+        }),
+    });
+
+    const defaultProcs = path.join(agentsDir, "default", "cgroup.procs");
+    expect(published).toEqual([
+      // Published while xum-agents still accepts commands, before it enables controllers.
+      { fallback: defaultProcs, subtreeControl: "\n" },
+      { fallback: defaultProcs, subtreeControl: "cpu memory\n" },
+    ]);
   });
 
   it("checks the controllers that only a project limit needs", async () => {

@@ -422,7 +422,7 @@ function changedLimits(
 }
 
 /** The projects to pick from, and the picked one; null for the limit of all projects. */
-function useScopedProject(view: LimitsView | null) {
+function useScopedProject(view: LimitsView | null, setScope: (scope: LimitsScope) => void) {
   const { userProjects } = useProjectContext();
   const projects = Array.from(userProjects, ([path, config]) => ({
     path,
@@ -434,6 +434,11 @@ function useScopedProject(view: LimitsView | null) {
       ? (projects.find((candidate) => candidate.path === view.scope) ?? null)
       : null;
   const scope: LimitsScope = project?.path ?? ALL_PROJECTS;
+  // A removed project leaves its drafts behind, and the next blur would save them as the limit of
+  // all projects. Adjust the state during render, so no blur and no frame sees the stale drafts.
+  if (view !== null && view.scope !== scope) {
+    setScope(scope);
+  }
   return { projects, project, scope };
 }
 
@@ -484,7 +489,7 @@ export function AgentResourceLimitsSettings() {
     setEnabled,
     disabled,
   } = useAgentResourceLimits();
-  const { projects, project, scope } = useScopedProject(view);
+  const { projects, project, scope } = useScopedProject(view, setScope);
 
   const handleBlur = () => {
     const change = view && changedLimits(view, scope);

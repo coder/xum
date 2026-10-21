@@ -208,6 +208,30 @@ describe("AgentResourceLimitsSettings for one project", () => {
     expect(view.set.mock.calls).toEqual([]);
   });
 
+  test("shows the shared limits again when the picked project is removed, and saves none of its values", async () => {
+    userProjects = new Map([[PHAROS, { workspaces: [] }]]);
+    const initial: AgentResourceLimitsState = {
+      enabled: true,
+      limits: { cpuCores: 28 },
+      projects: { [PHAROS]: { limits: { cpuCores: 14 }, cgroup: "/xum/xum-agents/p-1" } },
+      status: ACTIVE,
+      support: READY,
+    };
+    const view = renderSettings(initial);
+    await waitFor(() => expect(view.cpu().value).toBe("28"));
+    pickProject(view, PHAROS);
+    await waitFor(() => expect(view.cpu().value).toBe("14"));
+
+    // The project goes away while Settings is open; a config change renders the section again.
+    userProjects = new Map();
+    act(() => view.saveElsewhere(initial));
+
+    await waitFor(() => expect(view.cpu().value).toBe("28"));
+    fireEvent.blur(view.cpu());
+    expect(view.set.mock.calls).toEqual([]);
+    expect(view.setProject.mock.calls).toEqual([]);
+  });
+
   test("tells that a project limit above the shared limit does not raise it", async () => {
     userProjects = new Map([[PHAROS, { workspaces: [] }]]);
     const view = renderSettings({
