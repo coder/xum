@@ -322,6 +322,23 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     }
   });
 
+  it("deletes its sandbox in the account that created it when Settings switch accounts during setup", async () => {
+    const newAccount = rig.addAccount("new-key");
+    // The user saves another account's key while the create request is answered.
+    rig.plane.beforeAnswer.set("POST /sandbox", () => rig.service.setConfig({ apiKey: "new-key" }));
+
+    const failure = await makeRuntime({ sandboxId: "xum-moved", shared: false, ...SMALL })
+      .postCreateSetup(initParams())
+      .then(
+        () => undefined,
+        (error: unknown) => error
+      );
+
+    expect(String(failure)).toContain("Daytona settings changed");
+    expect(rig.plane.find("xum-moved")).toBeUndefined();
+    expect(newAccount.calls).toEqual([]);
+  });
+
   it("never deletes a sandbox that took its name before the create request", async () => {
     // Another Xum install created this name between validateBeforePersist and the create.
     const other = rig.plane.addSandbox({

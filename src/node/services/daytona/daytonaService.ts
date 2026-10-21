@@ -105,6 +105,15 @@ function sandboxStateError(sandboxId: string, sandbox: DaytonaSandbox): DaytonaA
   );
 }
 
+/**
+ * The client of the settings at one moment, stamped with their generation: work that must stay
+ * in one Daytona account (a create and its cleanup) holds it across a settings change.
+ */
+export interface DaytonaAccount {
+  client: DaytonaClient;
+  generation: number;
+}
+
 interface MintStamp {
   generation: number;
   release: number;
@@ -423,6 +432,22 @@ export class DaytonaService {
     };
   }
 
+  /** Stamped before the lookup, so a change during it reads as a change. */
+  async getAccount(): Promise<DaytonaAccount> {
+    const generation = this.credentialsGeneration;
+    const { client } = await this.getClient();
+    return { client, generation };
+  }
+
+  /** Whether the settings changed since `account` was taken. */
+  isAccountCurrent(account: DaytonaAccount): boolean {
+    return account.generation === this.credentialsGeneration;
+  }
+
+  private async clientOf(account: DaytonaAccount | undefined): Promise<DaytonaClient> {
+    return account?.client ?? (await this.getClient()).client;
+  }
+
   async getGatewayConfig(): Promise<DaytonaGatewayConfig> {
     const generation = this.credentialsGeneration;
     const { client, credentials } = await this.getClient();
@@ -518,9 +543,10 @@ export class DaytonaService {
   }
 
   async getSandboxState(
-    sandboxId: string
+    sandboxId: string,
+    account?: DaytonaAccount
   ): Promise<{ state: DaytonaSandboxState; sandbox?: DaytonaSandbox }> {
-    const { client } = await this.getClient();
+    const client = await this.clientOf(account);
     try {
       const sandbox = await client.getSandbox(sandboxId);
       return { state: mapDaytonaSandboxState(sandbox.state), sandbox };
@@ -581,9 +607,11 @@ export class DaytonaService {
     return (await this.credentialsStore.resolve())?.target;
   }
 
-  async createSandbox(request: DaytonaCreateSandboxRequest): Promise<DaytonaSandbox> {
-    const { client } = await this.getClient();
-    return client.createSandbox(request);
+  async createSandbox(
+    request: DaytonaCreateSandboxRequest,
+    account?: DaytonaAccount
+  ): Promise<DaytonaSandbox> {
+    return (await this.clientOf(account)).createSandbox(request);
   }
 
   async resizeSandbox(sandboxId: string, request: DaytonaResizeRequest): Promise<void> {
@@ -640,10 +668,11 @@ export class DaytonaService {
 
   /**
    * Delete the sandbox and drop Xum's SSH access to it (token and include block). A sandbox
-   * that is already gone counts as deleted.
+   * that is already gone counts as deleted. `account` deletes it in the account it was
+   * created in, even after the settings changed to another one.
    */
-  async deleteSandbox(sandboxId: string): Promise<void> {
-    const { client } = await this.getClient();
+  async deleteSandbox(sandboxId: string, account?: DaytonaAccount): Promise<void> {
+    const client = await this.clientOf(account);
     // Revoke first: Daytona refuses to revoke a token of a sandbox that no longer exists.
     await this.releaseSshAccess(sandboxId);
     try {

@@ -46,6 +46,8 @@ export class FakeDaytonaControlPlane {
   readonly failingRoutes = new Set<string>();
   /** POST /sandbox creates the sandbox, then answers 500 (the create's outcome looks unknown). */
   failAfterCreate = false;
+  /** Runs once a route (`METHOD /path`) is handled, before its answer reaches the client. */
+  readonly beforeAnswer = new Map<string, () => Promise<unknown>>();
   private nextId = 1;
   private nextToken = 1;
 
@@ -60,7 +62,9 @@ export class FakeDaytonaControlPlane {
         init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
       });
     }
-    return Promise.resolve(this.handle(route, url, init));
+    const response = this.handle(route, url, init);
+    const hook = this.beforeAnswer.get(route);
+    return hook ? hook().then(() => response) : Promise.resolve(response);
   }) as typeof fetch;
 
   addSandbox(partial: Partial<FakeSandbox> & { id: string }): FakeSandbox {
@@ -258,7 +262,10 @@ export class FakeDaytonaSshConfigWriter implements Pick<
 
 export interface DaytonaTestRig {
   rootDir: string;
+  /** The account of the default API key. */
   plane: FakeDaytonaControlPlane;
+  /** Another account: requests with this API key reach its own control plane. */
+  addAccount: (apiKey: string) => FakeDaytonaControlPlane;
   writer: FakeDaytonaSshConfigWriter;
   service: DaytonaService;
   clock: { now: number };
@@ -277,6 +284,11 @@ export async function createDaytonaTestRig(
   const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-daytona-test-"));
   const clock = { now: Date.parse("2026-01-01T00:00:00Z") };
   const plane = new FakeDaytonaControlPlane(() => clock.now);
+  const accounts = new Map<string, FakeDaytonaControlPlane>();
+  const planeFor = (init: RequestInit | undefined) => {
+    const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+    return accounts.get(auth?.replace(/^Bearer /, "") ?? "") ?? plane;
+  };
   const writer = new FakeDaytonaSshConfigWriter();
   const workspaces: DaytonaWorkspaceRef[] = [];
   const env: NodeJS.ProcessEnv =
@@ -285,7 +297,8 @@ export async function createDaytonaTestRig(
     credentialsStore: new DaytonaCredentialsStore(rootDir, env),
     rootDir,
     sshConfigWriter: writer,
-    fetch: plane.fetch,
+    fetch: ((input: string | URL | Request, init?: RequestInit) =>
+      planeFor(init).fetch(input, init)) as typeof fetch,
     now: () => clock.now,
     sleep: (ms) => {
       clock.now += ms;
@@ -296,6 +309,11 @@ export async function createDaytonaTestRig(
   return {
     rootDir,
     plane,
+    addAccount: (apiKey) => {
+      const account = new FakeDaytonaControlPlane(() => clock.now);
+      accounts.set(apiKey, account);
+      return account;
+    },
     writer,
     service,
     clock,

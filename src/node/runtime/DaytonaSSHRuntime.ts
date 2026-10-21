@@ -49,6 +49,7 @@ import {
   DAYTONA_LABEL_INSTANCE,
   DAYTONA_LABEL_WORKSPACE_ID,
   DAYTONA_START_TIMEOUT_MS,
+  type DaytonaAccount,
   type DaytonaService,
 } from "@/node/services/daytona/daytonaService";
 import { log } from "@/node/services/log";
@@ -66,6 +67,8 @@ export type DaytonaRuntimeService = Pick<
   DaytonaService,
   | "checkAvailability"
   | "getSandboxState"
+  | "getAccount"
+  | "isAccountCurrent"
   | "buildLabels"
   | "getDefaultTarget"
   | "createSandbox"
@@ -107,6 +110,8 @@ const DAYTONA_AUTO_ARCHIVE_MINUTES = 1440;
 const DAYTONA_AUTO_DELETE_DISABLED = -1;
 
 const SANDBOX_NAME_MAX_BRANCH_LENGTH = 40;
+const SETTINGS_CHANGED_DURING_SETUP =
+  "Daytona settings changed while the sandbox was set up; create the workspace again";
 
 /** `xum-<branch>-<random>`: unique per creation, and readable in the Daytona dashboard. */
 export function buildDaytonaSandboxName(branchName: string): string {
@@ -152,6 +157,8 @@ interface CreateAttempt {
   outcome: CreateOutcome;
   /** The labels the last create request carried. */
   labels?: Record<string, string>;
+  /** The account the create requests went to: cleanup deletes there, whatever Settings say. */
+  account?: DaytonaAccount;
 }
 
 /** Resolve with `promise`, or reject as soon as `signal` aborts (the shared work keeps going). */
@@ -700,13 +707,19 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     try {
       if (creates) {
         params.initLogger.logStep(`Creating Daytona sandbox "${sandboxId}"...`);
+        create.account = await this.daytonaService.getAccount();
         await this.createSandbox(sandboxId, params, create);
+        this.throwIfSettingsChanged(create);
         params.initLogger.logStep("Daytona sandbox created");
       }
       await this.connectAndSeed(sandboxId, creates, params);
       await this.prepareWorkspaceDirectory(params);
+      this.throwIfSettingsChanged(create);
     } catch (error) {
-      const errorMsg = redactDaytonaTokens(getErrorMessage(error));
+      // After a switch of account the step's own error (often "not found") would mislead.
+      const errorMsg = this.settingsChanged(create)
+        ? SETTINGS_CHANGED_DURING_SETUP
+        : redactDaytonaTokens(getErrorMessage(error));
       log.error("Daytona sandbox setup failed", { sandboxId, error: errorMsg });
       params.initLogger.logStderr(`Daytona sandbox setup failed: ${errorMsg}`);
       if (creates) {
@@ -719,6 +732,18 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       }
       throw new Error(`Daytona sandbox setup failed: ${errorMsg}`);
     }
+  }
+
+  /**
+   * Readiness, ssh and the checkout use the current settings, so a setup that spans a change
+   * would go on in another account (or deployment) than its sandbox's: it fails instead.
+   */
+  private settingsChanged(create: CreateAttempt): boolean {
+    return create.account !== undefined && !this.daytonaService.isAccountCurrent(create.account);
+  }
+
+  private throwIfSettingsChanged(create: CreateAttempt): void {
+    if (this.settingsChanged(create)) throw new Error(SETTINGS_CHANGED_DURING_SETUP);
   }
 
   /** Wait until the sandbox runs, write ssh access, and seed the home of a box Xum created. */
@@ -766,12 +791,12 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     initLogger: WorkspaceInitParams["initLogger"]
   ): Promise<void> {
     try {
-      if (create.outcome === "unknown" && !(await this.carriesLabels(sandboxId, create.labels))) {
+      if (create.outcome === "unknown" && !(await this.carriesLabels(sandboxId, create))) {
         log.warn("Not deleting a Daytona sandbox this setup may not have created", { sandboxId });
         return;
       }
       initLogger.logStep(`Deleting the sandbox "${sandboxId}" this setup created...`);
-      await this.daytonaService.deleteSandbox(sandboxId);
+      await this.daytonaService.deleteSandbox(sandboxId, create.account);
     } catch (error) {
       // The reconciler stops labeled, unreferenced sandboxes, so a leak here is bounded.
       const message = getErrorMessage(error);
@@ -784,11 +809,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   }
 
   /** After a create of unknown outcome: the sandbox has this install's and workspace's labels. */
-  private async carriesLabels(
-    sandboxId: string,
-    labels: Record<string, string> | undefined
-  ): Promise<boolean> {
-    const { sandbox } = await this.daytonaService.getSandboxState(sandboxId);
+  private async carriesLabels(sandboxId: string, create: CreateAttempt): Promise<boolean> {
+    const { labels } = create;
+    const { sandbox } = await this.daytonaService.getSandboxState(sandboxId, create.account);
     if (!sandbox || !labels) return false;
     return [DAYTONA_LABEL_INSTANCE, DAYTONA_LABEL_WORKSPACE_ID].every(
       (key) => labels[key] !== undefined && sandbox.labels?.[key] === labels[key]
@@ -802,7 +825,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   ): Promise<void> {
     create.outcome = "unknown";
     create.labels = request.labels;
-    await this.daytonaService.createSandbox(request);
+    await this.daytonaService.createSandbox(request, create.account);
     create.outcome = "created";
   }
 
