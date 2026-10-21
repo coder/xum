@@ -28,7 +28,10 @@ export const AGENT_PLUGIN_SCHEMA_ID_1_0_0 =
 import * as path from "node:path";
 
 // Name grammar shared with the install registry schema (see the module's doc comment).
-import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
+import {
+  isValidAgentPluginName,
+  isValidMarketplaceEntryName,
+} from "@/common/utils/agentPluginName";
 
 export { isValidAgentPluginName };
 
@@ -337,7 +340,9 @@ export function readGeneratedFrom(
   if (!isPlainObject(value)) return undefined;
   if (value.kind === "skills") return { kind: "skills" };
   if (value.kind !== "claude-marketplace") return undefined;
-  if (typeof value.entry !== "string" || !isValidAgentPluginName(value.entry)) return undefined;
+  if (typeof value.entry !== "string" || !isValidMarketplaceEntryName(value.entry)) {
+    return undefined;
+  }
   if (value.commands !== undefined && !isMarkerCommandList(value.commands)) return undefined;
   if (value.agentFiles !== undefined && !isMarkerAgentFileList(value.agentFiles)) return undefined;
   return {

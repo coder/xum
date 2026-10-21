@@ -70,6 +70,7 @@ import {
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
@@ -245,6 +246,9 @@ import {
  * reserved name so the write can never clobber plugin-owned content.
  */
 const PROMOTION_MARKER_FILE = ".mux-promotion-marker";
+
+/** Marketplace entries whose skills a listing scans at once (each scan reads SKILL.md files). */
+const MARKETPLACE_SCAN_CONCURRENCY = 8;
 
 /** Staging dirs left behind by crashes are reclaimed after this age. */
 const STALE_STAGING_MAX_AGE_MS = 60 * 60 * 1000;
@@ -3504,10 +3508,19 @@ export class AgentPluginInstallService {
     }
     const listing = marketplaceListing({ content, source, lockedSha: staged.sha, methods });
     const marketplace = parseClaudeMarketplace(content);
+    // A catalog can list hundreds of entries that share one folder: scan at most
+    // MARKETPLACE_SCAN_CONCURRENCY at once, and each distinct folder + skills list once.
+    const semaphore = new AsyncSemaphore(MARKETPLACE_SCAN_CONCURRENCY);
+    const scans = new Map<string, Promise<Set<string>>>();
     const entries = await Promise.all(
-      listing.entries.map((row) =>
-        this.withAcceptedSkillCount(staged.dir, marketplace, source, row)
-      )
+      listing.entries.map(async (row) => {
+        const slot = await semaphore.acquire();
+        try {
+          return await this.withAcceptedSkillCount(staged.dir, marketplace, source, row, scans);
+        } finally {
+          slot.release();
+        }
+      })
     );
     return { ...listing, entries };
   }
@@ -3520,7 +3533,9 @@ export class AgentPluginInstallService {
     stagedDir: string,
     marketplace: ClaudeMarketplace,
     source: AgentPluginGitSource,
-    row: AgentPluginMarketplaceEntry
+    row: AgentPluginMarketplaceEntry,
+    /** Scans of this listing by folder, skills list and plugin name. */
+    scans: Map<string, Promise<Set<string>>>
   ): Promise<AgentPluginMarketplaceEntry> {
     if (row.skillCount === undefined || !row.installable || row.sourceKind !== "relative") {
       return row;
@@ -3536,16 +3551,31 @@ export class AgentPluginInstallService {
       // A missing or escaping folder fails its own preview with the reason.
       return row;
     }
-    const { manifest } = marketplaceManifest({
-      entry,
-      relative: true,
-      rootSource: resolved.subpath === undefined,
-    });
-    const accepted = await this.acceptedSkillNames(entryDir, {
-      declared: declaredSkills(manifest),
-      pluginName: entry.name,
-    });
-    return { ...row, skillCount: accepted.size };
+    let manifest: Record<string, unknown>;
+    try {
+      ({ manifest } = marketplaceManifest({
+        entry,
+        relative: true,
+        rootSource: resolved.subpath === undefined,
+      }));
+    } catch {
+      // No plugin name fits the entry name: its own preview fails with the reason.
+      return row;
+    }
+    const declared = declaredSkills(manifest);
+    const pluginName = typeof manifest.name === "string" ? manifest.name : entry.name;
+    // The plugin name names only a skill at the plugin root itself (a declared "."), so
+    // entries that share a folder and skills list share one scan otherwise.
+    const namesRootSkill =
+      declared === undefined ||
+      [declared].flat().some((root) => path.posix.normalize(`${root}/`) === "./");
+    const key = JSON.stringify([entryDir, declared, namesRootSkill ? pluginName : null]);
+    let scan = scans.get(key);
+    if (scan === undefined) {
+      scan = this.acceptedSkillNames(entryDir, { declared, pluginName });
+      scans.set(key, scan);
+    }
+    return { ...row, skillCount: (await scan).size };
   }
 
   /**

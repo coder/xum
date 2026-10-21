@@ -428,6 +428,14 @@ export function entryInstallMethods(
   if (ctx.relative) {
     return { methods: [{ kind: "claude-marketplace", entry: name }], warnings: [] };
   }
+  // In Claude Code the entry is this plugin's manifest. Xum does not generate one for another
+  // repository (an update must find the entry again), so an entry that names components would
+  // install a different component set as Skills: refuse it instead.
+  if (entryDeclaresComponents(ctx.entry)) {
+    throw new Error(
+      `The marketplace entry '${name}' lists its own components, and the repository it points to has no plugin manifest. Xum does not install such an entry; install the repository as Skills instead.`
+    );
+  }
   const skills = detected.find((method) => method.kind === "skills");
   return { methods: skills !== undefined ? [skills] : [], warnings: [] };
 }
@@ -560,6 +568,9 @@ export function marketplaceManifest(ctx: MarketplaceEntryContext): {
   warnings: string[];
 } {
   const { raw, warnings } = entryAsManifest(ctx.entry);
+  // An entry name can hold what a plugin name cannot (`_`, capitals): the plugin takes the
+  // nearest valid name, and the marker keeps the entry name for updates.
+  raw.name = toPluginName(ctx.entry.name);
   const normalized = normalizeClaudeManifest(raw, {
     label: `the marketplace entry '${ctx.entry.name}'`,
     replaceDefaultSkills: ctx.rootSource,
