@@ -21,8 +21,12 @@ test(
     const prompt = `deep link ${randomBytes(4).toString("hex")}`;
     await xum.openDeepLink(`xum://chat/new?project=demo-app&prompt=${encodeURIComponent(prompt)}`);
     await expect(screen.getByRole("textbox", "Message")).toHaveValue(prompt, { timeout: 15_000 });
+    // A new chat shows as the new-workspace form until its first message, so the judge is asked
+    // for that form: asked for "a new chat", a Haiku 5.5 judge saw the form and answered
+    // ASSERTION_INCONCLUSIVE.
     await agent.assert(
-      `a new chat for the project demo-app is open, and its message box holds the text '${prompt}'`
+      `the form that creates a new workspace in the project demo-app is open, and its message ` +
+        `box holds the text '${prompt}'`
     );
   }
 );
