@@ -85,7 +85,7 @@ function client(ctx: CommentContext, token: string, fetchFn: Fetch): Api {
       const detail = (await response.text().catch(() => "")).slice(0, 200);
       throw new Error(`GitHub responded ${response.status} to ${method} ${route}: ${detail}`);
     }
-    return response.json();
+    return (await response.json()) as unknown;
   };
 }
 
@@ -161,7 +161,8 @@ function contextFromEnv(env: NodeJS.ProcessEnv, dryRun: boolean): CommentContext
     headSha: need("HEAD_SHA", local("HEAD")),
     runId: need("GITHUB_RUN_ID", local("0")),
     runAttempt: need("GITHUB_RUN_ATTEMPT", local("1")),
-    model: env.BUGBASH_MODEL || undefined,
+    // Unset, or empty when the lane left no output: the titles then name no model.
+    model: env.BUGBASH_MODEL === "" ? undefined : env.BUGBASH_MODEL,
   };
 }
 

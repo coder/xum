@@ -53,8 +53,9 @@ function fakeGitHub(comments: Comment[], head = ctx.headSha) {
   const calls: { method: string; url: string; body?: { body: string } }[] = [];
   const fetchFn = (url: string, init: RequestInit) => {
     const method = init.method ?? "GET";
+    // prComment.ts sends each body as a JSON string.
     const body =
-      init.body == null ? undefined : (JSON.parse(String(init.body)) as { body: string });
+      typeof init.body === "string" ? (JSON.parse(init.body) as { body: string }) : undefined;
     calls.push({ method, url, body });
     const u = new URL(url);
     const json = (value: unknown) => Promise.resolve(Response.json(value));
