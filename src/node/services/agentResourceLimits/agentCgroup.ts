@@ -181,10 +181,14 @@ export function parseSelfCgroup(contents: string): string | null {
  * `projects` are the limits of single projects. Each gets its own child of `xum-agents`, so the
  * kernel holds a project to its own limit and to the shared one, whichever is lower.
  *
- * `publishEnrollment` gets the targets for new agent commands before a change of the layout makes
- * the earlier targets refuse them: before a child of `xum-agents` is removed, and before
- * `xum-agents` enables controllers for its children. A command that cannot join its target runs
- * in xum's own cgroup, without even the shared limit.
+ * `publishEnrollment` gets the targets for new agent commands before `xum-agents` enables
+ * controllers for its children, which makes it refuse the earlier target. A command that cannot
+ * join its target runs in xum's own cgroup, without even the shared limit.
+ *
+ * While a limit applies, xum keeps the children of `xum-agents` that no project needs any more,
+ * with no limit of their own: another xum server that shares the base cgroup can still send new
+ * commands there until it sees the config change, and they stay inside the shared limit. Xum
+ * removes them once no limit applies.
  */
 export async function applyAgentCgroupLimits(
   limits: AgentResourceLimits,
@@ -402,10 +406,11 @@ async function setUpAgentsCgroup(
     if (problem !== null) {
       return problem;
     }
-    const enrollment = { fallback: procsFile, byProject: new Map<string, string>() };
-    publish(enrollment);
-    await removeEmptyChildren(agentsDir, new Set(), host);
-    return { status, enrollment, projectCgroups: NO_PROJECT_CGROUPS };
+    return {
+      status,
+      enrollment: { fallback: procsFile, byProject: new Map() },
+      projectCgroups: NO_PROJECT_CGROUPS,
+    };
   }
   return setUpProjectCgroups(agentsDir, agentsCgroup, projects, status, host, publish);
 }
@@ -463,10 +468,13 @@ async function setUpProjectCgroups(
     byProject.set(projectPath, procsFile);
     projectCgroups.set(projectPath, cgroup);
   }
-  const enrollment = { fallback: defaultProcs, byProject };
-  publish(enrollment);
-  await removeEmptyChildren(agentsDir, keep, host);
-  return { status, enrollment, projectCgroups };
+  // A project that lost its limit keeps its child, without a limit (see applyAgentCgroupLimits).
+  for (const name of await listAgentChildren(agentsDir)) {
+    if (!keep.has(name)) {
+      await writeLimits(agentsDir, name, {}, host);
+    }
+  }
+  return { status, enrollment: { fallback: defaultProcs, byProject }, projectCgroups };
 }
 
 /** Whether `xum-agents` enables a controller for its children, so its commands run in them. */
@@ -490,8 +498,8 @@ async function checkEnrollment(
 /**
  * Go back to the layout without project limits: write max to the children of `xum-agents` and turn
  * their controllers off, so that the kernel accepts agent commands in `xum-agents` again. Commands
- * that still run in a child keep running there without a project limit. The caller removes the
- * children once no enrollment target names them.
+ * that still run in a child keep running there without a project limit, and new commands that
+ * another xum server still sends there stay inside the limit of `xum-agents`.
  */
 async function unnestAgentsCgroup(agentsDir: string, host: AgentCgroupHost): Promise<void> {
   const children = await listAgentChildren(agentsDir);
@@ -510,23 +518,15 @@ async function unnestAgentsCgroup(agentsDir: string, host: AgentCgroupHost): Pro
 }
 
 /**
- * Remove the children of `xum-agents` that xum made and no longer needs, once they are empty.
- * A child that still holds processes loses its limit and stays until a later apply.
+ * Remove the children of `xum-agents` that xum made, once they are empty. A child that still holds
+ * processes stays until a later apply. Another xum server can remove a child at the same time.
  */
-async function removeEmptyChildren(
-  agentsDir: string,
-  keep: ReadonlySet<string>,
-  host: AgentCgroupHost
-): Promise<void> {
+async function removeEmptyChildren(agentsDir: string, host: AgentCgroupHost): Promise<void> {
   for (const name of await listAgentChildren(agentsDir)) {
-    if (keep.has(name)) {
-      continue;
-    }
-    await writeLimits(agentsDir, name, {}, host);
     try {
       await host.removeCgroup(path.join(agentsDir, name));
     } catch (error) {
-      if (!hasErrorCode(error, "EBUSY")) {
+      if (!hasErrorCode(error, "EBUSY") && !hasErrorCode(error, "ENOENT")) {
         throw error;
       }
     }
@@ -574,7 +574,7 @@ async function clearAgentCgroupLimits(host: AgentCgroupHost): Promise<void> {
   await writeLimits(baseDir, AGENTS_CGROUP, {}, host);
   await unnestAgentsCgroup(path.join(baseDir, AGENTS_CGROUP), host);
   // No limit applies, so a command that fails to join a removed child loses no limit.
-  await removeEmptyChildren(path.join(baseDir, AGENTS_CGROUP), new Set(), host);
+  await removeEmptyChildren(path.join(baseDir, AGENTS_CGROUP), host);
 }
 
 /** xum's own cgroup, and the base cgroup: the same, or its parent once xum moved into `xum-app`. */
