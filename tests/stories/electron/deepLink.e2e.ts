@@ -7,7 +7,7 @@
 import { randomBytes } from "node:crypto";
 import { expect } from "e2e";
 import { test } from "./fixtures";
-import { waitForProjects } from "./helpers";
+import { waitForProjects } from "../helpers";
 
 test(
   "a deep link of a second launch starts a chat in the running app",

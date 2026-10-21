@@ -144,7 +144,7 @@ launcher refuses an Electron job without `node_modules/electron/dist/electron`. 
 the mock AI, agent tools, terminals and project automation off, no HTTP API server, and never
 `XUM_ALLOW_MULTIPLE_INSTANCES`. It refuses to start Electron when a switch is missing. In Electron
 the seeded project starts collapsed, and every attempt shares the one seeded root, so a story
-sees the UI state that an earlier one left: use `tests/stories/electron/helpers.ts`
+sees the UI state that an earlier one left: use `tests/stories/helpers.ts`
 (`openPlayground`), which works from either state. `app.clearState()`,
 extra headers and locale overrides do not work on this target (one fresh app per attempt).
 The first run, with one smoke story and no agent repro, spent $0.09 at list price and took about
