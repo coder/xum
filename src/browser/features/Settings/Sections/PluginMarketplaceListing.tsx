@@ -27,9 +27,14 @@ export const MarketplaceListing: React.FC<{
   /** Install the whole repository with another method (Skills) instead of one entry. */
   onPickMethod: (method: AgentPluginInstallMethod) => void;
 }> = (props) => {
-  const [picked, setPicked] = useState<string | null>(
-    () => props.listing.entries.find((entry) => entry.installable)?.name ?? null
-  );
+  // The row index, not the name: a marketplace can list one name twice (the backend keeps both
+  // rows and refuses the later one), and two radios must never both be checked. Only an
+  // installable row can be picked, and the backend resolves a name to its first (installable) row.
+  const [pickedIndex, setPickedIndex] = useState<number | null>(() => {
+    const index = props.listing.entries.findIndex((entry) => entry.installable);
+    return index === -1 ? null : index;
+  });
+  const picked = pickedIndex === null ? null : (props.listing.entries[pickedIndex]?.name ?? null);
   return (
     <div className="space-y-3">
       <MarketplaceHeader listing={props.listing} />
@@ -37,13 +42,13 @@ export const MarketplaceListing: React.FC<{
       <fieldset className="min-w-0 space-y-1" disabled={props.busy}>
         <legend className="text-muted mb-1 text-xs">Pick one plugin to install</legend>
         <div className="max-h-80 space-y-1 overflow-y-auto">
-          {props.listing.entries.map((entry) => (
+          {props.listing.entries.map((entry, index) => (
             <EntryRow
-              key={entry.name}
+              key={`${index}:${entry.name}`}
               entry={entry}
-              checked={picked === entry.name}
+              checked={pickedIndex === index}
               onPick={() => {
-                setPicked(entry.name);
+                setPickedIndex(index);
                 props.onPickEntry();
               }}
             />
