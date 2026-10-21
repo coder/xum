@@ -248,8 +248,9 @@ export function buildAgentHomeSeedScript(files: readonly AgentHomeSeedFile[]): s
     const target = expandTildeForSSH(file.remotePath);
     lines.push(`mkdir -p ${expandTildeForSSH(path.posix.dirname(file.remotePath))}`);
     lines.push(`base64 -d > ${target} <<'${HEREDOC_MARKER}'`);
-    // Line-wrapped base64 never contains the marker.
-    lines.push(...(file.content.toString("base64").match(/.{1,76}/g) ?? []));
+    // Line-wrapped base64 never contains the marker. A loop, not a spread: a spread passes
+    // every line as an argument, and Node throws a RangeError past ~125k (a 10 MiB file).
+    for (const line of file.content.toString("base64").match(/.{1,76}/g) ?? []) lines.push(line);
     lines.push(HEREDOC_MARKER);
     lines.push(`chmod ${file.executable ? "755" : "644"} ${target}`);
   }

@@ -99,6 +99,15 @@ describe("agent-home seeding", () => {
     }
   });
 
+  it("builds the script for a file of more base64 lines than a call takes arguments", () => {
+    // Node refuses ~125k spread arguments (a 10 MiB file); Bun only ~640k, so 40 MiB here.
+    const content = Buffer.alloc(40 * 1024 * 1024);
+    const script = buildAgentHomeSeedScript([
+      { remotePath: "~/.mux/skills/big/data.bin", content, executable: false },
+    ]);
+    expect(script.length).toBeGreaterThan(content.length);
+  });
+
   it("follows symlinks only inside the skill being copied, except a linked skill itself", async () => {
     const secrets = path.join(hostHome, ".ssh");
     await fs.mkdir(secrets, { recursive: true });
