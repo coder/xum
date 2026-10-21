@@ -1,5 +1,5 @@
 import type { Workspace } from "@/common/types/project";
-import { isSSHRuntime, type RuntimeConfig } from "@/common/types/runtime";
+import { getDaytonaSandboxId, type RuntimeConfig } from "@/common/types/runtime";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import type { DaytonaSandbox } from "./daytonaClient";
@@ -23,11 +23,15 @@ export interface DaytonaReconcilerOptions {
     | "stopSandbox"
     | "hasExpiringSshToken"
     | "ensureSshAccess"
+    | "getSandboxState"
   >;
   /** Every workspace Xum knows, archived ones included (they still own their sandbox). */
   listWorkspaces: () => DaytonaWorkspaceRef[];
-  /** Streaming, or running a background job: Daytona counts only SSH and API traffic. */
-  isWorkspaceActive: (workspaceId: string) => boolean;
+  /**
+   * Streaming, or running a background job that has not exited: Daytona counts only SSH and
+   * API traffic. May check a job over ssh, so it is only asked about a started sandbox.
+   */
+  isWorkspaceActive: (workspaceId: string) => boolean | Promise<boolean>;
   intervalMs?: number;
   callTimeoutMs?: number;
 }
@@ -50,6 +54,10 @@ export function listDaytonaWorkspaceRefs(config: {
     }
   }
   return refs;
+}
+
+function isStarted(sandbox: DaytonaSandbox): boolean {
+  return mapDaytonaSandboxState(sandbox.state) === "started";
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, what: string): Promise<T> {
@@ -112,13 +120,15 @@ export class DaytonaReconciler {
     try {
       sandboxes = await this.call(service.listInstanceSandboxes(), "listing Daytona sandboxes");
     } catch (error) {
-      // Keepalive still runs from config alone; orphans wait for the next sweep.
+      // Without the list Xum cannot map stored names to ids or see states: keepalive and
+      // orphans wait for the next sweep instead of guessing.
       log.warn("Daytona reconcile: could not list sandboxes", { error: getErrorMessage(error) });
     }
 
-    for (const ref of refs) {
-      if (!this.options.isWorkspaceActive(ref.workspaceId)) continue;
-      await this.keepAlive(ref.sandboxId, sandboxes);
+    if (sandboxes) {
+      for (const ref of refs) {
+        await this.keepAlive(ref, sandboxes);
+      }
     }
     if (sandboxes) {
       await this.stopOrphans(sandboxes, refs);
@@ -128,33 +138,85 @@ export class DaytonaReconciler {
   private collectReferences(): Array<{ workspaceId: string; sandboxId: string }> {
     const refs: Array<{ workspaceId: string; sandboxId: string }> = [];
     for (const workspace of this.options.listWorkspaces()) {
-      const config = workspace.runtimeConfig;
-      const sandboxId = isSSHRuntime(config) ? config.daytona?.sandboxId?.trim() : undefined;
+      const sandboxId = getDaytonaSandboxId(workspace.runtimeConfig);
       if (sandboxId) refs.push({ workspaceId: workspace.workspaceId, sandboxId });
     }
     return refs;
   }
 
-  private async keepAlive(sandboxId: string, sandboxes: DaytonaSandbox[] | undefined) {
-    const service = this.options.daytonaService;
+  private async keepAlive(
+    ref: { workspaceId: string; sandboxId: string },
+    sandboxes: DaytonaSandbox[]
+  ): Promise<void> {
+    const sandbox = await this.findActiveSandbox(ref, sandboxes);
+    if (sandbox) await this.refreshActivityAndToken(ref.sandboxId, sandbox.id);
+  }
+
+  /** The sandbox of a workspace that is active, if the sandbox is known and started. */
+  private async findActiveSandbox(
+    ref: { workspaceId: string; sandboxId: string },
+    sandboxes: DaytonaSandbox[]
+  ): Promise<DaytonaSandbox | undefined> {
     // Xum stores a name for sandboxes it created; last-activity only takes the real id.
-    const listed = sandboxes?.find((sb) => sb.id === sandboxId || sb.name === sandboxId);
+    const listed = sandboxes.find((sb) => sb.id === ref.sandboxId || sb.name === ref.sandboxId);
+    // A stopped sandbox has nothing to keep alive, and checking its jobs over ssh would start it.
+    if (listed && !isStarted(listed)) return undefined;
+    if (!(await this.isWorkspaceActive(ref.workspaceId))) return undefined;
+    // An attached sandbox carries no label of this install, so the list does not show it.
+    const sandbox = listed ?? (await this.lookUpSandbox(ref.sandboxId));
+    return sandbox && isStarted(sandbox) ? sandbox : undefined;
+  }
+
+  private async isWorkspaceActive(workspaceId: string): Promise<boolean> {
     try {
-      await this.call(service.refreshActivity(listed?.id ?? sandboxId), "refreshing activity");
+      return await this.call(
+        Promise.resolve(this.options.isWorkspaceActive(workspaceId)),
+        "checking workspace activity"
+      );
+    } catch (error) {
+      log.warn("Daytona reconcile: could not check workspace activity", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return false;
+    }
+  }
+
+  /** `storedId` is what the workspace config holds (tokens use it), `realId` the sandbox id. */
+  private async refreshActivityAndToken(storedId: string, realId: string): Promise<void> {
+    const service = this.options.daytonaService;
+    try {
+      await this.call(service.refreshActivity(realId), "refreshing activity");
     } catch (error) {
       log.warn("Daytona reconcile: activity refresh failed", {
-        sandboxId,
+        sandboxId: storedId,
         error: getErrorMessage(error),
       });
     }
-    if (!service.hasExpiringSshToken(sandboxId)) return;
+    if (!service.hasExpiringSshToken(storedId)) return;
     try {
-      await this.call(service.ensureSshAccess(sandboxId), "refreshing the ssh token");
+      await this.call(service.ensureSshAccess(storedId), "refreshing the ssh token");
     } catch (error) {
       log.warn("Daytona reconcile: ssh token refresh failed", {
+        sandboxId: storedId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  private async lookUpSandbox(sandboxId: string): Promise<DaytonaSandbox | undefined> {
+    try {
+      const { sandbox } = await this.call(
+        this.options.daytonaService.getSandboxState(sandboxId),
+        "looking up a sandbox"
+      );
+      return sandbox;
+    } catch (error) {
+      log.warn("Daytona reconcile: could not look up a sandbox", {
         sandboxId,
         error: getErrorMessage(error),
       });
+      return undefined;
     }
   }
 

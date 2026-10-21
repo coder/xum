@@ -15,6 +15,8 @@ import type {
 } from "@/node/config/daytonaCredentialsStore";
 import { loadOrCreateInstallationId } from "@/node/config/installationIdentity";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
+import { rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
+import { getDaytonaSandboxId } from "@/common/types/runtime";
 import { log } from "@/node/services/log";
 import {
   DaytonaApiError,
@@ -26,6 +28,7 @@ import {
   type DaytonaSandbox,
   type DaytonaSshAccess,
 } from "./daytonaClient";
+import type { DaytonaWorkspaceRef } from "./daytonaReconciler";
 
 export const DAYTONA_LABEL_INSTANCE = "xum.instance";
 export const DAYTONA_LABEL_WORKSPACE_ID = "xum.workspaceId";
@@ -128,6 +131,11 @@ export interface DaytonaServiceOptions {
   fetch?: typeof fetch;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Every workspace Xum knows, archived ones included: a sandbox Xum created is deleted only
+   * with the last workspace that references it. Without it no sandbox counts as unreferenced.
+   */
+  listWorkspaces?: () => DaytonaWorkspaceRef[];
 }
 
 export interface DaytonaStartAndWaitOptions {
@@ -204,6 +212,9 @@ export class DaytonaService {
   private readonly sshConfigured = new Set<string>();
   private readonly readyAt = new Map<string, number>();
   private readonly readyRequests = new Map<string, SandboxReadyRequest>();
+  /** Why the setup of a sandbox Xum created (and then deleted) failed, for later turns. */
+  private readonly setupFailures = new Map<string, string>();
+  private readonly listWorkspaces?: () => DaytonaWorkspaceRef[];
 
   constructor(options: DaytonaServiceOptions) {
     this.credentialsStore = options.credentialsStore;
@@ -213,6 +224,7 @@ export class DaytonaService {
     this.fetchImpl = options.fetch;
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? defaultSleep;
+    this.listWorkspaces = options.listWorkspaces;
   }
 
   getPublicConfig(): Promise<DaytonaPublicConfig> {
@@ -220,13 +232,54 @@ export class DaytonaService {
   }
 
   async setConfig(patch: DaytonaCredentialsPatch): Promise<DaytonaPublicConfig> {
+    const previousClient = await this.getClientIfConfigured();
     await this.credentialsStore.update(patch);
-    // Tokens and gateway data belong to the old account or deployment.
+    // Tokens and gateway data belong to the old account or deployment. Revoke the tokens with
+    // the old credentials, which may not work for the new ones.
+    const tokens = [...this.tokens];
     this.gatewayCache = undefined;
     this.tokens.clear();
     this.sshConfigured.clear();
     this.readyAt.clear();
+    if (previousClient) {
+      await Promise.all(
+        tokens.map(([sandboxId, access]) =>
+          this.revokeQuietly(previousClient, sandboxId, access.token)
+        )
+      );
+    }
     return this.credentialsStore.getPublicConfig();
+  }
+
+  private async getClientIfConfigured(): Promise<DaytonaClient | undefined> {
+    try {
+      return (await this.getClient()).client;
+    } catch (error) {
+      log.debug("No Daytona client to revoke SSH tokens with", { error: getErrorMessage(error) });
+      return undefined;
+    }
+  }
+
+  /**
+   * Whether a workspace other than `workspaceId` (archived ones included) references the
+   * sandbox. Fails closed, as referenced, when the workspace list or the caller's id is
+   * unknown: a kept sandbox only costs storage (the reconciler stops it), a deleted one loses
+   * the other workspace's work.
+   */
+  isSandboxReferencedElsewhere(sandboxId: string, workspaceId: string | undefined): boolean {
+    if (!this.listWorkspaces || !workspaceId) return true;
+    return this.listWorkspaces().some(
+      (ref) =>
+        ref.workspaceId !== workspaceId && getDaytonaSandboxId(ref.runtimeConfig) === sandboxId
+    );
+  }
+
+  recordSetupFailure(sandboxId: string, reason: string): void {
+    this.setupFailures.set(sandboxId, reason);
+  }
+
+  getSetupFailure(sandboxId: string): string | undefined {
+    return this.setupFailures.get(sandboxId);
   }
 
   async checkAvailability(): Promise<DaytonaAvailability> {
@@ -458,6 +511,11 @@ export class DaytonaService {
     this.readyAt.set(sandboxId, this.now());
   }
 
+  /** An ssh connection failed: the sandbox may have stopped within the ready cache. */
+  invalidateSandboxReady(sandboxId: string): void {
+    this.readyAt.delete(sandboxId);
+  }
+
   /**
    * Bring the sandbox to `started` and make sure Xum can ssh into it (fresh token, include
    * block). Concurrent callers for one sandbox share a single request; each still gets its own
@@ -506,17 +564,20 @@ export class DaytonaService {
       hostKeys: gatewayConfig.sshGatewayHostKeys,
     };
     // A cached token was written by the mint that produced it, so only a mint writes files.
-    await this.getSshToken(sandboxId, {
+    const access = await this.getSshToken(sandboxId, {
       onNewToken: async ({ token }) => {
         if (this.sshConfigured.has(sandboxId)) {
           await this.sshConfigWriter.updateToken({ sandboxId, token, gateway });
           return;
         }
         await this.sshConfigWriter.writeSandbox({ sandboxId, token, gateway });
-        await this.sshConfigWriter.verifyResolvedUser(sandboxId, token);
-        this.sshConfigured.add(sandboxId);
       },
     });
+    if (this.sshConfigured.has(sandboxId)) return;
+    // Outside the mint: when the user's ssh config shadows the token, a retry after they fix it
+    // reuses this token (already written) instead of minting another one.
+    await this.sshConfigWriter.verifyResolvedUser(sandboxId, access.token);
+    this.sshConfigured.add(sandboxId);
   }
 
   /** Whether this process holds a token for the sandbox that is close to expiry. */
@@ -569,7 +630,14 @@ export class DaytonaService {
   ): Promise<DaytonaSshAccess> {
     const { client } = await this.getClient();
     const access = await client.createSshAccess(sandboxId, DAYTONA_SSH_TOKEN_TTL_MINUTES);
-    await options.onNewToken?.(access);
+    rememberDaytonaToken(access.token);
+    try {
+      await options.onNewToken?.(access);
+    } catch (error) {
+      // Nothing holds the new token any more: revoke it rather than leave it live.
+      await this.revokeQuietly(client, sandboxId, access.token);
+      throw error;
+    }
     this.tokens.set(sandboxId, access);
     if (previous && previous.token !== access.token) {
       await this.revokeQuietly(client, sandboxId, previous.token);

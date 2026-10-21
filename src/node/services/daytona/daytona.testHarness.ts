@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
 import type { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
+import type { DaytonaWorkspaceRef } from "./daytonaReconciler";
 import { DaytonaService } from "./daytonaService";
 
 /**
@@ -39,6 +40,8 @@ export class FakeDaytonaControlPlane {
   snapshotResources = { cpu: 1, memory: 1, disk: 3 };
   /** Routes (`METHOD /path`) that never answer, for timeout tests. */
   readonly hangingRoutes = new Set<string>();
+  /** Routes (`METHOD /path`) that answer 500. */
+  readonly failingRoutes = new Set<string>();
   private nextId = 1;
   private nextToken = 1;
 
@@ -85,6 +88,7 @@ export class FakeDaytonaControlPlane {
     const json = (status: number, body?: unknown) =>
       new Response(body === undefined ? "" : JSON.stringify(body), { status });
     const fail = (status: number, message: string) => json(status, { statusCode: status, message });
+    if (this.failingRoutes.has(route)) return fail(500, "Internal error");
 
     if (route === "GET /config") {
       return json(200, {
@@ -241,6 +245,8 @@ export interface DaytonaTestRig {
   writer: FakeDaytonaSshConfigWriter;
   service: DaytonaService;
   clock: { now: number };
+  /** The workspaces the service sees (it deletes a sandbox only with its last one). */
+  workspaces: DaytonaWorkspaceRef[];
   cleanup: () => Promise<void>;
 }
 
@@ -255,6 +261,7 @@ export async function createDaytonaTestRig(
   const clock = { now: Date.parse("2026-01-01T00:00:00Z") };
   const plane = new FakeDaytonaControlPlane(() => clock.now);
   const writer = new FakeDaytonaSshConfigWriter();
+  const workspaces: DaytonaWorkspaceRef[] = [];
   const env: NodeJS.ProcessEnv =
     options.apiKey === null ? {} : { DAYTONA_API_KEY: options.apiKey ?? "test-key" };
   const service = new DaytonaService({
@@ -267,6 +274,7 @@ export async function createDaytonaTestRig(
       clock.now += ms;
       return Promise.resolve();
     },
+    listWorkspaces: () => workspaces,
   });
   return {
     rootDir,
@@ -274,6 +282,7 @@ export async function createDaytonaTestRig(
     writer,
     service,
     clock,
+    workspaces,
     cleanup: () => fs.rm(rootDir, { recursive: true, force: true }),
   };
 }

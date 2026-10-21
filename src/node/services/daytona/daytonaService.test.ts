@@ -175,6 +175,41 @@ describe("DaytonaService", () => {
     expect(plane.calls.filter((call) => call === "POST /sandbox/sb-1/ssh-access")).toHaveLength(1);
   });
 
+  it("revokes the SSH tokens it holds when the settings change", async () => {
+    const held = await service.getSshToken("sb-1");
+    await service.setConfig({ target: "eu" });
+    expect(plane.revoked).toEqual([held.token]);
+    // The next request mints a fresh token instead of reusing the revoked one.
+    expect((await service.getSshToken("sb-1")).token).not.toBe(held.token);
+  });
+
+  it("reuses one token while the user fixes an ssh config that shadows it", async () => {
+    let shadowed = true;
+    const writer = {
+      writeSandbox: () => Promise.resolve(),
+      updateToken: () => Promise.resolve(),
+      removeSandbox: () => Promise.resolve(),
+      verifyResolvedUser: () =>
+        shadowed ? Promise.reject(new Error("ssh config shadows User")) : Promise.resolve(),
+    };
+    const withWriter = new DaytonaService({
+      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
+      rootDir,
+      fetch: plane.fetch,
+      now: () => clock,
+      sshConfigWriter: writer,
+    });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(await withWriter.ensureSshAccess("sb-1").catch((e: unknown) => e)).toBeInstanceOf(
+        Error
+      );
+    }
+    shadowed = false;
+    await withWriter.ensureSshAccess("sb-1");
+    expect(plane.calls.filter((call) => call === "POST /sandbox/sb-1/ssh-access")).toHaveLength(1);
+    expect(plane.revoked).toEqual([]);
+  });
+
   it("reports test-connection failures as typed results", async () => {
     expect(await service.testConnection()).toEqual({ ok: true });
 

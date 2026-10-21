@@ -1,6 +1,6 @@
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import { Err, Ok, type Result } from "@/common/types/result";
-import { isDedicatedDaytonaSandbox, isSSHRuntime } from "@/common/types/runtime";
+import { getDaytonaSandboxId, isDedicatedDaytonaSandbox } from "@/common/types/runtime";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
@@ -11,11 +11,20 @@ const DAYTONA_STOP_TIMEOUT_MS = 60_000;
 
 /**
  * Archive reuses the Coder archive behavior setting (keep, stop, delete) for sandboxes Xum
- * created; attached and shared sandboxes are never touched. No unarchive hook: ensureReady
- * starts a stopped sandbox on the next use.
+ * created; attached sandboxes are never stopped or deleted, and no sandbox another workspace
+ * still references is touched at all. Otherwise Xum's ssh access (token, include block) is
+ * released. No unarchive hook: ensureReady starts a stopped sandbox and mints a token on the
+ * next use.
  */
 export interface DaytonaArchiveHookOptions {
-  daytonaService: Pick<DaytonaService, "getSandboxState" | "stopAndWait" | "deleteSandbox">;
+  daytonaService: Pick<
+    DaytonaService,
+    | "getSandboxState"
+    | "stopAndWait"
+    | "deleteSandbox"
+    | "isSandboxReferencedElsewhere"
+    | "releaseSshAccess"
+  >;
   getArchiveBehavior: () => CoderWorkspaceArchiveBehavior;
   /** As for Coder: model-driven archives must not stop a box under a surviving detached job. */
   hasUnsettledRemoteBackgroundJobs?: (
@@ -31,31 +40,64 @@ export interface DaytonaArchiveHookOptions {
 
 export function createDaytonaArchiveHook(options: DaytonaArchiveHookOptions): BeforeArchiveHook {
   return async (args): Promise<Result<void>> => {
-    const sandboxId = dedicatedSandboxId(args.workspaceMetadata);
+    const sandboxId = unsharedSandboxId(options, args.workspaceMetadata);
     if (!sandboxId) return Ok(undefined);
 
-    // The archive operation's policy snapshot wins (see the Coder hook).
-    const behavior = args.coderWorkspaceArchiveBehavior ?? options.getArchiveBehavior();
-    if (behavior === "keep") return Ok(undefined);
-    try {
-      if (behavior === "delete") {
-        return await deleteForArchive(options, args, sandboxId);
-      }
-      return await stopForArchive(options, args, sandboxId);
-    } catch (error) {
-      return Err(`Failed to ${behavior} Daytona sandbox "${sandboxId}": ${getErrorMessage(error)}`);
-    }
+    const result = isDedicatedDaytonaSandbox(args.workspaceMetadata.runtimeConfig)
+      ? await applyArchiveBehavior(options, args, sandboxId)
+      : Ok(undefined);
+    if (result.success) await releaseSshAccess(options, sandboxId);
+    return result;
   };
 }
 
-/** Only sandboxes Xum created for this workspace; attached and shared ones are never touched. */
-function dedicatedSandboxId(workspaceMetadata: WorkspaceMetadata): string | undefined {
-  // A shared-checkout sub-agent copies its parent's runtime config, sandbox ID included,
-  // without marking it shared: the sandbox belongs to the parent.
+async function applyArchiveBehavior(
+  options: DaytonaArchiveHookOptions,
+  args: Parameters<BeforeArchiveHook>[0],
+  sandboxId: string
+): Promise<Result<void>> {
+  // The archive operation's policy snapshot wins (see the Coder hook).
+  const behavior = args.coderWorkspaceArchiveBehavior ?? options.getArchiveBehavior();
+  if (behavior === "keep") return Ok(undefined);
+  try {
+    if (behavior === "delete") {
+      return await deleteForArchive(options, args, sandboxId);
+    }
+    return await stopForArchive(options, args, sandboxId);
+  } catch (error) {
+    return Err(`Failed to ${behavior} Daytona sandbox "${sandboxId}": ${getErrorMessage(error)}`);
+  }
+}
+
+/** The archived workspace's sandbox, unless another workspace (archived ones too) uses it. */
+function unsharedSandboxId(
+  options: DaytonaArchiveHookOptions,
+  workspaceMetadata: WorkspaceMetadata
+): string | undefined {
+  // A shared-checkout sub-agent copies its parent's runtime config, sandbox ID included:
+  // the sandbox belongs to the parent.
   if (workspaceMetadata.taskIsolation === "none") return undefined;
-  const runtimeConfig = workspaceMetadata.runtimeConfig;
-  if (!isDedicatedDaytonaSandbox(runtimeConfig) || !isSSHRuntime(runtimeConfig)) return undefined;
-  return runtimeConfig.daytona?.sandboxId;
+  const sandboxId = getDaytonaSandboxId(workspaceMetadata.runtimeConfig);
+  if (!sandboxId) return undefined;
+  if (options.daytonaService.isSandboxReferencedElsewhere(sandboxId, workspaceMetadata.id)) {
+    return undefined;
+  }
+  return sandboxId;
+}
+
+/** The archived workspace needs no token; unarchive mints a new one. */
+async function releaseSshAccess(
+  options: DaytonaArchiveHookOptions,
+  sandboxId: string
+): Promise<void> {
+  try {
+    await options.daytonaService.releaseSshAccess(sandboxId);
+  } catch (error) {
+    log.warn("Failed to release Daytona ssh access on archive", {
+      sandboxId,
+      error: getErrorMessage(error),
+    });
+  }
 }
 
 /**

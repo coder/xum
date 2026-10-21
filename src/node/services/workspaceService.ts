@@ -8578,10 +8578,12 @@ export class WorkspaceService
           });
         } else {
           const projectPath = metadata.projectPath;
+          // The id lets a Daytona runtime tell whether other workspaces still use the sandbox.
           const runtime = createRuntime(metadata.runtimeConfig, {
             projectPath,
             workspaceName: metadata.name,
             workspacePath: persistedWorkspacePath,
+            workspaceId,
           });
 
           // Delete workspace from runtime first - if this fails with force=false, we abort

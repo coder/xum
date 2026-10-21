@@ -352,6 +352,7 @@ export class ServiceContainer {
     this.daytonaService = new DaytonaService({
       credentialsStore: new DaytonaCredentialsStore(this.config.rootDir),
       rootDir: this.config.rootDir,
+      listWorkspaces: () => listDaytonaWorkspaceRefs(this.config.loadConfigOrDefault()),
     });
     this.perfCaptures = new PerfCaptureService({
       dir: getXumPerfCapturesDir(this.config.rootDir),
@@ -476,9 +477,9 @@ export class ServiceContainer {
     return new DaytonaReconciler({
       daytonaService: this.daytonaService,
       listWorkspaces: () => listDaytonaWorkspaceRefs(this.config.loadConfigOrDefault()),
-      isWorkspaceActive: (workspaceId) =>
+      isWorkspaceActive: async (workspaceId) =>
         this.aiService.isStreaming(workspaceId) ||
-        this.backgroundProcessManager.hasRunningBackgroundProcesses(workspaceId),
+        (await this.backgroundProcessManager.hasLiveBackgroundProcesses(workspaceId)),
     });
   }
 

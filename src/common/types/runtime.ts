@@ -275,16 +275,23 @@ export function isSSHRuntime(
   return config?.type === "ssh";
 }
 
+/** The Daytona sandbox a runtime config points at, if any. */
+export function getDaytonaSandboxId(config: RuntimeConfig | undefined): string | undefined {
+  const sandboxId = isSSHRuntime(config) ? config.daytona?.sandboxId?.trim() : undefined;
+  return sandboxId ? sandboxId : undefined;
+}
+
 /**
- * A Daytona sandbox Xum created for this workspace alone: not an attached existing sandbox
- * and not one shared with a fork. Only these may be stopped or deleted with the workspace.
+ * A Daytona sandbox Xum created (for this workspace or the one it was forked from), not an
+ * attached existing one. Only these may be stopped or deleted, and only by the last workspace
+ * that references them.
  */
 export function isDedicatedDaytonaSandbox(config: RuntimeConfig | undefined): boolean {
   return (
     isSSHRuntime(config) &&
     config.daytona != null &&
     config.daytona.shared !== true &&
-    (config.daytona.sandboxId?.trim() ?? "") !== ""
+    getDaytonaSandboxId(config) !== undefined
   );
 }
 

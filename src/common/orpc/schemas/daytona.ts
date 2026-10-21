@@ -27,11 +27,18 @@ export const DaytonaSandboxConfigSchema = z.object({
     .meta({ description: "Disk in GiB (size preset)" }),
   target: z.string().optional().meta({ description: "Daytona target (region)" }),
   /**
-   * True when the sandbox is not owned by this workspace alone (attached existing sandbox, or a
-   * fork sharing its parent's sandbox). Shared sandboxes are never deleted with a workspace.
+   * True for an existing sandbox the user attached: Xum never stops or deletes it. A sandbox
+   * Xum created is deleted with the last workspace (archived ones included) that references it.
    */
   shared: z.boolean().optional().meta({
-    description: "True if the sandbox is shared with other workspaces or pre-existing",
+    description: "True if the sandbox is a pre-existing one the workspace attached to",
+  }),
+  /**
+   * True for a fork that reuses its source's sandbox: setup connects to it instead of creating
+   * one. The sandbox stays Xum's, so the last referencing workspace still deletes it.
+   */
+  forked: z.boolean().optional().meta({
+    description: "True if the workspace reuses the sandbox of the workspace it was forked from",
   }),
 });
 

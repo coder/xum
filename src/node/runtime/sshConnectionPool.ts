@@ -31,6 +31,8 @@ import {
   withSshBackoffJitter,
 } from "./sshBackoff";
 import { isPermanentSSHFailure } from "./Runtime";
+import { isXumDaytonaHost } from "@/common/constants/daytona";
+import { redactDaytonaHostStderr } from "./daytonaTokenRedaction";
 
 export type OpenSSHHostKeyPolicyMode = "strict" | "headless-fallback";
 
@@ -49,8 +51,13 @@ export function isInteractiveHostKeyApprovalAvailable(): boolean {
   return sshPromptService?.hasInteractiveResponder() === true;
 }
 
-export function appendOpenSSHHostKeyPolicyArgs(args: string[]): void {
-  if (hostKeyPolicyMode === "strict") {
+/**
+ * Daytona aliases are exempt from the headless fallback: their include block pins the gateway
+ * key (StrictHostKeyChecking yes, Xum's own known_hosts), and a command-line `-o` would
+ * override it and accept any key.
+ */
+export function appendOpenSSHHostKeyPolicyArgs(args: string[], host: string): void {
+  if (hostKeyPolicyMode === "strict" || isXumDaytonaHost(host)) {
     return;
   }
 
@@ -531,7 +538,7 @@ export class SSHConnectionPool {
     // Scope insecure host-key fallback to explicitly headless contexts where
     // no verification service is wired (e.g. CLI/test harness without UI).
     // Responder liveness only affects askpass prompt mechanics, not trust policy.
-    appendOpenSSHHostKeyPolicyArgs(args);
+    appendOpenSSHHostKeyPolicyArgs(args, config.host);
 
     args.push(config.host, "echo ok");
 
@@ -568,6 +575,8 @@ export class SSHConnectionPool {
         stdio: ["ignore", "pipe", "pipe"],
         ...(askpass ? { env: { ...process.env, ...askpass.env } } : {}),
       });
+      // The probe's stderr becomes the pool's last error, which reaches the UI and logs.
+      redactDaytonaHostStderr(proc, config.host);
 
       let timedOut = false;
       let timer: ReturnType<typeof setTimeout> | undefined;

@@ -77,6 +77,27 @@ describe("createDaytonaArchiveHook", () => {
     expect(rig.plane.find("sb-users")?.state).toBe("started");
   });
 
+  it("leaves a sandbox another workspace references alone, else releases Xum's ssh access", async () => {
+    rig.plane.addSandbox({ id: "sb-shared" });
+    await rig.service.ensureSshAccess("sb-shared");
+    rig.workspaces.push({
+      workspaceId: "fork",
+      runtimeConfig: metadata({ sandboxId: "sb-shared", forked: true }).runtimeConfig,
+    });
+
+    // The fork still works in the sandbox: no stop, no delete, its token stays live.
+    expect((await archive({ sandboxId: "sb-shared", shared: false }, "delete")).success).toBe(true);
+    expect(rig.plane.find("sb-shared")?.state).toBe("started");
+    expect(rig.plane.revokedTokens).toEqual([]);
+
+    // The last workspace on an attached sandbox: the sandbox stays, the token goes.
+    rig.workspaces.length = 0;
+    expect((await archive({ sandboxId: "sb-shared", shared: true }, "delete")).success).toBe(true);
+    expect(rig.plane.find("sb-shared")?.state).toBe("started");
+    expect(rig.plane.revokedTokens).toHaveLength(1);
+    expect(rig.writer.removed).toEqual(["sb-shared"]);
+  });
+
   it("leaves the parent's sandbox alone when a shared-checkout sub-agent is archived", async () => {
     rig.plane.addSandbox({ id: "sb-parent" });
     const hook = createDaytonaArchiveHook({
@@ -106,6 +127,10 @@ describe("createDaytonaArchiveHook", () => {
       },
       "checkWorkspaceDeletable"
     ).mockResolvedValue({ error: "Workspace contains uncommitted changes." });
+    // The Daytona check resolves the `~` workspace path on the sandbox first.
+    const resolvePath = spyOn(SSHRuntime.prototype, "resolvePath").mockResolvedValue(
+      "/home/daytona/src/proj/ws"
+    );
     const warnings: string[] = [];
     try {
       const daytona = { sandboxId: "sb-dirty", shared: false };
@@ -121,6 +146,7 @@ describe("createDaytonaArchiveHook", () => {
       expect(warnings[0]).toContain("uncommitted changes");
     } finally {
       sshCheck.mockRestore();
+      resolvePath.mockRestore();
     }
   });
 });

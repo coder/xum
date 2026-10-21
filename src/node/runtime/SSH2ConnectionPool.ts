@@ -28,6 +28,62 @@ import {
   withSshBackoffJitter,
 } from "./sshBackoff";
 import { isPermanentSSHFailure } from "./Runtime";
+import { isXumDaytonaHost } from "@/common/constants/daytona";
+
+/**
+ * Daytona aliases pin the gateway key in Xum's own known_hosts (UserKnownHostsFile in the
+ * include block). ssh2 reads no known_hosts, so check the server key against those lines here.
+ * Fails closed: no readable pinned key for the gateway accepts no server.
+ */
+async function createPinnedHostKeyVerifier(
+  resolved: Pick<ResolvedSSHConfig, "hostName" | "port" | "userKnownHostsFile" | "hostKeyAlias">
+): Promise<(key: Buffer) => boolean> {
+  const content = await readPinnedKnownHosts(resolved.userKnownHostsFile);
+  const lookupHost = resolved.hostKeyAlias ?? resolved.hostName;
+  const pinned = parsePinnedHostKeys(
+    content,
+    new Set([lookupHost, `[${lookupHost}]:${resolved.port}`])
+  );
+  return (key) => pinned.some((pinnedKey) => pinnedKey.equals(key));
+}
+
+/** Unreadable or unset reads as empty: no pinned key, so no server is accepted. */
+async function readPinnedKnownHosts(file: string | undefined): Promise<string> {
+  if (!file) return "";
+  try {
+    return await fs.readFile(file, "utf8");
+  } catch (error) {
+    log.warn("Could not read the pinned known_hosts of a Daytona gateway", {
+      file,
+      error: getErrorMessage(error),
+    });
+    return "";
+  }
+}
+
+/** The keys of the known_hosts lines whose (unhashed) host field names one of `hostPatterns`. */
+function parsePinnedHostKeys(content: string, hostPatterns: ReadonlySet<string>): Buffer[] {
+  const pinned: Buffer[] = [];
+  for (const line of content.split("\n")) {
+    const [hosts, , key] = line.trim().split(/\s+/);
+    if (!hosts || !key || hosts.startsWith("#")) continue;
+    if (hosts.split(",").some((host) => hostPatterns.has(host))) {
+      pinned.push(Buffer.from(key, "base64"));
+    }
+  }
+  return pinned;
+}
+
+// TODO(ethanndickson): Implement known_hosts support for SSH2 and restore interactive host key
+// verification once approvals can be persisted between connections.
+function createHostVerifier(
+  host: string,
+  resolved: Parameters<typeof createPinnedHostKeyVerifier>[0]
+): Promise<(key: Buffer) => boolean> {
+  return isXumDaytonaHost(host)
+    ? createPinnedHostKeyVerifier(resolved)
+    : Promise.resolve(() => true);
+}
 
 let sshPromptService: SshPromptService | undefined;
 
@@ -584,6 +640,7 @@ export class SSH2ConnectionPool {
           ? baseIdentityFiles
           : DEFAULT_IDENTITY_FILES.map((file) => expandLocalPath(file));
       const username = resolvedConfig.user ?? getDefaultUsername();
+      const hostVerifier = await createHostVerifier(config.host, resolvedConfig);
       const proxyTokens = {
         host: resolvedConfig.hostName,
         port: resolvedConfig.port,
@@ -761,10 +818,7 @@ export class SSH2ConnectionPool {
               keepaliveInterval: 5000,
               keepaliveCountMax: 2,
               ...(privateKey ? { privateKey } : {}),
-              // TODO(ethanndickson): Implement known_hosts support for SSH2
-              // and restore interactive host key verification once approvals
-              // can be persisted between connections.
-              hostVerifier: () => true,
+              hostVerifier,
             };
 
             client.connect(connectOptions);

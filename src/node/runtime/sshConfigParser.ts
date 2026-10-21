@@ -24,6 +24,9 @@ export interface ResolvedSSHConfig {
   port: number;
   identityFiles: string[];
   proxyCommand?: string;
+  /** First UserKnownHostsFile, home-expanded (ssh2 verifies pinned Daytona keys against it). */
+  userKnownHostsFile?: string;
+  hostKeyAlias?: string;
 }
 
 function getHomeDir(): string {
@@ -404,5 +407,23 @@ export async function resolveSSHConfig(host: string): Promise<ResolvedSSHConfig>
     port: Number.isFinite(port) ? port : DEFAULT_SSH_PORT,
     identityFiles,
     proxyCommand,
+    ...readHostKeyPinning(computed, homeDir),
+  };
+}
+
+function readHostKeyPinning(
+  computed: Parameters<typeof getConfigValue>[0],
+  homeDir: string
+): Pick<ResolvedSSHConfig, "userKnownHostsFile" | "hostKeyAlias"> {
+  const knownHostsValue = toStringValue(getConfigValue(computed, "UserKnownHostsFile"));
+  const userKnownHostsFile = knownHostsValue
+    ? splitIncludeArgs(knownHostsValue)
+        .map((file) => expandHomePath(file, homeDir))
+        .at(0)
+    : undefined;
+  const hostKeyAlias = toStringValue(getConfigValue(computed, "HostKeyAlias"));
+  return {
+    ...(userKnownHostsFile ? { userKnownHostsFile } : {}),
+    ...(hostKeyAlias ? { hostKeyAlias } : {}),
   };
 }

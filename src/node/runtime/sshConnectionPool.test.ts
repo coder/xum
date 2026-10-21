@@ -140,7 +140,7 @@ describe("appendOpenSSHHostKeyPolicyArgs", () => {
     const args: string[] = ["-T"];
     setOpenSSHHostKeyPolicyMode("headless-fallback");
 
-    appendOpenSSHHostKeyPolicyArgs(args);
+    appendOpenSSHHostKeyPolicyArgs(args, "example.test");
 
     expect(args).toEqual([
       "-T",
@@ -155,7 +155,17 @@ describe("appendOpenSSHHostKeyPolicyArgs", () => {
     const args: string[] = ["-T"];
     setOpenSSHHostKeyPolicyMode("strict");
 
-    appendOpenSSHHostKeyPolicyArgs(args);
+    appendOpenSSHHostKeyPolicyArgs(args, "example.test");
+
+    expect(args).toEqual(["-T"]);
+  });
+
+  test("never overrides the pinned gateway key of a Daytona alias", () => {
+    const args: string[] = ["-T"];
+    setOpenSSHHostKeyPolicyMode("headless-fallback");
+
+    // A command-line -o wins over the include file's StrictHostKeyChecking yes.
+    appendOpenSSHHostKeyPolicyArgs(args, "xum-feature-a1b2c3.xum--daytona");
 
     expect(args).toEqual(["-T"]);
   });
@@ -163,7 +173,7 @@ describe("appendOpenSSHHostKeyPolicyArgs", () => {
   test("defaults to headless-fallback", () => {
     const args: string[] = ["-T"];
 
-    appendOpenSSHHostKeyPolicyArgs(args);
+    appendOpenSSHHostKeyPolicyArgs(args, "example.test");
 
     expect(args).toEqual([
       "-T",

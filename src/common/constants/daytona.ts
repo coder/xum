@@ -16,6 +16,12 @@ export function toXumDaytonaHost(sandboxId: string): string {
   return `${sandboxId}.${XUM_DAYTONA_HOST_SUFFIX}`;
 }
 
+/** Whether an ssh host (optionally `user@host`) is a Daytona sandbox alias Xum manages. */
+export function isXumDaytonaHost(host: string): boolean {
+  const hostname = host.slice(host.lastIndexOf("@") + 1).toLowerCase();
+  return hostname.endsWith(`.${XUM_DAYTONA_HOST_SUFFIX}`);
+}
+
 export const XUM_DAYTONA_SSH_BLOCK_START = "# --- START XUM DAYTONA SSH ---";
 export const XUM_DAYTONA_SSH_BLOCK_END = "# --- END XUM DAYTONA SSH ---";
 

@@ -2132,7 +2132,7 @@ export class SSHRuntime extends RemoteRuntime {
     args.push("-o", "ServerAliveCountMax=2");
 
     // Match the runtime's host key policy (permissive in headless mode).
-    appendOpenSSHHostKeyPolicyArgs(args);
+    appendOpenSSHHostKeyPolicyArgs(args, config.host);
 
     return args.join(" ");
   }
@@ -3257,15 +3257,18 @@ export class SSHRuntime extends RemoteRuntime {
   ): Promise<"ok" | "missing" | { error: string }> {
     // Disable git hooks for untrusted projects
     const nhp = gitNoHooksPrefix(trusted);
+    // quoteForRemote expands a leading ~ remotely: a deferred-access runtime (Coder, Daytona)
+    // keeps the unresolved `~/...` path, and a quoted `~` would make a dirty checkout look missing.
+    const deletedPathArg = this.quoteForRemote(deletedPath);
     // Combine all pre-deletion checks into a single bash script to minimize round trips
     // Exit codes: 0=ok to delete, 1=uncommitted changes, 2=unpushed commits, 3=doesn't exist
     const checkScript = force
       ? // When force=true, only check existence
-        `test -d ${shescape.quote(deletedPath)} || exit 3`
+        `test -d ${deletedPathArg} || exit 3`
       : // When force=false, perform all safety checks
         `
-          test -d ${shescape.quote(deletedPath)} || exit 3
-          cd ${shescape.quote(deletedPath)} || exit 1
+          test -d ${deletedPathArg} || exit 3
+          cd ${deletedPathArg} || exit 1
           git diff --quiet --exit-code && git diff --quiet --cached --exit-code || exit 1
           if git remote | grep -q .; then
             # First, check the original condition: any commits not in any remote

@@ -25,16 +25,23 @@ function daytonaConfig(sandboxId: string): RuntimeConfig {
   };
 }
 
+/** Workspace ids the reconciler asked about, in order. */
+let activityChecks: string[];
+
 function makeReconciler(
   workspaces: Array<{ id: string; runtimeConfig: RuntimeConfig; archivedAt?: string }>,
   activeIds: string[],
   callTimeoutMs?: number
 ): DaytonaReconciler {
   const config = { projects: new Map([["/home/me/project", { workspaces }]]) };
+  activityChecks = [];
   return new DaytonaReconciler({
     daytonaService: rig.service,
     listWorkspaces: () => listDaytonaWorkspaceRefs(config),
-    isWorkspaceActive: (workspaceId) => activeIds.includes(workspaceId),
+    isWorkspaceActive: (workspaceId) => {
+      activityChecks.push(workspaceId);
+      return Promise.resolve(activeIds.includes(workspaceId));
+    },
     callTimeoutMs,
   });
 }
@@ -106,5 +113,28 @@ describe("DaytonaReconciler.sweep", () => {
 
     expect(rig.writer.tokens.get("sb-1")).not.toBe(firstToken);
     expect(rig.plane.revokedTokens).toEqual([firstToken ?? ""]);
+  });
+
+  it("keeps only started sandboxes alive and skips them all when the list fails", async () => {
+    rig.plane.addSandbox({ id: "sb-stopped", state: "stopped", labels: instanceLabels });
+    // Attached by the user: no label of this install, so only a lookup finds it.
+    rig.plane.addSandbox({ id: "sb-attached" });
+    const workspaces = [
+      { id: "ws-stopped", runtimeConfig: daytonaConfig("sb-stopped") },
+      { id: "ws-attached", runtimeConfig: daytonaConfig("sb-attached") },
+    ];
+    const active = ["ws-stopped", "ws-attached"];
+
+    await makeReconciler(workspaces, active).sweep();
+    expect(rig.plane.countCalls("POST /sandbox/sb-stopped/last-activity")).toBe(0);
+    // Checking a stopped sandbox's jobs over ssh would start it.
+    expect(activityChecks).toEqual(["ws-attached"]);
+    expect(rig.plane.countCalls("POST /sandbox/sb-attached/last-activity")).toBe(1);
+
+    rig.plane.failingRoutes.add("GET /sandbox");
+    rig.plane.calls.length = 0;
+    await makeReconciler(workspaces, active).sweep();
+    expect(rig.plane.calls.filter((call) => call.endsWith("/last-activity"))).toEqual([]);
+    expect(activityChecks).toEqual([]);
   });
 });

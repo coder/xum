@@ -112,8 +112,11 @@ describe.skipIf(process.platform === "win32")(
     // ECDSA keys: ssh2's ed25519 generator emits an unparseable key ~0.4% of the time under Bun.
     const newPrivateKey = () => utils.generateKeyPairSync("ecdsa", { bits: 256 }).private;
 
-    async function startServer(onConnection: ConstructorParameters<typeof Server>[1]) {
-      const server = new Server({ hostKeys: [newPrivateKey()] }, onConnection);
+    async function startServer(
+      onConnection: ConstructorParameters<typeof Server>[1],
+      hostKey = newPrivateKey()
+    ) {
+      const server = new Server({ hostKeys: [hostKey] }, onConnection);
       await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh2-pool-"));
       const identityFile = path.join(dir, "id_ecdsa");
@@ -173,6 +176,60 @@ describe.skipIf(process.platform === "win32")(
       const { waits, result } = acquire(pool, config, 2_500);
       expect(String(await result)).toContain("ECONNREFUSED");
       expect(waits.length).toBeGreaterThan(0);
+    });
+
+    // ssh2 reads no known_hosts: without this check a Daytona alias accepted any gateway key.
+    it("connects to a Daytona alias only when the gateway key matches the pinned one", async () => {
+      const hostKey = newPrivateKey();
+      const { config } = await startServer((conn) => {
+        conn.on("authentication", (ctx) => ctx.accept());
+        conn.on("error", () => undefined);
+      }, hostKey);
+      const home = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh2-daytona-home-"));
+      // The ssh config parser reads USERPROFILE first (sshConfigParser.test.ts does the same).
+      const originalUserProfile = process.env.USERPROFILE;
+      process.env.USERPROFILE = home;
+      try {
+        const knownHostsPath = path.join(home, "daytona_known_hosts");
+        await fs.mkdir(path.join(home, ".ssh"));
+        await fs.writeFile(
+          path.join(home, ".ssh", "config"),
+          [
+            "Host sb-1.xum--daytona",
+            "  HostName 127.0.0.1",
+            `  Port ${config.port}`,
+            "  HostKeyAlias gateway.test",
+            `  UserKnownHostsFile ${knownHostsPath}`,
+            "  StrictHostKeyChecking yes",
+          ].join("\n")
+        );
+        const pinLine = (privateKey: string) => {
+          const parsed = utils.parseKey(privateKey);
+          if (parsed instanceof Error) throw parsed;
+          return `gateway.test ${parsed.type} ${parsed.getPublicSSH().toString("base64")}\n`;
+        };
+        const daytona: SSHConnectionConfig = {
+          host: "sb-1.xum--daytona",
+          identityFile: config.identityFile,
+        };
+
+        await fs.writeFile(knownHostsPath, pinLine(newPrivateKey()));
+        const refused = await new SSH2ConnectionPool()
+          .acquireConnection(daytona, { maxWaitMs: 0 })
+          .then(
+            () => new Error("acquisition unexpectedly succeeded"),
+            (error: unknown) => error
+          );
+        expect(String(refused)).toContain("Host denied");
+
+        await fs.writeFile(knownHostsPath, pinLine(hostKey));
+        const entry = await new SSH2ConnectionPool().acquireConnection(daytona, { maxWaitMs: 0 });
+        entry.client.end();
+      } finally {
+        if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = originalUserProfile;
+        await fs.rm(home, { recursive: true, force: true });
+      }
     });
 
     it("a retired client's late error does not put the host into backoff", async () => {
