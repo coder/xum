@@ -532,16 +532,17 @@ export class ServiceContainer {
         this.syncPerfFlightRecorder();
       },
     },
-    // Bash commands that outlived a restart still hold the proxy URL and key: bind the saved
-    // port again before clients connect. Best-effort: a proxy problem never blocks startup.
-    { name: "bashAiProxy.restore", run: () => this.bashAiProxy.restore(), bestEffort: true },
-    // Before any ssh (skills listing, workspace open, task recovery): an earlier process's
-    // Daytona tokens still sit in the ssh include file, and ssh errors quote them.
+    // Before any ssh (forward restoration, skills listing, workspace open, task recovery): an
+    // earlier process's Daytona tokens still sit in the ssh include file, and ssh errors quote
+    // them.
     {
       name: "daytonaService.loadPersistedTokens",
       run: () => this.daytonaService.loadPersistedTokens(),
       bestEffort: true,
     },
+    // Bash commands that outlived a restart still hold the proxy URL and key: bind the saved
+    // port again before clients connect. Best-effort: a proxy problem never blocks startup.
+    { name: "bashAiProxy.restore", run: () => this.bashAiProxy.restore(), bestEffort: true },
     // Before task recovery, so commands of recovered tasks start under the agent resource limit.
     // Best-effort: a limit that cannot apply is reported in Settings and never blocks startup.
     {

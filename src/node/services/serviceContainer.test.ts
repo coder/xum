@@ -925,8 +925,8 @@ describe("ServiceContainer", () => {
     "telemetryService.initialize",
     "coderOauthService.separateDiscoveredModels",
     "experimentsService.initialize",
-    "bashAiProxy.restore",
     "daytonaService.loadPersistedTokens",
+    "bashAiProxy.restore",
     "agentResourceLimits.start",
     "taskService.recoverInterruptedTasks",
   ];
@@ -1217,6 +1217,27 @@ describe("ServiceContainer", () => {
 
     expect(await rejectionOf(services.initializeCore())).toBe(boom);
     expect(recoverTasks).not.toHaveBeenCalled();
+  });
+
+  it("initializeCore registers Daytona's saved ssh tokens before the bash AI proxy restores forwards", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(undefined);
+    // Forward restoration starts ssh in the background; its errors may quote a token.
+    const restore = spyOn(services.bashAiProxy, "restore").mockResolvedValue(undefined);
+    let tokensRequested!: () => void;
+    const requested = new Promise<void>((resolve) => (tokensRequested = resolve));
+    let releaseTokens!: () => void;
+    spyOn(services.daytonaService, "loadPersistedTokens").mockImplementation(() => {
+      tokensRequested();
+      return new Promise<void>((resolve) => (releaseTokens = resolve));
+    });
+
+    const core = services.initializeCore();
+    await requested;
+    expect(restore).not.toHaveBeenCalled();
+    releaseTokens();
+    await core;
+    expect(restore).toHaveBeenCalledTimes(1);
   });
 
   it("initializeCore records the eight core steps and re-runs them when called again", async () => {
