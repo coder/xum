@@ -14,7 +14,7 @@ Xum can run workspaces in [Daytona](https://www.daytona.io/docs) sandboxes. Each
 ## Set up access
 
 1. Open **Settings > Runtimes** and find the **Daytona** row.
-2. Paste your API key and click **Save**. Change **API URL** only for a self-hosted (BYOC) Daytona install. It must use `https://`, so that no one on the network can read the API key; `http://` works only for a loopback host (`localhost`, `127.0.0.1` or `::1`). **Target** picks a region; leave it empty for Daytona's default.
+2. Paste your API key and click **Save**. Change **API URL** only for a self-hosted (BYOC) Daytona install. It must use `https://`, so that no one on the network can read the API key; `http://` works only for a loopback host (`localhost`, `127.0.0.1` or `::1`). A saved URL that is no longer accepted keeps Daytona unavailable until you fix or clear it; Xum never sends the key to another deployment instead. **Target** picks a region; leave it empty for Daytona's default.
 3. Click **Test connection**.
 
 Xum stores the key in `~/.xum/daytona.json` (under `XUM_ROOT` when it is set) with file mode `0600`. The settings page never shows a saved key again: to change it, enter a new one, or click **Remove key**.

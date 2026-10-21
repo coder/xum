@@ -71,20 +71,26 @@ describe("DaytonaCredentialsStore", () => {
     expect((await store.resolve())?.apiKey).toBe(KEY);
   });
 
-  it("ignores a stored API URL that does not validate, like an invalid DAYTONA_API_URL", async () => {
-    await fs.writeFile(
-      path.join(rootDir, "daytona.json"),
-      JSON.stringify({ apiKey: KEY, apiUrl: "not a url" }),
-      "utf-8"
-    );
-    const withEnvUrl = new DaytonaCredentialsStore(rootDir, {
-      DAYTONA_API_URL: "https://env.example.com/api/",
-    });
-    expect((await withEnvUrl.resolve())?.apiUrl).toBe("https://env.example.com/api");
-    expect((await withEnvUrl.getPublicConfig()).apiUrl).toBe("https://env.example.com/api");
-    expect((await new DaytonaCredentialsStore(rootDir, {}).resolve())?.apiUrl).toBe(
-      DAYTONA_DEFAULT_API_URL
-    );
+  it("refuses a stored API URL that does not validate instead of sending the key elsewhere", async () => {
+    for (const apiUrl of ["not a url", "http://byoc.example.com/api"]) {
+      await fs.writeFile(
+        path.join(rootDir, "daytona.json"),
+        JSON.stringify({ apiKey: KEY, apiUrl }),
+        "utf-8"
+      );
+      for (const env of [{}, { DAYTONA_API_URL: "https://env.example.com/api" }]) {
+        const store = new DaytonaCredentialsStore(rootDir, env);
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+        await expect(store.resolve()).rejects.toThrow(/saved in Settings/);
+        // Shown as written, so the user sees what to fix.
+        expect((await store.getPublicConfig()).apiUrl).toBe(apiUrl);
+      }
+    }
+
+    // Clearing it is the user's choice of the default deployment.
+    const store = new DaytonaCredentialsStore(rootDir, {});
+    await store.update({ apiUrl: "" });
+    expect((await store.resolve())?.apiUrl).toBe(DAYTONA_DEFAULT_API_URL);
   });
 
   it("accepts plain http only for a loopback host, where no network sees the key", async () => {
@@ -103,16 +109,12 @@ describe("DaytonaCredentialsStore", () => {
     }
   });
 
-  it("ignores a stored non-loopback http URL, and refuses one from DAYTONA_API_URL", async () => {
+  it("refuses a non-loopback http DAYTONA_API_URL", async () => {
     await fs.writeFile(
       path.join(rootDir, "daytona.json"),
-      JSON.stringify({ apiKey: KEY, apiUrl: "http://byoc.example.com/api" }),
+      JSON.stringify({ apiKey: KEY }),
       "utf-8"
     );
-    expect((await new DaytonaCredentialsStore(rootDir, {}).resolve())?.apiUrl).toBe(
-      DAYTONA_DEFAULT_API_URL
-    );
-
     // The environment names the deployment, so another one must not get the key instead.
     const fromEnv = new DaytonaCredentialsStore(rootDir, {
       DAYTONA_API_URL: "http://byoc.example.com/api",
