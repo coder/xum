@@ -630,6 +630,54 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
     expect(rig.plane.countCalls("POST /sandbox/sb-nap/start")).toBe(1);
   });
 
+  /** The gateway answers a stopped or deleted sandbox with the same refusal as a bad token. */
+  function refusingTransportWhile(sandboxId: string, refuses: () => boolean): SSHTransport {
+    const local = localShellTransport(rig.rootDir);
+    return {
+      ...local,
+      spawnRemoteProcess: (command, options) =>
+        refuses()
+          ? Promise.reject(
+              new RuntimeError(
+                `${rig.writer.tokens.get(sandboxId) ?? ""}@127.0.0.1: Permission denied (publickey).`,
+                "network"
+              )
+            )
+          : local.spawnRemoteProcess(command, options),
+    };
+  }
+
+  it("restarts a stopped sandbox that refuses ssh, keeping its token", async () => {
+    const sandbox = rig.plane.addSandbox({ id: "sb-nap2" });
+    const transport = refusingTransportWhile("sb-nap2", () => sandbox.state !== "started");
+    const turn = makeRuntime({ sandboxId: "sb-nap2" }, rig, { transport });
+    expect(await turn.ensureReady()).toEqual({ ready: true });
+    const token = rig.writer.tokens.get("sb-nap2");
+    // Stopped within the ready cache: the next command goes straight to ssh.
+    sandbox.state = "stopped";
+
+    const stream = await turn.exec("echo ok", { cwd: "/tmp", timeout: 10 });
+    expect(await new Response(stream.stdout).text()).toBe("ok\n");
+    expect(rig.plane.countCalls("POST /sandbox/sb-nap2/start")).toBe(1);
+    expect(rig.plane.countCalls("POST /sandbox/sb-nap2/ssh-access")).toBe(1);
+    expect(rig.writer.tokens.get("sb-nap2")).toBe(token);
+    expect(rig.plane.revokedTokens).toEqual([]);
+  });
+
+  it("reports a sandbox deleted outside Xum instead of the refused token", async () => {
+    rig.plane.addSandbox({ id: "sb-gone" });
+    await rig.service.ensureSshAccess("sb-gone");
+    rig.plane.sandboxes.delete("sb-gone");
+    const runtime = makeRuntime({ sandboxId: "sb-gone" }, rig, {
+      transport: refusingTransportWhile("sb-gone", () => true),
+    });
+
+    await expect(runtime.exec("true", { cwd: "/tmp", timeout: 10 })).rejects.toThrow(
+      'Daytona sandbox "sb-gone" no longer exists'
+    );
+    expect(rig.plane.countCalls("POST /sandbox/sb-gone/ssh-access")).toBe(1);
+  });
+
   it("replaces a token the gateway refused and retries the command once", async () => {
     rig.plane.addSandbox({ id: "sb-rev" });
     await rig.service.ensureSshAccess("sb-rev");

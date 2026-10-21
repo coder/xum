@@ -26,7 +26,7 @@ import type {
   WorkspaceInitParams,
   WorkspaceInitResult,
 } from "./Runtime";
-import { isPermanentSSHFailure, isRuntimeTransportError } from "./Runtime";
+import { isPermanentSSHFailure, isRuntimeTransportError, RuntimeError } from "./Runtime";
 import type { SpawnResult } from "./RemoteRuntime";
 import { SSHRuntime, type SSHRuntimeConfig } from "./SSHRuntime";
 import type { SSHTransport } from "./transports";
@@ -38,7 +38,7 @@ import {
   type DaytonaSizePreset,
 } from "@/common/constants/daytona";
 import { getXumHome } from "@/common/constants/paths";
-import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
+import type { DaytonaSandboxConfig, DaytonaSandboxState } from "@/common/orpc/schemas/daytona";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { isSSHRuntime } from "@/common/types/runtime";
 import type { Result } from "@/common/types/result";
@@ -191,6 +191,13 @@ function isTokenRejected(error: unknown): boolean {
   );
 }
 
+function sandboxMissingMessage(sandboxId: string): string {
+  return (
+    `Daytona sandbox "${sandboxId}" no longer exists (it was deleted outside Xum). ` +
+    `Xum does not recreate it; delete this workspace or attach it to another sandbox.`
+  );
+}
+
 function redactingInitLogger(initLogger: InitLogger): InitLogger {
   return {
     ...initLogger,
@@ -268,9 +275,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   private sandboxMissing(sandboxId: string): EnsureReadyResult {
     return {
       ready: false,
-      error:
-        `Daytona sandbox "${sandboxId}" no longer exists (it was deleted outside Xum). ` +
-        `Xum does not recreate it; delete this workspace or attach it to another sandbox.`,
+      error: sandboxMissingMessage(sandboxId),
       errorType: "runtime_not_ready",
     };
   }
@@ -368,14 +373,45 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     };
   }
 
-  /** True when the failure was fixed (a new token, or a restarted sandbox) and a retry may pass. */
-  private recoverForRetry(error: unknown, abortSignal: AbortSignal | undefined): Promise<boolean> {
+  /**
+   * True when the failure was fixed (a new token, or a restarted sandbox) and a retry may pass.
+   * The sandbox state decides, not the error text: a stopped or deleted sandbox also answers
+   * "Permission denied", so only a started sandbox gets a new token. Throws a clear error for
+   * a sandbox deleted outside Xum.
+   */
+  private async recoverForRetry(
+    error: unknown,
+    abortSignal: AbortSignal | undefined
+  ): Promise<boolean> {
     const sandboxId = this.daytonaConfig.sandboxId;
-    if (!sandboxId || !isRuntimeTransportError(error) || abortSignal?.aborted) {
-      return Promise.resolve(false);
+    if (!sandboxId || !isRuntimeTransportError(error) || abortSignal?.aborted) return false;
+    const tokenRejected = isTokenRejected(error);
+    // A UI or background runtime never starts the sandbox, so only a refused token is worth a look.
+    if (!tokenRejected && !this.restartsStoppedSandbox) return false;
+    this.daytonaService.invalidateSandboxReady(sandboxId);
+    const state = await this.readStateAfterFailure(sandboxId);
+    return this.recoverInState(sandboxId, state, { error, tokenRejected }, abortSignal);
+  }
+
+  private recoverInState(
+    sandboxId: string,
+    state: DaytonaSandboxState | undefined,
+    failure: { error: unknown; tokenRejected: boolean },
+    abortSignal: AbortSignal | undefined
+  ): Promise<boolean> {
+    const { error, tokenRejected } = failure;
+    if (state === "missing") {
+      throw new RuntimeError(
+        sandboxMissingMessage(sandboxId),
+        "network",
+        redactDaytonaError(error)
+      );
     }
-    if (isTokenRejected(error)) return this.replaceRejectedToken(sandboxId, error);
-    return this.restartIfStopped(sandboxId, abortSignal);
+    if (state === "started") {
+      return tokenRejected ? this.replaceRejectedToken(sandboxId, error) : Promise.resolve(false);
+    }
+    if (state === undefined || !this.restartsStoppedSandbox) return Promise.resolve(false);
+    return this.restartSandbox(sandboxId, abortSignal);
   }
 
   private async replaceRejectedToken(sandboxId: string, error: unknown): Promise<boolean> {
@@ -395,17 +431,6 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     return true;
   }
 
-  /** True when the sandbox was found stopped (or starting) and is now started again. */
-  private async restartIfStopped(
-    sandboxId: string,
-    abortSignal: AbortSignal | undefined
-  ): Promise<boolean> {
-    if (!this.restartsStoppedSandbox) return false;
-    this.daytonaService.invalidateSandboxReady(sandboxId);
-    if (!(await this.isSandboxDown(sandboxId))) return false;
-    return this.restartSandbox(sandboxId, abortSignal);
-  }
-
   private async restartSandbox(
     sandboxId: string,
     abortSignal: AbortSignal | undefined
@@ -421,16 +446,16 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     return true;
   }
 
-  /** False when the sandbox runs (the failure is something else) or its state is unknown. */
-  private async isSandboxDown(sandboxId: string): Promise<boolean> {
+  /** Undefined when the state cannot be read (then nothing is retried). */
+  private async readStateAfterFailure(sandboxId: string): Promise<DaytonaSandboxState | undefined> {
     try {
-      return (await this.daytonaService.getSandboxState(sandboxId)).state !== "started";
+      return (await this.daytonaService.getSandboxState(sandboxId)).state;
     } catch (stateError) {
       log.warn("Could not read Daytona sandbox state after an ssh failure", {
         sandboxId,
         error: getErrorMessage(stateError),
       });
-      return false;
+      return undefined;
     }
   }
 
