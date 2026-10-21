@@ -14,6 +14,7 @@ import { ensureManagedSSHConfigBlock } from "@/node/runtime/muxSshConfigWriter";
 import { log } from "@/node/services/log";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 const execFileAsync = promisify(execFile);
@@ -200,7 +201,8 @@ function tokensIn(blocks: Map<string, string>): Array<{ sandboxId: string; token
   return tokens;
 }
 
-// One lock per include file across writer instances: blocks of different sandboxes share it.
+// One lock per include file across writer instances in this process (withIncludeFileLock adds
+// the cross-process one): blocks of different sandboxes share it.
 const includeFileLocks = new MutexMap<string>();
 
 export interface DaytonaSshConfigWriterOptions {
@@ -254,9 +256,8 @@ export class DaytonaSshConfigWriter {
     gateway: DaytonaSshGateway,
     edit: (blocks: Map<string, string>) => void
   ): Promise<void> {
-    await ensurePrivateDir(this.paths.dir);
     const knownHosts = renderDaytonaKnownHosts(gateway);
-    await includeFileLocks.withLock(this.paths.includePath, async () => {
+    await this.withIncludeFileLock(async () => {
       await writeFileAtomic(this.paths.knownHostsPath, knownHosts, {
         encoding: "utf-8",
         mode: 0o600,
@@ -276,13 +277,12 @@ export class DaytonaSshConfigWriter {
     token: string;
     gateway: DaytonaSshGateway;
   }): Promise<void> {
-    await ensurePrivateDir(this.paths.dir);
     await this.upsertBlock(input);
   }
 
   async removeSandbox(sandboxId: string): Promise<void> {
     const alias = toXumDaytonaHost(sandboxId);
-    await includeFileLocks.withLock(this.paths.includePath, async () => {
+    await this.withIncludeFileLock(async () => {
       const blocks = await this.readBlocks();
       if (!blocks.delete(alias)) return;
       await this.writeBlocks(blocks);
@@ -305,10 +305,33 @@ export class DaytonaSshConfigWriter {
   }): Promise<void> {
     const block = this.renderBlock(input);
     const alias = toXumDaytonaHost(input.sandboxId);
-    return includeFileLocks.withLock(this.paths.includePath, async () => {
+    return this.withIncludeFileLock(async () => {
       const blocks = await this.readBlocks();
       blocks.set(alias, block);
       await this.writeBlocks(blocks);
+    });
+  }
+
+  /**
+   * Every read-modify-write of the include file (and known_hosts) runs under this. Another
+   * backend on the same Xum root (a desktop app next to `xum server`) has its own MutexMap:
+   * without the file lock, two writers read the same file and the later rename drops the
+   * other's alias. Callers never nest it.
+   */
+  private async withIncludeFileLock(fn: () => Promise<void>): Promise<void> {
+    await ensurePrivateDir(this.paths.dir);
+    await includeFileLocks.withLock(this.paths.includePath, async () => {
+      const release = await acquireCrossProcessLock({
+        lockPath: `${this.paths.includePath}.lock`,
+        acquireTimeoutMs: 30_000,
+        staleMs: 60_000,
+        timeoutMessage: "Another Xum process is updating the Daytona ssh config.",
+      });
+      try {
+        await fn();
+      } finally {
+        await release();
+      }
     });
   }
 

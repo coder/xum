@@ -8,6 +8,7 @@ import {
   XUM_DAYTONA_SSH_BLOCK_START,
   toXumDaytonaHost,
 } from "@/common/constants/daytona";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { DaytonaSshConfigWriter, renderDaytonaKnownHosts } from "./daytonaSshConfig";
 import { appendOpenSSHHostKeyPolicyArgs } from "./sshConnectionPool";
 
@@ -127,6 +128,39 @@ describe("DaytonaSshConfigWriter", () => {
     expect(await fs.readFile(writer.paths.includePath, "utf8")).not.toContain("ssh2.daytona.test");
     expect(await writer.readTokens()).toHaveLength(2);
     expect(await fs.readFile(writer.paths.knownHostsPath, "utf8")).toContain("GatewayKey");
+  });
+
+  it("waits for another backend's include file update before reading the file", async () => {
+    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+    const updates = [
+      () => writer.writeSandbox({ sandboxId: "sb-2", token: "tokenB", gateway: GATEWAY }),
+      () => writer.updateToken({ sandboxId: "sb-1", token: "tokenA2", gateway: GATEWAY }),
+      () => writer.repointGateway(GATEWAY),
+      () => writer.removeSandbox("sb-1"),
+    ];
+    for (const update of updates) {
+      // Held by this process, the file lock looks to the writer like another backend mid-write.
+      const release = await acquireCrossProcessLock({
+        lockPath: `${writer.paths.includePath}.lock`,
+        acquireTimeoutMs: 1_000,
+        staleMs: 60_000,
+        timeoutMessage: "test holder",
+      });
+      const before = await fs.readFile(writer.paths.includePath, "utf8");
+      let settled = false;
+      const running = update().finally(() => {
+        settled = true;
+      });
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        expect(settled).toBe(false);
+        expect(await fs.readFile(writer.paths.includePath, "utf8")).toBe(before);
+      } finally {
+        await release();
+      }
+      await running;
+    }
+    expect(await writer.readTokens()).toEqual([{ sandboxId: "sb-2", token: "tokenB" }]);
   });
 
   it("reads back the tokens the include file holds, for a later Xum process", async () => {
