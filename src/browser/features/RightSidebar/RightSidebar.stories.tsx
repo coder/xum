@@ -1598,16 +1598,12 @@ export const NewTabLauncher: Story = {
       });
       await openSidebarNewTab(canvasElement);
     }
-    // The New tab row hands focus to the launcher, which keeps it after the menu unmounts: Radix
-    // refocuses the menu button on a timer then if focus is still inside the menu.
+    // The strip's "+" hands focus to the launcher, which keeps it.
     const launcherHasFocus = () =>
       canvasElement
         .querySelector('[role="tabpanel"][id$="-panel-new"]')
         ?.contains(document.activeElement) === true;
     await waitFor(() => expect(launcherHasFocus()).toBe(true));
-    await waitFor(() =>
-      expect(within(document.body).queryByRole("dialog", { name: "All tabs" })).toBeNull()
-    );
     await new Promise((resolve) => setTimeout(resolve, 50));
     await expect(launcherHasFocus()).toBe(true);
   },
@@ -1792,12 +1788,16 @@ export const TabsReachableUnderWideTitlebarInset: Story = {
     const canvas = within(canvasElement);
     const stats = await canvas.findByRole("tab", { name: /^stats/i, selected: true });
     const review = await canvas.findByRole("tab", { name: /^review/i });
-    await expectSelectedTabVisible(canvasElement);
-    // All tabs must stay clickable too: it reaches every tab and the New tab.
+    // The capped inset leaves 10rem for the row, "+", All tabs and the toggle's room, so the
+    // selected Stats tab (with its cost badge) can be cut off at its end. Its start stays in
+    // view and takes the click.
+    // "+" (New tab) and All tabs must stay clickable too.
     await waitFor(() => {
       if (!isHitTarget(stats)) throw new Error("selected tab is not under the pointer");
-      if (!isHitTarget(canvas.getByRole("button", { name: "All tabs" }))) {
-        throw new Error("All tabs is not under the pointer");
+      for (const name of ["New tab", "All tabs"]) {
+        if (!isHitTarget(canvas.getByRole("button", { name }))) {
+          throw new Error(`${name} is not under the pointer`);
+        }
       }
     });
     // Like Playwright: bring the other tab into view, then it must take the click.

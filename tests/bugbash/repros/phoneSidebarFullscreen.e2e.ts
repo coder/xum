@@ -44,8 +44,7 @@ test(
     // sidebar, and its New tab launcher lists Side chat with the tools.
     await screen.getByRole("button", "Workspace actions").tap();
     await screen.getByRole("button", "Sidebar").tap();
-    await screen.getByRole("button", "All tabs").tap();
-    await screen.getByRole("dialog", "All tabs").getByRole("button", "New tab").tap();
+    await screen.getByRole("button", "New tab").tap();
     await expect(screen.getByRole("button", "Side chat")).toBeVisible();
   }
 );

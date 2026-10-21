@@ -4646,7 +4646,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "| New right sidebar tab (lists the tools) | `Ctrl+Alt+N`   |",
       "| Close the right sidebar's active tab    | `Ctrl+W`       |",
       "",
-      "The right sidebar shows only the tabs you open. A new tab lists the tools it can show (Stats, Review, Instructions, Goal, Terminal, and more); pick one to open it in that tab's place. The chevron at the right end of the tab strip lists your open tabs, with **New tab** at the bottom.",
+      "The right sidebar shows only the tabs you open. A new tab lists the tools it can show (Stats, Review, Instructions, Goal, Terminal, and more); pick one to open it in that tab's place. The **+** button after the last tab opens a new tab. The chevron at the right end of the tab strip lists your open tabs.",
       "",
       "### Command Palette",
       "",

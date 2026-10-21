@@ -1,4 +1,4 @@
-import { render, type RenderResult, waitFor, within } from "@testing-library/react";
+import { render, type RenderResult, waitFor } from "@testing-library/react";
 
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
 // App renders its pages through React.lazy (#6206), so the first page navigation of a test file
@@ -98,22 +98,17 @@ export function renderApp(props: RenderReviewPanelParams): RenderedApp {
             return;
           }
           // The strip holds only opened tabs: open the tool from a New tab's launcher, opening
-          // a New tab from the All tabs menu (a portal) first when none is showing. The retry
-          // then selects the tab.
+          // a New tab with the strip's "+" button first when none is showing. The retry then
+          // selects the tab.
           const launcherRow = Array.from(
             result.container.querySelectorAll<HTMLElement>(
               '[role="tabpanel"][id*="-panel-new"] button'
             )
           ).find((row) => row.getAttribute("aria-label") === LAUNCHER_TOOL_NAMES[tab]);
-          const menu = document.querySelector<HTMLElement>(
-            '[role="dialog"][aria-label="All tabs"]'
-          );
           if (launcherRow) {
             launcherRow.click();
-          } else if (menu) {
-            within(menu).getByRole("button", { name: "New tab" }).click();
           } else {
-            result.container.querySelector<HTMLElement>('button[aria-label="All tabs"]')?.click();
+            result.container.querySelector<HTMLElement>('button[aria-label="New tab"]')?.click();
           }
           throw new Error(`Tab "${tab}" not open yet`);
         },

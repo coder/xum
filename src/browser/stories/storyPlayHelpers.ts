@@ -1,13 +1,11 @@
 import { userEvent, waitFor, within } from "storybook/test";
 
 /**
- * Open (or show) the New tab of the right sidebar pane inside `scope`: its strip offers it only
- * as the last row of the All tabs menu, which renders in a portal outside `scope`.
+ * Open (or show) the New tab of the right sidebar pane inside `scope` with the "+" button after
+ * its tabs.
  */
 export async function openSidebarNewTab(scope: HTMLElement): Promise<void> {
-  await userEvent.click(await within(scope).findByRole("button", { name: "All tabs" }));
-  const menu = await within(scope.ownerDocument.body).findByRole("dialog", { name: "All tabs" });
-  await userEvent.click(within(menu).getByRole("button", { name: "New tab" }));
+  await userEvent.click(await within(scope).findByRole("button", { name: "New tab" }));
 }
 
 /**

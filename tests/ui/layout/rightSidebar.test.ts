@@ -215,7 +215,7 @@ describeIntegration("RightSidebar (UI)", () => {
   const getTabs = (sidebar: HTMLElement) =>
     Array.from(sidebar.querySelectorAll<HTMLElement>('[role="tab"]'));
 
-  /** The All tabs menu's New tab row opens the New tab; its launcher lists the tools. */
+  /** The strip's "+" button opens the New tab; its launcher lists the tools. */
   async function openLauncher(sidebar: HTMLElement): Promise<HTMLElement> {
     await openSidebarNewTab(sidebar);
     return findSidebarPanel(sidebar, "-panel-new");

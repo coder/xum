@@ -527,7 +527,7 @@ interface RightSidebarTabsetNodeProps {
   setLayout: (updater: (prev: RightSidebarLayoutState) => RightSidebarLayoutState) => void;
   /** Handler to pop out a terminal tab to a separate window */
   onPopOutTerminal: (tab: TabType) => void;
-  /** The strip's New tab row (All tabs menu): open (or show) this tabset's New tab */
+  /** The strip's "+" button: open (or show) this tabset's New tab */
   onAddNewTab: (tabsetId: string) => void;
   /** Only the tabset at the sidebar's top-right corner, where the shell's toggle sits over its strip */
   reservesSidebarToggle: boolean;
@@ -1300,7 +1300,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     setReviewPanelStats(stats ? { total: stats.total, read: stats.read } : null);
   }, []);
 
-  // Tabset whose New tab launcher should focus its first row once shown (its strip's New tab row
+  // Tabset whose New tab launcher should focus its first row once shown (its strip's "+" button
   // or the shortcut).
   const [launcherAutoFocusTabsetId, setLauncherAutoFocusTabsetId] = React.useState<string | null>(
     null
@@ -2302,7 +2302,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     [setLayout]
   );
 
-  // A strip's New tab row (tabsetId) or the shortcut (focused tabset): show that tabset's New
+  // A strip's "+" button (tabsetId) or the shortcut (focused tabset): show that tabset's New
   // tab and move focus into its launcher.
   const handleAddNewTab = React.useCallback(
     (tabsetId?: string) => {

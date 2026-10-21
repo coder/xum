@@ -17,13 +17,11 @@ test(
     const tablist = screen.getByRole("tablist", "Sidebar views");
     // The strip shows only opened tabs: open Artifacts, then Goal after it, from New tabs.
     for (const tool of ["Artifacts", "Goal"]) {
-      // The All tabs button is a sibling of the tablist so the list owns only tabs. Its menu
-      // (a portal, outside the sidebar) ends with the New tab row.
+      // The "+" button is a sibling of the tablist so the list owns only tabs.
       await screen
         .getByRole("complementary", "Workspace insights")
-        .getByRole("button", "All tabs")
+        .getByRole("button", "New tab")
         .tap();
-      await screen.getByRole("dialog", "All tabs").getByRole("button", "New tab").tap();
       await screen
         .getByRole("tabpanel", /^New tab/)
         .getByRole("button", tool)

@@ -16,8 +16,9 @@ test(
     await browser.keyboard.press("Control+Shift+K");
     await expect(screen.getByTestId("artifacts-panel")).toBeFocused();
 
-    // The issue's steps: Shift+Tab past the strip's All tabs button reaches the tab's X (the
-    // right sidebar toggle comes before the sidebar in Tab order).
+    // The issue's steps: Shift+Tab past the strip's All tabs and "+" buttons reaches the tab's
+    // X (the right sidebar toggle comes before the sidebar in Tab order).
+    await browser.keyboard.press("Shift+Tab");
     await browser.keyboard.press("Shift+Tab");
     await browser.keyboard.press("Shift+Tab");
     const close = screen.getByRole("button", "Close Artifacts");

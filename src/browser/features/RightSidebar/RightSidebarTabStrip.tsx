@@ -5,15 +5,14 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/To
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { useDroppable, useDndContext } from "@dnd-kit/core";
-import { Check, ChevronDown, X } from "lucide-react";
-import { isNewTab, type TabType } from "@/browser/types/rightSidebar";
+import { Check, ChevronDown, Plus, X } from "lucide-react";
+import type { TabType } from "@/browser/types/rightSidebar";
 import { formatKeybind, formatKeybindForAria, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   isDesktopMode,
   DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
 } from "@/browser/hooks/useDesktopTitlebar";
 import { RightSidebarToggleSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
-import { NewTabLabel } from "./Tabs/TabLabels";
 
 // Re-export for consumers that import from this file
 export { getTabName } from "./Tabs";
@@ -51,7 +50,7 @@ interface RightSidebarTabStripProps {
   ariaLabel?: string;
   /** Unique ID of this tabset (for drag/drop) */
   tabsetId: string;
-  /** The All tabs menu's New tab row: open (or show) this tabset's New tab */
+  /** The "+" button after the tabs: open (or show) this tabset's New tab */
   onAddNewTab: () => void;
   /**
    * Ends with room for WorkspaceShell's right sidebar toggle, which sits over the sidebar's
@@ -201,7 +200,7 @@ const TabCloseButton: React.FC<{
 );
 
 /**
- * Icon buttons after the tabs (All tabs). Coarse pointers get a 24px target: tablets have no
+ * Icon buttons after the tabs ("+", All tabs). Coarse pointers get a 24px target: tablets have no
  * global touch floor (phones get 44px from it).
  */
 function stripIconButtonClassName(isDesktop: boolean): string {
@@ -212,6 +211,35 @@ function stripIconButtonClassName(isDesktop: boolean): string {
 }
 
 const TAB_LIST_LABEL = "All tabs";
+const NEW_TAB_LABEL = "New tab";
+
+/**
+ * Opens (or shows) this tabset's New tab. It sits right after the tabs, like a browser's "+",
+ * so it follows the last tab; once the tabs overflow, the row scrolls while "+" stays in view.
+ */
+const NewTabButton: React.FC<{ isDesktop: boolean; onAddNewTab: () => void }> = (props) => (
+  <Tooltip>
+    <TooltipTrigger asChild>
+      <button
+        type="button"
+        className={stripIconButtonClassName(props.isDesktop)}
+        aria-label={NEW_TAB_LABEL}
+        aria-keyshortcuts={formatKeybindForAria(KEYBINDS.NEW_SIDEBAR_TAB)}
+        onClick={props.onAddNewTab}
+      >
+        <Plus className="h-3.5 w-3.5" />
+      </button>
+    </TooltipTrigger>
+    <TooltipContent side="bottom">
+      {NEW_TAB_LABEL}
+      {/* Phones have no keyboard: hidden there. */}
+      <span className="mobile-hide-shortcut-hints">
+        {" "}
+        ({formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB)})
+      </span>
+    </TooltipContent>
+  </Tooltip>
+);
 
 /** Arrow keys move between the menu's rows, like a menu (Tab works too). */
 function handleTabListArrowKeys(event: React.KeyboardEvent<HTMLElement>): void {
@@ -228,53 +256,41 @@ const TabListMenuRow: React.FC<{
   label: React.ReactNode;
   selected: boolean;
   disabled?: boolean;
-  keyShortcuts?: string;
   onPick: () => void;
-  children?: React.ReactNode;
 }> = (props) => (
   <button
     type="button"
     disabled={props.disabled}
     aria-current={props.selected || undefined}
-    aria-keyshortcuts={props.keyShortcuts}
     className="text-content-secondary hover:bg-hover focus:bg-hover flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-xs outline-none disabled:opacity-50"
     onClick={props.onPick}
   >
     <Check className={cn("h-3 w-3 shrink-0", !props.selected && "invisible")} />
     <span className="flex min-w-0 items-center gap-1.5 truncate">{props.label}</span>
-    {props.children}
   </button>
 );
 
 /**
  * Lists every tab in the strip, so a tab scrolled out of the row is one pick away (a narrow
- * pane shows only a tab or two, and touch users may not know the row scrolls). Its last row
- * opens (or shows) the New tab, which therefore has no row among the tabs.
+ * pane shows only a tab or two, and touch users may not know the row scrolls). An open New tab
+ * is listed like any other tab; the strip's "+" button opens one.
  */
 const TabListMenu: React.FC<{
   items: RightSidebarTabStripItem[];
   isDesktop: boolean;
-  onAddNewTab: () => void;
 }> = (props) => {
   const [open, setOpen] = React.useState(false);
   const [tooltipOpen, setTooltipOpen] = React.useState(false);
   const contentRef = React.useRef<HTMLDivElement>(null);
 
-  const tabRows = props.items.filter((item) => !isNewTab(item.tab));
-  const newTabSelected = props.items.some((item) => isNewTab(item.tab) && item.selected);
-
-  // A pick moves focus out of the menu (to the tab, or into the New tab's launcher), so Radix
-  // does not send it back to this button on close.
+  // A pick moves focus out of the menu (to the tab), so Radix does not send it back to this
+  // button on close.
   const pick = (item: RightSidebarTabStripItem) => {
     setOpen(false);
     item.onSelect();
     // The strip scrolls the selected tab into view itself; focus() would also scroll the
     // sidebar's overflow-hidden ancestors.
     document.getElementById(item.id)?.focus({ preventScroll: true });
-  };
-  const pickNewTab = () => {
-    setOpen(false);
-    props.onAddNewTab();
   };
 
   return (
@@ -306,7 +322,7 @@ const TabListMenu: React.FC<{
         }}
         onKeyDown={handleTabListArrowKeys}
       >
-        {tabRows.map((item) => (
+        {props.items.map((item) => (
           <TabListMenuRow
             key={item.id}
             label={item.menuLabel ?? item.label}
@@ -315,23 +331,6 @@ const TabListMenu: React.FC<{
             onPick={() => pick(item)}
           />
         ))}
-        {tabRows.length > 0 && (
-          <div role="separator" className="border-separator-light my-1 border-t" />
-        )}
-        <TabListMenuRow
-          label={<NewTabLabel />}
-          selected={newTabSelected}
-          keyShortcuts={formatKeybindForAria(KEYBINDS.NEW_SIDEBAR_TAB)}
-          onPick={pickNewTab}
-        >
-          {/* Screen readers get it from aria-keyshortcuts. Phones have no keyboard: hidden. */}
-          <span
-            aria-hidden="true"
-            className="text-muted mobile-hide-shortcut-hints ml-auto shrink-0 pl-2 text-[10px]"
-          >
-            ({formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB)})
-          </span>
-        </TabListMenuRow>
       </PopoverContent>
     </Popover>
   );
@@ -341,14 +340,13 @@ const TabListMenu: React.FC<{
 const StripEndControls: React.FC<{
   items: RightSidebarTabStripItem[];
   isDesktop: boolean;
-  onAddNewTab: () => void;
   reservesSidebarToggle: boolean;
 }> = (props) => (
   <div
     className="ml-auto flex shrink-0 items-center gap-1"
     data-sidebar-toggle-room={props.reservesSidebarToggle || undefined}
   >
-    <TabListMenu items={props.items} isDesktop={props.isDesktop} onAddNewTab={props.onAddNewTab} />
+    <TabListMenu items={props.items} isDesktop={props.isDesktop} />
     {props.reservesSidebarToggle && <RightSidebarToggleSpacer />}
   </div>
 );
@@ -500,10 +498,10 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
         tabsetId={tabsetId}
         isDesktop={isDesktop}
       />
+      <NewTabButton isDesktop={isDesktop} onAddNewTab={onAddNewTab} />
       <StripEndControls
         items={items}
         isDesktop={isDesktop}
-        onAddNewTab={onAddNewTab}
         reservesSidebarToggle={reservesSidebarToggle === true}
       />
     </div>
