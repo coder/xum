@@ -1,5 +1,6 @@
 import type { Workspace } from "@/common/types/project";
 import { getDaytonaSandboxId, type RuntimeConfig } from "@/common/types/runtime";
+import { Err, type Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import type { DaytonaSandbox } from "./daytonaClient";
@@ -32,6 +33,11 @@ export interface DaytonaReconcilerOptions {
    * API traffic. May check a job over ssh, so it is only asked about a started sandbox.
    */
   isWorkspaceActive: (workspaceId: string) => boolean | Promise<boolean>;
+  /**
+   * Whether detached jobs that survived an unclean Xum exit still run (durable spawn records
+   * on the sandbox). Asked over ssh, so only about a started sandbox; an error counts as yes.
+   */
+  hasUnsettledRemoteJobs?: (ref: DaytonaSandboxRef) => Promise<Result<boolean>>;
   intervalMs?: number;
   callTimeoutMs?: number;
 }
@@ -54,6 +60,13 @@ export function listDaytonaWorkspaceRefs(config: {
     }
   }
   return refs;
+}
+
+/** A workspace on a Daytona sandbox. */
+export interface DaytonaSandboxRef {
+  workspaceId: string;
+  runtimeConfig: RuntimeConfig;
+  sandboxId: string;
 }
 
 function isStarted(sandbox: DaytonaSandbox): boolean {
@@ -83,6 +96,12 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, what: string): P
  */
 export class DaytonaReconciler {
   private readonly options: DaytonaReconcilerOptions;
+  /**
+   * Workspaces whose remote spawn records read clear. Crash survivors only predate this
+   * process (later jobs are tracked in memory), and each probe is ssh traffic that Daytona
+   * counts as activity, so a clear workspace is never probed again.
+   */
+  private readonly remoteJobsClear = new Set<string>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private sweeping: Promise<void> | undefined;
 
@@ -132,26 +151,23 @@ export class DaytonaReconciler {
     await this.stopOrphans(sandboxes, refs);
   }
 
-  private collectReferences(): Array<{ workspaceId: string; sandboxId: string }> {
-    const refs: Array<{ workspaceId: string; sandboxId: string }> = [];
-    for (const workspace of this.options.listWorkspaces()) {
-      const sandboxId = getDaytonaSandboxId(workspace.runtimeConfig);
-      if (sandboxId) refs.push({ workspaceId: workspace.workspaceId, sandboxId });
+  private collectReferences(): DaytonaSandboxRef[] {
+    const refs: DaytonaSandboxRef[] = [];
+    for (const { workspaceId, runtimeConfig } of this.options.listWorkspaces()) {
+      const sandboxId = getDaytonaSandboxId(runtimeConfig);
+      if (sandboxId && runtimeConfig) refs.push({ workspaceId, runtimeConfig, sandboxId });
     }
     return refs;
   }
 
-  private async keepAlive(
-    ref: { workspaceId: string; sandboxId: string },
-    sandboxes: DaytonaSandbox[]
-  ): Promise<void> {
+  private async keepAlive(ref: DaytonaSandboxRef, sandboxes: DaytonaSandbox[]): Promise<void> {
     const sandbox = await this.findActiveSandbox(ref, sandboxes);
     if (sandbox) await this.refreshActivityAndToken(ref.sandboxId, sandbox.id);
   }
 
   /** The sandbox of a workspace that is active, if the sandbox is known and started. */
   private async findActiveSandbox(
-    ref: { workspaceId: string; sandboxId: string },
+    ref: DaytonaSandboxRef,
     sandboxes: DaytonaSandbox[]
   ): Promise<DaytonaSandbox | undefined> {
     // Xum stores a name for sandboxes it created; last-activity only takes the real id. An
@@ -161,7 +177,8 @@ export class DaytonaReconciler {
       (await this.lookUpSandbox(ref.sandboxId));
     // A stopped sandbox has nothing to keep alive, and checking its jobs over ssh would start it.
     if (!sandbox || !isStarted(sandbox)) return undefined;
-    return (await this.isWorkspaceActive(ref.workspaceId)) ? sandbox : undefined;
+    if (await this.isWorkspaceActive(ref.workspaceId)) return sandbox;
+    return (await this.hasUnsettledRemoteJobs(ref)) ? sandbox : undefined;
   }
 
   private async isWorkspaceActive(workspaceId: string): Promise<boolean> {
@@ -177,6 +194,27 @@ export class DaytonaReconciler {
       });
       return false;
     }
+  }
+
+  /** Fails closed (keeps the sandbox alive) when the probe fails or times out. */
+  private async hasUnsettledRemoteJobs(ref: DaytonaSandboxRef): Promise<boolean> {
+    const probe = this.options.hasUnsettledRemoteJobs;
+    if (!probe || this.remoteJobsClear.has(ref.workspaceId)) return false;
+    let result: Result<boolean>;
+    try {
+      result = await this.call(probe(ref), "checking jobs that survived a restart");
+    } catch (error) {
+      result = Err(getErrorMessage(error));
+    }
+    if (!result.success) {
+      log.warn("Daytona reconcile: could not check jobs that survived a restart", {
+        workspaceId: ref.workspaceId,
+        error: result.error,
+      });
+      return true;
+    }
+    if (!result.data) this.remoteJobsClear.add(ref.workspaceId);
+    return result.data;
   }
 
   /** `storedId` is what the workspace config holds (tokens use it), `realId` the sandbox id. */

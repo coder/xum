@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { createDaytonaTestRig, type DaytonaTestRig } from "./daytona.testHarness";
-import { DaytonaReconciler, listDaytonaWorkspaceRefs } from "./daytonaReconciler";
+import { Ok } from "@/common/types/result";
+import {
+  DaytonaReconciler,
+  listDaytonaWorkspaceRefs,
+  type DaytonaReconcilerOptions,
+} from "./daytonaReconciler";
 import { DAYTONA_LABEL_INSTANCE } from "./daytonaService";
 
 let rig: DaytonaTestRig;
@@ -31,7 +36,8 @@ let activityChecks: string[];
 function makeReconciler(
   workspaces: Array<{ id: string; runtimeConfig: RuntimeConfig; archivedAt?: string }>,
   activeIds: string[],
-  callTimeoutMs?: number
+  callTimeoutMs?: number,
+  hasUnsettledRemoteJobs?: DaytonaReconcilerOptions["hasUnsettledRemoteJobs"]
 ): DaytonaReconciler {
   const config = { projects: new Map([["/home/me/project", { workspaces }]]) };
   activityChecks = [];
@@ -43,6 +49,7 @@ function makeReconciler(
       return Promise.resolve(activeIds.includes(workspaceId));
     },
     callTimeoutMs,
+    hasUnsettledRemoteJobs,
   });
 }
 
@@ -150,5 +157,32 @@ describe("DaytonaReconciler.sweep", () => {
 
     expect(activityChecks).toEqual([]);
     expect(rig.plane.countCalls("POST /sandbox/sb-attached-off/last-activity")).toBe(0);
+  });
+
+  it("keeps a sandbox alive under jobs that survived a Xum crash, probing a clear one once", async () => {
+    rig.plane.addSandbox({ id: "sb-1", name: "xum-survivor", labels: instanceLabels });
+    rig.plane.addSandbox({ id: "sb-2", name: "xum-quiet", labels: instanceLabels });
+    const probed: string[] = [];
+    const reconciler = makeReconciler(
+      [
+        { id: "ws-survivor", runtimeConfig: daytonaConfig("xum-survivor") },
+        { id: "ws-quiet", runtimeConfig: daytonaConfig("xum-quiet") },
+      ],
+      // Neither streams nor holds a job in this process's memory.
+      [],
+      undefined,
+      (ref) => {
+        probed.push(ref.workspaceId);
+        return Promise.resolve(Ok(ref.workspaceId === "ws-survivor"));
+      }
+    );
+
+    await reconciler.sweep();
+    await reconciler.sweep();
+
+    expect(rig.plane.countCalls("POST /sandbox/sb-1/last-activity")).toBe(2);
+    expect(rig.plane.countCalls("POST /sandbox/sb-2/last-activity")).toBe(0);
+    // A probe is itself ssh traffic that Daytona counts: a clear workspace is not probed again.
+    expect(probed).toEqual(["ws-survivor", "ws-quiet", "ws-survivor"]);
   });
 });

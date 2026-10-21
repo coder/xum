@@ -67,7 +67,7 @@ import {
 } from "@/node/services/daytona/daytonaReconciler";
 import { createDaytonaArchiveHook } from "@/node/services/daytona/daytonaLifecycleHooks";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
-import { setGlobalDaytonaService } from "@/node/runtime/runtimeFactory";
+import { createRuntime, setGlobalDaytonaService } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { DaytonaSSHRuntime } from "@/node/runtime/DaytonaSSHRuntime";
 import { Err } from "@/common/types/result";
@@ -480,6 +480,12 @@ export class ServiceContainer {
       isWorkspaceActive: async (workspaceId) =>
         this.aiService.isStreaming(workspaceId) ||
         (await this.backgroundProcessManager.hasLiveBackgroundProcesses(workspaceId)),
+      // Detached jobs that outlived an unclean exit are in no in-memory list.
+      hasUnsettledRemoteJobs: (ref) =>
+        this.backgroundProcessManager.hasUnsettledRemoteSpawnRecords(
+          createRuntime(ref.runtimeConfig, { workspaceId: ref.workspaceId }),
+          ref.workspaceId
+        ),
     });
   }
 
