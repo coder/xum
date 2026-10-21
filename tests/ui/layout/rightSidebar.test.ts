@@ -1206,6 +1206,55 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
+  test("the palette's split requests reveal the sidebar and move focus into the new pane", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      seedLayout(["costs", "goal"]);
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), true);
+    });
+    const split = (direction: "horizontal" | "vertical") =>
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE, { workspaceId, direction })
+      );
+
+    try {
+      // From two tabs, the split moves the shown one (Stats) to the new pane: focus follows it.
+      split("vertical");
+      await waitFor(() => {
+        const active = document.activeElement;
+        expect(active?.getAttribute("role")).toBe("tab");
+        expect(active?.getAttribute("aria-controls")).toContain("-panel-costs");
+      });
+      expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), true)).toBe(false);
+
+      // Stats is now alone in the focused pane, so the next split gives the new pane a New tab:
+      // focus lands on its launcher's first row.
+      split("horizontal");
+      const launcher = await findSidebarPanel(sidebar, "-panel-new");
+      await waitFor(() => {
+        expect(document.activeElement).toBe(launcher.querySelector("button"));
+      });
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("the palette's Add Tool request reveals the sidebar with focus on the tool's tab", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), true);
+    });
+
+    try {
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL, { workspaceId, tool: "costs" })
+      );
+      const statsTab = await findSidebarTab(sidebar, "costs");
+      await waitFor(() => expect(document.activeElement).toBe(statsTab));
+      expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), true)).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
   test("a new terminal gets its tab even when the layout no longer fits its budget", async () => {
     // Pad the tabset id so the layout sits just under its budget: with a terminal tab (~45 chars)
     // it no longer fits. That layout write used to be refused, so the terminal never got a tab.

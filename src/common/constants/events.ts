@@ -150,6 +150,20 @@ export const CUSTOM_EVENTS = {
   OPEN_NEW_SIDEBAR_TAB: "mux:openNewSidebarTab",
 
   /**
+   * Split the focused right-sidebar pane and move focus into the new pane (the command palette's
+   * "Right Sidebar: Split Horizontally/Vertically").
+   * Detail: { workspaceId: string, direction: "horizontal" | "vertical" }
+   */
+  SPLIT_SIDEBAR_PANE: "mux:splitSidebarPane",
+
+  /**
+   * Open a tool in the focused right-sidebar pane, as picking it in that pane's New tab does,
+   * focus included (the command palette's "Right Sidebar: Add Tool…").
+   * Detail: { workspaceId: string, tool: string } (a base tab id)
+   */
+  OPEN_SIDEBAR_TOOL: "mux:openSidebarTool",
+
+  /**
    * Start a new chat the way the left sidebar's "New chat" button does. Sent by the app shell's
    * toggle bar while the sidebar is collapsed; ProjectSidebar stays mounted and owns
    * the draft logic. No payload.
@@ -285,6 +299,15 @@ export interface CustomEventPayloads {
   };
   [CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB]: {
     workspaceId: string;
+  };
+  [CUSTOM_EVENTS.SPLIT_SIDEBAR_PANE]: {
+    workspaceId: string;
+    direction: "horizontal" | "vertical";
+  };
+  [CUSTOM_EVENTS.OPEN_SIDEBAR_TOOL]: {
+    workspaceId: string;
+    /** A base tab id (BaseTabType, a browser type); the sidebar ignores anything else. */
+    tool: string;
   };
   [CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB]: {
     /** The main chat whose right sidebar shows the tab. */
