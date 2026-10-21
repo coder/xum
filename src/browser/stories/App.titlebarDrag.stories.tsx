@@ -19,7 +19,7 @@ import { expect, userEvent, waitFor, within } from "storybook/test";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar, expandLeftSidebar, expandRightSidebar } from "./helpers/uiState";
-import { windowDragsAt, withDesktopTitlebar } from "./helpers/windowDrag";
+import { windowDragsAt, windowDragsAtEach, withDesktopTitlebar } from "./helpers/windowDrag";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
 
@@ -72,15 +72,31 @@ async function expectWorkspaceHeaderGapDrags(canvasElement: HTMLElement) {
   await expectDrags(bell, "Notifications button", false);
 }
 
-/** On every animation frame while `act` runs: does the window drag at the element's center? */
+/**
+ * Where in the element's box the window drags: its center and its corners (1px in). A no-drag
+ * hole smaller than the control, or off its place, still covers the center.
+ */
+function draggingPoints(element: Element): string[] {
+  const rect = element.getBoundingClientRect();
+  const points = {
+    center: center(element),
+    "top left": { x: rect.left + 1, y: rect.top + 1 },
+    "top right": { x: rect.right - 1, y: rect.top + 1 },
+    "bottom left": { x: rect.left + 1, y: rect.bottom - 1 },
+    "bottom right": { x: rect.right - 1, y: rect.bottom - 1 },
+  };
+  const drags = windowDragsAtEach(Object.values(points));
+  return Object.keys(points).filter((_, index) => drags[index]);
+}
+
+/** On every animation frame while `act` runs: does the window drag anywhere on the element? */
 async function sampleDragFrames(element: Element, act: () => Promise<void>) {
   const result = { frames: 0, dragging: 0 };
   let sampling = true;
   const sample = () => {
     if (!sampling) return;
     result.frames++;
-    const point = center(element);
-    if (windowDragsAt(point.x, point.y)) result.dragging++;
+    if (draggingPoints(element).length > 0) result.dragging++;
     requestAnimationFrame(sample);
   };
   sample();
@@ -194,7 +210,7 @@ export const RightSidebarToggle = desktopStory({
     const strip = () => canvas.queryByRole("tablist", { name: "Sidebar views" });
     // The toggle renders before the lazy sidebar: wait for the strip that comes after it.
     await waitFor(() => expect(strip()).toBeInTheDocument(), { timeout: 15_000 });
-    await expectDrags(toggle, "Collapse right sidebar button", false);
+    await expect(draggingPoints(toggle), "Collapse right sidebar button drags at").toEqual([]);
 
     // The strip slides under the toggle while the sidebar's width animates.
     const collapsing = await sampleDragFrames(toggle, async () => {
@@ -204,7 +220,7 @@ export const RightSidebarToggle = desktopStory({
     await expect(collapsing.frames).toBeGreaterThan(2);
     await expect(collapsing.dragging, "frames the toggle drags in while collapsing").toBe(0);
     await expect(toggle).toHaveAccessibleName("Expand right sidebar");
-    await expectDrags(toggle, "Expand right sidebar button", false);
+    await expect(draggingPoints(toggle), "Expand right sidebar button drags at").toEqual([]);
     await expectWorkspaceHeaderGapDrags(canvasElement);
 
     const expanding = await sampleDragFrames(toggle, async () => {

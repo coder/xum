@@ -33,7 +33,12 @@ export function rectContains(rect: DOMRect, x: number, y: number): boolean {
  * Chromium version.
  */
 export function windowDragsAt(x: number, y: number): boolean {
-  let drags = false;
+  return windowDragsAtEach([{ x, y }])[0];
+}
+
+/** {@link windowDragsAt} for several points in one walk of the DOM, cheap enough per frame. */
+export function windowDragsAtEach(points: ReadonlyArray<{ x: number; y: number }>): boolean[] {
+  const drags = points.map(() => false);
   const visit = (element: Element) => {
     const style = getComputedStyle(element);
     if (style.display === "none") return;
@@ -41,9 +46,12 @@ export function windowDragsAt(x: number, y: number): boolean {
       const mode = element.closest(APP_REGION_SELECTOR);
       const isBox = style.display !== "inline" || REPLACED_ELEMENTS.has(element.localName);
       if (mode && isBox && style.visibility === "visible") {
-        if (rectContains(element.getBoundingClientRect(), x, y)) {
-          drags = mode.classList.contains("titlebar-drag");
-        }
+        const rect = element.getBoundingClientRect();
+        points.forEach((point, index) => {
+          if (rectContains(rect, point.x, point.y)) {
+            drags[index] = mode.classList.contains("titlebar-drag");
+          }
+        });
       }
     }
     for (const child of element.children) visit(child);
