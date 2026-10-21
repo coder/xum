@@ -126,6 +126,27 @@ describe("createDaytonaArchiveHook", () => {
     expect(rig.plane.find("sb-9")?.state).toBe("started");
   });
 
+  it("releases an alias no other workspace stores, keeping the sandbox another one uses", async () => {
+    // The owner stores the generated name, the attached workspace the real id: ssh access
+    // (token, include block, pooled sessions, forwards) is per stored string.
+    rig.plane.addSandbox({ id: "sb-9", name: "xum-owner-def456" });
+    rig.workspaces.push({
+      workspaceId: "attached",
+      runtimeConfig: metadata({ sandboxId: "sb-9", shared: true }).runtimeConfig,
+    });
+    await rig.service.ensureSshAccess("xum-owner-def456"); // tok1
+    await rig.service.ensureSshAccess("sb-9");
+
+    expect((await archive({ sandboxId: "xum-owner-def456", shared: false }, "stop")).success).toBe(
+      true
+    );
+
+    expect(rig.plane.find("sb-9")?.state).toBe("started");
+    expect(rig.plane.revokedTokens).toEqual(["tok1"]);
+    expect(rig.writer.removed).toEqual(["xum-owner-def456"]);
+    expect(rig.service.tokenNeedsRefresh("sb-9")).toBe(false);
+  });
+
   it("leaves the parent's sandbox alone when a shared-checkout sub-agent is archived", async () => {
     rig.plane.addSandbox({ id: "sb-parent" });
     const hook = createDaytonaArchiveHook({

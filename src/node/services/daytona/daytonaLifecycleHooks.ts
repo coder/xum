@@ -23,6 +23,7 @@ export interface DaytonaArchiveHookOptions {
     | "stopAndWait"
     | "deleteSandbox"
     | "isSandboxReferencedElsewhere"
+    | "isAliasStoredElsewhere"
     | "releaseSshAccess"
     | "withAccountLease"
   >;
@@ -48,8 +49,17 @@ async function archiveSandbox(
   options: DaytonaArchiveHookOptions,
   args: Parameters<BeforeArchiveHook>[0]
 ): Promise<Result<void>> {
-  const sandboxId = await unsharedSandboxId(options, args.workspaceMetadata);
+  const sandboxId = storedSandboxId(args.workspaceMetadata);
   if (!sandboxId) return Ok(undefined);
+  const workspaceId = args.workspaceMetadata.id;
+  if (await options.daytonaService.isSandboxReferencedElsewhere(sandboxId, workspaceId)) {
+    // The sandbox stays as it is, but ssh access is per stored string: another workspace that
+    // stores the same sandbox under its other identifier (name or id) never uses this alias.
+    if (!options.daytonaService.isAliasStoredElsewhere(sandboxId, workspaceId)) {
+      await releaseSshAccess(options, sandboxId);
+    }
+    return Ok(undefined);
+  }
 
   const result = isDedicatedDaytonaSandbox(args.workspaceMetadata.runtimeConfig)
     ? await applyArchiveBehavior(options, args, sandboxId)
@@ -76,20 +86,12 @@ async function applyArchiveBehavior(
   }
 }
 
-/** The archived workspace's sandbox, unless another workspace (archived ones too) uses it. */
-async function unsharedSandboxId(
-  options: DaytonaArchiveHookOptions,
-  workspaceMetadata: WorkspaceMetadata
-): Promise<string | undefined> {
+/** The sandbox as the archived workspace stores it (its name or its id). */
+function storedSandboxId(workspaceMetadata: WorkspaceMetadata): string | undefined {
   // A shared-checkout sub-agent copies its parent's runtime config, sandbox ID included:
-  // the sandbox belongs to the parent.
+  // the sandbox and its access belong to the parent.
   if (workspaceMetadata.taskIsolation === "none") return undefined;
-  const sandboxId = getDaytonaSandboxId(workspaceMetadata.runtimeConfig);
-  if (!sandboxId) return undefined;
-  if (await options.daytonaService.isSandboxReferencedElsewhere(sandboxId, workspaceMetadata.id)) {
-    return undefined;
-  }
-  return sandboxId;
+  return getDaytonaSandboxId(workspaceMetadata.runtimeConfig);
 }
 
 /** The archived workspace needs no token; unarchive mints a new one. */
