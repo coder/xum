@@ -12,6 +12,7 @@ import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
 import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
+import { useDaytonaConfigVersion } from "@/browser/hooks/useDaytonaResources";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import { handOffCreationAiSelection } from "@/browser/utils/aiSelectionIntent";
 import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
@@ -380,6 +381,9 @@ export function useCreationWorkspace({
   // again: a new client (reconnect) reloads the same project behind the shown values.
   const shownProjectPathRef = useRef<string | null>(null);
 
+  // Saving Daytona access in Settings (which covers this view) changes Daytona's availability.
+  const daytonaConfigVersion = useDaytonaConfigVersion();
+
   // Load branches and runtime availability on mount with mounted guard
   useEffect(() => {
     if (kind === "scratch") {
@@ -422,7 +426,7 @@ export function useCreationWorkspace({
       mounted = false;
       cancelBranchLoad();
     };
-  }, [kind, projectPath, api]);
+  }, [kind, projectPath, api, daytonaConfigVersion]);
 
   // Cleanup: resolve trust prompt on unmount so handleSend doesn't wedge
   useEffect(() => {

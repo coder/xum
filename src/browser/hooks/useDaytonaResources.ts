@@ -6,6 +6,7 @@
 import { useEffect, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import type { DaytonaPublicConfig, DaytonaSandboxSummary } from "@/common/orpc/schemas/daytona";
+import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { getErrorMessage } from "@/common/utils/errors";
 
 export interface DaytonaResources {
@@ -40,8 +41,23 @@ interface UseDaytonaResourcesOptions {
   loadSandboxes: boolean;
 }
 
+/**
+ * Changes each time Daytona access is saved in Settings. Settings covers views that stay
+ * mounted (the creation controls), so what they loaded from the old access must reload.
+ */
+export function useDaytonaConfigVersion(): number {
+  const [version, setVersion] = useState(0);
+  useEffect(() => {
+    const bump = () => setVersion((previous) => previous + 1);
+    window.addEventListener(CUSTOM_EVENTS.DAYTONA_CONFIG_CHANGED, bump);
+    return () => window.removeEventListener(CUSTOM_EVENTS.DAYTONA_CONFIG_CHANGED, bump);
+  }, []);
+  return version;
+}
+
 export function useDaytonaResources(options: UseDaytonaResourcesOptions): DaytonaResources {
   const { api } = useAPI();
+  const configVersion = useDaytonaConfigVersion();
   // One state object so consumers get a stable identity until something actually loads.
   const [resources, setResources] = useState<DaytonaResources>(EMPTY_DAYTONA_RESOURCES);
   const { loadSandboxes } = options;
@@ -98,7 +114,7 @@ export function useDaytonaResources(options: UseDaytonaResourcesOptions): Dayton
     return () => {
       active = false;
     };
-  }, [api, loadSandboxes]);
+  }, [api, loadSandboxes, configVersion]);
 
   return resources;
 }

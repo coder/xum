@@ -4,6 +4,7 @@ import { Button } from "@/browser/components/Button/Button";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI } from "@/browser/contexts/API";
 import { DAYTONA_DEFAULT_API_URL } from "@/common/constants/daytona";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { DaytonaPublicConfig } from "@/common/orpc/schemas/daytona";
 import { getErrorMessage } from "@/common/utils/errors";
 import { DaytonaSandboxForm } from "@/browser/features/Runtime/DaytonaControls";
@@ -88,6 +89,7 @@ function useDaytonaAccess() {
     resetTest();
     try {
       setConfig(await api.daytona.setConfig(input));
+      window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.DAYTONA_CONFIG_CHANGED));
       return true;
     } catch (error) {
       setSaveError(`Could not save Daytona settings: ${getErrorMessage(error)}`);
