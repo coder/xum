@@ -2030,11 +2030,13 @@ export const workspace = {
       }),
       output: ResultSchema(z.void(), z.string()),
     },
-    // When the next heartbeat slot opens (epoch ms); null while the scheduler does not track the
-    // workspace (see HeartbeatService.getNextHeartbeatAt).
+    // Milliseconds until the next heartbeat slot opens; null while the scheduler does not track
+    // the workspace (see HeartbeatService.getMsUntilNextHeartbeat).
     next: {
-      // Non-empty: getNextHeartbeatAt asserts on it, and client input must fail validation instead.
-      input: z.object({ workspaceId: z.string().min(1) }),
+      // Not blank: the service asserts on it, and client input must fail validation instead.
+      input: z.object({
+        workspaceId: z.string().refine((id) => id.trim().length > 0, "workspaceId is blank"),
+      }),
       output: z.number().nullable(),
     },
   },

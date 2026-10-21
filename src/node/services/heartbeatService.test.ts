@@ -746,26 +746,33 @@ describe("HeartbeatService", () => {
       expect(resetDeadline).toBeGreaterThan(initialDeadline!);
     });
 
-    test("reports the tracked deadline, and none for an untracked workspace", async () => {
+    test("reports the time until the tracked deadline, and none for an untracked workspace", async () => {
       service.start();
       await getInternals().resyncFromConfig(0);
-      expect(service.getNextHeartbeatAt(testWorkspaceId)).toBe(defaultHeartbeatIntervalMs);
-      expect(service.getNextHeartbeatAt("untracked-ws")).toBeNull();
+      // resyncFromConfig(0) puts the first deadline one interval after time 0.
+      expect(service.getMsUntilNextHeartbeat(testWorkspaceId, 1000)).toBe(
+        defaultHeartbeatIntervalMs - 1000
+      );
+      // A passed deadline reads as due (zero or less), not as a wrapped or absent value.
+      expect(
+        service.getMsUntilNextHeartbeat(testWorkspaceId, defaultHeartbeatIntervalMs + 5000)
+      ).toBe(-5000);
+      expect(service.getMsUntilNextHeartbeat("untracked-ws", 1000)).toBeNull();
 
       // The report follows the countdown an idle trigger resets on new activity.
+      const activityAt = Date.now();
       wsEmitter.emit("activity", {
         workspaceId: testWorkspaceId,
-        activity: { recency: Date.now(), streaming: false },
+        activity: { recency: activityAt, streaming: false },
       });
-      expect(service.getNextHeartbeatAt(testWorkspaceId)).toBe(
-        getInternals().nextEligibleAtByWorkspaceId.get(testWorkspaceId) ?? null
-      );
-      expect(service.getNextHeartbeatAt(testWorkspaceId)).toBeGreaterThan(
-        defaultHeartbeatIntervalMs
+      const deadline = getInternals().nextEligibleAtByWorkspaceId.get(testWorkspaceId);
+      expect(deadline).toBeGreaterThanOrEqual(activityAt + defaultHeartbeatIntervalMs);
+      expect(service.getMsUntilNextHeartbeat(testWorkspaceId, activityAt)).toBe(
+        (deadline ?? Number.NaN) - activityAt
       );
 
       service.stop();
-      expect(service.getNextHeartbeatAt(testWorkspaceId)).toBeNull();
+      expect(service.getMsUntilNextHeartbeat(testWorkspaceId)).toBeNull();
     });
 
     test("activity event does not reset the countdown for interval-triggered workspaces", async () => {

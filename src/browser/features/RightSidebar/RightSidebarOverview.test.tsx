@@ -753,7 +753,7 @@ describe("RightSidebarOverview", () => {
       {
         client: createTestApiClient({
           workspace: {
-            heartbeat: { next: () => Promise.resolve(Date.now() + 3 * 60 * 60 * 1000) },
+            heartbeat: { next: () => Promise.resolve(3 * 60 * 60 * 1000) },
           },
         }),
       }
@@ -765,7 +765,8 @@ describe("RightSidebarOverview", () => {
 
   test("a passed deadline reads Due now, and a finished turn asks for the new one", async () => {
     sidebarState = { canInterrupt: true };
-    let nextAt = Date.now() - 1000;
+    // The API reports milliseconds until the slot: zero or less is due.
+    let dueInMs = -1000;
     const nextCalls: string[] = [];
     const { rerender, view } = renderOverview(
       [workspace({ id: WORKSPACE_ID, heartbeat: { enabled: true, intervalMs: 300_000 } })],
@@ -775,7 +776,7 @@ describe("RightSidebarOverview", () => {
             heartbeat: {
               next: (input: { workspaceId: string }) => {
                 nextCalls.push(input.workspaceId);
-                return Promise.resolve(nextAt);
+                return Promise.resolve(dueInMs);
               },
             },
           },
@@ -786,7 +787,7 @@ describe("RightSidebarOverview", () => {
     await waitFor(() => expect(activity.textContent).toContain("Due now"));
 
     // The heartbeat's turn ended, and the scheduler moved the deadline.
-    nextAt = Date.now() + 4 * 60 * 1000 + 30_000;
+    dueInMs = 4 * 60 * 1000 + 30_000;
     sidebarState = { canInterrupt: false };
     rerender({ artifactsEnabled: false, mcpAppsEnabled: false });
     await waitFor(() => expect(activity.textContent).toContain("Next in 5m"));
@@ -807,15 +808,15 @@ describe("RightSidebarOverview", () => {
     const startMs = Date.now();
     // The scheduler does not track the workspace yet (its first minute), then reports a
     // deadline, then moves it (an idle trigger's reset on activity the card does not show).
-    const answers = [null, startMs + 10 * 60_000, startMs + 2 * 60 * 60_000];
+    const answers = [null, 10 * 60_000, 2 * 60 * 60_000];
     let calls = 0;
+    // Moves this browser's clock to `atMs` (it stays there, so the read it starts is stamped with
+    // the same clock) and fires the countdown's tick.
+    const dateSpies: Array<{ mockRestore: () => void }> = [];
     const tick = (atMs: number) => {
-      const dateSpy = spyOn(Date, "now").mockReturnValue(atMs);
-      try {
-        act(() => ticks.forEach((fire) => fire()));
-      } finally {
-        dateSpy.mockRestore();
-      }
+      dateSpies.pop()?.mockRestore();
+      dateSpies.push(spyOn(Date, "now").mockReturnValue(atMs));
+      act(() => ticks.forEach((fire) => fire()));
     };
     try {
       const { view } = renderOverview(
@@ -832,12 +833,14 @@ describe("RightSidebarOverview", () => {
       await waitFor(() => expect(calls).toBe(1));
       expect(activity.textContent).not.toContain("Next in");
 
-      tick(startMs + 1000);
+      // The browser's clock runs an hour off the server's: durations keep the label right.
+      tick(startMs + 60 * 60_000);
       await waitFor(() => expect(activity.textContent).toContain("Next in 10m"));
-      tick(startMs + 2000);
+      tick(startMs + 60 * 60_000 + 1000);
       await waitFor(() => expect(activity.textContent).toContain("Next in 2h"));
       expect(calls).toBe(3);
     } finally {
+      dateSpies.pop()?.mockRestore();
       setIntervalSpy.mockRestore();
     }
   });

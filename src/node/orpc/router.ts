@@ -2107,7 +2107,7 @@ export const router = (authToken?: string) => {
           .handler(
             handlerGen(function* (_options, input) {
               const heartbeat = yield* Heartbeat;
-              return heartbeat.getNextHeartbeatAt(input.workspaceId);
+              return heartbeat.getMsUntilNextHeartbeat(input.workspaceId);
             })
           ),
       },

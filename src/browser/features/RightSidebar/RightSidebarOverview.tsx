@@ -478,7 +478,7 @@ function useClock(intervalMs: number): number {
 }
 
 /**
- * One read of the scheduler's deadline per `readKey`, with the time it was read. A failed read
+ * One read of the scheduler's deadline per `readKey`, as a local time, with the time it was read. A failed read
  * reports no deadline, so the row shows the cadence. Keyed by workspace, so a switch never shows
  * the previous workspace's deadline.
  */
@@ -496,8 +496,12 @@ function useHeartbeatDeadline(
   React.useEffect(() => {
     if (api == null) return;
     const controller = new AbortController();
-    const settle = (atMs: number | null) => {
-      if (!controller.signal.aborted) setRead({ workspaceId, atMs, readAtMs: Date.now() });
+    // The server reports a duration, so its clock never mixes with this one: a remote `xum
+    // server` host's clock can differ from the browser's.
+    const settle = (dueInMs: number | null) => {
+      if (controller.signal.aborted) return;
+      const readAtMs = Date.now();
+      setRead({ workspaceId, atMs: dueInMs == null ? null : readAtMs + dueInMs, readAtMs });
     };
     api.workspace.heartbeat
       .next({ workspaceId }, { signal: controller.signal })

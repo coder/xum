@@ -4,7 +4,7 @@
 // the first open (which loads the dialog's chunk behind a loading dialog) and on a later one.
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
-import { enablePlaygroundHeartbeat, openPlayground } from "./helpers";
+import { openPlayground, setPlaygroundHeartbeat } from "./helpers";
 
 test(
   "closing the heartbeat settings opened from the overview card refocuses its row",
@@ -12,20 +12,25 @@ test(
   async ({ app, screen, browser }) => {
     // The overview card shows only beside a wide transcript; fresh profiles start collapsed.
     await browser.setViewport({ width: 1440, height: 900 });
-    await enablePlaygroundHeartbeat(app, 10 * 60_000);
-    await openPlayground(app, screen, browser);
-    const row = screen.getByRole("button", /^Heartbeat/);
-    const dialog = screen.getByRole("dialog", "Configure heartbeat");
-    // The row reads the real scheduler through workspace.heartbeat.next (the unit tests mock it).
-    await expect(row).toContainText(/Next in \d+m/);
-    await expect(row).toContainText("Every 10m");
-    for (const key of ["Enter", "Space"]) {
-      await row.focus();
-      await browser.keyboard.press(key);
-      await expect(dialog).toBeVisible();
-      await browser.keyboard.press("Escape");
-      await expect(dialog).toBeHidden();
-      await expect(row).toBeFocused();
+    await setPlaygroundHeartbeat(app, true, 10 * 60_000);
+    try {
+      await openPlayground(app, screen, browser);
+      const row = screen.getByRole("button", /^Heartbeat/);
+      const dialog = screen.getByRole("dialog", "Configure heartbeat");
+      // The row reads the real scheduler through workspace.heartbeat.next (the unit tests mock it).
+      await expect(row).toContainText(/Next in \d+m/);
+      await expect(row).toContainText("Every 10m");
+      for (const key of ["Enter", "Space"]) {
+        await row.focus();
+        await browser.keyboard.press(key);
+        await expect(dialog).toBeVisible();
+        await browser.keyboard.press("Escape");
+        await expect(dialog).toBeHidden();
+        await expect(row).toBeFocused();
+      }
+    } finally {
+      // The seeded workspace is shared with every later test of this target.
+      await setPlaygroundHeartbeat(app, false, 10 * 60_000);
     }
   }
 );
