@@ -542,10 +542,11 @@ async function classifySkillsRoot(args: {
   }
   // The declared folder name, not the canonical one: a contained symlink keeps the name the
   // author wrote. The plugin root has no folder name of its own, so it takes the plugin's.
+  // Decide "root" from the declared path, not the canonical one: `alias -> .` is still
+  // the folder the author named `alias`.
+  const declaredPath = path.resolve(args.rootReal, args.relative);
   const name =
-    args.canonical === args.rootReal
-      ? args.pluginName
-      : path.basename(path.join(args.rootReal, args.relative));
+    declaredPath === args.rootReal ? args.pluginName : path.basename(declaredPath);
   return { dir: args.canonical, single: true, name };
 }
 

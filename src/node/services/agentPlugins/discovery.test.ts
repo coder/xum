@@ -1012,6 +1012,26 @@ describe("discoverAgentPlugins", () => {
     expect(result.diagnostics).toEqual([]);
   });
 
+  test("a symlink to the plugin root keeps its declared skill name", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "solo", {
+      manifest: {
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "solo",
+        contributes: { skills: ["alias"] },
+      },
+    });
+    await fs.writeFile(path.join(pluginDir, "SKILL.md"), "---\nname: alias\n---\n", "utf8");
+    await fs.symlink(".", path.join(pluginDir, "alias"));
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins[0].skillsDirs).toEqual([
+      { dir: result.plugins[0].rootPath, single: true, name: "alias" },
+    ]);
+  });
+
   test("the default skills/ holds skill folders even when it has a SKILL.md", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");
