@@ -132,8 +132,12 @@ export interface SkillsPackageRoot {
 
 interface WalkContext {
   rootReal: string;
-  /** Real paths already walked: two containers (or a symlink) can reach one folder. */
-  visited: Set<string>;
+  /**
+   * Real paths already walked, with the child depth of that walk: two containers (or a symlink)
+   * can reach one folder. A folder reached again at a smaller depth (an explicit container such
+   * as `skills/.curated` after the walk of `skills/`) is walked again for its deeper levels.
+   */
+  visited: Map<string, number>;
   roots: SkillsPackageRoot[];
 }
 
@@ -178,8 +182,9 @@ async function walkSkillParent(
   dirReal: string,
   depth: number
 ): Promise<void> {
-  if (ctx.visited.has(dirReal)) return;
-  ctx.visited.add(dirReal);
+  const seenDepth = ctx.visited.get(dirReal);
+  if (seenDepth !== undefined && seenDepth <= depth) return;
+  ctx.visited.set(dirReal, depth);
   const skills: string[] = [];
   const groups: Array<{ name: string; real: string }> = [];
   for (const name of await childNames(dirReal)) {
@@ -189,7 +194,8 @@ async function walkSkillParent(
     if (await holdsSkillFile(ctx.rootReal, real)) skills.push(name);
     else if (depth < MAX_CONTAINER_DEPTH) groups.push({ name, real });
   }
-  if (skills.length > 0) ctx.roots.push({ root: relative, skills });
+  // A walk again from a smaller depth finds the same children: record them once.
+  if (skills.length > 0 && seenDepth === undefined) ctx.roots.push({ root: relative, skills });
   for (const group of groups) {
     await walkSkillParent(ctx, `${relative}/${group.name}`, group.real, depth + 1);
   }
@@ -203,14 +209,16 @@ async function walkSkillParent(
 export async function findSkillsPackageRoots(dir: string): Promise<SkillsPackageRoot[]> {
   const rootReal = await fsPromises.realpath(dir);
   if (await holdsSkillFile(rootReal, rootReal)) return [{ root: ".", skills: [] }];
-  const ctx: WalkContext = { rootReal, visited: new Set([rootReal]), roots: [] };
+  const ctx: WalkContext = { rootReal, visited: new Map([[rootReal, 0]]), roots: [] };
   for (const container of SKILL_CONTAINERS) {
     const real = await containedDirectory(rootReal, path.join(rootReal, container));
-    if (real === undefined || ctx.visited.has(real)) continue;
-    if (await holdsSkillFile(rootReal, real)) {
+    if (real === undefined) continue;
+    const seenDepth = ctx.visited.get(real);
+    if (seenDepth !== undefined && seenDepth <= 1) continue;
+    if (seenDepth === undefined && (await holdsSkillFile(rootReal, real))) {
       // Discovery reads a declared path that holds SKILL.md as one skill, so the folders
       // below it are not skills either.
-      ctx.visited.add(real);
+      ctx.visited.set(real, 0);
       ctx.roots.push({ root: container, skills: [path.posix.basename(container)] });
       continue;
     }

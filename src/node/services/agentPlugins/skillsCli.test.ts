@@ -268,6 +268,41 @@ describe("skills CLI run", () => {
     expect(run.output).toBe("state=/state");
   });
 
+  test("the CLI's git ignores the user's hooks and filters and keeps GIT_SSH_COMMAND", async () => {
+    await fakeNode("v22.20.0");
+    // A relative core.hooksPath runs a repository's own hook, and a global filter runs on
+    // checkout: the preview's clone ignores both, and so must the CLI's.
+    await fs.writeFile(
+      path.join(home, ".gitconfig"),
+      '[core]\n\thooksPath = .githooks\n[filter "x"]\n\tsmudge = touch pwned\n'
+    );
+    // The test PATH holds the fake bin, /usr/bin and /bin: link the real git into the fake bin.
+    const gitPath = Bun.which("git");
+    if (gitPath === null) throw new Error("this test needs git on PATH");
+    await fs.symlink(gitPath, path.join(bin, "git"));
+    await writeScript(
+      "npx",
+      'echo "hooks=$(git config --get core.hooksPath) filter=$(git config --get filter.x.smudge) ssh=$GIT_SSH_COMMAND"'
+    );
+    const run = await installWithSkillsCli(
+      { source: REPO, skills: ["pdf"] },
+      { ...options, env: { ...options.env, GIT_SSH_COMMAND: "ssh -i /keys/work" } }
+    );
+    if (run.status !== "ran") throw new Error("expected a run");
+    expect(run.output).toBe("hooks=/dev/null filter= ssh=ssh -i /keys/work");
+  });
+
+  test("relative PATH entries reach neither the status check nor the run", async () => {
+    await fakeNode("v22.20.0");
+    await writeScript("npx", 'echo "path=$PATH"');
+    const run = await installWithSkillsCli(
+      { source: REPO, skills: ["pdf"] },
+      { ...options, env: { ...options.env, PATH: `.::relative/bin:${bin}:/usr/bin:/bin` } }
+    );
+    if (run.status !== "ran") throw new Error("expected a run");
+    expect(run.output).toBe(`path=${bin}:/usr/bin:/bin`);
+  });
+
   test("exit 0 without the skill folder is a missing-skill failure", async () => {
     await fakeNode("v22.20.0");
     await writeScript("npx", "echo 'No matching skills found'");

@@ -19,6 +19,7 @@ import {
   parseAgentPluginSourceInput,
 } from "@/node/services/agentPlugins/sourceInput";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
+import { gitEnv } from "@/node/services/agentPlugins/installService";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -259,7 +260,24 @@ function mergedEnv(options: SkillsCliOptions | undefined): NodeJS.ProcessEnv {
     // undefined here (spawn drops undefined values), not only left out.
     env[name] = isSkillsCliEnvName(name) ? value : undefined;
   }
+  // The run starts in an empty temp folder, where a relative or empty PATH entry finds other
+  // programs than the status check did: only absolute entries count, for both.
+  if (env.PATH !== undefined) {
+    env.PATH = env.PATH.split(path.delimiter)
+      .filter((entry) => path.isAbsolute(entry))
+      .join(path.delimiter);
+  }
   return env;
+}
+
+/**
+ * SECURITY: the CLI clones the untrusted repository with the user's git, so it gets the same Git
+ * environment as the preview's clone (installService.ts gitEnv): no system or global Git config
+ * (filters, credential helpers), no hooks, a transport allowlist and no prompts. The ambient
+ * GIT_SSH_COMMAND is kept, as for the preview, so an SSH source that previews also installs.
+ */
+function cliGitEnv(options: SkillsCliOptions | undefined): Record<string, string> {
+  return gitEnv({ ...process.env, ...options?.env });
 }
 
 export async function skillsCliStatus(options?: SkillsCliOptions): Promise<SkillsCliStatus> {
@@ -324,6 +342,7 @@ async function captureRun(
   npxPath: string,
   args: string[],
   env: NodeJS.ProcessEnv,
+  gitEnvForRun: Record<string, string>,
   timeoutMs: number
 ): Promise<CapturedRun> {
   // An empty working folder: the CLI must not pick up a project's skills or config.
@@ -339,6 +358,7 @@ async function captureRun(
       cwd,
       env: {
         ...env,
+        ...gitEnvForRun,
         // The CLI sends telemetry unless one of these is set.
         DISABLE_TELEMETRY: "1",
         DO_NOT_TRACK: "1",
@@ -406,7 +426,7 @@ async function runSkillsCli(
   options: SkillsCliOptions | undefined
 ): Promise<SkillsCliRun> {
   const timeoutMs = options?.timeoutMs ?? RUN_TIMEOUT_MS;
-  const run = await captureRun(npxPath, args, mergedEnv(options), timeoutMs);
+  const run = await captureRun(npxPath, args, mergedEnv(options), cliGitEnv(options), timeoutMs);
   const ran = {
     status: "ran" as const,
     exitCode: run.timedOut ? null : run.exitCode,
