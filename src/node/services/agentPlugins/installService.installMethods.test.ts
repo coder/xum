@@ -86,6 +86,7 @@ describe("AgentPluginInstallService install methods", () => {
       // A skills install never loads these.
       "hooks.js": "export default {};",
       "workflows/w.js": "export default async () => {};",
+      "skills/alpha/workflow.js": "export default async () => {};",
       "mcp.json": "{}",
     });
     await commit("init");
@@ -103,6 +104,8 @@ describe("AgentPluginInstallService install methods", () => {
     expect(preview.skills.map((skill) => skill.name)).toEqual(["alpha", "beta"]);
     expect(preview.hook).toBeUndefined();
     expect(preview.workflows).toEqual([]);
+    // A skill's workflow.js is not offered for review: a skills install runs no scripts.
+    expect(preview.reviewedComponents).toEqual([]);
     expect(preview.mcpServers).toEqual([]);
 
     // Install generates the same manifest from its own clone: the consent digest matches.

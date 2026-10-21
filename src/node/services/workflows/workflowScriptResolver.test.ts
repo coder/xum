@@ -382,6 +382,44 @@ describe("resolveWorkflowScript", () => {
       };
     }
 
+    test("a skills-only plugin's skill runs no workflow script", async () => {
+      using tempDir = new TestTempDir("workflow-script-skills-only");
+      const container = path.join(tempDir.path, ".mux", "plugins");
+      for (const [name, skillsOnly] of [
+        ["plain-skills", false],
+        ["generated-skills", true],
+      ] as const) {
+        const pluginDir = path.join(container, name);
+        await fs.mkdir(pluginDir, { recursive: true });
+        await fs.writeFile(
+          path.join(pluginDir, "plugin.json"),
+          JSON.stringify({
+            $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+            name,
+            ...(skillsOnly ? { extensions: { mux: { generatedFrom: { kind: "skills" } } } } : {}),
+          })
+        );
+        const skill = `${name}-flow`;
+        await writeWorkflowFile(
+          path.join(pluginDir, "skills", skill),
+          "SKILL.md",
+          `---\nname: ${skill}\ndescription: d\n---\nBody\n`
+        );
+        await writeWorkflowFile(path.join(pluginDir, "skills", skill), "workflow.js");
+      }
+      const resolve = (skill: string) =>
+        resolveWorkflowScript({
+          scriptPath: `skill://${skill}/workflow.js`,
+          runtime: new LocalRuntime(tempDir.path),
+          workspacePath: tempDir.path,
+          projectTrusted: true,
+          roots: pluginRoots(tempDir, container),
+        });
+
+      expect((await resolve("plain-skills-flow")).sourceKind).toBe("skill");
+      await expect(resolve("generated-skills-flow")).rejects.toThrow("skills-only plugin");
+    });
+
     test("resolves a plugin workflow", async () => {
       using tempDir = new TestTempDir("workflow-script-plugin");
       const container = path.join(tempDir.path, ".mux", "plugins");
