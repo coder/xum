@@ -143,20 +143,31 @@ function toAccessInput(drafts: { apiKey: string; apiUrl: string; target: string 
 
 function AccessField(props: {
   id: string;
-  label: ReactNode;
+  label: string;
+  /** Shown beside the label, not inside it, so the field's name stays the label alone. */
+  status?: ReactNode;
   value: string;
   onChange: (value: string) => void;
   placeholder: string;
   disabled: boolean;
   type?: "password";
 }) {
+  const statusId = `${props.id}-status`;
   return (
     <div className="flex flex-col gap-1">
-      <label className="text-muted text-xs" htmlFor={props.id}>
-        {props.label}
-      </label>
+      <div className="flex items-baseline justify-between gap-2">
+        <label className="text-muted text-xs" htmlFor={props.id}>
+          {props.label}
+        </label>
+        {props.status != null && (
+          <span id={statusId} className="text-foreground text-xs">
+            {props.status}
+          </span>
+        )}
+      </div>
       <Input
         id={props.id}
+        aria-describedby={props.status != null ? statusId : undefined}
         type={props.type}
         autoComplete="off"
         value={props.value}
@@ -248,11 +259,8 @@ export function DaytonaAccessForm() {
       <AccessField
         id="daytona-api-key"
         type="password"
-        label={
-          <>
-            API key <span className="text-foreground">{describeKey(access.config)}</span>
-          </>
-        }
+        label="API key"
+        status={describeKey(access.config)}
         value={drafts.apiKey}
         onChange={drafts.setApiKey}
         placeholder={keySet ? "Enter a new key to replace it" : "Paste a Daytona API key"}

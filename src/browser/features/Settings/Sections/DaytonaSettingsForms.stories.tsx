@@ -74,10 +74,14 @@ export const SaveKeyAndTest: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await canvas.findByText("Not set");
-    await userEvent.type(canvas.getByLabelText(/API key/), "dtn-story-key");
+    await userEvent.type(canvas.getByLabelText("API key"), "dtn-story-key");
     await userEvent.click(canvas.getByRole("button", { name: "Save" }));
     await canvas.findByText("Key set (settings)");
-    await expect(canvas.getByLabelText(/API key/)).toHaveValue("");
+    // The status sits beside the label: the field's name stays "API key".
+    await expect(canvas.getByLabelText("API key")).toHaveAccessibleDescription(
+      "Key set (settings)"
+    );
+    await expect(canvas.getByLabelText("API key")).toHaveValue("");
     await userEvent.click(canvas.getByRole("button", { name: "Test connection" }));
     await canvas.findByText(/Connected/);
   },

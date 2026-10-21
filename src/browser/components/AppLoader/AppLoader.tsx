@@ -236,6 +236,9 @@ function AppLoaderInner() {
       gitStatusStore.subscribeToFileModifications((listener) =>
         workspaceStore.subscribeFileModifyingTool(listener)
       );
+      runtimeStatusStore.subscribeToRuntimeStatusEvents((listener) =>
+        workspaceStoreInstance.subscribeRuntimeStatusEvents(listener)
+      );
 
       setStoresSynced(true);
     } else {

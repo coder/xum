@@ -3,6 +3,7 @@ import type { APIClient } from "@/browser/contexts/API";
 import { type FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isDevcontainerRuntime, isSSHRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import type { WorkspaceRuntimeStatus } from "@/common/orpc/schemas/runtime";
+import type { RuntimeStatusEvent } from "@/common/types/stream";
 import { MapStore } from "./MapStore";
 import { RefreshController } from "@/browser/utils/RefreshController";
 import { getStatusInputChanges } from "@/browser/utils/statusRefreshInputs";
@@ -10,7 +11,7 @@ import { getStatusInputChanges } from "@/browser/utils/statusRefreshInputs";
 export type RuntimeStatus = WorkspaceRuntimeStatus;
 
 /** Runtimes with a start/stop lifecycle the UI shows: devcontainers and Daytona sandboxes. */
-function hasRuntimeStatus(runtimeConfig: RuntimeConfig | undefined): boolean {
+export function hasRuntimeStatus(runtimeConfig: RuntimeConfig | undefined): boolean {
   return (
     isDevcontainerRuntime(runtimeConfig) ||
     (isSSHRuntime(runtimeConfig) && runtimeConfig.daytona != null)
@@ -50,6 +51,9 @@ export class RuntimeStatusStore {
   private workspaceMetadata = new Map<string, FrontendWorkspaceMetadata>();
   private isActive = true;
   private readonly refreshController: RefreshController;
+  /** Workspaces whose runtime a turn is starting: their status changes again once it is up. */
+  private readonly startingWorkspaces = new Set<string>();
+  private runtimeEventsUnsubscribe: (() => void) | null = null;
 
   constructor() {
     this.refreshController = new RefreshController({
@@ -132,6 +136,43 @@ export class RuntimeStatusStore {
     }
   }
 
+  /**
+   * A turn's ensureReady starting a stopped devcontainer or Daytona sandbox changes its status,
+   * and only the workspace chat stream tells. Idempotent: only the first call subscribes.
+   */
+  subscribeToRuntimeStatusEvents(
+    subscribe: (listener: (event: RuntimeStatusEvent) => void) => () => void
+  ): void {
+    if (this.runtimeEventsUnsubscribe) {
+      return;
+    }
+    this.runtimeEventsUnsubscribe = subscribe((event) => this.handleRuntimeStatusEvent(event));
+  }
+
+  private handleRuntimeStatusEvent(event: RuntimeStatusEvent): void {
+    if (event.source !== "runtime" || !this.tracksRuntimeStart(event)) {
+      return;
+    }
+    if (
+      hasRuntimeStatus(this.workspaceMetadata.get(event.workspaceId)?.runtimeConfig) &&
+      this.statuses.hasKeySubscribers(event.workspaceId)
+    ) {
+      this.refreshController.requestImmediate();
+    }
+  }
+
+  /** Whether the event begins a start ("starting") or ends one; every turn reports "ready". */
+  private tracksRuntimeStart(event: RuntimeStatusEvent): boolean {
+    if (event.phase === "starting") {
+      this.startingWorkspaces.add(event.workspaceId);
+      return true;
+    }
+    if (event.phase !== "ready" && event.phase !== "error") {
+      return false;
+    }
+    return this.startingWorkspaces.delete(event.workspaceId);
+  }
+
   invalidateWorkspace(workspaceId: string): void {
     this.statusCache.delete(workspaceId);
     this.statuses.delete(workspaceId);
@@ -140,6 +181,9 @@ export class RuntimeStatusStore {
 
   dispose(): void {
     this.isActive = false;
+    this.runtimeEventsUnsubscribe?.();
+    this.runtimeEventsUnsubscribe = null;
+    this.startingWorkspaces.clear();
     this.statusCache.clear();
     this.statuses.clear();
     this.refreshController.dispose();
