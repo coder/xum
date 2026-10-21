@@ -18,7 +18,7 @@ import type { APIClient } from "@/browser/contexts/API";
 
 import { installDom } from "../dom";
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
-import { cleanupView, setupWorkspaceView } from "../helpers";
+import { cleanupView, disableTutorial, setupWorkspaceView } from "../helpers";
 import { ChatHarness } from "./chatHarness";
 
 async function waitForWorkspaceChatToRender(container: HTMLElement): Promise<void> {
@@ -94,6 +94,9 @@ export async function createAppHarness(options?: {
     metadata = createResult.metadata;
 
     cleanupDom = installDom();
+    // Like setupTestDom: the workspace tutorial opens 300 ms after a workspace view mounts and
+    // moves focus into its bubble, so focus assertions would race it (#7120).
+    disableTutorial();
     options?.beforeRender?.(workspaceId);
     view = renderApp({ apiClient: options?.wrapApiClient?.(env.orpc) ?? env.orpc, metadata });
 
