@@ -275,16 +275,15 @@ async function resolveIncludePaths(value: string, homeDir: string): Promise<stri
     const expanded = expandHomePath(arg, homeDir);
     // OpenSSH resolves relative user-config Include paths against ~/.ssh.
     const absolute = path.isAbsolute(expanded) ? expanded : path.join(homeDir, ".ssh", expanded);
-    files.push(...(INCLUDE_WILDCARD.test(absolute) ? await globPath(absolute) : [absolute]));
+    files.push(...(await globPath(absolute)));
   }
   return files;
 }
 
-const INCLUDE_WILDCARD = /[*?]/;
-
 /**
- * The existing paths `pattern` matches, sorted, as OpenSSH's glob(3) of an Include: any
- * segment may hold a wildcard, and no match includes nothing.
+ * The paths `pattern` names, as OpenSSH's glob(3) of an Include: any segment may hold a
+ * wildcard, matches are existing paths sorted, and no match includes nothing. A pattern
+ * without wildcards names its one path, read (or skipped when missing) like any other.
  */
 async function globPath(pattern: string): Promise<string[]> {
   // Normalized so a Windows path split on path.sep keeps its "/" separators apart too.
@@ -292,21 +291,26 @@ async function globPath(pattern: string): Promise<string[]> {
   const { root } = path.parse(normalized);
   let matches = [root];
   for (const segment of normalized.slice(root.length).split(path.sep).filter(Boolean)) {
-    if (!INCLUDE_WILDCARD.test(segment)) {
+    const matcher = segmentMatcher(segment);
+    if (!matcher) {
       matches = matches.map((dir) => path.join(dir, segment));
       continue;
     }
     const next: string[][] = [];
-    for (const dir of matches) next.push(await matchingEntries(dir, segment));
+    for (const dir of matches) next.push(await matchingEntries(dir, segment, matcher));
     matches = next.flat();
   }
   return matches.sort();
 }
 
-async function matchingEntries(dir: string, segment: string): Promise<string[]> {
+async function matchingEntries(dir: string, segment: string, matcher: RegExp): Promise<string[]> {
   try {
     const entries = await fs.readdir(dir);
-    return entries.filter((entry) => glob([segment], entry)).map((entry) => path.join(dir, entry));
+    // glob(3) matches a leading "." only with a literal one.
+    const dotFiles = segment.startsWith(".");
+    return entries
+      .filter((entry) => (dotFiles || !entry.startsWith(".")) && matcher.test(entry))
+      .map((entry) => path.join(dir, entry));
   } catch (error) {
     log.debug("Failed to expand SSH config Include", {
       include: path.join(dir, segment),
@@ -314,6 +318,71 @@ async function matchingEntries(dir: string, segment: string): Promise<string[]> 
     });
     return [];
   }
+}
+
+const REGEXP_SPECIAL = /[\\^$.*+?()[\]{}|/-]/g;
+const escapeRegExp = (text: string) => text.replace(REGEXP_SPECIAL, "\\$&");
+
+/**
+ * One path segment of a glob(3) pattern as a RegExp: `*`, `?` (one character), bracket
+ * expressions (`[ab]`, `[a-z]`, negated by a leading `!` or `^`; an unclosed `[` is literal)
+ * and `\` escapes. Undefined when the segment has no wildcard.
+ */
+function segmentMatcher(segment: string): RegExp | undefined {
+  let source = "";
+  let wildcard = false;
+  for (let i = 0; i < segment.length; i++) {
+    const token = segmentToken(segment, i);
+    source += token.source;
+    wildcard ||= token.wildcard;
+    i = token.end;
+  }
+  return wildcard ? new RegExp(`^${source}$`, "s") : undefined;
+}
+
+const WILDCARD_SOURCES = new Map([
+  ["*", ".*"],
+  ["?", "."],
+]);
+
+/** The RegExp source of the pattern element at `i`, and the index of its last character. */
+function segmentToken(
+  segment: string,
+  i: number
+): { source: string; end: number; wildcard: boolean } {
+  const wildcardSource = WILDCARD_SOURCES.get(segment[i]);
+  if (wildcardSource !== undefined) return { source: wildcardSource, end: i, wildcard: true };
+  const bracket = segment[i] === "[" ? bracketExpression(segment, i) : undefined;
+  if (bracket) return { ...bracket, wildcard: true };
+  const end = segment[i] === "\\" && i + 1 < segment.length ? i + 1 : i;
+  return { source: escapeRegExp(segment[end]), end, wildcard: false };
+}
+
+/** The bracket expression opening at `start`, or undefined when it never closes. */
+function bracketExpression(
+  segment: string,
+  start: number
+): { source: string; end: number } | undefined {
+  const negated = segment[start + 1] === "!" || segment[start + 1] === "^";
+  let i = start + (negated ? 2 : 1);
+  let items = "";
+  // A "]" right after the opening (and its negation) is a member, not the close.
+  for (let first = true; i < segment.length && (first || segment[i] !== "]"); first = false) {
+    const member = bracketMember(segment, i);
+    items += member.source;
+    i = member.next;
+  }
+  if (i >= segment.length) return undefined;
+  return { source: `[${negated ? "^" : ""}${items}]`, end: i };
+}
+
+/** One character or range of a bracket expression, and the index after it. */
+function bracketMember(segment: string, i: number): { source: string; next: number } {
+  const range = segment[i + 1] === "-" && i + 2 < segment.length && segment[i + 2] !== "]";
+  if (!range) return { source: escapeRegExp(segment[i]), next: i + 1 };
+  const [low, high] = [segment[i], segment[i + 2]];
+  // A reversed range matches nothing, as in glob(3); a RegExp would refuse it.
+  return { source: low <= high ? `${escapeRegExp(low)}-${escapeRegExp(high)}` : "", next: i + 3 };
 }
 
 /**

@@ -222,6 +222,63 @@ describe("resolveSSHConfig", () => {
     });
   });
 
+  test("expands glob(3) bracket expressions in an Include path", async () => {
+    await withTempHome(async (homeDir) => {
+      const confDir = path.join(homeDir, ".ssh", "conf.d");
+      await fs.mkdir(confDir);
+      // Each file sets User for its own host; the pattern decides which ones are read.
+      for (const name of ["a", "b", "c", "m", "x", "[odd"]) {
+        await fs.writeFile(
+          path.join(confDir, `${name}.conf`),
+          `Host host-${name}\n  User user-${name}\n`,
+          "utf8"
+        );
+      }
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        [
+          "Include conf.d/[ab].conf conf.d/[k-n].conf conf.d/[!a-m].conf conf.d/[odd.conf",
+          "Host *",
+          "  User none",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+
+      const user = async (name: string) => (await resolveSSHConfig(`host-${name}`)).user;
+      expect(await user("a")).toBe("user-a");
+      expect(await user("b")).toBe("user-b");
+      expect(await user("m")).toBe("user-m");
+      expect(await user("x")).toBe("user-x");
+      // An unclosed "[" is a literal character.
+      expect(await user("[odd")).toBe("user-[odd");
+      expect(await user("c")).toBe("none");
+    });
+  });
+
+  test("matches an Include wildcard as glob(3) does: ? is one character, * skips dot files", async () => {
+    await withTempHome(async (homeDir) => {
+      const confDir = path.join(homeDir, ".ssh", "conf.d");
+      await fs.mkdir(confDir);
+      for (const [name, host] of [
+        ["1.conf", "one"],
+        ["12.conf", "two"],
+        [".hidden.conf", "hidden"],
+      ]) {
+        await fs.writeFile(path.join(confDir, name), `Host ${host}\n  User user-${host}\n`, "utf8");
+      }
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        ["Include conf.d/1?.conf conf.d/*hidden.conf", "Host *", "  User none", ""].join("\n"),
+        "utf8"
+      );
+
+      expect((await resolveSSHConfig("one")).user).toBe("none");
+      expect((await resolveSSHConfig("two")).user).toBe("user-two");
+      expect((await resolveSSHConfig("hidden")).user).toBe("none");
+    });
+  });
+
   test("applies an Include inside a Host block only to the hosts that block matches", async () => {
     await withTempHome(async (homeDir) => {
       const included = path.join(homeDir, ".ssh", "gated.conf");
