@@ -22,6 +22,7 @@ import { PLUGIN_REGISTRY_FILE_NAME, readPluginComponentImports } from "./registr
 import { noComponentConsent, type ComponentConsent } from "./componentConsent";
 import type { ApprovedCopiesSource } from "./approvedCopies";
 import {
+  hasGeneratedFromMarker,
   isPlainObject,
   isValidAgentPluginName,
   validatePluginManifest,
@@ -270,6 +271,12 @@ export interface AgentPluginInfo {
   claudeFallback?: true;
   /** Claude components without a `contributes` member (claudeFallback only). */
   claude?: ClaudePluginComponents;
+  /**
+   * The plugin.json carries `extensions.mux.generatedFrom` (Xum wrote it for a skills repository,
+   * or the repository claims so): only skills load. No hooks.js, hooks.json, agents, workflows,
+   * MCP, slash commands or com.openai (see discoverPluginAt).
+   */
+  skillsOnly?: true;
   /** Validated `extensions["com.openai"]` (parsed and exposed only; nothing consumes it yet). */
   openai?: OpenAIPluginExtension;
   /**
@@ -691,6 +698,82 @@ async function resolvePluginMcpConfig(args: {
     : { mcpConfigPath };
 }
 
+/**
+ * The manifest of a skills-only package: its metadata, `contributes.skills` and the marker. No
+ * slash commands, component paths, hook tool grants or com.openai survive.
+ */
+function skillsOnlyManifest(manifest: AgentPluginManifest): AgentPluginManifest {
+  const { contributes, extensions, ...metadata } = manifest;
+  const mux = extensions?.mux;
+  return {
+    ...metadata,
+    ...(contributes?.skills !== undefined ? { contributes: { skills: contributes.skills } } : {}),
+    extensions: { mux: { generatedFrom: isPlainObject(mux) ? mux.generatedFrom : undefined } },
+  };
+}
+
+type XumComponent = "hooks" | "agents" | "workflows";
+
+/** Where each Xum component lives by default and the AgentPluginInfo field that names it. */
+const XUM_COMPONENTS: Record<
+  XumComponent,
+  {
+    field: "hooksPath" | "agentsDir" | "workflowsDir";
+    defaultPath: string;
+    kind: "file" | "directory";
+    options?: { maxBytes: number };
+  }
+> = {
+  hooks: {
+    field: "hooksPath",
+    defaultPath: "hooks.js",
+    kind: "file",
+    options: { maxBytes: MAX_PLUGIN_HOOK_SOURCE_BYTES },
+  },
+  agents: { field: "agentsDir", defaultPath: "agents", kind: "directory" },
+  workflows: { field: "workflowsDir", defaultPath: "workflows", kind: "directory" },
+};
+
+/**
+ * Which Xum components a package kind may load. A package that was not written for Xum
+ * ("foreign": a Claude package, or a plugin.json with the generatedFrom marker) gets no Xum
+ * executable code: no hooks.js and no workflows/. A Codex-fallback package gets skills, MCP and
+ * com.openai only: no agents/ either (see normalizeCodexManifest's SECURITY AUDIT). A Claude
+ * package keeps agents/ (Claude-format agents, reviewed as usual); a skills-only package does not.
+ */
+function xumComponentGate(args: {
+  codexFallback: boolean;
+  foreign: boolean;
+  skillsOnly: boolean;
+}): Record<XumComponent, boolean> {
+  const xumCode = !args.codexFallback && !args.foreign;
+  return { hooks: xumCode, agents: !args.codexFallback && !args.skillsOnly, workflows: xumCode };
+}
+
+/** hooks.js, agents/ and workflows/: each one the gate allows and the tree has. */
+async function resolveXumComponents(args: {
+  allowed: Record<XumComponent, boolean>;
+  contributes: AgentPluginManifest["contributes"];
+  resolveComponent: (
+    relativePath: string,
+    expectKind: "file" | "directory",
+    options?: { maxBytes?: number }
+  ) => Promise<string | undefined>;
+}): Promise<Pick<AgentPluginInfo, "hooksPath" | "agentsDir" | "workflowsDir">> {
+  const resolved: Pick<AgentPluginInfo, "hooksPath" | "agentsDir" | "workflowsDir"> = {};
+  for (const component of ["hooks", "agents", "workflows"] as const) {
+    if (!args.allowed[component]) continue;
+    const spec = XUM_COMPONENTS[component];
+    const canonical = await args.resolveComponent(
+      args.contributes?.[component] ?? spec.defaultPath,
+      spec.kind,
+      spec.options
+    );
+    if (canonical !== undefined) resolved[spec.field] = canonical;
+  }
+  return resolved;
+}
+
 async function discoverPluginAt(args: {
   pluginDir: string;
   containerPath: string;
@@ -764,16 +847,24 @@ async function discoverPluginAt(args: {
     diagnostics.push({ path: manifestPath, scope, severity: "warning", message: warning });
   }
 
+  // SECURITY AUDIT: `extensions.mux.generatedFrom` marks a plugin.json that Xum generated for a
+  // skills repository (installMethods.ts). A repository can write the marker itself, so it may
+  // only REMOVE capabilities: such a package loads skills and nothing else. The only generated
+  // kind is skills, so a marker of any shape (also a malformed or unknown one) is skills-only.
+  const skillsOnly = hasGeneratedFromMarker(validation.manifest);
+  const manifest = skillsOnly ? skillsOnlyManifest(validation.manifest) : validation.manifest;
+
   const { openaiSource, openaiPath, openaiManifestPath } = await selectOpenAISource({
     rootReal,
-    manifest: validation.manifest,
+    manifest,
     manifestRelative,
     // A Claude package has no extensions (normalizeClaudeManifest drops them), so it gets no
-    // overlay either.
+    // overlay either. Nor does a skills-only package: com.openai can point at hooks.
     overlay:
       !codexFallback &&
       !claudeFallback &&
-      !isPlainObject(validation.manifest.extensions?.["com.openai"]),
+      !skillsOnly &&
+      !isPlainObject(manifest.extensions?.["com.openai"]),
     scope,
     diagnostics,
   });
@@ -784,16 +875,16 @@ async function discoverPluginAt(args: {
   }
 
   // Defensive: the validator guarantees a spec-valid name.
-  if (!isValidAgentPluginName(validation.manifest.name)) {
+  if (!isValidAgentPluginName(manifest.name)) {
     throw new Error(
-      `discoverPluginAt: validated manifest has spec-invalid name '${validation.manifest.name}'`
+      `discoverPluginAt: validated manifest has spec-invalid name '${manifest.name}'`
     );
   }
 
   // Manifest `contributes` path members override the conventional component
   // locations; the manifest validator already restricted them to safe relative
   // paths, and resolveComponentPath re-enforces realpath containment.
-  const contributes = validation.manifest.contributes;
+  const contributes = manifest.contributes;
   const resolveComponent = (
     relativePath: string,
     expectKind: "file" | "directory",
@@ -812,7 +903,7 @@ async function discoverPluginAt(args: {
   const skillsDirs = await resolveSkillsRoots({
     declared: contributes?.skills,
     rootReal,
-    pluginName: validation.manifest.name,
+    pluginName: manifest.name,
     resolveComponent,
   });
   // Claude commands load as user-only skills, after every skills root (a skill wins).
@@ -828,47 +919,34 @@ async function discoverPluginAt(args: {
       })
     : [];
   const allSkillsRoots = [...skillsDirs, ...commandRoots];
-  const mcp = await resolvePluginMcpConfig({
-    rootReal,
-    declared: contributes?.mcp,
-    manifestDialect: claudeFallback ? "claude" : codexFallback ? "codex" : undefined,
+  const mcp = skillsOnly
+    ? {}
+    : await resolvePluginMcpConfig({
+        rootReal,
+        declared: contributes?.mcp,
+        manifestDialect: claudeFallback ? "claude" : codexFallback ? "codex" : undefined,
+        resolveComponent,
+      });
+  const xumComponents = await resolveXumComponents({
+    allowed: xumComponentGate({ codexFallback, foreign: claudeFallback || skillsOnly, skillsOnly }),
+    contributes,
     resolveComponent,
   });
-  // A package that was not written for Xum ("foreign") gets no Xum executable code: no
-  // hooks.js and no workflows/. Today that is a Claude package; the seam is one boolean so a
-  // plugin.json that Xum generated for a foreign package can join it. A Codex-fallback package
-  // gets skills, MCP and com.openai only: no agents/ either (see normalizeCodexManifest's
-  // SECURITY AUDIT). A Claude package keeps agents/ (Claude-format agents, reviewed as usual).
-  const foreign = claudeFallback;
-  const hooksPath =
-    codexFallback || foreign
-      ? undefined
-      : await resolveComponent(contributes?.hooks ?? "hooks.js", "file", {
-          maxBytes: MAX_PLUGIN_HOOK_SOURCE_BYTES,
-        });
-  const agentsDir = codexFallback
-    ? undefined
-    : await resolveComponent(contributes?.agents ?? "agents", "directory");
-  const workflowsDir =
-    codexFallback || foreign
-      ? undefined
-      : await resolveComponent(contributes?.workflows ?? "workflows", "directory");
 
   return {
-    name: validation.manifest.name,
+    name: manifest.name,
     scope,
     rootPath: rootReal,
     containerPath: args.containerPath,
     dirName: args.dirName,
-    manifest: validation.manifest,
+    manifest,
     ...(codexFallback ? { codexFallback: true } : {}),
+    ...(skillsOnly ? { skillsOnly: true } : {}),
     ...(claudeFallback ? { claudeFallback: true, claude: normalized.claude ?? {} } : {}),
     ...(openai.extension !== undefined ? { openai: openai.extension, openaiManifestPath } : {}),
     ...(allSkillsRoots.length > 0 ? { skillsDirs: allSkillsRoots } : {}),
     ...mcp,
-    ...(hooksPath !== undefined ? { hooksPath } : {}),
-    ...(agentsDir !== undefined ? { agentsDir } : {}),
-    ...(workflowsDir !== undefined ? { workflowsDir } : {}),
+    ...xumComponents,
   };
 }
 

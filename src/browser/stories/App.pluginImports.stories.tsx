@@ -15,6 +15,8 @@ const preview: AgentPluginInstallPreview = {
     ref: "main",
     refType: "branch",
   },
+  method: { kind: "agent-plugin" },
+  methods: [{ kind: "agent-plugin" }],
   lockedSha: "a".repeat(40),
   manifest: { name: "review-tools", version: "1.0.0", description: "Review and research tools" },
   targetPath: "~/.xum/plugins/review-tools",

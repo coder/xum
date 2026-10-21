@@ -6,6 +6,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   computeAgentPluginContainers,
+  discoverAgentPluginAt,
   discoverAgentPlugins,
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
@@ -14,6 +15,7 @@ import {
 } from "./discovery";
 import { bumpContainerMutationEpoch, MUTATION_EPOCH_FILE, STAGING_DIR_NAME } from "./journals";
 import { resolvePluginHookGrants } from "./hookSandbox";
+import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { createTestPluginInstallEntry } from "./testFixtures";
 
@@ -1926,5 +1928,83 @@ describe("Claude Code plugin discovery", () => {
       ["b", "from-codex", false],
       ["c", "from-claude", true],
     ]);
+  });
+});
+
+describe("generatedFrom marker (skills-only packages)", () => {
+  const SKILL = "---\nname: s\ndescription: S\n---\n";
+  /** A plugin with every component kind; `marker` adds extensions.mux.generatedFrom. */
+  async function writeFullPlugin(pluginDir: string, marker: unknown): Promise<void> {
+    const files: Record<string, string> = {
+      "plugin.json": JSON.stringify({
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "kit",
+        contributes: { slashCommands: [{ name: "go", expansion: "Go" }] },
+        extensions: {
+          mux: {
+            hooks: { tools: ["bash"] },
+            ...(marker !== undefined ? { generatedFrom: marker } : {}),
+          },
+          "com.openai": { hooks: ["custom-hooks.json"] },
+        },
+      }),
+      "skills/s/SKILL.md": SKILL,
+      "hooks.js": "export default {};",
+      "hooks/hooks.json": JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: "command", command: "x" }] }] },
+      }),
+      "custom-hooks.json": JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: "command", command: "y" }] }] },
+      }),
+      "agents/a.md": "---\nname: a\ndescription: A\n---\n",
+      "workflows/w.js": "export default async () => {};",
+      "mcp.json": "{}",
+    };
+    for (const [relative, content] of Object.entries(files)) {
+      await fs.mkdir(path.dirname(path.join(pluginDir, relative)), { recursive: true });
+      await fs.writeFile(path.join(pluginDir, relative), content, "utf8");
+    }
+  }
+
+  test("a spoofed marker only removes capabilities: skills load, nothing else does", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    for (const [dirName, marker] of [
+      ["plain", undefined],
+      ["marked", { kind: "skills" }],
+      // An unknown or malformed marker is skills-only too.
+      ["unknown", { kind: "something-new" }],
+      ["malformed", "yes"],
+    ] as const) {
+      const pluginDir = path.join(tmp.path, dirName);
+      await writeFullPlugin(pluginDir, marker);
+      const { plugin } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+      if (plugin === null) throw new Error(`${dirName}: not a plugin`);
+      const hooks = await loadPluginCodexHooks(plugin);
+      const surface = {
+        skills: plugin.skillsDirs?.map((root) => path.relative(plugin.rootPath, root.dir)),
+        hooksJs: plugin.hooksPath !== undefined,
+        agents: plugin.agentsDir !== undefined,
+        workflows: plugin.workflowsDir !== undefined,
+        mcp: plugin.mcpConfigPath !== undefined,
+        codexHooks: hooks.hooks.length > 0,
+        slashCommands: plugin.manifest.contributes?.slashCommands !== undefined,
+        openai: plugin.openai !== undefined,
+        hookTools: resolvePluginHookGrants(plugin.manifest).bridgeTools.allow.length > 0,
+      };
+      const loaded = marker === undefined;
+      expect({ dirName, ...surface }).toEqual({
+        dirName,
+        skills: ["skills"],
+        hooksJs: loaded,
+        agents: loaded,
+        workflows: loaded,
+        mcp: loaded,
+        codexHooks: loaded,
+        slashCommands: loaded,
+        openai: loaded,
+        hookTools: loaded,
+      });
+      expect(plugin.skillsOnly).toBe(loaded ? undefined : true);
+    }
   });
 });

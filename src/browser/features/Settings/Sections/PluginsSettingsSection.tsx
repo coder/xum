@@ -31,6 +31,7 @@ import type {
 } from "@/common/orpc/schemas/agentPlugins";
 import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
 import { getErrorMessage } from "@/common/utils/errors";
+import { displayRepoUrl } from "@/common/utils/agentPluginSource";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import {
   consumePendingPluginsSectionIntent,
@@ -61,17 +62,6 @@ function formatSource(item: AgentPluginListItem): string | null {
   }
   const ref = item.source.refType === "commit" ? item.source.ref.slice(0, 12) : item.source.ref;
   return `${displayRepoUrl(item.source.url)}${subpathSuffix(item.source.subpath)} @ ${ref}`;
-}
-
-/**
- * Clone URL without scheme and `.git` ("github.com/foo/grill"), so a monorepo
- * folder appended to it reads as a path, not as an invalid `….git/pstack` URL.
- */
-function displayRepoUrl(url: string): string {
-  return url
-    .replace(/^https:\/\//, "")
-    .replace(/^git@([^:]+):/, "$1/")
-    .replace(/\.git$/, "");
 }
 
 /** Trimmed optional text-field value, or null when empty. */
@@ -598,6 +588,7 @@ const AddPluginPanel: React.FC<{
     try {
       const result = await api.agentPlugins.install({
         source: preview.source,
+        method: preview.method,
         expectedSha: preview.lockedSha,
         expectedConsentDigest: preview.consentDigest,
         importedComponents: selected,

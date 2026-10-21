@@ -18,6 +18,7 @@ import {
 import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
 import { getOwn } from "@/common/utils/getOwn";
 import type {
+  AgentPluginInstallMethod,
   AgentPluginInstallPreview,
   AgentPluginComponents,
   AgentPluginHooks,
@@ -69,14 +70,11 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
-  CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
-  CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
   readPluginFileWithinRootCapped,
   discoverAgentPluginAt,
   discoverAgentPlugins,
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
-  PLUGIN_MANIFEST_RELATIVE_PATH,
   PluginGitPathError,
   setAgentPluginDiscoveryGate,
   type AgentPluginContainer,
@@ -86,6 +84,15 @@ import {
   type PluginSkillsRoot,
 } from "./discovery";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
+import {
+  chooseInstallMethod,
+  detectInstallMethods,
+  installMethodRequest,
+  noInstallMethodMessage,
+  readInstalledGeneratedFrom,
+  writeGeneratedManifest,
+  type InstallMethodRequest,
+} from "./installMethods";
 import { pluginSkillMarkdown } from "./claudeCommands";
 import { listPluginAgentFiles, type PluginAgentFile } from "./agentFiles";
 import { checkLogoImage } from "./imageHeader";
@@ -2515,38 +2522,32 @@ export class AgentPluginInstallService {
   // ---------------------------------------------------------------------
 
   /**
-   * Run the exact runtime validation (manifest + component discovery) against
-   * a staged clone. Throws user-facing errors for non-plugins, including a
-   * clear message for a Claude Code marketplace repo (not installable yet).
+   * Pick the install method (installMethods.ts), write the generated plugin.json of a `skills`
+   * install, then run the exact runtime validation (manifest + component discovery) against the
+   * staged clone. Throws user-facing errors for non-plugins, including a clear message for a
+   * Claude Code marketplace repo (not installable yet).
    */
   private async validateStagedClone(
     stagedDir: string,
-    subpath?: string
+    source: Pick<AgentPluginGitSource, "url" | "subpath">,
+    request: InstallMethodRequest
   ): Promise<{
     plugin: AgentPluginInfo;
     warnings: string[];
+    method: AgentPluginInstallMethod;
+    methods: AgentPluginInstallMethod[];
   }> {
-    // Discovery reads `.codex-plugin/plugin.json`, then `.claude-plugin/plugin.json`, when the
-    // root manifest is absent; all of them live in the staged tree the consent receipt hashes.
-    let hasManifest = false;
-    for (const manifest of [
-      PLUGIN_MANIFEST_RELATIVE_PATH,
-      CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
-      CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
-    ]) {
-      if (await pathExists(path.join(stagedDir, manifest))) hasManifest = true;
-    }
-    if (!hasManifest) {
+    // Every manifest candidate, and the generated plugin.json, lives in the staged tree the
+    // consent receipt hashes.
+    const detected = await detectInstallMethods(stagedDir);
+    const method = chooseInstallMethod(detected.methods, request);
+    if (method === undefined) {
       if (await pathExists(path.join(stagedDir, ".claude-plugin", "marketplace.json"))) {
         throw new Error(
           "This repository is a Claude Code plugin marketplace (found .claude-plugin/marketplace.json). Xum does not install marketplaces yet. Install one of its plugins by its folder, as owner/repo/path/to/plugin."
         );
       }
-      throw new Error(
-        subpath === undefined
-          ? "No plugin.json (or .codex-plugin/plugin.json or .claude-plugin/plugin.json) found at the repository root. The repo is not a plugin — if the plugin lives in a subdirectory, install it as owner/repo/path/to/plugin."
-          : `No plugin.json (or .codex-plugin/plugin.json or .claude-plugin/plugin.json) found in '${subpath}'. The folder is not a plugin.`
-      );
+      throw new Error(noInstallMethodMessage(source.subpath));
     }
 
     // The crash-recovery marker name is RESERVED: install/update write a
@@ -2572,6 +2573,9 @@ export class AgentPluginInstallService {
       );
     }
 
+    // After the marker check, so a refused tree never gets a generated file.
+    const generatedWarnings =
+      method.kind === "skills" ? await writeGeneratedManifest(stagedDir, method, source) : [];
     const { plugin, diagnostics } = await discoverAgentPluginAt({
       pluginDir: stagedDir,
       scope: "global",
@@ -2582,7 +2586,12 @@ export class AgentPluginInstallService {
         reasons.length > 0 ? `Invalid plugin: ${reasons.join("; ")}` : "Invalid plugin manifest."
       );
     }
-    return { plugin, warnings: diagnostics.map((d) => d.message) };
+    return {
+      plugin,
+      warnings: [...generatedWarnings, ...diagnostics.map((d) => d.message)],
+      method,
+      methods: detected.methods,
+    };
   }
 
   /**
@@ -3227,6 +3236,8 @@ export class AgentPluginInstallService {
     input: string;
     ref?: string | undefined;
     subpath?: string | undefined;
+    /** Absent: the first method that fits. */
+    method?: AgentPluginInstallMethod | null | undefined;
   }): Promise<AgentPluginInstallPreview> {
     const parsed = parseAgentPluginSourceInput(args.input);
     const explicitRef = args.ref?.trim() ?? "";
@@ -3241,9 +3252,15 @@ export class AgentPluginInstallService {
     const resolved = await this.resolveRemoteRef(parsed.url, ref);
     const { dir: stagedDir, sha } = await this.cloneResolved(parsed.url, resolved, subpath);
     try {
-      const { plugin, warnings } = await this.validateStagedClone(stagedDir, subpath);
+      const { plugin, warnings, method, methods } = await this.validateStagedClone(
+        stagedDir,
+        { url: parsed.url, subpath },
+        installMethodRequest(args.method)
+      );
       const targetPath = this.targetPathFor(plugin.name);
-      await this.assertNoCollision(plugin.name);
+      // A name collision blocks only the install of this method: the preview still lists the
+      // other methods.
+      const installBlockedReason = await this.collisionReason(plugin.name);
 
       const skills = await this.collectSkillsFromRoots(plugin, warnings);
       assertDirectivesFit(skills);
@@ -3301,6 +3318,9 @@ export class AgentPluginInstallService {
       };
       return {
         source,
+        method,
+        methods,
+        installBlockedReason,
         lockedSha: sha,
         manifest: {
           ...manifestSummary(plugin.manifest),
@@ -3325,6 +3345,12 @@ export class AgentPluginInstallService {
   }
 
   private async assertNoCollision(name: string): Promise<void> {
+    const reason = await this.collisionReason(name);
+    if (reason !== undefined) throw new Error(reason);
+  }
+
+  /** Why a managed install of `name` cannot proceed (a name or folder collision), if it cannot. */
+  private async collisionReason(name: string): Promise<string | undefined> {
     // Strict: a corrupted registry must fail installs up front (with the
     // repair message) instead of letting a later strict read fail mid-flow.
     // Collide on RAW entry names, not just parsed ones: an entry this build
@@ -3332,19 +3358,23 @@ export class AgentPluginInstallService {
     // install rewrite would otherwise filter it out and replace it.
     const { rawEntries } = await this.readRegistryDocument("strict");
     if (rawEntries.some((rawEntry) => this.rawEntryName(rawEntry) === name)) {
-      throw new Error(`A managed plugin named '${name}' is already installed. Uninstall it first.`);
+      return `A managed plugin named '${name}' is already installed. Uninstall it first.`;
     }
     if (await pathExists(this.targetPathFor(name))) {
       // Never overwrite: an unmanaged dir may hold local work.
-      throw new Error(
-        `${shortenHome(this.targetPathFor(name))} already exists. Remove the directory first — the installer never overwrites.`
-      );
+      return `${shortenHome(this.targetPathFor(name))} already exists. Remove the directory first — the installer never overwrites.`;
     }
+    return undefined;
   }
 
   /** Fetch the consented SHA, validate again, promote into the container, and record the registry entry. */
   async install(args: {
     source: AgentPluginGitSource;
+    /**
+     * The preview's `method`; install refuses a clone it does not fit. The API always sends it;
+     * tests may omit it (the first method that fits).
+     */
+    method?: AgentPluginInstallMethod;
     expectedSha: string;
     /** The preview's `consentDigest`. The renderer always sends it; tests may omit it. */
     expectedConsentDigest?: string;
@@ -3364,7 +3394,11 @@ export class AgentPluginInstallService {
     return this.runExclusive(async () => {
       const stagedDir = await this.cloneExactSha(args.source, args.expectedSha);
       try {
-        const { plugin } = await this.validateStagedClone(stagedDir, args.source.subpath);
+        const { plugin } = await this.validateStagedClone(
+          stagedDir,
+          args.source,
+          installMethodRequest(args.method)
+        );
         const name = plugin.name;
         const inventory = await this.collectComponents(plugin, this.targetPathFor(name));
         // Install records consent for every directive command, so it bounds them like the
@@ -5893,7 +5927,13 @@ export class AgentPluginInstallService {
     // that disappeared upstream fails here, before any swap.
     const stagedDir = await this.cloneExactSha(entry.source, sha);
     try {
-      const { plugin, warnings } = await this.validateStagedClone(stagedDir, entry.source.subpath);
+      // A plugin.json that Xum generated is regenerated from the new commit, unless the
+      // repository now has its own manifest. The update review covers every component as usual.
+      const generatedFrom = await readInstalledGeneratedFrom(this.targetPathFor(entry.name));
+      const { plugin, warnings } = await this.validateStagedClone(stagedDir, entry.source, {
+        mode: "update",
+        generatedFrom,
+      });
       if (plugin.name !== entry.name) {
         // Container-entry names are identity (instanceId, PLUGIN_DATA,
         // workspace overrides hash the path) — never rename on update.

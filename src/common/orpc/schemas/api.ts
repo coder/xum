@@ -212,6 +212,7 @@ import {
 import {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
+  AgentPluginInstallMethodSchema,
   AgentPluginInstallPreviewSchema,
   AgentPluginComponentsSchema,
   AgentPluginComponentRefSchema,
@@ -1294,6 +1295,8 @@ export const agentPlugins = {
       input: z.string(),
       ref: z.string().nullish(),
       subpath: z.string().nullish(),
+      /** Absent: the first method that fits (see AgentPluginInstallMethodSchema). */
+      method: AgentPluginInstallMethodSchema.nullish(),
     }),
     output: ResultSchema(AgentPluginInstallPreviewSchema, z.string()),
   },
@@ -1301,6 +1304,8 @@ export const agentPlugins = {
   install: {
     input: z.object({
       source: AgentPluginGitSourceSchema,
+      /** The preview's `method`: install refuses a clone that this method does not fit. */
+      method: AgentPluginInstallMethodSchema,
       /** SHA from the preview the user consented to. */
       expectedSha: z.string(),
       /** `consentDigest` of that preview: install refuses other components (#6777). */

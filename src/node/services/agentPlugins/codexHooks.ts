@@ -155,9 +155,11 @@ export interface PluginHooksLoadResult {
 export async function loadPluginCodexHooks(
   plugin: Pick<
     AgentPluginInfo,
-    "rootPath" | "openai" | "openaiManifestPath" | "claudeFallback" | "claude"
+    "rootPath" | "openai" | "openaiManifestPath" | "claudeFallback" | "claude" | "skillsOnly"
   >
 ): Promise<PluginHooksLoadResult> {
+  // A skills-only package has no hooks, not even the default hooks/hooks.json.
+  if (plugin.skillsOnly === true) return { hooks: [], warnings: [] };
   const warnings = new HookWarnings();
   const hooks: PluginHookDefinition[] = [];
   const { entries, defaultFileListed } = listHookEntries(plugin, warnings);

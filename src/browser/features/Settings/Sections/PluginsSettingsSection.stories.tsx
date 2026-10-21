@@ -409,6 +409,8 @@ export const AddPluginConsentPreview: Story = {
               ref: "main",
               refType: "branch",
             },
+            method: { kind: "agent-plugin" },
+            methods: [{ kind: "agent-plugin" }],
             lockedSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
             manifest: {
               name: "grill",
@@ -521,6 +523,8 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
               ref: "main",
               refType: "branch",
             },
+            method: { kind: "agent-plugin" },
+            methods: [{ kind: "agent-plugin" }],
             lockedSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
             manifest: { name: MAX_LENGTH_NAME, version: "1.0.0", interface: OPENAI_INTERFACE },
             skills: [],

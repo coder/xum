@@ -160,8 +160,32 @@ export const AgentPluginComponentKindSchema = z.enum([
   "slashCommands",
 ]);
 
+/**
+ * How Xum reads a repository as a managed plugin. Preview lists every method that fits, in this
+ * order, and install must use the method the user previewed. Each member is an object so a method
+ * can carry its own fields (a later Claude marketplace method names its entry).
+ */
+export const AgentPluginInstallMethodSchema = z.discriminatedUnion("kind", [
+  /** plugin.json, or .codex-plugin/plugin.json. */
+  z.object({ kind: z.literal("agent-plugin") }),
+  /** .claude-plugin/plugin.json. */
+  z.object({ kind: z.literal("claude-plugin") }),
+  /** SKILL.md folders only: Xum writes a plugin.json for them (installMethods.ts). */
+  z.object({ kind: z.literal("skills") }),
+]);
+export type AgentPluginInstallMethod = z.infer<typeof AgentPluginInstallMethodSchema>;
+
 export const AgentPluginInstallPreviewSchema = z.object({
   source: AgentPluginGitSourceSchema,
+  /** The method this preview used. Install gets it back. */
+  method: AgentPluginInstallMethodSchema,
+  /** Every method that fits the repository, in order: agent-plugin, claude-plugin, skills. */
+  methods: z.array(AgentPluginInstallMethodSchema),
+  /**
+   * Why Install refuses this method: a plugin or folder of the same name exists. The preview
+   * still lists every method.
+   */
+  installBlockedReason: z.string().optional(),
   /** Commit SHA the preview was computed from; install verifies it gets the same tree. */
   lockedSha: z.string(),
   manifest: AgentPluginManifestSummarySchema,

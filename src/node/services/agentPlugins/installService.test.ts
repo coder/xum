@@ -3041,15 +3041,22 @@ describe("AgentPluginInstallService", () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({ source: preview.source, expectedSha: preview.lockedSha });
 
-    // Managed entry with the same name.
-    await expect(service.preview({ input: remoteDir })).rejects.toThrow(/already installed/);
+    // Managed entry with the same name: the preview names it, and install refuses.
+    expect((await service.preview({ input: remoteDir })).installBlockedReason).toMatch(
+      /already installed/
+    );
     await expect(
       service.install({ source: preview.source, expectedSha: preview.lockedSha })
     ).rejects.toThrow(/already installed/);
 
     // Unmanaged directory at the target path (registry entry removed, dir kept).
     await fsPromises.rm(registryFile(), { force: true });
-    await expect(service.preview({ input: remoteDir })).rejects.toThrow(/already exists/);
+    expect((await service.preview({ input: remoteDir })).installBlockedReason).toMatch(
+      /already exists/
+    );
+    await expect(
+      service.install({ source: preview.source, expectedSha: preview.lockedSha })
+    ).rejects.toThrow(/already exists/);
   });
 
   test("update: badge on branch movement, atomic swap, lockedSha bump, local edits discarded", async () => {
@@ -8246,7 +8253,11 @@ describe("AgentPluginInstallService", () => {
       })
     );
 
-    await expect(service.preview({ input: remoteDir })).rejects.toThrow(/already installed/);
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.installBlockedReason).toMatch(/already installed/);
+    await expect(
+      service.install({ source: preview.source, expectedSha: preview.lockedSha })
+    ).rejects.toThrow(/already installed/);
     // The unrecognized entry is untouched.
     expect(await registry()).toHaveLength(1);
   });
