@@ -308,6 +308,7 @@ export function extractToolInstructionsFromSources(
     ...getToolAvailabilityOptions({
       workspaceId: metadata.id,
       parentWorkspaceId: metadata.parentWorkspaceId,
+      scratchWorkspace: metadata.kind === "scratch",
     }),
     agentInstructions,
   });
