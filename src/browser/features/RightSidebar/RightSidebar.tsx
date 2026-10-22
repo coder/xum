@@ -195,6 +195,11 @@ interface SidebarContainerProps {
   header?: React.ReactNode;
   /** The docked panel's content (resize handle and tab layout). */
   renderPanel: () => React.ReactNode;
+  /**
+   * The panel shows only the New tab, so it slides out empty: closing the last tab leaves the New
+   * tab in its place, and the close must not show it (user request).
+   */
+  blankWhileClosing: boolean;
   /** The collapsed sidebar's overview card content. */
   renderCard: () => React.ReactNode;
   role: string;
@@ -325,6 +330,7 @@ const SidebarPanelFrame: React.FC<{
   phase: SidebarSlidePhase;
   fullscreen: boolean;
   width: string;
+  blankWhileClosing: boolean;
   render: () => React.ReactNode;
 }> = (props) => {
   const frameRef = React.useRef<HTMLDivElement>(null);
@@ -348,7 +354,7 @@ const SidebarPanelFrame: React.FC<{
       // container's left edge instead of reflowing (terminals, review) on every frame.
       style={props.phase === "open" ? undefined : { width: props.width }}
     >
-      {props.render()}
+      {props.phase === "closing" && props.blankWhileClosing ? null : props.render()}
     </div>
   );
 };
@@ -412,6 +418,7 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({ containerRef, ...pr
         phase={phase}
         fullscreen={props.fullscreen === true}
         width={width}
+        blankWhileClosing={props.blankWhileClosing}
         render={props.renderPanel}
       />
     </div>
@@ -529,6 +536,44 @@ function hasMountedReviewPanel(node: RightSidebarLayoutNode): boolean {
 /** The layout's only tab when it is one pane with one tab, else null. */
 function getOnlyTab(node: RightSidebarLayoutNode): TabType | null {
   return node.type === "tabset" && node.tabs.length === 1 ? node.tabs[0] : null;
+}
+
+/**
+ * User request: closing the last tab closes the sidebar instead of showing the New tab in its
+ * place; the layout still falls back to the New tab, for the next expand. The returned function
+ * acts only when `tab` is the only tab on screen (`layout` is the rendered layout, which can hide
+ * stored tabs), and returns whether it did, so the caller skips its own focus move. The phone
+ * full-screen view closes instead of collapsing: a collapse there left a blank view (bug bash
+ * RS2). It sits in a ref: a side chat closes once its removal resolves, and the check must see the
+ * sidebar as it is then.
+ */
+function useLastTabClosesSidebar(options: {
+  layout: RightSidebarLayoutState;
+  collapsed: boolean;
+  setCollapsed: (collapsed: boolean) => void;
+  fullscreen: boolean;
+  onCloseFullscreen: (() => void) | undefined;
+  containerRef: React.RefObject<HTMLDivElement>;
+}): React.MutableRefObject<(tab: TabType) => boolean> {
+  const closeSidebarIfLastTab = (tab: TabType): boolean => {
+    if (options.collapsed || getOnlyTab(options.layout.root) !== tab) return false;
+    if (options.fullscreen) {
+      options.onCloseFullscreen?.();
+      return true;
+    }
+    // The collapse unmounts the panel, and focus inside it would fall to <body>.
+    const container = options.containerRef.current;
+    if (container?.contains(document.activeElement) === true) {
+      focusRightSidebarToggle(container.closest("[data-workspace-shell]"));
+    }
+    options.setCollapsed(true);
+    return true;
+  };
+  const ref = React.useRef(closeSidebarIfLastTab);
+  React.useLayoutEffect(() => {
+    ref.current = closeSidebarIfLastTab;
+  });
+  return ref;
 }
 
 type TabsetNode = Extract<RightSidebarLayoutNode, { type: "tabset" }>;
@@ -2042,32 +2087,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return new Map(Object.entries(stored) as Array<[TabType, string]>);
   });
 
-  /**
-   * User request: closing the last tab closes the sidebar instead of showing the New tab in its
-   * place; the layout still falls back to the New tab, for the next expand. Acts only when `tab`
-   * is the only tab on screen (the rendered layout, which can hide stored tabs), and returns
-   * whether it did, so the caller skips its own focus move. The phone full-screen view closes
-   * instead of collapsing: a collapse there left a blank view (bug bash RS2).
-   */
-  const closeSidebarIfLastTab = (tab: TabType): boolean => {
-    if (collapsed || getOnlyTab(layout.root) !== tab) return false;
-    if (fullscreen) {
-      onCloseFullscreen?.();
-      return true;
-    }
-    // The collapse unmounts the panel, and focus inside it would fall to <body>.
-    const container = sidebarContainerRef.current;
-    if (container?.contains(document.activeElement) === true) {
-      focusRightSidebarToggle(container.closest("[data-workspace-shell]"));
-    }
-    setCollapsed(true);
-    return true;
-  };
-  // Callers go through the ref: a side chat closes once its removal resolves, and the check must
-  // see the sidebar as it is then.
-  const closeSidebarIfLastTabRef = React.useRef(closeSidebarIfLastTab);
-  React.useLayoutEffect(() => {
-    closeSidebarIfLastTabRef.current = closeSidebarIfLastTab;
+  const closeSidebarIfLastTabRef = useLastTabClosesSidebar({
+    layout,
+    collapsed,
+    setCollapsed,
+    fullscreen,
+    onCloseFullscreen,
+    containerRef: sidebarContainerRef,
   });
 
   const removeTerminalTab = React.useCallback(
@@ -2085,7 +2111,23 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         return next;
       });
     },
-    [focusActiveTerminal, getBaseLayout, setLayout, terminalTitlesKey]
+    [closeSidebarIfLastTabRef, focusActiveTerminal, getBaseLayout, setLayout, terminalTitlesKey]
+  );
+
+  // Close a terminal tab and its backend session (its X, or CLOSE_TAB)
+  const handleCloseTerminal = React.useCallback(
+    (tab: TabType) => {
+      // Close the backend session
+      const sessionId = getTerminalSessionId(tab);
+      if (sessionId) {
+        api?.terminal.close({ sessionId }).catch((err) => {
+          console.warn("[RightSidebar] Failed to close terminal session:", err);
+        });
+      }
+
+      removeTerminalTab(tab);
+    },
+    [api, removeTerminalTab]
   );
 
   // Close a static or New tab (close button, middle-click, or CLOSE_TAB). When that uncovers a
@@ -2117,7 +2159,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       if (isTerminalTab(target)) focusTerminalTab(target);
       else setTabToFocus(target);
     },
-    [baseId, focusTerminalTab, getBaseLayout, setLayout]
+    [baseId, closeSidebarIfLastTabRef, focusTerminalTab, getBaseLayout, setLayout]
   );
 
   const { workspaceMetadata: allWorkspaceMetadata, loaded: workspaceMetadataLoaded } =
@@ -2162,7 +2204,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         })
         .finally(() => closingSideChatTabsRef.current.delete(tab));
     },
-    [allWorkspaceMetadata, api, setLayout, workspaceId, workspaceMetadataLoaded]
+    [
+      allWorkspaceMetadata,
+      api,
+      closeSidebarIfLastTabRef,
+      setLayout,
+      workspaceId,
+      workspaceMetadataLoaded,
+    ]
   );
 
   // Drop missing/misowned side-chat tabs without deleting anything. Pending ids stay until
@@ -2182,11 +2231,18 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         : !pending.has(id);
     });
     if (staleTabs.length === 0) return;
-    for (const tab of staleTabs) {
-      if (closingSideChatTabsRef.current.has(tab)) closeSidebarIfLastTabRef.current(tab);
-    }
+    staleTabs
+      .filter((tab) => closingSideChatTabsRef.current.has(tab))
+      .forEach((tab) => closeSidebarIfLastTabRef.current(tab));
     setLayout((prev) => staleTabs.reduce((acc, tab) => removeTabEverywhere(acc, tab), prev));
-  }, [allWorkspaceMetadata, layout, setLayout, workspaceId, workspaceMetadataLoaded]);
+  }, [
+    allWorkspaceMetadata,
+    closeSidebarIfLastTabRef,
+    layout,
+    setLayout,
+    workspaceId,
+    workspaceMetadataLoaded,
+  ]);
 
   // Keyboard shortcut for closing the focused pane's active tab, whatever its type
   React.useEffect(() => {
@@ -2211,19 +2267,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         return;
       }
 
-      // Handle terminal tabs
       if (isTerminalTab(activeTab)) {
-        e.preventDefault();
-
-        // Close the backend session
-        const sessionId = getTerminalSessionId(activeTab);
-        if (sessionId) {
-          api?.terminal.close({ sessionId }).catch((err) => {
-            console.warn("[RightSidebar] Failed to close terminal session:", err);
-          });
-        }
-
-        removeTerminalTab(activeTab);
+        handleCloseTerminal(activeTab);
         return;
       }
 
@@ -2236,7 +2281,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
     window.addEventListener("keydown", handleKeyDown, { capture: true });
     return () => window.removeEventListener("keydown", handleKeyDown, { capture: true });
-  }, [api, closeNonTerminalTab, handleCloseSideChat, layout, removeTerminalTab]);
+  }, [closeNonTerminalTab, handleCloseSideChat, handleCloseTerminal, layout]);
 
   useTerminalSessionSync(api, workspaceId, layout, setLayout);
 
@@ -2543,22 +2588,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     };
   }, [addTerminalRef, handleAddTerminal]);
 
-  // Handler to close a terminal tab
-  const handleCloseTerminal = React.useCallback(
-    (tab: TabType) => {
-      // Close the backend session
-      const sessionId = getTerminalSessionId(tab);
-      if (sessionId) {
-        api?.terminal.close({ sessionId }).catch((err) => {
-          console.warn("[RightSidebar] Failed to close terminal session:", err);
-        });
-      }
-
-      removeTerminalTab(tab);
-    },
-    [api, removeTerminalTab]
-  );
-
   // Handler to pop out a terminal to a separate window, then remove the tab
   const handlePopOutTerminal = React.useCallback(
     (tab: TabType) => {
@@ -2601,7 +2630,15 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         return next;
       });
     },
-    [workspaceId, api, setLayout, terminalTitlesKey, terminalCreateError, terminalTitles]
+    [
+      workspaceId,
+      api,
+      closeSidebarIfLastTabRef,
+      setLayout,
+      terminalTitlesKey,
+      terminalCreateError,
+      terminalTitles,
+    ]
   );
 
   // Configure sensors with distance threshold for click vs drag disambiguation
@@ -2874,12 +2911,11 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             )}
 
             <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-              {/* Collapsed, the panel only paints while it slides out: after the last tab
-                  closed, it slides out empty rather than with the New tab left in its place. */}
-              {!(collapsed && getOnlyTab(layout.root) === NEW_TAB) && renderLayoutNode(layout.root)}
+              {renderLayoutNode(layout.root)}
             </div>
           </>
         )}
+        blankWhileClosing={getOnlyTab(layout.root) === NEW_TAB}
         renderCard={() => (
           <RightSidebarOverview
             workspaceId={workspaceId}
