@@ -41,10 +41,11 @@ test(
     await expect(
       browser.locator('[data-testid="chat-message"][data-tool-call-id="tool-file-read-verify"]')
     ).toContainText("README.md");
+    // The row's text, quoted: "a row that says Xum asked the agent ..." failed, because the row
+    // does not name Xum (PR lane, run 39695607277: ASSERTION_FAILED).
     await agent.assert(
-      "after a row that says Xum asked the agent to update its TODO list and finish open " +
-        "items, the agent read a " +
-        "file (README.md) and replied that the TODO list is complete"
+      "after the row 'Asked the agent to update its TODO list and finish open items', the " +
+        "agent read a file (README.md) and replied that the TODO list is complete"
     );
 
     const nudges = await todoNudgeToolPolicies(app);
