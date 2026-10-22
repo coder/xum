@@ -4078,15 +4078,15 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
       "bedrock"
     );
 
-  // Haiku 5.5 thinks adaptively when `thinking` is omitted, so "off" (the `haiku`
-  // alias default and the workspace-naming fallback level) must be explicit. The real
-  // Bedrock provider drops `reasoningConfig: { type: "disabled" }` for Claude, so this
-  // checks the bytes it actually sends.
-  test.each([
-    ["the canonical alias routed to Bedrock", "anthropic:claude-haiku-5-5"],
-    ["an explicit Bedrock model", "bedrock:anthropic.claude-haiku-5-5"],
-  ])("Haiku 5.5 off disables thinking for %s", async (_label, model) => {
-    const options = bedrockOptions(model, "off");
+  /**
+   * Sends one request through the real Bedrock Converse provider and returns the
+   * JSON body it put on the wire, so these tests check the bytes Bedrock gets,
+   * not Xum's option object (the SDK rewrites reasoningConfig into raw fields).
+   */
+  async function sentBedrockBody(
+    bedrockModelId: string,
+    options: ReturnType<typeof buildProviderOptions>
+  ): Promise<{ path: string; body: Record<string, unknown> }> {
     const captured: Array<{ path: string; body: Record<string, unknown> }> = [];
     const captureFetch = Object.assign(
       (
@@ -4123,25 +4123,118 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
     });
 
     await generateText({
-      model: bedrock("anthropic.claude-haiku-5-5"),
+      model: bedrock(bedrockModelId),
       prompt: "Return ok.",
       providerOptions: options as Parameters<typeof generateText>[0]["providerOptions"],
       maxRetries: 0,
     });
 
     expect(captured).toHaveLength(1);
-    expect(captured[0].path).toBe("/model/anthropic.claude-haiku-5-5/converse");
-    expect(captured[0].body.additionalModelRequestFields).toEqual({
+    return captured[0];
+  }
+
+  // Haiku 5.5 thinks adaptively when `thinking` is omitted, so "off" (the `haiku`
+  // alias default and the workspace-naming fallback level) must be explicit. The real
+  // Bedrock provider drops `reasoningConfig: { type: "disabled" }` for Claude, so this
+  // checks the bytes it actually sends.
+  test.each([
+    ["the canonical alias routed to Bedrock", "anthropic:claude-haiku-5-5"],
+    ["an explicit Bedrock model", "bedrock:anthropic.claude-haiku-5-5"],
+  ])("Haiku 5.5 off disables thinking for %s", async (_label, model) => {
+    const sent = await sentBedrockBody("anthropic.claude-haiku-5-5", bedrockOptions(model, "off"));
+    expect(sent.path).toBe("/model/anthropic.claude-haiku-5-5/converse");
+    expect(sent.body.additionalModelRequestFields).toEqual({
       thinking: { type: "disabled" },
       output_config: { effort: "low" },
     });
   });
 
-  test("leaves other levels and older Claude models on the Bedrock defaults", () => {
-    // The Bedrock route sends no thinking options for these yet (#5839). Haiku 4.5
-    // does not think unless asked, so omitting `thinking` already means "off".
-    expect(bedrockOptions("anthropic:claude-haiku-5-5", "low")).toEqual({});
-    expect(bedrockOptions("anthropic:claude-haiku-4-5", "off")).toEqual({});
-    expect(bedrockOptions("anthropic:claude-sonnet-5-5", "off")).toEqual({});
+  // #5839: the selected level must reach Bedrock with the same per-model shape as
+  // the direct Anthropic route. Adaptive models get adaptive thinking plus effort
+  // (native-xhigh models also ask for summarized thinking); older models get a
+  // thinking budget and no effort.
+  test.each([
+    [
+      "anthropic:claude-sonnet-5-5",
+      "low",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "low" } },
+    ],
+    [
+      "bedrock:anthropic.claude-sonnet-5-5",
+      "medium",
+      {
+        thinking: { type: "adaptive", display: "summarized" },
+        output_config: { effort: "medium" },
+      },
+    ],
+    [
+      "bedrock:anthropic.claude-sonnet-5-5",
+      "high",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "high" } },
+    ],
+    [
+      "bedrock:anthropic.claude-opus-5-5",
+      "xhigh",
+      {
+        thinking: { type: "adaptive", display: "summarized" },
+        output_config: { effort: "xhigh" },
+      },
+    ],
+    // Opus 4.6 has no native xhigh (it maps to "max") and must not get `display`.
+    [
+      "bedrock:anthropic.claude-opus-4-6",
+      "xhigh",
+      { thinking: { type: "adaptive" }, output_config: { effort: "max" } },
+    ],
+    [
+      "bedrock:anthropic.claude-sonnet-5",
+      "off",
+      { thinking: { type: "disabled" }, output_config: { effort: "low" } },
+    ],
+    // Sonnet 5.5 rejects disabled thinking and its `between_tools` needs the
+    // Anthropic payload, so "off" runs as low adaptive on Bedrock.
+    [
+      "bedrock:anthropic.claude-sonnet-5-5",
+      "off",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "low" } },
+    ],
+    [
+      "bedrock:anthropic.claude-sonnet-4-5",
+      "medium",
+      { thinking: { type: "enabled", budget_tokens: 10000 } },
+    ],
+    [
+      "bedrock:anthropic.claude-haiku-4-5",
+      "low",
+      { thinking: { type: "enabled", budget_tokens: 4000 } },
+    ],
+    // Opus 4.5 takes effort on the direct route, but Bedrock gets the budget only.
+    [
+      "bedrock:anthropic.claude-opus-4-5",
+      "high",
+      { thinking: { type: "enabled", budget_tokens: 20000 } },
+    ],
+  ] as const)("%s at %s sends the matching reasoning fields", async (model, level, expected) => {
+    const bedrockModelId = `anthropic.${model.slice(model.indexOf("claude-"))}`;
+    const sent = await sentBedrockBody(bedrockModelId, bedrockOptions(model, level));
+    expect(sent.body.additionalModelRequestFields).toEqual(expected);
+  });
+
+  test("raises the output limit by the thinking budget", async () => {
+    const sent = await sentBedrockBody(
+      "anthropic.claude-sonnet-4-5",
+      bedrockOptions("bedrock:anthropic.claude-sonnet-4-5", "high")
+    );
+    // A budget at or above max_tokens is a 400, so the SDK must add room for it.
+    const inferenceConfig = sent.body.inferenceConfig as { maxTokens?: number } | undefined;
+    expect(inferenceConfig?.maxTokens).toBeGreaterThan(20000);
+  });
+
+  test("budget-thinking models at off keep the Bedrock default (no thinking)", async () => {
+    const sent = await sentBedrockBody(
+      "anthropic.claude-haiku-4-5",
+      bedrockOptions("bedrock:anthropic.claude-haiku-4-5", "off")
+    );
+    expect(sent.body.additionalModelRequestFields).toBeUndefined();
   });
 });
