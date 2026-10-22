@@ -53,18 +53,18 @@ const compactForAnthropic = (name: string, inputSchema: JSONSchema7) =>
   compactToolInputSchema({ name, inputSchema }, { anthropicWire: true });
 
 describe("tool schema compaction", () => {
-  it("drops $schema, safe-integer bounds and zod's uuid regex on the OpenAI wire too", async () => {
+  it("drops $schema from every tool and zod's bounds and uuid regex from built-ins", async () => {
+    const inputSchema = z.object({
+      id: z.uuid(),
+      count: z.number().int().min(1).nullish(),
+      guid: z.guid(),
+    });
     const sent = await sentSchemas("openai.responses", "gpt-6", {
-      sample: tool({
-        inputSchema: z.object({
-          id: z.uuid(),
-          count: z.number().int().min(1).nullish(),
-          guid: z.guid(),
-        }),
-      }),
+      task_await: tool({ inputSchema }),
+      linear_get_issue: tool({ inputSchema }),
     });
 
-    expect(sent.sample).toEqual({
+    expect(sent.task_await).toEqual({
       type: "object",
       properties: {
         id: { type: "string", format: "uuid" },
@@ -75,6 +75,10 @@ describe("tool schema compaction", () => {
       required: ["id", "guid"],
       additionalProperties: false,
     });
+    // An MCP server wrote this schema, so its bounds and patterns may be deliberate.
+    expect(sent.linear_get_issue).not.toHaveProperty("$schema");
+    expect(sent.linear_get_issue.properties?.id).toHaveProperty("pattern");
+    expect(JSON.stringify(sent.linear_get_issue)).toContain(String(Number.MAX_SAFE_INTEGER));
   });
 
   it("drops null from optional built-in fields only on Anthropic wires", async () => {

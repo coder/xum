@@ -11,9 +11,10 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 
 const ZOD_UUID_PATTERN = z.toJSONSchema(z.uuid()).pattern;
 
-// Workflow agents get an agent_report schema the workflow author wrote, where null may mean
-// something. MCP tools never reach this set: collectTools reserves every TOOL_DEFINITIONS name.
-const NULL_STRIPPED_TOOL_NAMES = new Set(
+// Built-in tools, whose schemas we build with zod. A workflow writes its own agent_report schema
+// and an MCP server its tools', so a bound, pattern or null there may be deliberate. MCP tools
+// never reach this set: collectTools reserves every TOOL_DEFINITIONS name.
+const ZOD_SCHEMA_TOOL_NAMES = new Set(
   Object.keys(TOOL_DEFINITIONS).filter((name) => name !== "agent_report")
 );
 
@@ -67,17 +68,17 @@ function withoutZodAddedKeywords(schema: Record<string, unknown>): Record<string
 }
 
 /**
- * A tool's input schema as the model should read it. The AI SDK validates input against the tool's
- * own schema (zod for built-ins), never this JSON. On the Anthropic wire, optional built-in fields
- * also lose `null`, which only OpenAI strict mode needs (see toolDefinitions.ts).
+ * A tool's input schema as the model should read it. Built-in tools, which the AI SDK validates
+ * against their zod schema rather than this JSON, also lose keywords zod adds and, on the Anthropic
+ * wire, the `null` that only OpenAI strict mode needs (see toolDefinitions.ts).
  */
 export function compactToolInputSchema(
   tool: Pick<LanguageModelV4FunctionTool, "name" | "inputSchema" | "strict">,
   options: { anthropicWire: boolean }
 ): JSONSchema7 {
-  const stripOptionalNulls =
-    options.anthropicWire && tool.strict !== true && NULL_STRIPPED_TOOL_NAMES.has(tool.name);
   const { $schema: _schemaUri, ...schema } = tool.inputSchema;
+  if (!ZOD_SCHEMA_TOOL_NAMES.has(tool.name)) return schema;
+  const stripOptionalNulls = options.anthropicWire && tool.strict !== true;
   return mapToolSubschemas(schema, (node) => {
     const compacted = withoutZodAddedKeywords(node);
     return stripOptionalNulls ? withoutOptionalNulls(compacted) : compacted;
