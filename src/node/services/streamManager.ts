@@ -1889,7 +1889,9 @@ export class StreamManager {
     const withTimeout = <T>(promise: PromiseLike<T>): Promise<T | undefined> =>
       Promise.race([
         promise,
-        new Promise<undefined>((resolve) => this.hostClock.setTimer(() => resolve(undefined), timeoutMs)),
+        new Promise<undefined>((resolve) =>
+          this.hostClock.setTimer(() => resolve(undefined), timeoutMs)
+        ),
       ]).catch(() => undefined);
 
     // Fetch all metadata in parallel with independent timeouts
@@ -2044,7 +2046,9 @@ export class StreamManager {
     try {
       const steps = await Promise.race([
         streamInfo.streamResult.steps,
-        new Promise<undefined>((resolve) => this.hostClock.setTimer(() => resolve(undefined), timeoutMs)),
+        new Promise<undefined>((resolve) =>
+          this.hostClock.setTimer(() => resolve(undefined), timeoutMs)
+        ),
       ]);
 
       if (!steps || steps.length === 0) {
@@ -4032,7 +4036,10 @@ export class StreamManager {
         // Nested records never store an end time, so incremental replay needs
         // this to notice a nested call that completed while the renderer was
         // disconnected (same mechanism as top-level tool completions).
-        streamInfo.toolCompletionTimestamps.set(event.callId, event.endTime ?? this.hostClock.nowMs());
+        streamInfo.toolCompletionTimestamps.set(
+          event.callId,
+          event.endTime ?? this.hostClock.nowMs()
+        );
       }
       const parentPartIndex = streamInfo.parts.findIndex(
         (p): p is CompletedMessagePart & { type: "dynamic-tool"; toolCallId: string } =>
@@ -5899,7 +5906,8 @@ export class StreamManager {
     errorType = coerceStreamErrorTypeForMessage(errorType, errorMessage);
     // The AI SDK honors Retry-After only for its own short in-request retries; once they are
     // exhausted, Xum's auto-retry must not come back sooner than the provider asked.
-    const retryAfterMs = errorType === "rate_limit" ? getProviderRetryAfterMs(actualError, this.hostClock) : null;
+    const retryAfterMs =
+      errorType === "rate_limit" ? getProviderRetryAfterMs(actualError, this.hostClock) : null;
 
     return {
       messageId: streamInfo.messageId,
