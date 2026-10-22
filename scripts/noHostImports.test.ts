@@ -62,9 +62,16 @@ test("reports value imports in bare and node: forms", () => {
   expect(ids(`await import("electron");`)).toEqual(["host"]);
   expect(ids(`export { readFile } from "fs/promises";`)).toEqual(["host"]);
   expect(ids(`export * from "os";`)).toEqual(["host"]);
+  expect(ids(`export {} from "fs";`)).toEqual(["host"]);
 });
 
-test("resolves relative specifiers to @/ modules", () => {
+test("resolves relative specifiers, the @shared alias and extensions to @/ modules", () => {
+  expect(ids(`import { writeFileAtomic } from "@shared/node/utils/writeFileAtomic";`)).toEqual([
+    "host",
+  ]);
+  expect(ids(`import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime.js";`)).toEqual([
+    "host",
+  ]);
   expect(ids(`import { writeFileAtomic } from "../../utils/writeFileAtomic";`)).toEqual(["host"]);
   expect(ids(`import { LocalBaseRuntime } from "../../runtime/LocalBaseRuntime";`)).toEqual([
     "host",
