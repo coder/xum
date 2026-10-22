@@ -126,6 +126,7 @@ import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
   ensureDaytonaSandboxReady,
+  refuseDaytonaEditorRemoteForward,
   resolveWorkspaceExecutionPath,
   resolveWorkspaceRootPath,
 } from "@/node/runtime/runtimeHelpers";
@@ -12093,7 +12094,10 @@ export class WorkspaceService
       name: workspace.name ?? workspaceId,
       namedWorkspacePath: workspace.path,
     });
-    return ready.success ? undefined : ready.error;
+    if (!ready.success) return ready.error;
+    // After readiness, so the alias resolves with the managed block and a current token.
+    const forwarding = await refuseDaytonaEditorRemoteForward(workspace.runtimeConfig);
+    return forwarding.success ? undefined : forwarding.error;
   }
 
   /** Body of recordExternalEditorOpenForLaunch after pending-recording admission. */

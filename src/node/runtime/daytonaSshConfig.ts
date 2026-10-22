@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
@@ -174,13 +175,16 @@ export function renderDaytonaHostBlock(input: {
   // the token), agent, display or local commands. `ProxyCommand none` comes first: OpenSSH then
   // ignores a later ProxyJump too. KnownHostsCommand is left alone: OpenSSH before 8.5 rejects it
   // unless an `IgnoreUnknown` covers it, and ours would replace the user's own `IgnoreUnknown`
-  // (first value wins). Forwards an editor asks for on its command line are left alone.
+  // (first value wins). `Tunnel no` keeps a user's `Tunnel` from giving the sandbox a tun device.
+  // Forwards are not first-value-wins (see hasInheritedRemoteForward), and those an editor asks
+  // for on its command line are left alone.
   return [
     `Host ${toXumDaytonaHost(input.sandboxId)}`,
     "  ProxyCommand none",
     "  ForwardAgent no",
     "  ForwardX11 no",
     "  PermitLocalCommand no",
+    "  Tunnel no",
     `  HostName ${input.gateway.host}`,
     `  Port ${input.gateway.port}`,
     `  User ${input.token}`,
@@ -188,6 +192,43 @@ export function renderDaytonaHostBlock(input: {
     `  UserKnownHostsFile ${quoteConfigPath(input.knownHostsPath)}`,
     "  StrictHostKeyChecking yes",
   ].join("\n");
+}
+
+const RESOLVE_ALIAS_TIMEOUT_MS = 10_000;
+
+/**
+ * Whether an editor's ssh would open a reverse forward into the sandbox for `alias`: OpenSSH
+ * adds up every RemoteForward that matches instead of keeping the first, so Xum's block cannot
+ * turn a user's `Host *` one off, and ClearAllForwardings would also drop the tunnel an editor
+ * opens on its command line. Resolved as the editor does (`ssh -G` with the user's and the
+ * system config). Throws when ssh cannot resolve the alias, so a caller fails closed. The output
+ * holds the token (as `user`): it is never logged or put in an error.
+ */
+export function hasInheritedRemoteForward(
+  alias: string,
+  /** Tests read a temp config instead of the user's (`-F` skips the system config too). */
+  options: { sshConfigPath?: string } = {}
+): Promise<boolean> {
+  const args = options.sshConfigPath ? ["-G", "-F", options.sshConfigPath, alias] : ["-G", alias];
+  return new Promise((resolve, reject) => {
+    execFile(
+      "ssh",
+      args,
+      { timeout: RESOLVE_ALIAS_TIMEOUT_MS, windowsHide: true, maxBuffer: 1024 * 1024 },
+      (error, stdout) => {
+        if (error) {
+          const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+          reject(
+            new DaytonaSshConfigError(
+              `Could not check your SSH config for ${alias} (ssh -G failed: ${String(code)})`
+            )
+          );
+          return;
+        }
+        resolve(/^remoteforward\s/im.test(stdout));
+      }
+    );
+  });
 }
 
 const INCLUDE_FILE_HEADER =
