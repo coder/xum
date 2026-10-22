@@ -7,6 +7,7 @@ import {
   heavySkips,
   loopTestFiles,
   patchesGlobalTime,
+  recordName,
   runFile,
   runPool,
 } from "./loopTestBaseline";
@@ -208,4 +209,11 @@ describe("runPool", () => {
     );
     expect(started).toEqual(["slow"]);
   });
+});
+
+test("recordName keeps a filtered or short run off the full record of a commit", () => {
+  const sha = "0123456789abcdef";
+  expect(recordName(sha, false, undefined, 10)).toBe("0123456789");
+  expect(recordName(sha, true, undefined, 10)).toBe("0123456789-dirty");
+  expect(recordName(sha, false, "tools/bash", 2)).toBe("0123456789-tools_bash-r2");
 });
