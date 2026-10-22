@@ -1,7 +1,9 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fsPromises from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import assert from "@/common/utils/assert";
 
 import {
   PROJECT_METADATA_DIR_NAMES,
@@ -104,6 +106,94 @@ export interface PluginFileReadResult {
   modifiedTime: Date;
 }
 
+/** The file kinds and size that discovery reads from a stat or lstat. */
+export interface PluginFsStat {
+  isFile(): boolean;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+  size: number;
+}
+
+export interface PluginFsDirent {
+  name: string;
+  isFile(): boolean;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+/**
+ * Every filesystem read that plugin discovery and the contained plugin reader make (#6426). The
+ * host filesystem is `nodePluginFs`. Another implementation (a remote checkout's listing held in
+ * memory) lets the unchanged discovery rules run without host files. Like node:fs/promises,
+ * methods reject (never throw synchronously), with the same `code` values (ENOENT when missing).
+ */
+export interface PluginFs {
+  realpath(filePath: string): Promise<string>;
+  stat(filePath: string): Promise<PluginFsStat>;
+  lstat(filePath: string): Promise<PluginFsStat>;
+  readdir(dirPath: string): Promise<PluginFsDirent[]>;
+  /** ensurePathContained: the realpath of `candidatePath`, which must stay inside `root`. */
+  ensureContained(
+    root: string,
+    candidatePath: string,
+    options?: { allowMissing?: boolean }
+  ): Promise<string>;
+  /** readPluginFileWithinRootCapped's contract: contained, identity-checked and capped. */
+  readFileCapped(args: PluginFileReadArgs): Promise<PluginFileReadResult>;
+}
+
+export interface PluginFileReadArgs {
+  filePath: string;
+  pluginRoot: string;
+  maxBytes: number;
+  /** Component name used in error messages (e.g. "hooks.js"). */
+  label: string;
+}
+
+/** The host filesystem: one module-level object, so a read costs no wrapper per call. */
+export const nodePluginFs: PluginFs = {
+  realpath: (filePath) => fsPromises.realpath(filePath),
+  stat: (filePath) => fsPromises.stat(filePath),
+  lstat: (filePath) => fsPromises.lstat(filePath),
+  readdir: (dirPath) => fsPromises.readdir(dirPath, { withFileTypes: true }),
+  ensureContained: ensurePathContained,
+  readFileCapped: readPluginFileWithinRootCapped,
+};
+
+/**
+ * The PluginFs of the discovery that is running. AsyncLocalStorage, not a parameter, so the
+ * many internal helpers keep their signatures; concurrent discoveries never share a store.
+ */
+const pluginFsStorage = new AsyncLocalStorage<PluginFs>();
+
+function pluginFs(): PluginFs {
+  return pluginFsStorage.getStore() ?? nodePluginFs;
+}
+
+/**
+ * discoverAgentPlugins on another filesystem (#6426): every read of the discovery goes through
+ * `fs`, whose paths are POSIX paths (POSIX hosts only). The exported readers (readPluginFileWithinRootCapped, ensurePluginPathContained) stay
+ * host readers outside such a run; a caller reads a non-host plugin's files with `fs` itself.
+ */
+export async function discoverAgentPluginsIn(
+  fs: PluginFs,
+  containers: AgentPluginContainer[]
+): Promise<DiscoverAgentPluginsResult> {
+  // Managed installs (registries, journals) exist only on the host.
+  assert(
+    containers.every((container) => container.registryPath === undefined),
+    "discoverAgentPluginsIn: a non-host PluginFs cannot hold managed containers"
+  );
+  // Discovery joins paths with the host `node:path`. A non-host PluginFs holds POSIX paths, which
+  // a Windows host would rewrite with backslashes, so a Windows host finds no plugins there
+  // (fail closed; #7226 tracks Windows hosts).
+  if (process.platform === "win32") {
+    log.debug("discoverAgentPluginsIn: not supported on a Windows host");
+    return { plugins: [], diagnostics: [] };
+  }
+  return await pluginFsStorage.run(fs, () => discoverAgentPlugins(containers));
+}
+
 /** A plugin path that resolves into the plugin root's `.git` directory (#6161). */
 export class PluginGitPathError extends Error {
   constructor() {
@@ -125,8 +215,8 @@ export async function ensurePluginPathContained(
   candidatePath: string,
   options?: { allowMissing?: boolean }
 ): Promise<string> {
-  const resolved = await ensurePathContained(pluginRoot, candidatePath, options);
-  const relative = path.relative(await fsPromises.realpath(pluginRoot), resolved);
+  const resolved = await pluginFs().ensureContained(pluginRoot, candidatePath, options);
+  const relative = path.relative(await pluginFs().realpath(pluginRoot), resolved);
   // Case-insensitive: on macOS and Windows `.GIT` is the same directory.
   if (relative.split(path.sep)[0].toLowerCase() === ".git") {
     throw new PluginGitPathError();
@@ -169,13 +259,9 @@ export async function ensurePluginPathContained(
  * pair post-open content with pre-open stat results. Over-blocking is safe —
  * the caller skips and re-measures on the next discovery.
  */
-export async function readPluginFileWithinRootCapped(args: {
-  filePath: string;
-  pluginRoot: string;
-  maxBytes: number;
-  /** Component name used in error messages (e.g. "hooks.js"). */
-  label: string;
-}): Promise<PluginFileReadResult> {
+export async function readPluginFileWithinRootCapped(
+  args: PluginFileReadArgs
+): Promise<PluginFileReadResult> {
   const { filePath, pluginRoot, maxBytes, label } = args;
   // Opening a FIFO for reading blocks until a writer appears, which would hang every caller
   // (list(), preview, skill/agent/hook/MCP config loads). Refuse anything but a regular file
@@ -343,7 +429,7 @@ export async function listPluginSkillFolders(
     return [{ name: root.name, dir: root.dir, file }];
   }
   try {
-    const entries = await fsPromises.readdir(root.dir, { withFileTypes: true });
+    const entries = await pluginFs().readdir(root.dir);
     return entries
       .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
       .map((entry) => entry.name)
@@ -374,7 +460,7 @@ export interface DiscoverAgentPluginsResult {
 
 async function listChildDirectories(containerPath: string): Promise<string[]> {
   try {
-    const entries = await fsPromises.readdir(containerPath, { withFileTypes: true });
+    const entries = await pluginFs().readdir(containerPath);
     // Include symlinks: a symlinked plugin directory is fine because its
     // realpath becomes the plugin root for all containment checks.
     return entries
@@ -427,7 +513,7 @@ async function resolveComponentPath(args: {
 
   let stat;
   try {
-    stat = await fsPromises.stat(canonical);
+    stat = await pluginFs().stat(canonical);
   } catch {
     return undefined;
   }
@@ -487,7 +573,9 @@ async function readManifestCandidate(
           : `${relative} resolves outside the plugin root: ${getErrorMessage(error)}`,
     };
   }
-  const stat = await fsPromises.stat(manifestReal).catch(() => null);
+  const stat = await pluginFs()
+    .stat(manifestReal)
+    .catch(() => null);
   // A manifest of the wrong filesystem kind: not a plugin candidate.
   if (!stat?.isFile()) return { status: "missing" };
   if (stat.size > MAX_PLUGIN_MANIFEST_BYTES) {
@@ -500,7 +588,7 @@ async function readManifestCandidate(
     // The checks above only classify the candidate. The bytes come from one handle that is
     // identity-checked, contained and capped, so a local replacement after the size check
     // cannot redirect or grow the read (Codex PRRT_kwDOPxxmWM6rvwzc, #6297).
-    const { content } = await readPluginFileWithinRootCapped({
+    const { content } = await pluginFs().readFileCapped({
       filePath: manifestReal,
       pluginRoot: rootReal,
       maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
@@ -546,7 +634,7 @@ export async function resolveDeclaredSkillsRoots(args: {
   declared: string | string[] | undefined;
   pluginName: string;
 }): Promise<PluginSkillsRoot[]> {
-  const rootReal = await fsPromises.realpath(args.pluginDir);
+  const rootReal = await pluginFs().realpath(args.pluginDir);
   const diagnostics: AgentPluginDiagnostic[] = [];
   return resolveSkillsRoots({
     declared: args.declared,
@@ -574,7 +662,9 @@ async function classifySkillsRoot(args: {
   // lstat: a SKILL.md symlink still marks the folder as one skill, so the scan sites'
   // containment checks refuse an escaping link instead of this folder being read as a
   // container of skill folders.
-  const skillFile = await fsPromises.lstat(path.join(args.canonical, "SKILL.md")).catch(() => null);
+  const skillFile = await pluginFs()
+    .lstat(path.join(args.canonical, "SKILL.md"))
+    .catch(() => null);
   if (skillFile?.isFile() !== true && skillFile?.isSymbolicLink() !== true) {
     return { dir: args.canonical };
   }
@@ -608,7 +698,9 @@ async function listCommandFiles(
   }
   const dir = await resolveComponent(relative, "directory");
   if (dir === undefined) return [];
-  const entries = await fsPromises.readdir(dir, { withFileTypes: true }).catch(() => []);
+  const entries = await pluginFs()
+    .readdir(dir)
+    .catch(() => []);
   // Symlinks too: every scan site reads them through the contained reader.
   return entries
     .filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".md"))
@@ -637,7 +729,7 @@ async function isLoadableSkill(name: string, file: string, rootReal: string): Pr
   try {
     // The hardened reader checks containment, file type and size on the opened handle, so a file
     // swapped (for a link out of the root, a FIFO or a bigger file) after a check is not read.
-    const { content, byteSize } = await readPluginFileWithinRootCapped({
+    const { content, byteSize } = await pluginFs().readFileCapped({
       filePath: file,
       pluginRoot: rootReal,
       maxBytes: MAX_FILE_SIZE,
@@ -660,10 +752,16 @@ async function isLoadableSkill(name: string, file: string, rootReal: string): Pr
  * key loads as one skill (the caller passes "." as the declared skills path).
  */
 async function isClaudeRootSkill(rootReal: string): Promise<boolean> {
-  if ((await fsPromises.lstat(path.join(rootReal, "skills")).catch(() => null)) !== null) {
+  if (
+    (await pluginFs()
+      .lstat(path.join(rootReal, "skills"))
+      .catch(() => null)) !== null
+  ) {
     return false;
   }
-  const skillFile = await fsPromises.lstat(path.join(rootReal, SKILL_FILENAME)).catch(() => null);
+  const skillFile = await pluginFs()
+    .lstat(path.join(rootReal, SKILL_FILENAME))
+    .catch(() => null);
   return skillFile?.isFile() === true || skillFile?.isSymbolicLink() === true;
 }
 
@@ -680,7 +778,9 @@ async function keepDeclaredAgentsOnly(args: {
   if (args.agentsDir === undefined || args.declaredFiles === undefined) return args.agentsDir;
   // An empty list declares no agents (normalizeClaudeManifest warned when it was unmappable).
   if (args.declaredFiles.length === 0) return undefined;
-  const entries = await fsPromises.readdir(args.agentsDir, { withFileTypes: true }).catch(() => []);
+  const entries = await pluginFs()
+    .readdir(args.agentsDir)
+    .catch(() => []);
   const declared = new Set(args.declaredFiles);
   const undeclared = entries
     .filter((entry) => entry.isFile() && pluginAgentIdOf(entry.name) !== null)
@@ -786,7 +886,9 @@ async function resolvePluginMcpConfig(args: {
 }): Promise<Pick<AgentPluginInfo, "mcpConfigPath" | "mcpConfigDialect">> {
   const rootMcpJson =
     args.manifestDialect !== "claude" &&
-    (await fsPromises.lstat(path.join(args.rootReal, "mcp.json")).catch(() => null)) !== null;
+    (await pluginFs()
+      .lstat(path.join(args.rootReal, "mcp.json"))
+      .catch(() => null)) !== null;
   const defaultMcpPath = rootMcpJson ? "mcp.json" : CODEX_MCP_CONFIG_RELATIVE_PATH;
   const mcpConfigPath = await args.resolveComponent(args.declared ?? defaultMcpPath, "file");
   if (mcpConfigPath === undefined) return {};
@@ -893,7 +995,7 @@ async function discoverPluginAt(args: {
   // The canonical plugin root anchors every §4.1 containment check.
   let rootReal: string;
   try {
-    rootReal = await fsPromises.realpath(pluginDir);
+    rootReal = await pluginFs().realpath(pluginDir);
   } catch {
     // Broken symlink / vanished entry: not a plugin.
     return null;
@@ -1241,6 +1343,14 @@ export async function journalDerivedDiscoveryGate(
 
 let discoveryGate: AgentPluginDiscoveryGate = journalDerivedDiscoveryGate;
 
+const noDiscoveryGate: AgentPluginDiscoveryGate = () =>
+  Promise.resolve({ suppressed: [], confirm: () => Promise.resolve([]) });
+
+/** The crash-recovery gate reads host journals; a non-host PluginFs has no managed containers. */
+function activeDiscoveryGate(): AgentPluginDiscoveryGate {
+  return pluginFs() === nodePluginFs ? discoveryGate : noDiscoveryGate;
+}
+
 export function setAgentPluginDiscoveryGate(gate: AgentPluginDiscoveryGate): void {
   discoveryGate = gate;
 }
@@ -1248,7 +1358,7 @@ export function setAgentPluginDiscoveryGate(gate: AgentPluginDiscoveryGate): voi
 /** Missing containers stay optional; other identity failures must never become unmanaged scans. */
 async function resolveAgentPluginContainerPath(containerPath: string): Promise<string | undefined> {
   try {
-    return await fsPromises.realpath(containerPath);
+    return await pluginFs().realpath(containerPath);
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) return undefined;
     throw error;
@@ -1504,7 +1614,7 @@ export async function discoverAgentPlugins(
       }
     }
   };
-  const gateSession = await discoveryGate([
+  const gateSession = await activeDiscoveryGate()([
     ...new Set([...groups.values()].flatMap((group) => [...group.paths])),
   ]);
   const suppressedContainers = new Set(gateSession.suppressed);
