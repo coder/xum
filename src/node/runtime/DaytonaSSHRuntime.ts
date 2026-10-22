@@ -59,7 +59,6 @@ import {
 import { applyArchiveSettingToIdleSandbox } from "@/node/services/daytona/daytonaLifecycleHooks";
 import { log } from "@/node/services/log";
 import { execBuffered } from "@/node/utils/runtime/helpers";
-import { expandTildeForSSH } from "./tildeExpansion";
 import {
   redactChildStderr,
   redactDaytonaError,
@@ -941,7 +940,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         params.initLogger.logStep("Daytona sandbox created");
       }
       await this.connect(sandboxId, params);
-      await this.prepareWorkspaceDirectory(params);
+      await this.prepareWorkspaceParentDirectory(params);
     } catch (error) {
       const errorMsg = redactDaytonaTokens(getErrorMessage(error));
       log.error("Daytona sandbox setup failed", { sandboxId, error: errorMsg });
@@ -964,21 +963,6 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       onStarting: () => initLogger.logStep("Starting sandbox..."),
       signal: abortSignal,
     });
-  }
-
-  /** git clone does not create the parent directory of the workspace. */
-  private async prepareWorkspaceDirectory(params: WorkspaceInitParams): Promise<void> {
-    params.initLogger.logStep("Preparing workspace directory...");
-    const parentDir = path.posix.dirname(params.workspacePath);
-    const mkdirResult = await execBuffered(this, `mkdir -p ${expandTildeForSSH(parentDir)}`, {
-      cwd: "/tmp",
-      timeout: 10,
-      abortSignal: params.abortSignal,
-    });
-    if (mkdirResult.exitCode !== 0) {
-      const errorMsg = mkdirResult.stderr || mkdirResult.stdout || "Unknown error";
-      throw new Error(`Failed to prepare workspace directory: ${errorMsg}`);
-    }
   }
 
   private async deleteCreatedSandbox(

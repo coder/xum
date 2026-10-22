@@ -2575,6 +2575,23 @@ export class SSHRuntime extends RemoteRuntime {
     }
   }
 
+  /** For hosts provisioned in postCreateSetup (Coder, Daytona): git clone does not create the parent. */
+  protected async prepareWorkspaceParentDirectory(params: WorkspaceInitParams): Promise<void> {
+    params.initLogger.logStep("Preparing workspace directory...");
+    const parentDir = path.posix.dirname(params.workspacePath);
+    const mkdirResult = await execBuffered(this, `mkdir -p ${expandTildeForSSH(parentDir)}`, {
+      cwd: "/tmp",
+      timeout: 10,
+      abortSignal: params.abortSignal,
+    });
+    if (mkdirResult.exitCode !== 0) {
+      const errorMsg = mkdirResult.stderr || mkdirResult.stdout || "Unknown error";
+      log.error("Failed to create workspace parent directory", { parentDir, error: errorMsg });
+      params.initLogger.logStderr(`Failed to prepare workspace directory: ${errorMsg}`);
+      throw new Error(`Failed to prepare workspace directory: ${errorMsg}`);
+    }
+  }
+
   async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {
     // Disable git hooks for untrusted projects (prevents post-checkout execution)
     const nhp = gitNoHooksPrefix(params.trusted);
