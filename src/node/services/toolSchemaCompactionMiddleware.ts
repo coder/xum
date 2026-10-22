@@ -11,9 +11,9 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 
 const ZOD_UUID_PATTERN = z.toJSONSchema(z.uuid()).pattern;
 
-// Built-in tools, whose schemas we build with zod. A workflow writes its own agent_report schema
-// and an MCP server its tools', so a bound, pattern or null there may be deliberate. MCP tools
-// never reach this set: collectTools reserves every TOOL_DEFINITIONS name.
+// Built-in tools, whose schemas we build with zod, except agent_report: a workflow can supply its
+// schema, and the name cannot tell. A bound, pattern or null that a workflow or an MCP server wrote
+// may be deliberate. MCP tools never reach this set: collectTools reserves these names.
 const ZOD_SCHEMA_TOOL_NAMES = new Set(
   Object.keys(TOOL_DEFINITIONS).filter((name) => name !== "agent_report")
 );

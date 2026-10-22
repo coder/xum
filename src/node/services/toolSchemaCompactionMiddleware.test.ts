@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { JSONSchema7 } from "@ai-sdk/provider";
-import { generateText, jsonSchema, tool, wrapLanguageModel, type Tool } from "ai";
+import { asSchema, generateText, jsonSchema, tool, wrapLanguageModel, type Tool } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import { z } from "zod";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
@@ -75,10 +75,10 @@ describe("tool schema compaction", () => {
       required: ["id", "guid"],
       additionalProperties: false,
     });
-    // An MCP server wrote this schema, so its bounds and patterns may be deliberate.
-    expect(sent.linear_get_issue).not.toHaveProperty("$schema");
-    expect(sent.linear_get_issue.properties?.id).toHaveProperty("pattern");
-    expect(JSON.stringify(sent.linear_get_issue)).toContain(String(Number.MAX_SAFE_INTEGER));
+    // Other names keep their schema as written: an MCP server may mean its bounds and patterns.
+    const { $schema: _uri, ...asWritten } = await asSchema(inputSchema).jsonSchema;
+    expect(sent.linear_get_issue).toEqual(asWritten);
+    expect(sent.linear_get_issue).not.toEqual(sent.task_await);
   });
 
   it("drops null from optional built-in fields only on Anthropic wires", async () => {
