@@ -47,6 +47,9 @@ import {
   selectWorkspace,
 } from "@/browser/stories/helpers/uiState";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
+import { getArtifactKind } from "@/common/utils/artifactKind";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
   RIGHT_SIDEBAR_TAB_KEY,
@@ -61,6 +64,7 @@ import { useEffect, useRef } from "react";
 import type { TabType } from "@/browser/types/rightSidebar";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { RightSidebar } from "./RightSidebar.js";
+import { writeArtifactSelection } from "./ArtifactsTab/artifactSelection";
 
 const meta: Meta = {
   title: "Features/RightSidebar/RightSidebar",
@@ -2237,6 +2241,40 @@ export const ToggleStaysPutWhileSliding: Story = {
 };
 
 /**
+ * Closing the only tab collapses the sidebar, and the panel slides out empty: the New tab that
+ * takes the closed tab's place never paints during the slide (user request). A collapse with the
+ * New tab already open slides out with it (ToggleStaysPutWhileSliding).
+ */
+export const ClosingLastTabSlidesOutEmpty: Story = {
+  ...CollapsedOverview,
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const sidebar = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    await userEvent.click(canvas.getByRole("button", { name: "Expand right sidebar" }));
+    // The launcher row's name includes its description.
+    await userEvent.click(await within(sidebar).findByRole("button", { name: /^Stats\b/ }));
+    const close = await within(sidebar).findByRole("button", { name: "Close Stats" });
+    await waitFor(() => {
+      if (sidebar.getAnimations().length > 0) throw new Error("The sidebar is still sliding open");
+    });
+
+    const frames = await sampleToggleFrames(canvasElement, () => userEvent.click(close));
+    await expect(canvas.getByRole("button", { name: "Expand right sidebar" })).toBeVisible();
+    const openWidth = frames[0].sidebarWidth;
+    await expect(openWidth).toBeGreaterThan(200);
+    await expect(frames[frames.length - 1].sidebarWidth).toBe(0);
+    const sliding = frames.filter((frame) => frame.sidebarWidth < openWidth - 1);
+    await expect(sliding.some((frame) => frame.sidebarWidth > 1)).toBe(true);
+    await expect(sliding.some((frame) => frame.panel)).toBe(false);
+  },
+};
+
+/**
  * Dragging the resize handle past the snap point collapses the sidebar, and dragging back
  * reopens it, at once: the width (and the transcript's room for the card) follows the pointer
  * instead of sliding behind it.
@@ -2321,6 +2359,93 @@ export const StripReachableUnderToggleBar: Story = {
       // again on each retry, since it mounts while the panel is still sliding in.
       allTabs.scrollIntoView({ block: "nearest", inline: "nearest" });
       if (!isHitTarget(allTabs)) throw new Error("All tabs is not under the pointer");
+    });
+  },
+};
+
+const PINNED_CLOSE_WORKSPACE_ID = "ws-pinned-last-tab-close";
+const PINNED_REPORT: ArtifactReadResult = {
+  status: "ok",
+  path: "report.md",
+  kind: getArtifactKind("report.md"),
+  size: 26,
+  modifiedMs: 1,
+  encoding: "utf8",
+  content: "# Weekly report\n\nAll good.",
+};
+
+/**
+ * Cmd/Ctrl+W on the only tab while it is pinned (Artifacts fullscreen over the workspace shell)
+ * closes the sidebar, and focus still ends on the sidebar toggle. The pinned view holds the
+ * toggle inert until it unmounts with the tab.
+ */
+export const ClosingPinnedLastTabFocusesToggle: Story = {
+  globals: { viewport: { value: "desktop", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const client = setupSimpleChatStory({
+          workspaceId: PINNED_CLOSE_WORKSPACE_ID,
+          workspaceName: "feature/pinned-close",
+          experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true },
+          messages: [createUserMessage("msg-1", "Show me the report", { historySequence: 1 })],
+        });
+        client.artifacts = {
+          ...client.artifacts,
+          list: () =>
+            Promise.resolve({
+              success: true as const,
+              data: {
+                available: true,
+                dir: "/scratch/artifacts",
+                entries: [
+                  {
+                    path: PINNED_REPORT.path,
+                    kind: PINNED_REPORT.kind,
+                    size: PINNED_REPORT.size,
+                    modifiedMs: 1,
+                  },
+                ],
+                truncated: false,
+              },
+            }),
+          read: () => Promise.resolve({ success: true as const, data: PINNED_REPORT }),
+        };
+        writeArtifactSelection(PINNED_CLOSE_WORKSPACE_ID, {
+          scope: "artifact",
+          path: PINNED_REPORT.path,
+          version: null,
+        });
+        collapseLeftSidebar();
+        seedSidebarLayout(PINNED_CLOSE_WORKSPACE_ID, ["artifacts"]);
+        expandRightSidebar(PINNED_CLOSE_WORKSPACE_ID);
+        return client;
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const sidebar = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    await userEvent.click(
+      await within(sidebar).findByRole("button", { name: "Fullscreen" }, { timeout: 15_000 })
+    );
+    const pinned = await canvas.findByRole("region", { name: "Artifact report.md" });
+    await waitFor(() => expect(pinned).toHaveFocus());
+
+    await userEvent.keyboard("{Control>}w{/Control}");
+
+    const toggle = await canvas.findByRole("button", { name: "Expand right sidebar" });
+    // A plain throw (not the instrumented expect), so a failure names where focus went.
+    await waitFor(() => {
+      const active = document.activeElement;
+      if (active !== toggle) {
+        throw new Error(`Focus is on <${active?.tagName.toLowerCase() ?? "none"}>, not the toggle`);
+      }
     });
   },
 };
