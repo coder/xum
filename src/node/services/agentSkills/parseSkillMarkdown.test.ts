@@ -113,6 +113,21 @@ Body
     expect(result.frontmatter.when_to_use).toBe("Use when triaging issues");
   });
 
+  // The Claude Code docs write the hint unquoted, which YAML reads as a flow sequence ("[x]")
+  // or as invalid YAML ("[a] [b]"); either way the skill failed to load (#7123 item 5).
+  test.each(["[issue-number]", "[filename] [format]"])(
+    "keeps an unquoted argument-hint %s as typed",
+    (hint) => {
+      const content = `---\nname: hinted-skill\ndescription: Takes arguments\nargument-hint: ${hint}\n---\nBody\n`;
+      const result = parseSkillMarkdown({
+        content,
+        byteSize: Buffer.byteLength(content, "utf-8"),
+        directoryName: SkillNameSchema.parse("hinted-skill"),
+      });
+      expect(result.frontmatter["argument-hint"]).toBe(hint);
+    }
+  );
+
   test("parses kebab-case when-to-use spelling in frontmatter", () => {
     const content = `---
 name: kebab-skill
