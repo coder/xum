@@ -4085,7 +4085,8 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
    */
   async function sentBedrockBody(
     bedrockModelId: string,
-    options: ReturnType<typeof buildProviderOptions>
+    options: ReturnType<typeof buildProviderOptions>,
+    callSettings: { maxOutputTokens?: number; temperature?: number } = {}
   ): Promise<{ path: string; body: Record<string, unknown> }> {
     const captured: Array<{ path: string; body: Record<string, unknown> }> = [];
     const captureFetch = Object.assign(
@@ -4127,6 +4128,7 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
       prompt: "Return ok.",
       providerOptions: options as Parameters<typeof generateText>[0]["providerOptions"],
       maxRetries: 0,
+      ...callSettings,
     });
 
     expect(captured).toHaveLength(1);
@@ -4234,7 +4236,12 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
       "xhigh",
       { thinking: { type: "adaptive" }, output_config: { effort: "max" } },
     ],
-    ["bedrock:us.anthropic.claude-sonnet-5-5-v1:0", "off", { output_config: { effort: "low" } }],
+    // Like the unversioned id: Sonnet 5.5 "off" runs as low adaptive on Bedrock.
+    [
+      "bedrock:us.anthropic.claude-sonnet-5-5-v1:0",
+      "off",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "low" } },
+    ],
     [
       "bedrock:anthropic.claude-sonnet-4-5-20250929-v1:0",
       "medium",
@@ -4260,14 +4267,20 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
     expect(bedrockOptions("bedrock:amazon.nova-pro-v1:0", "high")).toEqual({});
   });
 
-  test("raises the output limit by the thinking budget", async () => {
+  // Production sends the catalog output ceiling as maxOutputTokens (64000 for
+  // Sonnet 4.5). The budget counts toward it, as on the direct API, so the
+  // request must not add the budget on top (84000 would be a Bedrock 400).
+  test("keeps the caller's output ceiling with a thinking budget", async () => {
     const sent = await sentBedrockBody(
       "anthropic.claude-sonnet-4-5",
-      bedrockOptions("bedrock:anthropic.claude-sonnet-4-5", "high")
+      bedrockOptions("bedrock:anthropic.claude-sonnet-4-5", "high"),
+      { maxOutputTokens: 64000, temperature: 0.5 }
     );
-    // A budget at or above max_tokens is a 400, so the SDK must add room for it.
-    const inferenceConfig = sent.body.inferenceConfig as { maxTokens?: number } | undefined;
-    expect(inferenceConfig?.maxTokens).toBeGreaterThan(20000);
+    expect(sent.body.additionalModelRequestFields).toEqual({
+      thinking: { type: "enabled", budget_tokens: 20000 },
+    });
+    // Thinking rejects sampling overrides; the SDK must still see thinking as on.
+    expect(sent.body.inferenceConfig).toEqual({ maxTokens: 64000 });
   });
 
   test("budget-thinking models at off keep the Bedrock default (no thinking)", async () => {

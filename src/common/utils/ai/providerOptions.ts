@@ -335,15 +335,18 @@ function adaptiveModelOffThinking(capabilityModel: string): AnthropicThinkingSha
  * `bedrock:` origin, and Bedrock ids end in -vN[:M]; both defeat the anchored
  * capability matchers (a missed "rejects disabled" match would send a 400).
  */
-function bedrockClaudeCapabilityModel(capabilityModel: string): string | null {
+function bedrockClaudeCapabilityModel(
+  formatProvider: string | undefined,
+  capabilityModel: string
+): string | null {
+  if (formatProvider !== "bedrock") return null;
   const match = /(?:^|[.:])(claude-[a-z0-9-]+?)(?:-v\d+(?::\d+)?)?$/i.exec(capabilityModel);
   return match ? `anthropic:${match[1].toLowerCase()}` : null;
 }
 
 /**
- * Bedrock Converse fields for one thinking shape. Thinking goes through the SDK's
- * typed `reasoningConfig`: for a budget the SDK also raises maxTokens by the
- * budget (a budget at or above max_tokens is a 400), which raw fields would skip.
+ * Bedrock Converse fields for one thinking shape. Adaptive thinking goes through
+ * the SDK's typed `reasoningConfig`; a budget goes in the raw field (see below).
  * The SDK serializes `reasoningConfig: { type: "disabled" }` as nothing for Claude,
  * so "disabled" goes through additionalModelRequestFields verbatim.
  *
@@ -356,8 +359,20 @@ function buildBedrockClaudeOptions(shape: AnthropicThinkingShape): ProviderOptio
     return bedrockAdaptiveClaudeOptions(shape);
   }
   const thinking = shape.thinking;
+  // The budget goes in the raw field: as `reasoningConfig.budgetTokens` the SDK
+  // adds it on top of maxOutputTokens, which production sets to the catalog
+  // ceiling, so the request would exceed the model's output limit (a 400). The
+  // budget-free `reasoningConfig` still tells the SDK thinking is on, so it drops
+  // the sampling overrides (temperature, topP, topK) that thinking rejects.
   return thinking?.type === "enabled"
-    ? { bedrock: { reasoningConfig: { type: "enabled", budgetTokens: thinking.budgetTokens } } }
+    ? {
+        bedrock: {
+          reasoningConfig: { type: "enabled" },
+          additionalModelRequestFields: {
+            thinking: { type: "enabled", budget_tokens: thinking.budgetTokens },
+          },
+        },
+      }
     : {};
 }
 
@@ -756,8 +771,11 @@ export function buildProviderOptions(
   // Sonnet 5.5 "off" is `between_tools` only for the Anthropic payload on an eligible
   // route and with the effort pinned; elsewhere it runs as "low" adaptive. The turn
   // path already resolved this; the pass covers headless callers (e.g. compaction).
+  // Claude on Bedrock resolves its rules from the canonical id (see
+  // bedrockClaudeCapabilityModel), the "off" clamp included.
+  const bedrockClaudeModel = bedrockClaudeCapabilityModel(formatProvider, capabilityModel);
   const effectiveThinking = resolveBetweenToolsThinkingLevel(
-    capabilityModel,
+    bedrockClaudeModel ?? capabilityModel,
     thinkingLevel,
     formatProvider === "anthropic" &&
       anthropicBetweenToolsRouteAvailable(modelString, routeProvider, providersConfig),
@@ -1154,8 +1172,6 @@ export function buildProviderOptions(
 
   // Claude on Bedrock gets the same per-model thinking shape as the direct route
   // (#5839); without it the level picker did nothing there.
-  const bedrockClaudeModel =
-    formatProvider === "bedrock" ? bedrockClaudeCapabilityModel(capabilityModel) : null;
   if (bedrockClaudeModel != null) {
     const options = buildBedrockClaudeOptions(
       resolveAnthropicThinkingShape(
