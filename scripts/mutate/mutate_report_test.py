@@ -198,6 +198,26 @@ def test_a_crash_that_leaves_the_copy_mutated_retires_the_worker(tmp_path):
     assert rows[1]["reason"].startswith("no worker left")
 
 
+def test_a_retired_worker_does_not_drain_the_sites_left_for_healthy_ones(tmp_path):
+    import time
+    from mutate_report import run_all
+
+    root, bad, good = tmp_path / "root", tmp_path / "w0", tmp_path / "w1"
+    for tree in (root, bad, good):
+        write(tree, {"src/m.ts": "same\n"})
+    sites = [Site("src/m.ts", "f", n, n, 0, 1, "<", "<=") for n in range(1, 9)]
+
+    def runner(w, site, _tests, _timeouts, _deadline):
+        if w == bad:
+            (w / site.path).write_text("mutated\n")  # and no restore
+            raise OSError("disk full")
+        time.sleep(0.05)
+        return "killed"
+
+    rows = run_all(root, sites, {"src/m.ts": ["t"]}, queue_of(bad, good), 2, {}, 0.0, runner)
+    assert sorted(r["outcome"] for r in rows) == ["error"] + ["killed"] * 7
+
+
 def test_zero_workers_is_a_usage_error(tmp_path):
     import pytest
     from mutate_report import main

@@ -41,6 +41,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -307,11 +308,14 @@ def run_all(
 ) -> list[dict]:
     """Run each site on a free worker. One crash costs one row, not the report.
 
-    A worker whose copy of the file a crash left mutated is retired: its slot
-    in `free` becomes None, so later sites get an "error" row instead of a
-    result from a wrong tree, and no thread waits on a worker that never
-    comes back.
+    A worker whose copy of the file a crash left mutated is retired, and the
+    other workers run the sites left. Only when the last worker retires does
+    `free` get None, so later sites get an "error" row instead of a result
+    from a wrong tree, and no thread waits on a worker that never comes back.
     """
+
+    alive = [worker_count]
+    lock = threading.Lock()
 
     def one(site: Site) -> dict:
         if not plan[site.path]:
@@ -331,7 +335,13 @@ def run_all(
                 worker = None
             return row(site, "error", f"{type(error).__name__}: {error}")
         finally:
-            free.put(worker)
+            if worker is not None:
+                free.put(worker)
+            else:
+                with lock:
+                    alive[0] -= 1
+                    if alive[0] == 0:
+                        free.put(None)
 
     if worker_count == 0:
         return []
