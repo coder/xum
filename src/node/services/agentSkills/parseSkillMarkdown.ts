@@ -100,9 +100,18 @@ export function skillConsentFrontmatter(
  * too, before their frontmatter is rewritten into SKILL.md text.
  */
 export function quoteBracketedArgumentHint(yaml: string): string {
+  // Top-level keys share the indent of the first content line (YAML allows an indented root
+  // mapping). Deeper lines, such as block scalar text, are left alone.
+  const rootIndent = /^([ \t]*)[^\s#]/m.exec(yaml)?.[1] ?? "";
+  // A `#` after whitespace starts a YAML comment: it stays a comment, outside the quoted hint.
+  const hintLine = new RegExp(
+    `^(${rootIndent}argument-hint[ \\t]*:)[ \\t]*(\\[.*?)((?:[ \\t]+#.*)?)[ \\t]*$`,
+    "m"
+  );
   return yaml.replace(
-    /^argument-hint:[ \t]*(\[.*?)[ \t]*$/m,
-    (_line, hint: string) => `argument-hint: ${JSON.stringify(hint)}`
+    hintLine,
+    (_line, key: string, hint: string, comment: string) =>
+      `${key} ${JSON.stringify(hint)}${comment}`
   );
 }
 

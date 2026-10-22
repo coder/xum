@@ -115,22 +115,39 @@ Body
 
   // The Claude Code docs write the hint unquoted, which YAML reads as a flow sequence ("[x]")
   // or as invalid YAML ("[a] [b]"); either way the skill failed to load (#7123 item 5).
-  test.each([
-    ["[issue-number]", "[issue-number]"],
-    ["[filename] [format]", "[filename] [format]"],
-    // JSON quoting keeps inner quotes and backslashes as typed.
-    ['[say "hi"] [C:\\dir]', '[say "hi"] [C:\\dir]'],
-    // A value that is already quoted is not quoted again.
-    ['"[pr]"', "[pr]"],
-    ["'[a] [b]'", "[a] [b]"],
-  ])("keeps argument-hint %s as typed", (line, hint) => {
-    const content = `---\nname: hinted-skill\ndescription: Takes arguments\nargument-hint: ${line}\n---\nBody\n`;
-    const result = parseSkillMarkdown({
+  const parseHintedSkill = (frontmatter: string) => {
+    const content = `---\n${frontmatter}\n---\nBody\n`;
+    return parseSkillMarkdown({
       content,
       byteSize: Buffer.byteLength(content, "utf-8"),
       directoryName: SkillNameSchema.parse("hinted-skill"),
-    });
-    expect(result.frontmatter["argument-hint"]).toBe(hint);
+    }).frontmatter;
+  };
+
+  test.each([
+    ["argument-hint: [issue-number]", "[issue-number]"],
+    ["argument-hint: [filename] [format]", "[filename] [format]"],
+    // JSON quoting keeps inner quotes and backslashes as typed.
+    ['argument-hint: [say "hi"] [C:\\dir]', '[say "hi"] [C:\\dir]'],
+    // A value that is already quoted is not quoted again.
+    ['argument-hint: "[pr]"', "[pr]"],
+    ["argument-hint: '[a] [b]'", "[a] [b]"],
+    // A trailing YAML comment stays a comment, as it does for a quoted hint.
+    ["argument-hint: [issue-number] # issue ID", "[issue-number]"],
+    ["argument-hint : [issue-number]", "[issue-number]"],
+  ])("keeps %s as typed", (line, hint) => {
+    const frontmatter = parseHintedSkill(
+      `name: hinted-skill\ndescription: Takes arguments\n${line}`
+    );
+    expect(frontmatter["argument-hint"]).toBe(hint);
+  });
+
+  test("keeps a bracketed argument-hint in an indented root mapping, not in block text", () => {
+    const frontmatter = parseHintedSkill(
+      "  name: hinted-skill\n  description: |\n    argument-hint: [x]\n  argument-hint: [pr]"
+    );
+    expect(frontmatter["argument-hint"]).toBe("[pr]");
+    expect(frontmatter.description).toBe("argument-hint: [x]\n");
   });
 
   test("parses kebab-case when-to-use spelling in frontmatter", () => {
