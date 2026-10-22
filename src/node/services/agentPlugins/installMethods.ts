@@ -169,8 +169,11 @@ async function walkSkillParent(
     // Symlinks are followed only while they stay inside the tree.
     const real = await containedDirectory(ctx.rootReal, path.join(dirReal, name));
     if (real === undefined) continue;
-    if (await holdsSkillFile(ctx.rootReal, real)) skills.push(name);
-    else if (depth < maxDepth) groups.push({ name, real });
+    if (await holdsSkillFile(ctx.rootReal, real)) {
+      // As in the CLI (tryAddSkillAt): a SKILL.md that does not parse is no skill, and the
+      // walk does not go below it.
+      if ((await readSkillsCliName(ctx.rootReal, real)) !== undefined) skills.push(name);
+    } else if (depth < maxDepth) groups.push({ name, real });
   }
   // A walk again from a smaller depth finds the same children: record them once.
   if (skills.length > 0 && seenDepth === undefined) ctx.roots.push({ root: relative, skills });
@@ -241,7 +244,9 @@ export async function findSkillsPackageRoots(dir: string): Promise<SkillsPackage
       // Discovery reads a declared path that holds SKILL.md as one skill, so the folders
       // below it are not skills either.
       ctx.visited.set(real, 0);
-      ctx.roots.push({ root: container, skills: [path.posix.basename(container)] });
+      if ((await readSkillsCliName(rootReal, real)) !== undefined) {
+        ctx.roots.push({ root: container, skills: [path.posix.basename(container)] });
+      }
       continue;
     }
     await walkSkillParent(ctx, container, real, 1, MAX_CONTAINER_DEPTH);
