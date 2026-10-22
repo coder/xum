@@ -319,6 +319,25 @@ describe("agentSkillsService", () => {
     ]);
   });
 
+  // #7167: the ~/.mux/skills root follows HOME as it is when called, like ~/.agents/skills, so a
+  // test or sandbox with its own HOME never reads the host's skills CLI folder.
+  test.skipIf(process.platform === "win32")(
+    "the ~/.mux/skills root follows the current HOME",
+    () => {
+      using home = new DisposableTempDir("agent-skills-home");
+      const previousHome = process.env.HOME;
+      process.env.HOME = home.path;
+      try {
+        const workspacePath = path.join(home.path, "project");
+        const roots = getDefaultAgentSkillsRoots(new LocalRuntime(workspacePath), workspacePath);
+        expect(roots.legacyMuxGlobalRoot).toBe(path.join(home.path, ".mux", "skills"));
+      } finally {
+        if (previousHome === undefined) delete process.env.HOME;
+        else process.env.HOME = previousHome;
+      }
+    }
+  );
+
   test("ancestor discovery fails closed when the boundary is not a parent", () => {
     const workspacePath = "/workspace/project/packages/app";
     const roots = getDefaultAgentSkillsRoots(new LocalRuntime(workspacePath), workspacePath, {
