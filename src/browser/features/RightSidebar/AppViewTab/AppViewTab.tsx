@@ -18,7 +18,7 @@ import {
 } from "../ArtifactsTab/mcpAppViewsStore";
 import { Notice } from "../ArtifactsTab/SourceText";
 import { withEntrypointScope } from "./mcpAppEntrypoints";
-import { useNarrowViewport } from "@/browser/hooks/useNarrowViewport";
+import { usePinnedViewCoversWindow } from "@/browser/hooks/usePinnedViewCoversWindow";
 import { pinnedViewClass, pinnedViewRole, pinView } from "@/browser/utils/ui/pinnedView";
 import { cn } from "@/common/lib/utils";
 import {
@@ -168,9 +168,9 @@ export function AppViewTabPanel(props: {
 const MAXIMIZED_APP_PANEL_ATTRIBUTE = "data-maximized-app-panel";
 
 /**
- * The maximized app tab panel inside `container`, unless another modal is open. In a narrow window
- * the panel is a modal dialog (aria-modal), so isDialogOpen() is true while it is up; in a wide one
- * it is a region. Either way the sidebar still owns it as its tab, so Cmd/Ctrl+W closes it
+ * The maximized app tab panel inside `container`, unless another modal is open. Over the window
+ * the panel is a modal dialog (aria-modal), so isDialogOpen() is true while it is up; over the
+ * workspace shell it is a region. Either way the sidebar still owns it as its tab, so Cmd/Ctrl+W closes it
  * (#6181). Any other open modal returns null: it keeps the keys.
  */
 export function findOwnMaximizedAppPanel(container: Element | null): HTMLElement | null {
@@ -187,7 +187,7 @@ export function findOwnMaximizedAppPanel(container: Element | null): HTMLElement
 /**
  * The app tab's box, pinned while maximized (#6165): over the workspace shell in a wide window,
  * like Artifacts fullscreen and immersive review, so the left sidebar stays usable; over the
- * window in a narrow one. Pinned in place, not moved into a portal: a portal remounts the frame,
+ * window in a narrow one or inside the full-window right sidebar overlay. Pinned in place, not moved into a portal: a portal remounts the frame,
  * which reloads the view and loses its state (the same reason as Artifacts fullscreen). The
  * covered content goes inert meanwhile, Escape on the panel restores it, and closing the tab
  * restores it too.
@@ -201,8 +201,8 @@ function MaximizablePanel(props: {
   const maximized = useMcpAppViewMaximized(workspaceId, toolCallId);
   const setMaximized = (next: boolean) => setMcpAppViewMaximized(workspaceId, toolCallId, next);
   const panelRef = useRef<HTMLDivElement>(null);
-  const narrow = useNarrowViewport();
-  usePinnedView(panelRef, maximized, narrow, () => setMaximized(false));
+  const coversWindow = usePinnedViewCoversWindow();
+  usePinnedView(panelRef, maximized, coversWindow, () => setMaximized(false));
   // A closed tab must not come back maximized.
   useEffect(
     () => () => setMcpAppViewMaximized(workspaceId, toolCallId, false),
@@ -214,9 +214,9 @@ function MaximizablePanel(props: {
       data-testid="app-view-tab-panel"
       tabIndex={-1}
       aria-label={maximized ? "Maximized app view" : undefined}
-      // Like the Artifacts fullscreen panel: a modal dialog over the window (narrow) or a region
-      // over the workspace shell beside the usable left sidebar (wide).
-      {...(maximized ? pinnedViewRole(narrow) : {})}
+      // Like the Artifacts fullscreen panel: a modal dialog over the window, or a region over the
+      // workspace shell beside the usable left sidebar.
+      {...(maximized ? pinnedViewRole(coversWindow) : {})}
       {...(maximized ? { [MAXIMIZED_APP_PANEL_ATTRIBUTE]: "" } : {})}
       // The Artifacts fullscreen shortcut toggles it while focus is in the panel (outside the
       // view's frame, which keeps its own keys); Escape restores it.
@@ -236,7 +236,7 @@ function MaximizablePanel(props: {
       // stay above them.
       className={cn(
         "flex flex-col outline-none",
-        maximized ? pinnedViewClass(narrow) : "h-full min-h-0"
+        maximized ? pinnedViewClass(coversWindow) : "h-full min-h-0"
       )}
     >
       {props.children(maximized, setMaximized)}
@@ -245,7 +245,7 @@ function MaximizablePanel(props: {
 }
 
 /**
- * While `active`, the panel is pinned over the window (`narrow`) or the workspace shell: the
+ * While `active`, the panel is pinned over the window (`coversWindow`) or the workspace shell: the
  * covered content is inert, focus that falls out with a removed node returns to the panel, and the
  * panel is unpinned when it has no box any more (a hidden sidebar would otherwise leave the app
  * inert behind nothing). Focus returns to the panel after.
@@ -253,7 +253,7 @@ function MaximizablePanel(props: {
 function usePinnedView(
   panelRef: RefObject<HTMLDivElement | null>,
   active: boolean,
-  narrow: boolean,
+  coversWindow: boolean,
   onLostBox: () => void
 ) {
   const lostBox = useRef(onLostBox);
@@ -263,7 +263,7 @@ function usePinnedView(
   useEffect(() => {
     const panel = panelRef.current;
     if (!active || panel == null) return;
-    const unpin = pinView(panel, narrow);
+    const unpin = pinView(panel, coversWindow);
     panel.focus();
     const sizeObserver =
       typeof ResizeObserver === "function"
@@ -277,7 +277,7 @@ function usePinnedView(
       unpin();
       if (panel.isConnected) panel.focus();
     };
-  }, [panelRef, active, narrow]);
+  }, [panelRef, active, coversWindow]);
 }
 
 /**

@@ -26,6 +26,7 @@ import {
   ARTIFACTS_SELECTION_KEY,
   ARTIFACTS_SELECTION_MAX_WORKSPACES,
 } from "@/common/constants/storage";
+import { RightSidebarOverlayContext } from "@/browser/hooks/usePinnedViewCoversWindow";
 import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
@@ -586,6 +587,45 @@ describe("ArtifactsPanel", () => {
       shell.remove();
     });
   }
+
+  // A wide window whose workspace shell is too narrow for the docked right sidebar shows it only as
+  // the full-window overlay, which covers the left sidebar and makes it inert: fullscreen inside it
+  // must cover the window too (a workspace-scoped region would claim a usable left sidebar).
+  test("wide window inside the full-window right sidebar overlay: fullscreen covers the window", async () => {
+    stubNarrowViewport(false);
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha") }
+    );
+    const leftSidebar = document.body.appendChild(document.createElement("button"));
+    const shell = document.body.appendChild(document.createElement("div"));
+    shell.setAttribute("data-workspace-shell", "");
+    const view = render(
+      <RightSidebarOverlayContext.Provider value={true}>
+        <ArtifactsPanel workspaceId="ws-artifacts" />
+      </RightSidebarOverlayContext.Provider>,
+      { wrapper: ApiWrapper, container: shell.appendChild(document.createElement("div")) }
+    );
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("alpha")).toBeTruthy();
+
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact a.txt" });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(leftSidebar.inert).toBe(true);
+    expect(dialog.style.left).toBe("");
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    expect(leftSidebar.inert).toBe(false);
+    leftSidebar.remove();
+    shell.remove();
+  });
 
   test("autoFocus takes focus from the chat input so J/K and Shift+F work at once", async () => {
     fake = createFakeArtifactsApi(

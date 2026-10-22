@@ -44,8 +44,9 @@ export function pinOverWorkspace(panel: HTMLElement): () => void {
 }
 
 /**
- * Pins the panel over the whole window (narrow windows, where the left sidebar is a drawer that
- * opens under the panel): everything else goes inert and fallen focus returns. Returns the undo.
+ * Pins the panel over the whole window (a narrow window, where the left sidebar is a drawer that
+ * would open under the panel, or inside the full-window right sidebar overlay, which covers the
+ * left sidebar already): everything else goes inert and fallen focus returns. Returns the undo.
  */
 export function pinOverWindow(panel: HTMLElement): () => void {
   const restoreInert = makeOthersInert(panel);
@@ -57,35 +58,35 @@ export function pinOverWindow(panel: HTMLElement): () => void {
 }
 
 /**
- * Pins a fullscreen or maximized panel for the current width: over the window when `narrow`,
- * else over the workspace shell. Returns the undo.
+ * Pins a fullscreen or maximized panel: over the window when `coversWindow`
+ * (usePinnedViewCoversWindow), else over the workspace shell. Returns the undo.
  */
-export function pinView(panel: HTMLElement, narrow: boolean): () => void {
-  return narrow ? pinOverWindow(panel) : pinOverWorkspace(panel);
+export function pinView(panel: HTMLElement, coversWindow: boolean): () => void {
+  return coversWindow ? pinOverWindow(panel) : pinOverWorkspace(panel);
 }
 
 /**
- * The role of a pinned panel. Narrow: the rest of the window is inert, so a modal dialog. Wide: a
- * region over the workspace shell beside the usable left sidebar, like immersive review, so
- * shortcuts that check isDialogOpen() work as they do there.
+ * The role of a pinned panel. Over the window: the rest of the window is inert, so a modal
+ * dialog. Over the workspace shell: a region beside the usable left sidebar, like immersive
+ * review, so shortcuts that check isDialogOpen() work as they do there.
  */
-export function pinnedViewRole(narrow: boolean): {
+export function pinnedViewRole(coversWindow: boolean): {
   role: "dialog" | "region";
   "aria-modal": true | undefined;
 } {
-  return narrow
+  return coversWindow
     ? { role: "dialog", "aria-modal": true }
     : { role: "region", "aria-modal": undefined };
 }
 
 /**
- * The position and layer of a pinned panel. Narrow: z-[1500], the shared Dialog layer. Wide:
- * z-[1040], above the chat's menus and toasts (z-[1000]-z-[1020]) and below the left sidebar
+ * The position and layer of a pinned panel. Over the window: z-[1500], the shared Dialog layer.
+ * Over the workspace shell: z-[1040], above the chat's menus and toasts (z-[1000]-z-[1020]) and below the left sidebar
  * toggle bar (z-[1050]), so a collapsed sidebar can still be opened; pinOverWorkspace sets the box
  * inline over `inset-0`. Portaled menus and tooltips stay above both.
  */
-export function pinnedViewClass(narrow: boolean): string {
-  return narrow
+export function pinnedViewClass(coversWindow: boolean): string {
+  return coversWindow
     ? "bg-background ios-standalone:top-px fixed inset-0 z-[1500]"
     : "bg-background fixed inset-0 z-[1040]";
 }

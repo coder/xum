@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { PinnedViewToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
-import { useNarrowViewport } from "@/browser/hooks/useNarrowViewport";
+import { usePinnedViewCoversWindow } from "@/browser/hooks/usePinnedViewCoversWindow";
 import { pinnedViewClass, pinnedViewRole, pinView } from "@/browser/utils/ui/pinnedView";
 import {
   Download,
@@ -696,8 +696,9 @@ export function ArtifactsPanel(props: {
   // In a wide window it covers the workspace shell, like immersive review, so the left sidebar
   // stays visible and usable (consistency with immersive review was the ask); the shell's other
   // content goes inert. In a narrow window the left sidebar is a drawer that would open under the
-  // panel, so it covers the window, everything else goes inert, and it is a modal dialog.
-  const narrow = useNarrowViewport();
+  // panel, and inside the full-window right sidebar overlay the left sidebar is covered already,
+  // so then it covers the window, everything else goes inert, and it is a modal dialog.
+  const coversWindow = usePinnedViewCoversWindow();
   useEffect(() => {
     const panel = panelRef.current;
     if (!showFullscreen || panel == null) return;
@@ -708,7 +709,7 @@ export function ArtifactsPanel(props: {
     // did: a poll that swaps the viewer for a new version, or a closing comment box. Focus then
     // sat on <body>, so J/K and Escape missed the panel (Escape could even reach
     // Escape-to-interrupt).
-    const unpin = pinView(panel, narrow);
+    const unpin = pinView(panel, coversWindow);
     // Focus the panel itself, not the button that opened fullscreen, so J/K, Shift+F and C work
     // at once. Script focus is not :focus-visible in Chrome, so mark the ring by hand.
     panel.focus();
@@ -740,7 +741,7 @@ export function ArtifactsPanel(props: {
       // focus on <body>.
       if (document.activeElement !== returnTo) panel.focus();
     };
-  }, [showFullscreen, narrow, setAnnotationPick]);
+  }, [showFullscreen, coversWindow, setAnnotationPick]);
 
   // Picker order: pinned files first, then artifacts, then deleted artifacts with stored
   // versions. A selected version whose working file is gone keeps its own entry so the picker
@@ -1408,15 +1409,15 @@ export function ArtifactsPanel(props: {
       // ring on the panel itself is hidden under the toolbar's and viewer's backgrounds.
       className={cn(
         "after:ring-accent flex flex-col outline-none after:pointer-events-none after:absolute after:inset-0 after:z-10 after:hidden after:ring-1 after:ring-inset focus-visible:after:block data-[shortcut-focus=true]:after:block",
-        showFullscreen ? pinnedViewClass(narrow) : "relative h-full min-h-0"
+        showFullscreen ? pinnedViewClass(coversWindow) : "relative h-full min-h-0"
       )}
       data-shortcut-focus={shortcutFocused || undefined}
       onBlur={(e) => {
         // Only the panel's own blur: focus moving into a toolbar button shows that button's ring.
         if (e.target === e.currentTarget) setShortcutFocused(false);
       }}
-      // A modal dialog over the window (narrow) or a region over the workspace shell (wide).
-      {...(showFullscreen ? pinnedViewRole(narrow) : {})}
+      // A modal dialog over the window, or a region over the workspace shell.
+      {...(showFullscreen ? pinnedViewRole(coversWindow) : {})}
       aria-label={showFullscreen && selected != null ? `Artifact ${selected.path}` : undefined}
       data-testid="artifacts-panel"
     >
