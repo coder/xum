@@ -64,6 +64,18 @@ describe("DaytonaReconciler.sweep", () => {
     expect(rig.plane.countCalls("POST /sandbox/sb-2/last-activity")).toBe(0);
   });
 
+  it("leaves an active workspace's sandbox alone once it lost this install's label", async () => {
+    rig.plane.addSandbox({ id: "sb-1", name: "xum-foreign-aaaaaa", labels: {} });
+
+    await makeReconciler(
+      [{ id: "ws-busy", runtimeConfig: daytonaConfig("xum-foreign-aaaaaa") }],
+      ["ws-busy"]
+    ).sweep();
+
+    expect(rig.plane.countCalls("POST /sandbox/sb-1/last-activity")).toBe(0);
+    expect(rig.plane.countCalls("POST /sandbox/sb-1/ssh-access")).toBe(0);
+  });
+
   it("moves on past a hung control-plane call", async () => {
     rig.plane.addSandbox({ id: "sb-hung", labels: instanceLabels });
     rig.plane.addSandbox({ id: "sb-next", labels: instanceLabels });

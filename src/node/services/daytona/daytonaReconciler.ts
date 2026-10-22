@@ -21,7 +21,7 @@ export interface DaytonaReconcilerOptions {
     account: Pick<DaytonaAccount, "checkAvailability" | "withAccountLease">;
     sandboxes: Pick<
       DaytonaSandboxes,
-      "listInstanceSandboxes" | "refreshActivity" | "getSandboxState"
+      "listInstanceSandboxes" | "refreshActivity"
     >;
     ssh: Pick<DaytonaSsh, "hasExpiringSshToken" | "ensureSshAccess">;
   };
@@ -158,10 +158,9 @@ export class DaytonaReconciler {
     ref: DaytonaSandboxRef,
     sandboxes: DaytonaSandbox[]
   ): Promise<DaytonaSandbox | undefined> {
-    // Xum stores a name for sandboxes it created; last-activity only takes the real id.
-    const sandbox =
-      sandboxes.find((sb) => sb.id === ref.sandboxId || sb.name === ref.sandboxId) ??
-      (await this.lookUpSandbox(ref.sandboxId));
+    // Xum stores a name for sandboxes it created; last-activity only takes the real id. Only the
+    // label-filtered list counts: a sandbox without this install's label is not Xum's to touch.
+    const sandbox = sandboxes.find((sb) => sb.id === ref.sandboxId || sb.name === ref.sandboxId);
     // A stopped sandbox has nothing to keep alive, and checking its jobs over ssh would start it.
     if (!sandbox || !isStarted(sandbox)) return undefined;
     return (await this.isWorkspaceActive(ref.workspaceId)) ? sandbox : undefined;
@@ -201,22 +200,6 @@ export class DaytonaReconciler {
         sandboxId: storedId,
         error: getErrorMessage(error),
       });
-    }
-  }
-
-  private async lookUpSandbox(sandboxId: string): Promise<DaytonaSandbox | undefined> {
-    try {
-      const { sandbox } = await this.call(
-        this.options.daytonaService.sandboxes.getSandboxState(sandboxId),
-        "looking up a sandbox"
-      );
-      return sandbox;
-    } catch (error) {
-      log.warn("Daytona reconcile: could not look up a sandbox", {
-        sandboxId,
-        error: getErrorMessage(error),
-      });
-      return undefined;
     }
   }
 

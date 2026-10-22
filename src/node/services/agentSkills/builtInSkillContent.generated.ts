@@ -7365,7 +7365,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "This applies to `tool_pre`, `tool_post`, and `tool_env`.",
       "",
-      "For SSH workspaces (including Coder and Daytona), hooks execute **on the remote machine**, and the user-level location there is `~/.mux/<hook>`, not `~/.xum/<hook>`. Docker workspaces read user-level hooks from `/var/mux/<hook>` inside the container. Xum copies your local user-level hooks into sandboxes it creates for [Daytona](/runtime/daytona) workspaces.",
+      "For SSH workspaces (including Coder and Daytona), hooks execute **on the remote machine**, and the user-level location there is `~/.mux/<hook>`, not `~/.xum/<hook>`. Docker workspaces read user-level hooks from `/var/mux/<hook>` inside the container.",
       "",
       "</Accordion>",
       "",
