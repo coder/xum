@@ -237,6 +237,50 @@ def run_mutant(worker: Path, site: Site, tests: list[str], timeouts: dict[str, f
         path.write_bytes(original)
 
 
+def run_all(
+    root: Path,
+    sites: list[Site],
+    plan: dict[str, list[str]],
+    free: Queue,
+    worker_count: int,
+    timeouts: dict[str, float],
+    deadline: float,
+    runner=run_mutant,
+) -> list[dict]:
+    """Run each site on a free worker. One crash costs one row, not the report.
+
+    A worker whose copy of the file a crash left mutated is retired: its slot
+    in `free` becomes None, so later sites get an "error" row instead of a
+    result from a wrong tree, and no thread waits on a worker that never
+    comes back.
+    """
+
+    def one(site: Site) -> dict:
+        if not plan[site.path]:
+            return row(site, "no-test")
+        worker = free.get()
+        if worker is None:
+            free.put(None)
+            return row(site, "error", "no worker left: an earlier crash left its copy mutated")
+        try:
+            return row(site, runner(worker, site, plan[site.path], timeouts, deadline))
+        except Exception as error:  # noqa: BLE001 - one mutant, not the run
+            try:
+                clean = (worker / site.path).read_bytes() == (root / site.path).read_bytes()
+            except OSError:
+                clean = False
+            if not clean:
+                worker = None
+            return row(site, "error", f"{type(error).__name__}: {error}")
+        finally:
+            free.put(worker)
+
+    if worker_count == 0:
+        return []
+    with ThreadPoolExecutor(worker_count) as pool:
+        return list(pool.map(one, sites))
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -296,20 +340,24 @@ def main(argv: list[str]) -> int:
         for worker in workers:
             free.put(worker)
 
-        def baseline(test: str) -> tuple[bool, float, bool]:
+        def baseline(test: str) -> tuple[bool, float, bool] | str:
             # One process per worker copy at a time, as for mutants.
             worker = free.get()
             try:
                 return run_test(worker, test, BASELINE_TIMEOUT)
+            except Exception as error:  # noqa: BLE001 - one test, not the run
+                return f"could not run: {error}"
             finally:
                 free.put(worker)
 
         if workers:
             with ThreadPoolExecutor(len(workers)) as pool:
                 results = list(pool.map(baseline, needed))
-            for test, (passed, seconds, _timed_out) in zip(needed, results):
-                if passed:
-                    timeouts[test] = max(MIN_TIMEOUT, seconds * TIMEOUT_FACTOR)
+            for test, result in zip(needed, results):
+                if isinstance(result, str):
+                    dropped.append({"path": test, "reason": result})
+                elif result[0]:
+                    timeouts[test] = max(MIN_TIMEOUT, result[1] * TIMEOUT_FACTOR)
                 else:
                     dropped.append({"path": test, "reason": "fails without a mutant"})
         for source in plan:
@@ -317,20 +365,7 @@ def main(argv: list[str]) -> int:
 
         budget = to_run[: args.max_mutants]
         rows += [row(site, "not-run") for site in to_run[args.max_mutants :]]
-        deadline = started + args.max_seconds
-
-        def one(site: Site) -> dict:
-            if not plan[site.path]:
-                return row(site, "no-test")
-            worker = free.get()
-            try:
-                return row(site, run_mutant(worker, site, plan[site.path], timeouts, deadline))
-            finally:
-                free.put(worker)
-
-        if workers:
-            with ThreadPoolExecutor(len(workers)) as pool:
-                rows += list(pool.map(one, budget))
+        rows += run_all(root, budget, plan, free, len(workers), timeouts, started + args.max_seconds)
 
     rows.sort(key=lambda r: (r["path"], r["line"], r["original"], r["mutant"]))
     report = {
@@ -344,8 +379,8 @@ def main(argv: list[str]) -> int:
     return 0
 
 
-def row(site: Site, outcome: str) -> dict:
-    return {
+def row(site: Site, outcome: str, reason: str | None = None) -> dict:
+    result = {
         "path": site.path,
         "function": site.function,
         "line": site.line,
@@ -353,6 +388,9 @@ def row(site: Site, outcome: str) -> dict:
         "mutant": site.mutant,
         "outcome": outcome,
     }
+    if reason is not None:
+        result["reason"] = reason
+    return result
 
 
 if __name__ == "__main__":

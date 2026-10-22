@@ -67,7 +67,8 @@ mutate-check: 2 survived, 7 killed, 0 uncovered, 0 without a test, 0 not run
 - `uncovered`: with `--coverage <lcov>` (CI uses the Test / Unit reports), a
   site on a line that no test ran does not run. `no-test`: no passing unit
   test imports the file. `not-run`: the run stopped at its limit (CI: 300
-  mutants or 15 minutes).
+  mutants or 15 minutes). `error`: the runner crashed on that one mutant; the
+  report gives the reason, and the other mutants still count.
 - Locally it runs on 4 workers at most (`--workers N`). Start with a small
   change: every site in a touched function runs.
 

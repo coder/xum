@@ -19,7 +19,7 @@ import { changesSince } from "../crap/changes";
 
 const ADAPTER = join(import.meta.dir, "mutate_report.py");
 
-export type Outcome = "killed" | "survived" | "uncovered" | "no-test" | "not-run";
+export type Outcome = "killed" | "survived" | "uncovered" | "no-test" | "not-run" | "error";
 
 export interface MutantRow {
   path: string;
@@ -30,6 +30,8 @@ export interface MutantRow {
   /** The replacement; "" deletes the original token. */
   mutant: string;
   outcome: Outcome;
+  /** Why an "error" row has no result (the runner's exception). */
+  reason?: string;
 }
 
 export interface MutateReport {
@@ -51,6 +53,7 @@ export function counts(report: MutateReport): Record<Outcome, number> {
     uncovered: 0,
     "no-test": 0,
     "not-run": 0,
+    error: 0,
   };
   for (const row of report.mutants) result[row.outcome]++;
   return result;
@@ -77,7 +80,7 @@ function verdict(report: MutateReport): string {
 export function formatReport(report: MutateReport): string {
   const c = counts(report);
   const lines = [
-    `mutate-check: ${verdict(report)}, ${c.killed} killed, ${c.uncovered} uncovered, ${c["no-test"]} without a test, ${c["not-run"]} not run (base ${report.base.slice(0, 10)}, ${report.seconds}s)`,
+    `mutate-check: ${verdict(report)}, ${c.killed} killed, ${c.uncovered} uncovered, ${c["no-test"]} without a test, ${c["not-run"]} not run${c.error > 0 ? `, ${c.error} error(s)` : ""} (base ${report.base.slice(0, 10)}, ${report.seconds}s)`,
   ];
   const survivors = report.mutants.filter((row) => row.outcome === "survived");
   for (const path of [...new Set(survivors.map((row) => row.path))]) {
@@ -92,6 +95,9 @@ export function formatReport(report: MutateReport): string {
   if (untested.length > 0) lines.push(`  no passing unit test imports: ${untested.join(", ")}`);
   for (const dropped of report.droppedTests) {
     lines.push(`  dropped test ${dropped.path}: ${dropped.reason}`);
+  }
+  for (const row of report.mutants.filter((r) => r.outcome === "error")) {
+    lines.push(`  error :${row.line} ${describe(row)} in ${row.path}: ${row.reason ?? "unknown"}`);
   }
   if (report.cappedTests.length > 0) {
     lines.push(`  only the nearest test files ran for: ${report.cappedTests.join(", ")}`);

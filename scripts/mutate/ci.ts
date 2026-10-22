@@ -48,7 +48,7 @@ export function summary(report: MutateReport | null, coverage: boolean, toolErro
   const lines = [
     "## Mutation",
     "",
-    `${c.survived} survived, ${c.killed} killed, ${c.uncovered} uncovered, ${c["no-test"]} without a passing test, ${c["not-run"]} not run (${report.seconds}s). This check only warns.`,
+    `${c.survived} survived, ${c.killed} killed, ${c.uncovered} uncovered, ${c["no-test"]} without a passing test, ${c["not-run"]} not run, ${c.error} error(s) (${report.seconds}s). This check only warns.`,
     coverage
       ? "Sites on lines that no unit test ran were skipped (uncovered)."
       : "Unit coverage was incomplete, so every site ran.",

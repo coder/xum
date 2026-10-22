@@ -101,3 +101,51 @@ def test_a_mutant_past_the_deadline_is_not_run_and_the_file_is_restored(tmp_path
     s = Site("src/m.ts", "f", 1, 1, 34, 35, "<", "<=")
     assert run_mutant(tmp_path, s, ["src/m.test.ts"], {"src/m.test.ts": 5.0}, deadline=0.0) == "not-run"
     assert (tmp_path / "src/m.ts").read_text() == "export const f = (n: number) => n < 1;\n"
+
+
+def queue_of(*workers):
+    from queue import Queue
+
+    q = Queue()
+    for worker in workers:
+        q.put(worker)
+    return q
+
+
+def two_sites():
+    return [Site("src/m.ts", "f", 1, 1, 0, 1, "<", "<="), Site("src/m.ts", "f", 2, 2, 0, 1, ">", ">=")]
+
+
+def test_one_crashing_mutant_costs_one_row_not_the_report(tmp_path):
+    from mutate_report import run_all
+
+    root, worker = tmp_path / "root", tmp_path / "w0"
+    write(root, {"src/m.ts": "same\n"})
+    write(worker, {"src/m.ts": "same\n"})
+
+    def runner(_worker, site, _tests, _timeouts, _deadline):
+        if site.line == 1:
+            raise RuntimeError("bun crashed")
+        return "killed"
+
+    rows = run_all(root, two_sites(), {"src/m.ts": ["t"]}, queue_of(worker), 1, {}, 0.0, runner)
+    assert [(r["line"], r["outcome"], r.get("reason")) for r in rows] == [
+        (1, "error", "RuntimeError: bun crashed"),
+        (2, "killed", None),
+    ]
+
+
+def test_a_crash_that_leaves_the_copy_mutated_retires_the_worker(tmp_path):
+    from mutate_report import run_all
+
+    root, worker = tmp_path / "root", tmp_path / "w0"
+    write(root, {"src/m.ts": "same\n"})
+    write(worker, {"src/m.ts": "same\n"})
+
+    def runner(w, site, _tests, _timeouts, _deadline):
+        (w / site.path).write_text("mutated\n")  # and no restore
+        raise OSError("disk full")
+
+    rows = run_all(root, two_sites(), {"src/m.ts": ["t"]}, queue_of(worker), 1, {}, 0.0, runner)
+    assert [r["outcome"] for r in rows] == ["error", "error"]
+    assert rows[1]["reason"].startswith("no worker left")
