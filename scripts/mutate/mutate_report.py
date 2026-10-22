@@ -121,8 +121,8 @@ def only_types(statement) -> bool:
     if clause is None:
         return False
     named = clause if clause.type == "export_clause" else next((c for c in clause.named_children if c.type == "named_imports"), None)
-    if named is None or len(clause.named_children) > 1:
-        return False  # a default or namespace import loads the module
+    if named is None or (clause.type == "import_clause" and len(clause.named_children) > 1):
+        return False  # a default or namespace import loads the module (an export clause holds only specifiers)
     specifiers = [c for c in named.named_children if c.type in ("import_specifier", "export_specifier")]
     return bool(specifiers) and all(c.child_count > 0 and c.children[0].type == "type" for c in specifiers)
 
