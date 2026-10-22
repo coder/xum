@@ -7,6 +7,7 @@ import { XUM_DAYTONA_SSH_BLOCK_START } from "@/common/constants/daytona";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { log } from "@/node/services/log";
 import { DaytonaApiError } from "./daytonaClient";
+import { FakeDaytonaControlPlane } from "./daytona.testHarness";
 import {
   DAYTONA_BUSY_MESSAGE,
   DAYTONA_LABEL_INSTANCE,
@@ -407,6 +408,8 @@ describe("DaytonaService", () => {
           includeFile.delete(sandboxId);
           return Promise.resolve();
         },
+        removeSandboxTokens: () => Promise.resolve(),
+
         readTokens: () => Promise.resolve([]),
       },
     });
@@ -470,6 +473,8 @@ describe("DaytonaService", () => {
           order.push(`repoint ${gateway.host} ${gateway.hostKeys.join(",")}`);
           return Promise.resolve();
         },
+        removeSandboxTokens: () => Promise.resolve(),
+
         readTokens: () =>
           Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
       },
@@ -642,6 +647,8 @@ describe("DaytonaService", () => {
       ensureManagedBlock: () => Promise.resolve(),
       updateToken: store,
       removeSandbox: () => Promise.resolve(),
+      removeSandboxTokens: () => Promise.resolve(),
+
       readTokens: () =>
         Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
       repointGateway: () => Promise.resolve(),
@@ -676,6 +683,8 @@ describe("DaytonaService", () => {
       ensureManagedBlock: () => Promise.resolve(),
       updateToken: () => Promise.resolve(),
       removeSandbox: () => Promise.resolve(),
+      removeSandboxTokens: () => Promise.resolve(),
+
       readTokens: () =>
         failedReads-- > 0
           ? Promise.reject(new Error("EIO: i/o error, read"))
@@ -763,5 +772,65 @@ describe("DaytonaService", () => {
     });
     expect(labels[DAYTONA_LABEL_INSTANCE]).toBe(again[DAYTONA_LABEL_INSTANCE]);
     expect(labels[DAYTONA_LABEL_PROJECT]).toBe("my-project");
+  });
+
+  // Another backend on this root switched accounts: this one cannot revoke the old tokens, so
+  // their aliases must leave the shared include file before it retires the connections, or a
+  // fresh ssh from an alias would keep reaching the old account's sandbox.
+  it("drops the old account's aliases from the include file when another process switches", async () => {
+    const planes = new Map([
+      ["Bearer key-a", new FakeDaytonaControlPlane(() => clock)],
+      ["Bearer key-b", new FakeDaytonaControlPlane(() => clock)],
+    ]);
+    for (const [auth, accountPlane] of planes) {
+      accountPlane.tokenPrefix = `${auth.slice(-1)}-tok`;
+      for (const id of ["sb-1", "sb-2", "sb-3"]) accountPlane.addSandbox({ id, state: "started" });
+    }
+    const sshConfigPath = path.join(rootDir, "home", ".ssh", "config");
+    const backend = () =>
+      new DaytonaService({
+        credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "key-a" }),
+        rootDir,
+        sshConfigWriter: new DaytonaSshConfigWriter({ xumHome: rootDir, sshConfigPath }),
+        fetch: ((input: string | URL | Request, init?: RequestInit) => {
+          const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
+          // GET /config is public: both accounts share one deployment.
+          return (planes.get(auth) ?? planes.get("Bearer key-a"))!.fetch(input, init);
+        }) as typeof fetch,
+        now: () => clock,
+      });
+    const desktop = backend();
+    const server = backend();
+    const tokenOf = async (sandboxId: string): Promise<string> => {
+      const tokens = await new DaytonaSshConfigWriter({
+        xumHome: rootDir,
+        sshConfigPath,
+      }).readTokens();
+      const token = tokens.find((entry) => entry.sandboxId === sandboxId)?.token;
+      if (token === undefined) throw new Error(`No include block for ${sandboxId}`);
+      return token;
+    };
+    await desktop.ensureSshAccess("sb-1");
+    await desktop.ensureSshAccess("sb-3");
+    await tokenOf("sb-3");
+
+    await server.setConfig({ apiKey: "key-b" });
+    await server.ensureSshAccess("sb-1");
+    await server.ensureSshAccess("sb-2");
+    const serverTokens: Record<string, string> = {
+      "sb-1": await tokenOf("sb-1"),
+      "sb-2": await tokenOf("sb-2"),
+    };
+
+    // A status probe is enough for the desktop to notice.
+    await desktop.getSandboxState("sb-2");
+
+    const remaining = await new DaytonaSshConfigWriter({
+      xumHome: rootDir,
+      sshConfigPath,
+    }).readTokens();
+    expect(Object.fromEntries(remaining.map((entry) => [entry.sandboxId, entry.token]))).toEqual(
+      serverTokens
+    );
   });
 });

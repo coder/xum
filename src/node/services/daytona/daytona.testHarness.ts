@@ -77,6 +77,8 @@ export class FakeDaytonaControlPlane {
   readonly onRequest = new Map<string, () => Promise<unknown>>();
   private nextId = 1;
   private nextToken = 1;
+  /** Minted tokens are `<prefix><n>`: real tokens never repeat across accounts. */
+  tokenPrefix = "tok";
 
   constructor(private readonly now: () => number) {}
 
@@ -219,7 +221,7 @@ export class FakeDaytonaControlPlane {
       case "POST ssh-access": {
         const minutes = Number(url.searchParams.get("expiresInMinutes"));
         return json(200, {
-          token: `tok${this.nextToken++}`,
+          token: `${this.tokenPrefix}${this.nextToken++}`,
           expiresAt: new Date(this.now() + minutes * 60_000).toISOString(),
         });
       }
@@ -281,6 +283,7 @@ export class FakeDaytonaSshConfigWriter implements Pick<
   | "updateToken"
   | "repointGateway"
   | "removeSandbox"
+  | "removeSandboxTokens"
   | "readTokens"
 > {
   /** Current token per sandbox alias, as the include file would hold it. */
@@ -333,6 +336,13 @@ export class FakeDaytonaSshConfigWriter implements Pick<
   removeSandbox(sandboxId: string): Promise<void> {
     this.removed.push(sandboxId);
     this.tokens.delete(sandboxId);
+    return Promise.resolve();
+  }
+
+  removeSandboxTokens(held: ReadonlyArray<{ sandboxId: string; token: string }>): Promise<void> {
+    for (const { sandboxId, token } of held) {
+      if (this.tokens.get(sandboxId) === token) this.tokens.delete(sandboxId);
+    }
     return Promise.resolve();
   }
 

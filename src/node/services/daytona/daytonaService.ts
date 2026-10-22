@@ -240,6 +240,7 @@ export interface DaytonaServiceOptions {
     | "updateToken"
     | "repointGateway"
     | "removeSandbox"
+    | "removeSandboxTokens"
     | "readTokens"
   >;
   fetch?: typeof fetch;
@@ -583,7 +584,9 @@ export class DaytonaService {
    * finishes under the old settings: it sees the bump and starts over. Returns the tokens
    * dropped, for the caller to revoke.
    */
-  private async retireAccountCaches(): Promise<Array<[string, DaytonaSshAccess]>> {
+  private async retireAccountCaches(
+    beforeRetiringConnections?: (tokens: Array<[string, DaytonaSshAccess]>) => Promise<void>
+  ): Promise<Array<[string, DaytonaSshAccess]>> {
     this.credentialsGeneration++;
     this.provenOwned.clear();
     const tokens = [...this.tokens];
@@ -592,6 +595,7 @@ export class DaytonaService {
     this.tokens.clear();
     this.sshConfigured.clear();
     this.readyAt.clear();
+    await beforeRetiringConnections?.(tokens);
     await this.retirePooledSsh(connected);
     return tokens;
   }
@@ -619,7 +623,25 @@ export class DaytonaService {
     this.accountFingerprint = fingerprint;
     if (previous === undefined || previous === fingerprint) return;
     log.info("Daytona settings changed in another Xum process; dropping cached SSH access");
-    await this.retireAccountCaches();
+    await this.retireAccountCaches((tokens) => this.removeOldAccountAliases(tokens));
+  }
+
+  /**
+   * The old account's tokens cannot be revoked here, so their aliases leave the shared include
+   * file before the connections are retired (as releaseSshAccess does): a fresh ssh from an
+   * alias would otherwise keep reaching the old sandbox until the token expires. Only blocks
+   * still holding this process's token go: the other backend may have rewritten an alias.
+   */
+  private async removeOldAccountAliases(tokens: Array<[string, DaytonaSshAccess]>) {
+    try {
+      await this.sshConfigWriter.removeSandboxTokens(
+        tokens.map(([sandboxId, access]) => ({ sandboxId, token: access.token }))
+      );
+    } catch (error) {
+      log.warn("Could not remove the old Daytona account's ssh aliases", {
+        error: getErrorMessage(error),
+      });
+    }
   }
 
   private async getClientIfConfigured(): Promise<DaytonaClient | undefined> {

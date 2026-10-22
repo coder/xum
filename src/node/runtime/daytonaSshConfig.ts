@@ -373,6 +373,22 @@ export class DaytonaSshConfigWriter {
     });
   }
 
+  /**
+   * Remove each alias whose block still holds the given token. Another backend that rewrote
+   * the alias (a new token, maybe of another account) keeps its block.
+   */
+  async removeSandboxTokens(held: ReadonlyArray<{ sandboxId: string; token: string }>) {
+    if (held.length === 0) return;
+    const stale = new Map(held.map(({ sandboxId, token }) => [toXumDaytonaHost(sandboxId), token]));
+    await this.withIncludeFileLock(async () => {
+      const blocks = await this.readBlocks();
+      const removed = tokensIn(blocks)
+        .map(({ sandboxId, token }) => ({ alias: toXumDaytonaHost(sandboxId), token }))
+        .filter(({ alias, token }) => stale.get(alias) === token && blocks.delete(alias));
+      if (removed.length > 0) await this.writeBlocks(blocks);
+    });
+  }
+
   /** The sandbox ids and tokens the include file holds (written by this or an earlier process). */
   async readTokens(): Promise<Array<{ sandboxId: string; token: string }>> {
     return tokensIn(await this.readBlocks());
