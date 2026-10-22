@@ -281,7 +281,7 @@ export const CreationDraftExecutionSchema = z.object({
   runtime: ParsedRuntimeSchema.nullable(),
   trunkBranch: z.string().nullable(),
   /**
-   * The draft's last Daytona choice (an existing sandbox, a snapshot, a size), restored when
+   * The draft's last Daytona choice (a snapshot, a size), restored when
    * the user switches to another runtime and back. Never written to the project defaults.
    */
   lastDaytona: DaytonaSandboxConfigSchema.optional(),
