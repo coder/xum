@@ -1096,17 +1096,29 @@ const DAYTONA_RUNTIME_STATUS: Record<DaytonaSandboxState, WorkspaceRuntimeStatus
   missing: "error",
 };
 
-/** Sandbox states of the requested Daytona workspaces, probed in parallel. */
+/**
+ * Sandbox states of the requested Daytona workspaces, probed in parallel. Forks and attachments
+ * share a sandbox, so each sandbox is read once and its status given to all of its workspaces:
+ * a large fork tree must not send a burst of identical control-plane requests.
+ */
 async function probeDaytonaRuntimeStatuses(
   workspaceIds: string[],
   metadataById: Map<string, WorkspaceMetadata>
 ): Promise<Record<string, WorkspaceRuntimeStatus>> {
+  const workspacesBySandbox = new Map<string, string[]>();
+  for (const workspaceId of workspaceIds) {
+    const runtimeConfig = metadataById.get(workspaceId)?.runtimeConfig;
+    const sandboxId = isSSHRuntime(runtimeConfig) ? runtimeConfig.daytona?.sandboxId : undefined;
+    if (!sandboxId) continue;
+    const workspaces = workspacesBySandbox.get(sandboxId) ?? [];
+    workspaces.push(workspaceId);
+    workspacesBySandbox.set(sandboxId, workspaces);
+  }
   const statuses: Record<string, WorkspaceRuntimeStatus> = {};
   await Promise.all(
-    workspaceIds.map(async (workspaceId) => {
-      const runtimeConfig = metadataById.get(workspaceId)?.runtimeConfig;
-      const sandboxId = isSSHRuntime(runtimeConfig) ? runtimeConfig.daytona?.sandboxId : undefined;
-      if (sandboxId) statuses[workspaceId] = await probeDaytonaRuntimeStatus(sandboxId);
+    [...workspacesBySandbox].map(async ([sandboxId, workspaces]) => {
+      const status = await probeDaytonaRuntimeStatus(sandboxId);
+      for (const workspaceId of workspaces) statuses[workspaceId] = status;
     })
   );
   return statuses;

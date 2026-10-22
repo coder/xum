@@ -6,6 +6,8 @@ import { shellQuote } from "@/common/utils/shell";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { EnsureReadyOptions, Runtime } from "@/node/runtime/Runtime";
 import * as daytonaSshConfig from "@/node/runtime/daytonaSshConfig";
+import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import type { DaytonaRuntimeService } from "@/node/runtime/DaytonaSSHRuntime";
 import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
 import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import {
@@ -225,6 +227,90 @@ describe.skipIf(process.platform === "win32")(
     });
   }
 );
+
+describe("WorkspaceService.getRuntimeStatuses for Daytona workspaces", () => {
+  let harness: WorkspaceServiceHarness;
+  let projectPath: string;
+  let globalService: { mockRestore: () => void };
+  const getSandboxState = mock((sandboxId: string) =>
+    sandboxId === "sb-broken"
+      ? Promise.reject(new Error("throttled"))
+      : Promise.resolve({
+          state: sandboxId === "sb-1" ? ("started" as const) : ("stopped" as const),
+        })
+  );
+
+  beforeEach(async () => {
+    harness = await createWorkspaceServiceHarness();
+    projectPath = path.join(harness.rootDir, "project");
+    await fs.mkdir(projectPath);
+    getSandboxState.mockClear();
+    globalService = spyOn(runtimeFactory, "getGlobalDaytonaService").mockReturnValue({
+      getSandboxState,
+    } as unknown as DaytonaRuntimeService);
+  });
+
+  afterEach(async () => {
+    globalService.mockRestore();
+    await harness.cleanup();
+  });
+
+  async function addDaytonaWorkspaces(sandboxByWorkspace: Record<string, string>): Promise<void> {
+    await harness.config.editConfig((config) => {
+      config.projects.set(projectPath, {
+        trusted: true,
+        workspaces: Object.entries(sandboxByWorkspace).map(([id, sandboxId]) => ({
+          id,
+          name: id,
+          path: path.join(harness.rootDir, "checkouts", id),
+          runtimeConfig: {
+            type: "ssh",
+            host: `${sandboxId}.xum--daytona`,
+            srcBaseDir: "/home/daytona/xum",
+            daytona: { sandboxId },
+          },
+          createdAt: "2026-01-01T00:00:00.000Z",
+        })),
+      });
+      return config;
+    });
+  }
+
+  // Forks and attachments share one sandbox: a large fork tree must not burst the control plane.
+  test("reads each sandbox's state once and gives it to every workspace on it", async () => {
+    await addDaytonaWorkspaces({
+      parent: "sb-1",
+      fork1: "sb-1",
+      fork2: "sb-1",
+      other: "sb-2",
+      broken1: "sb-broken",
+      broken2: "sb-broken",
+    });
+
+    expect(
+      await harness.service.getRuntimeStatuses([
+        "parent",
+        "fork1",
+        "fork2",
+        "other",
+        "broken1",
+        "broken2",
+      ])
+    ).toEqual({
+      parent: "running",
+      fork1: "running",
+      fork2: "running",
+      other: "stopped",
+      broken1: "unknown",
+      broken2: "unknown",
+    });
+    expect(getSandboxState.mock.calls.map(([sandboxId]) => sandboxId).sort()).toEqual([
+      "sb-1",
+      "sb-2",
+      "sb-broken",
+    ]);
+  });
+});
 
 describe("WorkspaceService.recordExternalEditorOpen for a Daytona workspace", () => {
   let harness: WorkspaceServiceHarness;
