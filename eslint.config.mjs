@@ -180,10 +180,6 @@ const HOST_IMPORT_ALLOW = {
   "src/node/services/compactionCancellation.ts": ["fs"],
   "src/node/services/compactionPendingState.ts": ["fs/promises"],
   "src/node/services/continuousCompactionJournal.ts": ["@/node/utils/writeFileAtomic", "fs"],
-  "src/node/services/historyAppendProvenance.ts": ["@/node/utils/fs", "@/node/utils/writeFileAtomic", "fs", "fs/promises"],
-  "src/node/services/historyReplacementRows.ts": ["fs/promises"],
-  "src/node/services/historyScanner.ts": ["fs/promises"],
-  "src/node/services/sendIds.ts": ["fs/promises"],
 };
 
 const SHARED_RESTRICTED_PATHS = [AI_TOKENIZER_ENCODING_RESTRICTION];

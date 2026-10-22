@@ -1,4 +1,6 @@
-import * as fs from "node:fs/promises";
+import type * as fs from "node:fs/promises";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { createHash } from "node:crypto";
 import {
   SESSION_HISTORY_MAX_LINE_BYTES,
@@ -41,14 +43,15 @@ export interface HistoryReplacementRowOptions {
 export async function scanHistoryReplacementRows(
   file: string,
   visit: (row: HistoryReplacementRow) => boolean | void | Promise<boolean | void>,
-  options: HistoryReplacementRowOptions = {}
+  options: HistoryReplacementRowOptions = {},
+  files: SessionFiles = nodeSessionFiles
 ): Promise<boolean> {
   const targets = { ...options };
   targets.signal?.throwIfAborted();
   try {
     let opened: fs.FileHandle;
     try {
-      opened = await fs.open(file, "r");
+      opened = await files.promises.open(file, "r");
     } catch (error) {
       targets.signal?.throwIfAborted();
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
@@ -196,16 +199,17 @@ async function hasReverseReset(
 export async function equalHistoryReplacementRows(
   left: HistoryReplacementRow,
   right: HistoryReplacementRow,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  files: SessionFiles = nodeSessionFiles
 ): Promise<boolean> {
   const a = { file: left.file, ...left.row };
   const b = { file: right.file, ...right.row };
   signal?.throwIfAborted();
   try {
     if (a.byteLength !== b.byteLength || a.sha256 !== b.sha256) return false;
-    await using aHandle = await fs.open(a.file, "r");
+    await using aHandle = await files.promises.open(a.file, "r");
     signal?.throwIfAborted();
-    await using bHandle = await fs.open(b.file, "r");
+    await using bHandle = await files.promises.open(b.file, "r");
     signal?.throwIfAborted();
     const aBytes = Buffer.alloc(SESSION_HISTORY_SCAN_CHUNK_BYTES);
     const bBytes = Buffer.alloc(SESSION_HISTORY_SCAN_CHUNK_BYTES);
