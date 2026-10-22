@@ -862,6 +862,8 @@ async function readSkillDescriptorFromDir(
   skillDir: string,
   /** The skill's Markdown file in `skillDir` (candidateSkillFile). */
   skillFilePath: string,
+  /** Where diagnostics point: skillFilePath, or its remote path for a remote plugin skill. */
+  displayPath: string,
   directoryName: SkillName,
   scope: AgentSkillScope,
   options?: {
@@ -877,13 +879,7 @@ async function readSkillDescriptorFromDir(
   // Every invalid-skill diagnostic for this directory shares the same identity
   // (directoryName / scope / displayPath); only message + hint vary per failure.
   const pushInvalidSkill = (message: string, hint: string): void => {
-    options?.invalidSkills?.push({
-      directoryName,
-      scope,
-      displayPath: skillFilePath,
-      message,
-      hint,
-    });
+    options?.invalidSkills?.push({ directoryName, scope, displayPath, message, hint });
   };
 
   let content: string;
@@ -965,7 +961,7 @@ async function readSkillDescriptorFromDir(
     pushDisplayNameWarning(options, {
       directoryName,
       scope,
-      displayPath: skillFilePath,
+      displayPath,
       displayName: parsed.displayName,
     });
     return validated.data;
@@ -1131,6 +1127,7 @@ export async function discoverAgentSkills(
         scan.runtime,
         skillDir,
         skillFilePath,
+        displayPathOf(scan, skillFilePath),
         directoryName,
         scan.scope,
         {

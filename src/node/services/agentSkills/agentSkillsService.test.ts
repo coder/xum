@@ -1493,9 +1493,12 @@ describe("agentSkillsService agent plugins", () => {
     async (projectPluginsTrusted) => {
       using checkout = new DisposableTempDir("plugin-skill-remote");
       const root = await fs.realpath(checkout.path);
-      await writePlugin(path.join(root, ".xum", "plugins"), "repo-plugin", [
+      const pluginDir = await writePlugin(path.join(root, ".xum", "plugins"), "repo-plugin", [
         { name: "remote-review", description: "From a remote plugin" },
       ]);
+      const brokenSkill = path.join(pluginDir, "skills", "broken", "SKILL.md");
+      await fs.mkdir(path.dirname(brokenSkill), { recursive: true });
+      await fs.writeFile(brokenSkill, "no frontmatter\n");
       const runtime = new (class extends ShellRemoteRuntime {
         override getAgentHostKey() {
           return `test:${root}`;
@@ -1510,9 +1513,16 @@ describe("agentSkillsService agent plugins", () => {
       });
       const containment = { kind: "runtime" as const, root };
       try {
-        const { skills } = await discoverAgentSkills(runtime, root, { roots, containment });
+        const { skills, invalidSkills } = await discoverAgentSkills(runtime, root, {
+          roots,
+          containment,
+        });
         const listed = skills.find((skill) => skill.name === "remote-review");
         expect(listed?.pluginName).toBe(projectPluginsTrusted ? "repo-plugin" : undefined);
+        // Diagnostics name the remote file, never the host mirror.
+        expect(invalidSkills.find((issue) => issue.directoryName === "broken")?.displayPath).toBe(
+          projectPluginsTrusted ? brokenSkill : undefined
+        );
         const read = readAgentSkill(runtime, root, SkillNameSchema.parse("remote-review"), {
           roots,
           containment,
