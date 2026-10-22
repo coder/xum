@@ -1,5 +1,5 @@
 import { tool } from "ai";
-import { nodeClock } from "@/node/utils/hostClock";
+import { clockOf } from "@/node/utils/hostClock";
 import assert from "node:assert/strict";
 // NOTE: We avoid readline; consume Web Streams directly to prevent race conditions
 import * as fs from "fs";
@@ -1343,7 +1343,7 @@ ${scriptWithEnv}`;
             toolCallId,
             text,
             isError,
-            timestamp: (config.clock ?? nodeClock).nowMs(),
+            timestamp: clockOf(config).nowMs(),
           } satisfies BashOutputEvent,
           "bash"
         );
@@ -1576,7 +1576,7 @@ ${scriptWithEnv}`;
             (await Promise.race([
               execStream.exitCode.then(() => true).catch(() => true),
               new Promise<boolean>((resolve) =>
-                (config.clock ?? nodeClock).setTimer(() => resolve(false), BACKGROUND_EXIT_GRACE_MS)
+                clockOf(config).setTimer(() => resolve(false), BACKGROUND_EXIT_GRACE_MS)
               ),
             ]));
 

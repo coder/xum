@@ -7,7 +7,7 @@
  */
 
 import { tool } from "ai";
-import { nodeClock, type HostClock } from "@/node/utils/hostClock";
+import { clockOf, type HostClock } from "@/node/utils/hostClock";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { Tool } from "ai";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
@@ -497,7 +497,7 @@ export async function createCodeExecutionTool(
 ): Promise<Tool> {
   const bridgeableTools = toolBridge.getBridgeableTools();
   const state: DispatchState = { toolBridge, withMount, loadFile: options?.loadFile };
-  const clock = options?.clock ?? nodeClock;
+  const clock = clockOf(options);
 
   // Kernel mode = persistent mount available (RLM experiment, or the
   // XUM_SANDBOX_PERSISTENT_MOUNTS dev override that rides the same path).

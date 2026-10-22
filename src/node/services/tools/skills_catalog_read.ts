@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { nodeClock, type HostClock } from "@/node/utils/hostClock";
+import { clockOf, type HostClock } from "@/node/utils/hostClock";
 import { tool } from "ai";
 
 import type { SkillsCatalogReadToolResult } from "@/common/types/tools";
@@ -147,7 +147,7 @@ export const createSkillsCatalogReadTool: ToolFactory = (config: ToolConfigurati
       try {
         const { fetched, parsed, snapshot, pinNote } = await loadSkillForPage(
           args,
-          config.clock ?? nodeClock
+          clockOf(config)
         );
 
         // Catalog SKILL.md files can reach MAX_FILE_SIZE (1 MB): return the body in pages.

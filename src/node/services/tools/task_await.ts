@@ -1,5 +1,5 @@
 import assert from "@/common/utils/assert";
-import { nodeClock, type HostClock } from "@/node/utils/hostClock";
+import { clockOf, type HostClock } from "@/node/utils/hostClock";
 import { tool } from "ai";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -279,7 +279,7 @@ async function waitForDelayOrAbort(
 }
 
 export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
-  const clock = config.clock ?? nodeClock;
+  const clock = clockOf(config);
   return tool({
     description: TOOL_DEFINITIONS.task_await.description,
     inputSchema: TOOL_DEFINITIONS.task_await.schema,

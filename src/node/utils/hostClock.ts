@@ -34,3 +34,11 @@ export const nodeClock: HostClock = {
     return () => clearTimeout(timer);
   },
 };
+
+/**
+ * The holder's clock, or `nodeClock` when it has none (tool configs and
+ * options that tests build by hand leave the clock out).
+ */
+export function clockOf(holder: { readonly clock?: HostClock } | undefined): HostClock {
+  return holder?.clock ?? nodeClock;
+}

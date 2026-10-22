@@ -1,5 +1,5 @@
 import { tool } from "ai";
-import { nodeClock } from "@/node/utils/hostClock";
+import { clockOf } from "@/node/utils/hostClock";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import {
@@ -261,7 +261,7 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
         }
       }
       const createdRun: { id: string | null } = { id: null };
-      const invocationStartedAtMs = (config.clock ?? nodeClock).nowMs();
+      const invocationStartedAtMs = clockOf(config).nowMs();
       const startInput = {
         script,
         workspaceId,

@@ -19,7 +19,7 @@
  */
 
 import assert from "node:assert";
-import { nodeClock, type HostClock } from "@/node/utils/hostClock";
+import { clockOf, type HostClock } from "@/node/utils/hostClock";
 import { randomUUID } from "node:crypto";
 import { asSchema, type FlexibleSchema, type Tool } from "ai";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
@@ -309,7 +309,7 @@ async function shellToolHookMiddleware(
   next: WaterfallNext
 ): Promise<void> {
   const { runtime, cwd } = ctx.host;
-  const clock = ctx.host.clock ?? nodeClock;
+  const clock = clockOf(ctx.host);
 
   // Find hooks (checked per call - hooks can be added/removed dynamically)
   const [preHookPath, postHookPath, legacyHookPath] = await Promise.all([
