@@ -6,6 +6,7 @@ import { createMemoryPluginFs } from "./memoryPluginFs";
 import { discoverAgentPluginsIn } from "./discovery";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import {
+  MAX_LISTING_OUTPUT_BYTES,
   MAX_REMOTE_PLUGIN_ENTRIES,
   parseRemotePluginListing,
   parseTarFiles,
@@ -144,6 +145,9 @@ describe("parseRemotePluginListing", () => {
     // Paths count toward the cache's byte cap even without any file.
     const dirs = Array.from({ length: 100 }, (_, i) => `D\t\t${root}/${"x".repeat(1000)}${i}`);
     expect(parseRemotePluginListing(listing(dirs, []))?.bytes).toBeGreaterThan(200_000);
+    // One deep path implies ~2000 ancestors whose keys add up to millions of chars.
+    const deep = `D\t\t${root}/${"a/".repeat(2000)}b`;
+    expect(parseRemotePluginListing(listing([deep], []))?.bytes).toBeGreaterThan(4_000_000);
     for (const bad of [
       [`D\t\t${root}/p/../../etc`],
       [`D\t\t/etc`],
@@ -160,5 +164,8 @@ describe("parseRemotePluginListing", () => {
       expect(parseRemotePluginListing(listing(bad, []))).toBeNull();
     }
     expect(parseRemotePluginListing(listing(ok, []).replace("END\n", ""))).toBeNull();
+    // An input over the exec's output cap is refused before it is split or decoded.
+    const huge = listing(ok, []).replace("T\n", `T\n${"A".repeat(MAX_LISTING_OUTPUT_BYTES)}\n`);
+    expect(parseRemotePluginListing(huge)).toBeNull();
   });
 });

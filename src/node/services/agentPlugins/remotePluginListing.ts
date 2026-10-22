@@ -16,6 +16,12 @@ import { isCanonicalRemotePath, isInsideRoot, type MemoryNode } from "./memoryPl
 /** Entries (directories, symlinks, files) per listing; more loads no remote plugins. */
 export const MAX_REMOTE_PLUGIN_ENTRIES = 4000;
 /**
+ * Encoded listing output (base64 lines plus the entry lines). It holds about 12 MiB of tar, and
+ * tar adds 512 to 1023 bytes per file (header and padding). The exec that reads a listing caps its
+ * output here, and the parser refuses a longer input before any split or decode as well.
+ */
+export const MAX_LISTING_OUTPUT_BYTES = 16 * 1024 * 1024;
+/**
  * Nodes per listing, the implied ancestor directories included. A real listing implies only the
  * few directories above its walked trees, so more means a crafted listing (refused).
  */
@@ -259,7 +265,7 @@ const ROOT_PREFIX = "ROOT\t\t";
 function splitListing(
   stdout: string
 ): { entryLines: string[]; root: string; base64Lines: string[] } | null {
-  if (!stdout.endsWith(FRAME_END)) return null;
+  if (stdout.length > MAX_LISTING_OUTPUT_BYTES || !stdout.endsWith(FRAME_END)) return null;
   const lines = stdout.slice(0, -FRAME_END.length).split("\n");
   const tarLine = lines.indexOf("T");
   const rootLine = tarLine < 1 ? "" : lines[tarLine - 1];
@@ -276,12 +282,20 @@ function decodeTar(base64Lines: string[]): { tar: Buffer; files: Map<string, Buf
   return files === null ? null : { tar, files };
 }
 
+/** Chars a node keeps: its map key, its name in the memory fs' child list, a link's target. */
+function nodeChars(remote: string, node: MemoryNode): number {
+  const target = node.kind === "symlink" ? (node.target?.length ?? 0) : 0;
+  return remote.length + path.posix.basename(remote).length + target;
+}
+
 /**
- * An estimate of the memory a parsed listing keeps: the tar, the path strings (2 bytes per
- * char) and a fixed cost per node, so a listing of many long paths and no files still counts.
+ * An estimate of the memory a parsed listing keeps: the tar, the path strings of EVERY node (the
+ * implied ancestors too; 2 bytes per char) and a fixed cost per node, so a listing of many or
+ * deep paths and no files still counts against the cache's byte cap.
  */
-function retainedBytes(tar: Buffer, entryLines: string[], nodes: Map<string, MemoryNode>): number {
-  const chars = entryLines.reduce((total, line) => total + line.length, 0);
+function retainedBytes(tar: Buffer, nodes: Map<string, MemoryNode>): number {
+  let chars = 0;
+  for (const [remote, node] of nodes) chars += nodeChars(remote, node);
   return tar.length + 2 * chars + 64 * nodes.size;
 }
 
@@ -304,7 +318,7 @@ export function parseRemotePluginListing(stdout: string): RemotePluginListing | 
     ? {
         root: parts.root,
         nodes: context.nodes,
-        bytes: retainedBytes(decoded.tar, parts.entryLines, context.nodes),
+        bytes: retainedBytes(decoded.tar, context.nodes),
       }
     : null;
 }
