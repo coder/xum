@@ -635,13 +635,17 @@ async function isLoadableSkill(name: string, file: string, rootReal: string): Pr
   const skillName = SkillNameSchema.safeParse(name);
   if (!skillName.success) return false;
   try {
-    const real = await fsPromises.realpath(file);
-    if (!real.startsWith(rootReal + path.sep)) return false;
-    const stat = await fsPromises.stat(real);
-    if (!stat.isFile() || stat.size > MAX_FILE_SIZE) return false;
+    // The hardened reader checks containment, file type and size on the opened handle, so a file
+    // swapped (for a link out of the root, a FIFO or a bigger file) after a check is not read.
+    const { content, byteSize } = await readPluginFileWithinRootCapped({
+      filePath: file,
+      pluginRoot: rootReal,
+      maxBytes: MAX_FILE_SIZE,
+      label: SKILL_FILENAME,
+    });
     parseSkillMarkdown({
-      content: await fsPromises.readFile(real, "utf8"),
-      byteSize: stat.size,
+      content,
+      byteSize,
       directoryName: skillName.data,
       allowDisplayName: true,
     });
