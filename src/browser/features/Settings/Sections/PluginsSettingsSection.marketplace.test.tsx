@@ -66,7 +66,6 @@ test("an entry preview focuses Back and offers no Skills CLI; Back focuses the p
       items: [],
       marketplace: listing,
       previewsByEntry: { remote: remotePreview },
-      skillsCliStatus: { available: true, nodeVersion: "v22.20.0", package: "skills@1.7.4" },
     },
   });
   const view = render(
