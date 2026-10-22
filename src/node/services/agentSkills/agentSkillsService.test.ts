@@ -19,6 +19,8 @@ import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { ShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { clearRemoteProjectPluginSnapshots } from "@/node/services/agentPlugins/remoteProjectPlugins";
 import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import {
   discoverAgentSkills,
@@ -1483,6 +1485,54 @@ describe("agentSkillsService agent plugins", () => {
     }
     return pluginDir;
   }
+
+  // #6426: a trusted remote checkout's plugin skills load from a host snapshot, but the read
+  // result names the REMOTE skill dir and runtime (bash and the skill tools use them).
+  test.each([true, false])(
+    "remote checkout plugin skills load only in a trusted project, with remote paths (trusted: %s)",
+    async (projectPluginsTrusted) => {
+      using checkout = new DisposableTempDir("plugin-skill-remote");
+      const root = await fs.realpath(checkout.path);
+      await writePlugin(path.join(root, ".xum", "plugins"), "repo-plugin", [
+        { name: "remote-review", description: "From a remote plugin" },
+      ]);
+      const runtime = new (class extends ShellRemoteRuntime {
+        override getAgentHostKey() {
+          return `test:${root}`;
+        }
+        protected override getBasePath() {
+          return root;
+        }
+      })(root);
+      const roots = getDefaultAgentSkillsRoots(runtime, root, {
+        projectSearchRoot: root,
+        projectPluginsTrusted,
+      });
+      const containment = { kind: "runtime" as const, root };
+      try {
+        const { skills } = await discoverAgentSkills(runtime, root, { roots, containment });
+        const listed = skills.find((skill) => skill.name === "remote-review");
+        expect(listed?.pluginName).toBe(projectPluginsTrusted ? "repo-plugin" : undefined);
+        const read = readAgentSkill(runtime, root, SkillNameSchema.parse("remote-review"), {
+          roots,
+          containment,
+        });
+        if (!projectPluginsTrusted) {
+          await expect(read).rejects.toThrow();
+          return;
+        }
+        const resolved = await read;
+        expect(resolved.skillDir).toBe(
+          path.join(root, ".xum", "plugins", "repo-plugin", "skills", "remote-review")
+        );
+        expect(resolved.sourceRuntime).toBe(runtime);
+        expect(resolved.pluginRoot).toBeUndefined();
+      } finally {
+        await clearRemoteProjectPluginSnapshots();
+      }
+    },
+    60_000
+  );
 
   test.each([
     [".xum", false],

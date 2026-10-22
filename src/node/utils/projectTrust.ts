@@ -1,6 +1,8 @@
 import type { Config } from "@/node/config";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
+import type { Runtime } from "@/node/runtime/Runtime";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 
@@ -63,4 +65,22 @@ export function isProjectTrustedIn(
  */
 export function projectPluginsAllowed(projectPluginsTrusted: boolean | undefined): boolean {
   return projectPluginsTrusted === true && !projectAutomationDisabled();
+}
+
+/**
+ * #6426: a project's Agent Plugins container paths under `root`, or undefined when its plugins
+ * must not load (see projectPluginsAllowed).
+ */
+export function projectPluginContainerPaths(
+  runtime: Runtime,
+  root: string,
+  projectPluginsTrusted: boolean | undefined
+): string[] | undefined {
+  if (!projectPluginsAllowed(projectPluginsTrusted)) return undefined;
+  return [
+    ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
+      runtime.normalizePath(relativePath, root)
+    ),
+    runtime.normalizePath(".agents/plugins", root),
+  ];
 }

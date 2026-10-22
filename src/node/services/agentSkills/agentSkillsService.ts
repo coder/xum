@@ -53,7 +53,7 @@ import {
   parseSkillLookupName,
 } from "@/common/utils/agentSkills/skillLookupName";
 import { log } from "@/node/services/log";
-import { isProjectTrusted, projectPluginsAllowed } from "@/node/utils/projectTrust";
+import { isProjectTrusted, projectPluginContainerPaths } from "@/node/utils/projectTrust";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { ensureRuntimePathWithinWorkspace } from "@/node/services/tools/runtimeSkillPathUtils";
 import {
@@ -84,6 +84,7 @@ import {
   type ApprovedCopiesSource,
 } from "@/node/services/agentPlugins/approvedCopies";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { getRemoteProjectPluginSnapshot } from "@/node/services/agentPlugins/remoteProjectPlugins";
 import {
   getCanonicalProjectMetadataRelativePath,
   LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR,
@@ -124,6 +125,11 @@ export interface AgentSkillsRoots {
   projectPluginRoots?: string[];
   /** Agent Plugins container dirs, e.g. ~/.xum/plugins (read-only). */
   globalPluginRoots?: string[];
+  /**
+   * #6426: Agent Plugins container dirs of a TRUSTED remote checkout (remote paths). Read
+   * through a cached host snapshot (getRemoteProjectPluginSnapshot), never per turn.
+   */
+  remoteProjectPluginRoots?: string[];
   /**
    * Host Xum home that owns the plugin registry (import receipts). When absent,
    * it is derived from globalRoot, which is only valid when globalRoot is a host
@@ -203,6 +209,11 @@ export function getDefaultAgentSkillsRoots(
   }
 
   const projectSearchRoot = options?.projectSearchRoot ?? workspacePath;
+  const pluginContainers = projectPluginContainerPaths(
+    runtime,
+    projectSearchRoot,
+    options?.projectPluginsTrusted
+  );
   return {
     projectRoot: runtime.normalizePath(
       getCanonicalProjectMetadataRelativePath("skills"),
@@ -221,24 +232,17 @@ export function getDefaultAgentSkillsRoots(
     // Agent Plugins discovery reads the host filesystem only. Remote runtimes
     // (SSH/Docker) get the GLOBAL host plugin containers, read through a host
     // LocalRuntime, so a plugin installed on the Xum host works in every
-    // workspace. They get no project plugin containers: a remote checkout is
-    // not on the host filesystem. The registry owner is the host Xum home,
+    // workspace. Their project plugin containers are remote paths, read through
+    // a host snapshot (#6426). The registry owner is the host Xum home,
     // never a path derived from the remote globalRoot (Docker: /var/mux).
     ...(!(runtime instanceof RemoteRuntime)
       ? {
-          ...(projectPluginsAllowed(options?.projectPluginsTrusted)
-            ? {
-                projectPluginRoots: [
-                  ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
-                    runtime.normalizePath(relativePath, projectSearchRoot)
-                  ),
-                  runtime.normalizePath(".agents/plugins", projectSearchRoot),
-                ],
-              }
-            : {}),
+          projectPluginRoots: pluginContainers,
           globalPluginRoots: [`${runtime.getXumHome()}/plugins`, UNIVERSAL_PLUGINS_ROOT],
         }
       : {
+          // #6426: a trusted remote checkout's own plugins load from a host snapshot.
+          remoteProjectPluginRoots: pluginContainers,
           globalPluginRoots: [`${HOST_XUM_HOME}/plugins`, UNIVERSAL_PLUGINS_ROOT],
           pluginManagedHome: HOST_XUM_HOME,
         }),
@@ -340,6 +344,59 @@ interface AgentSkillScanCandidate {
   pluginConsent?: ComponentConsent | undefined;
   /** Managed plugins only: the install's approved copies, for the skill's workflow script. */
   pluginApprovedCopies?: ApprovedCopiesSource | undefined;
+  /**
+   * #6426: a remote checkout's plugin skill, read from its host mirror. `toRemote` maps mirror
+   * paths to remote ones, so read results and diagnostics name the remote files.
+   */
+  remote?: { runtime: Runtime; toRemote: (local: string) => string };
+}
+
+/** #6426: scan candidates for the plugin skills of a trusted remote checkout's snapshot. */
+async function buildRemotePluginScanCandidates(
+  runtime: Runtime,
+  roots: AgentSkillsRoots,
+  workspacePath: string
+): Promise<AgentSkillScanCandidate[]> {
+  const containers = roots.remoteProjectPluginRoots ?? [];
+  if (containers.length === 0 || !(runtime instanceof RemoteRuntime)) return [];
+  const checkoutRoot = roots.projectSearchRoot ?? workspacePath;
+  const snapshot = await getRemoteProjectPluginSnapshot(runtime, checkoutRoot, containers);
+  if (snapshot === null) return [];
+  const mirrorRuntime = new LocalRuntime(snapshot.mirrorRoot);
+  const remote = { runtime, toRemote: snapshot.toRemote };
+  return snapshot.plugins.flatMap((plugin) =>
+    (plugin.skillsDirs ?? []).map((root) => ({
+      scope: "project" as const,
+      root: root.dir,
+      runtime: mirrorRuntime,
+      pluginRoot: plugin.rootPath,
+      pluginName: plugin.name,
+      singleSkillName: root.name,
+      commandSkill: root.command,
+      skillsOnlyPlugin: plugin.skillsOnly,
+      claudePackagePlugin: plugin.claudeFallback,
+      remote,
+    }))
+  );
+}
+
+/** #6426: a remote plugin skill's read result names the remote files and runtime. */
+function withRemotePaths(
+  resolved: ResolvedAgentSkill | null,
+  candidate: Pick<AgentSkillScanCandidate, "remote">
+): ResolvedAgentSkill | null {
+  if (resolved == null || candidate.remote == null) return resolved;
+  const { pluginRoot: _mirrorRoot, ...rest } = resolved;
+  return {
+    ...rest,
+    skillDir: candidate.remote.toRemote(resolved.skillDir),
+    sourceRuntime: candidate.remote.runtime,
+  };
+}
+
+/** A diagnostic path as the user knows it (remote for a remote plugin skill). */
+function displayPathOf(scan: Pick<AgentSkillScanCandidate, "remote">, local: string): string {
+  return scan.remote != null ? scan.remote.toRemote(local) : local;
 }
 
 /**
@@ -464,6 +521,7 @@ async function buildScanCandidates(
   return [
     ...getProjectSkillRoots(roots).map((root) => ({ scope: "project" as const, root, runtime })),
     ...projectPluginCandidates,
+    ...(await buildRemotePluginScanCandidates(runtime, roots, workspacePath)),
     ...(await getGlobalSkillRoots(roots, globalRuntime)).map((root) => ({
       scope: "global" as const,
       root,
@@ -1026,7 +1084,10 @@ export async function discoverAgentSkills(
         invalidSkills.push({
           directoryName: directoryNameRaw,
           scope: scan.scope,
-          displayPath: scan.runtime.normalizePath(directoryNameRaw, resolvedRoot),
+          displayPath: displayPathOf(
+            scan,
+            scan.runtime.normalizePath(directoryNameRaw, resolvedRoot)
+          ),
           message: `Invalid skill directory name '${directoryNameRaw}'.`,
           hint: "Rename the directory to kebab-case (lowercase letters/numbers/hyphens).",
         });
@@ -1050,7 +1111,7 @@ export async function discoverAgentSkills(
         diagnostics.invalidSkills.push({
           directoryName,
           scope: scan.scope,
-          displayPath: skillFilePath,
+          displayPath: displayPathOf(scan, skillFilePath),
           message,
           hint,
         });
@@ -1353,15 +1414,18 @@ async function readCandidateSkill(
     const stat = await candidate.runtime.stat(skillDir);
     if (!stat.isDirectory) return null;
 
-    return withPluginName(
-      await readAgentSkillFromDir(
-        candidate.runtime,
-        skillDir,
-        name,
-        candidate.scope,
-        candidate.pluginRoot,
-        candidate.skillConsent,
-        candidate.commandSkill
+    return withRemotePaths(
+      withPluginName(
+        await readAgentSkillFromDir(
+          candidate.runtime,
+          skillDir,
+          name,
+          candidate.scope,
+          candidate.pluginRoot,
+          candidate.skillConsent,
+          candidate.commandSkill
+        ),
+        candidate
       ),
       candidate
     );

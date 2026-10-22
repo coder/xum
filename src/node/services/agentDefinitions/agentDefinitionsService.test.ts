@@ -7,6 +7,8 @@ import { Config } from "@/node/config";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { ShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { clearRemoteProjectPluginSnapshots } from "@/node/services/agentPlugins/remoteProjectPlugins";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
@@ -1016,6 +1018,50 @@ base: a
           // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types `rejects` as void
           await expect(read(false)).rejects.toThrow("Agent definition not found");
           expect(await read(true)).toBe("Repo (plugin)");
+        }
+      }
+    );
+
+    // #6426: a trusted remote checkout's plugin agents load from a host snapshot; their source
+    // is the remote agents dir (stable across snapshots, used for strict-send pinning).
+    test.each([true, false])(
+      "remote checkout plugin agents load only in a trusted project (trusted: %s)",
+      async (projectPluginsTrusted) => {
+        using project = new DisposableTempDir("agent-defs-remote-plugin");
+        const root = await fs.realpath(project.path);
+        await writePluginWithAgent(
+          path.join(root, ".xum", "plugins"),
+          "repo-plugin",
+          "remote-agent",
+          "Remote (plugin)"
+        );
+        const runtime = new (class extends ShellRemoteRuntime {
+          override getAgentHostKey() {
+            return `test:${root}`;
+          }
+          protected override getBasePath() {
+            return root;
+          }
+        })(root);
+        try {
+          const ids = (
+            await discoverAgentDefinitions(runtime, root, { projectPluginsTrusted })
+          ).map((agent) => agent.id);
+          expect(ids.includes("remote-agent")).toBe(projectPluginsTrusted);
+          if (projectPluginsTrusted) {
+            const pkg = await readAgentDefinition(
+              runtime,
+              root,
+              AgentIdSchema.parse("remote-agent"),
+              {
+                projectPluginsTrusted,
+              }
+            );
+            expect(pkg.frontmatter.name).toBe("Remote (plugin)");
+            expect(pkg.source).toBe(path.join(root, ".xum", "plugins", "repo-plugin", "agents"));
+          }
+        } finally {
+          await clearRemoteProjectPluginSnapshots();
         }
       }
     );

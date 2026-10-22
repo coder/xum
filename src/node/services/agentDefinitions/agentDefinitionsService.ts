@@ -14,6 +14,7 @@ import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { isAgentEffectivelyDisabled } from "./agentEnablement";
 import { resolveAgentVisibility } from "./agentVisibility";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
+import { getRemoteProjectPluginSnapshot } from "@/node/services/agentPlugins/remoteProjectPlugins";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
@@ -39,7 +40,7 @@ import { log } from "@/node/services/log";
 import {
   isProjectTrusted,
   isWorkspaceProjectTrusted,
-  projectPluginsAllowed,
+  projectPluginContainerPaths,
 } from "@/node/utils/projectTrust";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 
@@ -123,6 +124,11 @@ export interface AgentDefinitionsRoots {
   projectPluginRoots?: string[];
   /** Agent Plugins container dirs, e.g. ~/.xum/plugins (read-only). */
   globalPluginRoots?: string[];
+  /**
+   * #6426: Agent Plugins container dirs of a TRUSTED remote checkout (remote paths). Read
+   * through a cached host snapshot (getRemoteProjectPluginSnapshot), never per turn.
+   */
+  remoteProjectPluginRoots?: string[];
 }
 
 export function getDefaultAgentDefinitionsRoots(
@@ -134,6 +140,11 @@ export function getDefaultAgentDefinitionsRoots(
   if (!workspacePath) {
     throw new Error("getDefaultAgentDefinitionsRoots: workspacePath is required");
   }
+  const pluginContainers = projectPluginContainerPaths(
+    runtime,
+    workspacePath,
+    projectPluginsTrusted
+  );
 
   return {
     projectRoots: listProjectMetadataRelativePaths("agents").map((relativePath) =>
@@ -142,25 +153,18 @@ export function getDefaultAgentDefinitionsRoots(
     globalRoot: GLOBAL_AGENTS_ROOT,
     // Agent Plugins discovery reads the host filesystem only. Remote runtimes
     // (SSH/Docker) get the GLOBAL host plugin containers (read through a host
-    // LocalRuntime) but no project plugin containers, because a remote
-    // checkout is not on the host filesystem (mirrors agentSkillsService).
+    // LocalRuntime). Their project plugin containers are remote paths, read
+    // through a host snapshot (#6426, mirrors agentSkillsService).
     ...(!(runtime instanceof RemoteRuntime)
       ? {
           // #6426: a project plugin's agents load only in a trusted project, like its skills,
           // MCP servers, hooks and slash commands. Missing trust is untrusted.
-          ...(projectPluginsAllowed(projectPluginsTrusted)
-            ? {
-                projectPluginRoots: [
-                  ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
-                    runtime.normalizePath(relativePath, workspacePath)
-                  ),
-                  runtime.normalizePath(".agents/plugins", workspacePath),
-                ],
-              }
-            : {}),
+          projectPluginRoots: pluginContainers,
           globalPluginRoots: [`${runtime.getXumHome()}/plugins`, UNIVERSAL_AGENT_PLUGINS_CONTAINER],
         }
       : {
+          // #6426: a trusted remote checkout's own plugins load from a host snapshot.
+          remoteProjectPluginRoots: pluginContainers,
           // Tilde form: the host LocalRuntime maps ~/.xum to the host Xum home.
           globalPluginRoots: ["~/.xum/plugins", UNIVERSAL_AGENT_PLUGINS_CONTAINER],
         }),
@@ -177,6 +181,39 @@ interface AgentDefinitionScanCandidate {
   pluginName?: string;
   /** Managed plugins only: the reviewed fingerprints (#6629). Unmanaged plugins have none. */
   pluginConsent?: ComponentConsent | undefined;
+  /** #6426: a remote plugin's agents read from its host mirror: the remote agents dir. */
+  remoteSource?: string;
+}
+
+/** A remote plugin's mirror path changes with each snapshot; its remote path does not. */
+function candidateSource(candidate: AgentDefinitionScanCandidate): string {
+  return candidate.remoteSource ?? candidate.root;
+}
+
+/** #6426: scan candidates for the plugin agents of a trusted remote checkout's snapshot. */
+async function buildRemotePluginAgentScanCandidates(
+  runtime: Runtime,
+  workspacePath: string,
+  containers: string[]
+): Promise<AgentDefinitionScanCandidate[]> {
+  if (containers.length === 0 || !(runtime instanceof RemoteRuntime)) return [];
+  const snapshot = await getRemoteProjectPluginSnapshot(runtime, workspacePath, containers);
+  if (snapshot === null) return [];
+  const mirrorRuntime = new LocalRuntime(snapshot.mirrorRoot);
+  return snapshot.plugins.flatMap((plugin) =>
+    plugin.agentsDir !== undefined
+      ? [
+          {
+            scope: "project" as const,
+            root: plugin.agentsDir,
+            runtime: mirrorRuntime,
+            pluginRoot: plugin.rootPath,
+            pluginName: plugin.name,
+            remoteSource: snapshot.toRemote(plugin.agentsDir),
+          },
+        ]
+      : []
+  );
 }
 
 /**
@@ -278,6 +315,11 @@ async function buildScanCandidates(
       runtime,
     })),
     ...projectPluginCandidates,
+    ...(await buildRemotePluginAgentScanCandidates(
+      runtime,
+      workspacePath,
+      roots.remoteProjectPluginRoots ?? []
+    )),
     {
       scope: "global",
       root: roots.globalRoot,
@@ -884,7 +926,7 @@ async function loadAgentDefinition(
         body: parsed.body,
         // Exact provenance for strict-send pinning; per-plugin candidate roots are
         // unique per plugin, so root identity distinguishes file vs plugin sources.
-        source: candidate.root,
+        source: candidateSource(candidate),
       };
 
       const validated = AgentDefinitionPackageSchema.safeParse(pkg);
