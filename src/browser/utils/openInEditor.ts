@@ -243,35 +243,25 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
 }
 
 /**
- * The editor connects to a Daytona sandbox's ssh alias on its own, so nothing in Xum would
- * start a stopped sandbox or refresh the token (the alias's ssh user) first. Disconnected
- * (api null) skips this: the recording step then refuses the open.
- *
- * A browser on another machine is refused: the deep link launches the editor there, but the
- * alias, token and pinned host keys exist only in the Xum server's ~/.ssh/config. Refused
- * before recording, so no editor-open marker is left for an editor that cannot connect.
+ * A browser on another machine cannot open a Daytona sandbox: the deep link launches the editor
+ * there, but the alias, token and pinned host keys exist only in the Xum server's
+ * ~/.ssh/config. Refused before recording, so no editor-open marker is left for an editor that
+ * cannot connect. Recording the open (recordEditorOpen) starts the sandbox and refreshes its
+ * token.
  */
-async function launchAfterDaytonaPrepare(
+function launchDaytonaFromThisMachine(
   args: OpenInEditorArgs,
   launch: () => Promise<OpenInEditorResult>
 ): Promise<OpenInEditorResult> {
-  if (!isSSHRuntime(args.runtimeConfig) || !args.runtimeConfig.daytona) {
-    return launch();
-  }
-  if (isBrowserModeNow() && !isLocalhost(window.location.hostname)) {
-    return {
+  const isDaytona = isSSHRuntime(args.runtimeConfig) && args.runtimeConfig.daytona != null;
+  if (isDaytona && isBrowserModeNow() && !isLocalhost(window.location.hostname)) {
+    return Promise.resolve({
       success: false,
       error:
         "Daytona sandboxes open in an editor only from the Xum desktop app or a browser on the Xum server's machine.",
-    };
+    });
   }
-  if (!args.api) {
-    return launch();
-  }
-  const ready = await args.api.workspace.ensureDaytonaSandboxReady({
-    workspaceId: args.workspaceId,
-  });
-  return ready.success ? launch() : { success: false, error: ready.error };
+  return launch();
 }
 
 async function openInEditorWithLaunch(
@@ -417,7 +407,7 @@ async function openInEditorWithLaunch(
       };
     }
 
-    return launchAfterDaytonaPrepare(args, () => launch(deepLink));
+    return launchDaytonaFromThisMachine(args, () => launch(deepLink));
   }
 
   // Custom editor:

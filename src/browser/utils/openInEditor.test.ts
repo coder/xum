@@ -127,125 +127,41 @@ describe("openInEditor", () => {
       daytona: { sandboxId: "sb-1" },
     };
 
-    test("prepares the sandbox before recording and launching the editor", async () => {
-      const events: string[] = [];
-      const ensureDaytonaSandboxReady = mock(() => {
-        events.push("prepare");
-        return Promise.resolve({ success: true as const, data: undefined });
-      });
-      const api = createTestApiClient({
-        general: {
-          recordEditorOpen: () => {
-            events.push("record");
-            return Promise.resolve({ success: true as const, data: undefined });
-          },
-        },
-        workspace: { ensureDaytonaSandboxReady },
-      });
-      const windowValue = {
-        ...createMockWindow([]),
-        open: (url: string) => {
-          events.push(`open ${url}`);
-          return null;
-        },
-      };
-
-      const result = await withWindow(windowValue, () =>
-        openInEditor({ api, workspaceId, targetPath: parentDir, runtimeConfig: daytonaConfig })
-      );
-
-      expect(result).toEqual({ success: true });
-      expect(ensureDaytonaSandboxReady).toHaveBeenCalledWith({ workspaceId });
-      expect(events.slice(0, 2)).toEqual(["prepare", "record"]);
-      expect(events[2]).toContain("ssh-remote+xum-daytona-sb-1");
-    });
-
-    test("refused readiness shows its error and opens nothing", async () => {
-      const calls: OpenCall[] = [];
-      const recordEditorOpen = mock(() =>
-        Promise.resolve({ success: true as const, data: undefined })
-      );
-      const api = createTestApiClient({
-        general: { recordEditorOpen },
-        workspace: {
-          ensureDaytonaSandboxReady: () =>
-            Promise.resolve({ success: false as const, error: "Daytona sandbox was deleted" }),
-        },
-      });
-
-      const result = await withWindow(createMockWindow(calls), () =>
-        openInEditor({ api, workspaceId, targetPath: parentDir, runtimeConfig: daytonaConfig })
-      );
-
-      expect(result).toEqual({ success: false, error: "Daytona sandbox was deleted" });
-      expect(recordEditorOpen).not.toHaveBeenCalled();
-      expect(calls).toEqual([]);
-    });
-
-    test("browser mode: a refused readiness closes the placeholder", async () => {
-      const calls: OpenCall[] = [];
-      const { windowValue, placeholder } = createBrowserModeWindow(calls);
-      const api = createTestApiClient({
-        workspace: {
-          ensureDaytonaSandboxReady: () =>
-            Promise.resolve({ success: false as const, error: "sandbox is archived" }),
-        },
-      });
-
-      const result = await withWindow(windowValue, () =>
-        openInEditor({ api, workspaceId, targetPath: parentDir, runtimeConfig: daytonaConfig })
-      );
-
-      expect(result).toEqual({ success: false, error: "sandbox is archived" });
-      expect(placeholder.navigations).toEqual([]);
-      expect(placeholder.closed).toBe(true);
-    });
-
-    test("remote browser: refuses before preparing, recording or launching", async () => {
+    test("remote browser: refuses before recording or launching", async () => {
       const calls: OpenCall[] = [];
       const { windowValue, placeholder } = createBrowserModeWindow(calls, {
         hostname: "xum.example.com",
       });
-      const ensureDaytonaSandboxReady = mock(() =>
-        Promise.resolve({ success: true as const, data: undefined })
-      );
       const recordEditorOpen = mock(() =>
         Promise.resolve({ success: true as const, data: undefined })
       );
-      const api = createTestApiClient({
-        general: { recordEditorOpen },
-        workspace: { ensureDaytonaSandboxReady },
-      });
+      const api = createTestApiClient({ general: { recordEditorOpen } });
 
       const result = await withWindow(windowValue, () =>
         openInEditor({ api, workspaceId, targetPath: parentDir, runtimeConfig: daytonaConfig })
       );
 
       expect(result.success).toBe(false);
-      expect(ensureDaytonaSandboxReady).not.toHaveBeenCalled();
       expect(recordEditorOpen).not.toHaveBeenCalled();
       expect(placeholder.navigations).toEqual([]);
       expect(placeholder.closed).toBe(true);
     });
 
-    test("other SSH workspaces launch without preparing", async () => {
+    test("a browser on the server's machine opens the sandbox", async () => {
       const calls: OpenCall[] = [];
-      const ensureDaytonaSandboxReady = mock(() =>
-        Promise.resolve({ success: true as const, data: undefined })
-      );
+      const { windowValue, placeholder } = createBrowserModeWindow(calls);
 
-      const result = await withWindow(createMockWindow(calls), () =>
+      const result = await withWindow(windowValue, () =>
         openInEditor({
-          api: createApiStub({ workspace: { ensureDaytonaSandboxReady } }),
+          api: createApiStub(),
           workspaceId,
           targetPath: parentDir,
-          runtimeConfig: { type: "ssh", host: "devbox", srcBaseDir: "~/xum" },
+          runtimeConfig: daytonaConfig,
         })
       );
 
-      expect(result.success).toBe(true);
-      expect(calls.length).toBe(1);
-      expect(ensureDaytonaSandboxReady).not.toHaveBeenCalled();
+      expect(result).toEqual({ success: true });
+      expect(placeholder.navigations[0]).toContain("ssh-remote+xum-daytona-sb-1");
     });
   });
 

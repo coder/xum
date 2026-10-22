@@ -2255,12 +2255,6 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) =>
           context.workspaceService.stopRuntime(input.workspaceId)
         ),
-      ensureDaytonaSandboxReady: t
-        .input(schemas.workspace.ensureDaytonaSandboxReady.input)
-        .output(schemas.workspace.ensureDaytonaSandboxReady.output)
-        .handler(async ({ context, input }) =>
-          context.workspaceService.ensureDaytonaSandboxReady(input.workspaceId)
-        ),
       getRuntimeStatuses: t
         .input(schemas.workspace.getRuntimeStatuses.input)
         .output(schemas.workspace.getRuntimeStatuses.output)

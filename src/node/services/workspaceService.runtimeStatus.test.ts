@@ -6,6 +6,7 @@ import { shellQuote } from "@/common/utils/shell";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import {
   createWorkspaceServiceHarness,
   type WorkspaceServiceHarness,
@@ -224,23 +225,27 @@ describe.skipIf(process.platform === "win32")(
   }
 );
 
-describe("WorkspaceService.ensureDaytonaSandboxReady", () => {
+describe("WorkspaceService.recordExternalEditorOpen for a Daytona workspace", () => {
   let harness: WorkspaceServiceHarness;
   let projectPath: string;
   let createRuntime: { mockRestore: () => void };
-  const ensureReady = mock(() =>
-    Promise.resolve({
-      ready: false as const,
-      error: 'Daytona sandbox "sb-1" no longer exists',
-      errorType: "runtime_not_ready" as const,
-    })
-  );
+  /** The editor use leases held on the workspace while each readiness check ran. */
+  let leasesDuringReadiness: number[];
+  let readiness: { ready: true } | { ready: false; error: string };
+  const ensureReady = mock(() => {
+    leasesDuringReadiness.push(workspaceUseLeasesFor(harness.config).heldCount("dt", "editor"));
+    return Promise.resolve(
+      readiness.ready ? readiness : { ...readiness, errorType: "runtime_not_ready" as const }
+    );
+  });
 
   beforeEach(async () => {
     harness = await createWorkspaceServiceHarness();
     projectPath = path.join(harness.rootDir, "project");
     await fs.mkdir(projectPath);
     ensureReady.mockClear();
+    leasesDuringReadiness = [];
+    readiness = { ready: true };
     createRuntime = spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue({
       ensureReady,
     } as unknown as Runtime);
@@ -275,20 +280,34 @@ describe("WorkspaceService.ensureDaytonaSandboxReady", () => {
     });
   }
 
-  test("brings the sandbox up and reports why it cannot", async () => {
+  // An archive cannot run while the editor use is held, so a sandbox started here cannot be
+  // left running by an archive that saw it stopped.
+  test("brings the sandbox up only once the editor use is admitted", async () => {
     await addDaytonaWorkspace();
 
-    expect(await harness.service.ensureDaytonaSandboxReady("dt")).toEqual({
+    expect(await harness.service.recordExternalEditorOpen("dt", "tok-1")).toEqual({
+      success: true,
+      data: undefined,
+    });
+    expect(leasesDuringReadiness).toEqual([1]);
+  });
+
+  test("refuses the open and releases the use when the sandbox cannot come up", async () => {
+    await addDaytonaWorkspace();
+    readiness = { ready: false, error: 'Daytona sandbox "sb-1" no longer exists' };
+
+    expect(await harness.service.recordExternalEditorOpen("dt", "tok-1")).toEqual({
       success: false,
       error: 'Daytona sandbox "sb-1" no longer exists',
     });
-    expect(ensureReady).toHaveBeenCalledTimes(1);
+    expect(leasesDuringReadiness).toEqual([1]);
+    expect(workspaceUseLeasesFor(harness.config).heldCount("dt", "editor")).toBe(0);
   });
 
   test("refuses an archived workspace without starting its sandbox", async () => {
     await addDaytonaWorkspace("2026-01-02T00:00:00.000Z");
 
-    expect((await harness.service.ensureDaytonaSandboxReady("dt")).success).toBe(false);
+    expect((await harness.service.recordExternalEditorOpen("dt", "tok-1")).success).toBe(false);
     expect(ensureReady).not.toHaveBeenCalled();
   });
 });

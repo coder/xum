@@ -12047,6 +12047,35 @@ export class WorkspaceService
     }
   }
 
+  /**
+   * Refusals once the editor use lease is held, all before the durable marker write so a
+   * refused open cannot permanently gate future snapshot archives of this workspace.
+   */
+  private async refuseAdmittedEditorOpen(
+    workspaceId: string,
+    entry: { projectPath: string; workspace: Workspace }
+  ): Promise<string | undefined> {
+    const { workspace } = entry;
+    // Persisted archived state (not just an in-progress archive): a stale renderer can request
+    // an editor for an already-archived workspace whose checkout may already be snapshot and
+    // removed (mirrors TerminalService.openNative and the send/PTY/desktop admissions).
+    if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
+      return `Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`;
+    }
+    if (workspace.runtimeConfig == null) return undefined;
+    // The editor connects to a Daytona sandbox's ssh alias on its own, so start a stopped
+    // sandbox and refresh its token first. Only under the lease, as for a native terminal: an
+    // archive cannot run meanwhile, so it cannot see the sandbox stopped and leave it running.
+    const ready = await ensureDaytonaSandboxReady({
+      id: workspaceId,
+      runtimeConfig: workspace.runtimeConfig,
+      projectPath: entry.projectPath,
+      name: workspace.name ?? workspaceId,
+      namedWorkspacePath: workspace.path,
+    });
+    return ready.success ? undefined : ready.error;
+  }
+
   /** Body of recordExternalEditorOpenForLaunch after pending-recording admission. */
   private async recordExternalEditorOpenAdmitted(
     workspaceId: string
@@ -12078,19 +12107,10 @@ export class WorkspaceService
       await lease.release();
       return Err(`Workspace not found: ${workspaceId}`);
     }
-    // Persisted archived state (not just an in-progress archive): a stale renderer can request
-    // an editor for an already-archived workspace whose checkout may already be snapshot and
-    // removed (mirrors TerminalService.openNative and the send/PTY/desktop admissions).
-    // Checked before the durable marker write so a refused open cannot permanently gate
-    // future snapshot archives of this workspace.
-    if (
-      isWorkspaceArchived(
-        workspaceEntry.workspace.archivedAt,
-        workspaceEntry.workspace.unarchivedAt
-      )
-    ) {
+    const refusal = await this.refuseAdmittedEditorOpen(workspaceId, workspaceEntry);
+    if (refusal != null) {
       await lease.release();
-      return Err(`Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`);
+      return Err(refusal);
     }
     // Before any durable effect: one share per workspace is kept, after a failed launch too
     // (fail closed).
@@ -13824,23 +13844,6 @@ export class WorkspaceService
     }
 
     return Ok(undefined);
-  }
-
-  /**
-   * Opening an external editor is an explicit action, so a stopped Daytona sandbox is started
-   * (and its ssh token refreshed) before the editor connects to its ssh alias. An archived
-   * workspace is refused like a native terminal: its sandbox must stay stopped.
-   */
-  async ensureDaytonaSandboxReady(workspaceId: string): Promise<Result<void>> {
-    const allMetadata = await this.config.getAllWorkspaceMetadata();
-    const workspace = allMetadata.find((w) => w.id === workspaceId);
-    if (!workspace) {
-      return Err(this.workspaceNotFoundError());
-    }
-    if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
-      return Err(`Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`);
-    }
-    return ensureDaytonaSandboxReady(workspace);
   }
 
   async getRuntimeStatuses(
