@@ -76,6 +76,8 @@ function runBridgeScript() {
   const posted: unknown[] = [];
   // window.setTimeout callbacks, run once a key press has gone through every listener.
   const timers: Array<() => void> = [];
+  // preventDefault calls by the bridge's own listeners.
+  let prevented = 0;
   const fakeWindow: { xum?: { openWorkspace: (id: unknown) => void } } & Record<string, unknown> = {
     parent: { postMessage: (message: unknown) => posted.push(message) },
     addEventListener: (type: string, listener: (event: unknown) => void) => {
@@ -106,6 +108,8 @@ function runBridgeScript() {
     shiftKey = false,
     extra: {
       ctrlKey?: boolean;
+      metaKey?: boolean;
+      altKey?: boolean;
       repeat?: boolean;
       defaultPrevented?: boolean;
       composedPath?: unknown[];
@@ -117,16 +121,19 @@ function runBridgeScript() {
       shiftKey,
       ctrlKey: extra.ctrlKey ?? false,
       repeat: extra.repeat ?? false,
-      metaKey: false,
-      altKey: false,
+      metaKey: extra.metaKey ?? false,
+      altKey: extra.altKey ?? false,
       defaultPrevented: false,
+      preventDefault: () => {
+        prevented += 1;
+      },
       ...(extra.composedPath ? { composedPath: () => extra.composedPath } : {}),
     };
     for (const entry of listeners) if (entry.type === "keydown") entry.listener(event);
     event.defaultPrevented = extra.defaultPrevented ?? false;
     for (const timer of timers.splice(0)) timer();
   };
-  return { keydown, posted, xum: fakeWindow.xum };
+  return { keydown, posted, xum: fakeWindow.xum, prevented: () => prevented };
 }
 
 describe("bridge script keys", () => {
@@ -166,6 +173,47 @@ describe("bridge script keys", () => {
     bridge.keydown(key.toUpperCase(), div);
     const c = { xumArtifact: 1, type: "key", key: "C", shiftKey: false };
     expect(bridge.posted).toEqual([c, c]);
+  });
+
+  test("the right-sidebar chord is posted with Ctrl or Cmd, even from an input, and claimed", () => {
+    // The keybind's own key: a keybind the shim cannot forward fails here, not at startup.
+    const key = KEYBINDS.TOGGLE_RIGHT_SIDEBAR.key;
+    const bridge = runBridgeScript();
+    bridge.keydown(key, div, false, { ctrlKey: true });
+    bridge.keydown(key, div, true);
+    bridge.keydown(key, div, true, { ctrlKey: true, altKey: true });
+    bridge.keydown(key, div, true, { ctrlKey: true, repeat: true });
+    expect(bridge.posted).toEqual([]);
+    expect(bridge.prevented()).toBe(0);
+    bridge.keydown(key, input, true, { ctrlKey: true });
+    bridge.keydown(key.toLowerCase(), div, true, { metaKey: true });
+    expect(bridge.posted).toEqual([
+      { xumArtifact: 1, type: "sidebarKey", ctrlKey: true, metaKey: false },
+      { xumArtifact: 1, type: "sidebarKey", ctrlKey: false, metaKey: true },
+    ]);
+    // Claimed in the frame, as the host claims it (Chrome binds the chord to its bookmarks bar).
+    expect(bridge.prevented()).toBe(2);
+  });
+});
+
+describe("sidebarKey messages", () => {
+  test("accepts the two modifier flags only", () => {
+    const accept = (data: unknown) =>
+      acceptArtifactFrameMessage({ source: frame, data }, frame, () => true);
+    const sidebarKey = {
+      xumArtifact: 1,
+      type: "sidebarKey",
+      ctrlKey: true,
+      metaKey: false,
+    } as const;
+    expect(accept(sidebarKey)).toEqual(sidebarKey);
+    for (const data of [
+      { xumArtifact: 1, type: "sidebarKey", ctrlKey: true },
+      { ...sidebarKey, metaKey: "yes" },
+      { ...sidebarKey, key: "Delete" },
+    ]) {
+      expect(accept(data)).toBeNull();
+    }
   });
 });
 
