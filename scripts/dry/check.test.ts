@@ -108,3 +108,26 @@ test("a new copy that shares a name with an old match is a finding", () => {
   // name-based base lookup hid (it read B.render's base match as A's).
   expect(pairs.sort()).toEqual(["cents", "render"]);
 });
+
+test("a function moved to another file keeps its old pairs quiet", () => {
+  // src/a.ts keeps other code, so git sees two edits, not a rename.
+  const other = `export function keep(s: string): number {
+  const parts = s.split(",");
+  let total = 0;
+  for (const p of parts) total += p.length * 3;
+  return total - parts.length;
+}
+`;
+  write("src/a.ts", `${bucket("cents")}\n${other}`);
+  write("src/c.ts", bucket("count"));
+  write("src/b.ts", other.replace("keep", "keepB"));
+  git("add", ".");
+  git("commit", "-q", "-m", "before the move");
+  write("src/a.ts", other);
+  write("src/b.ts", `${other.replace("keep", "keepB")}\n${bucket("cents")}`);
+
+  const { status, report } = check();
+
+  expect(status).toBe(0);
+  expect(report.pairs).toEqual([]);
+});
