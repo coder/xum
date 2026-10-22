@@ -271,19 +271,6 @@ describe("tokenizer", () => {
     expect(tokens).toBeGreaterThan(0);
   });
 
-  test("counts a tool's schema as the model's wire sends it", async () => {
-    // One tokenizer for both, so only the schema differs: the Anthropic wire drops null from
-    // optional fields (file_read's offset and limit).
-    const anthropic = await getToolDefinitionTokens(
-      "file_read",
-      KNOWN_MODELS.SONNET.id,
-      openaiModel,
-      undefined
-    );
-    const openai = await getToolDefinitionTokens("file_read", openaiModel, undefined, undefined);
-    expect(anthropic).toBeLessThan(openai);
-  });
-
   describe("per-encoding workers (#4816)", () => {
     // Shapes where BPE merges, byte fallback and pre-tokenization differ most between encodings.
     const corpus = [

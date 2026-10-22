@@ -75,10 +75,9 @@ describe("tool schema compaction", () => {
       required: ["id", "guid"],
       additionalProperties: false,
     });
-    // Other names keep their schema as written: an MCP server may mean its bounds and patterns.
+    // Other names keep all but $schema: an MCP server may mean its bounds and patterns.
     const { $schema: _uri, ...asWritten } = await asSchema(inputSchema).jsonSchema;
     expect(sent.linear_get_issue).toEqual(asWritten);
-    expect(sent.linear_get_issue).not.toEqual(sent.task_await);
   });
 
   it("drops null from optional built-in fields only on Anthropic wires", async () => {

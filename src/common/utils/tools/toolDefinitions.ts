@@ -89,6 +89,7 @@ import { TOOL_SEARCH_DEFAULT_LIMIT, TOOL_SEARCH_MAX_LIMIT } from "@/common/utils
 import { THINKING_LEVELS, ThinkingLevelSchema } from "@/common/types/thinking";
 import type { AvailableModel } from "@/common/utils/ai/selectableModels";
 
+import { zodToJsonSchema } from "zod-to-json-schema";
 import { extractToolFilePath } from "@/common/utils/tools/toolInputFilePath";
 import { WorkspaceTurnFinalMessageRefSchema } from "@/common/types/workspaceTurn";
 
@@ -1802,6 +1803,16 @@ function normalizeFilePath(value: unknown): unknown {
   return { ...rest, path: resolved };
 }
 
+interface ToolSchema {
+  name: string;
+  description: string;
+  inputSchema: {
+    type: string;
+    properties: Record<string, unknown>;
+    required: string[];
+  };
+}
+
 // -----------------------------------------------------------------------------
 // propose_name (workspace name generation)
 // -----------------------------------------------------------------------------
@@ -3486,6 +3497,26 @@ export function getToolResultSchema(toolName: string): z.ZodType | undefined {
   if (!Object.hasOwn(TOOL_DEFINITIONS, toolName)) return undefined;
   const definition = TOOL_DEFINITIONS[toolName as ToolName];
   return "resultSchema" in definition ? definition.resultSchema : undefined;
+}
+
+/**
+ * Get tool definition schemas for token counting
+ * JSON schemas are auto-generated from zod schemas
+ *
+ * @returns Record of tool name to schema
+ */
+export function getToolSchemas(): Record<string, ToolSchema> {
+  return Object.fromEntries(
+    Object.entries(TOOL_DEFINITIONS).map(([name, def]) => [
+      name,
+      {
+        name,
+        description: def.description,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument
+        inputSchema: zodToJsonSchema(def.schema as any) as ToolSchema["inputSchema"],
+      },
+    ])
+  );
 }
 
 /**
