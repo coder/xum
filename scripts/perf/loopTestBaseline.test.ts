@@ -146,6 +146,24 @@ describe("changedFiles", () => {
     sh("mv", "b.ts", "b2.ts");
     expect(changedFiles(root, base).sort()).toEqual(["a.ts", "a2.ts", "b.ts", "b2.ts"]);
   });
+
+  test("lists the changes of a base that is not an ancestor of HEAD", () => {
+    sh("init", "-q", "-b", "main");
+    sh("config", "user.email", "t@example.com");
+    sh("config", "user.name", "t");
+    write("a.ts", "a\n");
+    sh("add", ".");
+    sh("commit", "-qm", "root");
+    sh("checkout", "-qb", "other");
+    write("only-on-base.ts", "x\n");
+    sh("add", ".");
+    sh("commit", "-qm", "base change");
+    const base = sh("rev-parse", "HEAD");
+    sh("checkout", "-q", "main");
+    write("a.ts", "a2\n");
+    sh("commit", "-qam", "head change");
+    expect(changedFiles(root, base).sort()).toEqual(["a.ts", "only-on-base.ts"]);
+  });
 });
 
 test("an unknown --base exits 2 with a last loop-tests line", () => {
@@ -215,6 +233,138 @@ test("recordName keeps a filtered, short or other-jobs run off the full record o
   const sha = "0123456789abcdef";
   expect(recordName(sha, false, undefined, 10, 6)).toBe("0123456789");
   expect(recordName(sha, true, undefined, 10, 6)).toBe("0123456789-dirty");
-  expect(recordName(sha, false, "tools/bash", 2, 6)).toBe("0123456789-tools_bash-r2");
+  expect(recordName(sha, false, "tools", 2, 6)).toBe("0123456789-tools-r2");
   expect(recordName(sha, false, undefined, 10, 8)).toBe("0123456789-j8");
+  const slash = recordName(sha, false, "tools/bash", 10, 6);
+  const space = recordName(sha, false, "tools bash", 10, 6);
+  expect(slash).toStartWith("0123456789-tools_bash_");
+  expect(space).toStartWith("0123456789-tools_bash_");
+  expect(slash).not.toBe(space);
+});
+
+describe("the script on a fixture repo", () => {
+  const script = path.join(import.meta.dir, "loopTestBaseline.ts");
+  const loopTest = "src/node/services/tools/fixture.test.ts";
+  let tmp: string;
+
+  const sh = (...args: string[]) => {
+    const result = Bun.spawnSync(["git", ...args], { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(result.exitCode).toBe(0);
+    return result.stdout.toString().trim();
+  };
+
+  /** A git repo in `root` with src/version.ts and one loop test file with `body`. */
+  function repo(body: string): void {
+    sh("init", "-q");
+    sh("config", "user.email", "t@example.com");
+    sh("config", "user.name", "t");
+    write(".gitignore", "artifacts/\nsrc/version.ts\ntmp/\nfake-bin/\nchild.pid\n");
+    write("src/version.ts", "export const VERSION = {};\n");
+    write("tracked.txt", "a\n");
+    write(loopTest, `import { test } from "bun:test";\n${body}`);
+    sh("add", ".");
+    sh("commit", "-qm", "fixture");
+  }
+
+  /** Starts the script in `root` with a `bun` on PATH that is not process.execPath. */
+  function start(args: string[]) {
+    tmp = path.join(root, "tmp");
+    fs.mkdirSync(tmp);
+    const fakeBin = path.join(root, "fake-bin");
+    fs.mkdirSync(fakeBin);
+    fs.writeFileSync(path.join(fakeBin, "bun"), "#!/bin/sh\nexit 99\n", { mode: 0o755 });
+    return Bun.spawn([process.execPath, script, ...args], {
+      cwd: root,
+      env: { ...process.env, TMPDIR: tmp, PATH: `${fakeBin}${path.delimiter}${process.env.PATH}` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  }
+
+  async function finish(child: ReturnType<typeof start>) {
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    return { exitCode, lastLine: stdout.trim().split("\n").at(-1), stderr };
+  }
+
+  test("the children run process.execPath, not the first bun on PATH", async () => {
+    repo('test("ok", () => {});\n');
+    const result = await finish(start(["--runs", "1"]));
+    expect(result.exitCode).toBe(0);
+    const record = JSON.parse(
+      fs.readFileSync(
+        path.join(
+          root,
+          "artifacts",
+          "loop-tests",
+          `${sh("rev-parse", "HEAD").slice(0, 10)}-r1.json`
+        ),
+        "utf8"
+      )
+    ) as { files: Array<{ file: string; failedRuns: number }> };
+    expect(record.files).toEqual([expect.objectContaining({ file: loopTest, failedRuns: 0 })]);
+  });
+
+  test("without src/version.ts it exits 2 and asks for make version", async () => {
+    repo('test("ok", () => {});\n');
+    fs.rmSync(path.join(root, "src", "version.ts"));
+    const result = await finish(start(["--runs", "1"]));
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("run make version");
+    expect(result.lastLine).toBe("loop-tests: error");
+  });
+
+  test("a tracked file that changes during the run exits 2 and writes no record", async () => {
+    repo(
+      'import * as fs from "node:fs";\n' +
+        'test("edits", () => { fs.appendFileSync(`${process.cwd()}/tracked.txt`, "b\\n"); });\n'
+    );
+    const result = await finish(start(["--runs", "1"]));
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("changed during the run");
+    expect(fs.readdirSync(path.join(root, "artifacts", "loop-tests"))).toEqual([]);
+  });
+
+  test("a compare that selects only skipped heavy tests lists them and exits 0", async () => {
+    repo('test("ok", () => {});\n');
+    write(
+      "src/node/services/backgroundProcessManager.test.ts",
+      'import { test } from "bun:test";\ntest("x", () => {});\n'
+    );
+    sh("add", ".");
+    sh("commit", "-qm", "heavy");
+    const result = await finish(
+      start(["--base", "HEAD", "--runs", "2", "--filter", "backgroundProcessManager"])
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.lastLine).toBe("loop-tests: 0 trips");
+    const markdown = fs
+      .readdirSync(path.join(root, "artifacts", "loop-tests"))
+      .find((f) => f.endsWith(".md"));
+    expect(markdown).toBeDefined();
+    expect(
+      fs.readFileSync(path.join(root, "artifacts", "loop-tests", markdown ?? ""), "utf8")
+    ).toContain("skip src/node/services/backgroundProcessManager.test.ts");
+  });
+
+  test("SIGTERM stops the running bun test children before the cleanup", async () => {
+    const pidFile = path.join(root, "child.pid");
+    repo(
+      'import * as fs from "node:fs";\n' +
+        `test("waits", async () => { fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); await Bun.sleep(60_000); }, 120_000);\n`
+    );
+    const child = start(["--base", "HEAD", "--runs", "2"]);
+    while (!fs.existsSync(pidFile)) await Bun.sleep(20);
+    const pid = Number(fs.readFileSync(pidFile, "utf8"));
+    child.kill("SIGTERM");
+    const result = await finish(child);
+    expect(result.exitCode).toBe(143);
+    // The test process is gone, and so are the scratch dir and the base worktree.
+    expect(() => process.kill(pid, 0)).toThrow();
+    expect(fs.readdirSync(tmp)).toEqual([]);
+    expect(sh("worktree", "list").split("\n")).toHaveLength(1);
+  }, 30_000);
 });

@@ -74,7 +74,11 @@ export const LOOP_TEST_GLOBS = [
 export function loopTestFiles(root: string, filter?: string): string[] {
   const files = new Set<string>();
   for (const pattern of LOOP_TEST_GLOBS) {
-    for (const file of new Bun.Glob(pattern).scanSync({ cwd: root })) files.add(file);
+    // Bun.Glob returns native separators: "/" keeps --filter and the scratch file names alike on
+    // every platform.
+    for (const file of new Bun.Glob(pattern).scanSync({ cwd: root })) {
+      files.add(file.split(path.sep).join("/"));
+    }
   }
   return [...files].filter((file) => filter === undefined || file.includes(filter)).sort();
 }
@@ -125,17 +129,36 @@ export function patchesGlobalTime(root: string, file: string): boolean {
 
 const PRELOAD_PATH = path.join(import.meta.dir, "loopTests.preload.ts");
 
+/** The running `bun test` children of runFile, so a signal can stop them before the cleanup. */
+const children = new Set<Bun.Subprocess>();
+let stopping = false;
+
+/** Kills the running `bun test` children, lets runFile start no new one, and waits for them. */
+export async function stopChildren(): Promise<void> {
+  stopping = true;
+  for (const child of children) child.kill();
+  await Promise.all([...children].map((child) => child.exited));
+}
+
 /** Runs one test file in a fresh `bun test` process from `cwd`, with the measuring preload. */
 export async function runFile(cwd: string, file: string, scratchDir: string): Promise<LoopTestRun> {
   const out = path.join(scratchDir, `${file.replaceAll("/", "_")}-${crypto.randomUUID()}.json`);
+  assert(!stopping, "loop tests stopped");
   const start = performance.now();
-  const child = Bun.spawn(["bun", "test", "--preload", PRELOAD_PATH, `./${file}`], {
+  // process.execPath: the children run the Bun that the record names.
+  const child = Bun.spawn([process.execPath, "test", "--preload", PRELOAD_PATH, `./${file}`], {
     cwd,
     env: { ...process.env, LOOP_TESTS_OUT: out },
     stdout: "ignore",
     stderr: "ignore",
   });
-  const exitCode = await child.exited;
+  children.add(child);
+  let exitCode: number;
+  try {
+    exitCode = await child.exited;
+  } finally {
+    children.delete(child);
+  }
   const wallMs = performance.now() - start;
   const preload = fs.existsSync(out)
     ? (JSON.parse(fs.readFileSync(out, "utf8")) as PreloadOutput)
@@ -215,7 +238,12 @@ export function recordName(
 ) {
   const parts = [sha.slice(0, 10)];
   if (dirty) parts.push("dirty");
-  if (filter !== undefined) parts.push(filter.replace(/[^\w.-]+/g, "_"));
+  if (filter !== undefined) {
+    const slug = filter.replace(/[^\w.-]+/g, "_");
+    // Two filters that collapse to one slug ("a/b", "a b") get different names.
+    const hash = new Bun.CryptoHasher("sha256").update(filter).digest("hex").slice(0, 6);
+    parts.push(slug === filter ? slug : `${slug}_${hash}`);
+  }
   if (runs !== DEFAULT_RUNS) parts.push(`r${runs}`);
   if (jobs !== DEFAULT_JOBS) parts.push(`j${jobs}`);
   return parts.join("-");
@@ -260,13 +288,12 @@ export function heavySkips(runs: number, changedFiles: readonly string[]): strin
 }
 
 /**
- * Files that differ between the merge base of `baseSha` and HEAD, plus working-tree edits.
- * --no-renames lists a renamed file under its old and its new path.
+ * Files that differ between `baseSha` and HEAD, plus working-tree edits. Two endpoints, not the
+ * merge base: a base that is not an ancestor of HEAD has changes of its own. --no-renames lists a
+ * renamed file under its old and its new path.
  */
 export function changedFiles(root: string, baseSha: string): string[] {
-  const committed = git(root, ["diff", "--name-only", "--no-renames", `${baseSha}...HEAD`]).split(
-    "\n"
-  );
+  const committed = git(root, ["diff", "--name-only", "--no-renames", baseSha, "HEAD"]).split("\n");
   const edited = git(root, ["status", "--porcelain", "--no-renames"])
     .split("\n")
     .map((line) => line.slice(3));
@@ -284,6 +311,14 @@ function prepareWorktree(root: string, dir: string): void {
   // src/version.ts is generated and git-ignored; without it some loop tests fail at import.
   const versionFile = path.join(root, "src", "version.ts");
   if (fs.existsSync(versionFile)) fs.copyFileSync(versionFile, path.join(dir, "src", "version.ts"));
+}
+
+/**
+ * HEAD and the tracked changes of the working tree. It leaves out untracked files, because a test
+ * can leave some behind.
+ */
+export function treeState(root: string): string {
+  return `${git(root, ["rev-parse", "HEAD"])}\n${git(root, ["diff", "HEAD", "--binary"])}`;
 }
 
 interface Side {
@@ -412,7 +447,17 @@ async function main(): Promise<number> {
   assert(Number.isInteger(runs) && runs >= 1, `invalid --runs ${values.runs}`);
   assert(values.base === undefined || runs >= 2, "a compare needs --runs 2 or more");
   const root = repoRoot();
+  // Checked here: a fresh checkout has no src/version.ts, and both sides would record the import
+  // failures of the tests that need it.
+  assert(
+    fs.existsSync(path.join(root, "src", "version.ts")),
+    "src/version.ts is missing: run make version"
+  );
   const state = gitState(root);
+  const tree = treeState(root);
+  // The record names the commit and the tree of the start, so neither may change during the run.
+  const assertTreeUnchanged = () =>
+    assert(treeState(root) === tree, "HEAD or the working tree changed during the run");
   const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), "loop-tests-"));
   const baseDir = path.join(scratchDir, "base");
   let worktreeAdded = false;
@@ -426,8 +471,12 @@ async function main(): Promise<number> {
     ["SIGTERM", 143],
   ] as const) {
     process.once(signal, () => {
-      cleanup();
-      process.exit(code);
+      // Stop the `bun test` children first: they write into the scratch dir and run in the base
+      // worktree that the cleanup removes.
+      void stopChildren().finally(() => {
+        cleanup();
+        process.exit(code);
+      });
     });
   }
   try {
@@ -449,9 +498,9 @@ async function main(): Promise<number> {
       );
       files = files.filter((file) => baseFiles.has(file) && !skipped.includes(file));
     }
-    // A compare of only new test files is valid: it lists them and cannot trip.
+    // A compare of only new or skipped test files is valid: it lists them and cannot trip.
     assert(
-      files.length > 0 || newFiles.length > 0,
+      files.length > 0 || newFiles.length > 0 || skipped.length > 0,
       `no loop test files match --filter ${values.filter}`
     );
     console.error(
@@ -463,6 +512,7 @@ async function main(): Promise<number> {
     const headName = recordName(state.gitSha, state.dirty, values.filter, runs, jobs);
     const head = records[records.length - 1];
     if (records.length === 1) {
+      assertTreeUnchanged();
       const markdown = renderRecord(head);
       fs.writeFileSync(path.join(outDir, `${headName}.json`), `${JSON.stringify(head, null, 2)}\n`);
       fs.writeFileSync(path.join(outDir, `${headName}.md`), markdown);
@@ -479,6 +529,7 @@ async function main(): Promise<number> {
       const [rerunBase, rerunHead] = await measure(sides, [trip.file], RECHECK_RUNS, 1, scratchDir);
       checks.push(recheck(trip, { base: rerunBase, head: rerunHead }));
     }
+    assertTreeUnchanged();
     const counted = checks.flatMap((check) => (check.again === null ? [] : [check.again]));
     const compare: LoopTestCompare = { base, head, skipped, checks, trips: counted, newFiles };
     const name = `compare-${base.commit.slice(0, 10)}-${headName}`;
@@ -496,8 +547,12 @@ async function main(): Promise<number> {
 
 if (import.meta.main) {
   main().then(
-    (code) => process.exit(code),
+    // After a signal, the signal handler exits with its own code once the children are gone.
+    (code) => {
+      if (!stopping) process.exit(code);
+    },
     (error: unknown) => {
+      if (stopping) return;
       console.error(error instanceof Error ? error.message : error);
       console.log("loop-tests: error");
       process.exit(2);
