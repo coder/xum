@@ -441,6 +441,25 @@ function revealSelectedTabOnResize(row: HTMLElement): void {
   }
 }
 
+/** Re-reveal a tab whenever the row or one of its tabs changes size. Returns the cleanup. */
+function observeRowSizes(row: HTMLElement): () => void {
+  // A new observer reports every observed element once at the start. That report is no size
+  // change, so it reveals the selected tab, as the caller just did: preferring the focused tab
+  // there would scroll a tab that a shortcut just selected back out of view.
+  let initialReport = true;
+  const observer = new ResizeObserver(() => {
+    if (initialReport) {
+      initialReport = false;
+      revealSelectedTab(row);
+    } else {
+      revealSelectedTabOnResize(row);
+    }
+  });
+  observer.observe(row);
+  for (const child of Array.from(row.children)) observer.observe(child);
+  return () => observer.disconnect();
+}
+
 /** Keep the row's selected tab fully visible, clear of the edge fades (see `revealTab`). */
 function revealSelectedTab(row: HTMLElement): void {
   const tab = row.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
@@ -511,13 +530,9 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
   React.useEffect(() => {
     const row = scrollRowRef.current;
     if (row == null || selectedItemId == null) return;
-    const reveal = () => revealSelectedTab(row);
-    reveal();
+    revealSelectedTab(row);
     if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => revealSelectedTabOnResize(row));
-    observer.observe(row);
-    for (const child of Array.from(row.children)) observer.observe(child);
-    return () => observer.disconnect();
+    return observeRowSizes(row);
   }, [selectedItemId, itemIdsKey]);
 
   return (

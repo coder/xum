@@ -32,19 +32,26 @@ function stubRowLayout(row: HTMLElement): void {
 
 describe("RightSidebarTabStrip keyboard (#7102)", () => {
   let cleanupDom: (() => void) | null = null;
-  let resizeCallbacks: Array<() => void> = [];
+  let observers: Array<{ callback: () => void; connected: boolean }> = [];
+  // Fire every connected observer, as a size change in the row does.
+  const resize = () => observers.filter((o) => o.connected).forEach((o) => o.callback());
 
   beforeEach(() => {
     cleanupDom = installDom();
-    resizeCallbacks = [];
-    // The row re-reveals a tab on size changes; the test fires those changes itself.
+    observers = [];
+    // The row re-reveals a tab on size changes; the test fires those changes itself. A real
+    // observer also reports once right after it starts: `renderStrip` and `select` send that.
     globalThis.ResizeObserver = class {
+      private readonly entry: { callback: () => void; connected: boolean };
       constructor(callback: () => void) {
-        resizeCallbacks.push(callback);
+        this.entry = { callback, connected: true };
+        observers.push(this.entry);
       }
       observe = mock(() => undefined);
       unobserve = mock(() => undefined);
-      disconnect = mock(() => undefined);
+      disconnect = () => {
+        this.entry.connected = false;
+      };
     } as unknown as typeof ResizeObserver;
   });
 
@@ -56,30 +63,42 @@ describe("RightSidebarTabStrip keyboard (#7102)", () => {
 
   function renderStrip(options: { disabled?: TabType } = {}) {
     const onSelect = mock((_tab: TabType) => undefined);
-    const items: RightSidebarTabStripItem[] = TABS.map((tab) => ({
-      id: `tab-${tab}`,
-      panelId: `panel-${tab}`,
-      tab,
-      selected: tab === "costs",
-      disabled: tab === options.disabled,
-      onSelect: () => onSelect(tab),
-      label: tab,
-      tooltip: null,
-      onClose: () => undefined,
-      closeLabel: `Close ${tab}`,
-    }));
-    const view = render(
-      <TooltipProvider>
-        <DndContext>
-          <SortableContext items={TABS.map((tab) => `strip:${tab}`)}>
-            <RightSidebarTabStrip items={items} tabsetId="strip" onAddNewTab={() => undefined} />
-          </SortableContext>
-        </DndContext>
-      </TooltipProvider>
-    );
+    const strip = (selected: TabType) => {
+      const items: RightSidebarTabStripItem[] = TABS.map((tab) => ({
+        id: `tab-${tab}`,
+        panelId: `panel-${tab}`,
+        tab,
+        selected: tab === selected,
+        disabled: tab === options.disabled,
+        onSelect: () => onSelect(tab),
+        label: tab,
+        tooltip: null,
+        onClose: () => undefined,
+        closeLabel: `Close ${tab}`,
+      }));
+      return (
+        <TooltipProvider>
+          <DndContext>
+            <SortableContext items={TABS.map((tab) => `strip:${tab}`)}>
+              <RightSidebarTabStrip items={items} tabsetId="strip" onAddNewTab={() => undefined} />
+            </SortableContext>
+          </DndContext>
+        </TooltipProvider>
+      );
+    };
+    const view = render(strip("costs"));
     const row = view.getByRole("tablist");
+    stubRowLayout(row);
+    resize();
     const tabs = view.getAllByRole("tab");
-    return { view, row, tabs, onSelect };
+    // Selection from outside the strip (a keyboard shortcut, the launcher). The effect then
+    // starts a new observer, whose first report follows.
+    const select = (tab: TabType) => {
+      view.rerender(strip(tab));
+      stubRowLayout(row);
+      resize();
+    };
+    return { view, row, tabs, onSelect, select };
   }
 
   test("arrow keys, Home and End move focus and wrap; only Enter selects", () => {
@@ -130,9 +149,7 @@ describe("RightSidebarTabStrip keyboard (#7102)", () => {
 
   test("a size change keeps the focused tab in view, also while its button has focus", () => {
     const { view, row, tabs } = renderStrip();
-    stubRowLayout(row);
     const last = tabs[tabs.length - 1];
-    const resize = () => resizeCallbacks.forEach((callback) => callback());
     const lastFullyVisible = () => {
       const tab = last.getBoundingClientRect();
       return tab.left >= 0 && tab.right <= ROW_WIDTH;
@@ -154,5 +171,28 @@ describe("RightSidebarTabStrip keyboard (#7102)", () => {
     (document.activeElement as HTMLElement).blur();
     resize();
     expect(row.scrollLeft).toBe(0);
+  });
+
+  test("a shortcut selection while focus stays on another tab keeps the new tab in view", () => {
+    const { tabs, select } = renderStrip();
+    const fullyVisible = (tab: HTMLElement) => {
+      const box = tab.getBoundingClientRect();
+      return box.left >= 0 && box.right <= ROW_WIDTH;
+    };
+
+    // Focus moves to the last tab without selecting it.
+    tabs[0].focus();
+    fireEvent.keyDown(tabs[0], { key: "End" });
+    expect(fullyVisible(tabs[3])).toBe(true);
+
+    // A shortcut selects the second tab; focus stays on the last one. The new observer's
+    // first report (sent by `select`) is no size change and must not scroll back.
+    select("review");
+    expect(document.activeElement).toBe(tabs[3]);
+    expect(fullyVisible(tabs[1])).toBe(true);
+
+    // A real size change after that keeps the focused tab in view again.
+    resize();
+    expect(fullyVisible(tabs[3])).toBe(true);
   });
 });
