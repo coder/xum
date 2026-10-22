@@ -525,7 +525,9 @@ jobs:
     needs: [changes]
     if: ${{ !cancelled() && github.event_name == 'pull_request' }}
     continue-on-error: ${{ vars.DRY_MODE != 'block' }}
-    timeout-minutes: 10
+    # Above the step timeouts (15 minutes): a cancelled job fails Required in
+    # block mode, so only a finished report may block (Codex review of #7149).
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     permissions:
       contents: read

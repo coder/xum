@@ -55,7 +55,7 @@ from mutator.sites import apply_site, discover_raw
 # Reuse the CRAP gate's production-file rule and LCOV reader.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "crap"))
 from crapper_report import is_production, load_coverage  # noqa: E402
-from markers import marker_reason  # noqa: E402
+from markers import Comments  # noqa: E402
 
 MARKER = "mutation-equivalent"
 
@@ -289,13 +289,14 @@ def accept_marked(root: Path, rows: list[dict]) -> None:
     "equivalent", with the marker's reason. Only survivors: a marked mutant that
     a test kills is still reported as killed."""
 
-    cache: dict[str, list[str]] = {}
+    cache: dict[str, Comments] = {}
     for result in rows:
         if result["outcome"] != "survived":
             continue
         if result["path"] not in cache:
-            cache[result["path"]] = (root / result["path"]).read_bytes().decode("utf-8").split("\n")
-        reason = marker_reason(cache[result["path"]], result["line"], result["line"], MARKER)
+            source = (root / result["path"]).read_bytes().decode("utf-8")
+            cache[result["path"]] = Comments(source, result["path"])
+        reason = cache[result["path"]].reason(result["line"], result["line"], MARKER)
         if reason is not None:
             result["outcome"] = "equivalent"
             result["reason"] = reason

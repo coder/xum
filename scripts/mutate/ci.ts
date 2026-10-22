@@ -56,9 +56,14 @@ export function unitCoverage(
   };
 }
 
-/** 1 only in block mode with a report that has unaccepted survivors. */
+/**
+ * 1 only in block mode with a complete report that has unaccepted survivors.
+ * A dropped baseline test makes the report partial: a survivor there can be a
+ * mutant that the dropped test kills, and a baseline failure never blocks.
+ */
 export function exitCode(mode: CrapMode, report: MutateReport | null): number {
-  return mode === "block" && report !== null && counts(report).survived > 0 ? 1 : 0;
+  if (mode !== "block" || report === null || report.droppedTests.length > 0) return 0;
+  return counts(report).survived > 0 ? 1 : 0;
 }
 
 export function summary(

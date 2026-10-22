@@ -83,3 +83,11 @@ test("the summary says when the run cut a source's test files", () => {
   expect(text).toContain("src/a.ts");
   expect(text).toMatch(/nearest/);
 });
+
+test("a dropped baseline test never blocks, even next to a survivor", () => {
+  const partial = {
+    ...report,
+    droppedTests: [{ path: "src/b.test.ts", reason: "fails without a mutant" }],
+  };
+  expect(exitCode("block", partial)).toBe(0);
+});

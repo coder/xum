@@ -133,7 +133,10 @@ def test_a_new_copy_with_the_name_of_an_old_match_is_reported():
 
 
 def test_a_marker_needs_a_reason_and_sits_in_or_right_above_the_span():
-    from markers import marker_reason
+    from markers import Comments
+
+    def marker_reason(lines, first, last, marker):
+        return Comments("\n".join(lines), "a.ts").reason(first, last, marker)
 
     lines = [
         "const a = 1;",  # 1
@@ -190,3 +193,21 @@ def test_naming_parses_each_reported_file_once(monkeypatch):
     side = lambda line: {"path": "src/a.ts", "name": f"@{line}", "startLine": line}
     dryer_report.name_reported(Path("."), [{"left": side(1), "right": side(9)} for _ in range(5)])
     assert calls == ["src/a.ts"]
+
+
+def test_marker_text_inside_a_string_is_not_a_marker():
+    from markers import Comments
+
+    def marker_reason(lines, first, last, marker):
+        return Comments("\n".join(lines), "a.ts").reason(first, last, marker)
+
+    lines = [
+        'const help = "// mutation-equivalent: example";',  # 1: a string, not a comment
+        "const url = 'http://x/* dry-duplicate-ok: no */';",  # 2: a string, not a comment
+        'const s = "a"; // mutation-equivalent: real reason',  # 3: a real comment after a string
+        "const t = `x ${y}`; /* dry-duplicate-ok: block comment */",  # 4: a template, then a comment
+    ]
+    assert marker_reason(lines, 1, 1, "mutation-equivalent") is None
+    assert marker_reason(lines, 2, 2, "dry-duplicate-ok") is None
+    assert marker_reason(lines, 3, 3, "mutation-equivalent") == "real reason"
+    assert marker_reason(lines, 4, 4, "dry-duplicate-ok") == "block comment"

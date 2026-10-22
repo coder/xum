@@ -40,7 +40,8 @@ const cents = Number((m[2] ?? "").padEnd(2, "0"));
 - `mutation-equivalent: <reason>` goes on the mutant's line or in the comment
   lines right above it. It covers every surviving mutant on that line. A
   killed mutant stays killed.
-- A marker without a reason accepts nothing. The report lists each accepted
+- A marker without a reason accepts nothing, and only a real comment counts:
+  marker text inside a string accepts nothing. The report lists each accepted
   finding with its reason.
 - Use a marker only after the repair below did not apply. A marker that only
   hides a missing test is gaming the gate.
