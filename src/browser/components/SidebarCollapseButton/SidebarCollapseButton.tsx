@@ -191,6 +191,10 @@ export function RightSidebarToggle(props: RightSidebarToggleProps) {
         </TooltipTrigger>
         <TooltipContent side="bottom" align="end">
           {label}
+          <span className="mobile-hide-shortcut-hints">
+            {" "}
+            ({formatKeybind(KEYBINDS.TOGGLE_RIGHT_SIDEBAR)})
+          </span>
         </TooltipContent>
       </Tooltip>
     </div>

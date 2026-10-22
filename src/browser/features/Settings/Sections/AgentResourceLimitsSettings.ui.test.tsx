@@ -1,7 +1,9 @@
 import { installDom } from "../../../../../tests/ui/dom";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
+import * as SelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import { CONNECTION_LOST_MESSAGE } from "@/browser/contexts/connectionLink";
 import {
@@ -16,7 +18,36 @@ import type {
   AgentResourceLimitsStatus,
   AgentResourceLimitsSupport,
 } from "@/common/orpc/schemas/agentResourceLimits";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { AgentResourceLimitsSettings } from "./AgentResourceLimitsSettings";
+
+// Radix Select renders its options in a portal, which happy-dom does not show: use a native select.
+restoreModulesAfterSuite([
+  ["@/browser/components/SelectPrimitive/SelectPrimitive", { ...SelectPrimitiveModule }],
+]);
+void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () => ({
+  Select: (props: {
+    value: string;
+    onValueChange: (value: string) => void;
+    disabled?: boolean;
+    children: React.ReactNode;
+  }) => (
+    <select
+      aria-label="Project picker"
+      value={props.value}
+      disabled={props.disabled}
+      onChange={(event) => props.onValueChange(event.currentTarget.value)}
+    >
+      {props.children}
+    </select>
+  ),
+  SelectContent: (props: { children: React.ReactNode }) => <>{props.children}</>,
+  SelectItem: (props: { value: string; children: React.ReactNode }) => (
+    <option value={props.value}>{props.children}</option>
+  ),
+  SelectTrigger: () => null,
+  SelectValue: () => null,
+}));
 
 const ACTIVE: AgentResourceLimitsStatus = { state: "active", cgroup: "/xum/xum-agents" };
 const OFF: AgentResourceLimitsStatus = { state: "off" };
@@ -34,8 +65,15 @@ function createServer(initial: AgentResourceLimitsState) {
     saved = { ...saved, enabled, status: enabled ? ACTIVE : OFF };
     return Promise.resolve(saved);
   });
+  const setProject = mock(
+    ({ projectPath, limits }: { projectPath: string; limits: AgentResourceLimits }) => {
+      const cgroup = `/xum/xum-agents/p-${projectPath.length}`;
+      saved = { ...saved, projects: { ...saved.projects, [projectPath]: { limits, cgroup } } };
+      return Promise.resolve(saved);
+    }
+  );
   const overrides = (): TestApiOverrides<APIClient> => ({
-    agentResourceLimits: { get: () => Promise.resolve(saved), set, setEnabled },
+    agentResourceLimits: { get: () => Promise.resolve(saved), set, setEnabled, setProject },
     config: {
       onConfigChanged: () => {
         const subscription = createControllableAsyncIterable<undefined>();
@@ -49,7 +87,7 @@ function createServer(initial: AgentResourceLimitsState) {
     saved = next;
     for (const subscription of subscriptions) subscription.push(undefined);
   };
-  return { set, setEnabled, overrides, saveElsewhere };
+  return { set, setEnabled, setProject, overrides, saveElsewhere };
 }
 
 // happy-dom does not deliver React's synthetic onChange for controlled fields, so call the
@@ -85,13 +123,149 @@ function renderSettings(initial: AgentResourceLimitsState) {
   return { ...view, ...fields(view), ...server };
 }
 
+const PHAROS = "/home/user/src/pharos";
+let userProjects = new Map<string, { workspaces: []; parentProjectPath?: string }>();
 let restoreDom: (() => void) | undefined;
+let projectContextSpy: { mockRestore: () => void } | undefined;
 beforeEach(() => {
   restoreDom = installDom();
+  userProjects = new Map();
+  projectContextSpy = spyOn(ProjectContextModule, "useProjectContext").mockImplementation(
+    () => ({ userProjects }) as unknown as ProjectContextModule.ProjectContext
+  );
 });
 afterEach(() => {
   cleanup();
+  projectContextSpy?.mockRestore();
   restoreDom?.();
+});
+
+function pickProject(view: ReturnType<typeof renderSettings>, projectPath: string) {
+  fireEvent.change(view.getByRole("combobox", { name: "Project picker" }), {
+    target: { value: projectPath },
+  });
+}
+
+describe("AgentResourceLimitsSettings for one project", () => {
+  test("shows no project picker without projects", async () => {
+    const view = renderSettings({
+      enabled: true,
+      limits: { cpuCores: 28 },
+      projects: {},
+      status: ACTIVE,
+      support: READY,
+    });
+
+    await view.findByText(/Active: agents share 28 CPU cores/);
+    expect(view.queryByRole("combobox", { name: "Project picker" })).toBeNull();
+  });
+
+  test("edits the limit of the picked project, inside the shared limit", async () => {
+    userProjects = new Map([[PHAROS, { workspaces: [] }]]);
+    const view = renderSettings({
+      enabled: true,
+      limits: { cpuCores: 28, memoryGiB: 64 },
+      projects: {},
+      status: ACTIVE,
+      support: READY,
+    });
+    await waitFor(() => expect(view.cpu().value).toBe("28"));
+
+    pickProject(view, PHAROS);
+
+    // The fields show the project's own limits, which it does not have yet.
+    await waitFor(() => expect(view.cpu().value).toBe(""));
+    view.getByText("pharos has no limit of its own. Its agents share the limit of all projects.");
+    view.edit(view.cpu(), "14");
+    view.edit(view.memory(), "32");
+
+    await waitFor(() =>
+      expect(view.setProject.mock.calls.at(-1)).toEqual([
+        { projectPath: PHAROS, limits: { cpuCores: 14, memoryGiB: 32 } },
+      ])
+    );
+    expect(view.set.mock.calls).toEqual([]);
+    await view.findByText(/Active: agents of pharos share 14 CPU cores and 32 GiB of memory/);
+  });
+
+  test("drops the field errors of the old project when the picker changes", async () => {
+    userProjects = new Map([[PHAROS, { workspaces: [] }]]);
+    const view = renderSettings({
+      enabled: true,
+      limits: { cpuCores: 28 },
+      projects: {},
+      status: ACTIVE,
+      support: READY,
+    });
+    await waitFor(() => expect(view.cpu().value).toBe("28"));
+    view.edit(view.cpu(), "-1");
+    await view.findByText(/CPU limit must be from/);
+
+    pickProject(view, PHAROS);
+
+    await waitFor(() => expect(view.cpu().value).toBe(""));
+    expect(view.queryByText(/CPU limit must be from/)).toBeNull();
+    expect(view.set.mock.calls).toEqual([]);
+  });
+
+  test("shows the shared limits again when the picked project is removed, and saves none of its values", async () => {
+    userProjects = new Map([[PHAROS, { workspaces: [] }]]);
+    const initial: AgentResourceLimitsState = {
+      enabled: true,
+      limits: { cpuCores: 28 },
+      projects: { [PHAROS]: { limits: { cpuCores: 14 }, cgroup: "/xum/xum-agents/p-1" } },
+      status: ACTIVE,
+      support: READY,
+    };
+    const view = renderSettings(initial);
+    await waitFor(() => expect(view.cpu().value).toBe("28"));
+    pickProject(view, PHAROS);
+    await waitFor(() => expect(view.cpu().value).toBe("14"));
+
+    // The project goes away while Settings is open; a config change renders the section again.
+    userProjects = new Map();
+    act(() => view.saveElsewhere(initial));
+
+    await waitFor(() => expect(view.cpu().value).toBe("28"));
+    fireEvent.blur(view.cpu());
+    expect(view.set.mock.calls).toEqual([]);
+    expect(view.setProject.mock.calls).toEqual([]);
+  });
+
+  test("offers no sub-project, since its agents share the limits of its parent", async () => {
+    userProjects = new Map([
+      [PHAROS, { workspaces: [] }],
+      [`${PHAROS}/packages/web`, { workspaces: [], parentProjectPath: PHAROS }],
+    ]);
+    const view = renderSettings({
+      enabled: true,
+      limits: {},
+      projects: {},
+      status: ACTIVE,
+      support: READY,
+    });
+
+    const picker = await view.findByRole("combobox", { name: "Project picker" });
+    const options = Array.from(picker.querySelectorAll("option"), (option) => option.textContent);
+    expect(options).toEqual(["All projects", "pharos"]);
+  });
+
+  test("tells that a project limit above the shared limit does not raise it", async () => {
+    userProjects = new Map([[PHAROS, { workspaces: [] }]]);
+    const view = renderSettings({
+      enabled: true,
+      limits: { cpuCores: 28 },
+      projects: { [PHAROS]: { limits: { cpuCores: 32 }, cgroup: "/xum/xum-agents/p-1" } },
+      status: ACTIVE,
+      support: READY,
+    });
+    await waitFor(() => expect(view.cpu().value).toBe("28"));
+
+    pickProject(view, PHAROS);
+
+    await waitFor(() => expect(view.cpu().value).toBe("32"));
+    view.getByText("The limit for all projects is 28 cores. The lower limit applies.");
+  });
 });
 
 describe("AgentResourceLimitsSettings", () => {
@@ -99,6 +273,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: { cpuCores: 8, memoryGiB: 16 },
+      projects: {},
       status: ACTIVE,
       support: READY,
     });
@@ -108,6 +283,7 @@ describe("AgentResourceLimitsSettings", () => {
     view.saveElsewhere({
       enabled: true,
       limits: { cpuCores: 4, memoryGiB: 16 },
+      projects: {},
       status: ACTIVE,
       support: READY,
     });
@@ -126,6 +302,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: { cpuCores: 8 },
+      projects: {},
       status: { state: "active", cgroup: "/xum/xum-agents" },
       support: READY,
     });
@@ -146,6 +323,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: { cpuCores: 8, memoryGiB: 16 },
+      projects: {},
       status: { state: "active", cgroup: "/xum/xum-agents" },
       support: READY,
     });
@@ -161,6 +339,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: { cpuCores: 8 },
+      projects: {},
       status: ACTIVE,
       support: READY,
     });
@@ -186,6 +365,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: {},
+      projects: {},
       status: { state: "off" },
       support: READY,
     });
@@ -201,6 +381,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: { cpuCores: 2 },
+      projects: {},
       status: { state: "unavailable", reason: "xum runs in cgroup /init.scope." },
       support: READY,
     });
@@ -217,6 +398,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: { cpuCores: 2 },
+      projects: {},
       status: { state: "unavailable", reason: "xum runs in cgroup /init.scope." },
       support: READY,
     });
@@ -270,7 +452,7 @@ describe("AgentResourceLimitsSettings", () => {
   ])(
     "tells before any limit applies that applying them %s, and keeps the switch usable",
     async (_name, setting, support, note) => {
-      const view = renderSettings({ ...setting, status: OFF, support });
+      const view = renderSettings({ ...setting, projects: {}, status: OFF, support });
 
       await view.findByText(note);
       expect(view.toggle().disabled).toBe(false);
@@ -282,6 +464,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: true,
       limits: { cpuCores: 2 },
+      projects: {},
       status: { state: "unavailable", reason },
       support: { state: "unsupported", reason },
     });
@@ -299,6 +482,7 @@ describe("AgentResourceLimitsSettings", () => {
     const view = renderSettings({
       enabled: false,
       limits: { cpuCores: 2 },
+      projects: {},
       status: { state: "unavailable", reason: "Could not remove the limits: EACCES" },
       support: READY,
     });
@@ -319,6 +503,7 @@ describe.each([...GAP_MODES])("AgentResourceLimitsSettings while reconnecting (%
     const server = createServer({
       enabled: true,
       limits: { cpuCores: 8 },
+      projects: {},
       status: ACTIVE,
       support: READY,
     });

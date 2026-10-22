@@ -4,11 +4,11 @@ import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
 import {
-  agentCgroupEnrollmentLine,
-  setAgentCgroupEnrollmentTarget,
+  agentCgroupEnrollmentLineForProject,
+  setAgentCgroupEnrollmentTargets,
 } from "@/node/runtime/agentCgroupEnrollment";
 import { waitForCondition } from "@/node/services/testDispatchHelpers";
-import type { AgentCgroupHost } from "./agentCgroup";
+import { projectCgroupName, type AgentCgroupHost } from "./agentCgroup";
 import { AgentResourceLimitsService } from "./agentResourceLimitsService";
 import { createFakeCgroupTree, type FakeCgroupTree } from "./testHelpers";
 
@@ -33,7 +33,7 @@ describe("AgentResourceLimitsService", () => {
   afterEach(async () => {
     service?.dispose();
     service = undefined;
-    setAgentCgroupEnrollmentTarget(null);
+    setAgentCgroupEnrollmentTargets(null);
     await tree.dispose();
     await fs.rm(rootDir, { recursive: true, force: true });
   });
@@ -58,11 +58,12 @@ describe("AgentResourceLimitsService", () => {
     expect(await service.get()).toEqual({
       enabled: true,
       limits: { cpuCores: 2 },
+      projects: {},
       status: { state: "active", cgroup: "/xum/xum-agents" },
       support: READY,
     });
     expect(await cpuMax()).toBe("200000 100000");
-    expect(agentCgroupEnrollmentLine()).toContain(procsFile());
+    expect(agentCgroupEnrollmentLineForProject(undefined)).toContain(procsFile());
 
     // A change from another window or process arrives only through the config listener.
     await config.updateAgentResourceLimits({ cpuCores: 4 });
@@ -71,7 +72,7 @@ describe("AgentResourceLimitsService", () => {
     await config.updateAgentResourceLimits({});
     expect((await service.get()).status).toEqual({ state: "off" });
     expect(await cpuMax()).toBe("max 100000");
-    expect(agentCgroupEnrollmentLine()).toBe("");
+    expect(agentCgroupEnrollmentLineForProject(undefined)).toBe("");
   });
 
   it("removes the limits while they are off and applies the saved ones when turned on", async () => {
@@ -82,17 +83,18 @@ describe("AgentResourceLimitsService", () => {
     expect(await service.setEnabled(false)).toEqual({
       enabled: false,
       limits: { cpuCores: 2 },
+      projects: {},
       status: { state: "off" },
       support: READY,
     });
     expect(await cpuMax()).toBe("max 100000");
-    expect(agentCgroupEnrollmentLine()).toBe("");
+    expect(agentCgroupEnrollmentLineForProject(undefined)).toBe("");
 
     // Turned on in another window or process, so only the config listener sees it.
     await config.updateAgentResourceLimitsEnabled(true);
     await waitForCondition(async () => (await cpuMax()) === "200000 100000");
     expect((await service.get()).status).toEqual({ state: "active", cgroup: "/xum/xum-agents" });
-    expect(agentCgroupEnrollmentLine()).toContain(procsFile());
+    expect(agentCgroupEnrollmentLineForProject(undefined)).toContain(procsFile());
   });
 
   it("reports the status of limits that a config change is still applying", async () => {
@@ -105,6 +107,7 @@ describe("AgentResourceLimitsService", () => {
     expect(await service.get()).toEqual({
       enabled: true,
       limits: { cpuCores: 4 },
+      projects: {},
       status: { state: "active", cgroup: "/xum/xum-agents" },
       support: READY,
     });
@@ -236,6 +239,7 @@ describe("AgentResourceLimitsService", () => {
     expect(state).toEqual({
       enabled: true,
       limits: { cpuCores: 1.5, memoryGiB: 2 },
+      projects: {},
       status: { state: "active", cgroup: "/xum/xum-agents" },
       support: READY,
     });
@@ -262,20 +266,20 @@ describe("AgentResourceLimitsService", () => {
       hostFailingWhile(() => failing)
     );
     await service.set({ cpuCores: 2 });
-    expect(agentCgroupEnrollmentLine()).toContain(procsFile());
+    expect(agentCgroupEnrollmentLineForProject(undefined)).toContain(procsFile());
 
     failing = true;
     const state = await service.set({ cpuCores: 3 });
 
     expect(state.status).toEqual({ state: "unavailable", reason: "cannot read /proc/self/cgroup" });
-    expect(agentCgroupEnrollmentLine()).toBe("");
+    expect(agentCgroupEnrollmentLineForProject(undefined)).toBe("");
 
     // Try again in Settings saves the same limits.
     failing = false;
     const retried = await service.set({ cpuCores: 3 });
 
     expect(retried.status).toEqual({ state: "active", cgroup: "/xum/xum-agents" });
-    expect(agentCgroupEnrollmentLine()).toContain(procsFile());
+    expect(agentCgroupEnrollmentLineForProject(undefined)).toContain(procsFile());
   });
 
   it("retries limits it could not apply when another backend saves them again", async () => {
@@ -293,6 +297,99 @@ describe("AgentResourceLimitsService", () => {
     await config.updateAgentResourceLimits({ cpuCores: 3 });
 
     expect((await service.get()).status.state).toBe("active");
-    expect(agentCgroupEnrollmentLine()).toContain(procsFile());
+    expect(agentCgroupEnrollmentLineForProject(undefined)).toContain(procsFile());
+  });
+
+  describe("project limits", () => {
+    const PHAROS = "/home/user/src/pharos";
+    const pharosCgroup = `/xum/xum-agents/${projectCgroupName(PHAROS)}`;
+    const projectCpuMax = () => tree.read(pharosCgroup.slice(1), "cpu.max");
+    const addProject = (projectPath: string) =>
+      config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [] });
+        return current;
+      });
+
+    it("applies a save that changes only a project limit, and moves its commands", async () => {
+      await config.updateAgentResourceLimits({ cpuCores: 28, memoryGiB: 64 });
+      await addProject(PHAROS);
+      service = new AgentResourceLimitsService(config, tree.host);
+      await service.start();
+
+      const state = await service.setProject(PHAROS, { cpuCores: 14, memoryGiB: 32 });
+
+      expect(state.projects).toEqual({
+        [PHAROS]: { limits: { cpuCores: 14, memoryGiB: 32 }, cgroup: pharosCgroup },
+      });
+      expect(await projectCpuMax()).toBe("1400000 100000");
+      expect(agentCgroupEnrollmentLineForProject(PHAROS)).toContain(
+        path.join(tree.root, pharosCgroup, "cgroup.procs")
+      );
+      expect(agentCgroupEnrollmentLineForProject("/home/user/src/other")).toContain(
+        path.join(tree.root, "xum", "xum-agents", "default", "cgroup.procs")
+      );
+      // A save in another window or backend arrives only through the config listener.
+      await config.updateProjectAgentResourceLimits(PHAROS, { cpuCores: 7 });
+      await waitForCondition(async () => (await projectCpuMax()) === "700000 100000");
+    });
+
+    it("applies no project limit while the switch is off, and keeps it saved", async () => {
+      await addProject(PHAROS);
+      service = new AgentResourceLimitsService(config, tree.host);
+      await service.start();
+      await service.setProject(PHAROS, { cpuCores: 14 });
+
+      const state = await service.setEnabled(false);
+
+      expect(state.projects).toEqual({ [PHAROS]: { limits: { cpuCores: 14 } } });
+      // The project's cgroup held no command, so it is gone.
+      expect(await projectCpuMax().catch((error: unknown) => String(error))).toContain("ENOENT");
+      expect(agentCgroupEnrollmentLineForProject(PHAROS)).toBe("");
+    });
+
+    it("refuses a limit for a sub-project, whose commands share the limits of its parent", async () => {
+      const subProject = path.join(PHAROS, "packages", "web");
+      await addProject(PHAROS);
+      await config.editConfig((current) => {
+        current.projects.set(subProject, { workspaces: [], parentProjectPath: PHAROS });
+        return current;
+      });
+      service = new AgentResourceLimitsService(config, tree.host);
+      await service.start();
+
+      let error: unknown;
+      try {
+        await service.setProject(subProject, { cpuCores: 1 });
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(String(error)).toContain("shares the resource limits of its parent project");
+      // A limit saved for it by hand gets no cgroup: no command would ever join it.
+      await config.editConfig((current) => {
+        current.projects.set(subProject, {
+          workspaces: [],
+          parentProjectPath: PHAROS,
+          agentResourceLimits: { cpuCores: 1 },
+        });
+        return current;
+      });
+      expect((await service.get()).projects).toEqual({});
+    });
+
+    it("refuses a limit for a project that is not in the config", async () => {
+      service = new AgentResourceLimitsService(config, tree.host);
+      await service.start();
+
+      let error: unknown;
+      try {
+        await service.setProject("/not/a/project", { cpuCores: 1 });
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(String(error)).toContain("Project not found: /not/a/project");
+      expect((await service.get()).projects).toEqual({});
+    });
   });
 });

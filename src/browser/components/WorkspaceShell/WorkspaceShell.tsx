@@ -16,7 +16,21 @@ import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFul
 import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { guardSidebarKeys, holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
-import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
+import {
+  isBrowserViewportFocused,
+  isCommandPaletteTarget,
+  isDesktopViewportFocused,
+  isDialogOpen,
+  isTerminalFocused,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
+
+import {
+  focusRightSidebarToggle,
+  isWorkspaceRightSidebarHidden,
+  toggleRightSidebarCollapsed,
+} from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { PopoverError } from "../PopoverError/PopoverError";
@@ -322,6 +336,71 @@ const WorkspacePlaceholder: React.FC<{
   </main>
 );
 
+/**
+ * True for the TOGGLE_RIGHT_SIDEBAR chord outside terminals, browser and desktop viewports, which
+ * own their keystrokes.
+ */
+function isRightSidebarToggleChord(e: KeyboardEvent): boolean {
+  return (
+    matchesKeybind(e, KEYBINDS.TOGGLE_RIGHT_SIDEBAR) &&
+    !isTerminalFocused(e.target) &&
+    !isBrowserViewportFocused(e.target) &&
+    !isDesktopViewportFocused(e.target)
+  );
+}
+
+/**
+ * True when an overlay blocks the right sidebar toggle: a modal dialog, the command palette (not a
+ * modal dialog, bug bash RS1), or a focused popover or menu (Radix portals them out of the sidebar,
+ * so a collapse would unmount the control with focus and leave focus on <body>). A held key also
+ * blocks it, or it would flip the sidebar on every repeat.
+ */
+function isRightSidebarToggleBlocked(e: KeyboardEvent): boolean {
+  return (
+    e.repeat ||
+    isDialogOpen() ||
+    isCommandPaletteTarget(e.target) ||
+    (e.target instanceof Element && e.target.closest("[data-radix-popper-content-wrapper]") != null)
+  );
+}
+
+/**
+ * Toggles the right sidebar for its hotkey. A collapse unmounts the focused control, and focus then
+ * fell to <body> (bug bash RS3), so focus moves to the header toggle.
+ */
+function toggleRightSidebarFromKey(workspaceId: string, shell: HTMLElement | null): void {
+  const sidebar = shell?.querySelector(".mobile-hide-right-sidebar");
+  const focusWasInSidebar = sidebar?.contains(document.activeElement) === true;
+  if (toggleRightSidebarCollapsed(workspaceId, shell) && focusWasInSidebar) {
+    focusRightSidebarToggle(shell);
+  }
+}
+
+/**
+ * The right sidebar had no hotkey (user request). It lives in WorkspaceShell, outside the lazy
+ * sidebar, so it works while the sidebar chunk loads, like the header toggle. It also works from
+ * the chat input, where the chord types nothing, like TOGGLE_SIDEBAR for the left sidebar.
+ */
+function useRightSidebarToggleKey(
+  workspaceId: string,
+  shellRef: React.RefObject<HTMLDivElement | null>
+) {
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!isRightSidebarToggleChord(e)) return;
+      // Claim the chord even when an overlay blocks the toggle: in a browser, Chrome binds it to
+      // its bookmarks bar.
+      e.preventDefault();
+      if (isRightSidebarToggleBlocked(e)) return;
+      toggleRightSidebarFromKey(workspaceId, shellRef.current);
+    };
+    // Capture phase: some modal controls stop keydown propagation (stopKeyboardPropagation),
+    // which would hide the chord from a bubble-phase listener before it is claimed.
+    window.addEventListener("keydown", handler, { capture: true });
+    return () => window.removeEventListener("keydown", handler, { capture: true });
+  }, [workspaceId, shellRef]);
+}
+
 export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   const shellRef = useRef<HTMLDivElement>(null);
   const shellSize = useResizeObserver(shellRef);
@@ -464,6 +543,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   // Layer 1: the full-screen sidebar is drawn above the narrow-screen drawer (layer 0), so it
   // answers Escape first when both are open.
   useEscapeToDismiss(sidebarFullscreen, closeSidebarFullscreen, 1);
+  useRightSidebarToggleKey(props.workspaceId, shellRef);
   // The Timeline's "Reveal in transcript" scrolls to and highlights a message in the chat behind
   // the view, so close the view to show it (the phone Timeline dialog did the same).
   useEffect(() => {

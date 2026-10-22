@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { readFileSync } from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
 import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
 import type { AgentResourceLimitsSupport } from "@/common/orpc/schemas/agentResourceLimits";
-import { applyAgentCgroupLimits, checkAgentCgroupSupport } from "./agentCgroup";
+import { applyAgentCgroupLimits, checkAgentCgroupSupport, projectCgroupName } from "./agentCgroup";
 import { createFakeCgroupTree, type FakeCgroupTree } from "./testHelpers";
 
 const MEMORY_1_1_GIB = String(Math.round(1.1 * 2 ** 30));
@@ -25,7 +26,11 @@ describe("applyAgentCgroupLimits", () => {
 
     expect(result).toEqual({
       status: { state: "active", cgroup: "/xum/xum-agents" },
-      enrollmentTarget: path.join(tree.root, "xum", "xum-agents", "cgroup.procs"),
+      enrollment: {
+        fallback: path.join(tree.root, "xum", "xum-agents", "cgroup.procs"),
+        byProject: new Map(),
+      },
+      projectCgroups: new Map(),
     });
     expect(await tree.read("xum", "cgroup.subtree_control")).toBe("cpu memory\n");
     // 0.29 * 100000 and 1.1 GiB are not whole numbers in floating point.
@@ -187,7 +192,11 @@ describe("applyAgentCgroupLimits", () => {
 
     const result = await applyAgentCgroupLimits({}, tree.host);
 
-    expect(result).toEqual({ status: { state: "off" }, enrollmentTarget: null });
+    expect(result).toEqual({
+      status: { state: "off" },
+      enrollment: null,
+      projectCgroups: new Map(),
+    });
     expect(await tree.read("xum/xum-agents", "cpu.max")).toBe("max 100000");
     expect(await tree.read("xum/xum-agents", "memory.max")).toBe("max");
   });
@@ -214,7 +223,8 @@ describe("applyAgentCgroupLimits", () => {
         state: "unavailable",
         reason: "Could not remove the limits from the agent cgroup: EACCES: permission denied",
       },
-      enrollmentTarget: null,
+      enrollment: null,
+      projectCgroups: new Map(),
     });
     expect(await tree.read("xum/xum-agents", "cpu.max")).toBe("200000 100000");
   });
@@ -227,7 +237,8 @@ describe("applyAgentCgroupLimits", () => {
 
     expect(await applyAgentCgroupLimits({}, tree.host)).toEqual({
       status: { state: "off" },
-      enrollmentTarget: null,
+      enrollment: null,
+      projectCgroups: new Map(),
     });
     expect(tree.writes).toEqual([]);
   });
@@ -260,7 +271,11 @@ describe("applyAgentCgroupLimits", () => {
 
       expect(result).toEqual({
         status: { state: "active", cgroup: "/init.scope/xum-agents" },
-        enrollmentTarget: path.join(tree.root, "init.scope", "xum-agents", "cgroup.procs"),
+        enrollment: {
+          fallback: path.join(tree.root, "init.scope", "xum-agents", "cgroup.procs"),
+          byProject: new Map(),
+        },
+        projectCgroups: new Map(),
       });
       expect(tree.sudoCalls).toEqual(["init.scope"]);
       expect(
@@ -417,7 +432,13 @@ describe("applyAgentCgroupLimits", () => {
         "another xum's agent cgroup",
         undefined,
         "/outer/xum-agents",
-        "xum runs in cgroup /outer/xum-agents, the agent cgroup of another xum, whose limits already apply.",
+        "xum runs in cgroup /outer/xum-agents, in the agent cgroup of another xum, whose limits already apply.",
+      ],
+      [
+        "a child of another xum's agent cgroup",
+        undefined,
+        "/outer/xum-agents/default",
+        "xum runs in cgroup /outer/xum-agents/default, in the agent cgroup of another xum, whose limits already apply.",
       ],
     ])("%s", async (_name, platform, own, reason) => {
       tree = await createFakeCgroupTree({
@@ -427,7 +448,8 @@ describe("applyAgentCgroupLimits", () => {
       });
       expect(await applyAgentCgroupLimits({ cpuCores: 2 }, tree.host)).toEqual({
         status: { state: "unavailable", reason },
-        enrollmentTarget: null,
+        enrollment: null,
+        projectCgroups: new Map(),
       });
       expect(tree.writes).toEqual([]);
     });
@@ -499,7 +521,8 @@ describe("applyAgentCgroupLimits", () => {
           state: "unavailable",
           reason: "A test command ran in cgroup /xum/xum-app, not /xum/xum-agents.",
         },
-        enrollmentTarget: null,
+        enrollment: null,
+        projectCgroups: new Map(),
       });
     });
 
@@ -520,8 +543,207 @@ describe("applyAgentCgroupLimits", () => {
           state: "unavailable",
           reason: "Could not set up cgroup /xum/xum-agents: EINVAL: invalid argument",
         },
-        enrollmentTarget: null,
+        enrollment: null,
+        projectCgroups: new Map(),
       });
     });
+  });
+});
+
+describe("applyAgentCgroupLimits with project limits", () => {
+  const PHAROS = "/home/user/src/pharos";
+  const PHAROS_CGROUP = projectCgroupName(PHAROS);
+  const pharosLimits = new Map([[PHAROS, { cpuCores: 14, memoryGiB: 32 }]]);
+  let tree: FakeCgroupTree | undefined;
+  afterEach(async () => {
+    await tree?.dispose();
+    tree = undefined;
+  });
+
+  /** xum runs in xum-app, and one agent command (201) runs in xum-agents from before. */
+  const createTree = () =>
+    createFakeCgroupTree({
+      own: "/xum/xum-app",
+      cgroups: {
+        xum: { controllers: "cpu memory", subtreeControl: "cpu memory" },
+        "xum/xum-app": { procs: ["101"] },
+        "xum/xum-agents": { procs: ["201"] },
+      },
+    });
+  const pids = async (fakeTree: FakeCgroupTree, cgroup: string) =>
+    (await fakeTree.read(cgroup, "cgroup.procs")).split("\n").filter(Boolean);
+  const exists = (fakeTree: FakeCgroupTree, cgroup: string) =>
+    fs.access(path.join(fakeTree.root, cgroup)).then(
+      () => true,
+      () => false
+    );
+
+  it("limits a project in its own child of xum-agents, inside the shared limit", async () => {
+    tree = await createTree();
+
+    const result = await applyAgentCgroupLimits({ cpuCores: 28, memoryGiB: 64 }, tree.host, {
+      projects: pharosLimits,
+    });
+
+    const agentsDir = path.join(tree.root, "xum", "xum-agents");
+    expect(result).toEqual({
+      status: { state: "active", cgroup: "/xum/xum-agents" },
+      enrollment: {
+        fallback: path.join(agentsDir, "default", "cgroup.procs"),
+        byProject: new Map([[PHAROS, path.join(agentsDir, PHAROS_CGROUP, "cgroup.procs")]]),
+      },
+      projectCgroups: new Map([[PHAROS, `/xum/xum-agents/${PHAROS_CGROUP}`]]),
+    });
+    expect(PHAROS_CGROUP).toMatch(/^p-[0-9a-f]{12}$/);
+    expect(await tree.read("xum/xum-agents", "cpu.max")).toBe("2800000 100000");
+    expect(await tree.read("xum/xum-agents", "memory.max")).toBe(String(64 * 2 ** 30));
+    expect(await tree.read(`xum/xum-agents/${PHAROS_CGROUP}`, "cpu.max")).toBe("1400000 100000");
+    expect(await tree.read(`xum/xum-agents/${PHAROS_CGROUP}`, "memory.max")).toBe(
+      String(32 * 2 ** 30)
+    );
+    // Other projects get only the shared limit.
+    expect(await tree.read("xum/xum-agents/default", "cpu.max")).toBe("max 100000");
+    // The running agent command moved, so xum-agents could enable controllers for its children.
+    expect(await tree.read("xum/xum-agents", "cgroup.subtree_control")).toBe("cpu memory\n");
+    expect(await pids(tree, "xum/xum-agents")).toEqual([]);
+    expect(await pids(tree, "xum/xum-agents/default")).toEqual(["201"]);
+  });
+
+  it("moves running commands into default before a CPU-only project limit nests xum-agents", async () => {
+    // The kernel accepts cpu while xum-agents holds processes, so without the move xum-agents
+    // would become a thread root and refuse every command in its children.
+    tree = await createTree();
+
+    const result = await applyAgentCgroupLimits({}, tree.host, {
+      projects: new Map([[PHAROS, { cpuCores: 2 }]]),
+    });
+
+    expect(result.projectCgroups).toEqual(new Map([[PHAROS, `/xum/xum-agents/${PHAROS_CGROUP}`]]));
+    expect(await pids(tree, "xum/xum-agents")).toEqual([]);
+    expect(await pids(tree, "xum/xum-agents/default")).toEqual(["201"]);
+    expect(await tree.read(`xum/xum-agents/${PHAROS_CGROUP}`, "cpu.max")).toBe("200000 100000");
+  });
+
+  it("turns on the controllers that only a project limit needs", async () => {
+    tree = await createFakeCgroupTree({
+      own: "/xum",
+      cgroups: { xum: { controllers: "cpu memory" } },
+    });
+
+    const result = await applyAgentCgroupLimits({}, tree.host, {
+      projects: new Map([[PHAROS, { cpuCores: 2 }]]),
+    });
+
+    expect(result.status).toEqual({ state: "active", cgroup: "/xum/xum-agents" });
+    expect(await tree.read("xum", "cgroup.subtree_control")).toBe("cpu\n");
+    expect(await tree.read("xum/xum-agents", "cpu.max")).toBe("max 100000");
+    expect(await tree.read(`xum/xum-agents/${PHAROS_CGROUP}`, "cpu.max")).toBe("200000 100000");
+  });
+
+  it("goes back to xum-agents when the last project limit is cleared, and keeps the children until no limit applies", async () => {
+    tree = await createTree();
+    await applyAgentCgroupLimits({ cpuCores: 28 }, tree.host, { projects: pharosLimits });
+
+    const result = await applyAgentCgroupLimits({ cpuCores: 28 }, tree.host, {
+      projects: new Map(),
+    });
+
+    expect(result.enrollment).toEqual({
+      fallback: path.join(tree.root, "xum", "xum-agents", "cgroup.procs"),
+      byProject: new Map(),
+    });
+    expect(result.projectCgroups).toEqual(new Map());
+    expect(await tree.read("xum/xum-agents", "cgroup.subtree_control")).toBe("\n");
+    // Another xum server that has not seen the change yet can still send commands to the
+    // children, and there they stay inside the shared limit.
+    expect(await tree.read(`xum/xum-agents/${PHAROS_CGROUP}`, "cpu.max")).toBe("max 100000");
+    expect(await exists(tree, "xum/xum-agents/default")).toBe(true);
+
+    await fs.writeFile(path.join(tree.root, "xum", "xum-agents", "default", "cgroup.procs"), "");
+    await applyAgentCgroupLimits({}, tree.host, { projects: new Map() });
+    expect(await exists(tree, `xum/xum-agents/${PHAROS_CGROUP}`)).toBe(false);
+    expect(await exists(tree, "xum/xum-agents/default")).toBe(false);
+  });
+
+  it("keeps the child of a project that lost its limit, without a limit, while another project keeps one", async () => {
+    tree = await createTree();
+    const other = "/home/user/src/other";
+    const otherCgroup = `xum/xum-agents/${projectCgroupName(other)}`;
+    await applyAgentCgroupLimits({}, tree.host, {
+      projects: new Map<string, AgentResourceLimits>([...pharosLimits, [other, { cpuCores: 1 }]]),
+    });
+
+    const result = await applyAgentCgroupLimits({}, tree.host, { projects: pharosLimits });
+
+    expect(result.projectCgroups).toEqual(new Map([[PHAROS, `/xum/xum-agents/${PHAROS_CGROUP}`]]));
+    expect(await tree.read(otherCgroup, "cpu.max")).toBe("max 100000");
+    expect(await tree.read(otherCgroup, "memory.max")).toBe("max");
+    expect(await tree.read(`xum/xum-agents/${PHAROS_CGROUP}`, "cpu.max")).toBe("1400000 100000");
+  });
+
+  it("turns the limits off when another xum server removes a child at the same time", async () => {
+    tree = await createTree();
+    await applyAgentCgroupLimits({ cpuCores: 28 }, tree.host, { projects: pharosLimits });
+    const host = {
+      ...tree.host,
+      removeCgroup: () => Promise.reject(Object.assign(new Error("gone"), { code: "ENOENT" })),
+    };
+
+    const result = await applyAgentCgroupLimits({}, host, { projects: new Map() });
+
+    expect(result.status).toEqual({ state: "off" });
+  });
+
+  it("sends new commands to default before xum-agents refuses them", async () => {
+    tree = await createTree();
+    const agentsDir = path.join(tree.root, "xum", "xum-agents");
+    const published: Array<{ fallback: string; subtreeControl: string }> = [];
+
+    await applyAgentCgroupLimits({ cpuCores: 28 }, tree.host, {
+      projects: pharosLimits,
+      publishEnrollment: (targets) =>
+        published.push({
+          fallback: targets.fallback,
+          subtreeControl: readFileSync(path.join(agentsDir, "cgroup.subtree_control"), "utf-8"),
+        }),
+    });
+
+    // Published while xum-agents still accepts commands, before it enables controllers.
+    expect(published).toEqual([
+      { fallback: path.join(agentsDir, "default", "cgroup.procs"), subtreeControl: "\n" },
+    ]);
+  });
+
+  it("checks the controllers that only a project limit needs", async () => {
+    tree = await createFakeCgroupTree({
+      own: "/xum",
+      cgroups: { xum: { controllers: "memory" } },
+    });
+
+    const support = await checkAgentCgroupSupport({ memoryGiB: 64 }, tree.host, pharosLimits);
+
+    expect(support).toEqual({
+      state: "unavailable",
+      reason:
+        "The cpu controller is not available in cgroup /xum. Enable it in the parent cgroup's cgroup.subtree_control.",
+    });
+  });
+
+  it("removes every project limit when no limit applies", async () => {
+    tree = await createTree();
+    await applyAgentCgroupLimits({ cpuCores: 28 }, tree.host, { projects: pharosLimits });
+    await tree.addProcess(`xum/xum-agents/${PHAROS_CGROUP}`, "301");
+
+    const result = await applyAgentCgroupLimits({}, tree.host, { projects: new Map() });
+
+    expect(result).toEqual({
+      status: { state: "off" },
+      enrollment: null,
+      projectCgroups: new Map(),
+    });
+    expect(await tree.read("xum/xum-agents", "cpu.max")).toBe("max 100000");
+    // Command 301 keeps its cgroup until it exits, but no longer its project limit.
+    expect(await tree.read(`xum/xum-agents/${PHAROS_CGROUP}`, "cpu.max")).toBe("max 100000");
+    expect(await tree.read("xum/xum-agents", "cgroup.subtree_control")).toBe("\n");
   });
 });

@@ -37,7 +37,7 @@ import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport } from "./shellEnv";
 import { hostChildEnv, mergeChildEnv, sanitizeXumChildEnv } from "./childProcessEnv";
 import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
-import { agentCgroupEnrollmentLine } from "./agentCgroupEnrollment";
+import { agentCgroupEnrollmentLineForProject } from "./agentCgroupEnrollment";
 
 /**
  * Acquire a regular file for ReadFileOptions.requireRegularFile.
@@ -214,6 +214,14 @@ export function localRuntimeTempRoot(): string {
  * - forkWorkspace()
  */
 export abstract class LocalBaseRuntime implements Runtime {
+  /**
+   * The config path of the project whose agent resource limit binds this runtime's commands, or
+   * undefined when it is not known; those commands get only the limit that all projects share.
+   */
+  protected agentCgroupProjectPath(): string | undefined {
+    return undefined;
+  }
+
   async exec(command: string, options: ExecOptions): Promise<ExecStream> {
     const startTime = performance.now();
 
@@ -253,7 +261,7 @@ export abstract class LocalBaseRuntime implements Runtime {
       .join("\n");
     const spawnArgs = [
       "-c",
-      `${agentCgroupEnrollmentLine()}${nonInteractivePrelude}\n${pathEnvPrelude}\n${command}`,
+      `${agentCgroupEnrollmentLineForProject(this.agentCgroupProjectPath())}${nonInteractivePrelude}\n${pathEnvPrelude}\n${command}`,
     ];
 
     const defaultPath = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
@@ -614,7 +622,7 @@ export abstract class LocalBaseRuntime implements Runtime {
 
     return new Promise<void>((resolve) => {
       const bashPath = getBashPath();
-      const script = `${agentCgroupEnrollmentLine()}${shellQuote(hookPath)}`;
+      const script = `${agentCgroupEnrollmentLineForProject(this.agentCgroupProjectPath())}${shellQuote(hookPath)}`;
       const proc = spawn(bashPath, ["-c", script], {
         cwd: workspacePath,
         stdio: ["ignore", "pipe", "pipe"],

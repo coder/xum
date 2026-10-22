@@ -509,10 +509,10 @@ test.each<[string, boolean]>([
   expect(looksLikeCpuProfile(prefix)).toBe(expected);
 });
 
-function runCli(args: string[]) {
+function runCli(args: string[], env?: Record<string, string>) {
   const proc = Bun.spawnSync(
     [process.execPath, join(import.meta.dir, "analyzeProfiles.ts"), ...args],
-    { stdout: "pipe", stderr: "pipe" }
+    { stdout: "pipe", stderr: "pipe", ...(env ? { env: { ...process.env, ...env } } : {}) }
   );
   return {
     exitCode: proc.exitCode,
@@ -633,6 +633,25 @@ test("CLI falls back to a sibling map when the sourceMappingURL comment is malfo
     expect(rows.map((r) => [r.location, r.line, r.column])).toEqual([["orig.ts", 1, 6]]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI maps scrubbed file://~ script URLs from a report bundle against the home folder", () => {
+  const home = mkdtempSync(join(tmpdir(), "analyze-profiles-home-"));
+  try {
+    mkdirSync(join(home, "app"));
+    writeFileSync(join(home, "app", "main.js"), "function a(){}\n");
+    writeFileSync(join(home, "app", "main.js.map"), mapTo("orig.ts"));
+    // POSIX homes scrub to file://~/..., Windows homes (file:///C:/Users/x) to file:///~/...
+    for (const url of ["file://~/app/main.js", "file:///~/app/main.js"]) {
+      const profile = join(home, "p.cpuprofile");
+      writeFileSync(profile, JSON.stringify(oneFrame(url)));
+      const proc = runCli(["--format", "json", profile], { HOME: home, USERPROFILE: home });
+      expect(proc.exitCode).toBe(0);
+      expect(locations(proc.stdout)).toEqual(["orig.ts"]);
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });
 

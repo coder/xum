@@ -190,7 +190,11 @@ import {
   getTabConfig,
   type BaseTabType,
 } from "@/browser/features/RightSidebar/Tabs/tabConfig";
-import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
+import {
+  isRightSidebarToggleAvailable,
+  isWorkspaceRightSidebarHidden,
+  toggleRightSidebarFromPalette,
+} from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { formatProjectHierarchyLabel, getTopLevelProjectEntries } from "@/common/utils/subProjects";
 import { serverPathLabel } from "@/common/utils/paths";
 import {
@@ -199,10 +203,9 @@ import {
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import {
-  focusRightSidebarTab,
+  focusRightSidebarTabWithKeyboard,
   openRightSidebarTool,
   readRightSidebarLayout,
-  requestFocusedTabFocus,
   splitRightSidebarPane,
   updateRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
@@ -435,10 +438,8 @@ const findFirstTerminalSessionTab = (
 
 function focusExistingTerminalTab(workspaceId: string): void {
   const found = findFirstTerminalSessionTab(readRightSidebarLayout(workspaceId).root);
-  if (!found) return;
-  focusRightSidebarTab(workspaceId, found.tab);
   // "Focus Terminal" and Add Tool > Terminal: the terminal takes the keyboard, like other tools.
-  requestFocusedTabFocus(workspaceId);
+  if (found) focusRightSidebarTabWithKeyboard(workspaceId, found.tab);
 }
 
 /**
@@ -1036,7 +1037,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       },
       {
         id: CommandIds.navToggleSidebar(),
-        title: "Toggle Sidebar",
+        title: "Toggle Left Sidebar",
         section: section.navigation,
         shortcutHint: formatKeybind(KEYBINDS.TOGGLE_SIDEBAR),
         run: () => p.onToggleSidebar(),
@@ -1149,6 +1150,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             ]
           : []),
         ...mcpAppNavigationActions(p, wsId, section.navigation),
+        {
+          id: CommandIds.navRightSidebarToggle(),
+          title: "Right Sidebar: Toggle",
+          section: section.navigation,
+          shortcutHint: formatKeybind(KEYBINDS.TOGGLE_RIGHT_SIDEBAR),
+          // Listed only while the toggle can act: the layout can hide the sidebar, and the phone
+          // full-screen view, immersive review and a failed load refuse the toggle too.
+          visible: () => isRightSidebarToggleAvailable(wsId),
+          run: () => toggleRightSidebarFromPalette(wsId),
+        },
         {
           id: CommandIds.navRightSidebarFocusTerminal(),
           title: "Right Sidebar: Focus Terminal",

@@ -422,6 +422,24 @@ describe("PerfReportService", () => {
     expect(copyText).not.toContain(SECRET_QUERY);
   });
 
+  test("skips a profile whose size no longer matches its metadata", async () => {
+    await writeProfile("c-grown", '{"nodes":[],"samples":[1,2,3]}');
+    await writeProfile("c-intact", "{}");
+    captures = [
+      { ...captureMetadata("c-grown", 2000), profileBytes: 2 },
+      { ...captureMetadata("c-intact", 1000), profileBytes: 2 },
+    ];
+    const report = await createService().createReport();
+
+    const manifest = (await readJson(path.join(report.dir, "captures/manifest.json"))) as {
+      included: Array<{ id: string }>;
+      skipped: Array<{ id: string; reason: string }>;
+    };
+    expect(manifest.included.map((capture) => capture.id)).toEqual(["c-intact"]);
+    expect(manifest.skipped).toMatchObject([{ id: "c-grown", reason: "size-mismatch" }]);
+    await expect(fs.stat(path.join(report.dir, "captures/c-grown.cpuprofile"))).rejects.toThrow();
+  });
+
   test("copies long numeric runs but skips a profile it cannot cut safely", async () => {
     // Sample arrays hold megabytes without a string; that is fine.
     const samples = Array.from({ length: 1_000_000 }, (_, i) => i % 1000).join(",");

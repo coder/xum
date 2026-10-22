@@ -4,7 +4,8 @@
  * (mockAiRouter.ts), and Xum must drop the older messages from the live transcript once the
  * compaction boundary arrives (StreamingMessageAggregator's live prune). The story never reloads
  * the page, so the live prune decides what the user sees. The older messages stay reachable
- * through "Load older messages".
+ * through "Load older messages". It replaces the Playwright test "slash command /compact produces
+ * compacted summary" (tests/e2e/scenarios/slashCommands.spec.ts).
  */
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
@@ -31,10 +32,16 @@ test(
       await expect(transcript).toContainText(`Mock response: ${text}`, { timeout: 30_000 });
     }
 
-    await agent.act(
-      "type exactly '/compact -t 500' into the message box and send it as a message. Do not " +
-        "pick another command from the suggestions."
-    );
+    // Exact steps, not agent.act: the "Compaction started" toast (chatCommands.ts) dismisses
+    // itself after 3 s in a browser (ChatInputToast.tsx), sooner than an agent concludes its step.
+    const message = screen.getByRole("textbox", "Message");
+    await message.fill("/compact -t 500");
+    // Escape closes the command suggestions, so Enter sends instead of picking one.
+    await message.press("Escape");
+    await message.press("Enter");
+    await expect(
+      screen.getByRole("status").filter({ hasText: /^Compaction started/ })
+    ).toBeVisible();
     await expect(transcript).toContainText("Mock compaction summary:", { timeout: 30_000 });
     // innerText: the label renders upper case (CSS), "COMPACTION BOUNDARY #1".
     await expect(transcript).toContainText("Compaction boundary", { ignoreCase: true });

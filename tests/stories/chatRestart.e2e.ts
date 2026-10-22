@@ -1,9 +1,9 @@
 /**
  * Story: a chat survives a restart of the server. The user sends a message and gets the reply,
  * then the app server restarts (xum.restartServer, fixtures.ts). Xum must read the chat back
- * from disk (chat.jsonl), not from the old server's memory. The Playwright scenario
- * (tests/e2e/scenarios/persistence.spec.ts) only reloads the page, so the server keeps its
- * in-memory state there.
+ * from disk (chat.jsonl), not from the old server's memory. It replaces the Playwright test "chat
+ * history persists across page reload" (tests/e2e/scenarios/persistence.spec.ts, deleted), which
+ * only reloaded the page, so the server kept its in-memory state there.
  */
 import { expect } from "e2e";
 import { disableTutorials } from "../bugbash/repros/helpers";

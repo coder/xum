@@ -426,6 +426,7 @@ describe("global keybind collisions", () => {
     "NEXT_WORKSPACE",
     "PREV_WORKSPACE",
     "TOGGLE_SIDEBAR",
+    "TOGGLE_RIGHT_SIDEBAR",
     "CYCLE_MODEL",
     "OPEN_TERMINAL",
     "OPEN_IN_EDITOR",
