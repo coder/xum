@@ -261,18 +261,55 @@ export async function collectAgentHomeSeedFiles(
   return files;
 }
 
+/**
+ * Shell helpers of the seed script. The snapshot may already hold a seed path, and a write or
+ * chmod that followed a link there (`tool_env -> ~/.ssh/authorized_keys`) would clobber the
+ * link's target. So nothing follows a link:
+ * - a directory below the home that is a symlink fails the seed: removing it could drop
+ *   snapshot content, and writing through it would land anywhere;
+ * - each file is written to a fresh `mktemp` file in its own directory, chmodded there, and
+ *   renamed over the destination. A destination symlink is removed first, so the rename
+ *   replaces it (Xum owns the box and overwrites its seed files) instead of `mv` moving the
+ *   file into a directory the link points at; a real directory there fails the seed.
+ */
+const SEED_SCRIPT_PRELUDE = [
+  "set -e",
+  "xum_seed_tmp=",
+  `trap 'rm -f "$xum_seed_tmp"' EXIT`,
+  `xum_seed_refuse() { echo "Refusing to seed $1: $2" >&2; exit 1; }`,
+  `xum_seed_dir() { if [ -L "$1" ]; then xum_seed_refuse "$1" "it is a symlink"; fi; [ -d "$1" ] || mkdir "$1"; }`,
+  `xum_seed_open() { if [ -d "$1" ] && [ ! -L "$1" ]; then xum_seed_refuse "$1" "it is a directory"; fi; xum_seed_tmp=$(mktemp "$2/.xum-seed.XXXXXX"); }`,
+  `xum_seed_close() { chmod "$2" "$xum_seed_tmp"; if [ -L "$1" ]; then rm -f "$1"; fi; mv -f "$xum_seed_tmp" "$1"; xum_seed_tmp=; }`,
+];
+
+/** The `~/`-relative directories from the home down to `remoteDir`, each one level deeper. */
+function directoriesBelowHome(remoteDir: string): string[] {
+  if (!remoteDir.startsWith("~/")) {
+    throw new Error(`Agent seed paths must be under the sandbox home: ${remoteDir}`);
+  }
+  const parts = remoteDir.slice(2).split("/").filter(Boolean);
+  return parts.map((_, index) => `~/${parts.slice(0, index + 1).join("/")}`);
+}
+
 /** One POSIX sh script that writes every file (sent on stdin: no argv size limit applies). */
 export function buildAgentHomeSeedScript(files: readonly AgentHomeSeedFile[]): string {
-  const lines = ["set -e"];
+  const lines = [...SEED_SCRIPT_PRELUDE];
+  const checkedDirs = new Set<string>();
   for (const file of files) {
     const target = expandTildeForSSH(file.remotePath);
-    lines.push(`mkdir -p ${expandTildeForSSH(path.posix.dirname(file.remotePath))}`);
-    lines.push(`base64 -d > ${target} <<'${HEREDOC_MARKER}'`);
+    const remoteDir = path.posix.dirname(file.remotePath);
+    for (const dir of directoriesBelowHome(remoteDir)) {
+      if (checkedDirs.has(dir)) continue;
+      checkedDirs.add(dir);
+      lines.push(`xum_seed_dir ${expandTildeForSSH(dir)}`);
+    }
+    lines.push(`xum_seed_open ${target} ${expandTildeForSSH(remoteDir)}`);
+    lines.push(`base64 -d > "$xum_seed_tmp" <<'${HEREDOC_MARKER}'`);
     // Line-wrapped base64 never contains the marker. A loop, not a spread: a spread passes
     // every line as an argument, and Node throws a RangeError past ~125k (a 10 MiB file).
     for (const line of file.content.toString("base64").match(/.{1,76}/g) ?? []) lines.push(line);
     lines.push(HEREDOC_MARKER);
-    lines.push(`chmod ${file.executable ? "755" : "644"} ${target}`);
+    lines.push(`xum_seed_close ${target} ${file.executable ? "755" : "644"}`);
   }
   return `${lines.join("\n")}\n`;
 }
