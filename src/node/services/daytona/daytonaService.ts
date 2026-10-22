@@ -69,7 +69,7 @@ export const DAYTONA_LABEL_INSTANCE = "xum.instance";
 export function notOwnedSandboxNotice(sandboxId: string): string {
   return (
     `Daytona sandbox "${sandboxId}" was kept: it does not carry this Xum install's ` +
-    `"${DAYTONA_LABEL_INSTANCE}" label, so Xum did not create it.`
+    `"${DAYTONA_LABEL_INSTANCE}" label, so Xum does not treat it as its own.`
   );
 }
 export const DAYTONA_LABEL_WORKSPACE_ID = "xum.workspaceId";
