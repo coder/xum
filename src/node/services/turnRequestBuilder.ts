@@ -619,11 +619,14 @@ async function foldPendingThinkingOverrides<TMessages, TTail>(
       contextBudgetEstimate?: number;
     }>;
     currentEffectiveLevelRef: { current: ThinkingLevel };
+    /** Leave pending changes for StreamManager's step 0 (after a published stage, #5286). */
+    skip?: boolean;
   },
   initial: FoldedStreamState<TMessages, TTail>
 ): Promise<FoldedStreamState<TMessages, TTail> | { exceeded: ContextBudgetExceeded }> {
   const { holder } = input;
   let state = initial;
+  if (input.skip) return state;
   while (holder?.pending != null) {
     const pendingPreparingLevel = holder.pending;
     holder.pending = undefined;
@@ -667,12 +670,16 @@ export type OnTurnStartStage = (budget: {
   /** The turn's history rows: their warning rows are this window's stage claims. */
   messages: readonly MuxMessage[];
 }) => Promise<TurnStartStage | undefined>;
-/** A due, unclaimed stage. `publish` resolves false when the send lost its admission first. */
+/**
+ * A due, unclaimed stage. `publish` resolves false when the send lost its admission first, or
+ * when history holds a row newer than `readSequence` (the request's stamp): the request does not
+ * carry that row, and the warning's later sequence must not mark it as seen.
+ */
 export interface TurnStartStage {
   row: MuxMessage;
   /** Whether E′, the count of the request with `row` appended, leaves the stage its reserve. */
   fits: (estimate: number) => boolean;
-  publish: () => Promise<boolean>;
+  publish: (readSequence: number) => Promise<boolean>;
 }
 
 /** What a primary start dispatches: the built request, or the counted candidate with a stage. */
@@ -709,7 +716,12 @@ async function applyTurnStartStage<TMessages, TTail>(input: {
   const stage = await onTurnStartStage({ estimate, limit, model: input.model, messages });
   if (!stage) return current;
   messages.push(stage.row);
-  const candidate = await countAndPublishStage(stage, input.rebuild, input.abortSignal);
+  const candidate = await countAndPublishStage(
+    stage,
+    input.rebuild,
+    input.abortSignal,
+    current.requestHistorySequence
+  );
   if (!candidate) {
     messages.pop();
     return current;
@@ -726,7 +738,8 @@ async function applyTurnStartStage<TMessages, TTail>(input: {
 async function countAndPublishStage<TCandidate extends { contextBudgetEstimate?: number }>(
   stage: TurnStartStage,
   rebuild: () => Promise<TCandidate>,
-  abortSignal: AbortSignal
+  abortSignal: AbortSignal,
+  readSequence: number
 ): Promise<TCandidate | undefined> {
   let candidate: TCandidate;
   try {
@@ -739,7 +752,7 @@ async function countAndPublishStage<TCandidate extends { contextBudgetEstimate?:
   const fits =
     candidate.contextBudgetEstimate != null && stage.fits(candidate.contextBudgetEstimate);
   if (!fits || abortSignal.aborted) return undefined;
-  return (await stage.publish()) ? candidate : undefined;
+  return (await stage.publish(readSequence)) ? candidate : undefined;
 }
 
 /**
@@ -3665,15 +3678,6 @@ export class TurnRequestBuilder {
         systemMessageTokens = primaryRequest.systemMessageTokens;
       }
       const finalMessages = primaryRequest.messages;
-      // Debug sinks pair systemMessage with the message list, so when the
-      // assembler embedded the system prompt as leading rows (engineSystem
-      // undefined; a cached stable row plus an optional volatile row), drop
-      // them to keep the system prompt single-sourced in captures.
-      const leadingSystemRows = finalMessages.findIndex((message) => message.role !== "system");
-      const debugViewMessages =
-        primaryRequest.engineSystem == null
-          ? finalMessages.slice(leadingSystemRows === -1 ? finalMessages.length : leadingSystemRows)
-          : finalMessages;
       const mergedProviderOptions = primaryRequest.providerOptions;
       const currentEffectiveLevelRef = primaryRequest.currentEffectiveLevelRef;
       const computeRebuiltProviderOptions = primaryRequest.computeRebuiltProviderOptions;
@@ -3711,6 +3715,12 @@ export class TurnRequestBuilder {
       // Token Budget stage (#5286), decided on E, the count the turn-start check (or the fold)
       // just took; see applyTurnStartStage.
       const foldedLevel = streamState.thinkingLevel;
+      const unstaged = {
+        messages: streamState.messages,
+        volatileSystemTail: streamState.volatileSystemTail,
+        systemMessageTokens: streamState.systemMessageTokens,
+        requestHistorySequence,
+      };
       const staged = await applyTurnStartStage({
         onTurnStartStage,
         estimate: streamState.contextBudgetEstimate,
@@ -3719,13 +3729,9 @@ export class TurnRequestBuilder {
         messages,
         rebuild: () => primaryRequest.rebuildMessagesForThinkingLevel(foldedLevel),
         abortSignal: combinedAbortSignal,
-        current: {
-          messages: streamState.messages,
-          volatileSystemTail: streamState.volatileSystemTail,
-          systemMessageTokens: streamState.systemMessageTokens,
-          requestHistorySequence,
-        },
+        current: unstaged,
       });
+      const stagePublished = staged !== unstaged;
       ({ requestHistorySequence } = staged);
       streamState = {
         ...streamState,
@@ -3769,8 +3775,13 @@ export class TurnRequestBuilder {
         };
       }
       // A change written while the append's file I/O ran still reaches the messages, as when
-      // the fold ran after the append.
-      streamState = await foldPendingThinkingOverrides(foldInput, streamState);
+      // the fold ran after the append. A published stage skips this refold: its counted payload
+      // is dispatched, and the change applies at step 0 like any change written after dispatch,
+      // so a refusal here cannot leave the warning unanswered (#5286).
+      streamState = await foldPendingThinkingOverrides(
+        { ...foldInput, skip: stagePublished },
+        streamState
+      );
       if ("exceeded" in streamState) {
         runLanguageModelCleanup(modelResult.data.model);
         await deleteAbortedPlaceholder(assistantMessageId);
@@ -3783,6 +3794,20 @@ export class TurnRequestBuilder {
         volatileSystemTail: streamVolatileSystemTail,
       } = streamState;
       ({ systemMessageTokens } = streamState);
+      // Debug sinks pair systemMessage with the message list, so when the
+      // assembler embedded the system prompt as leading rows (engineSystem
+      // undefined; a cached stable row plus an optional volatile row), drop
+      // them to keep the system prompt single-sourced in captures. Taken from the dispatched
+      // messages, so a stage warning shows.
+      const leadingSystemRows = streamFinalMessages.findIndex(
+        (message) => message.role !== "system"
+      );
+      const debugViewMessages =
+        primaryRequest.engineSystem == null
+          ? streamFinalMessages.slice(
+              leadingSystemRows === -1 ? streamFinalMessages.length : leadingSystemRows
+            )
+          : streamFinalMessages;
 
       const historySequence = assistantMessage.metadata?.historySequence ?? 0;
 

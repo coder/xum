@@ -213,7 +213,12 @@ async function emulateTurnStartStage(
   });
   if (!stage?.fits(estimate + TURN_START_ROW_TOKENS)) return;
   await control.beforePublish?.();
-  if (await stage.publish()) request.messages.push(stage.row);
+  // The request's stamp, as TurnRequestBuilder passes it: the newest row it read.
+  const readSequence = Math.max(
+    -1,
+    ...request.messages.map((message) => message.metadata?.historySequence ?? -1)
+  );
+  if (await stage.publish(readSequence)) request.messages.push(stage.row);
 }
 
 describe("AgentSession token-budget lifecycle", () => {
@@ -2499,16 +2504,21 @@ describe("AgentSession token-budget lifecycle", () => {
         case "failed-publication": {
           // The turn start publishes the row (#5286): a failed publication dispatches the
           // Continue without it and claims nothing.
-          const accept = h.historyService.acceptCompactionReplacement.bind(h.historyService);
-          let refused = 0;
-          spyOn(h.historyService, "acceptCompactionReplacement").mockImplementation((...args) =>
-            args[2].kind === "append" && warningRows(args[2].messages).length > 0 && refused++ === 0
-              ? Promise.resolve(Err("disk full"))
-              : accept(...args)
-          );
+          // The Continue row is published first; the next fenced append is the warning's.
+          const accept = spyOn(h.historyService, "acceptCompactionReplacement");
+          let rejectedCall: number | undefined;
+          const unsubscribe = h.session.onChatEvent(({ message }) => {
+            if (message.type !== "message" || rejectedCall != null) return;
+            if (message.role !== "user" || text(message) !== "Continue") return;
+            rejectedCall = accept.mock.calls.length;
+            accept.mockRejectedValueOnce(new Error("disk full"));
+          });
           h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
           const continued = await h.waitForRequest(2);
-          expect(refused).toBe(1);
+          unsubscribe();
+          // Non-vacuous: the rejected call was the warning's publication.
+          const rejected = accept.mock.calls[rejectedCall!]?.[2];
+          expect(rejected?.kind === "append" && warningRows(rejected.messages).length).toBe(1);
           expect(text(continued.messages.at(-1)!)).toBe("Continue");
           expect(handoffClaimed(h)).toBe(false);
           h.settleStream(1, { finishReason: "stop", contextUsage: { inputTokens: 90_000 } });
@@ -4409,6 +4419,31 @@ describe("AgentSession token-budget lifecycle", () => {
       expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
       expect(advanced).toBe(true);
       expect(warningRows(await allRows(h))).toHaveLength(0);
+      expect(handoffClaimed(h)).toBe(false);
+      expect(text(h.requests[0].messages.at(-1)!)).toBe("Keep working");
+    });
+
+    // A row appended after the request's history read (here a sub-agent report) is not in the
+    // request. The warning's later sequence would stamp it as seen, so the warning is refused.
+    test("a turn-start warning is not published after a row the request did not read", async () => {
+      const h = await setup();
+      await seedHistory(h, 95_000);
+      h.turnStart.estimate = () => 100_000;
+      h.turnStart.beforePublish = async () => {
+        const late = createMuxMessage(
+          "late-report",
+          "user",
+          "<mux_subagent_report>done</mux_subagent_report>",
+          {
+            synthetic: true,
+          }
+        );
+        expect((await h.historyService.appendToHistory(workspaceId, late)).success).toBe(true);
+      };
+      expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
+      const rows = await allRows(h);
+      expect(rows.map((row) => row.id)).toContain("late-report");
+      expect(warningRows(rows)).toHaveLength(0);
       expect(handoffClaimed(h)).toBe(false);
       expect(text(h.requests[0].messages.at(-1)!)).toBe("Keep working");
     });

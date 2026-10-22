@@ -517,7 +517,7 @@ export class TokenBudgetStrategy {
   async prepareTurnStartStage(
     budget: Parameters<OnTurnStartStage>[0],
     options: SendMessageOptions,
-    publish: (row: MuxMessage) => Promise<boolean>
+    publish: (row: MuxMessage, readSequence: number) => Promise<boolean>
   ): Promise<TurnStartStage | undefined> {
     const threshold = this.resolveThreshold(budget.model);
     const stage = dueTurnStartStage(budget, threshold);
@@ -537,16 +537,16 @@ export class TokenBudgetStrategy {
     return {
       row,
       fits: (estimate) => estimate + reserve < ceiling,
-      publish: () => this.publishTurnStartStage(row, stream, publish),
+      publish: (readSequence) =>
+        this.publishTurnStartStage(stream, () => publish(row, readSequence)),
     };
   }
 
   private async publishTurnStartStage(
-    row: MuxMessage,
     stream: StreamContextSnapshot | undefined,
-    publish: (row: MuxMessage) => Promise<boolean>
+    publish: () => Promise<boolean>
   ): Promise<boolean> {
-    const published = await publish(row);
+    const published = await publish();
     if (published && this.stageDeclinedStream === stream) this.stageDeclinedStream = undefined;
     return published;
   }

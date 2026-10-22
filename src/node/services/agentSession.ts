@@ -6910,6 +6910,7 @@ export class AgentSession {
    */
   private async publishTurnStartStage(
     row: MuxMessage,
+    readSequence: number,
     admissionCapture: CompactionReplacementCapture | undefined,
     isStreamStartAborted: () => boolean,
     stopFence: () => boolean
@@ -6923,6 +6924,11 @@ export class AgentSession {
         {
           isCurrent: () => !isStreamStartAborted() && stopFence(),
           onCommitted: () => undefined,
+          // A row appended after the request's history read (a sub-agent report, a queued
+          // send) is not in the request: the warning's later sequence would mark it as seen.
+          // A stage row is rare (two per window), so the full scan is cheap enough.
+          admitsFullHistory: (rows) =>
+            rows.every((message) => (message.metadata?.historySequence ?? -1) <= readSequence),
         }
       )
       .catch((error: unknown) => Err(getErrorMessage(error)));
@@ -9189,8 +9195,14 @@ export class AgentSession {
         }),
         // The stage warning follows the user row (#5286). It is published under this send's
         // admission, like the user row itself, unless the start was superseded or stopped.
-        onTurnStartStage: this.contextController.turnStartStage(options, (row) =>
-          this.publishTurnStartStage(row, admissionCapture, isStreamStartAborted, stopFence)
+        onTurnStartStage: this.contextController.turnStartStage(options, (row, readSequence) =>
+          this.publishTurnStartStage(
+            row,
+            readSequence,
+            admissionCapture,
+            isStreamStartAborted,
+            stopFence
+          )
         ),
         openaiTruncationModeOverride,
         ...this.compactionRetryInputBudget(),

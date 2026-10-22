@@ -2668,6 +2668,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         stageCallback?: boolean;
         /** Runs after the candidate count, before the stage is published. */
         afterCandidate?: () => void;
+        /** Runs while the assistant placeholder's append is in flight. */
+        duringPlaceholderAppend?: () => void;
         abortController?: AbortController;
         activeTurnThinkingOverride?: ActiveTurnThinkingOverride;
       } = {}
@@ -2682,6 +2684,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       // Real history and real provider messages: the dispatched payload is what a provider gets.
       spyOn(harness.historyService, "appendToHistory").mockRestore();
       spyOn(messagePipeline, "prepareMessagesForProvider").mockRestore();
+      if (options.duringPlaceholderAppend) {
+        const realAppend = harness.historyService.appendToHistory.bind(harness.historyService);
+        spyOn(harness.historyService, "appendToHistory").mockImplementation((id, message) => {
+          const appended = realAppend(id, message);
+          if (message.role === "assistant") options.duringPlaceholderAppend?.();
+          return appended;
+        });
+      }
       const user = createMuxMessage("user-1", "user", USER_TEXT);
       expect((await harness.historyService.appendToHistory(metadata.id, user)).success).toBe(true);
       const read = await harness.historyService.getHistoryFromLatestBoundary(metadata.id);
@@ -2739,9 +2749,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(result.success).toBe(true);
       const history = await harness.historyService.getHistoryFromLatestBoundary(metadata.id);
       if (!history.success) throw new Error(history.error);
+      const snapshot = harness.service.debugGetLastLlmRequest(metadata.id);
       return {
         assemblyCalls,
         countOptions,
+        snapshot: snapshot.success ? snapshot.data : null,
         sent: harness.startStreamCalls.at(0),
         estimates,
         measured,
@@ -2797,6 +2809,28 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(turn.measured).toEqual([await countRequest(turn, sent.messages)]);
       expect(turn.measured[0]).toBeGreaterThan(turn.estimates[0]);
       expect(row.metadata?.muxMetadata).toMatchObject({ contextTokens: turn.estimates[0] });
+      // The debug snapshot shows the request that was sent, warning included.
+      expect(JSON.stringify(turn.snapshot?.messages)).toContain(
+        JSON.stringify(warningTextOf(row)).slice(1, -1)
+      );
+    });
+
+    it("a thinking change written during the placeholder append after a published stage applies after dispatch", async () => {
+      using xumHome = new DisposableTempDir("ai-turn-start-stage-change-during-append");
+      const override: ActiveTurnThinkingOverride = {};
+      const turn = await runStageTurn(xumHome.path, {
+        activeTurnThinkingOverride: override,
+        duringPlaceholderAppend: () => {
+          override.pending = "high";
+        },
+      });
+      // The counted candidate is dispatched at its level. The builder leaves the change pending
+      // for StreamManager's step 0, so no refold can refuse the turn after the warning is out.
+      expect(turn.history.filter(isWarning)).toHaveLength(1);
+      expect(override).toEqual({ pending: "high" });
+      const sent = turn.sent!;
+      expect(sent.thinkingLevel).toBe("off");
+      expect(turn.measured).toEqual([await countRequest(turn, sent.messages)]);
     });
 
     it("a stage that is not due adds no assembly and no count", async () => {
