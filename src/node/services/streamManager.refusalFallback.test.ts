@@ -1,4 +1,4 @@
-import { describe, test, expect, mock } from "bun:test";
+import { describe, test, expect, mock, spyOn } from "bun:test";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { Err, Ok } from "@/common/types/result";
@@ -507,7 +507,33 @@ describe("StreamManager - fallback stage handover (#5286)", () => {
     });
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(handOver).not.toHaveBeenCalled();
-    expect(completion.status).not.toBe("completed");
+    // The stop ends the turn (stream-abort), not a refusal failure.
+    expect(completion.status).toBe("aborted");
+  });
+
+  test("a handover row that cannot be written keeps a finalized partial", async () => {
+    const workspaceId = "ws-fallback-handover-write-fails";
+    const prepare = mock(() =>
+      Promise.resolve(Err({ type: "context_budget_stage" as const, handOver: () => "entry" }))
+    );
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([{ chunks: [REFUSAL_FINISH], usage: NO_USAGE }]),
+    });
+    const update = spyOn(historyService, "updateHistory").mockResolvedValueOnce(Err("disk full"));
+    try {
+      const { completion } = await runTurnForTests(streamManager, {
+        workspaceId,
+        modelString: KNOWN_MODELS.SONNET.id,
+        modelFallback: { chain: ["openai:gpt-5.6-luna"], prepare },
+      });
+      expect(completion.status).toBe("completed");
+    } finally {
+      update.mockRestore();
+    }
+    // Startup recovery commits a finalized partial instead of retrying the turn (#5322).
+    const partial = await historyService.readPartial(workspaceId);
+    expect(partial?.metadata?.streamFinalized).toBe(true);
+    expect(partial?.metadata?.stopCause).toMatchObject({ kind: "context-budget" });
   });
 });
 

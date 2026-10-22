@@ -737,11 +737,40 @@ async function applyTurnStartStage<TMessages, TTail>(input: {
   };
 }
 
+/** A fallback request's estimate rebuilt with `row` (E′); undefined when the budget refuses it. */
+async function estimateWithRow<
+  TRequest extends { contextBudgetEstimate?: number; model: LanguageModel },
+>(
+  build: (messages: MuxMessage[]) => Promise<TRequest>,
+  messages: MuxMessage[],
+  row: MuxMessage
+): Promise<number | undefined> {
+  try {
+    const candidate = await build([...messages, row]);
+    runLanguageModelCleanup(candidate.model);
+    return candidate.contextBudgetEstimate;
+  } catch (error) {
+    if (error instanceof ContextBudgetExceededError) return undefined;
+    throw error;
+  }
+}
+
+/** The stage due on a built fallback request's estimate E, if the budget applies to it. */
+function dueFallbackStage(
+  stage: { onTurnStartStage: OnTurnStartStage | undefined; model: string; messages: MuxMessage[] },
+  request: { contextBudgetEstimate?: number; contextBudgetLimit?: number }
+): Promise<TurnStartStage | undefined> | undefined {
+  const { contextBudgetEstimate: estimate, contextBudgetLimit: limit } = request;
+  if (stage.onTurnStartStage == null || estimate == null || limit == null) return undefined;
+  return stage.onTurnStartStage({ estimate, limit, model: stage.model, messages: stage.messages });
+}
+
 /**
  * Builds a refusal fallback's request. Err when the budget refuses it, or when a stage is due on
- * it (#5286): the turn's placeholder row is already written, so the warning cannot precede it.
- * The turn then hands over to a Continue on the fallback model, whose own turn start publishes
- * the warning. So no fallback request is dispatched without its own stage decision.
+ * it and its row fits (E′, as at a primary turn start) (#5286): the turn's placeholder row is
+ * already written, so the warning cannot precede it. The turn then hands over to a Continue on
+ * the fallback model, whose own turn start publishes the warning. So no fallback request is
+ * dispatched without its own stage decision.
  */
 async function buildFallbackRequest<
   TRequest extends {
@@ -750,7 +779,7 @@ async function buildFallbackRequest<
     model: LanguageModel;
   },
 >(
-  build: () => Promise<TRequest>,
+  build: (messages: MuxMessage[]) => Promise<TRequest>,
   stage: { onTurnStartStage: OnTurnStartStage | undefined; model: string; messages: MuxMessage[] }
 ): Promise<
   Result<
@@ -760,21 +789,15 @@ async function buildFallbackRequest<
 > {
   let request: TRequest;
   try {
-    request = await build();
+    request = await build(stage.messages);
   } catch (error) {
     if (error instanceof ContextBudgetExceededError) return Err(error.details);
     throw error;
   }
-  const estimate = request.contextBudgetEstimate;
-  const limit = request.contextBudgetLimit;
-  if (stage.onTurnStartStage == null || estimate == null || limit == null) return Ok(request);
-  const due = await stage.onTurnStartStage({
-    estimate,
-    limit,
-    model: stage.model,
-    messages: stage.messages,
-  });
-  if (!due?.fits(estimate)) return Ok(request);
+  const due = await dueFallbackStage(stage, request);
+  if (!due) return Ok(request);
+  const withRow = await estimateWithRow(build, stage.messages, due.row);
+  if (withRow == null || !due.fits(withRow)) return Ok(request);
   runLanguageModelCleanup(request.model);
   return Err({ type: "context_budget_stage", handOver: due.handOver });
 }
@@ -4086,10 +4109,10 @@ export class TurnRequestBuilder {
                 }
 
                 const built = await buildFallbackRequest(
-                  () =>
+                  (requestMessages) =>
                     prepareModelRequest({
                       seed: nextSeedResult.data,
-                      sourceMessages,
+                      sourceMessages: requestMessages,
                       initializeToolSearch: false,
                       reusePrePolicySystemContext: false,
                       requestHistorySequence: () => requestHistorySequence,

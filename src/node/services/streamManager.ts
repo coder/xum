@@ -4265,7 +4265,7 @@ export class StreamManager {
     // Written even with no parts: the row carries the stop and the fallback record. Row first,
     // then this stream's partial (the crash-safe order of the stream-end path).
     streamInfo.partialRetired = true;
-    const updated = await this.historyService.updateHistory(workspaceId as string, {
+    const row: MuxMessage = {
       id: streamInfo.messageId,
       role: "assistant",
       metadata: {
@@ -4275,7 +4275,8 @@ export class StreamManager {
         ),
       },
       parts: streamInfo.parts,
-    });
+    };
+    const updated = await this.historyService.updateHistory(workspaceId as string, row);
     const retired = updated.success
       ? await this.historyService.deletePartialIfMessageIdMatches(workspaceId, streamInfo.messageId)
       : updated;
@@ -4283,6 +4284,12 @@ export class StreamManager {
       this.getWorkspaceLogger(workspaceId, streamInfo).warn("Failed to persist the handover row", {
         error: retired.error,
       });
+      // As on a normal stream end (#5322): a kept partial marked finalized is committed by
+      // startup recovery, not retried as an interrupted turn. An empty row cannot show that.
+      await this.historyService.updatePartialIfMessageIdMatches(workspaceId, row.id, () => ({
+        ...row,
+        metadata: { ...row.metadata, streamFinalized: true },
+      }));
     }
     streamInfo.state = StreamState.COMPLETED;
     this.emitTurnEvent(streamEndEvent);
@@ -4322,10 +4329,12 @@ export class StreamManager {
     outcome: RefusalFallbackOutcome
   ): Promise<void> {
     if (outcome.kind === "handover") {
-      // A stop during the fallback prepare ends the turn as a stop before it does: no Continue.
       const stopped = streamInfo.abortController.signal.aborted || streamInfo.softInterrupt.pending;
       if (!stopped)
         return this.completeRefusalHandover(workspaceId, streamInfo, outcome.handOver());
+      // A stop during the fallback prepare owns the turn's end (stream-abort, no Continue). A soft
+      // stop takes effect at this boundary; a hard stop's canceller is already waiting for us.
+      return this.checkSoftCancelStream(workspaceId, streamInfo);
     }
     const fallbackNote = outcome.kind === "terminal" ? outcome.terminalNote : undefined;
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);

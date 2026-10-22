@@ -682,7 +682,9 @@ export class TokenBudgetStrategy {
         ...(context.workspaceTurnMetadata ?? { type: "normal" }),
         contextBudgetContinuation: true,
       },
-      autoModelRouting: context.autoModelRouting,
+      // The record names the model that answers. A refusal handover queues the Continue before
+      // any fallback swap updated the stream's record, so it would still name the refused model.
+      autoModelRouting: context.autoModelRouting && { ...context.autoModelRouting, model },
       goalKind: context.goalKind,
       goalId: context.goalId,
       taskTurnKind: context.taskTurnKind,

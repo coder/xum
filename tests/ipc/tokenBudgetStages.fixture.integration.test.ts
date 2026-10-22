@@ -604,4 +604,37 @@ describeIntegration("Token Budget stages (loopback fixture)", () => {
     },
     TEST_TIMEOUT_MS
   );
+
+  test(
+    "a refusal fallback whose stage row no longer fits is dispatched without a handover",
+    async () => {
+      const scenario = await startScenario({
+        slider: 70,
+        usageFor: LOW_USAGE,
+        refusalFallback: { primaryLimit: 200_000 },
+      });
+      try {
+        await scenario.send("Turn 0: read 4 files.");
+        await scenario.send("Turn 1: read 4 files.");
+        // The fallback's E ≈ 89.6k and E′ (with the warning row) ≈ 89.9k: E + 2,048 fits below
+        // C (91,808), E′ + 2,048 does not. The band is the row's ≈ 300 tokens. A handover here
+        // would only queue a Continue that declines the warning again.
+        await scenario.writeInstructions(filler("Instruction", 13_100));
+        await scenario.send(`Turn 2: read 0 files. ${REFUSE_MARKER}`);
+        const fallbackRequests = scenario.fixture.requests.filter(
+          (r) => r.main && r.model === FALLBACK_MODEL_ID
+        );
+        expect(fallbackRequests.map((r) => r.lastUserText.includes(REFUSE_MARKER))).toEqual([true]);
+        const history = await scenario.history();
+        expect(history.filter(isWarning)).toEqual([]);
+        expect(history.some((row) => textOf(row.parts as Block[]) === "Continue")).toBe(false);
+        const last = history.at(-1);
+        expect(last?.role).toBe("assistant");
+        expect(textOf((last?.parts ?? []) as Block[])).toContain("Done.");
+      } finally {
+        await scenario.close();
+      }
+    },
+    TEST_TIMEOUT_MS
+  );
 });

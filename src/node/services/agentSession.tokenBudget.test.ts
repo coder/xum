@@ -4483,7 +4483,17 @@ describe("AgentSession token-budget lifecycle", () => {
         await seedAutoCompactionThreshold(h.config, fallbackModel, 70);
         await seedHistory(h, 80_000);
         h.turnStart.estimate = () => NOT_DUE;
-        expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+        // An Auto-routed turn: the record names the refused primary until a fallback swap.
+        const record: AutoModelRoutingRecord = {
+          requestedFallbackModel: "anthropic:claude-sonnet-4-5",
+          model,
+          status: "routed",
+        };
+        const routed: SendMessageOptions & { autoModelRoutingRecord: AutoModelRoutingRecord } = {
+          ...options,
+          autoModelRoutingRecord: record,
+        };
+        expect((await h.session.sendMessage("Work", routed)).success).toBe(true);
         const primary = h.requests[0];
         // The fallback prepare's call: E of the fallback's built request, due in its window.
         const stage = await primary.onTurnStartStage?.({
@@ -4520,6 +4530,8 @@ describe("AgentSession token-budget lifecycle", () => {
         h.settleStream(0, { finishReason: "stop", contextUsage: { inputTokens: 80_000 } });
         const continued = await h.waitForRequest(2);
         expect(continued.modelString).toBe(fallbackModel);
+        // Its routing record names the model that answers it, not the refused primary.
+        expect(continued.autoModelRouting).toEqual({ ...record, model: fallbackModel });
         expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
       }
     );
