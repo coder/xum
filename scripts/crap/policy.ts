@@ -80,16 +80,21 @@ export type Hunk = [number, number, number, number];
  * The file and hunk headers of a `git diff -U0`, in order. A file header
  * names the head path (null for a deleted file). Each hunk's body lines are
  * skipped by count, because an added source line `++ x` renders as `+++ x`
- * and is not a file header.
+ * and is not a file header. A line with no body prefix ends the body early.
  */
 export function* diffHeaders(
   diff: string
 ): Generator<{ kind: "file"; path: string | null } | { kind: "hunk"; hunk: Hunk }> {
-  let body = 0;
+  // Body lines left in the current hunk, per side. A context line (from
+  // diff.interHunkContext) counts on both sides, a "-" line on the base, a "+"
+  // line on the head, and "\ No newline at end of file" on neither.
+  let base = 0;
+  let head = 0;
   for (const line of diff.split("\n")) {
-    if (body > 0) {
-      // "\ No newline at end of file" follows a body line and is not one.
-      if (!line.startsWith("\\")) body--;
+    const sign = line[0];
+    if (base + head > 0 && (sign === "-" || sign === "+" || sign === " " || sign === "\\")) {
+      if (sign !== "+" && sign !== "\\") base--;
+      if (sign !== "-" && sign !== "\\") head--;
       continue;
     }
     if (line.startsWith("+++ ")) {
@@ -101,7 +106,7 @@ export function* diffHeaders(
     if (!match) continue;
     const count = (value: string | undefined) => (value === undefined ? 1 : Number(value));
     const hunk: Hunk = [Number(match[1]), count(match[2]), Number(match[3]), count(match[4])];
-    body = hunk[1] + hunk[3];
+    [base, head] = [hunk[1], hunk[3]];
     yield { kind: "hunk", hunk };
   }
 }

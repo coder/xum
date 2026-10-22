@@ -25,6 +25,10 @@ def test_resolve_reads_alias_relative_extension_and_index_imports():
     assert resolve("src/a/x.test.ts", "./b.js", files) == "src/a/b.ts"
     assert resolve("src/a/e/x.test.ts", "../d", files) == "src/a/d/index.ts"
     assert resolve("src/a/x.test.ts", "react", files) is None
+    # The tsconfig aliases all map to src/, and Bun's ?query suffix names the same file.
+    for alias in ("@shared/", "xum/", "mux/"):
+        assert resolve("vscode/src/x.test.ts", f"{alias}a/b", files) == "src/a/b.ts"
+    assert resolve("src/a/x.test.ts", "./c?real=1", files) == "src/a/c.tsx"
 
 
 def test_the_graph_reads_dynamic_imports_but_not_strings(tmp_path):
