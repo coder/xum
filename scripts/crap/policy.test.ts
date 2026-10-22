@@ -346,6 +346,12 @@ describe("CRAP tax", () => {
     ]);
   });
 
+  test("context lines inside a hunk do not swallow the next file", () => {
+    // diff.interHunkContext merges nearby hunks with unchanged lines between.
+    const diff = `+++ b/${PATH}\n@@ -5,5 +5,5 @@\n-a\n+A\n x\n y\n z\n-b\n+B\n+++ b/src/demo/b.ts\n@@ -1,0 +2 @@\n+c\n`;
+    expect(parseChangedLines(diff).get("src/demo/b.ts")).toEqual([[2, 2]]);
+  });
+
   test("a path with a space keeps its spans despite Git's trailing tab", () => {
     const spaced = { ...row("big", 40, [10, 90]), path: "src/demo/a b.ts" };
     const diff = parseChangedLines("+++ b/src/demo/a b.ts\t\n@@ -50 +50 @@\n");

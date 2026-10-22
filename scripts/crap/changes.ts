@@ -93,6 +93,8 @@ export function changesSince(cwd: string, baseRef: string): Changes {
     "--default-prefix",
     "--no-color",
     "--no-ext-diff",
+    // diff.interHunkContext would merge nearby hunks with context lines.
+    "--inter-hunk-context=0",
     base,
   ];
   const files = parseNameStatus(git(root, [...diffArgs, "--name-status", "-z"])).filter(
