@@ -26,6 +26,7 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import { isSSHRuntime, isDockerRuntime, isDevcontainerRuntime } from "@/common/types/runtime";
 import {
   createRuntimeForWorkspace,
+  ensureDaytonaSandboxReady,
   resolveWorkspaceExecutionPath,
 } from "@/node/runtime/runtimeHelpers";
 import { log } from "@/node/services/log";
@@ -77,16 +78,12 @@ function assertTerminalsEnabled(): void {
   }
 }
 
-/**
- * A Daytona sandbox may be stopped, or its token (the ssh user name) due for refresh: bring it
- * up before a native emulator runs ssh. The user asked for this terminal, so starting it is fine.
- */
+/** The user asked for this terminal: a Daytona sandbox must be up before a native emulator runs ssh. */
 async function ensureDaytonaSandboxUp(
-  workspace: Parameters<typeof createRuntimeForWorkspace>[0]
+  workspace: Parameters<typeof ensureDaytonaSandboxReady>[0]
 ): Promise<void> {
-  if (!isSSHRuntime(workspace.runtimeConfig) || !workspace.runtimeConfig.daytona) return;
-  const ready = await createRuntimeForWorkspace(workspace).ensureReady();
-  if (!ready.ready) throw new Error(ready.error);
+  const ready = await ensureDaytonaSandboxReady(workspace);
+  if (!ready.success) throw new Error(ready.error);
 }
 
 export class TerminalService {

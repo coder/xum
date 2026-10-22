@@ -1,9 +1,11 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { shellQuote } from "@/common/utils/shell";
 import type { TerminalService } from "@/node/services/terminalService";
+import type { Runtime } from "@/node/runtime/Runtime";
+import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
 import {
   createWorkspaceServiceHarness,
   type WorkspaceServiceHarness,
@@ -221,3 +223,72 @@ describe.skipIf(process.platform === "win32")(
     });
   }
 );
+
+describe("WorkspaceService.ensureDaytonaSandboxReady", () => {
+  let harness: WorkspaceServiceHarness;
+  let projectPath: string;
+  let createRuntime: { mockRestore: () => void };
+  const ensureReady = mock(() =>
+    Promise.resolve({
+      ready: false as const,
+      error: 'Daytona sandbox "sb-1" no longer exists',
+      errorType: "runtime_not_ready" as const,
+    })
+  );
+
+  beforeEach(async () => {
+    harness = await createWorkspaceServiceHarness();
+    projectPath = path.join(harness.rootDir, "project");
+    await fs.mkdir(projectPath);
+    ensureReady.mockClear();
+    createRuntime = spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue({
+      ensureReady,
+    } as unknown as Runtime);
+  });
+
+  afterEach(async () => {
+    createRuntime.mockRestore();
+    await harness.cleanup();
+  });
+
+  async function addDaytonaWorkspace(archivedAt?: string): Promise<void> {
+    await harness.config.editConfig((config) => {
+      config.projects.set(projectPath, {
+        trusted: true,
+        workspaces: [
+          {
+            id: "dt",
+            name: "dt",
+            path: path.join(harness.rootDir, "checkouts", "dt"),
+            runtimeConfig: {
+              type: "ssh",
+              host: "sb-1.xum--daytona",
+              srcBaseDir: "/home/daytona/xum",
+              daytona: { sandboxId: "sb-1" },
+            },
+            createdAt: "2026-01-01T00:00:00.000Z",
+            archivedAt,
+          },
+        ],
+      });
+      return config;
+    });
+  }
+
+  test("brings the sandbox up and reports why it cannot", async () => {
+    await addDaytonaWorkspace();
+
+    expect(await harness.service.ensureDaytonaSandboxReady("dt")).toEqual({
+      success: false,
+      error: 'Daytona sandbox "sb-1" no longer exists',
+    });
+    expect(ensureReady).toHaveBeenCalledTimes(1);
+  });
+
+  test("refuses an archived workspace without starting its sandbox", async () => {
+    await addDaytonaWorkspace("2026-01-02T00:00:00.000Z");
+
+    expect((await harness.service.ensureDaytonaSandboxReady("dt")).success).toBe(false);
+    expect(ensureReady).not.toHaveBeenCalled();
+  });
+});

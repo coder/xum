@@ -2121,6 +2121,14 @@ export const workspace = {
     input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(z.void(), z.string()),
   },
+  /**
+   * Start a Daytona workspace's sandbox and refresh its ssh token before an external editor
+   * connects to the sandbox's ssh alias. A no-op for every other runtime.
+   */
+  ensureDaytonaSandboxReady: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   getRuntimeStatuses: {
     input: z.object({ workspaceIds: z.array(z.string()) }),
     output: z.record(z.string(), WorkspaceRuntimeStatusSchema),

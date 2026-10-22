@@ -125,6 +125,7 @@ import { DockerRuntime, getContainerName } from "@/node/runtime/DockerRuntime";
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
+  ensureDaytonaSandboxReady,
   resolveWorkspaceExecutionPath,
   resolveWorkspaceRootPath,
 } from "@/node/runtime/runtimeHelpers";
@@ -13823,6 +13824,23 @@ export class WorkspaceService
     }
 
     return Ok(undefined);
+  }
+
+  /**
+   * Opening an external editor is an explicit action, so a stopped Daytona sandbox is started
+   * (and its ssh token refreshed) before the editor connects to its ssh alias. An archived
+   * workspace is refused like a native terminal: its sandbox must stay stopped.
+   */
+  async ensureDaytonaSandboxReady(workspaceId: string): Promise<Result<void>> {
+    const allMetadata = await this.config.getAllWorkspaceMetadata();
+    const workspace = allMetadata.find((w) => w.id === workspaceId);
+    if (!workspace) {
+      return Err(this.workspaceNotFoundError());
+    }
+    if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
+      return Err(`Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`);
+    }
+    return ensureDaytonaSandboxReady(workspace);
   }
 
   async getRuntimeStatuses(
