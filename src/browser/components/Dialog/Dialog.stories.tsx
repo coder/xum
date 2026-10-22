@@ -1,6 +1,7 @@
+import { useState } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { waitFor, within } from "storybook/test";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { userEvent, waitFor, within } from "storybook/test";
+import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { isDialogOpen } from "@/browser/utils/ui/keybinds";
 import { Button } from "../Button/Button.js";
 import {
@@ -59,6 +60,68 @@ export const Default: Story = {
     if (!isDialogOpen()) {
       throw new Error("isDialogOpen() must report the open modal Dialog");
     }
+  },
+};
+
+function EscapeRightAfterOpenDemo() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="bg-background min-h-screen p-4">
+      <Button onClick={() => setOpen(true)}>Open dialog</Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Early Escape</DialogTitle>
+            <DialogDescription>Escape closes this dialog at once.</DialogDescription>
+          </DialogHeader>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+/**
+ * An Escape pressed in the first moments after a dialog opens closes it (#7141). Radix's
+ * dismissable layer reads its stack index from a render that has not run yet, so it ignored that
+ * Escape and the dialog stayed open.
+ */
+export const EscapeRightAfterOpen: Story = {
+  // Play-only: a timing contract, nothing new to look at.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <EscapeRightAfterOpenDemo />,
+  play: async ({ canvasElement }) => {
+    const doc = canvasElement.ownerDocument;
+    // Press Escape the moment focus enters the dialog. Radix moves focus there in a mount effect,
+    // after its layer has registered and before the render that updates the layer's index: the
+    // window a fast key hits. A timer would land before or after it depending on host load.
+    const pressedEscape = new Promise<void>((resolve) => {
+      const onFocusIn = (event: FocusEvent) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement) || target.closest('[role="dialog"]') == null) return;
+        doc.removeEventListener("focusin", onFocusIn);
+        target.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "Escape",
+            code: "Escape",
+            bubbles: true,
+            cancelable: true,
+          })
+        );
+        resolve();
+      };
+      doc.addEventListener("focusin", onFocusIn);
+    });
+    await userEvent.click(within(canvasElement).getByRole("button", { name: "Open dialog" }));
+    await pressedEscape;
+    const body = within(doc.body);
+    await waitFor(
+      () => {
+        if (body.queryByRole("dialog", { name: "Early Escape" }) != null) {
+          throw new Error("the dialog is still open after Escape");
+        }
+      },
+      { timeout: 1000 }
+    );
   },
 };
 
