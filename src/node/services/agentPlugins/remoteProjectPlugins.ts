@@ -123,13 +123,29 @@ interface Listing {
   entries: ListingEntry[];
 }
 
+/**
+ * An absolute POSIX path of plain names. A backslash, a `:` or a NUL could mean a separator or a
+ * drive on the host (Windows), and an empty, `.` or `..` segment could climb out of the mirror,
+ * so any such path refuses the whole listing.
+ */
+function isPlainRemotePath(remote: string): boolean {
+  return (
+    remote.startsWith("/") &&
+    remote
+      .slice(1)
+      .split("/")
+      .every((name) => name !== "" && name !== "." && name !== ".." && !/[\\:\0]/.test(name))
+  );
+}
+
 /** One line's fields as an entry, "B" for a blob header, or null when they are malformed. */
 function parseEntryFields(fields: string[]): ListingEntry | "B" | null {
   if (fields.length !== 4) return null;
   const [kind, size, target, entryPath] = fields;
-  if (!ENTRY_KINDS.has(kind) || !path.posix.isAbsolute(entryPath) || !/^\d+$/.test(size)) {
+  if (!ENTRY_KINDS.has(kind) || !isPlainRemotePath(entryPath) || !/^\d+$/.test(size)) {
     return null;
   }
+  if (target !== "" && !isPlainRemotePath(target)) return null;
   if (kind === "B") return "B";
   return { kind: kind as ListingEntry["kind"], size: Number(size), target, path: entryPath };
 }
@@ -192,7 +208,7 @@ export function parseRemotePluginListing(stdout: string): Listing | null {
   }
   const { entries, pendingFiles, root } = state;
   // F lines without their blob mean the output was cut.
-  if (pendingFiles.length > 0 || root === undefined || !path.posix.isAbsolute(root)) return null;
+  if (pendingFiles.length > 0 || root === undefined || !isPlainRemotePath(root)) return null;
   return entries.length <= MAX_REMOTE_PLUGIN_ENTRIES ? { root, entries } : null;
 }
 
@@ -204,6 +220,22 @@ function relativeInside(root: string, remote: string): string | null {
   return relative.split("/").includes("..") ? null : relative;
 }
 
+/** True when `dest`, resolved with the host path rules, is strictly inside `mirrorRoot`. */
+export function isInsideMirror(
+  hostPath: typeof path.posix,
+  mirrorRoot: string,
+  dest: string
+): boolean {
+  const relative = hostPath.relative(hostPath.resolve(mirrorRoot), hostPath.resolve(dest));
+  return (
+    relative !== "" &&
+    relative !== ".." &&
+    !relative.startsWith(`..${hostPath.sep}`) &&
+    !hostPath.isAbsolute(relative)
+  );
+}
+
+/** Remote path -> mirror path, checked inside the mirror; null outside the checkout root. */
 type ToMirror = (remote: string) => string | null;
 
 /** A container line: its real directory, plus a symlink at its lexical path when they differ. */
@@ -235,7 +267,10 @@ async function mirrorEntry(entry: ListingEntry, local: string, toMirror: ToMirro
 async function buildMirror(mirrorRoot: string, listing: Listing): Promise<Map<string, string>> {
   const toMirror: ToMirror = (remote) => {
     const relative = relativeInside(listing.root, remote);
-    return relative === null ? null : path.join(mirrorRoot, ...relative.split("/"));
+    if (relative === null) return null;
+    const local = path.join(mirrorRoot, ...relative.split("/"));
+    assert(isInsideMirror(path, mirrorRoot, local), `remote plugin mirror escaped: ${local}`);
+    return local;
   };
   const containers = new Map<string, string>();
   for (const entry of listing.entries) {
