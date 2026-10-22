@@ -89,6 +89,46 @@ const AGENT_LOOP_IGNORES = [
   "**/*.bench.ts",
   "src/node/services/tools/testHelpers.ts",
 ];
+// local/no-raw-clock (agent loop refactor, phase 3). Its own literal list, not
+// ...AGENT_LOOP_FILES: phase 2 adds history modules there, and their clock reads are not phase 3
+// work. .oxlintrc.json repeats these lists.
+const RAW_CLOCK_FILES = [
+  "src/node/services/agentSession.ts",
+  "src/node/services/aiService.ts",
+  "src/node/services/aiServiceEventGuards.ts",
+  "src/node/services/messagePipeline.ts",
+  "src/node/services/retryManager.ts",
+  "src/node/services/streamManager.ts",
+  "src/node/services/turn*.ts",
+  "src/node/services/contextManagement/**/*.ts",
+  "src/node/services/tools/**/*.ts",
+  // Not in AGENT_LOOP_FILES: phase 3 moves its timers too.
+  "src/node/services/backgroundProcessManager.ts",
+];
+// File -> the exact number of raw clock reads it still has. Phase 3 lowers each entry as it
+// moves the file onto the HostClock service, and the rule fails an entry that is too high.
+const RAW_CLOCK_ALLOW = {
+  "src/node/services/agentSession.ts": 11,
+  "src/node/services/aiService.ts": 7,
+  "src/node/services/backgroundProcessManager.ts": 25,
+  "src/node/services/contextManagement/strategies/continuous.ts": 1,
+  "src/node/services/contextManagement/strategies/tokenBudget.ts": 1,
+  "src/node/services/retryManager.ts": 1,
+  "src/node/services/streamManager.ts": 18,
+  "src/node/services/tools/bash.ts": 3,
+  "src/node/services/tools/bash_background_list.ts": 1,
+  "src/node/services/tools/code_execution.ts": 3,
+  "src/node/services/tools/intuition.ts": 1,
+  "src/node/services/tools/skills_catalog_read.ts": 1,
+  "src/node/services/tools/task.ts": 1,
+  "src/node/services/tools/task_await.ts": 7,
+  "src/node/services/tools/toolUtils.ts": 1,
+  "src/node/services/tools/web_fetch.ts": 2,
+  "src/node/services/tools/withHooks.ts": 6,
+  "src/node/services/tools/workflow_resume.ts": 1,
+  "src/node/services/tools/workflow_run.ts": 1,
+  "src/node/services/turnRequestBuilder.ts": 29,
+};
 // The rule strips "node:" and resolves relative specifiers to "@/..." forms.
 const HOST_MODULES = [
   "fs",
@@ -488,6 +528,15 @@ export default defineConfig([
     ignores: AGENT_LOOP_IGNORES,
     rules: {
       "local/no-host-imports": ["error", { modules: HOST_MODULES, allow: HOST_IMPORT_ALLOW }],
+    },
+  },
+  {
+    // Agent-loop files read time and arm timers through the HostClock service, so tests can
+    // drive loop time with the TestClock (agent loop refactor, phase 3).
+    files: RAW_CLOCK_FILES,
+    ignores: AGENT_LOOP_IGNORES,
+    rules: {
+      "local/no-raw-clock": ["error", { allow: RAW_CLOCK_ALLOW }],
     },
   },
   {
