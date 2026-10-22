@@ -34,7 +34,10 @@ test(
     // tab (PR lane, run 39670599114; 1 of 5 local runs). The row of RightSidebarOverview.tsx.
     await openPlayground(screen);
     await screen.getByRole("region", "Outputs").getByRole("button", "plugin-sources.md").tap();
-    await expect(screen.getByTestId("artifacts-panel")).toBeVisible({ timeout: 15_000 });
+    // The panel shows "Loading…" until the file is read, and agent.extract looks only once.
+    await expect(screen.getByTestId("artifacts-panel").getByText(/hook-guard: \//)).toBeVisible({
+      timeout: 15_000,
+    });
     // The clipboard is blocked in the sandbox, so the agent reads the path and types it later.
     const { path } = await agent.extract(
       "the local path listed for the hook-guard plugin in 'plugin-sources.md'",

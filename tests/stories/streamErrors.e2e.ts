@@ -8,8 +8,8 @@
  *
  * Auto-retry: the API and network errors retry after 1 s, 2 s, ... (retryState.ts), and the rate
  * limit after its Retry-After of 60 s. Each retry sends the same prompt, so it fails with the
- * same error. A user's next send cancels the pending retry (agentSession.ts), so every error
- * stays on screen until the next prompt.
+ * same error. The story stops each auto-retry before its next send, and the error stays on
+ * screen. A user's send turns auto-retry on again (agentSession.ts).
  */
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
@@ -32,6 +32,8 @@ const ERRORS = [
   ],
 ] as const;
 const MESSAGE = "sort the seed packets";
+// RetryBarrier.tsx's Stop with its shortcut hint, not StreamingBarrierView's "Stop streaming".
+const STOP_RETRY = /^Stop( \(.+\))?$/;
 // The mock AI's default reply (mockAiRouter.ts).
 const REPLY = `Mock response: ${MESSAGE}`;
 
@@ -50,12 +52,15 @@ test(
       // exact send: Haiku 5.5 did not send an error prompt in 4 of 14 cold failures (Phase 5)
       await sendMessage(screen, prompt);
       await expect(transcript).toContainText(error, { timeout: 30_000 });
+      // exact Stop: a send made while a retry streams stays "Queued" (PR lane, runs 39656243674
+      // and 39670600164), and the API and network errors retry 1 s later. A check of the
+      // countdown before the send cannot close that gap, so the story stops the auto-retry.
+      const stop = screen.getByRole("button", STOP_RETRY);
+      await expect(stop).toBeVisible({ timeout: 30_000 });
+      await stop.tap();
+      await expect(stop).not.toBeVisible({ timeout: 15_000 });
     }
 
-    // exact send: Haiku 5.5 sent this while a network-error retry streamed, so it stayed
-    // "Queued" (PR lane, runs 39656243674 and 39670600164). The countdown (RetryBarrier.tsx)
-    // shows only between attempts, when no stream runs, and the send cancels that retry.
-    await expect(screen.getByText(/Retrying in/)).toBeVisible({ timeout: 30_000 });
     await sendMessage(screen, MESSAGE);
     await expect(transcript).toContainText(REPLY, { timeout: 30_000 });
     await agent.assert(
