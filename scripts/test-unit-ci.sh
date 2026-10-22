@@ -7,15 +7,17 @@
 # (~15 min on the 16-core runner while the rest of the pipeline finished in ~11),
 # so each shard runs a size-balanced slice of the files in its own process.
 #
-# Usage: SHARD_INDEX=<1..N> SHARD_TOTAL=<N> ./scripts/test-unit-ci.sh [--list | --list-all]
+# Usage: SHARD_INDEX=<1..N> SHARD_TOTAL=<N> ./scripts/test-unit-ci.sh [--list | --list-all | --list-no-coverage]
 #        (defaults to 1/1, i.e. the whole suite in one shard)
 #        --list      prints this shard's shared-process files
 #        --list-all  prints every file this lane runs (isolated, tooling and shared)
 #                    across all shards; consumed by scripts/check-test-routing.sh
+#        --list-no-coverage  prints the isolated files that run without coverage;
+#                    consumed by scripts/mutate/check.ts
 set -euo pipefail
 
 mode="${1:-}"
-if [[ "$mode" == "--list-all" ]]; then
+if [[ "$mode" == "--list-all" || "$mode" == "--list-no-coverage" ]]; then
   SHARD_INDEX=1
   SHARD_TOTAL=1
 fi
@@ -315,6 +317,14 @@ if [[ "$mode" == "--list" ]]; then
 fi
 if [[ "$mode" == "--list-all" ]]; then
   printf '%s\n' "${isolated_unit_tests[@]}" "${tooling_files[@]}" "${unit_files[@]}"
+  exit 0
+fi
+if [[ "$mode" == "--list-no-coverage" ]]; then
+  for i in "${!isolated_unit_tests[@]}"; do
+    if ((isolated_coverage[i] == 0)); then
+      printf '%s\n' "${isolated_unit_tests[$i]}"
+    fi
+  done
   exit 0
 fi
 

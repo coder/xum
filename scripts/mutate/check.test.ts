@@ -50,8 +50,12 @@ const AGE = "export const isAdult = (age: number) => age >= 18;\n";
 beforeEach(() => {
   repo = mkdtempSync(join(tmpdir(), "mutate-check-test-"));
   git("init", "-q", "-b", "main");
-  // The real script lists the Bun unit lane; this one lists the fixture's tests.
-  write("scripts/test-unit-ci.sh", "git ls-files -- '*.test.ts' | sed 's#^#./#'\n");
+  // The real script lists the Bun unit lane; this one lists the fixture's tests,
+  // all with coverage.
+  write(
+    "scripts/test-unit-ci.sh",
+    "[ \"$1\" = --list-no-coverage ] && exit 0\ngit ls-files -- '*.test.ts' | sed 's#^#./#'\n"
+  );
   write("src/age.ts", AGE);
   write(
     "src/age.test.ts",

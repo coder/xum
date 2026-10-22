@@ -280,11 +280,15 @@ def main(argv: list[str]) -> int:
             head_forms += forms_in(args.root, relative, relative, args.min_lines, args.min_nodes)
     base_forms: list[Form] = []
     for f in files:
-        # A file renamed from a test into production has no base forms. A
-        # deleted file keeps its base path: its functions may have moved.
+        # A file renamed from a test into production has no base forms, and
+        # all of its functions are new to production, even the lines the diff
+        # did not touch (a pure rename has no hunks). A deleted file keeps its
+        # base path: its functions may have moved.
         if f["basePath"] and is_production(f["basePath"]):
             shown = f["headPath"] or f["basePath"]
             base_forms += forms_in(args.base_root, f["basePath"], shown, args.min_lines, args.min_nodes)
+        elif f["basePath"] and f["headPath"] and is_production(f["headPath"]):
+            spans[f["headPath"]] = [[1, float("inf")]]
 
     head = keyed(head_forms)
     base_by_path: dict[str, list[Form]] = {}

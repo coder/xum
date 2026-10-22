@@ -86,6 +86,20 @@ test("a test file copy is not a finding", () => {
   expect(check().status).toBe(0);
 });
 
+test("a test file renamed into production is a finding", () => {
+  // The base excludes the test file, so its copy of cents is new to production.
+  // A pure rename has no hunks, so the diff alone touches none of its lines.
+  write("src/fee.test.ts", bucket("fee"));
+  git("add", ".");
+  git("commit", "-q", "-m", "test fixture");
+  git("mv", "src/fee.test.ts", "src/fee.ts");
+
+  const { status, report } = check();
+
+  expect(status).toBe(1);
+  expect(report.changedFunctions).toBe(1);
+});
+
 test("a new copy that shares a name with an old match is a finding", () => {
   // Base: B.render already matches cents. The diff adds A.render, a copy, above
   // it. Both are "render", so only git's hunks tell the new one from the old one.

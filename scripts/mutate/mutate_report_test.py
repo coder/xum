@@ -40,6 +40,26 @@ def test_the_graph_reads_dynamic_imports_but_not_strings(tmp_path):
     assert graph == {"src/a.ts": {"src/t.test.ts"}}
 
 
+def test_the_graph_skips_type_only_commented_and_fixture_imports(tmp_path):
+    # None of these load the module at run time, so none can kill a mutant there.
+    test = "\n".join(
+        [
+            'import type { A } from "@/a";',
+            'export type { A2 } from "@/a";',
+            '// import { b } from "@/b";',
+            'const fixture = `import { c } from "@/c";`;',
+            'const text = "import { c } from \'@/c\'";',
+            'import { d } from "@/d";',
+            'export * from "@/e";',
+            'const f = require("./f");',
+        ]
+    )
+    files = {f"src/{name}.ts" for name in "abcdef"}
+    write(tmp_path, {**{path: "" for path in files}, "src/t.test.ts": test})
+    graph = import_graph(tmp_path, ["src/t.test.ts"], files)
+    assert sorted(graph) == ["src/d.ts", "src/e.ts", "src/f.ts"]
+
+
 def test_tests_for_puts_the_colocated_test_first_then_the_nearest_and_cuts():
     source = "src/a/b/x.ts"
     graph = {
@@ -92,6 +112,33 @@ def test_lcov_skips_only_sites_on_lines_no_report_hit():
     assert uncovered(site(4), coverage) is False
     assert uncovered(site(4), {}) is True  # a file no report lists did not run
     assert uncovered(site(3), None) is False  # no LCOV: every site runs
+
+
+def test_a_site_whose_test_runs_without_coverage_is_not_skipped_as_uncovered():
+    from mutate_report import triage
+
+    rows, to_run = triage([site(3)], {"src/m.ts": ["src/m.test.ts"]}, {"src/m.ts": [{3: 0}]}, set())
+    assert [r["outcome"] for r in rows] == ["uncovered"] and to_run == []
+    # src/m.test.ts writes no LCOV (a `no-coverage:` file), so line 3 can still run.
+    rows, to_run = triage([site(3)], {"src/m.ts": ["src/m.test.ts"]}, {"src/m.ts": [{3: 0}]}, {"src/m.test.ts"})
+    assert rows == [] and to_run == [site(3)]
+
+
+def test_baselines_get_only_the_time_left_before_the_run_deadline():
+    import time
+    from mutate_report import baselines
+
+    given = []
+
+    def runner(_worker, _test, timeout):
+        given.append(timeout)
+        return True, 0.1, False
+
+    timeouts, dropped = baselines(["a", "b"], queue_of("w"), 1, time.monotonic() + 30, runner)
+    assert sorted(timeouts) == ["a", "b"] and dropped == [] and max(given) <= 30
+    timeouts, dropped = baselines(["a"], queue_of("w"), 1, time.monotonic() - 1, runner)
+    assert timeouts == {} and [d["path"] for d in dropped] == ["a"]
+    assert len(given) == 2  # past the deadline, no baseline starts
 
 
 def test_a_mutant_past_the_deadline_is_not_run_and_the_file_is_restored(tmp_path):
