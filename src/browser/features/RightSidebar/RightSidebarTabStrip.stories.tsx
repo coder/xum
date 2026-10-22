@@ -406,6 +406,13 @@ export const ArrowKeys: Story = {
     await userEvent.keyboard("{End}");
     await expect(last).toHaveFocus();
     await expectFullyInRow(row, last);
+    // A size change in the row (a badge loads, a font swaps) must not scroll it back to the
+    // selected tab, away from the focused one. The row's ResizeObserver runs within a frame.
+    first.style.paddingLeft = "32px";
+    await frame();
+    await frame();
+    await expectFullyInRow(row, last);
+    first.style.paddingLeft = "";
     await userEvent.keyboard("{ArrowRight}");
     await expect(first).toHaveFocus();
     await userEvent.keyboard("{ArrowLeft}");

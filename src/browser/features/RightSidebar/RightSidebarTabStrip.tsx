@@ -440,6 +440,25 @@ const TabScrollRow: React.FC<{
 /** Width of the `.scroll-fade-x` edge fade (scrollbar-none.css): a tab under it looks cut off. */
 const SCROLL_FADE_PX = 24;
 
+/**
+ * After a size change in the row (a badge loads, a font swaps), keep the selected tab in view. If
+ * the arrow keys hold focus on another tab (#7102), keep that one in view instead: scrolling back
+ * to the selected tab would hide where the user is.
+ */
+function revealSelectedTabOnResize(row: HTMLElement): void {
+  const active = row.ownerDocument.activeElement;
+  if (
+    active instanceof HTMLElement &&
+    row.contains(active) &&
+    active.getAttribute("role") === "tab" &&
+    active.getAttribute("aria-selected") !== "true"
+  ) {
+    revealTab(row, active);
+  } else {
+    revealSelectedTab(row);
+  }
+}
+
 /** Keep the row's selected tab fully visible, clear of the edge fades (see `revealTab`). */
 function revealSelectedTab(row: HTMLElement): void {
   const tab = row.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
@@ -513,7 +532,7 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
     const reveal = () => revealSelectedTab(row);
     reveal();
     if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(reveal);
+    const observer = new ResizeObserver(() => revealSelectedTabOnResize(row));
     observer.observe(row);
     for (const child of Array.from(row.children)) observer.observe(child);
     return () => observer.disconnect();
