@@ -2,7 +2,13 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { heavySkips, loopTestFiles, patchesGlobalTime, runFile } from "./loopTestBaseline";
+import {
+  changedFiles,
+  heavySkips,
+  loopTestFiles,
+  patchesGlobalTime,
+  runFile,
+} from "./loopTestBaseline";
 import { summarizeFile } from "./loopTestStats";
 
 let root: string;
@@ -114,6 +120,29 @@ describe("heavySkips", () => {
 
   test("a full compare never skips it", () => {
     expect(heavySkips(5, [])).toEqual([]);
+  });
+});
+
+describe("changedFiles", () => {
+  const sh = (...args: string[]) => {
+    const result = Bun.spawnSync(["git", ...args], { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(result.exitCode).toBe(0);
+    return result.stdout.toString().trim();
+  };
+
+  test("lists a renamed file under its old and its new path", () => {
+    sh("init", "-q");
+    sh("config", "user.email", "t@example.com");
+    sh("config", "user.name", "t");
+    write("a.ts", "export const a = 1;\n".repeat(20));
+    write("b.ts", "export const b = 1;\n".repeat(20));
+    sh("add", ".");
+    sh("commit", "-qm", "base");
+    const base = sh("rev-parse", "HEAD");
+    sh("mv", "a.ts", "a2.ts");
+    sh("commit", "-qm", "rename a");
+    sh("mv", "b.ts", "b2.ts");
+    expect(changedFiles(root, base).sort()).toEqual(["a.ts", "a2.ts", "b.ts", "b2.ts"]);
   });
 });
 

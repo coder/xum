@@ -194,19 +194,28 @@ export function heavySkips(runs: number, changedFiles: readonly string[]): strin
     .map(([test]) => test);
 }
 
-/** Files that differ between the merge base of `baseSha` and HEAD, plus working-tree edits. */
-function changedFiles(root: string, baseSha: string): string[] {
-  const committed = git(root, ["diff", "--name-only", `${baseSha}...HEAD`]).split("\n");
-  const edited = git(root, ["status", "--porcelain"])
+/**
+ * Files that differ between the merge base of `baseSha` and HEAD, plus working-tree edits.
+ * --no-renames lists a renamed file under its old and its new path.
+ */
+export function changedFiles(root: string, baseSha: string): string[] {
+  const committed = git(root, ["diff", "--name-only", "--no-renames", `${baseSha}...HEAD`]).split(
+    "\n"
+  );
+  const edited = git(root, ["status", "--porcelain", "--no-renames"])
     .split("\n")
     .map((line) => line.slice(3));
   return [...committed, ...edited].filter(Boolean);
 }
 
-/** A detached worktree of `sha` in `dir`, with the caller's node_modules and src/version.ts. */
-function addWorktree(root: string, dir: string, sha: string): void {
-  git(root, ["worktree", "add", "--detach", dir, sha]);
-  fs.symlinkSync(path.join(root, "node_modules"), path.join(dir, "node_modules"), "dir");
+/** Gives the worktree in `dir` the caller's node_modules and src/version.ts. */
+function prepareWorktree(root: string, dir: string): void {
+  // Windows needs a junction: directory symlinks need Developer Mode or elevation there.
+  fs.symlinkSync(
+    path.join(root, "node_modules"),
+    path.join(dir, "node_modules"),
+    process.platform === "win32" ? "junction" : "dir"
+  );
   // src/version.ts is generated and git-ignored; without it some loop tests fail at import.
   const versionFile = path.join(root, "src", "version.ts");
   if (fs.existsSync(versionFile)) fs.copyFileSync(versionFile, path.join(dir, "src", "version.ts"));
@@ -359,8 +368,10 @@ async function main(): Promise<number> {
     let files = loopTestFiles(root, values.filter);
     if (values.base !== undefined) {
       const baseSha = git(root, ["rev-parse", "--verify", `${values.base}^{commit}`]);
-      addWorktree(root, baseDir, baseSha);
+      git(root, ["worktree", "add", "--detach", baseDir, baseSha]);
+      // Set before the next step can throw, so cleanup removes the registration too.
       worktreeAdded = true;
+      prepareWorktree(root, baseDir);
       sides.unshift({ label: "base", root: baseDir, commit: baseSha, dirty: false });
       const baseFiles = new Set(loopTestFiles(baseDir, values.filter));
       newFiles = files.filter((file) => !baseFiles.has(file));
@@ -369,7 +380,11 @@ async function main(): Promise<number> {
       );
       files = files.filter((file) => baseFiles.has(file) && !skipped.includes(file));
     }
-    assert(files.length > 0, `no loop test files match --filter ${values.filter}`);
+    // A compare of only new test files is valid: it lists them and cannot trip.
+    assert(
+      files.length > 0 || newFiles.length > 0,
+      `no loop test files match --filter ${values.filter}`
+    );
     console.error(
       `loop tests · ${files.length} files · ${runs} ${sides.length > 1 ? "paired " : ""}rounds · ${jobs} jobs`
     );
