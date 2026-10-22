@@ -64,6 +64,8 @@ test("reports value imports in bare and node: forms", () => {
   expect(ids(`export * from "os";`)).toEqual(["host"]);
   expect(ids(`export {} from "fs";`)).toEqual(["host"]);
   expect(ids("const fs = require(`fs`);")).toEqual(["host"]);
+  expect(ids(`import fs = require("fs");`)).toEqual(["host"]);
+  expect(ids(`import type fs = require("fs");`)).toEqual([]);
   expect(ids("await import(`node:fs/promises`);")).toEqual(["host"]);
   expect(ids(`require("@/node/utils/writeFileAtomic?fresh=1");`)).toEqual(["host"]);
 });

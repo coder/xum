@@ -740,6 +740,12 @@ const localPlugin = {
           ImportExpression(node) {
             check(node, node.source, null);
           },
+          // `import fs = require("fs")` (TypeScript import assignment).
+          TSImportEqualsDeclaration(node) {
+            if (node.importKind === "type") return;
+            if (node.moduleReference.type !== "TSExternalModuleReference") return;
+            check(node, node.moduleReference.expression, null);
+          },
           CallExpression(node) {
             if (node.callee.type === "Identifier" && node.callee.name === "require") {
               check(node, node.arguments[0], null);
