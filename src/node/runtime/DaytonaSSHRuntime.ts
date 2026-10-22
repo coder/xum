@@ -87,6 +87,8 @@ export type DaytonaRuntimeService = Pick<
   | "invalidateSandboxReady"
   | "replaceRejectedSshToken"
   | "sshTokenGeneration"
+  | "gatewayGeneration"
+  | "refreshGatewayAfterSshFailure"
   | "loadPersistedTokens"
   | "findSnapshot"
   | "getGatewayConfig"
@@ -181,6 +183,16 @@ interface CreateAttempt {
   labels?: Record<string, string>;
   /** The account the create requests went to: cleanup deletes there, whatever Settings say. */
   account?: DaytonaAccount;
+}
+
+/**
+ * Captured before an ssh command: a recovery acts only on what changed since. A refusal
+ * replaces only the token this command used; a gateway another failure already followed is
+ * not refetched again.
+ */
+interface SshAttempt {
+  tokenGeneration: number;
+  gatewayGeneration: number;
 }
 
 type DeleteResult =
@@ -443,8 +455,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   /**
    * Every ssh command to the sandbox goes through here: its stderr and errors are redacted
    * (the token is the ssh user name). A refused token is replaced, and a connection failure on
-   * a turn's runtime whose sandbox stopped within the ready cache starts the sandbox again;
-   * either way the command is retried once.
+   * a turn's runtime whose sandbox stopped within the ready cache starts the sandbox again (or,
+   * when it still runs, follows a gateway Daytona moved); either way the command is retried
+   * once.
    */
   protected override async spawnRemoteProcess(
     fullCommand: string,
@@ -452,11 +465,11 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   ): Promise<SpawnResult> {
     let result: SpawnResult;
     const sandboxId = this.daytonaConfig.sandboxId;
-    const tokenGeneration = await this.prepareSshAttempt(sandboxId);
+    const attempt = await this.prepareSshAttempt(sandboxId);
     try {
       result = await super.spawnRemoteProcess(fullCommand, options);
     } catch (error) {
-      if (!(await this.recoverForRetry(error, tokenGeneration, options.abortSignal))) {
+      if (!(await this.recoverForRetry(error, attempt, options.abortSignal))) {
         throw redactDaytonaError(error);
       }
       try {
@@ -479,14 +492,16 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     };
   }
 
-  /** The token generation a refusal of this command must match. */
-  private async prepareSshAttempt(sandboxId: string | undefined): Promise<number> {
-    if (!sandboxId) return 0;
+  /** What a recovery from this command's failure must compare against (see SshAttempt). */
+  private async prepareSshAttempt(sandboxId: string | undefined): Promise<SshAttempt> {
+    if (!sandboxId) return { tokenGeneration: 0, gatewayGeneration: 0 };
     // ssh may send a token an earlier process left in the include file: the redactor must
     // know it before ssh can quote it. Not every command runs after ensureReady.
     await this.daytonaService.loadPersistedTokens();
-    // Before the attempt: a refusal replaces only the token this command used.
-    return this.daytonaService.sshTokenGeneration(sandboxId);
+    return {
+      tokenGeneration: this.daytonaService.sshTokenGeneration(sandboxId),
+      gatewayGeneration: this.daytonaService.gatewayGeneration(),
+    };
   }
 
   /**
@@ -497,7 +512,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    */
   private recoverForRetry(
     error: unknown,
-    tokenGeneration: number,
+    attempt: SshAttempt,
     abortSignal: AbortSignal | undefined
   ): Promise<boolean> {
     return this.daytonaService.withAccountLease(async () => {
@@ -508,22 +523,17 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       if (!tokenRejected && !this.restartsStoppedSandbox) return false;
       this.daytonaService.invalidateSandboxReady(sandboxId);
       const state = await this.readStateAfterFailure(sandboxId);
-      return this.recoverInState(
-        sandboxId,
-        state,
-        { error, tokenRejected, tokenGeneration },
-        abortSignal
-      );
+      return this.recoverInState(sandboxId, state, { error, tokenRejected, attempt }, abortSignal);
     });
   }
 
   private recoverInState(
     sandboxId: string,
     state: DaytonaSandboxState | undefined,
-    failure: { error: unknown; tokenRejected: boolean; tokenGeneration: number },
+    failure: { error: unknown; tokenRejected: boolean; attempt: SshAttempt },
     abortSignal: AbortSignal | undefined
   ): Promise<boolean> {
-    const { error, tokenRejected, tokenGeneration } = failure;
+    const { error, tokenRejected, attempt } = failure;
     if (state === "missing") {
       throw new RuntimeError(
         sandboxMissingMessage(sandboxId),
@@ -532,9 +542,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       );
     }
     if (state === "started") {
+      // Only a runtime that may restart the sandbox gets here without a refused token.
       return tokenRejected
-        ? this.replaceRejectedToken(sandboxId, tokenGeneration)
-        : Promise.resolve(false);
+        ? this.replaceRejectedToken(sandboxId, attempt.tokenGeneration)
+        : this.followMovedGateway(sandboxId, attempt.gatewayGeneration);
     }
     if (state === undefined || !this.restartsStoppedSandbox) return Promise.resolve(false);
     return this.restartSandbox(sandboxId, abortSignal);
@@ -553,6 +564,24 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       });
       return false;
     }
+    this.sshTransport.resetConnectionHealth?.();
+    return true;
+  }
+
+  private async followMovedGateway(sandboxId: string, gatewayGeneration: number): Promise<boolean> {
+    let moved: boolean;
+    try {
+      moved = await this.daytonaService.refreshGatewayAfterSshFailure(sandboxId, gatewayGeneration);
+    } catch (refreshError) {
+      log.warn("Could not refetch the Daytona gateway after an ssh failure", {
+        sandboxId,
+        error: getErrorMessage(redactDaytonaError(refreshError)),
+      });
+      return false;
+    }
+    if (!moved) return false;
+    log.info("The Daytona gateway moved; retrying the command once", { sandboxId });
+    // A host key failure against the old gateway may have marked the alias as failing for good.
     this.sshTransport.resetConnectionHealth?.();
     return true;
   }

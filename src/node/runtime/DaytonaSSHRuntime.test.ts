@@ -1557,6 +1557,67 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
     expect(rig.plane.countCalls("POST /sandbox/sb-nap3/start")).toBe(1);
   });
 
+  it("refetches a gateway that moved or rotated its keys within the config cache, then retries once", async () => {
+    rig.plane.addSandbox({ id: "sb-moved" });
+    const local = localShellTransport(rig.rootDir);
+    let attempts = 0;
+    let healthResets = 0;
+    // ssh reaches the sandbox only through the gateway its include file and known_hosts name.
+    const transport: SSHTransport = {
+      ...local,
+      resetConnectionHealth: () => healthResets++,
+      spawnRemoteProcess: (command, options) => {
+        attempts++;
+        return JSON.stringify(rig.writer.gateway) === JSON.stringify(rig.plane.gateway)
+          ? local.spawnRemoteProcess(command, options)
+          : Promise.reject(new RuntimeError("Host key verification failed.", "network"));
+      },
+    };
+    const turn = () => makeRuntime({ sandboxId: "sb-moved" }, rig, { transport });
+    expect(await turn().ensureReady()).toEqual({ ready: true });
+    const configFetches = () => rig.plane.countCalls("GET /config");
+
+    const moves = [
+      { ...rig.plane.gateway, host: "ssh2.daytona.test", port: 2222 },
+      { ...rig.plane.gateway, hostKeys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIRotated"] },
+    ];
+    for (const gateway of moves) {
+      // Within the five-minute cache: nothing refetches /config on its own.
+      rig.plane.gateway = gateway;
+      const [fetches, tries, resets] = [configFetches(), attempts, healthResets];
+      const runtime = turn();
+      expect(await runtime.ensureReady()).toEqual({ ready: true });
+      // Two commands fail together; they share one refetch.
+      const streams = await Promise.all(
+        [1, 2].map(() => runtime.exec("echo ok", { cwd: "/tmp", timeout: 10 }))
+      );
+      for (const stream of streams) {
+        expect(await new Response(stream.stdout).text()).toBe("ok\n");
+      }
+      expect(attempts - tries).toBe(4);
+      expect(configFetches()).toBe(fetches + 1);
+      expect(rig.writer.repoints.at(-1)).toEqual(gateway);
+      expect(healthResets).toBeGreaterThan(resets);
+    }
+
+    // The gateway did not change: the failure is something else, so no retry.
+    const before = {
+      fetches: configFetches(),
+      tries: attempts,
+      repoints: rig.writer.repoints.length,
+    };
+    const unchanged = turn();
+    expect(await unchanged.ensureReady()).toEqual({ ready: true });
+    rig.writer.gateway = { ...rig.plane.gateway, host: "unreachable.test" };
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(unchanged.exec("echo ok", { cwd: "/tmp", timeout: 10 })).rejects.toThrow(
+      "Host key verification failed"
+    );
+    expect(attempts - before.tries).toBe(1);
+    expect(configFetches()).toBe(before.fetches + 1);
+    expect(rig.writer.repoints).toHaveLength(before.repoints);
+  });
+
   /** The gateway answers a stopped or deleted sandbox with the same refusal as a bad token. */
   function refusingTransportWhile(sandboxId: string, refuses: () => boolean): SSHTransport {
     const local = localShellTransport(rig.rootDir);

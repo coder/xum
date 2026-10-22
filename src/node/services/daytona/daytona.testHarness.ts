@@ -3,7 +3,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
-import type { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
+import type { DaytonaSshConfigWriter, DaytonaSshGateway } from "@/node/runtime/daytonaSshConfig";
 import type { SSHTransport } from "@/node/runtime/transports";
 import type { DaytonaWorkspaceRef } from "./daytonaReconciler";
 import { DAYTONA_LABEL_INSTANCE, DaytonaService } from "./daytonaService";
@@ -48,6 +48,12 @@ export class FakeDaytonaControlPlane {
     listedOnly?: boolean;
     state?: string;
   }> = [];
+  /** The ssh gateway GET /config advertises; a test moves it or rotates its host keys. */
+  gateway: DaytonaSshGateway = {
+    host: "ssh.daytona.test",
+    port: 22,
+    hostKeys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey"],
+  };
   /** The snapshot GET /config advertises as the deployment default; unset advertises none. */
   defaultSnapshot?: string;
   /** Answer POST /sandbox with 400 when it carries cpu/memory/disk (fixed-resource snapshot). */
@@ -119,9 +125,9 @@ export class FakeDaytonaControlPlane {
 
     if (route === "GET /config") {
       return json(200, {
-        sshGatewayHost: "ssh.daytona.test",
-        sshGatewayPort: 22,
-        sshGatewayHostKeys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKey"],
+        sshGatewayHost: this.gateway.host,
+        sshGatewayPort: this.gateway.port,
+        sshGatewayHostKeys: this.gateway.hostKeys,
         ...(this.defaultSnapshot ? { defaultSnapshot: this.defaultSnapshot } : {}),
       });
     }
@@ -278,19 +284,35 @@ export class FakeDaytonaSshConfigWriter implements Pick<
   /** Fails every first write of a sandbox (a setup failure after the sandbox exists). */
   writeError?: Error;
 
-  writeSandbox(input: { sandboxId: string; token: string }): Promise<void> {
+  /** The gateway the include file and known_hosts point at, as last written or repointed. */
+  gateway?: DaytonaSshGateway;
+  readonly repoints: DaytonaSshGateway[] = [];
+
+  writeSandbox(input: {
+    sandboxId: string;
+    token: string;
+    gateway: DaytonaSshGateway;
+  }): Promise<void> {
     if (this.writeError) return Promise.reject(this.writeError);
     this.fullWrites.push(input.sandboxId);
+    this.gateway = input.gateway;
     this.tokens.set(input.sandboxId, input.token);
     return Promise.resolve();
   }
 
-  updateToken(input: { sandboxId: string; token: string }): Promise<void> {
+  updateToken(input: {
+    sandboxId: string;
+    token: string;
+    gateway: DaytonaSshGateway;
+  }): Promise<void> {
+    this.gateway = input.gateway;
     this.tokens.set(input.sandboxId, input.token);
     return Promise.resolve();
   }
 
-  repointGateway(): Promise<void> {
+  repointGateway(gateway: DaytonaSshGateway): Promise<void> {
+    this.repoints.push(gateway);
+    this.gateway = gateway;
     return Promise.resolve();
   }
 

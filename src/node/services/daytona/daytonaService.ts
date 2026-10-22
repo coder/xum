@@ -313,6 +313,8 @@ export class DaytonaService {
   private readonly fetchImpl?: typeof fetch;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
+  /** See gatewayGeneration. */
+  private gatewayMoves = 0;
   private gatewayCache?: {
     apiUrl: string;
     generation: number;
@@ -797,25 +799,35 @@ export class DaytonaService {
     return account?.client ?? (await this.getClient()).client;
   }
 
-  async getGatewayConfig(): Promise<DaytonaGatewayConfig> {
+  /** `force` refetches a cached `/config` that is still fresh (an in-flight fetch is shared). */
+  async getGatewayConfig(options: { force?: boolean } = {}): Promise<DaytonaGatewayConfig> {
     const generation = this.credentialsGeneration;
     const { client, credentials } = await this.getClient();
     const cached = this.cachedGateway(credentials.apiUrl, generation);
-    if (cached && this.now() - cached.fetchedAt < DAYTONA_GATEWAY_CONFIG_TTL_MS) {
+    if (cached && !options.force && this.now() - cached.fetchedAt < DAYTONA_GATEWAY_CONFIG_TTL_MS) {
       return cached.config;
     }
-    // Concurrent lookups share one refresh: a reply that started earlier and arrived last would
-    // otherwise publish the old gateway over the new one.
+    return this.sharedGatewayRefresh(client, credentials.apiUrl, generation, cached);
+  }
+
+  /**
+   * Concurrent lookups share one refresh: a reply that started earlier and arrived last would
+   * otherwise publish the old gateway over the new one.
+   */
+  private sharedGatewayRefresh(
+    client: DaytonaClient,
+    apiUrl: string,
+    generation: number,
+    cached: ReturnType<DaytonaService["cachedGateway"]>
+  ): Promise<DaytonaGatewayConfig> {
     const inFlight = this.gatewayRequest;
-    if (inFlight?.apiUrl === credentials.apiUrl && inFlight.generation === generation) {
+    if (inFlight?.apiUrl === apiUrl && inFlight.generation === generation) {
       return inFlight.promise;
     }
-    const promise = this.refreshGateway(client, credentials.apiUrl, generation, cached).finally(
-      () => {
-        if (this.gatewayRequest?.promise === promise) this.gatewayRequest = undefined;
-      }
-    );
-    this.gatewayRequest = { apiUrl: credentials.apiUrl, generation, promise };
+    const promise = this.refreshGateway(client, apiUrl, generation, cached).finally(() => {
+      if (this.gatewayRequest?.promise === promise) this.gatewayRequest = undefined;
+    });
+    this.gatewayRequest = { apiUrl, generation, promise };
     return promise;
   }
 
@@ -830,8 +842,32 @@ export class DaytonaService {
     if (this.credentialsGeneration !== generation) return config;
     const moved = cached && gatewayIdentity(cached.config) !== gatewayIdentity(config);
     this.gatewayCache = { apiUrl, generation, fetchedAt: this.now(), config };
-    if (moved) await this.retireSshSetup(config);
+    if (moved) {
+      await this.retireSshSetup(config);
+      this.gatewayMoves++;
+    }
     return config;
+  }
+
+  /** Bumped once a moved gateway's ssh setup was rewritten; capture it before an ssh command. */
+  gatewayGeneration(): number {
+    return this.gatewayMoves;
+  }
+
+  /**
+   * An ssh command to a started sandbox failed with neither a refused token nor a stop: Daytona
+   * may have moved its gateway or rotated its host keys within the `/config` cache. True when
+   * the gateway changed since `attemptGeneration` (refetching `/config` unless a concurrent
+   * failure already found the move) and the sandbox's ssh setup now points at the new one.
+   */
+  async refreshGatewayAfterSshFailure(
+    sandboxId: string,
+    attemptGeneration: number
+  ): Promise<boolean> {
+    if (this.gatewayMoves === attemptGeneration) await this.getGatewayConfig({ force: true });
+    if (this.gatewayMoves === attemptGeneration) return false;
+    await this.ensureSshAccess(sandboxId);
+    return true;
   }
 
   /** The cached `/config` of these settings, fresh or not. */
