@@ -338,7 +338,9 @@ function parseMatcherGroup(
   if (matcher === null) return;
   for (const [handlerIndex, raw] of group.hooks.entries()) {
     if (out.length > MAX_PLUGIN_HOOKS) return;
-    const handler = parseHandler(raw, `${source}: '${event}'`, warnings);
+    const handler = parseHandler(raw, `${source}: '${event}'`, warnings, {
+      claude: where.status === "claude-plugin",
+    });
     if (handler === undefined) continue;
     let hash: string;
     try {
@@ -406,7 +408,8 @@ function isU64(value: unknown): boolean {
 function parseHandler(
   raw: unknown,
   where: string,
-  warnings: HookWarnings
+  warnings: HookWarnings,
+  dialect: { claude: boolean }
 ): PluginHookHandler | undefined {
   if (!isPlainObject(raw)) {
     warnings.push(`${where}: a hook handler must be an object; ignoring it`);
@@ -452,6 +455,15 @@ function parseHandler(
         invalid = "command";
         break;
       }
+      if (dialect.claude && raw.args !== undefined) {
+        // Claude's exec form: `args` is the argument vector, so the disclosure must show it.
+        if (!Array.isArray(raw.args) || !raw.args.every((arg) => typeof arg === "string")) {
+          invalid = "args";
+          break;
+        }
+        const argv: string[] = [raw.command, ...raw.args];
+        return { type: "command", summary: argv.map(quoteArgForSummary).join(" ") };
+      }
       return { type: "command", summary: raw.command };
     case "prompt":
     case "agent":
@@ -467,6 +479,11 @@ function parseHandler(
     `${where}: a '${String(raw.type)}' handler has missing or invalid fields ('${invalid}'${tool}); ignoring it`
   );
   return undefined;
+}
+
+/** One exec-form argument in a command summary: quoted when it is empty or has a space or quote. */
+function quoteArgForSummary(arg: string): string {
+  return arg === "" || /[\s"'\\]/.test(arg) ? JSON.stringify(arg) : arg;
 }
 
 /**

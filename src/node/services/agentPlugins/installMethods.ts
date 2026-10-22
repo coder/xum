@@ -13,6 +13,8 @@
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
+import YAML from "yaml";
+
 import { AGENT_PLUGIN_INSTALL_METHOD_LABELS } from "@/common/constants/agentPluginInstallMethods";
 import type { AgentPluginGitSource } from "@/common/config/schemas/agentPluginInstalls";
 import { SkillNameSchema } from "@/common/orpc/schemas";
@@ -23,6 +25,7 @@ import {
 } from "@/common/utils/agentPluginName";
 import { displayRepoUrl } from "@/common/utils/agentPluginSource";
 import assert from "@/common/utils/assert";
+import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { SKILL_FILENAME } from "@/node/services/tools/skillFileUtils";
 import {
   CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
@@ -41,78 +44,66 @@ import {
 } from "./manifest";
 
 /**
- * The skill containers of the skills CLI (skills@1.7.4, docs "Skill Discovery"), in its order,
- * so a repository installs the same skills as Skills and with the CLI.
+ * The priority skill folders of the pinned skills CLI, in its order (skills@1.7.4, src/skills.ts:
+ * `prioritySearchDirs` = the repository root, `skills`, its `.curated`, `.experimental` and
+ * `.system` folders, then `AGENT_PROJECT_SKILL_DIRS`). The root itself is walked one level deep
+ * (findSkillsPackageRoots); these containers are walked MAX_CONTAINER_DEPTH levels deep. Keep this
+ * a plain copy of the pinned version so a repository installs the same skills as Skills and with
+ * the CLI. Not mirrored: plugin-manifest skill paths and the CLI's deep fallback search when these
+ * folders hold no skill (Xum then offers no Skills install).
  */
 const SKILL_CONTAINERS = [
   "skills",
   "skills/.curated",
   "skills/.experimental",
   "skills/.system",
-  ".aider-desk/skills",
   ".agents/skills",
-  "data/skills",
-  ".autohand/skills",
-  ".augment/skills",
-  ".bob/skills",
   ".claude/skills",
-  ".codeartsdoer/skills",
+  ".cline/skills",
   ".codebuddy/skills",
-  ".codemaker/skills",
-  ".codestudio/skills",
+  ".codex/skills",
   ".commandcode/skills",
   ".continue/skills",
-  ".cortex/skills",
-  ".crush/skills",
-  ".devin/skills",
-  "agent/skills",
-  ".forge/skills",
+  ".factory/skills",
+  ".github/skills",
   ".goose/skills",
   ".grok/skills",
-  ".hermes/skills",
-  ".inferencesh/skills",
-  ".jazz/skills",
-  ".junie/skills",
   ".iflow/skills",
+  ".junie/skills",
+  ".kilo/skills",
+  ".kilocode/skills",
   ".kimchi/skills",
   ".kiro/skills",
-  ".kode/skills",
-  ".lingma/skills",
-  ".mcpjam/skills",
   ".minimax/skills",
-  ".vibe/skills",
-  ".moxby/skills",
   ".mux/skills",
+  ".neovate/skills",
+  ".opencode/skills",
   ".openhands/skills",
-  ".ona/skills",
+  ".pi/skills",
   ".posit/assistant/skills",
   ".qoder/skills",
-  ".qwen/skills",
-  ".reasonix/skills",
-  ".rovodev/skills",
   ".roo/skills",
-  ".tabnine/agent/skills",
-  ".terramind/skills",
-  ".tinycloud/skills",
   ".trae/skills",
   ".windsurf/skills",
   ".zcode/skills",
   ".zencoder/skills",
-  ".neovate/skills",
-  ".pochi/skills",
-  ".adal/skills",
 ] as const;
 
 /** The CLI walks each container this deep: `c/<name>`, `c/<group>/<name>`, `c/<g>/<g>/<name>`. */
 const MAX_CONTAINER_DEPTH = 3;
+/** The CLI walks the repository root one level deep only: `<repo>/<name>/SKILL.md`. */
+const ROOT_WALK_DEPTH = 1;
 
 /** One `contributes.skills` entry of a generated manifest. */
 export interface SkillsPackageRoot {
-  /** Root-relative and "/"-separated. "." when the repository root holds SKILL.md. */
+  /**
+   * Root-relative and "/"-separated. "." is the repository root: one skill when the root holds
+   * SKILL.md (`skills` empty), else the folder of the root's own skill folders.
+   */
   root: string;
   /**
    * The skill folder names under `root`, sorted, or `[basename]` when `root` holds SKILL.md
-   * itself. Empty for ".": that skill takes the plugin name (discovery's single-root rule).
+   * itself. Empty for the root skill: it takes the plugin name (discovery's single-root rule).
    */
   skills: string[];
 }
@@ -167,7 +158,8 @@ async function walkSkillParent(
   ctx: WalkContext,
   relative: string,
   dirReal: string,
-  depth: number
+  depth: number,
+  maxDepth: number
 ): Promise<void> {
   const seenDepth = ctx.visited.get(dirReal);
   if (seenDepth !== undefined && seenDepth <= depth) return;
@@ -179,12 +171,45 @@ async function walkSkillParent(
     const real = await containedDirectory(ctx.rootReal, path.join(dirReal, name));
     if (real === undefined) continue;
     if (await holdsSkillFile(ctx.rootReal, real)) skills.push(name);
-    else if (depth < MAX_CONTAINER_DEPTH) groups.push({ name, real });
+    else if (depth < maxDepth) groups.push({ name, real });
   }
   // A walk again from a smaller depth finds the same children: record them once.
   if (skills.length > 0 && seenDepth === undefined) ctx.roots.push({ root: relative, skills });
   for (const group of groups) {
-    await walkSkillParent(ctx, `${relative}/${group.name}`, group.real, depth + 1);
+    await walkSkillParent(ctx, `${relative}/${group.name}`, group.real, depth + 1, maxDepth);
+  }
+}
+
+/**
+ * The skills CLI identity of the skill in `dirReal` (skills@1.7.4 parseSkillMd): its frontmatter
+ * `name`, when SKILL.md starts with YAML frontmatter that has a non-empty string `name` and
+ * `description`. Undefined when the CLI would skip the file.
+ */
+export async function readSkillsCliName(
+  rootReal: string,
+  dirReal: string
+): Promise<string | undefined> {
+  try {
+    const { content } = await readPluginFileWithinRootCapped({
+      filePath: path.join(dirReal, SKILL_FILENAME),
+      pluginRoot: rootReal,
+      maxBytes: MAX_FILE_SIZE,
+      label: SKILL_FILENAME,
+    });
+    // The CLI's frontmatter pattern (src/frontmatter.ts).
+    const match = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(content);
+    if (match === null) return undefined;
+    const data: unknown = YAML.parse(match[1] ?? "");
+    if (!isPlainObject(data)) return undefined;
+    const { name, description } = data;
+    const valid =
+      typeof name === "string" &&
+      name !== "" &&
+      typeof description === "string" &&
+      description !== "";
+    return valid ? name : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -195,8 +220,19 @@ async function walkSkillParent(
  */
 export async function findSkillsPackageRoots(dir: string): Promise<SkillsPackageRoot[]> {
   const rootReal = await fsPromises.realpath(dir);
-  if (await holdsSkillFile(rootReal, rootReal)) return [{ root: ".", skills: [] }];
-  const ctx: WalkContext = { rootReal, visited: new Map([[rootReal, 0]]), roots: [] };
+  const ctx: WalkContext = { rootReal, visited: new Map(), roots: [] };
+  if (await holdsSkillFile(rootReal, rootReal)) {
+    // The CLI returns the root skill alone only when its SKILL.md parses (parseSkillMd).
+    if ((await readSkillsCliName(rootReal, rootReal)) !== undefined) {
+      return [{ root: ".", skills: [] }];
+    }
+    // An invalid root SKILL.md: the CLI skips it and walks the folders below. Xum walks the
+    // containers but not the root's own skill folders: discovery would read a declared "." that
+    // holds SKILL.md as that one (invalid) skill.
+    ctx.visited.set(rootReal, 0);
+  } else {
+    await walkSkillParent(ctx, ".", rootReal, 1, ROOT_WALK_DEPTH);
+  }
   for (const container of SKILL_CONTAINERS) {
     const real = await containedDirectory(rootReal, path.join(rootReal, container));
     if (real === undefined) continue;
@@ -209,7 +245,7 @@ export async function findSkillsPackageRoots(dir: string): Promise<SkillsPackage
       ctx.roots.push({ root: container, skills: [path.posix.basename(container)] });
       continue;
     }
-    await walkSkillParent(ctx, container, real, 1);
+    await walkSkillParent(ctx, container, real, 1, MAX_CONTAINER_DEPTH);
   }
   assert(
     ctx.roots.every((root) => !path.isAbsolute(root.root) && !root.root.split("/").includes("..")),
@@ -340,8 +376,9 @@ export function toPluginName(raw: string): string {
 
 /** The last segment of a clone URL without `.git` ("skills" for github.com/anthropics/skills). */
 function repositoryName(url: string): string {
-  const trimmed = url.replace(/\/+$/, "").replace(/\.git$/, "");
-  return trimmed.split(/[/:]/).pop() ?? trimmed;
+  // A Windows path (`C:\Users\me\repo`) separates with backslashes.
+  const trimmed = url.replace(/[/\\]+$/, "").replace(/\.git$/, "");
+  return trimmed.split(/[/\\:]/).pop() ?? trimmed;
 }
 
 /** The generated plugin name: the subpath's last folder, or the repository name. */

@@ -674,6 +674,8 @@ async function keepDeclaredAgentsOnly(args: {
   warn: (message: string) => void;
 }): Promise<string | undefined> {
   if (args.agentsDir === undefined || args.declaredFiles === undefined) return args.agentsDir;
+  // An empty list declares no agents (normalizeClaudeManifest warned when it was unmappable).
+  if (args.declaredFiles.length === 0) return undefined;
   const entries = await fsPromises.readdir(args.agentsDir, { withFileTypes: true }).catch(() => []);
   const declared = new Set(args.declaredFiles);
   const undeclared = entries
