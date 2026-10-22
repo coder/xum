@@ -17,7 +17,7 @@ import type { E2EConfig } from "e2e";
 import { web } from "@e2e-dev/web";
 import base from "../bugbash/e2e.config";
 import { xumElectron } from "./electronProvider";
-import { model, storyCache, storyContext } from "./storyConfig";
+import { judge, model, storyCache, storyContext } from "./storyConfig";
 
 const [webTarget] = base.targets;
 if (webTarget.name !== "web")
@@ -53,6 +53,7 @@ export default {
     default: {
       ...base.agents.default,
       model,
+      judge,
       context: storyContext("Here it runs as the desktop app, in its own window."),
     },
   },

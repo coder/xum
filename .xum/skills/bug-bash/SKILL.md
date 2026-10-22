@@ -170,7 +170,8 @@ workflow, on any branch). `Required` waits for it in the queue but counts its re
 repo variable `STORIES_MODE` is `block`. Unset is warn mode: a failure shows but blocks no merge.
 On each push to a PR that is not a draft, pr.yml's `Test / Stories (Haiku)` job runs it with
 Haiku 5.5 and a $1 cap per job (its `model` and `budget_usd` inputs): Haiku on PRs, Sonnet in the
-queue. Fork and Dependabot PRs skip it. `Required` counts that result only when the repo variable
+queue. Sonnet 5.5 judges that lane's story asserts (`judge_model`, which sets
+`BUGBASH_JUDGE_MODEL`): Haiku misjudged screenshots (#7185). Fork and Dependabot PRs skip it. `Required` counts that result only when the repo variable
 `STORIES_PR_MODE` is `block`: warn until 50 PR runs with less than 5% failures. When
 every failed job's proxy record holds a provider 5xx (`bun tests/stories/summary.ts
 --upstream-fault`), the workflow runs `make test-stories` once more. It restores the seed with actions/cache

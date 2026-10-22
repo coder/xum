@@ -20,6 +20,11 @@ on:
       model:
         type: string
         required: false
+      # The model that judges the story suites' asserts instead (BUGBASH_JUDGE_MODEL,
+      # storyConfig.ts). Unset: `model` judges. The agent repros always judge with `model`.
+      judge_model:
+        type: string
+        required: false
       # The cap per job at list price, in $. Unset: 3.
       budget_usd:
         type: string
@@ -76,6 +81,7 @@ jobs:
       # The model of every job, and the pages' titles (summary.ts). schedule and
       # workflow_dispatch have no inputs: Sonnet 5.5.
       BUGBASH_MODEL: ${{ inputs.model || 'anthropic:claude-sonnet-5-5' }}
+      BUGBASH_JUDGE_MODEL: ${{ inputs.judge_model || '' }}
     outputs:
       model: ${{ env.BUGBASH_MODEL }}
       reports_artifact: stories-reports-${{ github.run_attempt }}

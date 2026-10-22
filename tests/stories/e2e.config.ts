@@ -12,7 +12,7 @@
 import "./hostPause";
 import type { E2EConfig } from "e2e";
 import base from "../bugbash/e2e.config";
-import { model, storyCache, storyContext } from "./storyConfig";
+import { judge, model, storyCache, storyContext } from "./storyConfig";
 
 const [web] = base.targets;
 if (web.name !== "web") throw new Error(`the bug-bash config's first target is ${web.name}`);
@@ -43,6 +43,6 @@ export default {
   retries: 0,
   // Serial: every story shares one seeded app.
   workers: 1,
-  agents: { default: { ...base.agents.default, model, context: storyContext() } },
+  agents: { default: { ...base.agents.default, model, judge, context: storyContext() } },
   ...storyCache(),
 } satisfies E2EConfig;

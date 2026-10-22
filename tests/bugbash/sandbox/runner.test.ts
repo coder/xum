@@ -1197,6 +1197,55 @@ test.each([
   expectNothingLeft();
 });
 
+const JUDGE = { BUGBASH_JUDGE_MODEL: "anthropic:claude-opus-5-5" };
+test("a story job gets BUGBASH_JUDGE_MODEL, and its proxy lets the judge through", async () => {
+  const { code, requests } = await mcpLaunch(
+    { RUN: "proxycall", CALLMODEL: "claude-opus-5-5" },
+    JUDGE,
+    undefined,
+    undefined,
+    STORIES
+  );
+  expect(code).toBe(7);
+  const run = calls()
+    .split("\n")
+    .find((line) => line.startsWith("run "))!;
+  expect(run).toContain("--env BUGBASH_JUDGE_MODEL=anthropic:claude-opus-5-5");
+  expect(requests).toHaveLength(2); // the probe of the driving model, then the judge's call
+  expect(JSON.parse(requests[1].body)).toMatchObject({ model: "claude-opus-5-5" });
+  expectNothingLeft();
+});
+
+test("the agent repros read no judge: no judge env, and the proxy refuses its model", async () => {
+  const { code, requests } = await mcpLaunch(
+    { RUN: "proxycall", CALLMODEL: "claude-opus-5-5" },
+    JUDGE,
+    undefined,
+    undefined,
+    AGENT_REPROS
+  );
+  expect(code).toBe(7);
+  expect(calls()).not.toContain("BUGBASH_JUDGE_MODEL");
+  expect(calls()).toContain("model: not allowed");
+  expect(requests).toHaveLength(1); // the probe only
+});
+
+test.each([
+  ["an OpenAI judge", "openai:gpt-6.1-sol", /BUGBASH_JUDGE_MODEL .*only anthropic/],
+  ["a judge the proxy cannot price", "anthropic:claude-x-9", /BUGBASH_JUDGE_MODEL .*no price/],
+])("a story job refuses %s before any docker command", async (_name, spec, message) => {
+  const { code } = await mcpLaunch(
+    {},
+    { BUGBASH_JUDGE_MODEL: spec },
+    undefined,
+    undefined,
+    STORIES
+  );
+  expect(code).toBeInstanceOf(Refusal);
+  expect((code as Error).message).toMatch(message);
+  expect(calls()).toBe("");
+});
+
 test.each([
   ["the story suite without a budget", STORIES, { BUGBASH_BUDGET_USD: "" }, /BUGBASH_BUDGET_USD/],
   ["the agent repros without a budget", AGENT_REPROS, { BUGBASH_BUDGET_USD: "" }, /BUDGET/],
