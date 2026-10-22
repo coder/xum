@@ -173,6 +173,26 @@ describe("AgentPluginInstallService Claude marketplaces", () => {
     await expect(previewEntry("missing")).rejects.toThrow("does not list a plugin named 'missing'");
   });
 
+  test("a marketplace.json above 1 MiB lists (real catalogs are that big); above the cap it refuses", async () => {
+    // anthropics/claude-plugins-community's marketplace.json is about 1.49 MB.
+    const write = async (bytes: number) => {
+      const json = marketplace([DOCS]);
+      await writeFiles(marketDir, {
+        ".claude-plugin/marketplace.json": json + " ".repeat(bytes - json.length),
+      });
+      await commit(marketDir, `marketplace of ${bytes} bytes`);
+    };
+    await write(1_500_000);
+    const listed = await service.previewSource({ input: marketDir });
+    if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
+    expect(listed.marketplace.entries.map((entry) => entry.name)).toEqual(["docs"]);
+
+    await write(8 * 1024 * 1024 + 1);
+    await expect(service.previewSource({ input: marketDir })).rejects.toThrow(
+      "marketplace.json is larger than 8 MiB"
+    );
+  });
+
   test("a skill that Xum rejects counts nowhere: not in the listing, not for the Skills CLI", async () => {
     // Like anthropics/skills `claude-api`: a description over 1024 characters.
     await writeFiles(marketDir, {
