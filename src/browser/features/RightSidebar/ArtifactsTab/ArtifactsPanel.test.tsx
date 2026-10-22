@@ -26,7 +26,11 @@ import {
   ARTIFACTS_SELECTION_KEY,
   ARTIFACTS_SELECTION_MAX_WORKSPACES,
 } from "@/common/constants/storage";
-import { RightSidebarOverlayContext } from "@/browser/hooks/usePinnedViewCoversWindow";
+import { PinnedViewToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
+import {
+  PinnedViewToolbarSpacerContext,
+  RightSidebarOverlayContext,
+} from "@/browser/hooks/usePinnedViewCoversWindow";
 import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
@@ -565,10 +569,13 @@ describe("ArtifactsPanel", () => {
       const shell = document.body.appendChild(document.createElement("div"));
       shell.setAttribute("data-workspace-shell", "");
       const chat = shell.appendChild(document.createElement("button"));
-      const view = render(<ArtifactsPanel workspaceId="ws-artifacts" />, {
-        wrapper: ApiWrapper,
-        container: shell.appendChild(document.createElement("div")),
-      });
+      // RightSidebar provides the toolbar spacer (the webview bundles the panel without it).
+      const view = render(
+        <PinnedViewToolbarSpacerContext.Provider value={PinnedViewToggleBarSpacer}>
+          <ArtifactsPanel workspaceId="ws-artifacts" />
+        </PinnedViewToolbarSpacerContext.Provider>,
+        { wrapper: ApiWrapper, container: shell.appendChild(document.createElement("div")) }
+      );
       const panel = view.getByTestId("artifacts-panel");
       expect(await view.findByText("alpha")).toBeTruthy();
 

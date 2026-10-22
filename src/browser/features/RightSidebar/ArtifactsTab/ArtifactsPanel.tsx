@@ -1,6 +1,8 @@
-import React, { useEffect, useRef, useState } from "react";
-import { PinnedViewToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
-import { usePinnedViewCoversWindow } from "@/browser/hooks/usePinnedViewCoversWindow";
+import React, { useContext, useEffect, useRef, useState } from "react";
+import {
+  PinnedViewToolbarSpacerContext,
+  usePinnedViewCoversWindow,
+} from "@/browser/hooks/usePinnedViewCoversWindow";
 import { pinnedViewClass, pinnedViewRole, pinView } from "@/browser/utils/ui/pinnedView";
 import {
   Download,
@@ -699,6 +701,7 @@ export function ArtifactsPanel(props: {
   // panel, and inside the full-window right sidebar overlay the left sidebar is covered already,
   // so then it covers the window, everything else goes inert, and it is a modal dialog.
   const coversWindow = usePinnedViewCoversWindow();
+  const ToolbarSpacer = useContext(PinnedViewToolbarSpacerContext);
   useEffect(() => {
     const panel = panelRef.current;
     if (!showFullscreen || panel == null) return;
@@ -1090,7 +1093,7 @@ export function ArtifactsPanel(props: {
   const artbar = (
     <div className="border-border-light bg-sidebar flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
       {/* In a wide window, fullscreen can sit under the left sidebar's toggle bar. */}
-      {showFullscreen && <PinnedViewToggleBarSpacer />}
+      {showFullscreen && ToolbarSpacer != null && <ToolbarSpacer />}
       <ArtifactPickerSelect
         value={selected ? pickerValue(selected.scope, selected.path) : ""}
         onToggleOtherFiles={() => setOtherFilesExpanded(!otherFilesExpanded)}
