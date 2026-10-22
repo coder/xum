@@ -32,9 +32,9 @@ async function writeFiles(files: Record<string, string>): Promise<string[]> {
   return written;
 }
 
-/** A real (GNU) tar of `files`. */
-function tarOf(files: string[]): Buffer {
-  return Bun.spawnSync(["tar", "-cf", "-", "-T", "-"], {
+/** A real (GNU) tar of `files`; `format` "pax" writes pax headers as bsdtar does. */
+function tarOf(files: string[], format = "gnu"): Buffer {
+  return Bun.spawnSync(["tar", `--format=${format}`, "-cf", "-", "-T", "-"], {
     stdin: Buffer.from(files.join("\n") + "\n"),
     stderr: "ignore",
   }).stdout;
@@ -101,6 +101,41 @@ describe("parseRemotePluginListing", () => {
     expect(parseTarFiles(Buffer.concat([once.subarray(0, 1024), tarOf([a])]))).toBeNull();
     // A directory member (a listed file replaced by a directory) is not a regular file.
     expect(parseRemotePluginListing(listing([`F\t\t${a}`], [path.join(root, "p")]))).toBeNull();
+  });
+
+  test("pax headers name the next member; a malformed, oversized or escaping one refuses", async () => {
+    const [a] = await writeFiles({ "p/a.md": "a" });
+    // pax extended headers (bsdtar's default format) carry a long name and other records.
+    const long = path.join(root, "p", "y".repeat(150) + ".md");
+    await fs.writeFile(long, "pax");
+    expect(
+      parseTarFiles(tarOf([long], "pax"))
+        ?.get(long)
+        ?.toString()
+    ).toBe("pax");
+    // A hand-made pax header before a real member: a malformed or oversized header, or a pax
+    // path that is not canonical, refuses the archive.
+    const member = tarOf([a]).subarray(0, 1024);
+    const withPax = (records: string) => {
+      const data = Buffer.from(records);
+      const header = Buffer.alloc(512);
+      header.write("PaxHeader");
+      header.write(data.length.toString(8).padStart(11, "0"), 124);
+      header.write("x", 156);
+      const padded = Buffer.alloc(Math.ceil(data.length / 512) * 512);
+      data.copy(padded);
+      return parseTarFiles(Buffer.concat([header, padded, member, Buffer.alloc(1024)]));
+    };
+    // `<len> <key>=<value>\n`, where len counts its own digits too.
+    const record = (value: string) => {
+      const rest = value.length + 2;
+      const total = rest + String(rest + String(rest).length).length;
+      return `${total} ${value}\n`;
+    };
+    expect(withPax(record(`path=${a}`))?.has(a)).toBe(true);
+    expect(withPax(record(`path=${root}/p/../../etc/x`))).toBeNull();
+    expect(withPax("99 comment=x\n")).toBeNull();
+    expect(withPax(record(`comment=${"c".repeat(70_000)}`))).toBeNull();
   });
 
   test("malformed, outside-the-root, oversized or cut-off listings are refused", () => {

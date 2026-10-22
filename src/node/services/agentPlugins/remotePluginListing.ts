@@ -61,10 +61,62 @@ function tarMemberAt(tar: Buffer, offset: number): TarMember | "end" | null {
   };
 }
 
-/** GNU long names (`L`) and long link names (`K`) for the next member. */
+/** The long name (`L`) and long link name (`K`) of the next member, from GNU or pax headers. */
 interface LongNames {
   L?: string;
   K?: string;
+}
+
+/** A pax extended header holds a few short records; a bigger one refuses the listing. */
+const MAX_PAX_HEADER_BYTES = 64 * 1024;
+
+/** The pax record at `offset` (`<len> <key>=<value>\n`, len counting the whole record). */
+function paxRecordAt(
+  data: Buffer,
+  offset: number
+): { key: string; value: string; next: number } | null {
+  const space = data.indexOf(0x20, offset);
+  const lengthField = space === -1 ? "" : data.toString("latin1", offset, space);
+  const next = offset + (/^[1-9]\d{0,5}$/.test(lengthField) ? Number(lengthField) : 0);
+  if (next <= space || next > data.length || data[next - 1] !== 0x0a) return null;
+  const record = data.toString("utf8", space + 1, next - 1);
+  const equals = record.indexOf("=");
+  return equals < 1
+    ? null
+    : { key: record.slice(0, equals), value: record.slice(equals + 1), next };
+}
+
+/**
+ * The `path` and `linkpath` records of a pax extended header; other keys (times, xattrs) are
+ * ignored. Null when the header is over MAX_PAX_HEADER_BYTES or a record is malformed.
+ */
+function paxNames(data: Buffer): LongNames | null {
+  if (data.length > MAX_PAX_HEADER_BYTES) return null;
+  const names: LongNames = {};
+  for (let offset = 0; offset < data.length; ) {
+    const record = paxRecordAt(data, offset);
+    if (record === null) return null;
+    if (record.key === "path") names.L = record.value;
+    if (record.key === "linkpath") names.K = record.value;
+    offset = record.next;
+  }
+  return names;
+}
+
+/**
+ * Reads a header that describes the next member only: GNU long names (`L`, `K`), pax extended
+ * headers (`x`, as bsdtar writes them) and pax global headers (`g`, skipped). False for any other
+ * member, null for a malformed pax header.
+ */
+function readExtension(member: TarMember, long: LongNames): boolean | null {
+  if (member.type === "L" || member.type === "K") {
+    long[member.type] = tarString(member.data);
+    return true;
+  }
+  if (member.type !== "x") return member.type === "g";
+  const names = paxNames(member.data);
+  if (names !== null) Object.assign(long, names);
+  return names === null ? null : true;
 }
 
 /** A regular file's bytes, or a hard link's (its target's); undefined for any other type. */
@@ -78,21 +130,23 @@ function memberBytes(
 }
 
 /**
- * Adds one file member; false for an unsupported member (no bytes) or a repeated path whose bytes
- * differ: two walks of one tree read a file twice, and a change between the reads must refuse the
+ * Adds one file member; false for an unsupported member (no bytes), a name that is not a
+ * canonical path, or a repeated path whose bytes differ: two walks of one tree read a file twice, and a change between the reads must refuse the
  * listing rather than keep one version.
  */
 function addTarFile(files: Map<string, Buffer>, name: string, bytes: Buffer | undefined): boolean {
   const existing = files.get(name);
   if (bytes === undefined || (existing !== undefined && !existing.equals(bytes))) return false;
+  // The same checks as listing paths (length cap, no `..` or NUL), for ustar, GNU and pax names.
+  if (!isCanonicalRemotePath(name)) return false;
   files.set(name, bytes);
   return true;
 }
 
 /**
- * The regular files of a tar (ustar or GNU, as GNU tar and BusyBox write them): absolute path ->
- * a view of the bytes. A hard link reuses its target's bytes, and GNU long names (`L`, `K`) are
- * read. Any other member type, a bad header or a cut-off member gives null (fail closed).
+ * The regular files of a tar (ustar, GNU or pax, as GNU tar, BusyBox and bsdtar write them):
+ * absolute path -> a view of the bytes. A hard link reuses its target's bytes, and GNU long names
+ * and pax `path`/`linkpath` records are read. Any other member type, a bad header or a cut-off member gives null (fail closed).
  */
 export function parseTarFiles(tar: Buffer): Map<string, Buffer> | null {
   const files = new Map<string, Buffer>();
@@ -102,10 +156,9 @@ export function parseTarFiles(tar: Buffer): Map<string, Buffer> | null {
     if (member === "end") return files;
     if (member === null) return null;
     offset = member.next;
-    if (member.type === "L" || member.type === "K") {
-      long[member.type] = tarString(member.data);
-      continue;
-    }
+    const extension = readExtension(member, long);
+    if (extension === null) return null;
+    if (extension) continue;
     if (!addTarFile(files, tarPath(long.L ?? member.name), memberBytes(member, files, long))) {
       return null;
     }
