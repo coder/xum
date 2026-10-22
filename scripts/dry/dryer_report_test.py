@@ -129,3 +129,43 @@ def test_a_new_copy_with_the_name_of_an_old_match_is_reported():
     base = [form("src/a.ts", "@1", 1, SHAPE), form("src/a.ts", "@20", 20, SHAPE)]
     pairs = run([copy, old, cents], base, ["src/a.ts"], {"src/a.ts": [[1, 7]]}, {"src/a.ts": [[0, 0, 1, 7]]})
     assert names(pairs) == [("@1", "@27"), ("@1", "@8")]
+
+
+def test_a_function_moved_out_of_a_deleted_file_keeps_its_old_pairs_quiet():
+    # Base: cents in src/old.ts already matched count in src/c.ts. The diff
+    # deletes src/old.ts and adds cents to src/b.ts (all added lines).
+    moved = form("src/b.ts", "@1", 1, SHAPE)
+    count = form("src/c.ts", "count", 1, SHAPE)
+    base = [form("src/old.ts", "@1", 1, SHAPE)]  # a deleted file keeps its base path
+    pairs = run([moved, count], base, ["src/b.ts"], {"src/b.ts": [[1, 6]]}, {"src/b.ts": [[0, 0, 1, 6]]})
+    assert pairs == []
+
+
+def test_a_new_copy_is_reported_when_the_original_stays():
+    # Same as above, but the original stays in its file: a copy, not a move.
+    copy = form("src/b.ts", "@1", 1, SHAPE)
+    original = form("src/a.ts", "@1", 1, SHAPE)
+    base = [form("src/a.ts", "@1", 1, SHAPE)]
+    pairs = run(
+        [copy, original], base, ["src/a.ts", "src/b.ts"], {"src/b.ts": [[1, 6]]}, {"src/b.ts": [[0, 0, 1, 6]], "src/a.ts": []}
+    )
+    assert names(pairs) == [("@1", "@1")]
+
+
+def test_one_function_split_in_two_similar_halves_is_a_new_pair():
+    # Base line 1-20 was one function. The diff adds a header at 1 and 12, so
+    # both halves map back into that one base form.
+    base = [Form("src/a.ts", "@1", 1, 20, frozenset("abcdefghijklmnopqrst"))]
+    halves = [Form("src/a.ts", "@1", 1, 9, SHAPE), Form("src/a.ts", "@12", 12, 21, SHAPE)]
+    pairs = run(halves, base, ["src/a.ts"], {"src/a.ts": [[1, 1], [12, 13]]}, {"src/a.ts": [[0, 0, 1, 1], [10, 0, 12, 2]]})
+    assert names(pairs) == [("@1", "@12")]
+
+
+def test_naming_parses_each_reported_file_once(monkeypatch):
+    import dryer_report
+
+    calls = []
+    monkeypatch.setattr(dryer_report, "crapper_functions", lambda root, rel: calls.append(rel) or [])
+    side = lambda line: {"path": "src/a.ts", "name": f"@{line}", "startLine": line}
+    dryer_report.name_reported(Path("."), [{"left": side(1), "right": side(9)} for _ in range(5)])
+    assert calls == ["src/a.ts"]
