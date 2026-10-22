@@ -39,6 +39,22 @@ function isSidebarArtifactsKey(e: KeyboardEvent, container: HTMLElement | null):
 }
 
 /**
+ * Collapses the sidebar when it is expanded on the Artifacts tab, and returns whether it did. The
+ * collapse refuses where it would not show (immersive review, the failed-load frame): the key then
+ * opens the tab as before.
+ */
+function collapseOnArtifactsTab(
+  workspaceId: string,
+  collapsed: boolean,
+  layout: RightSidebarLayoutState,
+  container: HTMLElement | null
+): boolean {
+  if (collapsed || !isTabSelected(layout.root, "artifacts")) return false;
+  const shell = container?.closest("[data-workspace-shell]") ?? null;
+  return toggleRightSidebarFromKey(workspaceId, shell);
+}
+
+/**
  * Global shortcut: open (and un-collapse) the Artifacts tab, or, when the expanded sidebar already
  * shows it, collapse the whole sidebar like TOGGLE_RIGHT_SIDEBAR (user request: the key toggles
  * the tab). Works from the chat input too, because the chord inserts nothing there.
@@ -54,16 +70,9 @@ export function useArtifactsTabKey(options: ArtifactsTabKeyOptions): void {
       e.preventDefault();
       // A held key would open and collapse the sidebar on every repeat.
       if (e.repeat) return;
-      // The collapse refuses where it would not show (immersive review, the failed-load frame):
-      // the key then opens the tab as before.
-      if (
-        !collapsed &&
-        isTabSelected(getLayout().root, "artifacts") &&
-        toggleRightSidebarFromKey(workspaceId, container?.closest("[data-workspace-shell]") ?? null)
-      ) {
-        return;
+      if (!collapseOnArtifactsTab(workspaceId, collapsed, getLayout(), container)) {
+        openArtifactsTab();
       }
-      openArtifactsTab();
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
