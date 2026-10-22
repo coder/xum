@@ -105,6 +105,9 @@ const RAW_CLOCK_FILES = [
   // Not in AGENT_LOOP_FILES: phase 3 moves its timers too.
   "src/node/services/backgroundProcessManager.ts",
 ];
+// Loop test files that moved from global fake timers and Date patches to the TestClock
+// (makeTestEffectRunner). Each phase 3 PR adds the test files it moves.
+const CLOCK_PATCH_FREE_TESTS = ["src/node/services/streamManager.toolEvents.test.ts"];
 // File -> the exact number of raw clock reads it still has. Phase 3 lowers each entry as it
 // moves the file onto the HostClock service, and the rule fails an entry that is too high.
 const RAW_CLOCK_ALLOW = {
@@ -114,7 +117,6 @@ const RAW_CLOCK_ALLOW = {
   "src/node/services/contextManagement/strategies/continuous.ts": 1,
   "src/node/services/contextManagement/strategies/tokenBudget.ts": 1,
   "src/node/services/retryManager.ts": 1,
-  "src/node/services/streamManager.ts": 18,
   "src/node/services/tools/bash.ts": 3,
   "src/node/services/tools/bash_background_list.ts": 1,
   "src/node/services/tools/code_execution.ts": 3,
@@ -537,6 +539,13 @@ export default defineConfig([
     ignores: AGENT_LOOP_IGNORES,
     rules: {
       "local/no-raw-clock": ["error", { allow: RAW_CLOCK_ALLOW }],
+    },
+  },
+  {
+    // These loop tests drive time with the TestClock; a global patch would come back silently.
+    files: CLOCK_PATCH_FREE_TESTS,
+    rules: {
+      "local/no-global-clock-patch": "error",
     },
   },
   {
