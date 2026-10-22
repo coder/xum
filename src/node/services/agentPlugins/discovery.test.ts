@@ -1948,6 +1948,54 @@ describe("Claude Code plugin discovery", () => {
     expect(plugin.mcpConfigPath).toBeUndefined();
   });
 
+  test("a skill file swapped for an outside link after its check does not take a command's name", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    await writeTree(path.join(container, "kit"), {
+      ...claudeManifest({ name: "kit" }),
+      "commands/deploy.md": "x",
+      "skills/deploy/SKILL.md": "not a skill\n",
+    });
+    const outside = path.join(tmp.path, "outside.md");
+    await fs.writeFile(outside, "---\nname: deploy\ndescription: D\n---\n", "utf8");
+    const skillFile = path.join(
+      await fs.realpath(path.join(container, "kit")),
+      "skills",
+      "deploy",
+      "SKILL.md"
+    );
+    // A local process replaces SKILL.md between the probe's stat and its read.
+    const realStat = fs.stat;
+    let swapped = false;
+    const stats = spyOn(fs, "stat").mockImplementation((async (
+      ...args: Parameters<typeof fs.stat>
+    ) => {
+      const result = await realStat(...args);
+      if (!swapped && args[0] === skillFile) {
+        swapped = true;
+        await fs.rm(skillFile);
+        await fs.symlink(outside, skillFile);
+      }
+      return result;
+    }) as typeof fs.stat);
+    try {
+      const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+      expect(swapped).toBe(true);
+      // The outside file is never read as the skill, so the command keeps its name.
+      expect(result.plugins[0]?.skillsDirs).toContainEqual({
+        dir: path.join(result.plugins[0].rootPath, "commands"),
+        single: true,
+        name: "deploy",
+        command: true,
+      });
+      expect(result.diagnostics.map((d) => d.message).join("\n")).not.toContain(
+        "'deploy.md' is ignored"
+      );
+    } finally {
+      stats.mockRestore();
+    }
+  });
+
   test("commands become command roots after the skills roots; bad and taken names warn", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");
