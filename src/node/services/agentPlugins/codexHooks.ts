@@ -453,16 +453,12 @@ function parseHandler(
         invalid = "command";
         break;
       }
-      if (dialect.claude && raw.args !== undefined) {
-        // Claude's exec form: `args` is the argument vector, so the disclosure must show it.
-        if (!Array.isArray(raw.args) || !raw.args.every((arg) => typeof arg === "string")) {
-          invalid = "args";
-          break;
-        }
-        const argv: string[] = [raw.command, ...raw.args];
-        return { type: "command", summary: argv.map(quoteArgForSummary).join(" ") };
+      {
+        const summary = commandSummary(raw.command, dialect.claude ? raw.args : undefined);
+        if (summary !== undefined) return { type: "command", summary };
+        invalid = "args";
+        break;
       }
-      return { type: "command", summary: raw.command };
     case "prompt":
     case "agent":
       return { type: raw.type, summary: `${raw.type} handler` };
@@ -479,9 +475,18 @@ function parseHandler(
   return undefined;
 }
 
-/** One exec-form argument in a command summary: quoted when it is empty or has a space or quote. */
-function quoteArgForSummary(arg: string): string {
-  return arg === "" || /[\s"'\\]/.test(arg) ? JSON.stringify(arg) : arg;
+/**
+ * A command hook's summary. Claude's exec form adds `args`, the argument vector, so the
+ * disclosure shows it too: each argument is quoted when it is empty or has a space or quote.
+ * Undefined when `args` is not a list of strings.
+ */
+function commandSummary(command: string, args: unknown): string | undefined {
+  if (args === undefined) return command;
+  if (!Array.isArray(args) || !args.every((arg) => typeof arg === "string")) return undefined;
+  const argv: string[] = [command, ...args];
+  return argv
+    .map((arg) => (arg === "" || /[\s"'\\]/.test(arg) ? JSON.stringify(arg) : arg))
+    .join(" ");
 }
 
 /**
