@@ -13,6 +13,17 @@ export const SKILLS_CLI_REF_OR_SUBPATH_PROBLEM =
   "The Skills CLI method installs from the default branch of the whole repository. Remove the @ref or the subpath.";
 export const SKILLS_CLI_NOT_REMOTE_PROBLEM =
   "The Skills CLI method needs an https:// or ssh:// repository URL or owner/repo shorthand.";
+export const SKILLS_CLI_UNSAFE_CHARACTER_PROBLEM =
+  "The Skills CLI method takes only letters, digits and @ _ + = : , . / - in the source, so its command is safe to paste into any shell. Remove the other characters (also a ? query or a # fragment).";
+
+/**
+ * SECURITY: Xum shows the CLI command for the user to copy and run (always on Windows), and the
+ * command is not quoted: cmd.exe would run `&calc&` from a source such as
+ * `https://attacker.example/repo&calc&x.git`. So every argument may hold only these characters,
+ * which https, ssh and scp git URLs and shorthand need. `%` is left out: cmd.exe expands `%VAR%`.
+ */
+export const SKILLS_CLI_SAFE_ARG_PATTERN = /^[A-Za-z0-9@_+=:,./-]+$/;
+
 export const SKILLS_CLI_NOT_GIT_HTTPS_PROBLEM =
   "The Skills CLI reads this https:// URL as a download, not a git repository. Use the clone URL that ends in .git.";
 
@@ -55,6 +66,12 @@ export function isSkillsCliRemoteUrl(url: string): boolean {
  */
 export function skillsCliSourceProblem(input: string): string | undefined {
   const source = input.trim();
+  const problem = sourceShapeProblem(source);
+  if (problem !== undefined) return problem;
+  return SKILLS_CLI_SAFE_ARG_PATTERN.test(source) ? undefined : SKILLS_CLI_UNSAFE_CHARACTER_PROBLEM;
+}
+
+function sourceShapeProblem(source: string): string | undefined {
   if (isSkillsCliRemoteUrl(source)) {
     return source.startsWith("https://") && !isSkillsCliGitHttpsUrl(source)
       ? SKILLS_CLI_NOT_GIT_HTTPS_PROBLEM

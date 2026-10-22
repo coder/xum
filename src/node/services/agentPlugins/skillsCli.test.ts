@@ -19,7 +19,7 @@ const REPO = "https://github.com/anthropics/skills.git";
 describe("skillsCliArgs", () => {
   test("passes the normalized clone URL and one --skill per name", () => {
     expect(
-      skillsCliArgs(" https://github.com/anthropics/skills.git?x=1 ", ["pdf", "skill-creator"])
+      skillsCliArgs(" https://github.com/anthropics/skills.git ", ["pdf", "skill-creator"])
     ).toEqual([
       "--yes",
       SKILLS_CLI_PACKAGE,
@@ -63,6 +63,7 @@ describe("skillsCliArgs", () => {
     ["plain http", "http://example.com/skills.git"],
     ["shorthand with a ref", "anthropics/skills@main"],
     ["shorthand with a subpath", "anthropics/skills/skills/pdf"],
+    ["a cmd.exe metacharacter", "https://attacker.example/repo&calc&x.git"],
   ])("refuses %s", (_label, source) => {
     expect(() => skillsCliArgs(source, ["pdf"])).toThrow();
   });
