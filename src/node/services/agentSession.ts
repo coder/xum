@@ -9203,14 +9203,18 @@ export class AgentSession {
         }),
         // The stage warning follows the user row (#5286). It is published under this send's
         // admission, like the user row itself, unless the start was superseded or stopped.
-        onTurnStartStage: this.contextController.turnStartStage(options, (row) =>
-          this.publishTurnStartStage(
-            row,
-            historyReadSequence,
-            admissionCapture,
-            isStreamStartAborted,
-            stopFence
-          )
+        onTurnStartStage: this.contextController.turnStartStage(
+          options,
+          (row) =>
+            this.publishTurnStartStage(
+              row,
+              historyReadSequence,
+              admissionCapture,
+              isStreamStartAborted,
+              stopFence
+            ),
+          // A refusal-fallback handover's first stream-end would be an outside owner's answer.
+          !this.isExternallyOwnedSend(options)
         ),
         openaiTruncationModeOverride,
         ...this.compactionRetryInputBudget(),
@@ -10837,9 +10841,13 @@ export class AgentSession {
     payload: StreamEndEvent,
     options: SendMessageOptions | undefined
   ): boolean {
+    return payload.acpPromptId != null || this.isExternallyOwnedSend(options);
+  }
+
+  /** The send's options alone name an outside owner of its end (ACP prompt, `xum run`). */
+  private isExternallyOwnedSend(options: SendMessageOptions | undefined): boolean {
     return (
       this.callerOwnsTurnEnd ||
-      payload.acpPromptId != null ||
       (normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(options?.muxMetadata)) !=
         null
     );

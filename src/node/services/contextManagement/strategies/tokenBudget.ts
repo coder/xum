@@ -517,7 +517,8 @@ export class TokenBudgetStrategy {
   async prepareTurnStartStage(
     budget: Parameters<OnTurnStartStage>[0],
     options: SendMessageOptions,
-    publish: (row: MuxMessage) => Promise<boolean>
+    publish: (row: MuxMessage) => Promise<boolean>,
+    handOverAllowed = true
   ): Promise<TurnStartStage | undefined> {
     const threshold = this.resolveThreshold(budget.model);
     const stage = dueTurnStartStage(budget, threshold);
@@ -539,10 +540,12 @@ export class TokenBudgetStrategy {
       fits: (estimate) => estimate + reserve < ceiling,
       publish: () => this.publishTurnStartStage(stream, () => publish(row)),
       // A Stop or a budget reset since the decision withdraws the handover's Continue.
-      handOver: () =>
-        stream != null && this.host.state.stream === stream && this.validatePreparation(receipt)
-          ? this.enqueueContinuation(stream, options, budget.model, true)
-          : undefined,
+      ...(handOverAllowed && {
+        handOver: () =>
+          stream != null && this.host.state.stream === stream && this.validatePreparation(receipt)
+            ? this.enqueueContinuation(stream, options, budget.model, true)
+            : undefined,
+      }),
     };
   }
 

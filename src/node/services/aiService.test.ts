@@ -87,6 +87,7 @@ import * as turnContextAssembler from "./turnContextAssembler";
 import { resolveCompactionInputBudgetTokens } from "./turnRequestBuilder";
 import * as messagePipeline from "./messagePipeline";
 import type { OnTurnStartStage } from "./turnRequestBuilder";
+import * as languageModelCleanupModule from "./languageModelCleanup";
 import { TokenBudgetStrategy } from "./contextManagement/strategies/tokenBudget";
 import type { ContextManagementDependencies } from "./contextManagement/contextManagementService";
 import type { SessionContextHost } from "./contextManagement/sessionContextHost";
@@ -2579,6 +2580,69 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       removeLive?.();
     }
   });
+
+  // A refusal fallback decides its own stage after the placeholder row exists (#5286). Its E′
+  // rebuild shares the fallback's model with the request, so only a handover releases it.
+  it.each([
+    { fits: false, handedOver: false },
+    { fits: true, handedOver: true },
+  ])(
+    "a fallback stage that fits=$fits hands over=$handedOver and releases the model only then",
+    async ({ fits, handedOver }) => {
+      using xumHome = new DisposableTempDir("ai-fallback-stage-handover");
+      const sourceModel = KNOWN_MODELS.SONNET.id;
+      const fallbackModel = KNOWN_MODELS.GPT.id;
+      await writeMainConfig(xumHome.path, {
+        modelFallbacks: { [sourceModel]: { models: [fallbackModel] } },
+      });
+      const metadata = createLocalWorkspaceMetadata("fallback-stage-handover", xumHome.path);
+      const harness = createHarness(xumHome.path, metadata, {
+        useRequestedModelString: true,
+        experimentsService: await experimentsServiceWith(xumHome.path, [
+          EXPERIMENT_IDS.TOKEN_BUDGET,
+          EXPERIMENT_IDS.MEMORY,
+        ]),
+      });
+      const handOver = () => "continue-entry";
+      // Only the fallback's request has a stage due; the primary's start opens none.
+      const onTurnStartStage: OnTurnStartStage = (budget) =>
+        Promise.resolve(
+          budget.model === fallbackModel
+            ? {
+                row: createMuxMessage("stage-row", "user", "Context budget warning"),
+                fits: () => fits,
+                publish: () => Promise.resolve(false),
+                handOver,
+              }
+            : undefined
+        );
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: sourceModel,
+        thinkingLevel: "off",
+        onTurnStartStage,
+      });
+      expect(result.success).toBe(true);
+      const cleanup = spyOn(languageModelCleanupModule, "runLanguageModelCleanup");
+      try {
+        const fallback = await harness.startStreamCalls[0].modelFallback!.prepare(fallbackModel);
+        if (handedOver) {
+          expect(fallback).toEqual({
+            success: false,
+            error: { type: "context_budget_stage", handOver },
+          });
+          expect(cleanup).toHaveBeenCalledTimes(1);
+          return;
+        }
+        if (!fallback.success) throw new Error("Expected a dispatchable fallback request");
+        // Declined: the request is sent, so its model is not released.
+        expect(cleanup.mock.calls.map(([model]) => model)).not.toContain(fallback.data.model);
+      } finally {
+        cleanup.mockRestore();
+      }
+    }
+  );
 
   // The pre-stream thinking fold runs before the placeholder append (#7164). A refused first fold
   // returns before any row is written. A refused refold (a change written during the append)

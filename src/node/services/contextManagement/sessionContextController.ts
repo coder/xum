@@ -184,10 +184,12 @@ export class SessionContextController {
   /** Turn-start stage decision (#5286); the session supplies how the warning row is published. */
   turnStartStage(
     options: SendMessageOptions | undefined,
-    publish: (row: MuxMessage) => Promise<boolean>
+    publish: (row: MuxMessage) => Promise<boolean>,
+    handOverAllowed: boolean
   ): OnTurnStartStage | undefined {
     return options && this.isTokenBudgetActive(options)
-      ? (budget) => this.tokenBudget.prepareTurnStartStage(budget, options, publish)
+      ? (budget) =>
+          this.tokenBudget.prepareTurnStartStage(budget, options, publish, handOverAllowed)
       : undefined;
   }
 

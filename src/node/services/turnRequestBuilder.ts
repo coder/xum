@@ -683,8 +683,12 @@ export interface TurnStartStage {
   /** Whether E′, the count of the request with `row` appended, leaves the stage its reserve. */
   fits: (estimate: number) => boolean;
   publish: () => Promise<boolean>;
-  /** Queues the stage's Continue on its model instead (refusal fallback); its entry id, if any. */
-  handOver: () => string | undefined;
+  /**
+   * Queues the stage's Continue on its model instead (refusal fallback); its entry id, if any.
+   * Absent when an outside client owns the turn's end (an ACP prompt, `xum run`): the handover's
+   * stream-end would be that client's answer, so the fallback is dispatched as before.
+   */
+  handOver?: () => string | undefined;
 }
 
 /** What a primary start dispatches: the built request, or the counted candidate with a stage. */
@@ -737,18 +741,17 @@ async function applyTurnStartStage<TMessages, TTail>(input: {
   };
 }
 
-/** A fallback request's estimate rebuilt with `row` (E′); undefined when the budget refuses it. */
-async function estimateWithRow<
-  TRequest extends { contextBudgetEstimate?: number; model: LanguageModel },
->(
-  build: (messages: MuxMessage[]) => Promise<TRequest>,
+/**
+ * A fallback request's estimate rebuilt with `row` (E′); undefined when the budget refuses it.
+ * The candidate shares the fallback's model, so it releases nothing: the request may be sent.
+ */
+async function estimateWithRow<TRequest extends { contextBudgetEstimate?: number }>(
+  build: (messages: MuxMessage[], cleanupModelOnError: boolean) => Promise<TRequest>,
   messages: MuxMessage[],
   row: MuxMessage
 ): Promise<number | undefined> {
   try {
-    const candidate = await build([...messages, row]);
-    runLanguageModelCleanup(candidate.model);
-    return candidate.contextBudgetEstimate;
+    return (await build([...messages, row], false)).contextBudgetEstimate;
   } catch (error) {
     if (error instanceof ContextBudgetExceededError) return undefined;
     throw error;
@@ -779,7 +782,7 @@ async function buildFallbackRequest<
     model: LanguageModel;
   },
 >(
-  build: (messages: MuxMessage[]) => Promise<TRequest>,
+  build: (messages: MuxMessage[], cleanupModelOnError: boolean) => Promise<TRequest>,
   stage: { onTurnStartStage: OnTurnStartStage | undefined; model: string; messages: MuxMessage[] }
 ): Promise<
   Result<
@@ -789,15 +792,16 @@ async function buildFallbackRequest<
 > {
   let request: TRequest;
   try {
-    request = await build(stage.messages);
+    request = await build(stage.messages, true);
   } catch (error) {
     if (error instanceof ContextBudgetExceededError) return Err(error.details);
     throw error;
   }
   const due = await dueFallbackStage(stage, request);
-  if (!due) return Ok(request);
+  if (due?.handOver == null) return Ok(request);
   const withRow = await estimateWithRow(build, stage.messages, due.row);
   if (withRow == null || !due.fits(withRow)) return Ok(request);
+  // Both builds share the seed's model, so only a handover releases it (the request is not sent).
   runLanguageModelCleanup(request.model);
   return Err({ type: "context_budget_stage", handOver: due.handOver });
 }
@@ -4109,7 +4113,7 @@ export class TurnRequestBuilder {
                 }
 
                 const built = await buildFallbackRequest(
-                  (requestMessages) =>
+                  (requestMessages, cleanupModelOnError) =>
                     prepareModelRequest({
                       seed: nextSeedResult.data,
                       sourceMessages: requestMessages,
@@ -4117,7 +4121,7 @@ export class TurnRequestBuilder {
                       reusePrePolicySystemContext: false,
                       requestHistorySequence: () => requestHistorySequence,
                       partialContinuationMessage: prepareOptions?.continuation?.assistantMessage,
-                      cleanupModelOnError: true,
+                      cleanupModelOnError,
                     }),
                   { onTurnStartStage, model: nextModelString, messages: sourceMessages }
                 );

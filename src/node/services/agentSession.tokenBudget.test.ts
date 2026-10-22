@@ -4502,7 +4502,7 @@ describe("AgentSession token-budget lifecycle", () => {
           model: fallbackModel,
           messages: primary.messages,
         });
-        assert(stage != null);
+        assert(stage?.handOver != null);
         if (stopped) {
           // The Stop ends the controlled provider's stream before the handover runs.
           const stop = h.session.interruptStream();
@@ -4535,6 +4535,26 @@ describe("AgentSession token-budget lifecycle", () => {
         expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
       }
     );
+
+    // An ACP prompt resolves on the turn's first stream-end, so a handover's empty stream-end
+    // would be its answer. Such a turn gets no handover: its fallback is dispatched as before.
+    test("a turn whose end an ACP client owns offers no refusal-fallback handover", async () => {
+      const h = await setup();
+      await seedHistory(h, 80_000);
+      h.turnStart.estimate = () => NOT_DUE;
+      const acp: SendMessageOptions = { ...options, acpPromptId: "acp-prompt-1" };
+      expect((await h.session.sendMessage("Work", acp)).success).toBe(true);
+      const primary = h.requests[0];
+      const stage = await primary.onTurnStartStage?.({
+        estimate: 100_000,
+        limit: 128_000,
+        model: primary.modelString,
+        messages: primary.messages,
+      });
+      // Non-vacuous: the stage is due, and only the handover is withheld.
+      expect(stage?.row).toBeDefined();
+      expect(stage?.handOver).toBeUndefined();
+    });
 
     // The builder drops a stage once its abort signal fires. The session's publish fence covers a
     // Stop that is already in progress when the warning would be published.
