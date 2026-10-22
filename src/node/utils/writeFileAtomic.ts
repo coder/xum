@@ -375,9 +375,8 @@ export default async function writeFileAtomic(
   }
 }
 
-/* eslint-disable local/no-sync-fs-methods -- the synchronous variant exists for the
-   two callers that must persist before returning (providers.jsonc writers); it mirrors
-   the async pipeline step for step. */
+// The synchronous variant exists for the two callers that must persist before returning
+// (providers.jsonc writers); it mirrors the async pipeline step for step.
 
 function writeAllSync(
   files: WriteFileAtomicFs,
@@ -498,7 +497,5 @@ export function sync(
     }
   }
 }
-
-/* eslint-enable local/no-sync-fs-methods */
 
 writeFileAtomic.sync = sync;
