@@ -169,3 +169,13 @@ def test_naming_parses_each_reported_file_once(monkeypatch):
     side = lambda line: {"path": "src/a.ts", "name": f"@{line}", "startLine": line}
     dryer_report.name_reported(Path("."), [{"left": side(1), "right": side(9)} for _ in range(5)])
     assert calls == ["src/a.ts"]
+
+
+def test_two_old_duplicates_moved_together_stay_quiet():
+    # Base: a and b in src/a.ts already matched. The diff moves both into
+    # src/b.ts as added lines, and src/a.ts keeps other code (no rename).
+    base = [form("src/a.ts", "@1", 1, SHAPE), form("src/a.ts", "@20", 20, SHAPE), form("src/a.ts", "@40", 40, OTHER)]
+    head = [form("src/b.ts", "@1", 1, SHAPE), form("src/b.ts", "@10", 10, SHAPE), form("src/a.ts", "@1", 1, OTHER)]
+    hunks = {"src/b.ts": [[0, 0, 1, 16]], "src/a.ts": [[1, 39, 0, 0]]}
+    pairs = run(head, base, ["src/a.ts", "src/b.ts"], {"src/b.ts": [[1, 16]]}, hunks)
+    assert pairs == []

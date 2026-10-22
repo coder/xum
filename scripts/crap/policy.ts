@@ -71,7 +71,40 @@ export function keyRows(rows: readonly FunctionRow[]): Map<string, FunctionRow> 
   return keyed;
 }
 
-const HUNK_HEADER = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
+/** One `git diff -U0` hunk: [baseStart, baseCount, headStart, headCount]. */
+export type Hunk = [number, number, number, number];
+
+/**
+ * The file and hunk headers of a `git diff -U0`, in order. A file header
+ * names the head path (null for a deleted file). Each hunk's body lines are
+ * skipped by count, because an added source line `++ x` renders as `+++ x`
+ * and is not a file header.
+ */
+export function* diffHeaders(
+  diff: string
+): Generator<{ kind: "file"; path: string | null } | { kind: "hunk"; hunk: Hunk }> {
+  let body = 0;
+  for (const line of diff.split("\n")) {
+    if (body > 0) {
+      // "\ No newline at end of file" follows a body line and is not one.
+      if (!line.startsWith("\\")) body--;
+      continue;
+    }
+    if (line.startsWith("+++ ")) {
+      const target = line.slice(4).replace(/\t$/, "");
+      yield { kind: "file", path: target === "/dev/null" ? null : target.replace(/^b\//, "") };
+      continue;
+    }
+    const match = HUNK_HEADER.exec(line);
+    if (!match) continue;
+    const count = (value: string | undefined) => (value === undefined ? 1 : Number(value));
+    const hunk: Hunk = [Number(match[1]), count(match[2]), Number(match[3]), count(match[4])];
+    body = hunk[1] + hunk[3];
+    yield { kind: "hunk", hunk };
+  }
+}
 
 /**
  * Parses `git diff -U0 --default-prefix` output (with `core.quotePath=false`)
@@ -82,17 +115,14 @@ const HUNK_HEADER = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
 export function parseChangedLines(diff: string): ChangedLines {
   const changed: ChangedLines = new Map();
   let spans: Array<[number, number]> | null = null;
-  for (const line of diff.split("\n")) {
-    if (line.startsWith("+++ ")) {
-      const target = line.slice(4).replace(/\t$/, "");
-      spans = target === "/dev/null" ? null : [];
-      if (spans) changed.set(target.replace(/^b\//, ""), spans);
+  for (const header of diffHeaders(diff)) {
+    if (header.kind === "file") {
+      spans = header.path === null ? null : [];
+      if (spans && header.path !== null) changed.set(header.path, spans);
       continue;
     }
-    const hunk = HUNK_HEADER.exec(line);
-    if (!hunk || !spans) continue;
-    const start = Number(hunk[1]);
-    const count = hunk[2] === undefined ? 1 : Number(hunk[2]);
+    if (!spans) continue;
+    const [, , start, count] = header.hunk;
     // A pure deletion sits between head lines `start` and `start + 1`. The
     // half-line span touches only a function that contains both of them.
     spans.push(count === 0 ? [start + 0.5, start + 0.5] : [start, start + count - 1]);
