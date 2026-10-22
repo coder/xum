@@ -139,11 +139,7 @@ export async function recordArtifactVersion(
   const artifactId = getArtifactId(params.relPath);
   const dir = artifactDir(params.sessionDir, artifactId);
   return indexLocks.withLock(dir, async () => {
-    await using _fileLock = await acquireIndexFileLock(
-      dir,
-      params.abortSignal,
-      params.locks ?? nodeSessionLocks
-    );
+    await using _fileLock = await acquireIndexFileLock(dir, params.abortSignal, params.locks);
     const existing = await readArtifactIndex(params.sessionDir, artifactId);
     const index: ArtifactVersionIndex = existing ?? {
       id: artifactId,
@@ -210,7 +206,7 @@ export async function recordArtifactVersion(
 async function acquireIndexFileLock(
   dir: string,
   abortSignal: AbortSignal | undefined,
-  locks: SessionLocks
+  locks: SessionLocks = nodeSessionLocks
 ): Promise<AsyncDisposable> {
   // Checked first: acquiring creates the artifact dir, and a cancelled publish writes nothing.
   if (abortSignal?.aborted) throw new Error(ARTIFACT_PUBLISH_INTERRUPTED);
