@@ -1046,9 +1046,17 @@ describe("createOrpcServer", () => {
     }
   });
 
-  test("includes app-proxy base paths in OAuth callback return URLs", async () => {
+  test("includes app-proxy base paths in OAuth redirect and callback return URLs", async () => {
+    const redirectUris: string[] = [];
     const stubContext: Partial<ORPCContext> = {
       coderOauthService: {
+        startServerFlow: (input: { redirectUri: string }) => {
+          redirectUris.push(input.redirectUri);
+          return Promise.resolve({
+            success: true,
+            data: { flowId: "flow", authorizeUrl: "https://coder.test/authorize" },
+          });
+        },
         handleServerCallback: () => Promise.resolve({ success: true, data: undefined }),
       } as unknown as ORPCContext["coderOauthService"],
     };
@@ -1061,6 +1069,18 @@ describe("createOrpcServer", () => {
         context: stubContext as ORPCContext,
         authToken: "test-token",
       });
+
+      const startResponse = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test`,
+        {
+          headers: {
+            Authorization: "Bearer test-token",
+            "X-Forwarded-Prefix": APP_PROXY_BASE_PATH,
+          },
+        }
+      );
+      expect(startResponse.status).toBe(200);
+      expect(redirectUris).toEqual([`${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/coder/callback`]);
 
       const callbackResponse = await fetch(
         `${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/coder/callback?state=test&code=test`
