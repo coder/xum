@@ -92,6 +92,7 @@ import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager"
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
 import type { AppFiberScopeTag } from "./appFiberScope";
 import type { EffectRunnerTag } from "./effectRunner";
+import type { HostClockTag } from "./hostClockLive";
 import type { CoreOptionsTag } from "./layers/core";
 
 export class ConfigTag extends Context.Service<ConfigTag, Config>()("xum/Config") {}
@@ -322,9 +323,10 @@ export type StoreTags =
 
 /**
  * The runtime seams provided at the base of every graph (`./effectRunner.ts`,
- * `./appFiberScope.ts`); their tags live next to their layers.
+ * `./hostClockLive.ts`, `./appFiberScope.ts`); their tags live next to their
+ * layers.
  */
-export type RuntimeSeamTags = EffectRunnerTag | AppFiberScopeTag;
+export type RuntimeSeamTags = EffectRunnerTag | HostClockTag | AppFiberScopeTag;
 
 /**
  * Everything `CoreLive` (./layers/core.ts) provides: every `CoreServices`
