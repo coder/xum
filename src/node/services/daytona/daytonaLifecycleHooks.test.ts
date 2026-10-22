@@ -98,20 +98,31 @@ describe("createDaytonaArchiveHook", () => {
     expect(rig.writer.tokens.has("sb-waking")).toBe(false);
   });
 
-  it("keeps a sandbox without this install's label on archive delete, and says why", async () => {
+  it("never stops or deletes a sandbox without this install's label on archive, and says why", async () => {
     rig.plane.addSandbox({ id: "sb-foreign", labels: { "xum.instance": "another-install" } });
-    const warnings: string[] = [];
+    for (const behavior of ["stop", "delete"] as const) {
+      const warnings: string[] = [];
+      let checked = false;
+      const check = () => {
+        // The delete checks start a stopped sandbox to look at its checkout.
+        checked = true;
+        return cleanCheck();
+      };
 
-    const result = await archive(
-      { sandboxId: "sb-foreign", shared: false },
-      "delete",
-      cleanCheck,
-      (w) => warnings.push(w)
-    );
+      const result = await archive(
+        { sandboxId: "sb-foreign", shared: false },
+        behavior,
+        check,
+        (w) => warnings.push(w)
+      );
 
-    expect(result.success).toBe(true);
-    expect(rig.plane.find("sb-foreign")?.state).toBe("started");
-    expect(warnings.join(" ")).toContain("xum.instance");
+      expect(result.success).toBe(true);
+      expect(checked).toBe(false);
+      expect(rig.plane.find("sb-foreign")?.state).toBe("started");
+      expect(warnings.join(" ")).toContain("xum.instance");
+    }
+    expect(rig.plane.countCalls("POST /sandbox/sb-foreign/stop")).toBe(0);
+    expect(rig.plane.countCalls("DELETE /sandbox/sb-foreign")).toBe(0);
   });
 
   it("never stops or deletes an attached or shared sandbox", async () => {

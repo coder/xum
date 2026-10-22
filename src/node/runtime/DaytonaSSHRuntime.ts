@@ -95,6 +95,7 @@ export type DaytonaRuntimeService = Pick<
   | "sandboxReferencesElsewhere"
   | "isAliasStoredElsewhere"
   | "withSandboxRemovalLock"
+  | "sandboxOwnership"
   | "waitUntilDestroyed"
   | "recordWorkspaceRemoval"
   | "releaseSshAccess"
@@ -1144,6 +1145,8 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       log.warn("Daytona sandbox id not set, falling back to SSH-only deletion");
       return sshDelete();
     }
+    const unowned = await this.removalOfUnownedSandbox(sandboxId, deletedPath, force);
+    if (unowned) return unowned;
 
     const forced = force ? await this.forcedRemovalWithoutSsh(sandboxId, deletedPath) : undefined;
     if (forced) return forced;
@@ -1159,6 +1162,43 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       return { success: false, error: prepared.error };
     }
     return this.settleAfterSshDelete(sandboxId, deletedPath, await sshDelete(), force);
+  }
+
+  /**
+   * A sandbox this workspace says Xum created, but without this install's label: a create of
+   * unknown outcome left the workspace naming someone else's sandbox, which may hold a
+   * checkout at this workspace's path. So the removal changes nothing on it (no start, no
+   * checks, no checkout or sandbox delete) and only drops Xum's access. Undefined for a sandbox
+   * that is Xum's, attached, or gone: the removal goes on as usual.
+   */
+  private async removalOfUnownedSandbox(
+    sandboxId: string,
+    deletedPath: string,
+    force: boolean
+  ): Promise<DeleteResult | undefined> {
+    if (this.daytonaConfig.shared === true) return undefined;
+    let ownership: Awaited<ReturnType<DaytonaRuntimeService["sandboxOwnership"]>>;
+    try {
+      ownership = await this.daytonaService.sandboxOwnership(sandboxId);
+    } catch (error) {
+      const message = getErrorMessage(error);
+      log.error("Could not read a Daytona sandbox's labels before removal", {
+        sandboxId,
+        error: message,
+      });
+      return {
+        success: false,
+        error: `Could not check that Daytona sandbox "${sandboxId}" is Xum's: ${message}`,
+        // A forced removal goes on without it: remove shows this as a warning to act on.
+        ...(force ? { leftoverPaths: [`Daytona sandbox "${sandboxId}"`] } : {}),
+      };
+    }
+    if (ownership !== "notOwned") return undefined;
+    return this.daytonaService.withSandboxRemovalLock(async () => {
+      await this.releaseAccessOnDelete(sandboxId, "keep");
+      this.recordRemoval();
+      return { success: true, deletedPath, notice: notOwnedSandboxNotice(sandboxId) };
+    });
   }
 
   /** A failed check (dirty or unpushed work) keeps the workspace and its sandbox. */

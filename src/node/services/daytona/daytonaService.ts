@@ -1169,7 +1169,7 @@ export class DaytonaService {
     account?: DaytonaAccount
   ): Promise<"deleted" | "notOwned"> {
     const client = await this.clientOf(account);
-    if (!(await this.carriesInstanceLabel(client, sandboxId))) return "notOwned";
+    if ((await this.ownershipWith(client, sandboxId)) === "notOwned") return "notOwned";
     // Revoke first: Daytona refuses to revoke a token of a sandbox that no longer exists.
     await this.releaseSshAccess(sandboxId);
     try {
@@ -1180,16 +1180,28 @@ export class DaytonaService {
     return "deleted";
   }
 
-  /** True for a sandbox that is gone: there is nothing left to protect. */
-  private async carriesInstanceLabel(client: DaytonaClient, sandboxId: string): Promise<boolean> {
+  /**
+   * Whether a sandbox a workspace says Xum created carries this install's label. Asked before
+   * any step that changes it (a start, a checkout delete, a stop or a delete): a create of
+   * unknown outcome may have left the workspace naming someone else's sandbox.
+   */
+  async sandboxOwnership(sandboxId: string): Promise<"owned" | "notOwned" | "missing"> {
+    return this.ownershipWith((await this.getClient()).client, sandboxId);
+  }
+
+  private async ownershipWith(
+    client: DaytonaClient,
+    sandboxId: string
+  ): Promise<"owned" | "notOwned" | "missing"> {
     let sandbox: DaytonaSandbox;
     try {
       sandbox = await client.getSandbox(sandboxId);
     } catch (error) {
-      if (isDaytonaNotFound(error)) return true;
+      if (isDaytonaNotFound(error)) return "missing";
       throw error;
     }
-    return sandbox.labels?.[DAYTONA_LABEL_INSTANCE] === (await this.getInstanceId());
+    const owned = sandbox.labels?.[DAYTONA_LABEL_INSTANCE] === (await this.getInstanceId());
+    return owned ? "owned" : "notOwned";
   }
 
   async refreshActivity(sandboxId: string): Promise<void> {

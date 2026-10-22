@@ -22,6 +22,7 @@ export interface DaytonaArchiveHookOptions {
     | "getSandboxState"
     | "stopAndWait"
     | "deleteSandbox"
+    | "sandboxOwnership"
     | "sandboxUseElsewhere"
     | "isAliasStoredElsewhere"
     | "releaseSshAccess"
@@ -86,6 +87,11 @@ async function applyArchiveBehavior(
   const behavior = args.coderWorkspaceArchiveBehavior ?? options.getArchiveBehavior();
   if (behavior === "keep") return Ok(undefined);
   try {
+    // Neither policy, nor the delete checks' start, touches a sandbox that is not Xum's.
+    if ((await options.daytonaService.sandboxOwnership(sandboxId)) === "notOwned") {
+      args.reportWarning?.(notOwnedSandboxNotice(sandboxId));
+      return Ok(undefined);
+    }
     if (behavior === "delete") {
       return archivedOthers
         ? await stopInsteadOfDelete(options, args, sandboxId)

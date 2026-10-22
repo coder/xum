@@ -712,7 +712,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     expect(rig.plane.find("xum-theirs")).toBe(other);
   });
 
-  it("never deletes a sandbox without this install's label when the failed workspace is removed", async () => {
+  it("never touches a sandbox without this install's label when the failed workspace is removed", async () => {
     const sshDelete = spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
       success: true,
       deletedPath: "/path",
@@ -731,17 +731,24 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
         .catch(() => undefined);
       rig.plane.failingRoutes.clear();
 
-      // The persisted workspace still says Xum created it; neither removal deletes it.
-      for (const force of [false, true]) {
-        const removal = await makeRuntime(daytona).deleteWorkspace(
-          "/home/me/project",
-          "feature",
-          force
-        );
-        expect(removal.success).toBe(true);
-        if (removal.success) expect(removal.notice).toContain("xum.instance");
-        expect(rig.plane.find("xum-theirs")).toBe(other);
+      // The persisted workspace still says Xum created it. Their sandbox may hold a checkout at
+      // this workspace's path: no removal starts it, checks it, deletes that checkout or it.
+      for (const state of ["started", "stopped"]) {
+        for (const force of [false, true]) {
+          other.state = state;
+          const removal = await makeRuntime(daytona).deleteWorkspace(
+            "/home/me/project",
+            "feature",
+            force
+          );
+          expect(removal.success).toBe(true);
+          if (removal.success) expect(removal.notice).toContain("xum.instance");
+          expect(rig.plane.find("xum-theirs")).toBe(other);
+          expect(other.state).toBe(state);
+        }
       }
+      expect(sshDelete).not.toHaveBeenCalled();
+      expect(rig.plane.countCalls("POST /sandbox/xum-theirs/start")).toBe(0);
       expect(rig.plane.countCalls("DELETE /sandbox/xum-theirs")).toBe(0);
     } finally {
       sshDelete.mockRestore();
