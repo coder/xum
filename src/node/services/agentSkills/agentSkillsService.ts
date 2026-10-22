@@ -961,6 +961,27 @@ export interface AgentSkillDiscoveryResult {
   skillWarnings?: AgentSkillIssue[];
 }
 
+/** The caller's roots, else the default roots for its options (discovery and reads share it). */
+function resolveSkillRoots(
+  runtime: Runtime,
+  workspacePath: string,
+  options:
+    | {
+        roots?: AgentSkillsRoots;
+        includeClaudeSkills?: boolean;
+        projectSearchRoot?: string;
+        projectPluginsTrusted?: boolean;
+      }
+    | undefined
+): AgentSkillsRoots {
+  if (options?.roots != null) return options.roots;
+  return getDefaultAgentSkillsRoots(runtime, workspacePath, {
+    includeClaudeSkills: options?.includeClaudeSkills,
+    projectSearchRoot: options?.projectSearchRoot,
+    projectPluginsTrusted: options?.projectPluginsTrusted,
+  });
+}
+
 /**
  * Discover skills from every root. A list is partial by design: a root that
  * cannot be read (e.g. a project root on an unreachable SSH host) becomes an
@@ -986,13 +1007,7 @@ export async function discoverAgentSkills(
     throw new Error("discoverAgentSkills: workspacePath is required");
   }
 
-  const roots =
-    options?.roots ??
-    getDefaultAgentSkillsRoots(runtime, workspacePath, {
-      includeClaudeSkills: options?.includeClaudeSkills,
-      projectSearchRoot: options?.projectSearchRoot,
-      projectPluginsTrusted: options?.projectPluginsTrusted,
-    });
+  const roots = resolveSkillRoots(runtime, workspacePath, options);
 
   const containment = resolveProjectSkillContainment(options);
   const dedupeByName = options?.dedupeByName ?? true;
@@ -1388,13 +1403,7 @@ export async function readAgentSkill(
     throw new Error("readAgentSkill: workspacePath is required");
   }
 
-  const roots =
-    options?.roots ??
-    getDefaultAgentSkillsRoots(runtime, workspacePath, {
-      includeClaudeSkills: options?.includeClaudeSkills,
-      projectSearchRoot: options?.projectSearchRoot,
-      projectPluginsTrusted: options?.projectPluginsTrusted,
-    });
+  const roots = resolveSkillRoots(runtime, workspacePath, options);
 
   const containment = resolveProjectSkillContainment(options);
 
