@@ -202,9 +202,8 @@ describe("WorkspaceService sendMessage status clearing", () => {
       hostClock: clock.hostClock,
     });
     service.registerSession("test-workspace", fakeSession as unknown as AgentSession);
-    const updateRecency = harness.extensionMetadata.updateRecency as unknown as ReturnType<
-      typeof mock
-    >;
+    // beforeEach already spies on updateRecency; spyOn returns that same spy.
+    const updateRecency = spyOn(harness.extensionMetadata, "updateRecency");
     try {
       await clock.adjust(7_000);
       const result = await service.sendMessage("test-workspace", "hello", {
