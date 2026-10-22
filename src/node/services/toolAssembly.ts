@@ -227,50 +227,28 @@ function policyLeavesNoTools(tools: Record<string, Tool>, policy: ToolPolicy | u
 }
 
 /**
- * How the PTC branch offers code_execution (#7028). A policy result that denies
- * the name stops PTC, allowlists that do not list it included ("allowlist" means
- * [disable .*, enable ...]): policy must be honored for the synthesized tool too.
- * - "allowed": the active policy allows it.
- * - "refused": the active (or caller) policy denies it, but another switchable
- *   agent allows it, so it stays advertised with a refusing execute and the tool
- *   block stays the same across agent switches (#5253).
- * - "absent": no agent allows it, or the active policy leaves no tools at all
- *   (a no-tools contract such as compaction's `.*` disable). PTC does not run,
- *   and the model gets the policy-filtered flat tools.
+ * Whether policy lets the PTC branch run (#7028): the active policy must allow
+ * the code_execution name, so a deny stops PTC, allowlists that do not list it
+ * included ("allowlist" means [disable .*, enable ...]). A policy that leaves no
+ * tools at all (a no-tools contract such as compaction's `.*` disable) stops it
+ * too. Otherwise the model gets the policy-filtered flat tools.
+ *
+ * Even when another switchable agent allows code_execution, a refusing stub is
+ * no option: exclusive PTC moves every bridgeable tool behind code_execution, so
+ * the refusal would also hide the allowed ones. A switch between such agents
+ * changes the tool block (one cache miss), as an absent tool does (#5253).
+ *
  * Only policy decides, never capability grants: a least-privilege grants ceiling
  * stubs bridged tools but keeps code_execution as the entry point.
  */
-type CodeExecutionPosture = "allowed" | "refused" | "absent";
-
-function resolveCodeExecutionPosture(
+function policyAllowsPtc(
   tools: Record<string, Tool>,
-  opts: ApplyToolPolicyAndExperimentsOptions,
-  callerLeavesNoTools: boolean
-): CodeExecutionPosture {
-  if (policyLeavesNoTools(tools, opts.effectiveToolPolicy)) return "absent";
-  const allows = (policy: ToolPolicy | undefined) =>
-    applyToolPolicyToNames(["code_execution"], policy).length > 0;
-  if (allows(opts.effectiveToolPolicy)) return "allowed";
-  // A caller no-tools contract hides the switchable agents (see applyPolicy).
-  const advertised =
-    !callerLeavesNoTools && opts.switchableAgentToolPolicies?.some(allows) === true;
-  return advertised ? "refused" : "absent";
-}
-
-/** The model-visible code_execution for a posture that runs PTC. */
-function codeExecutionForPosture(
-  tool: Tool,
-  posture: Exclude<CodeExecutionPosture, "absent">,
-  opts: ApplyToolPolicyAndExperimentsOptions
-): Tool {
-  return posture === "allowed"
-    ? tool
-    : refuseToolForAgent(
-        "code_execution",
-        tool,
-        opts.activeAgentId ?? "the current",
-        opts.callerToolPolicy
-      );
+  activePolicy: ToolPolicy | undefined
+): boolean {
+  return (
+    !policyLeavesNoTools(tools, activePolicy) &&
+    applyToolPolicyToNames(["code_execution"], activePolicy).length > 0
+  );
 }
 
 /**
@@ -349,20 +327,17 @@ export async function applyToolPolicyAndExperiments(
   // RLM rides the PTC parent flag: this flag is only read inside the PTC
   // branch below, so RLM alone (PTC off) is inert by construction.
   const rlmActive = experiments?.rlm === true;
-  // Policy decides whether PTC runs (see resolveCodeExecutionPosture): a
-  // policy that disables every tool (e.g. auto-compaction's `.*` disable rule,
-  // inherited alongside the original send's experiment flags) or denies the
-  // code_execution name gets no working code_execution. Decided on policy,
-  // not on the grant-filtered tools, so a least-privilege grants ceiling
-  // (which stubs, not disables) keeps code_execution as the bridge entry
-  // point. The ACTIVE policy decides: the advertised union may hold refused
-  // tools. A caller no-tools contract also hides the switchable agents.
-  const codeExecutionPosture = resolveCodeExecutionPosture(
-    allToolsWithExtra,
-    opts,
-    callerLeavesNoTools
-  );
-  if (experiments?.programmaticToolCalling && codeExecutionPosture !== "absent") {
+  // Policy decides whether PTC runs (see policyAllowsPtc): a policy that
+  // disables every tool (e.g. auto-compaction's `.*` disable rule, inherited
+  // alongside the original send's experiment flags) or denies the
+  // code_execution name gets the flat tools. Decided on policy, not on the
+  // grant-filtered tools, so a least-privilege grants ceiling (which stubs, not
+  // disables) keeps code_execution as the bridge entry point. The ACTIVE policy
+  // decides: the advertised union may hold refused tools.
+  if (
+    experiments?.programmaticToolCalling &&
+    policyAllowsPtc(allToolsWithExtra, effectiveToolPolicy)
+  ) {
     try {
       // Lazy-load PTC modules only when experiments are enabled
       const ptc = await getPTCModules();
@@ -454,9 +429,8 @@ export async function applyToolPolicyAndExperiments(
       );
 
       // code_execution is the only way to use bridged tools, so it exists
-      // whenever PTC runs. Policy decides whether PTC runs and whether this
-      // agent may call it (resolveCodeExecutionPosture, #7028); a refused
-      // code_execution reaches no bridged tool. nonBridgeable is policy-filtered but
+      // whenever PTC runs; policy decides whether PTC runs (policyAllowsPtc,
+      // #7028). nonBridgeable is policy-filtered but
       // comes from the PRE-grant bridge input, so re-apply the grants ceiling here to
       // keep grant-denied non-bridgeable tools out of the model-visible set.
       const nonBridgeable = opts.capabilityGrants
@@ -466,7 +440,7 @@ export async function applyToolPolicyAndExperiments(
         ...nonBridgeable,
         ...requiredTools,
         ...(promptGet !== undefined ? { mcp_prompt_get: promptGet } : {}),
-        code_execution: codeExecutionForPosture(codeExecutionTool, codeExecutionPosture, opts),
+        code_execution: codeExecutionTool,
       };
 
       // RLM-only model surface: ID-addressed rollback of journaled harness

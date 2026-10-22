@@ -486,9 +486,6 @@ describe("a policy that denies code_execution stops PTC (#7028)", () => {
     return { allTools, calls };
   }
 
-  const shape = (tools: Record<string, Tool>) =>
-    JSON.stringify(Object.entries(tools).map(([name, tool]) => [name, tool.description]));
-
   test("with no agent allowing it, the model gets the policy-filtered flat tools", async () => {
     const { allTools } = toolsWithSideEffect();
     const tools = await applyToolPolicyAndExperiments({
@@ -539,39 +536,29 @@ describe("a policy that denies code_execution stops PTC (#7028)", () => {
     expect(Object.keys(tools)).toEqual(["file_read"]);
   });
 
+  // Exclusive PTC moves bridgeable tools behind code_execution, so a refused
+  // code_execution would also hide the allowed tools behind it. An active deny
+  // therefore gives flat tools even when another switchable agent allows
+  // code_execution: one cache miss on that switch is the price (#5253).
   test.each([
-    [
-      "the active agent",
-      undefined,
-      "Tool 'code_execution' is not allowed in quiet mode. Switch agents to use it.",
-    ],
-    ["the caller", denyCodeExecution, "Tool 'code_execution' is disabled for this turn."],
+    ["the active agent", undefined],
+    ["the caller", denyCodeExecution],
   ] as const)(
-    "a deny by %s keeps code_execution advertised but refuses it",
-    async (_label, callerToolPolicy, error) => {
-      const assembleFor = async (effectiveToolPolicy: typeof denyCodeExecution | undefined) => {
-        const { allTools, calls } = toolsWithSideEffect();
-        const tools = await applyToolPolicyAndExperiments({
-          allTools,
-          effectiveToolPolicy,
-          // Another switchable agent allows code_execution, so the tool block
-          // must not change when the user switches to it (#5253).
-          switchableAgentToolPolicies: [callerToolPolicy ? [] : denyCodeExecution, []],
-          callerToolPolicy,
-          activeAgentId: "quiet",
-          experiments: { programmaticToolCalling: true },
-          emitNestedToolEvent: () => undefined,
-        });
-        return { tools, calls };
-      };
-      const allowed = await assembleFor(undefined);
-      const denied = await assembleFor(denyCodeExecution);
-
-      expect(shape(denied.tools)).toBe(shape(allowed.tools));
-      expect(
-        await denied.tools.code_execution.execute!({ code: "return mux.mutate({});" }, options)
-      ).toEqual({ success: false, error });
-      expect(denied.calls).toEqual([]);
+    "a deny by %s gives flat tools even when another agent allows code_execution",
+    async (_label, callerToolPolicy) => {
+      const { allTools, calls } = toolsWithSideEffect();
+      const tools = await applyToolPolicyAndExperiments({
+        allTools,
+        effectiveToolPolicy: denyCodeExecution,
+        switchableAgentToolPolicies: [callerToolPolicy ? [] : denyCodeExecution, []],
+        callerToolPolicy,
+        activeAgentId: "quiet",
+        experiments: { programmaticToolCalling: true },
+        emitNestedToolEvent: () => undefined,
+      });
+      expect(Object.keys(tools)).toEqual(["mutate", "file_read"]);
+      expect(await tools.mutate.execute!({}, options)).toEqual({ success: true });
+      expect(calls).toHaveLength(1);
     }
   );
 });
