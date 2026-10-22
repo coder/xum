@@ -188,7 +188,8 @@ def new_pairs(
     A form made only of added lines can still be old code that moved from
     another file (or from another place git did not pair). It stands for a
     removed base form (one that no head form maps back to) that it matches,
-    so moving a function does not report its old pairs as new.
+    one moved form per removed form, so moving a function does not report its
+    old pairs as new.
     """
 
     own = {
@@ -199,28 +200,28 @@ def new_pairs(
     kept = {id(base) for base in own.values() if base is not None}
     removed = [base for forms in base_by_path.values() for base in forms if id(base) not in kept]
 
-    cache: dict[int, list[Form]] = {}
+    # One-to-one: each removed form stands for at most one moved form. In head
+    # order, each form without a counterpart takes its best unclaimed match,
+    # so two removed duplicates cover two moved copies and a third copy is new.
+    moved: dict[int, Form] = {}
+    unclaimed = list(removed)
+    lost = [f for f in head.values() if f.path in changed_paths and own[id(f)] is None]
+    for form in sorted(lost, key=lambda f: (f.path, f.start_line)):
+        scored = [(score, -i) for i, base in enumerate(unclaimed) if (score := similar(form.fingerprints, base.fingerprints, threshold))]
+        if scored:
+            moved[id(form)] = unclaimed.pop(-max(scored)[1])
 
-    def at_base(form: Form) -> list[Form]:
-        """The base forms that `form` can stand for: itself if its file did not
-        change, its counterpart, or else every removed form it matches (so two
-        old duplicates moved together can each take a different one)."""
-
+    def at_base(form: Form) -> Form | None:
         if form.path not in changed_paths:
-            return [form]
-        if own[id(form)] is not None:
-            return [own[id(form)]]
-        if id(form) not in cache:
-            cache[id(form)] = [base for base in removed if similar(form.fingerprints, base.fingerprints, threshold)]
-        return cache[id(form)]
+            return form
+        return own[id(form)] or moved.get(id(form))
 
     def matched_before(left: Form, right: Form) -> bool:
+        left_base, right_base = at_base(left), at_base(right)
         # Two distinct base forms: one base function split in two is not an old pair.
-        return any(
-            lb is not rb and similar(lb.fingerprints, rb.fingerprints, threshold)
-            for lb in at_base(left)
-            for rb in at_base(right)
-        )
+        if left_base is None or right_base is None or left_base is right_base:
+            return False
+        return similar(left_base.fingerprints, right_base.fingerprints, threshold) is not None
 
     pairs: dict[tuple[str, str], dict] = {}
     items = list(head.items())
