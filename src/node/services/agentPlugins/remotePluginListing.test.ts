@@ -5,7 +5,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createMemoryPluginFs } from "./memoryPluginFs";
 import { discoverAgentPluginsIn } from "./discovery";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
-import { MAX_REMOTE_PLUGIN_ENTRIES, parseRemotePluginListing } from "./remotePluginListing";
+import {
+  MAX_REMOTE_PLUGIN_ENTRIES,
+  parseRemotePluginListing,
+  parseTarFiles,
+} from "./remotePluginListing";
 
 let root: string;
 
@@ -28,15 +32,17 @@ async function writeFiles(files: Record<string, string>): Promise<string[]> {
   return written;
 }
 
+/** A real (GNU) tar of `files`. */
+function tarOf(files: string[]): Buffer {
+  return Bun.spawnSync(["tar", "-cf", "-", "-T", "-"], {
+    stdin: Buffer.from(files.join("\n") + "\n"),
+    stderr: "ignore",
+  }).stdout;
+}
+
 /** A listing like the remote script prints, with a real (GNU) tar of `tarred` files. */
 function listing(lines: string[], tarred: string[]): string {
-  const tar =
-    tarred.length === 0
-      ? ""
-      : Bun.spawnSync(["tar", "-cf", "-", "-T", "-"], {
-          stdin: Buffer.from(tarred.join("\n") + "\n"),
-          stderr: "ignore",
-        }).stdout.toString("base64");
+  const tar = tarred.length === 0 ? "" : tarOf(tarred).toString("base64");
   const base64 = tar.match(/.{1,76}/g) ?? [];
   return [...lines, `ROOT\t\t${root}`, "T", ...base64, ".", "END", ""].join("\n");
 }
@@ -87,6 +93,12 @@ describe("parseRemotePluginListing", () => {
     // A file that vanished before tar ran, and a member that was never listed.
     expect(parseRemotePluginListing(listing(both, [a]))).toBeNull();
     expect(parseRemotePluginListing(listing([`F\t\t${a}`], [a, b]))).toBeNull();
+    // One path archived twice (two walks of one tree): the same bytes are fine, changed ones are
+    // refused. Each member of a small file is one header block plus one data block.
+    const once = tarOf([a]);
+    expect(parseTarFiles(Buffer.concat([once.subarray(0, 1024), once]))?.size).toBe(1);
+    await fs.writeFile(a, "changed");
+    expect(parseTarFiles(Buffer.concat([once.subarray(0, 1024), tarOf([a])]))).toBeNull();
     // A directory member (a listed file replaced by a directory) is not a regular file.
     expect(parseRemotePluginListing(listing([`F\t\t${a}`], [path.join(root, "p")]))).toBeNull();
   });
