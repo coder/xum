@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
 import { describe, expect, test } from "bun:test";
 
 import { SKILLS_CLI_PACKAGE, skillsCliArgs, skillsCliCommandResult } from "./skillsCli";
