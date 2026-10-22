@@ -545,6 +545,8 @@ const AddPluginPanel: React.FC<{
   });
   /** The "Skills CLI" choice of the Install as picker: not a managed install. */
   const [cliChosen, setCliChosen] = useState(false);
+  // A Skills CLI run locks the method choice (SkillsCliInstall onRunningChange).
+  const [cliRunning, setCliRunning] = useState(false);
 
   /** `method`: the Install as choice; null takes the first method that fits. */
   const handlePreview = async (method: AgentPluginInstallMethod | null) => {
@@ -699,7 +701,7 @@ const AddPluginPanel: React.FC<{
             preview={preview}
             cliOffered={offersSkillsCli({ input, ref, subpath, skills: preview.skillsCliSkills })}
             cliChosen={cliChosen}
-            disabled={busy}
+            disabled={busy || cliRunning}
             onPickCurrent={() => {
               // A changed method clears the error of the previous one.
               setError(null);
@@ -719,6 +721,7 @@ const AddPluginPanel: React.FC<{
               source={input.trim()}
               skills={preview.skillsCliSkills}
               onBack={backToSource}
+              onRunningChange={setCliRunning}
             />
           ) : (
             <>

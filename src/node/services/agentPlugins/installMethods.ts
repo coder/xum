@@ -183,8 +183,11 @@ async function walkSkillParent(
     // Symlinks are followed only while they stay inside the tree.
     const real = await containedDirectory(ctx.rootReal, path.join(dirReal, name));
     if (real === undefined) continue;
-    if (await holdsSkillFile(ctx.rootReal, real)) skills.push(name);
-    else if (depth < maxDepth) groups.push({ name, real });
+    if (await holdsSkillFile(ctx.rootReal, real)) {
+      // As in the CLI (tryAddSkillAt): a SKILL.md that does not parse is no skill, and the
+      // walk does not go below it.
+      if ((await readSkillsCliName(ctx.rootReal, real)) !== undefined) skills.push(name);
+    } else if (depth < maxDepth) groups.push({ name, real });
   }
   // A walk again from a smaller depth finds the same children: record them once.
   if (skills.length > 0 && seenDepth === undefined) ctx.roots.push({ root: relative, skills });
@@ -255,7 +258,9 @@ export async function findSkillsPackageRoots(dir: string): Promise<SkillsPackage
       // Discovery reads a declared path that holds SKILL.md as one skill, so the folders
       // below it are not skills either.
       ctx.visited.set(real, 0);
-      ctx.roots.push({ root: container, skills: [path.posix.basename(container)] });
+      if ((await readSkillsCliName(rootReal, real)) !== undefined) {
+        ctx.roots.push({ root: container, skills: [path.posix.basename(container)] });
+      }
       continue;
     }
     await walkSkillParent(ctx, container, real, 1, MAX_CONTAINER_DEPTH);
@@ -430,18 +435,22 @@ export async function skillsCliSkillNames(
 ): Promise<{ names: string[]; warnings: string[] }> {
   const rootReal = await fsPromises.realpath(stagedDir);
   const names: string[] = [];
+  // One folder can be listed twice (`skills/SKILL.md` is a root child and the `skills`
+  // container), so each canonical folder counts once before the shared-name check below.
+  const seen = new Set<string>();
+  const add = async (dir: string): Promise<boolean> => {
+    const name = await readSkillsCliName(rootReal, dir);
+    if (name === undefined) return false;
+    const real = await fsPromises.realpath(dir);
+    if (!seen.has(real)) names.push(name);
+    seen.add(real);
+    return true;
+  };
   for (const root of roots) {
     const rootDir = path.join(rootReal, root.root);
     // A root that holds SKILL.md is one skill (the repository root, or a container path).
-    const own = await readSkillsCliName(rootReal, rootDir);
-    if (own !== undefined) {
-      names.push(own);
-      continue;
-    }
-    for (const skill of root.skills) {
-      const name = await readSkillsCliName(rootReal, path.join(rootDir, skill));
-      if (name !== undefined) names.push(name);
-    }
+    if (await add(rootDir)) continue;
+    for (const skill of root.skills) await add(path.join(rootDir, skill));
   }
   const valid = names.filter((name) => SkillNameSchema.safeParse(name).success);
   const shared = new Set(valid.filter((name, index) => valid.indexOf(name) !== index));
