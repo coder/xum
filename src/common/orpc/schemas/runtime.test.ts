@@ -94,7 +94,6 @@ describe("RuntimeConfigSchema ssh backends", () => {
       memoryGiB: 4,
       diskGiB: 10,
       target: "eu",
-      shared: false,
       forked: true,
     };
     expect(RuntimeConfigSchema.parse({ ...ssh, daytona })).toEqual({ ...ssh, daytona });

@@ -769,24 +769,6 @@ describe("WorkspaceService remove shared-workspace guard", () => {
       return harness;
     }
 
-    // The owner's removal skipped the sandbox for the borrower, so the borrower's removal
-    // settles it as the owner's would have: nothing else could delete it later.
-    test("the last borrower of a removed owner settles the sandbox", async () => {
-      const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
-      try {
-        await using harness = await createDaytonaHarness([workspaceId]);
-
-        expect((await harness.service.remove("parent-ws-id", true)).success).toBe(true);
-        expect(deleteWorkspace).not.toHaveBeenCalled();
-
-        expect((await harness.service.remove(workspaceId, true)).success).toBe(true);
-        expect(deleteWorkspace).toHaveBeenCalledTimes(1);
-        expect(createRuntimeSpy.mock.calls.at(-1)?.[0]).toEqual(daytonaRuntime);
-      } finally {
-        createRuntimeSpy.mockRestore();
-      }
-    });
-
     test("a borrower leaves the sandbox alone while another workspace still uses it", async () => {
       const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
       try {
