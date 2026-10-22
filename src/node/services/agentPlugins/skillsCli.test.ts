@@ -74,7 +74,7 @@ test("the command holds only validated arguments; invalid input is the error bra
   ).toEqual({
     success: true,
     data: {
-      command: `${process.platform === "win32" ? 'cd /d "%USERPROFILE%" &&' : "cd ~ &&"} npx --yes ${SKILLS_CLI_PACKAGE} add git@github.com:anthropics/skills.git --skill pdf --global --agent codex --copy`,
+      command: `${process.platform === "win32" ? "" : "cd ~ && "}npx --yes ${SKILLS_CLI_PACKAGE} add git@github.com:anthropics/skills.git --skill pdf --global --agent codex --copy`,
     },
   });
   for (const input of [
@@ -84,6 +84,15 @@ test("the command holds only validated arguments; invalid input is the error bra
   ]) {
     expect(skillsCliCommandResult(input).success).toBe(false);
   }
+});
+
+// Windows terminals differ (cmd.exe, PowerShell 5 and 7, Git Bash), and no folder-change prefix
+// works in all of them, so the Windows command has none: Settings asks the user to run it from
+// the home folder instead.
+test("the Windows command has no shell-specific prefix", () => {
+  const command = skillsCliCommand({ source: REPO, skills: ["pdf"] }, "win32");
+  expect(command.startsWith("npx --yes ")).toBe(true);
+  expect(skillsCliCommand({ source: REPO, skills: ["pdf"] }, "darwin")).toBe(`cd ~ && ${command}`);
 });
 
 // npx prefers a matching package in the working folder's node_modules over the registry, so the

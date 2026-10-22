@@ -94,19 +94,16 @@ function formatCommand(argv: string[]): string {
 /**
  * SECURITY: `npx skills@<version>` prefers a matching package in the working folder's
  * node_modules over the registry, so the copied command run inside an attacker's checkout would
- * start the attacker's copy. The command therefore changes to the home folder first; `&&` stops
- * it when that fails. A fixed constant per shell, never built from input.
+ * start the attacker's copy. On macOS and Linux the command changes to the home folder first
+ * (`&&` stops it when that fails); `cd ~ &&` works in bash, zsh and fish. Windows has no prefix
+ * that works in cmd.exe, Windows PowerShell 5, PowerShell 7 and Git Bash alike, so there the
+ * command has none and Settings tells the user to run it from the home folder.
  */
-const SKILLS_CLI_CWD_PREFIX = {
-  posix: "cd ~ &&",
-  // cmd.exe has no `~`; `/d` also switches the drive.
-  win32: 'cd /d "%USERPROFILE%" &&',
-} as const;
+const SKILLS_CLI_POSIX_CWD_PREFIX = "cd ~ &&";
 
 /**
  * The command for `input`: validated source and skill names only. Throws a user-facing error for
- * invalid input. `platform` picks the shell syntax of the folder change (the user's terminal runs
- * on the same machine as the Xum backend).
+ * invalid input. `platform` is the user's machine (the terminal runs where the Xum backend runs).
  */
 export function skillsCliCommand(
   input: { source: string; skills: string[] },
@@ -119,8 +116,8 @@ export function skillsCliCommand(
     args.every((arg) => SKILLS_CLI_SAFE_ARG_PATTERN.test(arg)),
     "skillsCliCommand: every argument must be safe to show unquoted in any shell"
   );
-  const prefix = platform === "win32" ? SKILLS_CLI_CWD_PREFIX.win32 : SKILLS_CLI_CWD_PREFIX.posix;
-  return `${prefix} ${formatCommand(["npx", ...args])}`;
+  const command = formatCommand(["npx", ...args]);
+  return platform === "win32" ? command : `${SKILLS_CLI_POSIX_CWD_PREFIX} ${command}`;
 }
 
 /** The ORPC shape: invalid input becomes the error branch. */

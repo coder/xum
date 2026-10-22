@@ -259,8 +259,8 @@ export const SkillsCliInstall: React.FC<{
       {cli.command !== null && (
         <div className="space-y-1">
           <p className="text-muted text-xs">
-            Run this command in a terminal. It starts in your home folder, so npx cannot pick up a
-            skills package from a project&apos;s node_modules.
+            Run this command in a terminal, from your home folder. Inside a project, npx would
+            prefer a skills package from that project&apos;s node_modules.
           </p>
           <div className="bg-modal-bg border-border-medium flex items-start gap-2 rounded border px-2 py-1.5">
             <code className="text-foreground min-w-0 flex-1 font-mono text-[11px] break-all">
