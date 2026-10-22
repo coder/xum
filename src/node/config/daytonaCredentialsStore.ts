@@ -152,19 +152,34 @@ export class DaytonaCredentialsStore {
     this.env = env;
   }
 
-  /** A missing or malformed file reads as empty (self-healing): the user can re-enter the key. */
+  /**
+   * A missing or malformed file reads as empty (self-healing): the user can re-enter the key.
+   * So does one that cannot be read, here only: this is for using and showing the settings.
+   */
   async read(): Promise<DaytonaStoredCredentials> {
+    try {
+      return await this.readSaved();
+    } catch (error) {
+      log.warn("Failed to read Daytona credentials file", {
+        filePath: this.filePath,
+        error: getErrorMessage(error),
+      });
+      return {};
+    }
+  }
+
+  /**
+   * As read, but a read that fails for another reason than a missing file (an I/O error, a
+   * permission problem) throws: an update writes the whole file back, and taking such a read
+   * as empty would drop the saved key, URL and target.
+   */
+  private async readSaved(): Promise<DaytonaStoredCredentials> {
     let raw: string;
     try {
       raw = await fs.readFile(this.filePath, "utf-8");
     } catch (error) {
-      if (!isErrnoWithCode(error, "ENOENT")) {
-        log.warn("Failed to read Daytona credentials file", {
-          filePath: this.filePath,
-          error: getErrorMessage(error),
-        });
-      }
-      return {};
+      if (isErrnoWithCode(error, "ENOENT")) return {};
+      throw error;
     }
     const stored = parseStoredCredentials(raw);
     if (!stored) {
@@ -199,7 +214,7 @@ export class DaytonaCredentialsStore {
       timeoutMessage: "Another Xum process is saving Daytona settings.",
     });
     try {
-      const next = applyPatch(await this.read(), patch);
+      const next = applyPatch(await this.readSaved(), patch);
       await writeFileAtomic(this.filePath, JSON.stringify(next, null, 2), {
         encoding: "utf-8",
         mode: 0o600,

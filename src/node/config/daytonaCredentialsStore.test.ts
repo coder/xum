@@ -110,6 +110,30 @@ describe("DaytonaCredentialsStore", () => {
     expect((await store.resolve())?.apiKey).toBe(KEY);
   });
 
+  it("keeps the saved settings when the file cannot be read for an update", async () => {
+    const store = new DaytonaCredentialsStore(rootDir, {});
+    await store.update({ apiKey: KEY, apiUrl: "https://byoc.example.com/api", target: "eu" });
+    const file = path.join(rootDir, "daytona.json");
+
+    // A read that fails for another reason than absence (here: a permission problem).
+    await fs.chmod(file, 0o000);
+    let refusal: unknown;
+    try {
+      await store.update({ target: "us" });
+    } catch (error) {
+      refusal = error;
+    } finally {
+      await fs.chmod(file, 0o600);
+    }
+
+    expect(refusal).toBeInstanceOf(Error);
+    expect(await store.resolve()).toMatchObject({
+      apiKey: KEY,
+      apiUrl: "https://byoc.example.com/api",
+      target: "eu",
+    });
+  });
+
   it("refuses a stored API URL that does not validate instead of sending the key elsewhere", async () => {
     for (const apiUrl of ["not a url", "http://byoc.example.com/api"]) {
       await fs.writeFile(
