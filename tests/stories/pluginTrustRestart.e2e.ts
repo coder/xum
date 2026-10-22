@@ -58,7 +58,7 @@ test(
     await xum.restartServer();
     await app.open();
     // exact steps: the replay ran its taps, its end-state check misread the open review, and
-    // Haiku 5.5 then toggled the review closed (PR lane, runs 39656243674; #7070: 3 of 10 warm).
+    // Haiku 5.5 then toggled the review closed (PR lane, run 39656243674; #7070: 3 of 10 warm).
     // The button names of SettingsButton.tsx, SettingsPage.tsx and PluginsSettingsSection.tsx.
     await screen.getByTestId("settings-button").tap();
     await settings.getByRole("button", "Plugins").tap();
