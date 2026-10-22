@@ -551,6 +551,24 @@ function getOnlyTab(node: RightSidebarLayoutNode): TabType | null {
   return node.type === "tabset" && node.tabs.length === 1 ? node.tabs[0] : null;
 }
 
+interface LastTabClose {
+  /** Tabs that go with this one: one metadata update can drop several side chats. */
+  alsoRemoved: readonly TabType[];
+  /** Whether the sidebar held focus when a close that resolves later (a side chat's) began. */
+  heldFocus: boolean;
+}
+
+const SINGLE_TAB_CLOSE: LastTabClose = { alsoRemoved: [], heldFocus: false };
+
+/**
+ * Whether focus is in `container`, or fell to <body> after a close began there (`heldFocus`): a
+ * side chat's composer can unmount before its close resolves, when its metadata goes first.
+ */
+function holdsFocus(container: Element | null, heldFocus = false): boolean {
+  const active = document.activeElement;
+  return container?.contains(active) === true || (heldFocus && active === document.body);
+}
+
 /**
  * User request: closing the last tab closes the sidebar instead of showing the New tab in its
  * place; the layout still falls back to the New tab, for the next expand. The returned function
@@ -568,11 +586,12 @@ function useLastTabClosesSidebar(options: {
   fullscreen: boolean;
   onCloseFullscreen: (() => void) | undefined;
   containerRef: React.RefObject<HTMLDivElement>;
-}): React.MutableRefObject<(tab: TabType, alsoRemoved?: readonly TabType[]) => boolean> {
+}): React.MutableRefObject<(tab: TabType, close?: LastTabClose) => boolean> {
   // The shell whose toggle takes focus once the collapse commits (see below).
   const deferredToggleFocusRef = React.useRef<Element | null>(null);
   const closedSinceCommitRef = React.useRef<TabType[]>([]);
-  const closeSidebarIfLastTab = (tab: TabType, alsoRemoved: readonly TabType[] = []): boolean => {
+  const closeSidebarIfLastTab = (tab: TabType, close = SINGLE_TAB_CLOSE): boolean => {
+    const { alsoRemoved } = close;
     const others = [...closedSinceCommitRef.current, ...alsoRemoved].filter((t) => t !== tab);
     closedSinceCommitRef.current.push(tab, ...alsoRemoved);
     const left = others.reduce((acc, t) => removeTabEverywhere(acc, t), options.layout);
@@ -583,7 +602,7 @@ function useLastTabClosesSidebar(options: {
     }
     // The collapse unmounts the panel, and focus inside it would fall to <body>.
     const container = options.containerRef.current;
-    if (container?.contains(document.activeElement) === true) {
+    if (container != null && holdsFocus(container, close.heldFocus)) {
       const shell = container.closest("[data-workspace-shell]");
       focusRightSidebarToggle(shell);
       // A pinned view (Artifacts fullscreen, a maximized App View tab) keeps the toggle inert
@@ -2182,10 +2201,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const { workspaceMetadata: allWorkspaceMetadata, loaded: workspaceMetadataLoaded } =
     workspaceMetadataContext;
 
-  // Side chat tabs closed here whose removal has not settled. Their metadata goes before the
-  // removal resolves, so the stale-tab cleanup below usually drops the tab first, and it then
-  // closes the sidebar as the close would.
-  const closingSideChatTabsRef = React.useRef(new Set<TabType>());
+  // Side chat tabs closed here whose removal has not settled, each with whether the sidebar held
+  // focus when its close began. Their metadata goes before the removal resolves, so the stale-tab
+  // cleanup below usually drops the tab first, and it then closes the sidebar as the close would.
+  const closingSideChatTabsRef = React.useRef(new Map<TabType, boolean>());
 
   // Persisted tab ids are untrusted: a corrupt side:<id> must never force-delete an ordinary
   // workspace or another chat's child. Keep valid tabs until removal succeeds so failures retry.
@@ -2203,7 +2222,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         return;
       }
       if (api == null) return;
-      closingSideChatTabsRef.current.add(tab);
+      closingSideChatTabsRef.current.set(tab, holdsFocus(sidebarContainerRef.current));
       api.workspace
         .remove({ workspaceId: id, options: { force: true } })
         .then((result) => {
@@ -2249,8 +2268,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     });
     if (staleTabs.length === 0) return;
     // One metadata update can drop several side chats: decide on the layout without all of them.
-    const closing = staleTabs.find((tab) => closingSideChatTabsRef.current.has(tab));
-    if (closing != null) closeSidebarIfLastTabRef.current(closing, staleTabs);
+    const closingTabs = closingSideChatTabsRef.current;
+    const closing = staleTabs.find((tab) => closingTabs.has(tab));
+    if (closing != null) {
+      closeSidebarIfLastTabRef.current(closing, {
+        alsoRemoved: staleTabs,
+        heldFocus: staleTabs.some((tab) => closingTabs.get(tab) === true),
+      });
+    }
     setLayout((prev) => staleTabs.reduce((acc, tab) => removeTabEverywhere(acc, tab), prev));
   }, [
     allWorkspaceMetadata,

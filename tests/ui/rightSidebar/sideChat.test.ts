@@ -769,6 +769,52 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     }
   }, 90_000);
 
+  test("closing the last side chat from its composer focuses the toggle when its metadata goes first", async () => {
+    const app = await createAppHarness({ branchPrefix: "side-close-focus" });
+    const service = app.env.services.toORPCContext().workspaceService;
+    const realRemove = service.remove.bind(service);
+    const remove = jest.spyOn(service, "remove");
+    // As above: a late init-end refresh would bring the dropped chat back.
+    const refresh = jest.spyOn(service, "refreshAndEmitMetadata");
+    let reply: () => void = () => undefined;
+    const replied = new Promise<void>((resolve) => (reply = resolve));
+    try {
+      await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
+      const id = await waitForSideChatId(app);
+      const composer = await waitFor(() => getSideComposer(app, id), { timeout: 10_000 });
+      await waitFor(() =>
+        expect(refresh.mock.calls.map(([workspaceId]) => workspaceId)).toContain(id)
+      );
+      await Promise.all(
+        refresh.mock.results.flatMap((result) => (result.type === "return" ? [result.value] : []))
+      );
+      // The real discard drops the chat's metadata, which unmounts its composer, and its reply
+      // waits: focus has already left the sidebar when the close resolves.
+      remove.mockImplementation(async (...args) => {
+        const result = await realRemove(...args);
+        await replied;
+        return result;
+      });
+      composer.focus();
+      fireEvent.keyDown(composer, { key: "w", ctrlKey: true });
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(1));
+
+      await waitFor(() => expect(getSavedSidebarTabs(app)).toEqual([NEW_TAB]), { timeout: 10_000 });
+      expect(readPersistedState(getRightSidebarCollapsedKey(app.workspaceId), false)).toBe(true);
+      const expectToggleFocused = () =>
+        expect(document.activeElement?.getAttribute("aria-label")).toBe("Expand right sidebar");
+      await waitFor(expectToggleFocused);
+      // The late reply leaves focus there.
+      await act(async () => reply());
+      expectToggleFocused();
+    } finally {
+      reply();
+      refresh.mockRestore();
+      remove.mockRestore();
+      await app.dispose();
+    }
+  }, 90_000);
+
   test("corrupt side tabs never force-delete an ordinary workspace", async () => {
     let remove: jest.SpyInstance | undefined;
     const app = await createAppHarness({
