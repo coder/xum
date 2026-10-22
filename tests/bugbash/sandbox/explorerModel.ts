@@ -21,8 +21,8 @@ export function proxyModel(env: NodeJS.ProcessEnv = process.env, variable = "BUG
 /**
  * The story agents' judge (`agents.<name>.judge`): BUGBASH_JUDGE_MODEL through the proxy, or
  * undefined (e2e then judges with the agent's own model). The cheap PR lane drives with Haiku 5.5,
- * which misjudged screenshots (#7185: it passed 44px checkboxes and a wrapped meta row), so its
- * asserts go to a stronger model.
+ * which missed layout defects on screenshots (it passed 44px checkboxes and a wrapped meta row),
+ * so its asserts go to a stronger model.
  */
 export function proxyJudgeModel(env: NodeJS.ProcessEnv = process.env) {
   return (env.BUGBASH_JUDGE_MODEL ?? "") === ""

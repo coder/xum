@@ -836,8 +836,8 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     with:
       model: anthropic:claude-haiku-5-5
-      # Haiku misjudged screenshots (#7185: 21 of 25 defects caught, Sonnet 25 of 25), so Sonnet
-      # judges the story asserts. Haiku still drives the steps.
+      # Haiku missed layout defects on screenshots (caught 21 of 25 on a bug build, Sonnet 25 of
+      # 25), so Sonnet judges the story asserts. Haiku still drives the steps.
       judge_model: anthropic:claude-sonnet-5-5
       budget_usd: "1"
 
