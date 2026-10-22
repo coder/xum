@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 
@@ -17,13 +17,15 @@ describe("TutorialTooltip", () => {
     cleanupDom = null;
   });
 
-  function renderTooltip() {
+  // Before the bubble opens, focus is on a header button by default: a control the user clicked.
+  function renderTooltip(focusBefore: "button" | "composer" = "button") {
     const onNext = mock(() => undefined);
     const onDismiss = mock(() => undefined);
     const onDisableTutorial = mock(() => undefined);
     const tree = (showTooltip: boolean) => (
       <>
         <div data-tutorial="target">Target</div>
+        <button type="button">Header button</button>
         <textarea aria-label="Composer" />
         {showTooltip && (
           <TutorialTooltip
@@ -39,7 +41,10 @@ describe("TutorialTooltip", () => {
     );
     // The tooltip portals into document.body, which is render()'s default query root.
     const view = render(tree(false));
-    view.getByRole("textbox", { name: "Composer" }).focus();
+    (focusBefore === "composer"
+      ? view.getByRole("textbox", { name: "Composer" })
+      : view.getByRole("button", { name: "Header button" })
+    ).focus();
     view.rerender(tree(true));
     const close = () => view.rerender(tree(false));
     return { view, close, onNext, onDismiss, onDisableTutorial };
@@ -110,6 +115,31 @@ describe("TutorialTooltip", () => {
 
     close();
 
-    expect(document.activeElement).toBe(view.getByRole("textbox", { name: "Composer" }));
+    expect(document.activeElement).toBe(view.getByRole("button", { name: "Header button" }));
+  });
+
+  test("the bubble leaves focus in a composer the user is typing in (#7114)", () => {
+    const { view, close } = renderTooltip("composer");
+    const composer = view.getByRole("textbox", { name: "Composer" });
+
+    expect(document.activeElement).toBe(composer);
+    close();
+    expect(document.activeElement).toBe(composer);
+  });
+
+  test("the bubble does not take focus while a full-screen layer covers it (#7114)", () => {
+    // The full-screen Artifacts and App View panels (z-1500) draw over the bubble. Layout is not
+    // computed here, so the browser's hit test is stubbed to report that panel on top.
+    const panel = document.createElement("div");
+    document.body.appendChild(panel);
+    const hitTest = spyOn(document, "elementFromPoint").mockReturnValue(panel);
+
+    try {
+      const { view } = renderTooltip();
+      expect(document.activeElement).toBe(view.getByRole("button", { name: "Header button" }));
+    } finally {
+      hitTest.mockRestore();
+      panel.remove();
+    }
   });
 });

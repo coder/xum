@@ -2,7 +2,7 @@ import React, { useState, useRef, useLayoutEffect, useEffect, useId } from "reac
 import { createPortal } from "react-dom";
 import { cn } from "@/common/lib/utils";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 
 // The bubble's secondary texts (step counter, body, Skip, opt-out). Plain text-muted on the modal
 // background is below WCAG AA in dark (3.78) and flexoki-light (4.47); 30% of the text color
@@ -35,10 +35,25 @@ interface TooltipPosition {
 }
 
 /**
+ * Whether something is drawn over the bubble: the full-screen Artifacts and App View panels
+ * (z-1500, above the tutorial) are not modal, so they do not trap focus. A hit test needs no list
+ * of such layers. An unknown result (no layout, or the center off screen) counts as uncovered.
+ */
+function isBubbleCovered(bubble: HTMLElement): boolean {
+  const rect = bubble.getBoundingClientRect();
+  const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  return hit != null && !bubble.contains(hit);
+}
+
+/**
  * Moves focus into the bubble once it is on screen (a hidden element cannot take focus), so
  * Escape, Skip and Next work from the keyboard (#5701). Later steps keep focus on the control that
  * advanced them. When the bubble closes and leaves focus on the body, focus goes back to where it
  * was. An open modal dialog traps focus, so the bubble cannot take it from one.
+ *
+ * It leaves focus alone in a text field, where the user may be typing (keys such as Escape would
+ * otherwise skip a tutorial they never chose to act on), and under a layer that covers the bubble,
+ * where Escape would skip a tutorial the user cannot see (#7114). The bubble stays clickable.
  */
 function useBubbleFocus(
   tooltipRef: React.RefObject<HTMLDivElement | null>,
@@ -48,6 +63,7 @@ function useBubbleFocus(
     const bubble = tooltipRef.current;
     if (!isPositioned || !bubble) return;
     const previous = document.activeElement;
+    if (isEditableElement(previous) || isBubbleCovered(bubble)) return;
     bubble.focus();
     return () => {
       const active = document.activeElement;
