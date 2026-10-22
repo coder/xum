@@ -124,24 +124,29 @@ test(
     await openPlayground(app, screen, browser);
     // The story job's app AI is the mock, whose model name is long enough to wrap.
     await sendMessage(screen, "Touch alignment story: model and time on one line");
-    // The judge needs the reply on screen: wait for a meta row that shows more than the time
-    // (the user's own row shows only the time).
+    // The judge needs this reply's settled meta row on screen. Every story of a run shares the one
+    // seeded workspace, so wait on this reply's own block: an earlier story's reply has a meta row
+    // too (Stories (Haiku) on #7185 judged this reply while it was still starting).
     await expect
       .poll(
         () =>
-          browser.evaluate(
-            () =>
-              Array.from(document.querySelectorAll("[data-message-meta-right]")).filter(
-                (row) => row.childElementCount >= 2 && row.querySelector("[data-message-timestamp]")
-              ).length
-          ),
+          browser.evaluate(() => {
+            const reply = Array.from(document.querySelectorAll("[data-message-block]"))
+              .filter((block) =>
+                block.textContent?.includes("Mock response: Touch alignment story")
+              )
+              .at(-1);
+            const time = reply?.querySelector("[data-message-meta-right] [data-message-timestamp]");
+            time?.scrollIntoView({ block: "center" });
+            return time != null;
+          }),
         { timeout: 20_000 }
       )
-      .toBeGreaterThan(0);
+      .toBe(true);
     await applyTouchPointerRules(browser);
     // Before the fix (#5834) the model and the time sat on two lines, 24px apart.
     await agent.assert(
-      "under the newest assistant reply, the model name and the time are on one single line",
+      "under the assistant reply that starts 'Mock response: Touch alignment story', the model name and the time are on one single line",
       { vision: "only" }
     );
   }
