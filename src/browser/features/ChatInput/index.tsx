@@ -707,7 +707,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   });
 
   const voiceInputUnavailableMessage =
-    "Voice input requires an OpenAI API key. Configure in Settings → Providers.";
+    "Voice input requires an enabled OpenAI provider with an API key. Configure in Settings → Providers.";
 
   // Start creation tutorial when entering creation mode
   useEffect(() => {

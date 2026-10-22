@@ -87,7 +87,7 @@ export const VoiceInputButton: React.FC<VoiceInputButtonProps> = (props) => {
           </>
         ) : notConfigured ? (
           <>
-            Voice input requires an OpenAI API key.
+            Voice input requires an enabled OpenAI provider with an API key.
             <br />
             Configure in Settings → Providers.
           </>
