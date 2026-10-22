@@ -116,8 +116,10 @@ describe("the queued card's Edit during an open edit (#5934)", () => {
       }, WAIT);
       // It shows as blocked while the edit is open.
       expect(queuedEdit.getAttribute("aria-disabled")).toBe("true");
+      // Counted at the backend: the blocked click must never reach clearQueue. The allowed Edit at
+      // the end reaches it exactly once, so a late clear from this click shows as a second call.
+      const clearQueue = jest.spyOn(app.env.services.workspaceService, "clearQueue");
       fireEvent.click(queuedEdit);
-      await new Promise((resolve) => setTimeout(resolve, 300));
       expect(session.hasQueuedMessages()).toBe(true);
       expect(editTextarea(app)?.value).toBe("edited message");
 
@@ -137,8 +139,10 @@ describe("the queued card's Edit during an open edit (#5934)", () => {
         () => expect(queuedEditButton(app)?.hasAttribute("aria-disabled")).toBe(false),
         WAIT
       );
+      expect(clearQueue).not.toHaveBeenCalled();
       fireEvent.click(queuedEditButton(app)!);
       await waitFor(() => expect(getDraftStore().getText(scope)).toContain("queued Q"), WAIT);
+      expect(clearQueue).toHaveBeenCalledTimes(1);
       await waitFor(() => expect(composerSection(app).textContent).toContain("queued note"), WAIT);
       expect(session.hasQueuedMessages()).toBe(false);
     } finally {
