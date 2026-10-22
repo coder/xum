@@ -67,7 +67,9 @@ const SortableTab: React.FC<{
   item: RightSidebarTabStripItem;
   index: number;
   tabsetId: string;
-}> = ({ item, index, tabsetId }) => {
+  /** The one tab that Tab reaches (roving tabindex); arrow keys reach the others. */
+  isTabStop: boolean;
+}> = ({ item, index, tabsetId, isTabStop }) => {
   // Create a unique sortable ID that encodes tabset + tab
   const sortableId = `${tabsetId}:${item.tab}`;
 
@@ -99,6 +101,9 @@ const SortableTab: React.FC<{
               "group relative flex min-w-0 max-w-[240px] items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1 text-xs font-medium transition-colors duration-150",
               // Let touch users pan the overflowing strip; mouse pointers still drag/reorder.
               "cursor-grab touch-pan-x active:cursor-grabbing",
+              // Arrow keys move focus without selecting (#7102), so the focused tab needs a mark of
+              // its own, like the strip's icon buttons. Inset: the scrolling row clips an outer ring.
+              "focus-visible:ring-accent outline-none focus-visible:ring-1 focus-visible:ring-inset",
               // Reserve the X's space even while hidden: hovering/focusing/selecting a tab must
               // neither cover its text nor change its label width (especially for long titles).
               // Phones reserve row height/padding for the 44px touch X. Tablets keep the desktop
@@ -143,7 +148,7 @@ const SortableTab: React.FC<{
             aria-selected={item.selected}
             aria-controls={item.panelId}
             aria-disabled={item.disabled ? true : undefined}
-            tabIndex={item.disabled ? -1 : (attributes.tabIndex ?? 0)}
+            tabIndex={!item.disabled && isTabStop ? 0 : -1}
           >
             {/* Long labels truncate inside the tab instead of stretching the strip. */}
             <span className="flex min-w-0 items-center gap-1.5 truncate">{item.label}</span>
@@ -351,6 +356,42 @@ const StripEndControls: React.FC<{
   </div>
 );
 
+/** Where each tab-moving key sends focus, from the focused tab's index among `count` tabs. */
+const TAB_STRIP_FOCUS_MOVES: Record<string, (index: number, count: number) => number> = {
+  ArrowLeft: (index, count) => (index - 1 + count) % count,
+  ArrowRight: (index, count) => (index + 1) % count,
+  Home: () => 0,
+  End: (_index, count) => count - 1,
+};
+
+function hasModifierKey(event: React.KeyboardEvent): boolean {
+  return event.altKey || event.ctrlKey || event.metaKey || event.shiftKey;
+}
+
+/**
+ * ArrowLeft/ArrowRight (wrapping), Home and End move focus between the tabs, per the WAI-ARIA
+ * tabs pattern (#7102). They do not select the tab: Enter or Space does (manual activation), so
+ * passing over a tab does not mount its panel (a terminal, the review diff).
+ */
+function handleTabStripKeyDown(event: React.KeyboardEvent<HTMLElement>): void {
+  const move = TAB_STRIP_FOCUS_MOVES[event.key];
+  // Keys from controls inside a tab (close, pop-out) and modified keys keep their own meaning.
+  if (move == null || hasModifierKey(event)) return;
+  const target = event.target;
+  if (!(target instanceof HTMLElement) || target.getAttribute("role") !== "tab") return;
+  const row = event.currentTarget;
+  const tabs = Array.from(
+    row.querySelectorAll<HTMLElement>('[role="tab"]:not([aria-disabled="true"])')
+  );
+  const index = tabs.indexOf(target);
+  if (index < 0) return;
+  event.preventDefault();
+  const next = tabs[move(index, tabs.length)];
+  // Like the All tabs menu: focus() would also scroll the sidebar's overflow-hidden ancestors.
+  next.focus({ preventScroll: true });
+  revealTab(row, next);
+}
+
 /**
  * One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges) while the
  * controls after it stay in view. Its wrapper holds the desktop no-drag box over the row's
@@ -364,36 +405,53 @@ const TabScrollRow: React.FC<{
   items: RightSidebarTabStripItem[];
   tabsetId: string;
   isDesktop: boolean;
-}> = ({ rowRef, ...props }) => (
-  <div className="relative flex min-w-0">
-    {props.isDesktop && (
-      <div aria-hidden className="titlebar-no-drag pointer-events-none absolute inset-0" />
-    )}
-    <div
-      ref={rowRef}
-      data-tab-scroll-row
-      role="tablist"
-      aria-label={props.ariaLabel}
-      className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
-    >
-      {props.items.map((item, index) => (
-        <SortableTab key={item.id} item={item} index={index} tabsetId={props.tabsetId} />
-      ))}
+}> = ({ rowRef, ...props }) => {
+  // Tab reaches the selected tab, or the first enabled one when none is selected.
+  const tabStopId =
+    props.items.find((item) => item.selected && !item.disabled)?.id ??
+    props.items.find((item) => !item.disabled)?.id;
+  return (
+    <div className="relative flex min-w-0">
+      {props.isDesktop && (
+        <div aria-hidden className="titlebar-no-drag pointer-events-none absolute inset-0" />
+      )}
+      <div
+        ref={rowRef}
+        data-tab-scroll-row
+        role="tablist"
+        aria-label={props.ariaLabel}
+        className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
+        onKeyDown={handleTabStripKeyDown}
+      >
+        {props.items.map((item, index) => (
+          <SortableTab
+            key={item.id}
+            item={item}
+            index={index}
+            tabsetId={props.tabsetId}
+            isTabStop={item.id === tabStopId}
+          />
+        ))}
+      </div>
     </div>
-  </div>
-);
+  );
+};
 
 /** Width of the `.scroll-fade-x` edge fade (scrollbar-none.css): a tab under it looks cut off. */
 const SCROLL_FADE_PX = 24;
 
-/**
- * Scroll the row (only as far as needed) so its selected tab is fully visible and clear of the
- * edge fades. Computed against the row instead of `scrollIntoView`, which also scrolls
- * overflow-hidden ancestors and ignores the fades.
- */
+/** Keep the row's selected tab fully visible, clear of the edge fades (see `revealTab`). */
 function revealSelectedTab(row: HTMLElement): void {
   const tab = row.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
-  if (tab == null) return;
+  if (tab != null) revealTab(row, tab);
+}
+
+/**
+ * Scroll the row (only as far as needed) so `tab` is fully visible and clear of the edge fades.
+ * Computed against the row instead of `scrollIntoView`, which also scrolls overflow-hidden
+ * ancestors and ignores the fades.
+ */
+function revealTab(row: HTMLElement, tab: HTMLElement): void {
   const rowRect = row.getBoundingClientRect();
   const tabRect = tab.getBoundingClientRect();
   const tabStart = tabRect.left - rowRect.left + row.scrollLeft;
