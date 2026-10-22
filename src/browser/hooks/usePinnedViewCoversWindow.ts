@@ -15,7 +15,12 @@ export const RightSidebarOverlayContext = createContext(false);
  * webview, which bundles ArtifactsPanel and McpAppFrame but has no app shell, never bundles the
  * desktop shell classes (vscode/src/webview/webviewCss.test.ts).
  */
-export const PinnedViewToolbarSpacerContext = createContext<ComponentType | null>(null);
+export const PinnedViewToolbarSpacerContext = createContext<ComponentType>(NoToolbarSpacer);
+
+/** Outside RightSidebar (the webview, tests): no app shell, so no toggle bar to keep clear. */
+function NoToolbarSpacer() {
+  return null;
+}
 
 /**
  * Whether a pinned view (Artifacts fullscreen, a maximized App View tab) covers the whole window

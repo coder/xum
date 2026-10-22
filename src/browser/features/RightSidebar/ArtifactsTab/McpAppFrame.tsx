@@ -181,7 +181,7 @@ function McpAppViewHeader(props: {
   return (
     <div className="border-border-light flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-[11px]">
       {/* Maximized in a wide window, the panel can sit under the left sidebar's toggle bar. */}
-      {props.maximized === true && ToolbarSpacer != null && <ToolbarSpacer />}
+      {props.maximized === true && <ToolbarSpacer />}
       <span className="text-muted min-w-0 flex-1 truncate">
         App view from{" "}
         <TooltipIfPresent tooltip={props.serverName}>

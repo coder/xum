@@ -1093,7 +1093,7 @@ export function ArtifactsPanel(props: {
   const artbar = (
     <div className="border-border-light bg-sidebar flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
       {/* In a wide window, fullscreen can sit under the left sidebar's toggle bar. */}
-      {showFullscreen && ToolbarSpacer != null && <ToolbarSpacer />}
+      {showFullscreen && <ToolbarSpacer />}
       <ArtifactPickerSelect
         value={selected ? pickerValue(selected.scope, selected.path) : ""}
         onToggleOtherFiles={() => setOtherFilesExpanded(!otherFilesExpanded)}
