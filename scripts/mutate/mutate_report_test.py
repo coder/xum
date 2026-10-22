@@ -56,12 +56,15 @@ def test_the_graph_skips_type_only_commented_and_fixture_imports(tmp_path):
             'import { d } from "@/d";',
             'export * from "@/e";',
             'const f = require("./f");',
+            'import { type G } from "@/g";',  # Bun drops it: every specifier is a type
+            'import { type H, h } from "@/h";',  # h is a value, so the module loads
+            'export { type I } from "@/i";',
         ]
     )
-    files = {f"src/{name}.ts" for name in "abcdef"}
+    files = {f"src/{name}.ts" for name in "abcdefghi"}
     write(tmp_path, {**{path: "" for path in files}, "src/t.test.ts": test})
     graph = import_graph(tmp_path, ["src/t.test.ts"], files)
-    assert sorted(graph) == ["src/d.ts", "src/e.ts", "src/f.ts"]
+    assert sorted(graph) == ["src/d.ts", "src/e.ts", "src/f.ts", "src/h.ts"]
 
 
 def test_tests_for_puts_the_colocated_test_first_then_the_nearest_and_cuts():

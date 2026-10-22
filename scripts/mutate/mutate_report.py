@@ -109,6 +109,24 @@ def resolve(importer: str, specifier: str, files: set[str]) -> str | None:
     return None
 
 
+def only_types(statement) -> bool:
+    """Whether every named specifier is `type X`: `import { type A } from "m"`.
+
+    Bun drops such an import (checked on Bun 1.4.3: "m" does not load), so
+    the test is no importer. One value specifier, a default or a namespace
+    import keeps it.
+    """
+
+    clause = next((c for c in statement.named_children if c.type in ("import_clause", "export_clause")), None)
+    if clause is None:
+        return False
+    named = clause if clause.type == "export_clause" else next((c for c in clause.named_children if c.type == "named_imports"), None)
+    if named is None or len(clause.named_children) > 1:
+        return False  # a default or namespace import loads the module
+    specifiers = [c for c in named.named_children if c.type in ("import_specifier", "export_specifier")]
+    return bool(specifiers) and all(c.child_count > 0 and c.children[0].type == "type" for c in specifiers)
+
+
 def runtime_specifiers(source: bytes, tsx: bool) -> list[str]:
     """The specifiers that a test loads at run time.
 
@@ -126,7 +144,7 @@ def runtime_specifiers(source: bytes, tsx: bool) -> list[str]:
         stack.extend(node.children)
         target = None
         if node.type in ("import_statement", "export_statement"):
-            erased = node.child_count > 1 and node.children[1].type == "type"
+            erased = (node.child_count > 1 and node.children[1].type == "type") or only_types(node)
             target = None if erased else node.child_by_field_name("source")
         elif node.type == "call_expression":
             function = node.child_by_field_name("function")
