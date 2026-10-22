@@ -41,8 +41,13 @@ import * as contextBudgetCounting from "../../src/node/services/contextBudgetCou
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
-const MODEL = "anthropic:claude-opus-5-5";
+const PRIMARY_MODEL_ID = "claude-opus-5-5";
+const MODEL = `anthropic:${PRIMARY_MODEL_ID}`;
+const FALLBACK_MODEL_ID = "claude-sonnet-5-5";
+const FALLBACK_MODEL = `anthropic:${FALLBACK_MODEL_ID}`;
 const CONTEXT_LIMIT = 100_000;
+/** Text that makes the fixture refuse a primary request (stop_reason "refusal", no output). */
+const REFUSE_MARKER = "[refuse]";
 const TEST_TIMEOUT_MS = 180_000;
 /** Start of every warning row's text (buildBudgetWarningText); the lead-in never contains it. */
 const WARNING_MARKER = "Context budget ~";
@@ -61,6 +66,7 @@ interface Block {
 interface FixtureRequest {
   chars: number;
   main: boolean;
+  model: string;
   messages: { role: string; blocks: Block[] }[];
   lastUserText: string;
 }
@@ -71,7 +77,7 @@ type Reply =
 /** Provider usage as a function of the raw request size; ≈2.4 request chars per counted token. */
 type UsageFor = (requestChars: number) => number;
 
-function sse(blocks: Reply[], inputTokens: number): string {
+function sse(blocks: Reply[], inputTokens: number, refused = false): string {
   const events: [string, unknown][] = [
     [
       "message_start",
@@ -103,7 +109,11 @@ function sse(blocks: Reply[], inputTokens: number): string {
     events.push(["content_block_delta", { type: "content_block_delta", index, delta }]);
     events.push(["content_block_stop", { type: "content_block_stop", index }]);
   });
-  const stopReason = blocks.some((block) => block.type === "tool_use") ? "tool_use" : "end_turn";
+  const stopReason = refused
+    ? "refusal"
+    : blocks.some((block) => block.type === "tool_use")
+      ? "tool_use"
+      : "end_turn";
   events.push([
     "message_delta",
     {
@@ -139,6 +149,7 @@ async function startFixture(usageFor: UsageFor) {
       const raw = Buffer.concat(chunks).toString("utf8");
       const body = JSON.parse(raw) as {
         stream?: boolean;
+        model: string;
         tools?: { name: string }[];
         messages: { role: string; content: string | Block[] }[];
       };
@@ -152,7 +163,13 @@ async function startFixture(usageFor: UsageFor) {
       const last = messages.at(-1)?.blocks ?? [];
       // Main turns carry the agent toolset; side requests (naming, status) do not.
       const main = (body.tools ?? []).some((tool) => tool.name === "file_read");
-      const request = { chars: raw.length, main, messages, lastUserText: textOf(last) };
+      const request = {
+        chars: raw.length,
+        main,
+        model: body.model,
+        messages,
+        lastUserText: textOf(last),
+      };
       requests.push(request);
       let reply: Reply[] = [{ type: "text", text: "Done." }];
       const toolResults = last.filter((block) => block.type === "tool_result");
@@ -195,7 +212,12 @@ async function startFixture(usageFor: UsageFor) {
         );
         return;
       }
-      res.writeHead(200, { "content-type": "text/event-stream" }).end(sse(reply, inputTokens));
+      // The primary refuses any request whose last user text asks it to (no output).
+      const refused =
+        main && body.model === PRIMARY_MODEL_ID && request.lastUserText.includes(REFUSE_MARKER);
+      res
+        .writeHead(200, { "content-type": "text/event-stream" })
+        .end(sse(refused ? [] : reply, inputTokens, refused));
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -223,6 +245,9 @@ interface HistoryRow {
   parts: { type: string; text?: string; toolCallId?: string }[];
   metadata?: {
     contextBoundaryKind?: string;
+    finishReason?: string;
+    stopCause?: { kind?: string; decision?: string };
+    modelFallback?: { refusedModels?: string[] };
     muxMetadata?: { type?: string; handoff?: boolean; final?: boolean; contextTokens?: number };
   };
 }
@@ -232,7 +257,12 @@ const isReset = (row: HistoryRow) => row.metadata?.contextBoundaryKind === "rese
 /** Observes (does not change) each full count; a send's first one is its turn-start E. */
 const fullCounts = jest.spyOn(contextBudgetCounting, "measureAssembledRequestBudgetForModel");
 
-async function startScenario(options: { slider: number; usageFor: UsageFor }) {
+async function startScenario(options: {
+  slider: number;
+  usageFor: UsageFor;
+  /** Primary window, and a refusal fallback to FALLBACK_MODEL with a CONTEXT_LIMIT window. */
+  refusalFallback?: { primaryLimit: number };
+}) {
   const fixture = await startFixture(options.usageFor);
   // No-provider setup clears inherited Anthropic env auth/base URL; the fixture is the only route.
   const { env, workspaceId, workspacePath, cleanup } =
@@ -240,9 +270,19 @@ async function startScenario(options: { slider: number; usageFor: UsageFor }) {
   await setupProviders(env, { anthropic: { apiKey: "fixture-key", baseUrl: fixture.baseUrl } });
   const models = await env.orpc.providers.setModels({
     provider: "anthropic",
-    models: [{ id: "claude-opus-5-5", contextWindowTokens: CONTEXT_LIMIT }],
+    models: [
+      {
+        id: PRIMARY_MODEL_ID,
+        contextWindowTokens: options.refusalFallback?.primaryLimit ?? CONTEXT_LIMIT,
+      },
+      { id: FALLBACK_MODEL_ID, contextWindowTokens: CONTEXT_LIMIT },
+    ],
   });
   expect(models.success).toBe(true);
+  if (options.refusalFallback)
+    await env.orpc.config.updateModelFallbacks({
+      modelFallbacks: { [MODEL]: { models: [FALLBACK_MODEL] } },
+    });
   await env.services.experimentsService.setOverride(EXPERIMENT_IDS.TOKEN_BUDGET, true);
   await env.services.experimentsService.setOverride(EXPERIMENT_IDS.MEMORY, true);
   // The slider is persisted per model in config.json, as Settings writes it.
@@ -252,7 +292,10 @@ async function startScenario(options: { slider: number; usageFor: UsageFor }) {
       ...config.userPreferences,
       ai: {
         ...config.userPreferences?.ai,
-        autoCompactionThresholdByModel: { [MODEL]: options.slider },
+        autoCompactionThresholdByModel: {
+          [MODEL]: options.slider,
+          [FALLBACK_MODEL]: options.slider,
+        },
       },
     },
   }));
@@ -492,6 +535,69 @@ describeIntegration("Token Budget stages (loopback fixture)", () => {
         ]);
         expect(warnings[1].metadata?.muxMetadata?.contextTokens).toBeGreaterThanOrEqual(81_616);
         expect(scenario.stageRequests().at(-1)?.lastUserText).toContain("Turn 3: read 0 files.");
+      } finally {
+        await scenario.close();
+      }
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  test(
+    "a refusal fallback whose request reaches a stage hands over to a Continue on the fallback model",
+    async () => {
+      // The primary's window (200k, H = 140k) has no stage due at E ≈ 75k. The fallback's window
+      // (100k, H = 70k) does, and the warning cannot sit before the turn's placeholder row.
+      const scenario = await startScenario({
+        slider: 70,
+        usageFor: LOW_USAGE,
+        refusalFallback: { primaryLimit: 200_000 },
+      });
+      try {
+        await scenario.send("Turn 0: read 4 files.");
+        await scenario.send("Turn 1: read 4 files.");
+        await scenario.send(`Turn 2: read 0 files. ${REFUSE_MARKER}`);
+        const fallbackRequests = scenario.fixture.requests.filter(
+          (r) => r.main && r.model === FALLBACK_MODEL_ID
+        );
+        // No fallback request is sent without its own stage decision: the first one is the
+        // Continue's, and it carries the warning.
+        expect(fallbackRequests[0]?.lastUserText).toContain(WARNING_MARKER);
+        // The Continue did not re-run the refused primary: its last request is the refused one.
+        const primaryRequests = scenario.fixture.requests.filter(
+          (r) => r.main && r.model === PRIMARY_MODEL_ID
+        );
+        expect(primaryRequests.filter((r) => r.lastUserText.includes(REFUSE_MARKER))).toHaveLength(
+          1
+        );
+        expect(primaryRequests.at(-1)?.lastUserText).toContain(REFUSE_MARKER);
+        // The refused row is empty: it must not reach the Continue's request.
+        // The refused row is empty: it must not reach the Continue's request. Nothing sits between
+        // the refused turn's user text and the Continue with its warning.
+        const continueMessages = fallbackRequests[0]?.messages ?? [];
+        const refusedAt = continueMessages.findIndex((message) =>
+          textOf(message.blocks).includes(REFUSE_MARKER)
+        );
+        expect(refusedAt).toBeGreaterThan(0);
+        expect(continueMessages.slice(refusedAt).map((message) => message.role)).toEqual(["user"]);
+        const history = await scenario.history();
+        const refusedTurn = history.findIndex((row) =>
+          textOf(row.parts as Block[]).includes(REFUSE_MARKER)
+        );
+        const [user, refused, next, warning] = history.slice(refusedTurn, refusedTurn + 4);
+        expect(user?.role).toBe("user");
+        expect({ role: refused?.role, parts: refused?.parts }).toEqual({
+          role: "assistant",
+          parts: [],
+        });
+        expect(refused?.metadata?.stopCause).toMatchObject({
+          kind: "context-budget",
+          decision: "warn",
+        });
+        expect(refused?.metadata?.modelFallback?.refusedModels).toEqual([MODEL]);
+        expect(refused?.metadata?.finishReason).toBeUndefined();
+        expect(textOf((next?.parts ?? []) as Block[])).toBe("Continue");
+        expect(warning && isWarning(warning)).toBe(true);
+        expect(warning?.metadata?.muxMetadata?.handoff).toBe(true);
       } finally {
         await scenario.close();
       }

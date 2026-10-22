@@ -62,7 +62,6 @@ import type { ContextManagementDependencies } from "../contextManagementService"
 import type { SessionContextHost } from "../sessionContextHost";
 import type { ContinuationEntry, PreparationReceipt } from "../types";
 
-/** Budget policy and window claims; the host retains queue and publication authority. */
 /** A stage is claimed once per window by its warning row in that window's history. */
 function isStageClaimed(messages: readonly MuxMessage[], key: "handoff" | "final"): boolean {
   return messages.some((row) => {
@@ -125,6 +124,7 @@ function createTurnStartStageRow(
   };
 }
 
+/** Budget policy and window claims; the host retains queue and publication authority. */
 export class TokenBudgetStrategy {
   // Slider edits cannot expand the budget of a reset that has already been queued.
   private pendingRollover?: ContextWindowRollover & { budgetTokens: number };
@@ -538,6 +538,11 @@ export class TokenBudgetStrategy {
       row,
       fits: (estimate) => estimate + reserve < ceiling,
       publish: () => this.publishTurnStartStage(stream, () => publish(row)),
+      // A Stop or a budget reset since the decision withdraws the handover's Continue.
+      handOver: () =>
+        stream != null && this.host.state.stream === stream && this.validatePreparation(receipt)
+          ? this.enqueueContinuation(stream, options, budget.model, true)
+          : undefined,
     };
   }
 
@@ -639,34 +644,50 @@ export class TokenBudgetStrategy {
         budgetTokens: getContextBudgetHardCeiling(recordedLimit),
       };
     }
-    // Keep the continuation's delegated-turn/goal attribution; the prompt
-    // itself is a separate durable prefix row when this entry dispatches.
     // Capture the exact successor before publishing the queue so the stop retains upstream
     // queue-cut attribution.
-    let continuationEntryId: string | undefined;
-    if (this.host.continuations.isEmpty()) {
-      const entry: ContinuationEntry = {
-        admissionCapture: context.admissionCapture,
-        text: "Continue",
-        dedupeKey: prompt ? CONTEXT_WARNING_DEDUPE_KEY : CONTEXT_CONTINUE_DEDUPE_KEY,
-        options: context.options,
-        model: step.model,
-        muxMetadata: {
-          ...(context.workspaceTurnMetadata ?? { type: "normal" }),
-          contextBudgetContinuation: true,
-        },
-        autoModelRouting: context.autoModelRouting,
-        goalKind: context.goalKind,
-        goalId: context.goalId,
-        taskTurnKind: context.taskTurnKind,
-      };
-      continuationEntryId = this.host.continuations.enqueue([entry], true);
-    }
+    const continuationEntryId = this.enqueueContinuation(
+      context,
+      context.options,
+      step.model,
+      prompt
+    );
     // Nothing enqueued (unrelated input already queued): the stop designates no successor.
     return {
       decision: prompt ? "warn" : "rollover",
       ...(continuationEntryId != null ? { continuationEntryId } : {}),
     };
+  }
+
+  /**
+   * Queues the turn's "Continue" on `model` and returns its entry id, or nothing when unrelated
+   * input is already queued. A stage prompt's Continue publishes the row at its own turn start.
+   */
+  private enqueueContinuation(
+    context: StreamContextSnapshot,
+    options: SendMessageOptions,
+    model: string,
+    prompt: boolean
+  ): string | undefined {
+    if (!this.host.continuations.isEmpty()) return undefined;
+    // Keep the continuation's delegated-turn/goal attribution; the prompt
+    // itself is a separate durable prefix row when this entry dispatches.
+    const entry: ContinuationEntry = {
+      admissionCapture: context.admissionCapture,
+      text: "Continue",
+      dedupeKey: prompt ? CONTEXT_WARNING_DEDUPE_KEY : CONTEXT_CONTINUE_DEDUPE_KEY,
+      options,
+      model,
+      muxMetadata: {
+        ...(context.workspaceTurnMetadata ?? { type: "normal" }),
+        contextBudgetContinuation: true,
+      },
+      autoModelRouting: context.autoModelRouting,
+      goalKind: context.goalKind,
+      goalId: context.goalId,
+      taskTurnKind: context.taskTurnKind,
+    };
+    return this.host.continuations.enqueue([entry], true);
   }
 
   /** Re-derive this window's once-only claims from history before a stream resumes. */

@@ -92,6 +92,7 @@ import { log } from "./log";
 import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
 import type { StreamManager } from "./streamManager";
 import {
+  type FallbackStageHandover,
   type ModelFallbackOptions,
   type TurnCompletion,
   type TurnExecutionOptions,
@@ -662,7 +663,10 @@ async function foldPendingThinkingOverrides<TMessages, TTail>(
   return state;
 }
 
-/** Called once per primary start() with E, the full estimate of the built request (#5286). */
+/**
+ * Called with E, the full estimate of the built request (#5286): once per primary start(), and
+ * once per refusal fallback's prepare.
+ */
 export type OnTurnStartStage = (budget: {
   estimate: number;
   limit: number;
@@ -679,6 +683,8 @@ export interface TurnStartStage {
   /** Whether E′, the count of the request with `row` appended, leaves the stage its reserve. */
   fits: (estimate: number) => boolean;
   publish: () => Promise<boolean>;
+  /** Queues the stage's Continue on its model instead (refusal fallback); its entry id, if any. */
+  handOver: () => string | undefined;
 }
 
 /** What a primary start dispatches: the built request, or the counted candidate with a stage. */
@@ -729,6 +735,48 @@ async function applyTurnStartStage<TMessages, TTail>(input: {
     systemMessageTokens: candidate.systemMessageTokens,
     requestHistorySequence: stage.row.metadata?.historySequence ?? current.requestHistorySequence,
   };
+}
+
+/**
+ * Builds a refusal fallback's request. Err when the budget refuses it, or when a stage is due on
+ * it (#5286): the turn's placeholder row is already written, so the warning cannot precede it.
+ * The turn then hands over to a Continue on the fallback model, whose own turn start publishes
+ * the warning. So no fallback request is dispatched without its own stage decision.
+ */
+async function buildFallbackRequest<
+  TRequest extends {
+    contextBudgetEstimate?: number;
+    contextBudgetLimit?: number;
+    model: LanguageModel;
+  },
+>(
+  build: () => Promise<TRequest>,
+  stage: { onTurnStartStage: OnTurnStartStage | undefined; model: string; messages: MuxMessage[] }
+): Promise<
+  Result<
+    TRequest,
+    Extract<SendMessageError, { type: "context_budget_exceeded" }> | FallbackStageHandover
+  >
+> {
+  let request: TRequest;
+  try {
+    request = await build();
+  } catch (error) {
+    if (error instanceof ContextBudgetExceededError) return Err(error.details);
+    throw error;
+  }
+  const estimate = request.contextBudgetEstimate;
+  const limit = request.contextBudgetLimit;
+  if (stage.onTurnStartStage == null || estimate == null || limit == null) return Ok(request);
+  const due = await stage.onTurnStartStage({
+    estimate,
+    limit,
+    model: stage.model,
+    messages: stage.messages,
+  });
+  if (!due?.fits(estimate)) return Ok(request);
+  runLanguageModelCleanup(request.model);
+  return Err({ type: "context_budget_stage", handOver: due.handOver });
 }
 
 /** After a published stage, StreamManager applies thinking changes only after the first request. */
@@ -4037,21 +4085,21 @@ export class TurnRequestBuilder {
                   return Err(formatSendMessageError(nextSeedResult.error).message);
                 }
 
-                let nextRequest: Awaited<ReturnType<typeof prepareModelRequest>>;
-                try {
-                  nextRequest = await prepareModelRequest({
-                    seed: nextSeedResult.data,
-                    sourceMessages,
-                    initializeToolSearch: false,
-                    reusePrePolicySystemContext: false,
-                    requestHistorySequence: () => requestHistorySequence,
-                    partialContinuationMessage: prepareOptions?.continuation?.assistantMessage,
-                    cleanupModelOnError: true,
-                  });
-                } catch (error) {
-                  if (error instanceof ContextBudgetExceededError) return Err(error.details);
-                  throw error;
-                }
+                const built = await buildFallbackRequest(
+                  () =>
+                    prepareModelRequest({
+                      seed: nextSeedResult.data,
+                      sourceMessages,
+                      initializeToolSearch: false,
+                      reusePrePolicySystemContext: false,
+                      requestHistorySequence: () => requestHistorySequence,
+                      partialContinuationMessage: prepareOptions?.continuation?.assistantMessage,
+                      cleanupModelOnError: true,
+                    }),
+                  { onTurnStartStage, model: nextModelString, messages: sourceMessages }
+                );
+                if (!built.success) return built;
+                const nextRequest = built.data;
                 let nextHeaders = nextRequest.headers;
                 if (pendingRunMetadataId != null) {
                   // The fallback's run is created after this, under the same metadata ID.

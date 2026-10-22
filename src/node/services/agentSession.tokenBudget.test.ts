@@ -4473,6 +4473,57 @@ describe("AgentSession token-budget lifecycle", () => {
       expect(handoffClaimed(h)).toBe(true);
     });
 
+    // A refusal fallback decides its own request's stage after the placeholder row is written, so
+    // a due stage hands the turn over to a Continue on the fallback model instead (#5286).
+    test.each([{ stopped: false }, { stopped: true }])(
+      "a refusal fallback's handover queues the Continue on its model unless a Stop came first (stopped=$stopped)",
+      async ({ stopped }) => {
+        const fallbackModel = "openai:gpt-4o-mini";
+        const h = await setup();
+        await seedAutoCompactionThreshold(h.config, fallbackModel, 70);
+        await seedHistory(h, 80_000);
+        h.turnStart.estimate = () => NOT_DUE;
+        expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+        const primary = h.requests[0];
+        // The fallback prepare's call: E of the fallback's built request, due in its window.
+        const stage = await primary.onTurnStartStage?.({
+          estimate: 100_000,
+          limit: 128_000,
+          model: fallbackModel,
+          messages: primary.messages,
+        });
+        assert(stage != null);
+        if (stopped) {
+          // The Stop ends the controlled provider's stream before the handover runs.
+          const stop = h.session.interruptStream();
+          h.aiEmitter.emit("stream-abort", {
+            type: "stream-abort",
+            workspaceId,
+            messageId: "assistant-1",
+            abortReason: "user",
+            metadata: { duration: 1 },
+          });
+          h.completions[0].settle({
+            status: "aborted",
+            abortReason: "user",
+            streamAbort: { type: "stream-abort", workspaceId, metadata: { duration: 1 } },
+          });
+          expect((await stop).success).toBe(true);
+          await h.session.waitForIdle();
+        }
+        const entryId = stage.handOver();
+        expect(entryId != null).toBe(!stopped);
+        expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(!stopped);
+        if (stopped) return;
+        // The Continue runs on the fallback model and publishes the warning at its own start.
+        h.turnStart.estimate = () => 100_000;
+        h.settleStream(0, { finishReason: "stop", contextUsage: { inputTokens: 80_000 } });
+        const continued = await h.waitForRequest(2);
+        expect(continued.modelString).toBe(fallbackModel);
+        expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
+      }
+    );
+
     // The builder drops a stage once its abort signal fires. The session's publish fence covers a
     // Stop that is already in progress when the warning would be published.
     test("a Stop that lands before the turn-start warning is published writes no warning", async () => {

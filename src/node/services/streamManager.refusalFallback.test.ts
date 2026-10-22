@@ -1,7 +1,7 @@
 import { describe, test, expect, mock } from "bun:test";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import {
   DEFAULT_MODEL_FALLBACKS,
@@ -441,6 +441,73 @@ describe("StreamManager - fallback volatile-tail record (mechanism 10)", () => {
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!history.success) throw new Error(history.error);
     expect(history.data.at(-1)?.metadata?.volatileSystemTail).toEqual(rebuiltTail);
+  });
+});
+
+describe("StreamManager - fallback stage handover (#5286)", () => {
+  test("a handover ends the turn with the stage stop and records the refused usage once", async () => {
+    const usage = createUsageRecorder();
+    const handOver = mock(() => "continue-entry");
+    const prepare = mock(() =>
+      Promise.resolve(Err({ type: "context_budget_stage" as const, handOver }))
+    );
+    const workspaceId = "ws-fallback-handover";
+    const streamManager = createStreamManagerForTests(historyService, {
+      sessionUsageService: usage.sessionUsageService,
+      // One attempt only: a fallback dispatch would fail the turn.
+      streamText: scriptedStreamText([
+        {
+          chunks: [REFUSAL_FINISH],
+          usage: { inputTokens: 1200, outputTokens: 0, totalTokens: 1200 },
+        },
+      ]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      modelString: KNOWN_MODELS.SONNET.id,
+      modelFallback: { chain: ["openai:gpt-5.6-luna"], prepare },
+    });
+    expect(handOver).toHaveBeenCalledTimes(1);
+    if (completion.status !== "completed")
+      throw new Error(`Expected completion: ${completion.status}`);
+    const metadata = completion.streamEnd.metadata;
+    expect(metadata.stopCause).toEqual({
+      kind: "context-budget",
+      decision: "warn",
+      continuationEntryId: "continue-entry",
+    });
+    // No refusal finishReason (settlement defers to the Continue) and no second usage record.
+    expect(metadata.finishReason).toBeUndefined();
+    expect(metadata.usage).toBeUndefined();
+    expect(usage.recordUsage).toHaveBeenCalledTimes(1);
+    expect(metadata.modelFallback?.refusedModels).toHaveLength(1);
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const row = history.data.at(-1);
+    expect(row?.parts).toEqual([]);
+    expect(row?.metadata?.stopCause).toEqual(metadata.stopCause);
+    expect(await historyService.readPartial(workspaceId)).toBeNull();
+  });
+
+  test("a stop during the fallback prepare queues no Continue", async () => {
+    const handOver = mock(() => "continue-entry");
+    const workspaceId = "ws-fallback-handover-stop";
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([{ chunks: [REFUSAL_FINISH], usage: NO_USAGE }]),
+    });
+    const prepare = mock(() => {
+      // The user stops the turn while the fallback request is being built.
+      void streamManager.stopStream(workspaceId, { soft: true });
+      return Promise.resolve(Err({ type: "context_budget_stage" as const, handOver }));
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      modelString: KNOWN_MODELS.SONNET.id,
+      modelFallback: { chain: ["openai:gpt-5.6-luna"], prepare },
+    });
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(handOver).not.toHaveBeenCalled();
+    expect(completion.status).not.toBe("completed");
   });
 });
 

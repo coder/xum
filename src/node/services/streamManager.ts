@@ -628,7 +628,9 @@ export interface ModelFallbackOptions {
    * Rebuilds the full request for a fallback model. An Err result fails the
    * turn terminally as model_refusal (never a retryable error): silently
    * skipping an unstartable fallback would effectively create fallback on
-   * auth/config errors, which is explicitly out of scope.
+   * auth/config errors, which is explicitly out of scope. Two structured Errs
+   * are Token Budget outcomes instead: the budget refusing the request, and a
+   * stage handover (FallbackStageHandover).
    */
   prepare: (
     nextModelString: string,
@@ -636,9 +638,32 @@ export interface ModelFallbackOptions {
   ) => Promise<
     Result<
       PreparedModelFallback,
-      string | Extract<SendMessageError, { type: "context_budget_exceeded" }>
+      | string
+      | Extract<SendMessageError, { type: "context_budget_exceeded" }>
+      | FallbackStageHandover
     >
   >;
+}
+
+/**
+ * The fallback's request reached a Token Budget stage (#5286), so it is not dispatched: the turn
+ * ends with the stage's stop. `handOver` queues the Continue on the fallback model (its entry id).
+ */
+export interface FallbackStageHandover {
+  type: "context_budget_stage";
+  handOver: () => string | undefined;
+}
+
+type RefusalFallbackOutcome =
+  | { kind: "handover"; handOver: FallbackStageHandover["handOver"] }
+  | { kind: "terminal"; terminalNote?: string };
+
+/** A structured prepare Err: a stage handover (#5286), or the budget refusing the fallback. */
+function fallbackBudgetOutcome(
+  error: Extract<SendMessageError, { type: "context_budget_exceeded" }> | FallbackStageHandover
+): RefusalFallbackOutcome {
+  if (error.type === "context_budget_stage") return { kind: "handover", handOver: error.handOver };
+  throw new ContextBudgetExceededError(error);
 }
 
 function isKnownProviderName(provider: string): provider is keyof typeof PROVIDER_DEFINITIONS {
@@ -4198,6 +4223,72 @@ export class StreamManager {
     );
   }
 
+  /**
+   * Ends a refused turn whose fallback request reached a Token Budget stage (#5286): a normal
+   * stream-end with the stage's stop, like a settled step's, and no fallback dispatch. The refused
+   * attempt's usage is already recorded (recordRefusedAttemptUsage), so the row reports none. It
+   * saves no refusal finishReason, so task and delegated-turn settlement defer to the Continue.
+   */
+  private async completeRefusalHandover(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    continuationEntryId: string | undefined
+  ): Promise<void> {
+    streamInfo.request.stopCause = {
+      kind: "context-budget",
+      decision: "warn",
+      ...(continuationEntryId != null ? { continuationEntryId } : {}),
+    };
+    await this.discardInFlightSessionUsage(workspaceId, streamInfo);
+    const streamEndEvent: StreamEndEvent = {
+      type: "stream-end",
+      workspaceId: workspaceId as string,
+      messageId: streamInfo.messageId,
+      ...(streamInfo.initialMetadata?.acpPromptId != null
+        ? { acpPromptId: streamInfo.initialMetadata.acpPromptId }
+        : {}),
+      metadata: {
+        ...streamInfo.initialMetadata,
+        model: metadataModelIdentity(streamInfo.model),
+        metadataModel: streamInfo.metadataModel,
+        routedThroughGateway:
+          streamInfo.initialMetadata?.routedThroughGateway ??
+          streamInfo.model.startsWith("mux-gateway:"),
+        // Holds the refused attempt's entry (recordRefusedAttemptUsage).
+        toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage),
+        stopCause: streamInfo.request.stopCause,
+        historySequence: streamInfo.historySequence,
+        duration: Date.now() - streamInfo.startTime,
+      },
+      parts: streamInfo.parts,
+    };
+    // Written even with no parts: the row carries the stop and the fallback record. Row first,
+    // then this stream's partial (the crash-safe order of the stream-end path).
+    streamInfo.partialRetired = true;
+    const updated = await this.historyService.updateHistory(workspaceId as string, {
+      id: streamInfo.messageId,
+      role: "assistant",
+      metadata: {
+        ...streamEndEvent.metadata,
+        stepStartPartIndices: streamInfo.stepStartIndices.filter(
+          (index) => index < streamInfo.parts.length
+        ),
+      },
+      parts: streamInfo.parts,
+    });
+    const retired = updated.success
+      ? await this.historyService.deletePartialIfMessageIdMatches(workspaceId, streamInfo.messageId)
+      : updated;
+    if (!retired.success) {
+      this.getWorkspaceLogger(workspaceId, streamInfo).warn("Failed to persist the handover row", {
+        error: retired.error,
+      });
+    }
+    streamInfo.state = StreamState.COMPLETED;
+    this.emitTurnEvent(streamEndEvent);
+    streamInfo.terminalCompletion = { status: "completed", streamEnd: streamEndEvent };
+  }
+
   private async handleEmptyStreamCompletion(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo
@@ -4228,8 +4319,15 @@ export class StreamManager {
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
     refusalFinishReason: string,
-    fallbackNote?: string
+    outcome: RefusalFallbackOutcome
   ): Promise<void> {
+    if (outcome.kind === "handover") {
+      // A stop during the fallback prepare ends the turn as a stop before it does: no Continue.
+      const stopped = streamInfo.abortController.signal.aborted || streamInfo.softInterrupt.pending;
+      if (!stopped)
+        return this.completeRefusalHandover(workspaceId, streamInfo, outcome.handOver());
+    }
+    const fallbackNote = outcome.kind === "terminal" ? outcome.terminalNote : undefined;
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     const streamMeta = await this.getStreamMetadata(streamInfo);
 
@@ -4434,7 +4532,7 @@ export class StreamManager {
     streamInfo: WorkspaceStreamInfo,
     refusalFinishReason: string,
     options?: { preserveParts?: boolean }
-  ): Promise<{ kind: "swapped" } | { kind: "terminal"; terminalNote?: string }> {
+  ): Promise<{ kind: "swapped" } | RefusalFallbackOutcome> {
     const fallbackState = streamInfo.modelFallback;
     const preserveParts = options?.preserveParts === true;
     const refusedModel = normalizeToCanonical(streamInfo.model);
@@ -4538,7 +4636,7 @@ export class StreamManager {
       };
     }
     if (!prepared.success) {
-      if (typeof prepared.error !== "string") throw new ContextBudgetExceededError(prepared.error);
+      if (typeof prepared.error !== "string") return fallbackBudgetOutcome(prepared.error);
       return {
         kind: "terminal",
         terminalNote: `Configured fallback model ${nextModelString} could not be started: ${prepared.error}`,
@@ -5457,7 +5555,7 @@ export class StreamManager {
                 workspaceId,
                 streamInfo,
                 refusalFinishReason,
-                fallback.terminalNote
+                fallback
               );
               break;
             }
