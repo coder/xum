@@ -1136,3 +1136,123 @@ describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => 
     await waitFor(() => expect(isDisabled(maxParallelInput(view))).toBe(false));
   });
 });
+
+// #6384: the limit inputs used to clamp and autosave on every keystroke, so clearing a field saved
+// 1. The field must keep the typed text, save only a valid value, and settle the text on blur.
+describe("TasksSection limit inputs", () => {
+  let restoreDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    restoreDom = installDom();
+    experimentsEnabledByDefault = false;
+    experimentValues = {};
+    apiMock = null;
+    selectedWorkspaceMock = null;
+  });
+
+  afterEach(() => {
+    cleanup();
+    apiMock = null;
+    restoreDom?.();
+    restoreDom = null;
+  });
+
+  function limitInput(view: ReturnType<typeof render>, label: string): HTMLInputElement {
+    const row = view.getByText(label).closest(".justify-between");
+    const input = row?.querySelector("input");
+    if (!(input instanceof window.HTMLInputElement)) throw new Error(`No input for ${label}`);
+    return input;
+  }
+
+  // fireEvent does not reach this Input's React handlers in happy-dom (see the reconnect suite
+  // above), so call them through React's props, as a browser event would.
+  function reactHandlers(input: HTMLInputElement) {
+    const key = Object.keys(input).find((name) => name.startsWith("__reactProps"));
+    return (key ? (input as unknown as Record<string, unknown>)[key] : null) as {
+      onChange?: (event: { target: { value: string } }) => void;
+      onBlur?: (event: { target: { value: string } }) => void;
+      onKeyDown?: (event: { key: string }) => void;
+    } | null;
+  }
+
+  function type(view: ReturnType<typeof render>, label: string, value: string) {
+    const onChange = reactHandlers(limitInput(view, label))?.onChange;
+    if (!onChange) throw new Error("Expected an onChange handler");
+    act(() => onChange({ target: { value } }));
+  }
+
+  // Without an onBlur handler, a blur changes nothing.
+  function blur(view: ReturnType<typeof render>, label: string) {
+    const input = limitInput(view, label);
+    const onBlur = reactHandlers(input)?.onBlur;
+    if (onBlur) act(() => onBlur({ target: { value: input.value } }));
+  }
+
+  const savedValues = (saveConfig: ReturnType<typeof mock>, key: string): unknown[] =>
+    saveConfig.mock.calls.map(
+      (call) => (call[0] as { taskSettings: Record<string, unknown> }).taskSettings[key]
+    );
+
+  // Longer than the autosave debounce, so a save of the cleared field would have happened.
+  const waitPastAutosave = () =>
+    act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 600));
+    });
+
+  test("Max Parallel Agent Tasks keeps the typed text and never saves a cleared field as 1", async () => {
+    const view = renderTasksSection();
+    const label = "Max Parallel Agent Tasks";
+    await waitFor(() => expect(limitInput(view, label).value).toBe("32"));
+
+    type(view, label, "");
+    expect(limitInput(view, label).value).toBe("");
+    await waitPastAutosave();
+    expect(savedValues(view.saveConfig, "maxParallelAgentTasks")).not.toContain(1);
+
+    // A valid value saves while the user types.
+    type(view, label, "12");
+    expect(limitInput(view, label).value).toBe("12");
+    await waitFor(() =>
+      expect(savedValues(view.saveConfig, "maxParallelAgentTasks")).toContain(12)
+    );
+
+    // An out-of-range value stays as typed, then clamps on blur.
+    type(view, label, "999");
+    expect(limitInput(view, label).value).toBe("999");
+    blur(view, label);
+    expect(limitInput(view, label).value).toBe("256");
+    await waitFor(() =>
+      expect(savedValues(view.saveConfig, "maxParallelAgentTasks").at(-1)).toBe(256)
+    );
+
+    // A field left empty goes back to the saved value.
+    type(view, label, "");
+    blur(view, label);
+    expect(limitInput(view, label).value).toBe("256");
+    await waitPastAutosave();
+    expect(savedValues(view.saveConfig, "maxParallelAgentTasks")).not.toContain(1);
+  });
+
+  test("Max Task Nesting Depth keeps the typed text and reverts an empty field on blur", async () => {
+    const view = renderTasksSection();
+    const label = "Max Task Nesting Depth";
+    await waitFor(() => expect(limitInput(view, label).value).toBe("5"));
+
+    type(view, label, "");
+    expect(limitInput(view, label).value).toBe("");
+    blur(view, label);
+    expect(limitInput(view, label).value).toBe("5");
+
+    // Enter settles the text like blur: an out-of-range value clamps to the maximum.
+    type(view, label, "9");
+    const onKeyDown = reactHandlers(limitInput(view, label))?.onKeyDown;
+    if (!onKeyDown) throw new Error("Expected an onKeyDown handler");
+    act(() => onKeyDown({ key: "Enter" }));
+    expect(limitInput(view, label).value).toBe("5");
+
+    type(view, label, "2");
+    await waitFor(() => expect(savedValues(view.saveConfig, "maxTaskNestingDepth")).toContain(2));
+    await waitPastAutosave();
+    expect(savedValues(view.saveConfig, "maxTaskNestingDepth")).not.toContain(1);
+  });
+});

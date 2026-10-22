@@ -18,6 +18,7 @@ import {
 import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
 import { getOwn } from "@/common/utils/getOwn";
 import type {
+  AgentPluginInstallMethod,
   AgentPluginInstallPreview,
   AgentPluginComponents,
   AgentPluginHooks,
@@ -69,20 +70,34 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
-  CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
   readPluginFileWithinRootCapped,
   discoverAgentPluginAt,
   discoverAgentPlugins,
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
-  PLUGIN_MANIFEST_RELATIVE_PATH,
   PluginGitPathError,
   setAgentPluginDiscoveryGate,
   type AgentPluginContainer,
   type AgentPluginDiagnostic,
   type AgentPluginInfo,
+  listPluginSkillFolders,
+  resolveDeclaredSkillsRoots,
+  type PluginSkillsRoot,
 } from "./discovery";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
+import {
+  chooseInstallMethod,
+  detectInstallMethods,
+  methodLabel,
+  installMethodRequest,
+  noInstallMethodMessage,
+  readInstalledGeneratedFrom,
+  skillsCliSkillNames,
+  writeGeneratedManifest,
+  type InstallMethodRequest,
+  type SkillsPackageRoot,
+} from "./installMethods";
+import { pluginSkillMarkdown } from "./claudeCommands";
 import { listPluginAgentFiles, type PluginAgentFile } from "./agentFiles";
 import { checkLogoImage } from "./imageHeader";
 import {
@@ -838,7 +853,11 @@ interface ResolvedRemoteRef {
   sha: string;
 }
 
-function gitEnv(): Record<string, string> {
+/**
+ * The Git environment of every staging clone, fetch and checkout. `ambient` is the environment
+ * the Git process inherits: its GIT_SSH_COMMAND (a custom identity, proxy or wrapper) is kept.
+ */
+function gitEnv(ambient: NodeJS.ProcessEnv = process.env): Record<string, string> {
   // Fail fast instead of hanging on credential prompts: installs run from the
   // UI with no terminal attached (acceptance: "private repo without auth" must
   // fail cleanly).
@@ -871,9 +890,8 @@ function gitEnv(): Record<string, string> {
     GIT_CONFIG_SYSTEM: os.devNull,
     ...GIT_NO_HOOKS_ENV,
   };
-  if (process.env.GIT_SSH_COMMAND === undefined) {
-    env.GIT_SSH_COMMAND = "ssh -oBatchMode=yes";
-  }
+  const sshCommand = ambient.GIT_SSH_COMMAND;
+  env.GIT_SSH_COMMAND = sshCommand ?? "ssh -oBatchMode=yes";
   return env;
 }
 
@@ -1178,8 +1196,18 @@ function displayNameWarnings(
 ): string[] {
   if (displayName === undefined) return [];
   return [
-    `${label}/${dirName}: SKILL.md name '${displayName}' is not the directory name; it loads as '${dirName}'`,
+    `${label}: SKILL.md name '${displayName}' is not the directory name; it loads as '${dirName}'`,
   ];
+}
+
+/** A preview warning's plugin-relative name for skill `name` of `skillsRoot`. */
+function skillReviewLabel(pluginRoot: string, skillsRoot: PluginSkillsRoot, name: string): string {
+  const relativeRoot = path.relative(pluginRoot, skillsRoot.dir);
+  // A command is its file; a single skill folder is the skill itself, and at the plugin root it
+  // has no relative path.
+  if (skillsRoot.command) return path.join(relativeRoot, `${name}.md`);
+  if (skillsRoot.single) return relativeRoot === "" ? "." : relativeRoot;
+  return `${relativeRoot}/${name}`;
 }
 
 function shortenHome(absPath: string): string {
@@ -2501,36 +2529,40 @@ export class AgentPluginInstallService {
   // ---------------------------------------------------------------------
 
   /**
-   * Run the exact runtime validation (manifest + component discovery) against
-   * a staged clone. Throws user-facing errors for non-plugins, including a
-   * clear message for Claude Code plugin/marketplace repos (explicit non-goal).
+   * Pick the install method (installMethods.ts), write the generated plugin.json of a `skills`
+   * install, then run the exact runtime validation (manifest + component discovery) against the
+   * staged clone. Throws user-facing errors for non-plugins, including a clear message for a
+   * Claude Code marketplace repo (not installable yet).
    */
   private async validateStagedClone(
     stagedDir: string,
-    subpath?: string
+    source: Pick<AgentPluginGitSource, "url" | "subpath">,
+    request: InstallMethodRequest
   ): Promise<{
     plugin: AgentPluginInfo;
     warnings: string[];
+    method: AgentPluginInstallMethod;
+    methods: AgentPluginInstallMethod[];
+    skillsCliSkills: string[];
   }> {
-    // Discovery reads `.codex-plugin/plugin.json` when the root manifest is
-    // absent; both live in the staged tree the consent receipt hashes.
-    const hasManifest =
-      (await pathExists(path.join(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH))) ||
-      (await pathExists(path.join(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH)));
-    if (!hasManifest) {
-      if (
-        (await pathExists(path.join(stagedDir, ".claude-plugin", "plugin.json"))) ||
-        (await pathExists(path.join(stagedDir, ".claude-plugin", "marketplace.json")))
-      ) {
+    // Every manifest candidate, and the generated plugin.json, lives in the staged tree the
+    // consent receipt hashes.
+    const detected = await detectInstallMethods(stagedDir);
+    const method = chooseInstallMethod(detected.methods, request);
+    if (method === undefined) {
+      if (await pathExists(path.join(stagedDir, ".claude-plugin", "marketplace.json"))) {
         throw new Error(
-          "This repository is a Claude Code plugin or marketplace (found .claude-plugin/). Mux implements the vendor-neutral Agent Plugins 1.0.0 format and cannot install Claude Code collections. If an Agent Plugin lives in one of its folders, install it as owner/repo/path/to/plugin."
+          "This repository is a Claude Code plugin marketplace (found .claude-plugin/marketplace.json). Xum does not install marketplaces yet. Install one of its plugins by its folder, as owner/repo/path/to/plugin."
         );
       }
-      throw new Error(
-        subpath === undefined
-          ? "No plugin.json (or .codex-plugin/plugin.json) found at the repository root. The repo is not an Agent Plugin — if the plugin lives in a subdirectory, install it as owner/repo/path/to/plugin."
-          : `No plugin.json (or .codex-plugin/plugin.json) found in '${subpath}'. The folder is not an Agent Plugin.`
-      );
+      if (request.mode === "update" && detected.methods.length > 0) {
+        // The installed plugin.json is the repository's own, or a Claude one: Xum does not turn
+        // it into a generated skills install on update (installMethods.ts, InstallMethodRequest).
+        throw new Error(
+          `The repository no longer has the manifest this plugin was installed from; it fits: ${detected.methods.map(methodLabel).join(", ")}. Uninstall the plugin and install it again to choose a method.`
+        );
+      }
+      throw new Error(noInstallMethodMessage(source.subpath));
     }
 
     // The crash-recovery marker name is RESERVED: install/update write a
@@ -2556,17 +2588,79 @@ export class AgentPluginInstallService {
       );
     }
 
+    // After the marker check, so a refused tree never gets a generated file.
+    const generatedWarnings =
+      method.kind === "skills" ? await writeGeneratedManifest(stagedDir, method, source) : [];
     const { plugin, diagnostics } = await discoverAgentPluginAt({
       pluginDir: stagedDir,
       scope: "global",
     });
     if (!plugin) {
       const reasons = diagnostics.map((d) => d.message);
-      throw new Error(
-        reasons.length > 0 ? `Invalid plugin: ${reasons.join("; ")}` : "Invalid plugin manifest."
-      );
+      const problem =
+        reasons.length > 0 ? `Invalid plugin: ${reasons.join("; ")}` : "Invalid plugin manifest.";
+      // A preview without a method must still reach the "Install as" choice: when the first
+      // method's manifest is invalid (a broken .claude-plugin/plugin.json next to valid skill
+      // folders), preview the next method and name the problem. No file was written: only
+      // `skills` generates one, and it is always the last method.
+      const next = detected.methods[detected.methods.indexOf(method) + 1];
+      if (request.mode === "first" && next !== undefined) {
+        assert(method.kind !== "skills", "validateStagedClone: skills must be the last method");
+        const fallback = await this.validateStagedClone(stagedDir, source, {
+          mode: "exact",
+          method: next,
+        });
+        return {
+          ...fallback,
+          warnings: [`${methodLabel(method)}: ${problem}`, ...fallback.warnings],
+        };
+      }
+      throw new Error(problem);
     }
-    return { plugin, warnings: diagnostics.map((d) => d.message) };
+    const cli = await skillsCliSkillNames(stagedDir, detected.skillsRoots);
+    return {
+      plugin,
+      warnings: [...generatedWarnings, ...diagnostics.map((d) => d.message), ...cli.warnings],
+      method,
+      methods: detected.methods,
+      skillsCliSkills: await this.acceptedSkillsCliNames(
+        stagedDir,
+        detected.skillsRoots,
+        cli.names
+      ),
+    };
+  }
+
+  /**
+   * The Skills CLI names whose SKILL.md the preview accepts (collectSkills): the CLI would copy
+   * a rejected skill, for example one with a description over the limit, but Xum never loads it.
+   */
+  private async acceptedSkillsCliNames(
+    stagedDir: string,
+    roots: SkillsPackageRoot[],
+    names: string[]
+  ): Promise<string[]> {
+    if (names.length === 0) return names;
+    // A root SKILL.md makes the repository one skill, and its frontmatter name
+    // (skillsCliSkillNames) is then the only name. The other roots never use pluginName. A skill
+    // whose frontmatter name is not its folder name drops out here: Xum knows it by the folder.
+    const accepted = await this.acceptedSkillNames(stagedDir, {
+      declared: roots.map((root) => root.root),
+      pluginName: names[0],
+    });
+    return names.filter((name) => accepted.has(name));
+  }
+
+  /** The skills that the preview accepts from a manifest `skills` value in `pluginDir`. */
+  private async acceptedSkillNames(
+    pluginDir: string,
+    skills: { declared: string | string[] | undefined; pluginName: string }
+  ): Promise<Set<string>> {
+    const rootPath = await fsPromises.realpath(pluginDir);
+    const skillsDirs = await resolveDeclaredSkillsRoots({ pluginDir: rootPath, ...skills });
+    // Warnings belong to a preview of these skills, not to this count.
+    const collected = await this.collectSkillsFromRoots({ rootPath, skillsDirs }, []);
+    return new Set(collected.map((skill) => skill.name));
   }
 
   /**
@@ -2911,13 +3005,13 @@ export class AgentPluginInstallService {
     warnings: string[]
   ): Promise<CollectedPluginSkill[]> {
     const skills: CollectedPluginSkill[] = [];
-    for (const skillsDir of plugin.skillsDirs ?? []) {
-      for (const skill of await this.collectSkills(plugin.rootPath, skillsDir, warnings)) {
+    for (const skillsRoot of plugin.skillsDirs ?? []) {
+      for (const skill of await this.collectSkills(plugin.rootPath, skillsRoot, warnings)) {
         // Runtime discovery keeps the first skill of a name (roots in declared order), so the
         // preview must not promise the later one (#6121).
         if (skills.some((earlier) => earlier.name === skill.name)) {
           warnings.push(
-            `${path.relative(plugin.rootPath, skillsDir)}/${skill.name}: an earlier skills root has a skill with this name; it will not load`
+            `${skillReviewLabel(plugin.rootPath, skillsRoot, skill.name)}: an earlier skills root has a skill with this name; it will not load`
           );
           continue;
         }
@@ -2930,25 +3024,16 @@ export class AgentPluginInstallService {
   /** One skills root of collectSkillsFromRoots. Warnings name the root by its plugin-relative path. */
   private async collectSkills(
     pluginRoot: string,
-    skillsDir: string,
+    skillsRoot: PluginSkillsRoot,
     warnings: string[]
   ): Promise<CollectedPluginSkill[]> {
-    const label = path.relative(pluginRoot, skillsDir);
     const skills: CollectedPluginSkill[] = [];
-    let entries: string[] = [];
-    try {
-      // Include symlinked skill dirs, matching runtime discovery
-      // (listSkillDirectoriesFromLocalFs): a symlinked skill activates after
-      // install, so it MUST appear in the consent preview.
-      entries = (await fsPromises.readdir(skillsDir, { withFileTypes: true }))
-        .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-        .map((entry) => entry.name)
-        .sort((a, b) => a.localeCompare(b));
-    } catch {
-      return [];
-    }
-    for (const dirName of entries) {
-      const skillPath = path.join(skillsDir, dirName, "SKILL.md");
+    // Includes symlinked skill dirs, matching runtime discovery: a symlinked
+    // skill activates after install, so it MUST appear in the consent preview.
+    for (const { name: dirName, dir: skillDir, file: skillPath } of await listPluginSkillFolders(
+      skillsRoot
+    )) {
+      const label = skillReviewLabel(pluginRoot, skillsRoot, dirName);
       // Spec §4.1 containment anchored at the plugin root, mirroring runtime
       // component checks: a symlink escaping the plugin is surfaced as a
       // warning instead of silently ignored.
@@ -2963,7 +3048,7 @@ export class AgentPluginInstallService {
       } catch (error) {
         if (!hasErrorCode(error, "ENOENT")) {
           warnings.push(
-            `${label}/${dirName}: ${error instanceof PluginGitPathError ? "resolves into the plugin's .git directory" : "resolves outside the plugin root"}; it will not load`
+            `${label}: ${error instanceof PluginGitPathError ? "resolves into the plugin's .git directory" : "resolves outside the plugin root"}; it will not load`
           );
         }
         // ENOENT (unresolvable path) → not a skill dir; skip silently.
@@ -2984,7 +3069,7 @@ export class AgentPluginInstallService {
       // never-loading skill as a capability addition.
       const dirNameParsed = SkillNameSchema.safeParse(dirName);
       if (!dirNameParsed.success) {
-        warnings.push(`${label}/${dirName}: invalid skill directory name; it will not load`);
+        warnings.push(`${label}: invalid skill directory name; it will not load`);
         continue;
       }
       // Size-check BEFORE reading (mirroring runtime discovery): the parse
@@ -2992,12 +3077,18 @@ export class AgentPluginInstallService {
       // identical guard in collectAgentFiles.
       if (stat.size > MAX_FILE_SIZE) {
         warnings.push(
-          `${label}/${dirName}: SKILL.md is too large (${stat.size} bytes; max ${MAX_FILE_SIZE}); it will not load`
+          `${label}: SKILL.md is too large (${stat.size} bytes; max ${MAX_FILE_SIZE}); it will not load`
         );
         continue;
       }
       try {
-        const content = await fsPromises.readFile(containedSkillPath, "utf8");
+        // A Claude command becomes SKILL.md text first, so its review, fingerprint and approved
+        // copy are a skill's (the copy is that text, which the runtime check parses as is).
+        const content = pluginSkillMarkdown(
+          dirName,
+          await fsPromises.readFile(containedSkillPath, "utf8"),
+          skillsRoot.command
+        );
         const parsed = parseSkillMarkdown({
           content,
           byteSize: stat.size,
@@ -3006,7 +3097,7 @@ export class AgentPluginInstallService {
           allowDisplayName: true,
         });
         warnings.push(...displayNameWarnings(label, dirName, parsed.displayName));
-        const relativeDir = path.relative(pluginRoot, path.join(skillsDir, dirName));
+        const relativeDir = path.relative(pluginRoot, skillDir);
         skills.push({
           name: parsed.frontmatter.name,
           ...skillConsentFields({
@@ -3031,7 +3122,7 @@ export class AgentPluginInstallService {
           paths: resolveSkillPaths(parsed.frontmatter),
         });
       } catch (error) {
-        warnings.push(`${label}/${dirName}: ${getErrorMessage(error)}`);
+        warnings.push(`${label}: ${getErrorMessage(error)}`);
       }
     }
     return skills;
@@ -3214,6 +3305,8 @@ export class AgentPluginInstallService {
     input: string;
     ref?: string | undefined;
     subpath?: string | undefined;
+    /** Absent: the first method that fits. */
+    method?: AgentPluginInstallMethod | null | undefined;
   }): Promise<AgentPluginInstallPreview> {
     const parsed = parseAgentPluginSourceInput(args.input);
     const explicitRef = args.ref?.trim() ?? "";
@@ -3228,9 +3321,15 @@ export class AgentPluginInstallService {
     const resolved = await this.resolveRemoteRef(parsed.url, ref);
     const { dir: stagedDir, sha } = await this.cloneResolved(parsed.url, resolved, subpath);
     try {
-      const { plugin, warnings } = await this.validateStagedClone(stagedDir, subpath);
+      const { plugin, warnings, method, methods, skillsCliSkills } = await this.validateStagedClone(
+        stagedDir,
+        { url: parsed.url, subpath },
+        installMethodRequest(args.method)
+      );
       const targetPath = this.targetPathFor(plugin.name);
-      await this.assertNoCollision(plugin.name);
+      // A name collision blocks only the managed install of this method: the preview still lists
+      // the other methods and the Skills CLI choice, which creates no managed plugin.
+      const installBlockedReason = await this.collisionReason(plugin.name);
 
       const skills = await this.collectSkillsFromRoots(plugin, warnings);
       assertDirectivesFit(skills);
@@ -3288,6 +3387,10 @@ export class AgentPluginInstallService {
       };
       return {
         source,
+        method,
+        methods,
+        skillsCliSkills,
+        installBlockedReason,
         lockedSha: sha,
         manifest: {
           ...manifestSummary(plugin.manifest),
@@ -3312,6 +3415,12 @@ export class AgentPluginInstallService {
   }
 
   private async assertNoCollision(name: string): Promise<void> {
+    const reason = await this.collisionReason(name);
+    if (reason !== undefined) throw new Error(reason);
+  }
+
+  /** Why a managed install of `name` cannot proceed (a name or folder collision), if it cannot. */
+  private async collisionReason(name: string): Promise<string | undefined> {
     // Strict: a corrupted registry must fail installs up front (with the
     // repair message) instead of letting a later strict read fail mid-flow.
     // Collide on RAW entry names, not just parsed ones: an entry this build
@@ -3319,19 +3428,23 @@ export class AgentPluginInstallService {
     // install rewrite would otherwise filter it out and replace it.
     const { rawEntries } = await this.readRegistryDocument("strict");
     if (rawEntries.some((rawEntry) => this.rawEntryName(rawEntry) === name)) {
-      throw new Error(`A managed plugin named '${name}' is already installed. Uninstall it first.`);
+      return `A managed plugin named '${name}' is already installed. Uninstall it first.`;
     }
     if (await pathExists(this.targetPathFor(name))) {
       // Never overwrite: an unmanaged dir may hold local work.
-      throw new Error(
-        `${shortenHome(this.targetPathFor(name))} already exists. Remove the directory first — the installer never overwrites.`
-      );
+      return `${shortenHome(this.targetPathFor(name))} already exists. Remove the directory first — the installer never overwrites.`;
     }
+    return undefined;
   }
 
   /** Fetch the consented SHA, validate again, promote into the container, and record the registry entry. */
   async install(args: {
     source: AgentPluginGitSource;
+    /**
+     * The preview's `method`; install refuses a clone it does not fit. The API always sends it;
+     * tests may omit it (the first method that fits).
+     */
+    method?: AgentPluginInstallMethod;
     expectedSha: string;
     /** The preview's `consentDigest`. The renderer always sends it; tests may omit it. */
     expectedConsentDigest?: string;
@@ -3351,7 +3464,11 @@ export class AgentPluginInstallService {
     return this.runExclusive(async () => {
       const stagedDir = await this.cloneExactSha(args.source, args.expectedSha);
       try {
-        const { plugin } = await this.validateStagedClone(stagedDir, args.source.subpath);
+        const { plugin } = await this.validateStagedClone(
+          stagedDir,
+          args.source,
+          installMethodRequest(args.method)
+        );
         const name = plugin.name;
         const inventory = await this.collectComponents(plugin, this.targetPathFor(name));
         // Install records consent for every directive command, so it bounds them like the
@@ -5880,7 +5997,13 @@ export class AgentPluginInstallService {
     // that disappeared upstream fails here, before any swap.
     const stagedDir = await this.cloneExactSha(entry.source, sha);
     try {
-      const { plugin, warnings } = await this.validateStagedClone(stagedDir, entry.source.subpath);
+      // A plugin.json that Xum generated is regenerated from the new commit, unless the
+      // repository now has its own manifest. The update review covers every component as usual.
+      const generatedFrom = await readInstalledGeneratedFrom(this.targetPathFor(entry.name));
+      const { plugin, warnings } = await this.validateStagedClone(stagedDir, entry.source, {
+        mode: "update",
+        generatedFrom,
+      });
       if (plugin.name !== entry.name) {
         // Container-entry names are identity (instanceId, PLUGIN_DATA,
         // workspace overrides hash the path) — never rename on update.

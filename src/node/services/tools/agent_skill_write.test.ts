@@ -1,7 +1,8 @@
 import * as fs from "node:fs/promises";
+import os from "node:os";
 import * as path from "node:path";
 
-import { describe, it, expect } from "bun:test";
+import { describe, it, expect, spyOn } from "bun:test";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { FILE_EDIT_DIFF_OMITTED_MESSAGE } from "@/common/types/tools";
 import type { AgentSkillReadToolResult, AgentSkillWriteToolResult } from "@/common/types/tools";
@@ -71,6 +72,33 @@ describe("agent_skill_write", () => {
       "utf-8"
     );
     expect(stored).toBe(content);
+  });
+
+  it("writes a global skill to the Xum home even when ~/.mux/skills has one of that name", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-legacy-mux");
+    const xumHome = path.join(tempDir.path, "xum-home");
+    const legacySkillFile = path.join(tempDir.path, ".mux", "skills", "shared", SKILL_FILENAME);
+    await writeSkill(path.join(tempDir.path, ".mux", "skills"), "shared");
+    const legacyContent = await fs.readFile(legacySkillFile, "utf-8");
+    const homedirSpy = spyOn(os, "homedir").mockReturnValue(tempDir.path);
+    try {
+      const tool = await createWriteTool(xumHome);
+      const content = skillMarkdown("shared", { body: "Written by Xum" });
+
+      const result = (await tool.execute!(
+        { name: "shared", content },
+        mockToolCallOptions
+      )) as AgentSkillWriteToolResult;
+
+      expect(result.success).toBe(true);
+      // ~/.mux/skills is read-only: the write lands in the Xum home only.
+      expect(
+        await fs.readFile(path.join(xumHome, "skills", "shared", SKILL_FILENAME), "utf-8")
+      ).toBe(content);
+      expect(await fs.readFile(legacySkillFile, "utf-8")).toBe(legacyContent);
+    } finally {
+      homedirSpy.mockRestore();
+    }
   });
 
   it("recreates deleted global xum home before validating skill writes", async () => {

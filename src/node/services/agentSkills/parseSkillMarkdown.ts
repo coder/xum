@@ -91,6 +91,30 @@ export function skillConsentFrontmatter(
  * - Enforces a 1MB max file size (consistent with existing file tools)
  * - Requires YAML frontmatter delimited by `---` on its own line at the top
  */
+/**
+ * The Claude Code docs write `argument-hint: [issue-number]` and `[filename] [format]` unquoted.
+ * YAML reads the first as a list and refuses the second, so the skill did not load (#7123 item 5),
+ * while Claude Code shows the hint as typed. Quote a bracketed top-level hint so it stays that
+ * text. JSON.stringify keeps a hint with quotes or backslashes valid YAML; an already quoted value
+ * does not start with `[`, so it is left alone. Claude command files (claudeCommands.ts) use it
+ * too, before their frontmatter is rewritten into SKILL.md text.
+ */
+export function quoteBracketedArgumentHint(yaml: string): string {
+  // Top-level keys share the indent of the first content line (YAML allows an indented root
+  // mapping). Deeper lines, such as block scalar text, are left alone.
+  const rootIndent = /^([ \t]*)[^\s#]/m.exec(yaml)?.[1] ?? "";
+  // Keep the pattern free of nested or adjacent variable-length groups: SKILL.md can be 1 MB from
+  // a cloned repo, and a lazy hint followed by an optional comment group backtracked in O(n^2).
+  const hintLine = new RegExp(`^(${rootIndent}argument-hint[ \\t]*:)[ \\t]*(\\[.*)$`, "m");
+  return yaml.replace(hintLine, (_line, key: string, rest: string) => {
+    // A `#` after whitespace starts a YAML comment: it stays a comment, outside the quoted hint.
+    const commentStart = rest.search(/[ \t]#/);
+    const hint = (commentStart === -1 ? rest : rest.slice(0, commentStart)).trimEnd();
+    const comment = commentStart === -1 ? "" : rest.slice(commentStart);
+    return `${key} ${JSON.stringify(hint)}${comment}`;
+  });
+}
+
 export function parseSkillMarkdown(input: {
   content: string;
   byteSize: number;
@@ -134,7 +158,7 @@ export function parseSkillMarkdown(input: {
 
   let raw: unknown;
   try {
-    raw = YAML.parse(yamlText);
+    raw = YAML.parse(quoteBracketedArgumentHint(yamlText));
   } catch (err) {
     const message = getErrorMessage(err);
     throw new AgentSkillParseError(`Failed to parse SKILL.md YAML frontmatter: ${message}`);

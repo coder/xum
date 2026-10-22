@@ -184,6 +184,7 @@ import {
   AgentIdSchema,
 } from "./agentDefinition";
 import { PluginSlashCommandDescriptorSchema, WorkspaceCompositionSchema } from "./agentPlugins";
+import { SkillsCliCommandInputSchema, SkillsCliCommandSchema } from "./skillsCli";
 import {
   MCPAddGlobalParamsSchema,
   MCPAddParamsSchema,
@@ -212,6 +213,7 @@ import {
 import {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
+  AgentPluginInstallMethodSchema,
   AgentPluginInstallPreviewSchema,
   AgentPluginComponentsSchema,
   AgentPluginComponentRefSchema,
@@ -1294,13 +1296,25 @@ export const agentPlugins = {
       input: z.string(),
       ref: z.string().nullish(),
       subpath: z.string().nullish(),
+      /** Absent: the first method that fits (see AgentPluginInstallMethodSchema). */
+      method: AgentPluginInstallMethodSchema.nullish(),
     }),
     output: ResultSchema(AgentPluginInstallPreviewSchema, z.string()),
+  },
+  /**
+   * The pinned skills CLI command for the "Skills CLI" method, for the user to run in a terminal
+   * (Xum does not run it). The error branch is invalid input.
+   */
+  skillsCliCommand: {
+    input: SkillsCliCommandInputSchema,
+    output: ResultSchema(SkillsCliCommandSchema, z.string()),
   },
   /** Fetch the consented SHA, promote into ~/.mux/plugins, write the registry entry. */
   install: {
     input: z.object({
       source: AgentPluginGitSourceSchema,
+      /** The preview's `method`: install refuses a clone that this method does not fit. */
+      method: AgentPluginInstallMethodSchema,
       /** SHA from the preview the user consented to. */
       expectedSha: z.string(),
       /** `consentDigest` of that preview: install refuses other components (#6777). */

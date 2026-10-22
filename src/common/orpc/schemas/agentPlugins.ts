@@ -73,9 +73,15 @@ export const PluginHookHandlerSchema = z.discriminatedUnion("type", [
 
 /**
  * `runnable`: an mcp_tool handler on a mapped event. `unsupported-handler`: a command, prompt or
- * agent handler. `ignored-event`: a Codex event Xum does not map.
+ * agent handler. `ignored-event`: a Codex event Xum does not map. `claude-plugin`: any hook of a
+ * Claude Code plugin (Xum lists them and never runs them).
  */
-export const PluginHookStatusSchema = z.enum(["runnable", "unsupported-handler", "ignored-event"]);
+export const PluginHookStatusSchema = z.enum([
+  "runnable",
+  "unsupported-handler",
+  "ignored-event",
+  "claude-plugin",
+]);
 
 /**
  * Trust review state, keyed by the hook's location and checked against its hash (Codex trust):
@@ -154,8 +160,37 @@ export const AgentPluginComponentKindSchema = z.enum([
   "slashCommands",
 ]);
 
+/**
+ * How Xum reads a repository as a managed plugin. Preview lists every method that fits, in this
+ * order, and install must use the method the user previewed. Each member is an object so a method
+ * can carry its own fields (a later Claude marketplace method names its entry).
+ */
+export const AgentPluginInstallMethodSchema = z.discriminatedUnion("kind", [
+  /** plugin.json, or .codex-plugin/plugin.json. */
+  z.object({ kind: z.literal("agent-plugin") }),
+  /** .claude-plugin/plugin.json. */
+  z.object({ kind: z.literal("claude-plugin") }),
+  /** SKILL.md folders only: Xum writes a plugin.json for them (installMethods.ts). */
+  z.object({ kind: z.literal("skills") }),
+]);
+export type AgentPluginInstallMethod = z.infer<typeof AgentPluginInstallMethodSchema>;
+
 export const AgentPluginInstallPreviewSchema = z.object({
   source: AgentPluginGitSourceSchema,
+  /** The method this preview used. Install gets it back. */
+  method: AgentPluginInstallMethodSchema,
+  /** Every method that fits the repository, in order: agent-plugin, claude-plugin, skills. */
+  methods: z.array(AgentPluginInstallMethodSchema),
+  /**
+   * Skill folder names found with the skills CLI rules, for the "Skills CLI" choice (empty when
+   * the repository has no SKILL.md files). Independent of `method`.
+   */
+  skillsCliSkills: z.array(z.string()),
+  /**
+   * Why Install refuses this method: a plugin or folder of the same name exists. The preview
+   * still lists every method and the Skills CLI choice (it creates no managed plugin).
+   */
+  installBlockedReason: z.string().optional(),
   /** Commit SHA the preview was computed from; install verifies it gets the same tree. */
   lockedSha: z.string(),
   manifest: AgentPluginManifestSummarySchema,

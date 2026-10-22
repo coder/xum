@@ -6,6 +6,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   computeAgentPluginContainers,
+  discoverAgentPluginAt,
   discoverAgentPlugins,
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
@@ -14,6 +15,7 @@ import {
 } from "./discovery";
 import { bumpContainerMutationEpoch, MUTATION_EPOCH_FILE, STAGING_DIR_NAME } from "./journals";
 import { resolvePluginHookGrants } from "./hookSandbox";
+import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { createTestPluginInstallEntry } from "./testFixtures";
 
@@ -88,7 +90,7 @@ describe("discoverAgentPlugins", () => {
     expect(plugin.name).toBe("hello-plugin");
     expect(plugin.scope).toBe("global");
     expect(plugin.rootPath).toBe(await fs.realpath(path.join(container, "hello-plugin")));
-    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
+    expect(plugin.skillsDirs).toEqual([{ dir: path.join(plugin.rootPath, "skills") }]);
     expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, "mcp.json"));
     expect(result.diagnostics).toEqual([]);
   });
@@ -944,7 +946,7 @@ describe("discoverAgentPlugins", () => {
 
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
-    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "lib", "skills")]);
+    expect(plugin.skillsDirs).toEqual([{ dir: path.join(plugin.rootPath, "lib", "skills") }]);
     expect(plugin.workflowsDir).toBe(path.join(plugin.rootPath, "scripts"));
     expect(plugin.agentsDir).toBeUndefined();
   });
@@ -972,11 +974,111 @@ describe("discoverAgentPlugins", () => {
     const plugin = result.plugins[0];
     // Declared roots replace the default skills/ (as in Codex), in declared order.
     expect(plugin.skillsDirs).toEqual([
-      path.join(plugin.rootPath, "core"),
-      path.join(plugin.rootPath, "extra"),
+      { dir: path.join(plugin.rootPath, "core") },
+      { dir: path.join(plugin.rootPath, "extra") },
     ]);
     expect(result.diagnostics).toHaveLength(1);
     expect(result.diagnostics[0].message).toContain("outside/ resolves outside the plugin root");
+  });
+
+  test("a skills path that holds SKILL.md is one skill named after the declared folder", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "solo", {
+      manifest: {
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "solo",
+        contributes: { skills: ["one-skill", "alias", ".", "skills"] },
+      },
+      skills: ["nested"],
+    });
+    for (const dir of ["one-skill", path.join("impl", "real")]) {
+      await fs.mkdir(path.join(pluginDir, dir), { recursive: true });
+      await fs.writeFile(path.join(pluginDir, dir, "SKILL.md"), "---\nname: x\n---\n", "utf8");
+    }
+    // A contained symlink keeps the name the author wrote, not the target's.
+    await fs.symlink(path.join("impl", "real"), path.join(pluginDir, "alias"));
+    await fs.writeFile(path.join(pluginDir, "SKILL.md"), "---\nname: solo\n---\n", "utf8");
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const plugin = result.plugins[0];
+    expect(plugin.skillsDirs).toEqual([
+      { dir: path.join(plugin.rootPath, "one-skill"), single: true, name: "one-skill" },
+      { dir: path.join(plugin.rootPath, "impl", "real"), single: true, name: "alias" },
+      // The plugin root has no folder name of its own: it takes the plugin name.
+      { dir: plugin.rootPath, single: true, name: "solo" },
+      // A folder without SKILL.md still holds skill folders.
+      { dir: path.join(plugin.rootPath, "skills") },
+    ]);
+    expect(result.diagnostics).toEqual([]);
+  });
+
+  test("a symlink to the plugin root keeps its declared skill name", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "solo", {
+      manifest: {
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "solo",
+        contributes: { skills: ["alias"] },
+      },
+    });
+    await fs.writeFile(path.join(pluginDir, "SKILL.md"), "---\nname: alias\n---\n", "utf8");
+    await fs.symlink(".", path.join(pluginDir, "alias"));
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins[0].skillsDirs).toEqual([
+      { dir: result.plugins[0].rootPath, single: true, name: "alias" },
+    ]);
+  });
+
+  test.each([".", "./"])(
+    "a Codex skills path %p names the plugin root as one skill",
+    async (skills) => {
+      using tmp = new DisposableTempDir("agent-plugins");
+      const container = path.join(tmp.path, "plugins");
+      const pluginDir = path.join(container, "solo");
+      await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+      await fs.writeFile(
+        path.join(pluginDir, ".codex-plugin", "plugin.json"),
+        JSON.stringify({ name: "solo", skills })
+      );
+      await fs.writeFile(path.join(pluginDir, "SKILL.md"), "---\nname: solo\n---\n", "utf8");
+
+      const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+      expect(result.plugins[0].skillsDirs).toEqual([
+        { dir: result.plugins[0].rootPath, single: true, name: "solo" },
+      ]);
+    }
+  );
+
+  test("the default skills/ holds skill folders even when it has a SKILL.md", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "implicit", { skills: ["nested"] });
+    await fs.writeFile(path.join(pluginDir, "skills", "SKILL.md"), "---\nname: x\n---\n", "utf8");
+    // The same folder declared in the manifest is one skill.
+    const declaredDir = await writePlugin(container, "declared", {
+      manifest: {
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "declared",
+        contributes: { skills: "skills" },
+      },
+      skills: ["nested"],
+    });
+    await fs.writeFile(path.join(declaredDir, "skills", "SKILL.md"), "---\nname: x\n---\n", "utf8");
+
+    const { plugins } = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const skillsDirs = (name: string) => plugins.find((p) => p.name === name)?.skillsDirs;
+    const root = (name: string) => plugins.find((p) => p.name === name)?.rootPath ?? "";
+    expect(skillsDirs("implicit")).toEqual([{ dir: path.join(root("implicit"), "skills") }]);
+    expect(skillsDirs("declared")).toEqual([
+      { dir: path.join(root("declared"), "skills"), single: true, name: "skills" },
+    ]);
   });
 
   test("discovers a manifest-only plugin without components", async () => {
@@ -1033,7 +1135,7 @@ describe("discoverAgentPlugins", () => {
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
     expect(plugin.name).toBe("figma");
-    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
+    expect(plugin.skillsDirs).toEqual([{ dir: path.join(plugin.rootPath, "skills") }]);
     expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, ".mcp.json"));
     // Parsed and exposed only: no hook component resolves from the legacy key.
     expect(plugin.hooksPath).toBeUndefined();
@@ -1093,7 +1195,7 @@ describe("discoverAgentPlugins", () => {
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
     expect(plugin.codexFallback).toBe(true);
-    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
+    expect(plugin.skillsDirs).toEqual([{ dir: path.join(plugin.rootPath, "skills") }]);
     expect(plugin.hooksPath).toBeUndefined();
     expect(plugin.agentsDir).toBeUndefined();
     expect(plugin.workflowsDir).toBeUndefined();
@@ -1699,5 +1801,411 @@ describe("plugin .git containment (#6161)", () => {
     expect(await ensurePluginPathContained(root, path.join(root, ".gitignore"))).toBe(
       path.join(root, ".gitignore")
     );
+  });
+});
+
+describe("Claude Code plugin discovery", () => {
+  /** Write files (relative path → content) under a new plugin folder. */
+  async function writeTree(pluginDir: string, files: Record<string, string>): Promise<void> {
+    for (const [relative, content] of Object.entries(files)) {
+      await fs.mkdir(path.dirname(path.join(pluginDir, relative)), { recursive: true });
+      await fs.writeFile(path.join(pluginDir, relative), content, "utf8");
+    }
+  }
+  const claudeManifest = (manifest: unknown) => ({
+    ".claude-plugin/plugin.json": JSON.stringify(manifest),
+  });
+
+  test("maps the Claude manifest: skills add to skills/, one agents folder, ignored keys warn", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "review-kit");
+    await writeTree(pluginDir, {
+      ...claudeManifest({
+        $schema: "https://json.schemastore.org/claude-code-plugin.json",
+        name: "review-kit",
+        version: "1.4.0",
+        description: "Review tools",
+        author: { name: "Example", email: "dev@example.com", team: "x" },
+        metadata: { catalogId: "c" },
+        skills: ["./extra-skills/"],
+        agents: ["./custom-agents/reviewer.md", "./custom-agents/tester.md"],
+        mcpServers: "./config/servers.json",
+        lspServers: "./.lsp.json",
+        userConfig: { token: { type: "string" } },
+        contributes: { slashCommands: [{ name: "x", expansion: "y" }] },
+        extensions: { mux: { hooks: { tools: ["bash"] } } },
+      }),
+      "skills/a/SKILL.md": "---\nname: a\ndescription: A\n---\n",
+      "extra-skills/b/SKILL.md": "---\nname: b\ndescription: B\n---\n",
+      "custom-agents/reviewer.md": "---\nname: reviewer\ndescription: R\n---\n",
+      "config/servers.json": "{}",
+      ".mcp.json": "{}",
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toHaveLength(1);
+    const plugin = result.plugins[0];
+    expect(plugin.claudeFallback).toBe(true);
+    expect(plugin.manifest).toMatchObject({
+      name: "review-kit",
+      version: "1.4.0",
+      description: "Review tools",
+      author: { name: "Example", email: "dev@example.com" },
+    });
+    expect(plugin.manifest.extensions).toBeUndefined();
+    expect(plugin.manifest.contributes?.slashCommands).toBeUndefined();
+    expect(resolvePluginHookGrants(plugin.manifest).bridgeTools.allow).toEqual([]);
+    expect(plugin.skillsDirs).toEqual([
+      { dir: path.join(plugin.rootPath, "skills") },
+      { dir: path.join(plugin.rootPath, "extra-skills") },
+    ]);
+    expect(plugin.agentsDir).toBe(path.join(plugin.rootPath, "custom-agents"));
+    expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, "config", "servers.json"));
+    expect(plugin.mcpConfigDialect).toBe("claude");
+    expect(result.diagnostics.map((d) => d.severity)).not.toContain("error");
+    const messages = result.diagnostics.map((d) => d.message).join("\n");
+    for (const key of ["author.team", "lspServers", "userConfig", "contributes", "extensions"]) {
+      expect(messages).toContain(`'${key}'`);
+    }
+    // Keys Claude Code itself ignores at load time do not warn.
+    expect(messages).not.toContain("'metadata'");
+    expect(messages).not.toContain("'$schema'");
+  });
+
+  test("agents spread over two folders, or an empty list, load no agents (never agents/)", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const agent = "---\nname: c\ndescription: C\n---\n";
+    await writeTree(path.join(container, "spread"), {
+      ...claudeManifest({ name: "spread", agents: ["./one/a.md", "./two/b.md"] }),
+      "one/a.md": agent,
+      "two/b.md": agent,
+      "agents/c.md": agent,
+    });
+    // A Claude `agents` value replaces the default scan, so an empty list declares none.
+    await writeTree(path.join(container, "none"), {
+      ...claudeManifest({ name: "none", agents: [] }),
+      "agents/c.md": agent,
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins.map((plugin) => [plugin.name, plugin.agentsDir])).toEqual([
+      ["none", undefined],
+      ["spread", undefined],
+    ]);
+    expect(result.diagnostics.map((d) => d.message).join("\n")).toContain(
+      "'agents' must list .md files in one folder below the plugin root; loading no agents"
+    );
+  });
+
+  test("a Claude name with capitals or underscores loads in the Agent Plugins grammar", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    for (const [dirName, name] of [
+      ["snake", "my_plugin"],
+      ["camel", "MyPlugin"],
+      // No safe mapping: "--" stays invalid, so the validator refuses the plugin.
+      ["double", "my__plugin"],
+    ]) {
+      await writeTree(path.join(container, dirName), claudeManifest({ name }));
+    }
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins.map((plugin) => [plugin.dirName, plugin.name])).toEqual([
+      ["camel", "myplugin"],
+      ["snake", "my-plugin"],
+    ]);
+    const messages = result.diagnostics.map((d) => `${d.severity}: ${d.message}`).join("\n");
+    expect(messages).toContain("Plugin name 'my_plugin' is not an Agent Plugins name");
+    expect(messages).toContain("error: Invalid plugin manifest");
+  });
+
+  test("a Claude package gets agents/ but no hooks.js and no workflows/", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "gated");
+    await writeTree(pluginDir, {
+      ...claudeManifest({ name: "gated" }),
+      "hooks.js": "export default {};",
+      "workflows/run.js": "export {};",
+      "agents/helper.md": "---\nname: helper\ndescription: H\n---\n",
+      // Claude Code reads only .mcp.json, so a Claude package never falls back to mcp.json.
+      "mcp.json": "{}",
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toHaveLength(1);
+    const plugin = result.plugins[0];
+    expect(plugin.hooksPath).toBeUndefined();
+    expect(plugin.workflowsDir).toBeUndefined();
+    expect(plugin.agentsDir).toBe(path.join(plugin.rootPath, "agents"));
+    expect(plugin.mcpConfigPath).toBeUndefined();
+  });
+
+  test("a skill file swapped for an outside link after its check does not take a command's name", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    await writeTree(path.join(container, "kit"), {
+      ...claudeManifest({ name: "kit" }),
+      "commands/deploy.md": "x",
+      "skills/deploy/SKILL.md": "not a skill\n",
+    });
+    const outside = path.join(tmp.path, "outside.md");
+    await fs.writeFile(outside, "---\nname: deploy\ndescription: D\n---\n", "utf8");
+    const skillFile = path.join(
+      await fs.realpath(path.join(container, "kit")),
+      "skills",
+      "deploy",
+      "SKILL.md"
+    );
+    // A local process replaces SKILL.md between the probe's stat and its read.
+    const realStat = fs.stat;
+    let swapped = false;
+    const stats = spyOn(fs, "stat").mockImplementation((async (
+      ...args: Parameters<typeof fs.stat>
+    ) => {
+      const result = await realStat(...args);
+      if (!swapped && args[0] === skillFile) {
+        swapped = true;
+        await fs.rm(skillFile);
+        await fs.symlink(outside, skillFile);
+      }
+      return result;
+    }) as typeof fs.stat);
+    try {
+      const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+      expect(swapped).toBe(true);
+      // The outside file is never read as the skill, so the command keeps its name.
+      expect(result.plugins[0]?.skillsDirs).toContainEqual({
+        dir: path.join(result.plugins[0].rootPath, "commands"),
+        single: true,
+        name: "deploy",
+        command: true,
+      });
+      expect(result.diagnostics.map((d) => d.message).join("\n")).not.toContain(
+        "'deploy.md' is ignored"
+      );
+    } finally {
+      stats.mockRestore();
+    }
+  });
+
+  test("commands become command roots after the skills roots; bad and taken names warn", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "cmds");
+    await writeTree(pluginDir, {
+      // A manifest `commands` list replaces commands/ (the Claude rule).
+      ...claudeManifest({ name: "cmds", commands: ["./extra/", "./one/solo.md"] }),
+      "commands/ignored.md": "x",
+      "extra/deploy.md": "x",
+      "extra/Bad_Name.md": "x",
+      "extra/notes.txt": "x",
+      "extra/greet.md": "x",
+      "one/solo.md": "x",
+      "skills/greet/SKILL.md": "---\nname: greet\ndescription: G\n---\n",
+    });
+    const objectMap = path.join(container, "map");
+    await writeTree(objectMap, {
+      ...claudeManifest({ name: "map", commands: { about: { content: "x" } } }),
+      "commands/default.md": "x",
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const [cmds, map] = result.plugins;
+    const extra = path.join(cmds.rootPath, "extra");
+    expect(cmds.skillsDirs).toEqual([
+      { dir: path.join(cmds.rootPath, "skills") },
+      { dir: extra, single: true, name: "deploy", command: true },
+      { dir: path.join(cmds.rootPath, "one"), single: true, name: "solo", command: true },
+    ]);
+    // An ignored object map still replaces commands/.
+    expect(map.skillsDirs).toBeUndefined();
+    const messages = result.diagnostics.map((d) => d.message).join("\n");
+    expect(messages).toContain("'Bad_Name.md' has no valid skill name");
+    expect(messages).toContain("'greet.md' is ignored");
+    expect(messages).toContain("object map in 'commands'");
+  });
+
+  test("an agents list that leaves out a file in its folder loads no agents", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    await writeTree(path.join(container, "partial"), {
+      ...claudeManifest({ name: "partial", agents: ["./custom/reviewer.md"] }),
+      "custom/reviewer.md": "---\nname: reviewer\ndescription: R\n---\n",
+      "custom/internal.md": "---\nname: internal\ndescription: I\n---\n",
+    });
+    await writeTree(path.join(container, "complete"), {
+      ...claudeManifest({ name: "complete", agents: ["./custom/reviewer.md"] }),
+      "custom/reviewer.md": "---\nname: reviewer\ndescription: R\n---\n",
+      "custom/notes.txt": "not an agent",
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const byName = new Map(result.plugins.map((plugin) => [plugin.name, plugin]));
+    expect(byName.get("partial")?.agentsDir).toBeUndefined();
+    const complete = byName.get("complete");
+    expect(complete?.agentsDir).toBe(path.join(complete?.rootPath ?? "", "custom"));
+    expect(result.diagnostics.map((d) => d.message).join("\n")).toContain("internal.md");
+  });
+
+  test("a root SKILL.md is the one skill only without skills/ and a skills key", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const skill = "---\nname: solo\ndescription: S\n---\n";
+    await writeTree(path.join(container, "solo"), {
+      ...claudeManifest({ name: "solo" }),
+      "SKILL.md": skill,
+    });
+    await writeTree(path.join(container, "has-dir"), {
+      ...claudeManifest({ name: "has-dir" }),
+      "SKILL.md": skill,
+      "skills/a/SKILL.md": "---\nname: a\ndescription: A\n---\n",
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const byName = new Map(result.plugins.map((plugin) => [plugin.name, plugin]));
+    const solo = byName.get("solo");
+    expect(solo?.skillsDirs).toEqual([{ dir: solo?.rootPath ?? "", single: true, name: "solo" }]);
+    const hasDir = byName.get("has-dir");
+    expect(hasDir?.skillsDirs).toEqual([{ dir: path.join(hasDir?.rootPath ?? "", "skills") }]);
+  });
+
+  test("a command keeps its declared name through a symlink and survives a broken skill", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "cmds");
+    await writeTree(pluginDir, {
+      ...claudeManifest({
+        name: "cmds",
+        commands: ["./commands/review.md", "./commands/deploy.md"],
+      }),
+      "shared/prompt.md": "Review $ARGUMENTS",
+      "commands/deploy.md": "Deploy",
+      // An empty skill folder and a SKILL.md without frontmatter never load as skills.
+      "skills/review/SKILL.md": "no frontmatter",
+    });
+    await fs.mkdir(path.join(pluginDir, "skills", "deploy"), { recursive: true });
+    await fs.symlink(
+      path.join("..", "shared", "prompt.md"),
+      path.join(pluginDir, "commands", "review.md")
+    );
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const plugin = result.plugins[0];
+    const commands = path.join(plugin.rootPath, "commands");
+    expect(plugin.skillsDirs).toEqual([
+      { dir: path.join(plugin.rootPath, "skills") },
+      { dir: commands, single: true, name: "review", command: true },
+      { dir: commands, single: true, name: "deploy", command: true },
+    ]);
+  });
+
+  test("plugin.json beats .codex-plugin/plugin.json, which beats .claude-plugin/plugin.json", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const claude = claudeManifest({ name: "from-claude" });
+    const codex = { ".codex-plugin/plugin.json": JSON.stringify({ name: "from-codex" }) };
+    const root = {
+      "plugin.json": JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "from-root" }),
+    };
+    await writeTree(path.join(container, "a"), { ...claude, ...codex, ...root });
+    await writeTree(path.join(container, "b"), { ...claude, ...codex });
+    await writeTree(path.join(container, "c"), claude);
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins.map((p) => [p.dirName, p.name, p.claudeFallback === true])).toEqual([
+      ["a", "from-root", false],
+      ["b", "from-codex", false],
+      ["c", "from-claude", true],
+    ]);
+  });
+});
+
+describe("generatedFrom marker (skills-only packages)", () => {
+  const SKILL = "---\nname: s\ndescription: S\n---\n";
+  /** A plugin with every component kind; `marker` adds extensions.mux.generatedFrom. */
+  async function writeFullPlugin(pluginDir: string, marker: unknown): Promise<void> {
+    const files: Record<string, string> = {
+      "plugin.json": JSON.stringify({
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "kit",
+        contributes: { slashCommands: [{ name: "go", expansion: "Go" }] },
+        extensions: {
+          mux: {
+            hooks: { tools: ["bash"] },
+            ...(marker !== undefined ? { generatedFrom: marker } : {}),
+          },
+          "com.openai": { hooks: ["custom-hooks.json"] },
+        },
+      }),
+      "skills/s/SKILL.md": SKILL,
+      "hooks.js": "export default {};",
+      "hooks/hooks.json": JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: "command", command: "x" }] }] },
+      }),
+      "custom-hooks.json": JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: "command", command: "y" }] }] },
+      }),
+      "agents/a.md": "---\nname: a\ndescription: A\n---\n",
+      "workflows/w.js": "export default async () => {};",
+      "mcp.json": "{}",
+    };
+    for (const [relative, content] of Object.entries(files)) {
+      await fs.mkdir(path.dirname(path.join(pluginDir, relative)), { recursive: true });
+      await fs.writeFile(path.join(pluginDir, relative), content, "utf8");
+    }
+  }
+
+  test("a spoofed marker only removes capabilities: skills load, nothing else does", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    for (const [dirName, marker] of [
+      ["plain", undefined],
+      ["marked", { kind: "skills" }],
+      // An unknown or malformed marker is skills-only too.
+      ["unknown", { kind: "something-new" }],
+      ["malformed", "yes"],
+    ] as const) {
+      const pluginDir = path.join(tmp.path, dirName);
+      await writeFullPlugin(pluginDir, marker);
+      const { plugin } = await discoverAgentPluginAt({ pluginDir, scope: "global" });
+      if (plugin === null) throw new Error(`${dirName}: not a plugin`);
+      const hooks = await loadPluginCodexHooks(plugin);
+      const surface = {
+        skills: plugin.skillsDirs?.map((root) => path.relative(plugin.rootPath, root.dir)),
+        hooksJs: plugin.hooksPath !== undefined,
+        agents: plugin.agentsDir !== undefined,
+        workflows: plugin.workflowsDir !== undefined,
+        mcp: plugin.mcpConfigPath !== undefined,
+        codexHooks: hooks.hooks.length > 0,
+        slashCommands: plugin.manifest.contributes?.slashCommands !== undefined,
+        openai: plugin.openai !== undefined,
+        hookTools: resolvePluginHookGrants(plugin.manifest).bridgeTools.allow.length > 0,
+      };
+      const loaded = marker === undefined;
+      expect({ dirName, ...surface }).toEqual({
+        dirName,
+        skills: ["skills"],
+        hooksJs: loaded,
+        agents: loaded,
+        workflows: loaded,
+        mcp: loaded,
+        codexHooks: loaded,
+        slashCommands: loaded,
+        openai: loaded,
+        hookTools: loaded,
+      });
+      expect(plugin.skillsOnly).toBe(loaded ? undefined : true);
+    }
   });
 });
