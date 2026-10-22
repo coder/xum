@@ -567,6 +567,8 @@ function useLastTabClosesSidebar(options: {
   onCloseFullscreen: (() => void) | undefined;
   containerRef: React.RefObject<HTMLDivElement>;
 }): React.MutableRefObject<(tab: TabType) => boolean> {
+  // The shell whose toggle takes focus once the collapse commits (see below).
+  const deferredToggleFocusRef = React.useRef<Element | null>(null);
   const closeSidebarIfLastTab = (tab: TabType): boolean => {
     if (options.collapsed || getOnlyTab(options.layout.root) !== tab) return false;
     if (options.fullscreen) {
@@ -576,7 +578,11 @@ function useLastTabClosesSidebar(options: {
     // The collapse unmounts the panel, and focus inside it would fall to <body>.
     const container = options.containerRef.current;
     if (container?.contains(document.activeElement) === true) {
-      focusRightSidebarToggle(container.closest("[data-workspace-shell]"));
+      const shell = container.closest("[data-workspace-shell]");
+      focusRightSidebarToggle(shell);
+      // A pinned view (Artifacts fullscreen, a maximized App View tab) keeps the toggle inert
+      // until the view unmounts with its tab, so the focus move waits for the commit.
+      if (container.contains(document.activeElement)) deferredToggleFocusRef.current = shell;
     }
     options.setCollapsed(true);
     return true;
@@ -585,6 +591,12 @@ function useLastTabClosesSidebar(options: {
   React.useLayoutEffect(() => {
     ref.current = closeSidebarIfLastTab;
   });
+  // A passive effect, so it runs after the closed view's effect cleanup has un-pinned it.
+  React.useEffect(() => {
+    const shell = deferredToggleFocusRef.current;
+    deferredToggleFocusRef.current = null;
+    focusRightSidebarToggle(shell);
+  }, [options.collapsed]);
   return ref;
 }
 
