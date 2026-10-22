@@ -34,7 +34,10 @@ const fsPromises = require("fs/promises") as Record<string, unknown>;
 const tmpDir = (require("os") as { tmpdir(): string }).tmpdir();
 const writeFileSync = fsModule.writeFileSync as (file: string, data: string) => void;
 
-const now = () => performance.now();
+// Bind the clock now: tests spy on performance.now (session_history.budget.test.ts counts its
+// reads), and the wrappers must not read through such a spy.
+const perfNow = performance.now.bind(performance);
+const now = () => perfNow();
 const fsIntervals: Interval[] = [];
 const timerIntervals: Interval[] = [];
 const recordFs = (interval: Interval) => fsIntervals.push(interval);
