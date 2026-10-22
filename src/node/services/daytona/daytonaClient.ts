@@ -83,15 +83,12 @@ const SnapshotSchema = z.object({
   sandboxClass: z.string().nullish(),
   /** GPU units of the sandboxes it creates, as on a sandbox. */
   gpu: z.number().nullish(),
-  /** SnapshotState: only "active" creates sandboxes (building, inactive, error, ...). */
-  state: z.string().nullish(),
 });
 
 export interface DaytonaSnapshot {
   name: string;
   sandboxClass?: string;
   gpu?: number;
-  state?: string;
 }
 
 function toSnapshot(item: z.infer<typeof SnapshotSchema>): DaytonaSnapshot {
@@ -99,7 +96,6 @@ function toSnapshot(item: z.infer<typeof SnapshotSchema>): DaytonaSnapshot {
     name: item.name,
     ...(item.sandboxClass ? { sandboxClass: item.sandboxClass } : {}),
     ...(item.gpu ? { gpu: item.gpu } : {}),
-    ...(item.state ? { state: item.state } : {}),
   };
 }
 

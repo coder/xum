@@ -47,7 +47,6 @@ export class FakeDaytonaControlPlane {
     sandboxClass?: string;
     gpu?: number;
     listedOnly?: boolean;
-    state?: string;
   }> = [];
   /** The ssh gateway GET /config advertises; a test moves it or rotates its host keys. */
   gateway: DaytonaSshGateway = {

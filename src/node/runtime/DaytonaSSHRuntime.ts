@@ -256,23 +256,6 @@ function makeStatusEmitter(statusSink: EnsureReadyOptions["statusSink"]): Status
   return (phase, detail) => statusSink?.({ phase, runtimeType: "ssh", detail });
 }
 
-/**
- * An unreported disk is left as it is: the snapshot's may be larger than the preset's, and
- * sending the preset would then be a shrink Daytona refuses, failing (and deleting) the sandbox.
- */
-/**
- * Only an active snapshot creates sandboxes (SnapshotState: building, pending, pulling,
- * snapshotting, inactive, error, build_failed, removing do not); none reported passes.
- */
-function snapshotStateRefusal(snapshot: string, state: string | undefined): string | undefined {
-  if (!state || state === "active") return undefined;
-  const next =
-    state === "inactive"
-      ? "activate it in Daytona or pick another snapshot"
-      : "pick another snapshot";
-  return `Daytona snapshot "${snapshot}" is ${state}, not active; ${next}`;
-}
-
 /** Why an existing sandbox cannot be attached, before the workspace is persisted. */
 function attachRefusal(
   sandboxId: string,
@@ -918,8 +901,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       const { label, why } = UNSUPPORTED_SANDBOXES[found.unsupported];
       return Err(`Daytona snapshot "${snapshot}" creates ${label} sandboxes. ${why}`);
     }
-    const refusal = snapshotStateRefusal(snapshot, found.state);
-    return refusal ? Err(refusal) : Ok(undefined);
+    return Ok(undefined);
   }
 
   /** The sandbox may not exist yet, so only compute the path (as Coder does). */

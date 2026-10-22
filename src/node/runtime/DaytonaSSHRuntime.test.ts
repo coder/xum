@@ -491,22 +491,16 @@ describe("DaytonaSSHRuntime Windows and GPU sandboxes", () => {
     expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
   });
 
-  it.each([
-    [{ name: "default-snap", sandboxClass: "windows" }, '"default-snap" creates Windows'],
-    [{ name: "default-snap", state: "inactive" }, '"default-snap" is inactive'],
-  ])(
-    "refuses a deployment default Xum cannot use when no snapshot is chosen (%o)",
-    async (snapshot, refusal) => {
-      rig.plane.snapshots.push(snapshot);
-      rig.plane.defaultSnapshot = "default-snap";
-      const runtime = makeRuntime({});
-      const finalized = await runtime.finalizeConfig("b", sshDaytonaConfig({}));
-      if (!finalized.success) throw new Error(finalized.error);
-      const refused = await runtime.validateBeforePersist("b", finalized.data);
-      expect(refused.success ? "" : refused.error).toContain(refusal);
-      expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
-    }
-  );
+  it("refuses a Windows deployment default when no snapshot is chosen", async () => {
+    rig.plane.snapshots.push({ name: "default-snap", sandboxClass: "windows" });
+    rig.plane.defaultSnapshot = "default-snap";
+    const runtime = makeRuntime({});
+    const finalized = await runtime.finalizeConfig("b", sshDaytonaConfig({}));
+    if (!finalized.success) throw new Error(finalized.error);
+    const refused = await runtime.validateBeforePersist("b", finalized.data);
+    expect(refused.success ? "" : refused.error).toContain('"default-snap" creates Windows');
+    expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
+  });
 
   it("neither offers nor attaches a sandbox in an error state", async () => {
     rig.plane.addSandbox({ id: "sb-broken", state: "build_failed" });
@@ -523,37 +517,6 @@ describe("DaytonaSSHRuntime Windows and GPU sandboxes", () => {
     expect(refused.success ? "" : refused.error).toContain("build_failed");
     const listed = await rig.service.listSandboxes();
     expect(listed.ok && listed.sandboxes.map((s) => s.id)).toEqual(["sb-ok"]);
-  });
-
-  it("neither offers nor accepts a snapshot that is not active", async () => {
-    rig.plane.snapshots.push(
-      { name: "snap-building", state: "building" },
-      { name: "snap-inactive", state: "inactive" },
-      { name: "snap-active", state: "active" },
-      // No state reported: accepted, as before Daytona reported one.
-      { name: "snap-unknown" }
-    );
-    const runtime = makeRuntime({});
-    const validate = async (snapshot: string) => {
-      const finalized = await runtime.finalizeConfig("b", sshDaytonaConfig({ snapshot }));
-      if (!finalized.success) return finalized;
-      return runtime.validateBeforePersist("b", finalized.data);
-    };
-    const error = (result: Awaited<ReturnType<typeof validate>>) =>
-      result.success ? "" : result.error;
-
-    expect(error(await validate("snap-building"))).toContain("building");
-    const inactive = error(await validate("snap-inactive"));
-    expect(inactive).toContain("inactive");
-    expect(inactive).toContain("activate");
-    expect((await validate("snap-active")).success).toBe(true);
-    expect((await validate("snap-unknown")).success).toBe(true);
-    const listed = await rig.service.listSnapshots();
-    expect(listed.ok && listed.snapshots.map((s) => s.name)).toEqual([
-      "snap-active",
-      "snap-unknown",
-    ]);
-    expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
   });
 
   it("offers neither Windows nor GPU snapshots and sandboxes", async () => {
