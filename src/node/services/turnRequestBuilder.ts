@@ -3493,6 +3493,63 @@ export class TurnRequestBuilder {
         primaryRequest.engineSystem == null
           ? finalMessages.slice(leadingSystemRows === -1 ? finalMessages.length : leadingSystemRows)
           : finalMessages;
+      const mergedProviderOptions = primaryRequest.providerOptions;
+      const currentEffectiveLevelRef = primaryRequest.currentEffectiveLevelRef;
+      const computeRebuiltProviderOptions = primaryRequest.computeRebuiltProviderOptions;
+      // Fold PREPARING-window pending thinking overrides into the ACTUAL
+      // request build, not just the envelope: message preparation is
+      // thinking-level-dependent (Anthropic signed-reasoning transforms), so
+      // recording the new level while streaming old-level messages would make
+      // wire and replay diverge — or send an invalid extended-thinking
+      // request. Consuming pending here (applied set below) is safe:
+      // createStreamAtomically seeds streamInfo.thinkingLevel from `applied`,
+      // and prepareStep simply sees no pending to re-apply.
+      // Loop until pending is quiescent: setActiveTurnThinkingLevel can write
+      // a NEW pending while the awaited message rebuild runs, and stamping the
+      // first level after the await would leave step 0 rebuilding only
+      // provider options while the messages stay at the stale level.
+      // The fold runs before the assistant placeholder is appended: its budget-checked rebuild
+      // is the last count of this request, so a refusal leaves no row to delete, and a Token
+      // Budget stage decided after it is never re-counted after publication (#5286).
+      let streamThinkingLevel = effectiveThinkingLevel;
+      let streamProviderOptions = mergedProviderOptions;
+      let streamFinalMessages = finalMessages;
+      let streamVolatileSystemTail = primaryRequest.volatileSystemTail;
+      while (activeTurnThinkingOverride?.pending != null) {
+        const pendingPreparingLevel = activeTurnThinkingOverride.pending;
+        activeTurnThinkingOverride.pending = undefined;
+        const folded = computeRebuiltProviderOptions(
+          pendingPreparingLevel,
+          streamThinkingLevel,
+          true
+        );
+        if (folded == null) {
+          // No-op fold (same effective level / non-foldable variant swap):
+          // re-check pending — a change may have raced the previous rebuild.
+          continue;
+        }
+        try {
+          ({
+            messages: streamFinalMessages,
+            volatileSystemTail: streamVolatileSystemTail,
+            systemMessageTokens,
+          } = await primaryRequest.rebuildMessagesForThinkingLevel(folded.effectiveLevel));
+        } catch (error) {
+          if (error instanceof ContextBudgetExceededError) {
+            runLanguageModelCleanup(modelResult.data.model);
+            return { type: "finished", result: Err(error.details) };
+          }
+          throw error;
+        }
+        streamProviderOptions = folded.providerOptions;
+        streamThinkingLevel = folded.effectiveLevel;
+        activeTurnThinkingOverride.applied = folded.effectiveLevel;
+        // Keep the mid-turn rebuild baseline in sync so a later identical
+        // request is correctly treated as a no-op.
+        currentEffectiveLevelRef.current = folded.effectiveLevel;
+        // Loop re-checks pending: a change during the awaits above re-folds
+        // against the level just applied.
+      }
       if (combinedAbortSignal.aborted)
         return {
           type: "finished",
@@ -3578,10 +3635,7 @@ export class TurnRequestBuilder {
       }
 
       let requestHeaders = primaryRequest.headers;
-      const mergedProviderOptions = primaryRequest.providerOptions;
       const resolvedOverrides = primaryRequest.resolvedOverrides;
-      const currentEffectiveLevelRef = primaryRequest.currentEffectiveLevelRef;
-      const computeRebuiltProviderOptions = primaryRequest.computeRebuiltProviderOptions;
       const rebuildProviderOptionsForThinkingLevel =
         primaryRequest.rebuildProviderOptionsForThinkingLevel;
       // Debug dump: Log the complete LLM request when MUX_DEBUG_LLM_REQUEST is set
@@ -3803,59 +3857,6 @@ export class TurnRequestBuilder {
           : undefined;
 
       const forcedFirstStepToolNames = primaryRequest.forcedFirstStepToolNames;
-
-      // Fold PREPARING-window pending thinking overrides into the ACTUAL
-      // request build, not just the envelope: message preparation is
-      // thinking-level-dependent (Anthropic signed-reasoning transforms), so
-      // recording the new level while streaming old-level messages would make
-      // wire and replay diverge — or send an invalid extended-thinking
-      // request. Consuming pending here (applied set below) is safe:
-      // createStreamAtomically seeds streamInfo.thinkingLevel from `applied`,
-      // and prepareStep simply sees no pending to re-apply.
-      // Loop until pending is quiescent: setActiveTurnThinkingLevel can write
-      // a NEW pending while the awaited message rebuild runs, and stamping the
-      // first level after the await would leave step 0 rebuilding only
-      // provider options while the messages stay at the stale level.
-      let streamThinkingLevel = effectiveThinkingLevel;
-      let streamProviderOptions = mergedProviderOptions;
-      let streamFinalMessages = finalMessages;
-      let streamVolatileSystemTail = primaryRequest.volatileSystemTail;
-      while (activeTurnThinkingOverride?.pending != null) {
-        const pendingPreparingLevel = activeTurnThinkingOverride.pending;
-        activeTurnThinkingOverride.pending = undefined;
-        const folded = computeRebuiltProviderOptions(
-          pendingPreparingLevel,
-          streamThinkingLevel,
-          true
-        );
-        if (folded == null) {
-          // No-op fold (same effective level / non-foldable variant swap):
-          // re-check pending — a change may have raced the previous rebuild.
-          continue;
-        }
-        try {
-          ({
-            messages: streamFinalMessages,
-            volatileSystemTail: streamVolatileSystemTail,
-            systemMessageTokens,
-          } = await primaryRequest.rebuildMessagesForThinkingLevel(folded.effectiveLevel));
-        } catch (error) {
-          if (error instanceof ContextBudgetExceededError) {
-            runLanguageModelCleanup(modelResult.data.model);
-            await deleteAbortedPlaceholder(assistantMessageId);
-            return { type: "finished", result: Err(error.details) };
-          }
-          throw error;
-        }
-        streamProviderOptions = folded.providerOptions;
-        streamThinkingLevel = folded.effectiveLevel;
-        activeTurnThinkingOverride.applied = folded.effectiveLevel;
-        // Keep the mid-turn rebuild baseline in sync so a later identical
-        // request is correctly treated as a no-op.
-        currentEffectiveLevelRef.current = folded.effectiveLevel;
-        // Loop re-checks pending: a change during the awaits above re-folds
-        // against the level just applied.
-      }
 
       const emitPrimaryEnvelope = (): Promise<void> =>
         primaryRequest.emitEnvelopeWith(streamThinkingLevel, streamProviderOptions);
