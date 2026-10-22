@@ -764,7 +764,7 @@ export class DaytonaService {
     return { available: true };
   }
 
-  /** The idle read before a lease; unusable settings fail the lease's own first call instead. */
+  /** The idle read before a lease; unusable settings fail the lease's own first call. */
   private async refreshIdleCredentials(): Promise<void> {
     try {
       await this.resolveCredentials();
@@ -772,6 +772,9 @@ export class DaytonaService {
       log.debug("Could not read the Daytona settings before an operation", {
         error: getErrorMessage(error),
       });
+      // The lease must not pin the account this process used before: unusable settings must
+      // make Daytona unusable, so its first resolve reads them again and fails.
+      this.credentialsSnapshot = undefined;
     }
   }
 

@@ -303,6 +303,28 @@ describe("DaytonaService", () => {
     expect((await service.getAccount()).generation).toBe(before + 1);
   });
 
+  it("fails a lease whose settings another process made unusable while idle", async () => {
+    plane.states = ["started"];
+    await service.getSandboxState("sb-1");
+    const requests = plane.calls.length;
+
+    // A hand edit (or another backend) saves an API URL that must not get the key.
+    await fs.writeFile(
+      path.join(rootDir, "daytona.json"),
+      JSON.stringify({ apiKey: "k", apiUrl: "http://remote.example.com/api" })
+    );
+    const failure = await service
+      .withAccountLease(() => service.getSandboxState("sb-1"))
+      .then(
+        () => undefined,
+        (error: unknown) => error
+      );
+
+    expect(failure).toBeInstanceOf(DaytonaApiError);
+    expect((failure as DaytonaApiError).kind).toBe("not_configured");
+    expect(plane.calls.length).toBe(requests);
+  });
+
   it("leaves a resolve during its own settings save to that save", async () => {
     const revokeKeys: string[] = [];
     const store = new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" });
