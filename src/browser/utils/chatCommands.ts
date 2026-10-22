@@ -1053,8 +1053,9 @@ export async function processSlashCommand(
         return handlePlanShowCommand({ ...env, api: client, workspaceId: env.workspaceId });
       case "plan-open":
         if (!env.workspaceId) throw new Error("Workspace ID required");
-        if (!client) return notConnected();
-        return handlePlanOpenCommand({ ...env, api: client, workspaceId: env.workspaceId });
+        // No client needed: the tab shows the reconnecting state itself. (A side chat never
+        // gets here: the side-chat gate above refuses workspace-only commands.)
+        return handlePlanOpenCommand(env.workspaceId);
       case "goal-show":
       case "goal-set":
       case "goal-budget":
@@ -2054,10 +2055,10 @@ function handlePlanShowCommand(env: WorkspaceCommandEnv): CommandResult {
   });
 }
 
-function handlePlanOpenCommand(env: WorkspaceCommandEnv): CommandResult {
-  // The Plan tab shows the plan, or that there is none yet; opening it in an editor is one of
-  // the tab's actions.
-  openPlanTab(env.workspaceId);
+function handlePlanOpenCommand(workspaceId: string): CommandResult {
+  // The Plan tab shows the plan, or that there is none yet (or that the backend is away);
+  // opening it in an editor is one of the tab's actions.
+  openPlanTab(workspaceId);
   trackCommandUsed("plan");
   return complete("consume", [{ type: "clear-input" }]);
 }
