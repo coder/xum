@@ -46,6 +46,7 @@ import {
   Provider,
   ProvidersConfigStoreTag,
   SecretsStoreTag,
+  SessionFilesTag,
   SessionLocatorTag,
   SessionUsage,
   StreamManagerTag,
@@ -171,7 +172,9 @@ export const WorkspaceMcpOverridesDefaultLive: Layer.Layer<
 
 export const HistoryLive = Layer.effect(
   History,
-  Effect.map(SessionLocatorTag, (sessionLocator) => new HistoryService(sessionLocator))
+  Effect.gen(function* () {
+    return new HistoryService(yield* SessionLocatorTag, yield* SessionFilesTag);
+  })
 );
 
 export const InitStateManagerLive = Layer.effect(
