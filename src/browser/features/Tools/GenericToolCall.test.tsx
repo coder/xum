@@ -177,7 +177,9 @@ describe("GenericToolCall MCP Apps view", () => {
     const view = renderAppCall("completed");
     await view.findByTestId("mcp-app-frame");
     // "Open in tab" adds the tab; the card drops its frame and offers the tab.
-    act(() => updateRightSidebarLayout("ws-app-card", (s) => withAppViewTab(s, "call-1")));
+    act(() => {
+      updateRightSidebarLayout("ws-app-card", (s) => withAppViewTab(s, "call-1"));
+    });
     await waitFor(() => expect(view.queryByTestId("mcp-app-frame")).toBeNull());
     const goTo = view.getByRole("button", { name: "Go to tab" });
     const opened: string[] = [];
@@ -188,11 +190,11 @@ describe("GenericToolCall MCP Apps view", () => {
     window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
     expect(opened).toEqual(["call-1"]);
     // Closing the tab brings the view back, mounted again (a new resource read).
-    act(() =>
+    act(() => {
       updateRightSidebarLayout("ws-app-card", (s) =>
         removeTabEverywhere(s, appViewTabFor("call-1"))
-      )
-    );
+      );
+    });
     await view.findByTestId("mcp-app-frame");
     expect(getViewCalls).toBe(2);
   });
@@ -207,9 +209,9 @@ describe("GenericToolCall MCP Apps view", () => {
       updateRightSidebarLayout(workspaceId, (s) => withAppViewTab(s, "call-1"));
     });
     await waitFor(() => expect(view.queryByTestId("mcp-app-frame")).toBeNull());
-    act(() =>
-      updateRightSidebarLayout(workspaceId, (s) => removeTabEverywhere(s, appViewTabFor("call-1")))
-    );
+    act(() => {
+      updateRightSidebarLayout(workspaceId, (s) => removeTabEverywhere(s, appViewTabFor("call-1")));
+    });
     // No frame comes back, which would move the view to a tab again.
     expect(view.getByRole("button", { name: "Go to tab" })).toBeTruthy();
     expect(view.queryByTestId("mcp-app-frame")).toBeNull();
@@ -221,7 +223,9 @@ describe("GenericToolCall MCP Apps view", () => {
     const view = renderAppCall("completed");
     await view.findByTestId("mcp-app-frame");
     expect(isCard()).toBe(true);
-    act(() => updateRightSidebarLayout("ws-app-card", (s) => withAppViewTab(s, "call-1")));
+    act(() => {
+      updateRightSidebarLayout("ws-app-card", (s) => withAppViewTab(s, "call-1"));
+    });
     await waitFor(() => expect(view.queryByTestId("mcp-app-frame")).toBeNull());
     expect(isCard()).toBe(true);
     // Collapsed, the card mounts no view: inline from the tab must not close it.
