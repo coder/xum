@@ -109,6 +109,57 @@ describe("runFile", () => {
     expect(crash.exitCode).not.toBe(0);
     expect(summarizeFile("f", [ok, crash], false).failedRuns).toBe(1);
   });
+
+  test("directory reads through opendir count as fs time", async () => {
+    // Made here, in a process without the preload, so the fixture's fs time is the opendir call
+    // and the reads of the Dir it returns.
+    for (let i = 0; i < 3000; i++) write(`many/f${i}`);
+    const readMsFile = path.join(root, "read-ms");
+    write(
+      "dir.test.ts",
+      [
+        'import { test } from "bun:test";',
+        'import { opendir } from "node:fs/promises";',
+        'test("dir", async () => {',
+        `  const dir = await opendir(${JSON.stringify(path.join(root, "many"))});`,
+        "  const start = performance.now();",
+        "  let entries = 0;",
+        "  for await (const _ of dir) entries++;",
+        "  const readMs = performance.now() - start;",
+        "  if (entries !== 3000) throw new Error(`read ${entries} entries`);",
+        // Bun.write: not an fs export, so the preload does not time it.
+        `  await Bun.write(${JSON.stringify(readMsFile)}, String(readMs));`,
+        "});",
+      ].join("\n")
+    );
+    const run = await runFile(root, "dir.test.ts", root);
+    expect(run.exitCode).toBe(0);
+    const readMs = Number(fs.readFileSync(readMsFile, "utf8"));
+    // Without the Dir methods timed, only the opendir call counts, a small part of the reads.
+    expect(run.preload?.fsMs).toBeGreaterThanOrEqual(readMs / 2);
+  });
+
+  test("an interval that a test waits on counts as timer time", async () => {
+    write(
+      "interval.test.ts",
+      [
+        'import { test } from "bun:test";',
+        'test("interval", async () => {',
+        "  await new Promise<void>((resolve) => {",
+        "    let fires = 0;",
+        "    const id = setInterval(() => {",
+        "      if (++fires < 5) return;",
+        "      clearInterval(id);",
+        "      resolve();",
+        "    }, 10);",
+        "  });",
+        "});",
+      ].join("\n")
+    );
+    const run = await runFile(root, "interval.test.ts", root);
+    expect(run.exitCode).toBe(0);
+    expect(run.preload?.timerMs).toBeGreaterThanOrEqual(40);
+  });
 });
 
 describe("heavySkips", () => {
