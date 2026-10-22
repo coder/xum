@@ -1,25 +1,16 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   # mutator gives the mutation sites (which token, which replacement); this
-#   # script runs them itself. Upstream's runner fails on this repository (its
-#   # import scan reads a string in a source file as a path) and follows only
-#   # relative imports, while Xum's tests import with "@/". Crapper names the
-#   # functions; keep its SHA and the grammar pins equal to
-#   # scripts/crap/crapper_report.py.
-#   "mutator @ git+https://github.com/unclebob/mutator@a5a0cb803b66e0cdb8bf471b3b08af701d424a41",
-#   "crapper @ git+https://github.com/unclebob/crapper@9f1bead298b5a9d576bdd6319289fcf426e5b18a",
-#   "tree-sitter==0.26.0",
-#   "tree-sitter-language-pack==1.21.3",
-# ]
-# ///
 """Run mutants in the changed functions and print one JSON report.
 
-Usage (through uv, which reads the pins above; mutate/check.ts calls it):
+mutator gives the mutation sites (which token, which replacement); this script
+runs them itself. Upstream's runner fails on this repository (its import scan
+reads a string in a source file as a path) and follows only relative imports,
+while Xum's tests import with "@/".
 
-    uv run --script scripts/mutate/mutate_report.py --root DIR --changes FILE
-        --lane FILE [--lcov FILE]... [--workers N] [--max-mutants N]
-        [--max-seconds N] [--max-test-files N]
+Usage (through uv, with the mutate group of pyproject.toml; mutate/check.ts
+calls it):
+
+    uv run --locked --only-group mutate python scripts/mutate/mutate_report.py
+        --root DIR --changes FILE --lane FILE [--lcov FILE]... [--workers N]
+        [--max-mutants N] [--max-seconds N] [--max-test-files N]
 
 `--changes` is the JSON of scripts/crap/changes.ts ({"files", "spans"}).
 `--lane` lists the Bun unit-lane test files (scripts/test-unit-ci.sh

@@ -1,22 +1,10 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   # dryer gives the structural fingerprints and the Jaccard score; Crapper
-#   # gives the function names, so a DRY finding names the same function that
-#   # crap-check names. Keep the Crapper SHA and the grammar pins equal to
-#   # scripts/crap/crapper_report.py: a grammar bump can move every fingerprint.
-#   "dryer @ git+https://github.com/unclebob/dryer@66ff6d21a42c04afcad89c78a80066176d1294b0",
-#   "crapper @ git+https://github.com/unclebob/crapper@9f1bead298b5a9d576bdd6319289fcf426e5b18a",
-#   "tree-sitter==0.26.0",
-#   "tree-sitter-language-pack==1.21.3",
-# ]
-# ///
 """Find near-duplicate functions that a diff makes, and print them as JSON.
 
-Usage (through uv, which reads the pins above; dry/check.ts calls it):
+Usage (through uv, with the dry group of pyproject.toml; dry/check.ts calls it):
 
-    uv run --script scripts/dry/dryer_report.py --root DIR --base-root DIR
-        --changes FILE [--threshold N] [--min-lines N] [--min-nodes N]
+    uv run --locked --only-group dry python scripts/dry/dryer_report.py
+        --root DIR --base-root DIR --changes FILE [--threshold N]
+        [--min-lines N] [--min-nodes N]
 
 `--changes` is a JSON file: {"files": [{"basePath", "headPath"}...],
 "spans": {headPath: [[start, end]...]}, "hunks": {headPath: [[baseStart,

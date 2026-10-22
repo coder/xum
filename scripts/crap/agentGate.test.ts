@@ -33,10 +33,17 @@ function git(...args: string[]): void {
   expect(result.status).toBe(0);
 }
 
+/** The scorer runs with the repository's pyproject.toml and uv.lock (uv.ts). */
+function copyPythonProject(root: string): void {
+  for (const file of ["pyproject.toml", "uv.lock"]) cpSync(join(REPO, file), join(root, file));
+}
+
 /** A copy of scripts/crap with the mode constant set, so tests never edit the real one. */
 function gateIn(mode: "warn" | "block"): string {
-  const copy = join(dir, `crap-${mode}`);
+  const root = join(dir, `crap-${mode}`);
+  const copy = join(root, "scripts/crap");
   cpSync(import.meta.dir, copy, { recursive: true });
+  copyPythonProject(root);
   const gate = join(copy, "agent-gate.sh");
   const source = readFileSync(gate, "utf8");
   expect(source).toContain(SHIPPED_MODE);
@@ -252,6 +259,7 @@ function projectToolPost(): string {
   mkdirSync(join(project, ".xum"), { recursive: true });
   cpSync(join(REPO, ".xum/tool_post"), join(project, ".xum/tool_post"));
   cpSync(dirname(gateIn("warn")), join(project, "scripts/crap"), { recursive: true });
+  copyPythonProject(project);
   return join(project, ".xum/tool_post");
 }
 

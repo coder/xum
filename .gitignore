@@ -118,6 +118,8 @@ runs/
 __pycache__
 # ruff format (fmt.mk) drops its cache at the repo root
 .ruff_cache/
+# uv run installs pyproject.toml's dependency groups here
+/.venv/
 
 tmpfork
 .mux-agent-cli

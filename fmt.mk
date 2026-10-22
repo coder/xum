@@ -17,7 +17,7 @@ PRETTIER := bun x prettier
 SHFMT := $(shell command -v shfmt 2>/dev/null)
 NIX := $(shell command -v nix 2>/dev/null)
 NIX_FILES := flake.nix nix/package.nix
-UVX := $(shell command -v uvx 2>/dev/null || (test -x $(HOME)/.local/bin/uvx && echo $(HOME)/.local/bin/uvx))
+UV := $(shell command -v uv 2>/dev/null || (test -x $(HOME)/.local/bin/uv && echo $(HOME)/.local/bin/uv))
 
 fmt: fmt-prettier fmt-shell fmt-python fmt-nix fmt-sync-docs
 	@echo "==> All formatting complete!"
@@ -51,20 +51,21 @@ else
 	@shfmt -i 2 -ci -bn -d $(SHELL_SCRIPTS)
 endif
 
-# Helper target to check for uvx
-.check-uvx:
-ifeq ($(UVX),)
-	@echo "Error: uvx not found. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
+# Helper target to check for uv
+.check-uv:
+ifeq ($(UV),)
+	@echo "Error: uv not found. Install it: https://docs.astral.sh/uv/getting-started/installation/"
 	@exit 1
 endif
 
-fmt-python: .check-uvx
+# ruff comes from the ruff group in pyproject.toml, installed as uv.lock pins it.
+fmt-python: .check-uv
 	@echo "Formatting Python files..."
-	@$(UVX) ruff format --quiet $(PYTHON_DIRS)
+	@$(UV) run --locked --quiet --only-group ruff ruff format --quiet $(PYTHON_DIRS)
 
-fmt-python-check: .check-uvx
+fmt-python-check: .check-uv
 	@echo "Checking Python formatting..."
-	@$(UVX) ruff format --quiet --check $(PYTHON_DIRS)
+	@$(UV) run --locked --quiet --only-group ruff ruff format --quiet --check $(PYTHON_DIRS)
 
 fmt-nix:
 ifeq ($(NIX),)

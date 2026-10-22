@@ -106,7 +106,9 @@ node -e "
 "
 
 # Publish waves (e.g. AWS SDK) can transiently request sibling versions not yet visible on the registry.
-if ! (cd "$CHECK_DIR" && "$REPO_ROOT/scripts/retry.sh" 5 60 bun install --ignore-scripts); then
+# The CLI below runs whatever this resolves, so take releases at least a week old, as bunfig.toml
+# does for lock updates: a compromised release is usually caught and pulled within days (#7227).
+if ! (cd "$CHECK_DIR" && "$REPO_ROOT/scripts/retry.sh" 5 60 bun install --ignore-scripts --minimum-release-age=604800); then
   echo "❌ Error: bun install (lockfile-free) failed"
   exit 1
 fi
