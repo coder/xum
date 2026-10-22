@@ -262,7 +262,7 @@ function useSkillsCliStatus(): { status: SkillsCliStatus | null; error: string |
 }
 
 /** One CLI run at a time; a successful run refreshes the skill lists. */
-function useSkillsCliRun(source: string) {
+function useSkillsCliRun(source: string, onRunningChange: (running: boolean) => void) {
   const { api } = useAPI();
   const [running, setRunning] = useState(false);
   const [run, setRun] = useState<SkillsCliRun | null>(null);
@@ -270,6 +270,7 @@ function useSkillsCliRun(source: string) {
   const start = async (skills: string[]) => {
     if (!api || running || skills.length === 0) return;
     setRunning(true);
+    onRunningChange(true);
     setError(null);
     setRun(null);
     try {
@@ -290,6 +291,7 @@ function useSkillsCliRun(source: string) {
       setError(getErrorMessage(err));
     } finally {
       setRunning(false);
+      onRunningChange(false);
     }
   };
   return { running, run, error, start };
@@ -312,9 +314,14 @@ export const SkillsCliInstall: React.FC<{
   source: string;
   skills: string[];
   onBack: () => void;
+  /**
+   * The Add panel locks its method choice while a run goes on: another choice would unmount this
+   * panel, and the run's result or error would then show nowhere.
+   */
+  onRunningChange?: (running: boolean) => void;
 }> = (props) => {
   const cliStatus = useSkillsCliStatus();
-  const cliRun = useSkillsCliRun(props.source);
+  const cliRun = useSkillsCliRun(props.source, (running) => props.onRunningChange?.(running));
   const [selected, setSelected] = useState<string[]>(props.skills);
 
   return (
