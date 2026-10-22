@@ -162,3 +162,6 @@ ds-bundle/
 
 # CRAP score snapshots (make crap)
 .metrics/
+
+# Written from bun.lock at pack time (scripts/generate-npm-shrinkwrap.ts)
+/npm-shrinkwrap.json

@@ -870,7 +870,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
-      - run: ./scripts/generate-npm-shrinkwrap.sh
+      - run: bun scripts/generate-npm-shrinkwrap.ts
       - run: make build
       - run: make check-startup-imports-runtime
       - name: Pack npm package
