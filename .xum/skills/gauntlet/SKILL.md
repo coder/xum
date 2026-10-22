@@ -27,7 +27,9 @@ warning  new-duplicate score 1.00 src/x.ts:41-46 feeBucket
   lines and 20 syntax nodes.
 - Only pairs that the change made are findings: a new function that copies
   another one, or an edit that makes two functions match. An edit to one side
-  of a pair that already matched on main is quiet.
+  of a pair that already matched on main is quiet. The gate does not track
+  moves across files: a function moved into another file reports its old
+  pairs again. Say so in the PR; it is not a new duplicate.
 - Files under test, story and fixture paths do not count (the CRAP gate's
   production-file rule).
 

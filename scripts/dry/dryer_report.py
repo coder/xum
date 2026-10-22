@@ -181,15 +181,13 @@ def new_pairs(
     """Pairs with a changed function on one side that the diff made.
 
     `head` holds every production form. `base_by_path` holds the base forms
-    of the changed files only, under their head path (a deleted file under its
-    base path): an unchanged file is the same at the base, so its head form
-    stands in for its base form.
+    of the changed files only, under their head path: an unchanged file is the
+    same at the base, so its head form stands in for its base form.
 
-    A form made only of added lines can still be old code that moved from
-    another file (or from another place git did not pair). It stands for a
-    removed base form (one that no head form maps back to) that it matches,
-    one moved form per removed form, so moving a function does not report its
-    old pairs as new.
+    Moves across files are not tracked: a form made only of added lines is
+    new, so a function moved into another file reports its old pairs again.
+    Matching moved forms to removed ones drew a new edge case in every review
+    round of #7147, and the gate warns unless DRY_MODE=block.
     """
 
     own = {
@@ -197,24 +195,9 @@ def new_pairs(
         for form in head.values()
         if form.path in changed_paths
     }
-    kept = {id(base) for base in own.values() if base is not None}
-    removed = [base for forms in base_by_path.values() for base in forms if id(base) not in kept]
-
-    # One-to-one: each removed form stands for at most one moved form. In head
-    # order, each form without a counterpart takes its best unclaimed match,
-    # so two removed duplicates cover two moved copies and a third copy is new.
-    moved: dict[int, Form] = {}
-    unclaimed = list(removed)
-    lost = [f for f in head.values() if f.path in changed_paths and own[id(f)] is None]
-    for form in sorted(lost, key=lambda f: (f.path, f.start_line)):
-        scored = [(score, -i) for i, base in enumerate(unclaimed) if (score := similar(form.fingerprints, base.fingerprints, threshold))]
-        if scored:
-            moved[id(form)] = unclaimed.pop(-max(scored)[1])
 
     def at_base(form: Form) -> Form | None:
-        if form.path not in changed_paths:
-            return form
-        return own[id(form)] or moved.get(id(form))
+        return own[id(form)] if form.path in changed_paths else form
 
     def matched_before(left: Form, right: Form) -> bool:
         left_base, right_base = at_base(left), at_base(right)
@@ -269,11 +252,10 @@ def main(argv: list[str]) -> int:
     for f in files:
         # A file renamed from a test into production has no base forms, and
         # all of its functions are new to production, even the lines the diff
-        # did not touch (a pure rename has no hunks). A deleted file keeps its
-        # base path: its functions may have moved.
-        if f["basePath"] and is_production(f["basePath"]):
-            shown = f["headPath"] or f["basePath"]
-            base_forms += forms_in(args.base_root, f["basePath"], shown, args.min_lines, args.min_nodes)
+        # did not touch (a pure rename has no hunks). A deleted file has no
+        # head forms to pair, so its base forms are not read.
+        if f["basePath"] and f["headPath"] and is_production(f["basePath"]):
+            base_forms += forms_in(args.base_root, f["basePath"], f["headPath"], args.min_lines, args.min_nodes)
         elif f["basePath"] and f["headPath"] and is_production(f["headPath"]):
             spans[f["headPath"]] = [[1, float("inf")]]
 
