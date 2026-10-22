@@ -3174,7 +3174,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     modelString: string,
     toolSearch: boolean,
     muxProviderOptions?: MuxProviderOptions,
-    routeProvider?: ProviderName
+    routeProvider?: ProviderName,
+    ptc?: { activeAgentDeniesCodeExecution?: boolean }
   ) {
     using xumHome = new DisposableTempDir("ai-tool-search-cache");
     const metadata = createLocalWorkspaceMetadata("tool-search-cache", xumHome.path);
@@ -3183,11 +3184,28 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const mcpTools: Record<string, Tool> = {
       tracker_list_issues: { ...stubTool, description: NATIVE_DEFERRAL_DESCRIPTION },
     };
+    let experimentsService: ExperimentsService | undefined;
+    if (ptc) {
+      experimentsService = new ExperimentsService({
+        telemetryService: new TelemetryService(xumHome.path),
+        xumHome: xumHome.path,
+      });
+      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING
+      );
+    }
     const harness = createHarness(xumHome.path, metadata, {
       useRequestedModelString: true,
       routeProvider,
+      experimentsService,
     });
     if (!toolSearch) await harness.config.updateToolSearchEnabled(false);
+    if (ptc?.activeAgentDeniesCodeExecution) {
+      const agent = resolvedAgentResultFor(metadata);
+      if (!agent.success) throw new Error("Expected resolved agent");
+      agent.data.effectiveToolPolicy = [{ regex_match: "code_execution", action: "disable" }];
+      spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(agent);
+    }
     // Mirror getToolsForModel: the search tool exists only with a tool-search runtime.
     harness.getToolsForModelSpy.mockImplementation((_model, config) =>
       Promise.resolve({
@@ -3296,6 +3314,21 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(on.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
     expect(on.toolNames).toContain("tool_catalog_search");
     expect(on.deferLoadingNames).toEqual([]);
+  });
+
+  // #7028: a policy that denies code_execution stops PTC, so the MCP tools are
+  // flat again and tool search must defer them as it does without PTC.
+  it("defers MCP tools when a policy turns PTC off", async () => {
+    const withPtc = await startToolSearchStream("openai:gpt-5.2", true, undefined, undefined, {});
+    expect(withPtc.toolNames).toContain("code_execution");
+    expect(withPtc.toolNames).not.toContain("tool_catalog_search");
+
+    const denied = await startToolSearchStream("openai:gpt-5.2", true, undefined, undefined, {
+      activeAgentDeniesCodeExecution: true,
+    });
+    expect(denied.toolNames).not.toContain("code_execution");
+    expect(denied.toolNames).toContain("tool_catalog_search");
+    expect(denied.state?.deferredToolNames.has("tracker_list_issues")).toBe(true);
   });
 
   it("disables tool-search deferral when the user setting is off", async () => {

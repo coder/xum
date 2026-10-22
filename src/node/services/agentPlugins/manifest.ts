@@ -258,6 +258,36 @@ export interface AgentPluginManifest {
   contributes?: AgentPluginContributes;
 }
 
+/**
+ * `extensions.mux.generatedFrom`: Xum wrote this plugin.json for a repository that had none
+ * (installMethods.ts). Update reads it from the installed tree to regenerate with the same
+ * method. Only `kind: "skills"` exists today.
+ */
+export interface GeneratedFrom {
+  kind: "skills";
+}
+
+function generatedFromValue(manifest: Pick<AgentPluginManifest, "extensions">): unknown {
+  const mux = manifest.extensions?.mux;
+  return isPlainObject(mux) ? mux.generatedFrom : undefined;
+}
+
+/**
+ * True when the manifest carries the marker in any shape. A repository can write the marker
+ * itself, so discovery uses this only to REMOVE capabilities (see discoverPluginAt).
+ */
+export function hasGeneratedFromMarker(manifest: Pick<AgentPluginManifest, "extensions">): boolean {
+  return generatedFromValue(manifest) !== undefined;
+}
+
+/** The marker when its kind is one this build generates; undefined for absent or unknown ones. */
+export function readGeneratedFrom(
+  manifest: Pick<AgentPluginManifest, "extensions">
+): GeneratedFrom | undefined {
+  const value = generatedFromValue(manifest);
+  return isPlainObject(value) && value.kind === "skills" ? { kind: "skills" } : undefined;
+}
+
 export type PluginManifestValidation =
   | { ok: true; manifest: AgentPluginManifest; warnings: string[] }
   | { ok: false; reason: "unsupported-version" | "invalid-manifest"; errors: string[] };

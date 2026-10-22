@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
 import * as fs from "node:fs/promises";
+import os from "node:os";
 import * as path from "node:path";
 
 import { describe, expect, spyOn, test } from "bun:test";
@@ -11,6 +12,7 @@ import {
 } from "@/node/services/agentPlugins/testFixtures";
 import type { ComponentConsent } from "@/node/services/agentPlugins/componentConsent";
 import { SkillNameSchema } from "@/common/orpc/schemas";
+import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
@@ -885,6 +887,71 @@ describe("agentSkillsService", () => {
     });
   });
 
+  test("scans ~/.mux/skills after ~/.agents/skills and before ~/.claude/skills", async () => {
+    using project = new DisposableTempDir("agent-skills-legacy-mux-project");
+    using global = new DisposableTempDir("agent-skills-legacy-mux-global");
+    using universal = new DisposableTempDir("agent-skills-legacy-mux-universal");
+    using legacyMux = new DisposableTempDir("agent-skills-legacy-mux");
+    using claude = new DisposableTempDir("agent-skills-legacy-mux-claude");
+
+    await writeSkill(universal.path, "over-legacy", "from universal");
+    await writeSkill(legacyMux.path, "over-legacy", "from legacy mux");
+    await writeSkill(legacyMux.path, "over-claude", "from legacy mux");
+    await writeSkill(claude.path, "over-claude", "from claude");
+    const roots = {
+      projectRoot: path.join(project.path, ".xum", "skills"),
+      globalRoot: global.path,
+      universalRoot: universal.path,
+      legacyMuxGlobalRoot: legacyMux.path,
+      globalClaudeRoot: claude.path,
+    };
+    const runtime = new LocalRuntime(project.path);
+
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
+
+    const description = (name: string) => skills.find((s) => s.name === name)?.description;
+    expect(description("over-legacy")).toBe("from universal");
+    expect(description("over-claude")).toBe("from legacy mux");
+    const read = await readAgentSkill(runtime, project.path, SkillNameSchema.parse("over-claude"), {
+      roots,
+    });
+    expect(read.package.frontmatter.description).toBe("from legacy mux");
+  });
+
+  test("skips ~/.mux/skills when it is the Xum home's skills dir", async () => {
+    using project = new DisposableTempDir("agent-skills-legacy-mux-same-project");
+    using home = new DisposableTempDir("agent-skills-legacy-mux-same-home");
+    const globalRoot = path.join(home.path, ".mux", "skills");
+    await writeSkill(globalRoot, "only-once", "from the Xum home");
+    // ~/.xum links to ~/.mux: two spellings of one directory.
+    await fs.symlink(path.join(home.path, ".mux"), path.join(home.path, ".xum"));
+    const runtime = new LocalRuntime(project.path);
+
+    for (const legacyMuxGlobalRoot of [globalRoot, path.join(home.path, ".xum", "skills")]) {
+      const { skills } = await discoverAgentSkills(runtime, project.path, {
+        roots: { projectRoot: "", globalRoot, universalRoot: "", legacyMuxGlobalRoot },
+        dedupeByName: false,
+      });
+      expect(skills.filter((skill) => skill.name === "only-once")).toHaveLength(1);
+    }
+  });
+
+  test("~/.mux/skills is read where universalRoot is read: the host, or a Docker home", () => {
+    const workspacePath = "/remote/workspace";
+    // SSH keeps ~/.mux as its home and reads global skills on the Xum host.
+    const sshRoots = getDefaultAgentSkillsRoots(
+      new RemotePathMappedRuntime("/tmp", "/remote"),
+      workspacePath
+    );
+    expect(sshRoots.legacyMuxGlobalRoot).toBe(path.join(os.homedir(), ".mux", "skills"));
+    // Docker reads global skills in the container, so its own ~/.mux.
+    const dockerRoots = getDefaultAgentSkillsRoots(
+      new RemotePathMappedRuntime("/tmp", "/remote", { xumHome: "/var/mux" }),
+      workspacePath
+    );
+    expect(dockerRoots.legacyMuxGlobalRoot).toBe("~/.mux/skills");
+  });
+
   test("readAgentSkill resolves project before global", async () => {
     using project = new DisposableTempDir("agent-skills-project");
     using global = new DisposableTempDir("agent-skills-global");
@@ -1545,6 +1612,109 @@ describe("agentSkillsService agent plugins", () => {
       (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("summarize"), { roots }))
         .package.frontmatter.description
     ).toBe("from extra");
+  });
+
+  test("a skills path that holds SKILL.md serves one skill; the first root still wins a name", async () => {
+    using tmp = new DisposableTempDir("plugin-single-skill");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "solo");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: "solo", skills: ["./lone", "./more", ".", "./leaky", "./linked"] })
+    );
+    await writeSkill(pluginDir, "lone", "single folder");
+    await writeSkill(path.join(pluginDir, "more"), "lone", "from more");
+    await writeSkill(path.join(pluginDir, "more"), "extra", "from more");
+    // The plugin root itself is a skill folder: it loads under the plugin name.
+    await writeSkill(container, "solo", "plugin root");
+    // Escapes: a SKILL.md that links outside, and a skill folder that links outside.
+    await writeSkill(tmp.path, "outside", "outside the plugin");
+    await fs.mkdir(path.join(pluginDir, "leaky"));
+    await fs.symlink(
+      path.join(tmp.path, "outside", "SKILL.md"),
+      path.join(pluginDir, "leaky", "SKILL.md")
+    );
+    await fs.symlink(path.join(tmp.path, "outside"), path.join(pluginDir, "linked"));
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+
+    const { skills, invalidSkills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+
+    const pluginSkills = skills.filter((skill) => skill.pluginName === "solo");
+    expect(pluginSkills.map((skill) => [skill.name, skill.description])).toEqual([
+      ["extra", "from more"],
+      ["lone", "single folder"],
+      ["solo", "plugin root"],
+    ]);
+    const pluginIssues = invalidSkills.filter((issue) => issue.scope === "global");
+    expect(pluginIssues.map((issue) => issue.directoryName)).toEqual(["leaky"]);
+    expect(pluginIssues[0].message).toContain("escapes the plugin root");
+
+    const read = async (name: string) =>
+      readAgentSkill(runtime, tmp.path, SkillNameSchema.parse(name), { roots });
+    expect((await read("lone")).package.frontmatter.description).toBe("single folder");
+    const root = await read("solo");
+    expect(root.skillDir).toBe(await fs.realpath(pluginDir));
+    expect(root.package.frontmatter.description).toBe("plugin root");
+    for (const name of ["leaky", "linked"]) {
+      await expect(read(name)).rejects.toThrow("not found");
+    }
+  });
+
+  test("a Claude command loads as a skill only the user invokes; a same-named skill wins", async () => {
+    using tmp = new DisposableTempDir("plugin-claude-commands");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "kit");
+    await fs.mkdir(path.join(pluginDir, ".claude-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".claude-plugin", "plugin.json"),
+      JSON.stringify({ name: "kit" })
+    );
+    await fs.mkdir(path.join(pluginDir, "commands"));
+    // No frontmatter: the description comes from the first body line, as in Claude Code.
+    await fs.writeFile(
+      path.join(pluginDir, "commands", "review.md"),
+      "Review the diff for $ARGUMENTS.\n"
+    );
+    // The model may invoke this one in Claude Code; Xum still keeps it for the user.
+    await fs.writeFile(
+      path.join(pluginDir, "commands", "ship.md"),
+      "---\ndescription: Ship it\nargument-hint: '[env]'\ndisable-model-invocation: false\n---\nShip to $1.\n"
+    );
+    await fs.writeFile(path.join(pluginDir, "commands", "deploy.md"), "Command body\n");
+    await writeSkill(path.join(pluginDir, "skills"), "deploy", "skill wins");
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+
+    const { skills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+
+    const kit = skills.filter((skill) => skill.pluginName === "kit");
+    expect(
+      kit.map((skill) => [skill.name, skill.description, skill.advertise, skill.argumentHint])
+    ).toEqual([
+      ["deploy", "skill wins", undefined, undefined],
+      ["review", "Review the diff for $ARGUMENTS.", false, undefined],
+      ["ship", "Ship it", false, "[env]"],
+    ]);
+    const read = async (name: string) =>
+      readAgentSkill(runtime, tmp.path, SkillNameSchema.parse(name), { roots });
+    const review = await read("review");
+    expect(substituteSkillArguments(review.package.body, "auth.ts").body).toBe(
+      "Review the diff for auth.ts.\n"
+    );
+    expect(review.package.frontmatter["disable-model-invocation"]).toBe(true);
+    expect((await read("deploy")).package.frontmatter.description).toBe("skill wins");
   });
 
   test("managed imports gate enumeration and direct reads without shadowing allowed same-name fallbacks", async () => {

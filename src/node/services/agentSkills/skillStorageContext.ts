@@ -12,6 +12,7 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import {
   buildProjectSkillRoots,
   getDefaultAgentSkillsRoots,
+  getLegacyMuxGlobalSkillsRoot,
   type AgentSkillsRoots,
 } from "./agentSkillsService";
 
@@ -45,6 +46,7 @@ function buildProjectLocalRoots(
     }),
     globalRoot: path.join(xumScope.xumHome, "skills"),
     universalRoot: "~/.agents/skills",
+    legacyMuxGlobalRoot: getLegacyMuxGlobalSkillsRoot(runtime, xumScope.projectRoot),
     ...(options?.includeClaudeSkills ? { globalClaudeRoot: "~/.claude/skills" } : {}),
     // Read-only Agent Plugins containers at lowest precedence within each scope.
     // Containers anchor at the CHECKOUT root: for subProjectPath workspaces
@@ -71,6 +73,7 @@ function buildGlobalLocalRoots(input: {
     projectRoot: "",
     globalRoot: path.join(xumHome, "skills"),
     universalRoot: "~/.agents/skills",
+    legacyMuxGlobalRoot: getLegacyMuxGlobalSkillsRoot(input.runtime, xumHome),
     // claude-skills-compat experiment: read-only root at lowest global precedence.
     ...(input.includeClaudeSkills ? { globalClaudeRoot: "~/.claude/skills" } : {}),
     // Read-only Agent Plugins containers at lowest global precedence.
