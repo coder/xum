@@ -3,7 +3,7 @@
  * Writes npm-shrinkwrap.json for the published @coder/xum package from bun.lock.
  *
  * npm installs a published package's shrinkwrap verbatim, so this file decides what every
- * `npm install -g @coder/xum` and npm-managed server update gets. It used to come from a fresh
+ * `npm install -g @coder/xum` and `npx @coder/xum` gets. It used to come from a fresh
  * `npm install --package-lock-only` at publish time, which pins whatever the registry serves
  * that minute, so a release compromised an hour earlier would have shipped to every user (a
  * compromised litellm reached CI that way, #7227). Projecting bun.lock publishes the versions and
