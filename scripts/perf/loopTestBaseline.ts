@@ -7,7 +7,7 @@
  *        bun scripts/perf/loopTestBaseline.ts [--runs 10] [--jobs 6] [--filter <substring>]
  *          [--base <ref>]
  *
- * It writes artifacts/loop-tests/<sha>[-dirty][-<filter>][-r<runs>].json and .md (recordName).
+ * It writes artifacts/loop-tests/<sha>[-dirty][-<filter>][-r<runs>][-j<jobs>].json and .md.
  * They are git-ignored: never commit a record, it goes stale. With --base it also measures <ref>
  * in a temporary worktree, pairs the rounds of each file, and writes compare-<base>-<name>.json
  * and .md with the trips of loopTestStats.ts. Stage 2 reruns each tripped file alone, paired,
@@ -199,16 +199,25 @@ export async function runPool<T>(tasks: Array<PoolTask<T>>, jobs: number): Promi
 }
 
 export const DEFAULT_RUNS = 10;
+export const DEFAULT_JOBS = 6;
 
 /**
- * The artifact name: <sha>[-dirty], plus the filter and the rounds when they differ from a full
- * run, so a filtered or short smoke run never overwrites the full baseline of a commit.
+ * The artifact name: <sha>[-dirty], plus the filter, the rounds and the jobs when they differ
+ * from a full run, so a filtered, short or other-concurrency run never overwrites the full
+ * baseline of a commit.
  */
-export function recordName(sha: string, dirty: boolean, filter: string | undefined, runs: number) {
+export function recordName(
+  sha: string,
+  dirty: boolean,
+  filter: string | undefined,
+  runs: number,
+  jobs: number
+) {
   const parts = [sha.slice(0, 10)];
   if (dirty) parts.push("dirty");
   if (filter !== undefined) parts.push(filter.replace(/[^\w.-]+/g, "_"));
   if (runs !== DEFAULT_RUNS) parts.push(`r${runs}`);
+  if (jobs !== DEFAULT_JOBS) parts.push(`j${jobs}`);
   return parts.join("-");
 }
 
@@ -393,7 +402,7 @@ async function main(): Promise<number> {
   const { values } = parseArgs({
     options: {
       runs: { type: "string", default: String(DEFAULT_RUNS) },
-      jobs: { type: "string", default: "6" },
+      jobs: { type: "string", default: String(DEFAULT_JOBS) },
       filter: { type: "string" },
       base: { type: "string" },
     },
@@ -451,7 +460,7 @@ async function main(): Promise<number> {
     const records = await measure(sides, files, runs, jobs, scratchDir);
     const outDir = path.join(root, "artifacts", "loop-tests");
     fs.mkdirSync(outDir, { recursive: true });
-    const headName = recordName(state.gitSha, state.dirty, values.filter, runs);
+    const headName = recordName(state.gitSha, state.dirty, values.filter, runs, jobs);
     const head = records[records.length - 1];
     if (records.length === 1) {
       const markdown = renderRecord(head);
