@@ -72,6 +72,16 @@ export function exitCode(mode: CrapMode, report: MutateReport | null): number {
   return blocking.length > 0 ? 1 : 0;
 }
 
+/** The summary's mode sentence, from the same rule as exitCode(). */
+function blockNote(mode: CrapMode, report: MutateReport, survived: number): string {
+  if (mode !== "block") return "This check only warns.";
+  if (exitCode(mode, report) === 1)
+    return "Block mode: the survivors fail this check until a test or a marker clears them.";
+  return survived > 0
+    ? "Block mode: no survivor blocks, because a dropped test or a capped source makes the run partial."
+    : "Block mode.";
+}
+
 export function summary(
   report: MutateReport | null,
   coverage: boolean,
@@ -85,7 +95,7 @@ export function summary(
   const lines = [
     "## Mutation",
     "",
-    `${c.survived} survived, ${c.killed} killed, ${c.uncovered} uncovered, ${c["no-test"]} without a passing test, ${c["not-run"]} not run, ${c.error} error(s), ${c.equivalent} accepted as equivalent (${report.seconds}s). ${mode === "block" ? (c.survived > 0 ? "Block mode: the survivors fail this check until a test or a marker clears them." : "Block mode.") : "This check only warns."}`,
+    `${c.survived} survived, ${c.killed} killed, ${c.uncovered} uncovered, ${c["no-test"]} without a passing test, ${c["not-run"]} not run, ${c.error} error(s), ${c.equivalent} accepted as equivalent (${report.seconds}s). ${blockNote(mode, report, c.survived)}`,
     coverage
       ? "Sites on lines that no unit test ran were skipped (uncovered)."
       : "Unit coverage was incomplete, so every site ran.",

@@ -72,9 +72,19 @@ test("block mode fails only on a survivor that no marker accepts", () => {
 
 test("block mode ignores a survivor whose source had more tests than the run used", () => {
   const capped = { ...report, cappedTests: [report.mutants[0].path] };
-  expect(exitCode("block", { ...capped, mutants: [{ ...report.mutants[0], outcome: "survived" }] })).toBe(0);
+  expect(
+    exitCode("block", { ...capped, mutants: [{ ...report.mutants[0], outcome: "survived" }] })
+  ).toBe(0);
   const other = { ...report.mutants[0], path: "src/other.ts", outcome: "survived" as const };
   expect(exitCode("block", { ...capped, mutants: [other] })).toBe(1);
+});
+
+test("the block-mode summary says survivors fail only when they block", () => {
+  const survivor = { ...report.mutants[0], outcome: "survived" as const };
+  const blocking = { ...report, mutants: [survivor] };
+  expect(summary(blocking, true, "", "block")).toMatch(/fail this check/);
+  const capped = { ...blocking, cappedTests: [survivor.path] };
+  expect(summary(capped, true, "", "block")).not.toMatch(/fail this check/);
 });
 
 test("a unit test that ran without coverage makes coverage incomplete", () => {
