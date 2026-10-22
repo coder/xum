@@ -944,7 +944,7 @@ export default defineConfig([
             "src/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection.test.tsx": [
               "./useBrowserBridgeConnection.ts?test-isolation=static",
             ],
-            "src/browser/utils/feedbackToast.test.tsx": ["../components/Dialog/Dialog?real=1"],
+            "src/browser/utils/feedbackToastView.test.tsx": ["../components/Dialog/Dialog?real=1"],
             "src/browser/utils/perf/appShellReady.test.ts": ["./appShellReady?fresh=1"],
           },
         },
