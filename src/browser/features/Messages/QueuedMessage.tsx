@@ -6,15 +6,24 @@ import { SEND_DISPATCH_MODES } from "@/browser/features/ChatInput/sendDispatchMo
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import { ArtifactInteractionPill } from "@/browser/features/Messages/ArtifactInteractionPill";
 import { UserMessageContent } from "@/browser/features/Messages/UserMessageContent";
+import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { cn } from "@/common/lib/utils";
 import { stripReviewBlocksForDisplay } from "@/common/types/review";
 
+/** Why the queued card's Edit is blocked while another message is being edited (#5934). */
+export const QUEUED_EDIT_BLOCKED_BY_EDIT = "Finish or cancel the open edit first";
+
 interface QueuedMessageProps {
   message: QueuedMessageType;
   className?: string;
   onEdit?: () => void;
+  /**
+   * Why Edit cannot run now (e.g. another message is being edited: #5934). The button stays
+   * visible but does nothing, and the reason shows as its tooltip.
+   */
+  editBlockedReason?: string;
   onChangeDispatchMode?: (mode: QueueDispatchMode) => Promise<void>;
   onActionError?: (error: unknown) => void;
   actionError?: string | null;
@@ -126,14 +135,24 @@ export const QueuedMessage: React.FC<QueuedMessageProps> = (props) => {
           >
             {/* An artifact send is the artifact's message, not a draft: it cannot be edited. */}
             {props.onEdit && props.message.artifactInteraction == null && (
-              <button
-                type="button"
-                onClick={props.onEdit}
-                className="text-muted hover:bg-hover hover:text-foreground flex h-6 items-center gap-1 rounded-md px-1.5 font-medium transition-colors"
-              >
-                <Pencil className="size-3" />
-                Edit
-              </button>
+              <TooltipIfPresent tooltip={props.editBlockedReason}>
+                {/* aria-disabled, not disabled: a disabled button gets no hover or focus, so
+                    its tooltip could not explain why. */}
+                <button
+                  type="button"
+                  aria-disabled={props.editBlockedReason != null ? true : undefined}
+                  onClick={props.editBlockedReason != null ? undefined : props.onEdit}
+                  className={cn(
+                    "text-muted flex h-6 items-center gap-1 rounded-md px-1.5 font-medium transition-colors",
+                    props.editBlockedReason != null
+                      ? "cursor-not-allowed opacity-50"
+                      : "hover:bg-hover hover:text-foreground"
+                  )}
+                >
+                  <Pencil className="size-3" />
+                  Edit
+                </button>
+              </TooltipIfPresent>
             )}
 
             <div
