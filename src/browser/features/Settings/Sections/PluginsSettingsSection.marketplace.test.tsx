@@ -60,7 +60,7 @@ const remotePreview: AgentPluginInstallPreview = {
   consentDigest: "c".repeat(64),
 };
 
-test("an entry preview offers no Skills CLI, and Back focuses the previewed entry", async () => {
+test("an entry preview focuses Back and offers no Skills CLI; Back focuses the previewed entry", async () => {
   const api = createMockORPCClient({
     agentPlugins: {
       items: [],
@@ -83,6 +83,10 @@ test("an entry preview offers no Skills CLI, and Back focuses the previewed entr
   fireEvent.click(view.getByRole("button", { name: "Preview remote" }));
 
   await view.findByText("Tools from another repository");
+  // The Preview button unmounted with the list: Back takes the focus, not the dialog.
+  await waitFor(() =>
+    expect(document.activeElement).toBe(view.getByRole("button", { name: /Back/ }))
+  );
   // The CLI would install from acme/market, not from the entry's repository.
   expect(view.queryByRole("radio", { name: "Skills CLI" })).toBeNull();
 

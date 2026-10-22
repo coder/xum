@@ -759,6 +759,7 @@ const AddPluginPanel: React.FC<{
               error={error}
               onBack={backToSource}
               onInstall={() => void handleInstall()}
+              focusBack={previewedEntry !== null}
             />
           )}
         </>
@@ -857,6 +858,11 @@ const PreviewConsent: React.FC<{
   error: string | null;
   onBack: () => void;
   onInstall: () => void;
+  /**
+   * An entry preview replaces the marketplace list and unmounts the focused Preview button, so
+   * Back takes the focus (as the list's picked radio does on the way back).
+   */
+  focusBack: boolean;
 }> = (props) => (
   <>
     <PreviewHeader preview={props.preview} />
@@ -911,7 +917,13 @@ const PreviewConsent: React.FC<{
     )}
 
     <div className="flex gap-2">
-      <Button variant="ghost" size="sm" onClick={props.onBack} disabled={props.busy}>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={props.onBack}
+        disabled={props.busy}
+        autoFocus={props.focusBack}
+      >
         <ArrowLeft className="h-3.5 w-3.5" />
         Back
       </Button>
