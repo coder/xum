@@ -86,9 +86,9 @@ describe("AgentSession turn completion", () => {
         },
       })
     );
-    const open = fileIO.open;
+    const open = fs.open;
     let failed = false;
-    const reading = spyOn(fileIO, "open").mockImplementation(
+    const reading = spyOn(fs, "open").mockImplementation(
       async (...args: Parameters<typeof open>) => {
         if (args[0] === storage.path && !failed) {
           failed = true;
@@ -139,23 +139,21 @@ describe("AgentSession turn completion", () => {
       const stream = spyOn(h.aiService, "streamMessage");
       const storage = h.historyService.getCompactionCancellationStorage(workspaceId);
       const failure = Object.assign(new Error(`${code}: cancellation read unavailable`), { code });
-      const open = fileIO.open;
-      let reading: ReturnType<typeof spyOn<typeof fileIO, "open">> | undefined;
+      const open = fs.open;
+      let reading: ReturnType<typeof spyOn<typeof fs, "open">> | undefined;
       const warning = spyOn(log, "warn");
       try {
         expect(await h.session.sendMessage("original", sendOptions)).toEqual(Ok(undefined));
         expect(await h.session.cancelCompaction(true)).toEqual(Ok(undefined));
         const cancellationBytes = await fileIO.readFile(storage.path);
-        reading = spyOn(fileIO, "open").mockImplementation(
-          async (...args: Parameters<typeof open>) => {
-            if (args[0] === storage.path) {
-              entered.resolve();
-              await release.promise;
-              throw failure;
-            }
-            return open(...args);
+        reading = spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
+          if (args[0] === storage.path) {
+            entered.resolve();
+            await release.promise;
+            throw failure;
           }
-        );
+          return open(...args);
+        });
         const streamError = {
           messageId: "assistant-1",
           error: "provider failed",
