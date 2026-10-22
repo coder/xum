@@ -129,6 +129,20 @@ describe("PluginFs", () => {
     }
   });
 
+  // Discovery joins paths with the host node:path, which would rewrite POSIX paths on Windows.
+  test("a Windows host finds no plugins on another PluginFs", async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { value: "win32" });
+    try {
+      const { plugins } = await discoverAgentPluginsIn(memoryFs(files), [
+        { path: container, scope: "project" },
+      ]);
+      expect(plugins).toEqual([]);
+    } finally {
+      if (platform !== undefined) Object.defineProperty(process, "platform", platform);
+    }
+  });
+
   test("a non-host PluginFs refuses managed containers", async () => {
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types `rejects` as void
     await expect(

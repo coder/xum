@@ -172,7 +172,7 @@ function pluginFs(): PluginFs {
 
 /**
  * discoverAgentPlugins on another filesystem (#6426): every read of the discovery goes through
- * `fs`. The exported readers (readPluginFileWithinRootCapped, ensurePluginPathContained) stay
+ * `fs`, whose paths are POSIX paths (POSIX hosts only). The exported readers (readPluginFileWithinRootCapped, ensurePluginPathContained) stay
  * host readers outside such a run; a caller reads a non-host plugin's files with `fs` itself.
  */
 export async function discoverAgentPluginsIn(
@@ -184,6 +184,13 @@ export async function discoverAgentPluginsIn(
     containers.every((container) => container.registryPath === undefined),
     "discoverAgentPluginsIn: a non-host PluginFs cannot hold managed containers"
   );
+  // Discovery joins paths with the host `node:path`. A non-host PluginFs holds POSIX paths, which
+  // a Windows host would rewrite with backslashes, so a Windows host finds no plugins there
+  // (fail closed; #7226 tracks Windows hosts).
+  if (process.platform === "win32") {
+    log.debug("discoverAgentPluginsIn: not supported on a Windows host");
+    return { plugins: [], diagnostics: [] };
+  }
   return await pluginFsStorage.run(fs, () => discoverAgentPlugins(containers));
 }
 
