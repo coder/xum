@@ -136,3 +136,26 @@ test("a marker on the old side does not excuse a new copy", () => {
   expect(status).toBe(1);
   expect((report.pairs as Array<{ accepted?: string }>).some((p) => p.accepted)).toBe(false);
 });
+
+test("a function moved to another file keeps its old pairs quiet", () => {
+  // src/a.ts keeps other code, so git sees two edits, not a rename.
+  const other = `export function keep(s: string): number {
+  const parts = s.split(",");
+  let total = 0;
+  for (const p of parts) total += p.length * 3;
+  return total - parts.length;
+}
+`;
+  write("src/a.ts", `${bucket("cents")}\n${other}`);
+  write("src/c.ts", bucket("count"));
+  write("src/b.ts", other.replace("keep", "keepB"));
+  git("add", ".");
+  git("commit", "-q", "-m", "before the move");
+  write("src/a.ts", other);
+  write("src/b.ts", `${other.replace("keep", "keepB")}\n${bucket("cents")}`);
+
+  const { status, report } = check();
+
+  expect(status).toBe(0);
+  expect(report.pairs).toEqual([]);
+});

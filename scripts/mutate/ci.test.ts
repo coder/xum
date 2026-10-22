@@ -69,3 +69,17 @@ test("block mode fails only on a survivor that no marker accepts", () => {
   expect(exitCode("warn", only("survived"))).toBe(0);
   expect(exitCode("block", null)).toBe(0);
 });
+
+test("a unit test that ran without coverage makes coverage incomplete", () => {
+  shard("crap-lcov-unit-1");
+  shard("crap-lcov-unit-2");
+  // scripts/test-unit-ci.sh writes this marker when a retry ran without coverage.
+  writeFileSync(join(dir, "crap-lcov-unit-2", "ran-without-coverage.txt"), "isolated/3\n");
+  expect(unitCoverage(dir, 2)).toEqual({ files: [], complete: false });
+});
+
+test("the summary says when the run cut a source's test files", () => {
+  const text = summary({ ...report, cappedTests: ["src/a.ts"] }, true, "");
+  expect(text).toContain("src/a.ts");
+  expect(text).toMatch(/nearest/);
+});

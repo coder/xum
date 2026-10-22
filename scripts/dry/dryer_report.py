@@ -127,8 +127,10 @@ def name_reported(root: Path, pairs: list[dict]) -> None:
     for pair in pairs:
         for side in (pair["left"], pair["right"]):
             if side["name"].startswith("@"):
-                functions = cache.setdefault(side["path"], crapper_functions(root, side["path"]))
-                side["name"] = holder_name(functions, side["startLine"])
+                # Not setdefault: its default argument would parse the file every time.
+                if side["path"] not in cache:
+                    cache[side["path"]] = crapper_functions(root, side["path"])
+                side["name"] = holder_name(cache[side["path"]], side["startLine"])
 
 
 def keyed(forms: list[Form]) -> dict[str, Form]:
@@ -203,14 +205,32 @@ def new_pairs(
     """Pairs with a changed function on one side that the diff made.
 
     `head` holds every production form. `base_by_path` holds the base forms
-    of the changed files only, under their head path: an unchanged file is the
-    same at the base, so its head form stands in for its base form.
+    of the changed files only, under their head path (a deleted file under its
+    base path): an unchanged file is the same at the base, so its head form
+    stands in for its base form.
+
+    A form made only of added lines can still be old code that moved from
+    another file (or from another place git did not pair). It stands for the
+    removed base form (one that no head form maps back to) that it matches
+    best, so moving a function does not report its old pairs as new.
     """
+
+    own = {
+        id(form): counterpart(form, base_by_path.get(form.path, []), hunks.get(form.path, []))
+        for form in head.values()
+        if form.path in changed_paths
+    }
+    kept = {id(base) for base in own.values() if base is not None}
+    removed = [base for forms in base_by_path.values() for base in forms if id(base) not in kept]
+
+    def moved_from(form: Form) -> Form | None:
+        scored = [(similar(form.fingerprints, base.fingerprints, threshold), base) for base in removed]
+        return max(((score, base) for score, base in scored if score is not None), key=lambda sb: sb[0], default=(0, None))[1]
 
     def at_base(form: Form) -> Form | None:
         if form.path not in changed_paths:
             return form
-        return counterpart(form, base_by_path.get(form.path, []), hunks.get(form.path, []))
+        return own[id(form)] or moved_from(form)
 
     pairs: dict[tuple[str, str], dict] = {}
     items = list(head.items())
@@ -224,7 +244,9 @@ def new_pairs(
             if score is None:
                 continue
             left_base, right_base = at_base(left), at_base(right)
-            if left_base and right_base and similar(left_base.fingerprints, right_base.fingerprints, threshold):
+            # Two distinct base forms: one base function split in two is not an old pair.
+            old = left_base is not None and right_base is not None and left_base is not right_base
+            if old and similar(left_base.fingerprints, right_base.fingerprints, threshold):
                 continue  # the same two functions matched before the diff
             pair = tuple(sorted((key, other)))
             if pair not in pairs:
@@ -257,9 +279,11 @@ def main(argv: list[str]) -> int:
             head_forms += forms_in(args.root, relative, relative, args.min_lines, args.min_nodes)
     base_forms: list[Form] = []
     for f in files:
-        # A file renamed from a test into production has no base forms.
-        if f["basePath"] and f["headPath"] and is_production(f["basePath"]):
-            base_forms += forms_in(args.base_root, f["basePath"], f["headPath"], args.min_lines, args.min_nodes)
+        # A file renamed from a test into production has no base forms. A
+        # deleted file keeps its base path: its functions may have moved.
+        if f["basePath"] and is_production(f["basePath"]):
+            shown = f["headPath"] or f["basePath"]
+            base_forms += forms_in(args.base_root, f["basePath"], shown, args.min_lines, args.min_nodes)
 
     head = keyed(head_forms)
     base_by_path: dict[str, list[Form]] = {}

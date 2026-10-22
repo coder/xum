@@ -309,13 +309,22 @@ def tracked_files(root: Path) -> list[str]:
     return [p for p in out.decode("utf-8").split("\0") if p]
 
 
+def positive(value: str) -> int:
+    """argparse type: 0 workers would run no mutant and report none."""
+
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {number}")
+    return number
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--changes", required=True, type=Path)
     parser.add_argument("--lane", required=True, type=Path)
     parser.add_argument("--lcov", action="append", default=[], type=Path)
-    parser.add_argument("--workers", type=int, default=max(1, min(4, (os.cpu_count() or 2) // 2)))
+    parser.add_argument("--workers", type=positive, default=max(1, min(4, (os.cpu_count() or 2) // 2)))
     parser.add_argument("--max-mutants", type=int, default=300)
     parser.add_argument("--max-seconds", type=float, default=15 * 60)
     parser.add_argument("--max-test-files", type=int, default=MAX_TEST_FILES)
