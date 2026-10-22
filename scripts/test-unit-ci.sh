@@ -83,6 +83,12 @@ isolated_unit_tests=(
   # AgentListItem.test.tsx into the same shard and failed the merge queue
   # (#7029, #7031). Verified on origin/main with a two-file run.
   src/browser/components/WorkspaceMenuBar/WorkspaceMenuBar.test.tsx
+  # Its first test asserts the pending frame before React.lazy loads the Mermaid chunk, and
+  # React.lazy caches the resolved chunk for the whole process. An earlier file that renders a
+  # mermaid block (staticRowTree.test.tsx) resolves it first, so the frame never shows. Verified
+  # with a two-file run in file mode (`bun test ./…/staticRowTree.test.tsx ./…/Mermaid.test.tsx`).
+  # A path rename in #7192 moved it into the same shard (#7191).
+  src/browser/features/Messages/Mermaid.test.tsx
   # Post-login catalog refreshes can outlive their test and hit a later global fetch mock,
   # making catalog-call assertions order-dependent in the shared process.
   src/node/services/coderOauthService.test.ts
