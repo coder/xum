@@ -68,7 +68,8 @@ interface LoadedDaytonaResources extends DaytonaLoadKey {
 
 /** `loaded`'s resources if they came from the load `key` names, else empty ones. */
 function resourcesFor(loaded: LoadedDaytonaResources | null, key: DaytonaLoadKey) {
-  return loaded?.api === key.api &&
+  return loaded !== null &&
+    loaded.api === key.api &&
     loaded.configVersion === key.configVersion &&
     loaded.loadSandboxes === key.loadSandboxes
     ? loaded.resources
