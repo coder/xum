@@ -154,7 +154,9 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
   // does not stop backend agents, so launching unrecorded would let a concurrent archive
   // remove the checkout under the new editor. Custom-editor opens are recorded by the
   // backend route instead.
-  const recordOpenBeforeLaunch = async (): Promise<{ launchToken: string } | { error: string }> => {
+  const recordOpenBeforeLaunch = async (
+    remotePath: string | undefined
+  ): Promise<{ launchToken: string; remotePath?: string } | { error: string }> => {
     if (!args.api) {
       return {
         error:
@@ -169,11 +171,12 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
       const recorded = await args.api.general.recordEditorOpen({
         workspaceId: args.workspaceId,
         launchToken,
+        remotePath,
       });
       if (!recorded.success) {
         return { error: recorded.error };
       }
-      return { launchToken };
+      return { launchToken, remotePath: resolvedRemotePath(recorded.data) };
     } catch (error) {
       // Ambiguous outcome: the backend may have committed the reservation even though the
       // response was lost, and this open will not launch. Best-effort reconciliation with
@@ -199,13 +202,16 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
   // the user can flip it at any time.
   const isPlaceholderClosed = (): boolean => placeholder?.closed === true;
 
-  const recordThenLaunch = async (deepLink: string): Promise<OpenInEditorResult> => {
+  const recordThenLaunch = async (
+    deepLink: string,
+    remote?: RemoteEditorPath
+  ): Promise<OpenInEditorResult> => {
     // The user can close the blank placeholder during any await that ran before this point
     // (devcontainer/SSH discovery); refuse before recording so no marker needs rolling back.
     if (isPlaceholderClosed()) {
       return { success: false, error: placeholderClosedError };
     }
-    const admission = await recordOpenBeforeLaunch();
+    const admission = await recordOpenBeforeLaunch(pathToResolve(remote));
     if ("error" in admission) {
       return { success: false, error: admission.error };
     }
@@ -224,11 +230,12 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
       return { success: false, error: placeholderClosedError };
     }
     launched = true;
+    const target = remoteDeepLink(deepLink, remote, admission.remotePath);
     if (placeholder != null) {
-      placeholder.location.href = deepLink;
+      placeholder.location.href = target;
     } else {
       // Electron: no placeholder was needed.
-      openUrl(deepLink);
+      openUrl(target);
     }
     return { success: true };
   };
@@ -240,6 +247,33 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
       placeholder.close();
     }
   }
+}
+
+/**
+ * An SSH checkout path the backend resolves while it records the open: workspaces whose host
+ * is provisioned after creation (Daytona, Coder) keep the default srcBaseDir's `~`, which an
+ * editor's ssh deep link cannot use.
+ */
+interface RemoteEditorPath {
+  path: string;
+  deepLinkFor: (resolvedPath: string) => string | null;
+}
+
+function pathToResolve(remote: RemoteEditorPath | undefined): string | undefined {
+  return remote?.path;
+}
+
+function resolvedRemotePath(data: { remotePath: string } | null | undefined): string | undefined {
+  return data?.remotePath;
+}
+
+function remoteDeepLink(
+  deepLink: string,
+  remote: RemoteEditorPath | undefined,
+  resolvedPath: string | undefined
+): string {
+  if (remote == null || resolvedPath == null) return deepLink;
+  return remote.deepLinkFor(resolvedPath) ?? deepLink;
 }
 
 /**
@@ -267,7 +301,7 @@ function launchDaytonaFromThisMachine(
 async function openInEditorWithLaunch(
   args: OpenInEditorArgs,
   editorConfig: EditorConfig,
-  launch: (deepLink: string) => Promise<OpenInEditorResult>
+  launch: (deepLink: string, remote?: RemoteEditorPath) => Promise<OpenInEditorResult>
 ): Promise<OpenInEditorResult> {
   const isSSH = isSSHRuntime(args.runtimeConfig);
   const isDocker = isDockerRuntime(args.runtimeConfig);
@@ -392,13 +426,16 @@ async function openInEditorWithLaunch(
     // else: localhost access to local workspace → no SSH needed
 
     // VS Code/Cursor SSH deep links treat the path as a folder unless a line/column is present.
-    const deepLink = getEditorDeepLink({
-      editor: editorConfig.editor as DeepLinkEditor,
-      path: args.targetPath,
-      sshHost,
-      line: args.isFile && sshHost ? 1 : undefined,
-      column: args.isFile && sshHost ? 1 : undefined,
-    });
+    const position = args.isFile && sshHost ? 1 : undefined;
+    const deepLinkFor = (path: string) =>
+      getEditorDeepLink({
+        editor: editorConfig.editor as DeepLinkEditor,
+        path,
+        sshHost,
+        line: position,
+        column: position,
+      });
+    const deepLink = deepLinkFor(args.targetPath);
 
     if (!deepLink) {
       return {
@@ -407,7 +444,10 @@ async function openInEditorWithLaunch(
       };
     }
 
-    return launchDaytonaFromThisMachine(args, () => launch(deepLink));
+    // The backend resolves only an SSH workspace's path under ~ (see RemoteEditorPath).
+    return launchDaytonaFromThisMachine(args, () =>
+      launch(deepLink, { path: args.targetPath, deepLinkFor })
+    );
   }
 
   // Custom editor:

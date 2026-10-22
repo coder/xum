@@ -397,6 +397,33 @@ describe("WorkspaceService.recordExternalEditorOpen for a Daytona workspace", ()
     expect(workspaceUseLeasesFor(harness.config).heldCount("dt", "editor")).toBe(0);
   });
 
+  // A workspace created with the default srcBaseDir keeps its ~ path (the sandbox did not exist
+  // yet); the editor needs it absolute, which only the running sandbox can tell.
+  test("resolves a checkout path under ~ on the sandbox once it is ready", async () => {
+    await addDaytonaWorkspace();
+    const markerPath = path.join(harness.config.sessionsDir, "dt", "external-editor-opened");
+    const resolvePath = mock((p: string) => {
+      // Only once the sandbox is ready under the editor use.
+      expect(leasesDuringReadiness.length).toBeGreaterThan(0);
+      return Promise.resolve(p.replace(/^~/, "/home/daytona"));
+    });
+    createRuntime.mockRestore();
+    createRuntime = spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue({
+      ensureReady,
+      resolvePath,
+    } as unknown as Runtime);
+
+    // A path that cannot be resolved opens nothing and leaves no marker behind.
+    resolvePath.mockImplementationOnce(() => Promise.reject(new Error("ssh: connection refused")));
+    const refused = await harness.service.recordExternalEditorOpen("dt", "tok-1", "~/mux/x");
+    expect(refused.success).toBe(false);
+    expect(await Bun.file(markerPath).exists()).toBe(false);
+
+    expect(
+      await harness.service.recordExternalEditorOpen("dt", "tok-2", "~/mux/project/dt")
+    ).toEqual({ success: true, data: { remotePath: "/home/daytona/mux/project/dt" } });
+  });
+
   // The editor reads the user's ssh config, where a matching RemoteForward would give the
   // sandbox a tunnel to a local service.
   test("refuses the open when the user's ssh config forwards into the sandbox", async () => {
