@@ -27,6 +27,19 @@ test(
       await expect(settings.getByRole("button", TURN_OFF)).toBeVisible({ timeout: 15_000 });
       await expect(settings.getByRole("button", TRUST)).not.toBeVisible();
     };
+    // Opens the hook review of hook-guard from any state, with the button names of
+    // SettingsButton.tsx, SettingsPage.tsx and PluginsSettingsSection.tsx. Haiku 5.5 closed
+    // Settings after its trust tap (1 of 16 local runs), and the review button only toggles,
+    // with no expanded state, so the helper looks for the hook's own buttons.
+    const openHookReview = async () => {
+      if (!(await settings.isVisible())) await screen.getByTestId("settings-button").tap();
+      const reviewOpen =
+        (await settings.getByRole("button", TURN_OFF).isVisible()) ||
+        (await settings.getByRole("button", TRUST).isVisible());
+      if (reviewOpen) return;
+      await settings.getByRole("button", "Plugins").tap();
+      await settings.getByRole("button", "Review hooks for hook-guard").tap();
+    };
 
     await disableTutorials(app);
     await app.open();
@@ -56,16 +69,14 @@ test(
       "in Settings > Plugins, open the hook review of the hook-guard plugin and trust ONLY its " +
         "PreToolUse hook (MCP tool guard / check_command). Do not trust or turn off any other hook."
     );
+    await openHookReview();
     await expectTrusted();
 
     await xum.restartServer();
     await app.open();
     // exact steps: the replay ran its taps, its end-state check misread the open review, and
     // Haiku 5.5 then toggled the review closed (PR lane, run 39656243674; #7070: 3 of 10 warm).
-    // The button names of SettingsButton.tsx, SettingsPage.tsx and PluginsSettingsSection.tsx.
-    await screen.getByTestId("settings-button").tap();
-    await settings.getByRole("button", "Plugins").tap();
-    await settings.getByRole("button", "Review hooks for hook-guard").tap();
+    await openHookReview();
     // The exact checks first, then the judge: the judge sees one screen.
     await expectTrusted();
     // Only what the screen shows now. A claim about a later prompt ("does not ask again") made
