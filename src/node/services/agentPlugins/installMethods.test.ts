@@ -98,6 +98,18 @@ describe("findSkillsPackageRoots", () => {
     expect(await findSkillsPackageRoots(tmp.path)).toEqual([{ root: "skills", skills: ["foo"] }]);
   });
 
+  test("a nested SKILL.md that does not parse is no skill, so no Skills install fits", async () => {
+    using tmp = new DisposableTempDir("install-methods");
+    await writeTree(tmp.path, [], {
+      "skills/foo/SKILL.md": "# No frontmatter\n",
+      "skills/foo/inner/SKILL.md": SKILL("inner"),
+      ".claude/skills/SKILL.md": "---\nname: claude\n---\n",
+    });
+    // The CLI skips both and does not look below them.
+    expect(await findSkillsPackageRoots(tmp.path)).toEqual([]);
+    expect((await detectInstallMethods(tmp.path)).methods).toEqual([]);
+  });
+
   test("a nested container restarts its own three levels", async () => {
     using tmp = new DisposableTempDir("install-methods");
     await writeTree(tmp.path, ["skills/a", "skills/.curated/g1/g2/deep"]);

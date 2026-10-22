@@ -138,6 +138,33 @@ describe("loadPluginCodexHooks", () => {
     ]);
   });
 
+  test("a Claude matcherless event ignores its matcher, so the hook stays listed", async () => {
+    using tmp = new DisposableTempDir("claude-hook-matcherless");
+    const hook = { hooks: [{ type: "command", command: "x.sh" }] };
+    await writePlugin(tmp.path, {
+      ".claude-plugin/plugin.json": { name: "guard" },
+      "hooks/hooks.json": {
+        hooks: {
+          // Claude Code silently ignores a matcher on these events, even an invalid one.
+          TaskCompleted: [{ matcher: "[", ...hook }],
+          PostToolBatch: [{ matcher: "[", ...hook }],
+          // A matcher event still refuses an invalid regex.
+          PreToolUse: [{ matcher: "[", ...hook }],
+        },
+      },
+    });
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    assert(plugin, "the Claude package is discovered");
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((h) => [h.event, h.status])).toEqual([
+      ["TaskCompleted", "claude-plugin"],
+      ["PostToolBatch", "claude-plugin"],
+    ]);
+    expect(warnings.join("\n")).toContain("a 'PreToolUse' matcher is not a valid regex");
+  });
+
   test("a Claude exec-form hook shows its args in the summary; bad args drop the hook", async () => {
     using tmp = new DisposableTempDir("claude-hook-args");
     await writePlugin(tmp.path, {
