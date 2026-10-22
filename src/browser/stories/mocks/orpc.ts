@@ -1444,7 +1444,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           success: true as const,
           data: {
             command: [
-              "npx --yes skills@1.7.4 add",
+              "cd ~ && npx --yes skills@1.7.4 add",
               input.source,
               ...input.skills.map((skill) => `--skill ${skill}`),
               "--global --agent codex --copy",

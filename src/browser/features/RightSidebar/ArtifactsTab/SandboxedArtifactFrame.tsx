@@ -6,7 +6,7 @@ import {
   useWorkspaceActionsOptional,
 } from "@/browser/contexts/WorkspaceContext";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
-import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import { matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { useAppConfig, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isWorkspaceArchived } from "@/common/utils/archive";
@@ -14,11 +14,13 @@ import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createArtifactAssetLoader } from "./artifactAssets";
 import {
+  ARTIFACT_FRAME_CHORDS,
   acceptArtifactFrameMessage,
   buildArtifactBridgeScript,
   createBridgeRateLimiter,
   postArtifactAnnotateMode,
   postArtifactTheme,
+  type ArtifactFrameChord,
   type ArtifactFrameToHostMessage,
   type ArtifactTheme,
 } from "./artifactBridge";
@@ -71,31 +73,34 @@ function hasLiveUserGesture(frame: HTMLIFrameElement | null): boolean {
 }
 
 /**
- * Replays the right-sidebar chord pressed inside `frame` as a keydown on the frame element, so
- * the app's one handler (WorkspaceShell's useRightSidebarToggleKey) applies its own rules: the
- * dialog and palette blocks (Artifacts fullscreen is a modal dialog), and the focus move to the
- * toggle after a collapse.
+ * Replays a right-sidebar chord pressed inside `frame` as a keydown on the frame element, so the
+ * app's one handler for it applies its own rules: WorkspaceShell's useRightSidebarToggleKey for
+ * TOGGLE_RIGHT_SIDEBAR, useArtifactsTabKey for OPEN_ARTIFACTS_TAB. Both keep the dialog block
+ * (Artifacts fullscreen is a modal dialog) and the focus move to the toggle after a collapse.
  *
  * SECURITY AUDIT: the artifact's script can post the message without a key press. The host
  * honours it only while the frame holds focus (a hidden frame cannot), and the replayed event
- * matches only TOGGLE_RIGHT_SIDEBAR. The frame lives in the right sidebar, so this can only ever
- * collapse the sidebar, which unmounts the frame: like Escape, it needs no live gesture.
+ * matches only the named chord's keybind. The frame lives in the right sidebar's Artifacts tab, so
+ * either chord can only collapse the sidebar, which unmounts the frame: OPEN_ARTIFACTS_TAB
+ * collapses a sidebar that shows that tab, and where a collapse refuses it selects the tab that
+ * already shows. Like Escape, it needs no live gesture.
  */
 function replayFrameSidebarKey(
   frame: HTMLIFrameElement | null,
-  modifiers: { ctrlKey: boolean; metaKey: boolean }
+  message: { chord: ArtifactFrameChord; ctrlKey: boolean; metaKey: boolean }
 ): void {
   if (frame == null || document.activeElement !== frame) return;
+  const keybind = ARTIFACT_FRAME_CHORDS[message.chord];
   const event = new KeyboardEvent("keydown", {
-    key: KEYBINDS.TOGGLE_RIGHT_SIDEBAR.key,
+    key: keybind.key,
     shiftKey: true,
-    ctrlKey: modifiers.ctrlKey,
-    metaKey: modifiers.metaKey,
+    ctrlKey: message.ctrlKey,
+    metaKey: message.metaKey,
     bubbles: true,
     cancelable: true,
   });
   // The frame's script can post any modifiers, so the host matches the keybind itself.
-  if (!matchesKeybind(event, KEYBINDS.TOGGLE_RIGHT_SIDEBAR)) return;
+  if (!matchesKeybind(event, keybind)) return;
   frame.dispatchEvent(event);
 }
 

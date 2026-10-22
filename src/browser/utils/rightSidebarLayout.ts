@@ -557,6 +557,12 @@ export function hasTab(state: RightSidebarLayoutState, tab: TabType): boolean {
   return collectAllTabs(state.root).includes(tab);
 }
 
+/** True when some tabset has `tab` selected, so the tab is on screen while the sidebar is. */
+export function isTabSelected(node: RightSidebarLayoutNode, tab: TabType): boolean {
+  if (node.type === "tabset") return node.activeTab === tab;
+  return isTabSelected(node.children[0], tab) || isTabSelected(node.children[1], tab);
+}
+
 export function toggleTab(state: RightSidebarLayoutState, tab: TabType): RightSidebarLayoutState {
   return hasTab(state, tab) ? removeTabEverywhere(state, tab) : selectOrAddTab(state, tab);
 }

@@ -521,6 +521,157 @@ jobs:
             exit 1
           fi
 
+  dry:
+    name: Quality / DRY
+    # Near-duplicate functions that the PR makes (scripts/dry/). The repo
+    # variable DRY_MODE picks the mode, as CRAP_MODE does for Quality / CRAP.
+    # Unset or anything but "block" is warn mode: scripts/dry/ci.ts exits 0 and
+    # Required ignores this job. With "block", a duplicate that no
+    # `dry-duplicate-ok:` marker accepts fails the Verdict step and Required.
+    # A tool error never blocks. It needs no test results, so it starts at once
+    # and adds no time to Required.
+    # ROLLBACK: set the DRY_MODE repo variable back to "warn". No code change.
+    needs: [changes]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    continue-on-error: ${{ vars.DRY_MODE != 'block' }}
+    # Above the step timeouts (15 minutes): a cancelled job fails Required in
+    # block mode, so only a finished report may block (Codex review of #7149).
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          persist-credentials: false
+      # The merge commit's first parent, as in Quality / CRAP above.
+      - name: Fetch the merge base
+        id: base
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          sha=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)
+          git fetch --no-tags --depth=1 origin "$sha"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@b7a1c7ccf290d58743029c4f6903da283811b979 # v2.1.0
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          bun-version: 1.4.3
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          enable-cache: false
+      # ci.ts writes verdict=violations only for a finished report with
+      # unaccepted duplicates in block mode. A crash or a timeout leaves none.
+      - name: DRY report
+        id: report
+        continue-on-error: true
+        timeout-minutes: 6
+        env:
+          BASE_REF: ${{ steps.base.outputs.sha }}
+          DRY_MODE: ${{ vars.DRY_MODE }}
+        run: |
+          if ! command -v bun >/dev/null; then
+            echo "::warning title=DRY::bun setup failed, so no DRY report"
+            exit 0
+          fi
+          bun scripts/dry/ci.ts
+      - name: Verdict
+        if: ${{ always() }}
+        env:
+          VERDICT: ${{ steps.report.outputs.verdict }}
+        run: |
+          if [[ "$VERDICT" == "violations" ]]; then
+            echo "❌ New duplicates (block mode): see the DRY report step"
+            exit 1
+          fi
+
+  mutation:
+    name: Quality / Mutation
+    # Mutants in the PR's changed functions that the unit tests do not kill
+    # (scripts/mutate/). It waits for Test / Unit to reuse its coverage
+    # (crap-lcov-unit-*): a site on a line no unit test ran is skipped. ci.ts
+    # stops at 300 mutants or 15 minutes. The repo variable MUTATION_MODE picks
+    # the mode. Unset or anything but "block" is warn mode: ci.ts exits 0. With
+    # "block", a survivor that no `mutation-equivalent:` marker accepts fails
+    # the Verdict step, so this check turns red. Required does not list this
+    # job in either mode: it starts after Test / Unit, the last job Required
+    # waits for, so listing it would add its whole run to every PR.
+    # ROLLBACK: set the MUTATION_MODE repo variable back to "warn".
+    needs: [changes, test-unit]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.tests == 'true' }}
+    continue-on-error: ${{ vars.MUTATION_MODE != 'block' }}
+    # Above the step timeouts (34 minutes) so a slow setup still leaves a summary.
+    timeout-minutes: 35
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          persist-credentials: false
+      # The merge commit's first parent, as in Quality / CRAP above.
+      - name: Fetch the merge base
+        id: base
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          sha=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)
+          git fetch --no-tags --depth=1 origin "$sha"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+      # The mutants run the unit tests, which need node_modules.
+      - uses: ./.github/actions/setup-xum
+        continue-on-error: true
+        timeout-minutes: 6
+        with:
+          skip-build-caches: "true"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          enable-cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        timeout-minutes: 3
+        with:
+          pattern: crap-lcov-unit-*
+          path: coverage-shards
+      # ci.ts writes verdict=violations only for a finished report with
+      # unaccepted survivors in block mode.
+      - name: Mutation report
+        id: report
+        continue-on-error: true
+        timeout-minutes: 18
+        env:
+          BASE_REF: ${{ steps.base.outputs.sha }}
+          LCOV_DIR: coverage-shards
+          # Shard count of the test-unit matrix above.
+          EXPECTED_UNIT: "6"
+          MUTATION_MODE: ${{ vars.MUTATION_MODE }}
+        run: |
+          if ! command -v bun >/dev/null; then
+            echo "::warning title=Mutation::bun setup failed, so no mutation report"
+            exit 0
+          fi
+          bun scripts/mutate/ci.ts
+      - name: Verdict
+        if: ${{ always() }}
+        env:
+          VERDICT: ${{ steps.report.outputs.verdict }}
+        run: |
+          if [[ "$VERDICT" == "violations" ]]; then
+            echo "❌ Surviving mutants (block mode): see the Mutation report step"
+            exit 1
+          fi
+
   test-storybook:
     name: Test / Storybook
     needs: [changes]
@@ -1106,6 +1257,8 @@ jobs:
       - codex-comments
       # Counts only in CRAP block mode (vars.CRAP_MODE == 'block'); see the crap job.
       - crap
+      # Counts only in DRY block mode (vars.DRY_MODE == 'block'); see the dry job.
+      - dry
       # Counts only in stories block mode (vars.STORIES_MODE == 'block'); see the stories job.
       - stories
       # Counts only in PR stories block mode (vars.STORIES_PR_MODE == 'block'); see stories-pr.
@@ -1121,17 +1274,19 @@ jobs:
       # dropped here, and every later step reads this list. The same for
       # Test / Stories in stories warn mode (vars.STORIES_MODE is not "block"),
       # and for Test / Stories (Haiku) in PR stories warn mode
-      # (vars.STORIES_PR_MODE is not "block").
+      # (vars.STORIES_PR_MODE is not "block"), and for Quality / DRY in DRY
+      # warn mode (vars.DRY_MODE is not "block").
       - id: results
         env:
           CRAP_MODE: ${{ vars.CRAP_MODE }}
+          DRY_MODE: ${{ vars.DRY_MODE }}
           STORIES_MODE: ${{ vars.STORIES_MODE }}
           STORIES_PR_MODE: ${{ vars.STORIES_PR_MODE }}
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          # shellcheck disable=SC2016 # $mode, $stories and $storiesPr are jq variables, not shell ones.
-          filter='to_entries[] | select(.key != "crap" or $mode == "block") | select(.key != "stories" or $stories == "block") | select(.key != "stories-pr" or $storiesPr == "block") | .value.result'
-          echo "list=$(jq -r --arg mode "$CRAP_MODE" --arg stories "$STORIES_MODE" --arg storiesPr "$STORIES_PR_MODE" "$filter" <<<"$NEEDS_JSON" | paste -sd ' ' -)" >>"$GITHUB_OUTPUT"
+          # shellcheck disable=SC2016 # $mode, $dry, $stories and $storiesPr are jq variables, not shell ones.
+          filter='to_entries[] | select(.key != "crap" or $mode == "block") | select(.key != "dry" or $dry == "block") | select(.key != "stories" or $stories == "block") | select(.key != "stories-pr" or $storiesPr == "block") | .value.result'
+          echo "list=$(jq -r --arg mode "$CRAP_MODE" --arg dry "$DRY_MODE" --arg stories "$STORIES_MODE" --arg storiesPr "$STORIES_PR_MODE" "$filter" <<<"$NEEDS_JSON" | paste -sd ' ' -)" >>"$GITHUB_OUTPUT"
       # A cancelled duplicate run must not leave a red Required when another run for
       # this PR will publish one (#4547). The script stands down only with proof and
       # fails closed otherwise; see its header for the rules.

@@ -36,6 +36,11 @@ import type {
   AgentId,
 } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
+import {
+  isProjectTrusted,
+  isWorkspaceProjectTrusted,
+  projectPluginsAllowed,
+} from "@/node/utils/projectTrust";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -122,7 +127,9 @@ export interface AgentDefinitionsRoots {
 
 export function getDefaultAgentDefinitionsRoots(
   runtime: Runtime,
-  workspacePath: string
+  workspacePath: string,
+  /** #6426: only `true` adds the project's plugin containers (see projectPluginsAllowed). */
+  projectPluginsTrusted?: boolean
 ): AgentDefinitionsRoots {
   if (!workspacePath) {
     throw new Error("getDefaultAgentDefinitionsRoots: workspacePath is required");
@@ -139,12 +146,18 @@ export function getDefaultAgentDefinitionsRoots(
     // checkout is not on the host filesystem (mirrors agentSkillsService).
     ...(!(runtime instanceof RemoteRuntime)
       ? {
-          projectPluginRoots: [
-            ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
-              runtime.normalizePath(relativePath, workspacePath)
-            ),
-            runtime.normalizePath(".agents/plugins", workspacePath),
-          ],
+          // #6426: a project plugin's agents load only in a trusted project, like its skills,
+          // MCP servers, hooks and slash commands. Missing trust is untrusted.
+          ...(projectPluginsAllowed(projectPluginsTrusted)
+            ? {
+                projectPluginRoots: [
+                  ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
+                    runtime.normalizePath(relativePath, workspacePath)
+                  ),
+                  runtime.normalizePath(".agents/plugins", workspacePath),
+                ],
+              }
+            : {}),
           globalPluginRoots: [`${runtime.getXumHome()}/plugins`, UNIVERSAL_AGENT_PLUGINS_CONTAINER],
         }
       : {
@@ -549,13 +562,15 @@ export async function discoverAgentDefinitions(
      * Used by the plugin composition inspector to report shadowing.
      */
     dedupeById?: boolean;
+    /** #6426: only `true` adds project plugin agents (used only when `roots` is absent). */
+    projectPluginsTrusted?: boolean;
   }
 ): Promise<AgentDefinitionDescriptor[]> {
   if (!workspacePath) {
     throw new Error("discoverAgentDefinitions: workspacePath is required");
   }
 
-  const roots = options?.roots ?? getDefaultAgentDefinitionsRoots(runtime, workspacePath);
+  const roots = resolveAgentDefinitionsRoots(runtime, workspacePath, options);
   const dedupeById = options?.dedupeById ?? true;
 
   const byId = new Map<AgentId, AgentDefinitionDescriptor>();
@@ -703,6 +718,8 @@ export class AgentDefinitionRequestCache {
       agentId,
       options?.roots != null ? this.objectId(options.roots) : null,
       options?.skipScopesAbove ?? null,
+      // #6426: the default roots differ with trust (project plugin agents).
+      options?.projectPluginsTrusted === true,
     ]);
     let definition = this.definitions.get(key);
     if (definition == null) {
@@ -728,9 +745,32 @@ export interface ReadAgentDefinitionOptions {
    * probing further candidates; readAgentDefinition then rejects with the abort reason.
    */
   abortSignal?: AbortSignal;
+  /** #6426: only `true` adds project plugin agents (used only when `roots` is absent). */
+  projectPluginsTrusted?: boolean;
 }
 
 const SCOPE_PRIORITY: AgentDefinitionScope[] = ["project", "global", "built-in"];
+
+/** The caller's roots, else the default roots for its trust (discovery and reads share it). */
+function resolveAgentDefinitionsRoots(
+  runtime: Runtime,
+  workspacePath: string,
+  options: { roots?: AgentDefinitionsRoots; projectPluginsTrusted?: boolean } | undefined
+): AgentDefinitionsRoots {
+  if (options?.roots != null) return options.roots;
+  return getDefaultAgentDefinitionsRoots(runtime, workspacePath, options?.projectPluginsTrusted);
+}
+
+/** The options each inherited read keeps from the caller (its skip scope is per base). */
+function pickInheritedReadOptions(
+  options: Pick<ReadAgentDefinitionOptions, "roots" | "cache" | "projectPluginsTrusted"> | undefined
+): Pick<ReadAgentDefinitionOptions, "roots" | "cache" | "projectPluginsTrusted"> {
+  return {
+    roots: options?.roots,
+    cache: options?.cache,
+    projectPluginsTrusted: options?.projectPluginsTrusted,
+  };
+}
 
 export async function readAgentDefinition(
   runtime: Runtime,
@@ -756,7 +796,7 @@ async function loadAgentDefinition(
   agentId: AgentId,
   options?: ReadAgentDefinitionOptions
 ): Promise<AgentDefinitionPackage> {
-  const roots = options?.roots ?? getDefaultAgentDefinitionsRoots(runtime, workspacePath);
+  const roots = resolveAgentDefinitionsRoots(runtime, workspacePath, options);
   const skipScopesAbove = options?.skipScopesAbove;
 
   // Determine which scopes to skip based on skipScopesAbove
@@ -898,9 +938,12 @@ export async function resolveAgentBody(
     roots?: AgentDefinitionsRoots;
     skipScopesAbove?: AgentDefinitionScope;
     cache?: AgentDefinitionRequestCache;
+    /** #6426: see ReadAgentDefinitionOptions.projectPluginsTrusted. */
+    projectPluginsTrusted?: boolean;
   }
 ): Promise<string> {
   const visited = new Set<string>();
+  const baseReadOptions = pickInheritedReadOptions(options);
 
   function mergeSkipScopesAbove(
     a: AgentDefinitionScope | undefined,
@@ -936,9 +979,8 @@ export async function resolveAgentBody(
     }
 
     const pkg = await readAgentDefinition(runtime, workspacePath, id, {
-      roots: options?.roots,
+      ...baseReadOptions,
       skipScopesAbove,
-      cache: options?.cache,
     });
 
     const visitKey = agentVisitKey(pkg.id, pkg.scope);
@@ -1043,6 +1085,7 @@ export async function resolveAgentDefinition(
   }
 
   const visited = new Set<string>();
+  const baseReadOptions = pickInheritedReadOptions(options);
 
   function mergeSkipScopesAbove(
     a: AgentDefinitionScope | undefined,
@@ -1079,9 +1122,8 @@ export async function resolveAgentDefinition(
     }
 
     const pkg = await readAgentDefinition(runtime, workspacePath, id, {
-      roots: options?.roots,
+      ...baseReadOptions,
       skipScopesAbove,
-      cache: options?.cache,
     });
 
     const visitKey = agentVisitKey(pkg.id, pkg.scope);
@@ -1171,7 +1213,13 @@ export type AgentDefinitionsContext = Pick<ORPCContext, "config"> & {
 export async function resolveAgentDiscoveryContext(
   context: AgentDefinitionsContext,
   input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
-): Promise<{ runtime: Runtime; discoveryPath: string; metadata?: WorkspaceMetadata }> {
+): Promise<{
+  runtime: Runtime;
+  discoveryPath: string;
+  metadata?: WorkspaceMetadata;
+  /** #6426: whether project plugin agents may load for this discovery. */
+  projectPluginsTrusted: boolean;
+}> {
   if (!input.projectPath && !input.workspaceId)
     throw new Error("Either projectPath or workspaceId must be provided");
   if (input.workspaceId) {
@@ -1185,6 +1233,7 @@ export async function resolveAgentDiscoveryContext(
         ? metadata.projectPath
         : runtime.getWorkspacePath(metadata.projectPath, metadata.name),
       metadata,
+      projectPluginsTrusted: isWorkspaceProjectTrusted(context.config, metadata),
     };
   }
   // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
@@ -1192,6 +1241,7 @@ export async function resolveAgentDiscoveryContext(
   return {
     runtime: createRuntime({ type: "local", srcBaseDir: context.config.srcDir }, { projectPath }),
     discoveryPath: projectPath,
+    projectPluginsTrusted: isProjectTrusted(context.config, projectPath),
   };
 }
 
@@ -1205,8 +1255,13 @@ export async function listAgentDefinitions(
   }
 ) {
   if (input.workspaceId) await context.initStateManager.waitForInit(input.workspaceId);
-  const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
-  const descriptors = await discoverAgentDefinitions(runtime, discoveryPath);
+  const { runtime, discoveryPath, projectPluginsTrusted } = await resolveAgentDiscoveryContext(
+    context,
+    input
+  );
+  const descriptors = await discoverAgentDefinitions(runtime, discoveryPath, {
+    projectPluginsTrusted,
+  });
   const cfg = context.config.loadConfigOrDefault();
   const resolved = await Promise.all(
     descriptors.map(async (listedDescriptor) => {
@@ -1224,6 +1279,7 @@ export async function listAgentDefinitions(
           headless?.frontmatter ??
           (await resolveAgentFrontmatter(runtime, discoveryPath, descriptor.id, {
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
+            projectPluginsTrusted,
           }));
         if (
           isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }) &&
@@ -1266,6 +1322,9 @@ export async function getAgentDefinition(
   }
 ) {
   if (input.workspaceId) await context.initStateManager.waitForInit(input.workspaceId);
-  const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
-  return readAgentDefinition(runtime, discoveryPath, input.agentId);
+  const { runtime, discoveryPath, projectPluginsTrusted } = await resolveAgentDiscoveryContext(
+    context,
+    input
+  );
+  return readAgentDefinition(runtime, discoveryPath, input.agentId, { projectPluginsTrusted });
 }

@@ -91,7 +91,7 @@ include fmt.mk
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config typecheck static-check static-check-full
-.PHONY: crap crap-check test-crap-scripts
+.PHONY: crap crap-check test-crap-scripts tree-sitter-grammars dry-check test-dry-scripts mutate-check test-mutate-scripts
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
 .PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
@@ -543,7 +543,7 @@ STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler 
 
 static-check: lint $(STATIC_CHECKS) ## Run fast local static checks
 
-static-check-full: lint-full $(STATIC_CHECKS) check-bench-agent test-bench-scripts test-crap-scripts check-docs-links ## Run the full CI static check suite
+static-check-full: lint-full $(STATIC_CHECKS) check-bench-agent test-bench-scripts test-crap-scripts test-dry-scripts test-mutate-scripts check-docs-links ## Run the full CI static check suite
 
 # Harbor version for benchmark-terminal and the adapter tests below, so CI tests the
 # adapter against the same Harbor API the scheduled benchmark runs.
@@ -574,16 +574,46 @@ crap-check: ## CRAP gate on files changed since BASE (default: merge-base with o
 
 CRAP_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --quiet --no-project --with pytest --with-requirements scripts/crap/crapper_report.py python
 
-test-crap-scripts: ## Test the Crapper adapter (hand-counted fixtures) and crap-check end to end (needs uv)
-	@# tree-sitter-language-pack downloads its grammars from GitHub releases on
-	@# first use. This target is in static-check-full (Required), so retry a
-	@# transient failure there (seen: HTTP 504) before the tests use them.
+# tree-sitter-language-pack downloads its grammars from GitHub releases on
+# first use. The script tests are in static-check-full (Required), so retry a
+# transient failure there (seen: HTTP 504) once, before any test uses them.
+tree-sitter-grammars:
 	@for attempt in 1 2 3; do \
 		$(CRAP_PYTHON) -c 'from tree_sitter_language_pack import download; download(["typescript", "tsx", "javascript"])' && break; \
 		[ $$attempt -lt 3 ] || exit 1; echo "grammar download failed, retrying ($$attempt/3)" >&2; sleep 10; \
 	done
+
+test-crap-scripts: tree-sitter-grammars ## Test the Crapper adapter (hand-counted fixtures) and crap-check end to end (needs uv)
 	@$(CRAP_PYTHON) -m pytest -q -p no:cacheprovider scripts/crap/crapper_report_test.py
 	@bun test ./scripts/crap/check.test.ts ./scripts/crap/agentGate.test.ts
+
+# DRY gate (scripts/dry/): near-duplicate functions that the changes since
+# BASE make (CI's mode: DRY_MODE; see .xum/skills/gauntlet). The script exits
+# 0 no findings, 1 findings that no marker accepts, 2 tool error; CI calls
+# it through scripts/dry/ci.ts.
+dry-check: ## DRY gate on functions changed since BASE (default: merge-base with origin/main) [DRY_CHECK_ARGS=--json]
+	@bun scripts/dry/check.ts --base "$(or $(BASE),$$(git merge-base origin/main HEAD))" $(DRY_CHECK_ARGS)
+
+DRY_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --quiet --no-project --with pytest --with-requirements scripts/dry/dryer_report.py python
+
+test-dry-scripts: tree-sitter-grammars ## Test the dryer adapter and dry-check end to end (needs uv)
+	@$(DRY_PYTHON) -m pytest -q -p no:cacheprovider scripts/dry/dryer_report_test.py
+	@bun test ./scripts/dry/check.test.ts
+
+# Mutation gate (scripts/mutate/): mutants in the functions changed since BASE
+# that the unit tests do not kill (CI's mode: MUTATION_MODE; see
+# .xum/skills/gauntlet). The script exits 0 no survivors, 1 survivors that no
+# marker accepts, 2 tool error, 3 a test failed
+# without a mutant; CI calls it through scripts/mutate/ci.ts.
+mutate-check: ## Mutation gate on functions changed since BASE (default: merge-base with origin/main) [COVERAGE="<lcov>..."] [MUTATE_CHECK_ARGS=--json]
+	@bun scripts/mutate/check.ts --base "$(or $(BASE),$$(git merge-base origin/main HEAD))" \
+		$(foreach lcov,$(COVERAGE),--coverage $(lcov)) $(MUTATE_CHECK_ARGS)
+
+MUTATE_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --quiet --no-project --with pytest --with-requirements scripts/mutate/mutate_report.py python
+
+test-mutate-scripts: tree-sitter-grammars ## Test the mutation runner and mutate-check end to end (needs uv)
+	@$(MUTATE_PYTHON) -m pytest -q -p no:cacheprovider scripts/mutate/mutate_report_test.py
+	@bun test ./scripts/mutate/check.test.ts
 
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh

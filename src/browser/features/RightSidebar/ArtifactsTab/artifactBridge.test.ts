@@ -190,10 +190,33 @@ describe("bridge script keys", () => {
     expect(bridge.prevented()).toBe(0);
     bridge.keydown(key, input, true, { ctrlKey: true });
     bridge.keydown(key.toLowerCase(), div, true, { ctrlKey: true });
-    const posted = { xumArtifact: 1, type: "sidebarKey", ctrlKey: true, metaKey: false };
+    const posted = {
+      xumArtifact: 1,
+      type: "sidebarKey",
+      chord: "sidebar",
+      ctrlKey: true,
+      metaKey: false,
+    };
     expect(bridge.posted).toEqual([posted, posted]);
     // Claimed in the frame, as the host claims it (Chrome binds the chord to its bookmarks bar).
     expect(bridge.prevented()).toBe(2);
+  });
+
+  test("the Artifacts tab chord is posted by name, and other Ctrl+Shift keys stay the artifact's", () => {
+    // The keybind's own key, so a keybind the shim cannot forward fails here.
+    const key = KEYBINDS.OPEN_ARTIFACTS_TAB.key;
+    const bridge = runBridgeScript();
+    // Keys of no forwarded chord, including names every object inherits.
+    for (const other of ["A", "constructor", "toString", "__proto__"]) {
+      bridge.keydown(other, div, true, { ctrlKey: true });
+    }
+    expect(bridge.posted).toEqual([]);
+    expect(bridge.prevented()).toBe(0);
+    bridge.keydown(key, div, true, { ctrlKey: true });
+    expect(bridge.posted).toEqual([
+      { xumArtifact: 1, type: "sidebarKey", chord: "artifacts", ctrlKey: true, metaKey: false },
+    ]);
+    expect(bridge.prevented()).toBe(1);
   });
 
   test("on macOS the right-sidebar chord is Cmd, and Ctrl stays the artifact's", () => {
@@ -208,10 +231,15 @@ describe("bridge script keys", () => {
       expect(bridge.posted).toEqual([]);
       expect(bridge.prevented()).toBe(0);
       bridge.keydown(key, div, true, { metaKey: true });
+      // The Artifacts tab keybind also takes Ctrl on macOS: only its Cmd form is forwarded.
+      const artifactsKey = KEYBINDS.OPEN_ARTIFACTS_TAB.key;
+      bridge.keydown(artifactsKey, div, true, { ctrlKey: true });
+      bridge.keydown(artifactsKey, div, true, { metaKey: true });
       expect(bridge.posted).toEqual([
-        { xumArtifact: 1, type: "sidebarKey", ctrlKey: false, metaKey: true },
+        { xumArtifact: 1, type: "sidebarKey", chord: "sidebar", ctrlKey: false, metaKey: true },
+        { xumArtifact: 1, type: "sidebarKey", chord: "artifacts", ctrlKey: false, metaKey: true },
       ]);
-      expect(bridge.prevented()).toBe(1);
+      expect(bridge.prevented()).toBe(2);
     } finally {
       global.window = saved;
     }
@@ -219,18 +247,25 @@ describe("bridge script keys", () => {
 });
 
 describe("sidebarKey messages", () => {
-  test("accepts the two modifier flags only", () => {
+  test("accepts a known chord name and the two modifier flags only", () => {
     const accept = (data: unknown) =>
       acceptArtifactFrameMessage({ source: frame, data }, frame, () => true);
     const sidebarKey = {
       xumArtifact: 1,
       type: "sidebarKey",
+      chord: "sidebar",
       ctrlKey: true,
       metaKey: false,
     } as const;
     expect(accept(sidebarKey)).toEqual(sidebarKey);
+    expect(accept({ ...sidebarKey, chord: "artifacts" })).toEqual({
+      ...sidebarKey,
+      chord: "artifacts",
+    });
     for (const data of [
-      { xumArtifact: 1, type: "sidebarKey", ctrlKey: true },
+      { xumArtifact: 1, type: "sidebarKey", chord: "sidebar", ctrlKey: true },
+      { xumArtifact: 1, type: "sidebarKey", ctrlKey: true, metaKey: false },
+      { ...sidebarKey, chord: "palette" },
       { ...sidebarKey, metaKey: "yes" },
       { ...sidebarKey, key: "Delete" },
     ]) {

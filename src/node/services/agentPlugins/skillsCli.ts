@@ -92,10 +92,23 @@ function formatCommand(argv: string[]): string {
 }
 
 /**
- * The command for `input`: validated source and skill names only. Throws a user-facing error for
- * invalid input.
+ * SECURITY: `npx skills@<version>` prefers a matching package in the working folder's
+ * node_modules over the registry, so the copied command run inside an attacker's checkout would
+ * start the attacker's copy. On macOS and Linux the command changes to the home folder first
+ * (`&&` stops it when that fails); `cd ~ &&` works in bash, zsh and fish. Windows has no prefix
+ * that works in cmd.exe, Windows PowerShell 5, PowerShell 7 and Git Bash alike, so there the
+ * command has none and Settings tells the user to run it from the home folder.
  */
-export function skillsCliCommand(input: { source: string; skills: string[] }): string {
+const SKILLS_CLI_POSIX_CWD_PREFIX = "cd ~ &&";
+
+/**
+ * The command for `input`: validated source and skill names only. Throws a user-facing error for
+ * invalid input. `platform` is the user's machine (the terminal runs where the Xum backend runs).
+ */
+export function skillsCliCommand(
+  input: { source: string; skills: string[] },
+  platform: NodeJS.Platform = process.platform
+): string {
   const args = skillsCliArgs(input.source, input.skills);
   // skillsCliSourceProblem and the skill-name grammar admit only safe characters. Check what Xum
   // shows again: an unsafe argument throws here, it is never quoted.
@@ -103,7 +116,8 @@ export function skillsCliCommand(input: { source: string; skills: string[] }): s
     args.every((arg) => SKILLS_CLI_SAFE_ARG_PATTERN.test(arg)),
     "skillsCliCommand: every argument must be safe to show unquoted in any shell"
   );
-  return formatCommand(["npx", ...args]);
+  const command = formatCommand(["npx", ...args]);
+  return platform === "win32" ? command : `${SKILLS_CLI_POSIX_CWD_PREFIX} ${command}`;
 }
 
 /** The ORPC shape: invalid input becomes the error branch. */

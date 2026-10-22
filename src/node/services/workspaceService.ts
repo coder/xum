@@ -19,6 +19,7 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   WORKSPACE_NAME_GENERATION_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
+import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { SERVER_UPDATE_MONITOR_VERIFY_TIMEOUT_MS } from "@/constants/serverUpdate";
 import { EventEmitter } from "events";
@@ -21696,7 +21697,12 @@ export class WorkspaceService
         return undefined;
       }
       const runtime = createRuntimeForWorkspace(metadata);
-      return { runtime, workspacePath: resolveWorkspaceRootPath(metadata, runtime), workspaceId };
+      return {
+        runtime,
+        workspacePath: resolveWorkspaceRootPath(metadata, runtime),
+        workspaceId,
+        projectPluginsTrusted: isWorkspaceProjectTrusted(this.config, metadata),
+      };
     } catch {
       return undefined;
     }

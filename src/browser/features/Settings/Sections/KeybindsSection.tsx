@@ -67,7 +67,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   REVEAL_TIMELINE_EVENT: "Reveal selected timeline event in transcript",
   OPEN_TIMELINE_DIALOG: "Open Timeline tab (small viewports)",
   OPEN_STATS_DIALOG: "Open Stats tab (small viewports)",
-  OPEN_ARTIFACTS_TAB: "Open Artifacts tab",
+  OPEN_ARTIFACTS_TAB: "Toggle Artifacts tab",
   TOGGLE_ARTIFACT_FULLSCREEN: "Toggle artifact fullscreen (Artifacts tab)",
   NEXT_ARTIFACT: "Next artifact (Artifacts tab)",
   PREV_ARTIFACT: "Previous artifact (Artifacts tab)",

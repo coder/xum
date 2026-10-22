@@ -2450,6 +2450,53 @@ export class HistoryService {
     );
   }
 
+  /** The append preconditions of acceptCompactionReplacement; call under the write lock. */
+  private async admitsAppendUnlocked(
+    workspaceId: string,
+    observer: {
+      admitsFullHistory?: (messages: MuxMessage[]) => boolean;
+      maxHistorySequence?: number;
+    }
+  ): Promise<Result<boolean>> {
+    const { admitsFullHistory, maxHistorySequence } = observer;
+    if (maxHistorySequence != null) {
+      const newer = await this.hasRowAboveSequenceUnlocked(workspaceId, maxHistorySequence);
+      if (!newer.success || newer.data) return newer.success ? Ok(false) : newer;
+    }
+    if (!admitsFullHistory) return Ok(true);
+    const rows: MuxMessage[] = [];
+    const scanned = await this.iterateFullHistoryUnlocked(workspaceId, "forward", (chunk) => {
+      rows.push(...chunk);
+    });
+    return scanned.success ? Ok(admitsFullHistory(rows)) : scanned;
+  }
+
+  /**
+   * Whether a row has a historySequence above `max`, read back from the tail (#5286).
+   * Precondition: sequences never decrease in file order, active file after archive
+   * (appendToHistory assigns them in order). So the first chunk that holds a sequenced row
+   * decides: every row in it is checked, and no older chunk is read. A chunk whose rows break
+   * that order fails closed: it reports a newer row, so the caller's append is skipped.
+   */
+  private async hasRowAboveSequenceUnlocked(
+    workspaceId: string,
+    max: number
+  ): Promise<Result<boolean>> {
+    let newer = false;
+    const scanned = await this.iterateFullHistoryUnlocked(workspaceId, "backward", (chunk) => {
+      // Newest first: each sequence must be at most the one before it.
+      let previous = Number.POSITIVE_INFINITY;
+      for (const message of chunk) {
+        const sequence = message.metadata?.historySequence;
+        if (sequence == null) continue;
+        if (sequence > max || sequence > previous) newer = true;
+        previous = sequence;
+      }
+      return previous === Number.POSITIVE_INFINITY;
+    });
+    return scanned.success ? Ok(newer) : scanned;
+  }
+
   private async iterateFullHistoryUnlocked(
     workspaceId: string,
     direction: "forward" | "backward",
@@ -4286,6 +4333,14 @@ export class HistoryService {
        */
       admitsFullHistory?: (messages: MuxMessage[]) => boolean;
       /**
+       * Append precondition under this write lock, right before the append: skip it when any
+       * row has a historySequence above this one (a row the caller did not read). It relies on
+       * sequences never decreasing in file order: the scan reads back from the tail, decides on
+       * the first chunk that holds a sequenced row, and fails closed (skips) on rows out of
+       * order. Cost: normally one chunk read from the tail of chat.jsonl.
+       */
+      maxHistorySequence?: number;
+      /**
        * Idempotent sends (append only): the ids the trigger row accepts. Checked against every
        * row (archive included) under this write lock, right before the write, and stamped on the
        * trigger: an id a row already carries is never appended twice. `onDecision` reports the
@@ -4531,13 +4586,10 @@ export class HistoryService {
           };
         }
         // Last check before the write, so a `false` here is the only reason for this skip.
-        if (prepared.kind === "append" && observer.admitsFullHistory) {
-          const rows: MuxMessage[] = [];
-          const scanned = await this.iterateFullHistoryUnlocked(workspaceId, "forward", (chunk) => {
-            rows.push(...chunk);
-          });
-          if (!scanned.success) return scanned;
-          if (!observer.admitsFullHistory(rows)) return Ok({ kind: "skipped" });
+        if (prepared.kind === "append") {
+          const admitted = await this.admitsAppendUnlocked(workspaceId, observer);
+          if (!admitted.success) return admitted;
+          if (!admitted.data) return Ok({ kind: "skipped" });
         }
         let superseded = false;
         const rememberPublished = (): undefined => {

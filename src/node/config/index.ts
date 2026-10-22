@@ -4566,6 +4566,7 @@ export class Config {
     workspaceName?: string;
     parentWorkspaceId?: string;
     pendingAutoTitle?: boolean;
+    kind?: Workspace["kind"];
   } | null {
     const config = this.loadConfigOrDefault({ throwOnError: options?.throwOnError });
 
@@ -4586,6 +4587,7 @@ export class Config {
         workspaceName: workspace.name,
         parentWorkspaceId: workspace.parentWorkspaceId,
         pendingAutoTitle: workspace.pendingAutoTitle,
+        kind: workspace.kind,
       };
     }
 

@@ -606,7 +606,7 @@ export const KEYBINDS = {
   /** Show the Stats tab full-screen on small viewports, where the right sidebar is hidden */
   OPEN_STATS_DIALOG: { key: "s", shift: true },
 
-  /** Open (or focus) the Artifacts tab in the right sidebar */
+  /** Open (or focus) the Artifacts tab in the right sidebar, or collapse the sidebar when it shows it */
   OPEN_ARTIFACTS_TAB: { key: "K", ctrl: true, shift: true },
 
   // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,

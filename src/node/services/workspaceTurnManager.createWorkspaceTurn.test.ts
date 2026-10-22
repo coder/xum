@@ -219,6 +219,97 @@ describe("WorkspaceTurnManager", () => {
     });
   });
 
+  // #6426: a project's own plugin agents load only when project plugins are allowed (a trusted
+  // project, no project-automation kill switch), so an explicit workspace-turn agentId naming one
+  // validates only then. createWorkspaceTurn already refuses an untrusted owner project, so the
+  // reachable "not allowed" case is a trusted project under the kill switch.
+  test.each([true, false])(
+    "createWorkspaceTurn validates a project plugin agent id only when project plugins are allowed (allowed: %s)",
+    async (allowed) => {
+      const config = await createTestConfig(rootDir);
+      stubStableIds(config, ["childworkspace", "firstturn", "followuphandle", "followupturn"]);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      const pluginDir = path.join(projectPath, ".mux", "plugins", "repo-plugin");
+      await fsPromises.mkdir(path.join(pluginDir, "agents"), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(pluginDir, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: "repo-plugin",
+        }),
+        "utf-8"
+      );
+      await fsPromises.writeFile(
+        path.join(pluginDir, "agents", "repo-agent.md"),
+        "---\nname: Repo agent\ndescription: Project plugin agent\nbase: exec\n---\nBody\n",
+        "utf-8"
+      );
+
+      const createWorkspace = mock(async (): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+        await config.editConfig((cfg) => {
+          const project = cfg.projects.get(projectPath);
+          assert(project, "test project must exist");
+          project.workspaces.push({
+            path: projectPath,
+            id: "childworkspace",
+            name: "workspace-turn",
+            title: "Workspace turn",
+            createdAt: "2026-06-19T00:00:00.000Z",
+            runtimeConfig: { type: "local" },
+          });
+          return cfg;
+        });
+        return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
+      });
+      const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
+        const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+        await internal?.onAccepted?.();
+        return Ok(undefined);
+      });
+      const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+      const { taskService } = createWorkspaceTurnManagerHarness(config, {
+        workspaceService: workspaceMocks.workspaceService,
+      });
+
+      const first = await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: parentId,
+        prompt: "Initial turn",
+        title: "Workspace turn",
+        workspace: { mode: "new" },
+      });
+      expect(first.success).toBe(true);
+
+      const previousKillSwitch = process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+      if (allowed) delete process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+      else process.env.XUM_DISABLE_PROJECT_AUTOMATION = "1";
+      let followUp: Awaited<ReturnType<typeof taskService.createWorkspaceTurn>>;
+      try {
+        followUp = await taskService.createWorkspaceTurn({
+          ownerWorkspaceId: parentId,
+          agentId: "repo-agent",
+          prompt: "Use the plugin agent",
+          title: "Plugin agent",
+          workspace: { mode: "existing", workspaceId: "childworkspace" },
+        });
+      } finally {
+        if (previousKillSwitch === undefined) delete process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+        else process.env.XUM_DISABLE_PROJECT_AUTOMATION = previousKillSwitch;
+      }
+
+      if (allowed) {
+        expect(followUp.success).toBe(true);
+        expect(sendMessage).toHaveBeenCalledTimes(2);
+        expect(sendMessage.mock.calls[1]?.[2]).toMatchObject({ agentId: "repo-agent" });
+      } else {
+        expect(followUp.success).toBe(false);
+        if (!followUp.success) {
+          expect(followUp.error).toContain("unknown agentId (repo-agent)");
+        }
+        expect(sendMessage).toHaveBeenCalledTimes(1);
+      }
+    }
+  );
+
   test("createWorkspaceTurn keeps prechecks advisory when the owner has uncommitted agent changes", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);

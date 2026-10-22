@@ -34,6 +34,8 @@ export interface NodeAgentDefinitionContext {
   runtime: Runtime;
   workspacePath: string;
   workspaceId: string;
+  /** #6426: only `true` lets project plugin agents (and bases) load. */
+  projectPluginsTrusted?: boolean;
 }
 
 export interface ResolveNodeAgentAiSettingsParams {
@@ -151,7 +153,10 @@ export async function loadAgentDefinitionAiLayers(
       context.runtime,
       context.workspacePath,
       agentId,
-      abortSignal != null ? { abortSignal } : undefined
+      {
+        ...(abortSignal != null ? { abortSignal } : {}),
+        projectPluginsTrusted: context.projectPluginsTrusted,
+      }
     );
     const chain = await resolveAgentInheritanceChain({
       runtime: context.runtime,
@@ -160,6 +165,7 @@ export async function loadAgentDefinitionAiLayers(
       agentDefinition,
       workspaceId: context.workspaceId,
       ...(abortSignal != null ? { abortSignal } : {}),
+      projectPluginsTrusted: context.projectPluginsTrusted,
     });
     return collectDefinitionLayers(agentId, chain);
   };

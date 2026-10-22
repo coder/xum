@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { isProjectTrustedIn } from "@/node/utils/projectTrust";
 import assert from "node:assert/strict";
 
 import type { Config, ProjectsConfig } from "@/node/config";
@@ -100,6 +101,7 @@ async function resolveAgentEditingCapability(args: {
   discoveryContexts: readonly WorkspaceRuntimeContext[];
   agentId: string;
   workspaceId: string;
+  projectPluginsTrusted: boolean;
 }): Promise<{ editingCapable: boolean; projectScoped: boolean } | undefined> {
   const parsedAgentId = AgentIdSchema.safeParse(args.agentId);
   if (!parsedAgentId.success) {
@@ -113,7 +115,8 @@ async function resolveAgentEditingCapability(args: {
       const agentDefinition = await readAgentDefinition(
         discovery.runtime,
         discovery.workspacePath,
-        parsedAgentId.data
+        parsedAgentId.data,
+        { projectPluginsTrusted: args.projectPluginsTrusted }
       );
       const chain = await resolveAgentInheritanceChain({
         runtime: discovery.runtime,
@@ -121,6 +124,7 @@ async function resolveAgentEditingCapability(args: {
         agentId: agentDefinition.id,
         agentDefinition,
         workspaceId: args.workspaceId,
+        projectPluginsTrusted: args.projectPluginsTrusted,
       });
 
       if (agentDefinition.scope === "project") {
@@ -387,14 +391,15 @@ export class GitPatchArtifactService {
     const cfg = options?.config ?? this.config.loadConfigOrDefault();
     const childEntry = findWorkspaceEntry(cfg, childWorkspaceId);
 
-    if (childEntry?.workspace.kind === "scratch") {
+    // No entry: no persisted agent id, so no patch (#6426 narrows it once for the trust read).
+    if (childEntry == null || childEntry.workspace.kind === "scratch") {
       return;
     }
 
     // Only exec-like subagents are expected to make commits that should be handed back to the parent.
     // NOTE: Custom agents can inherit from exec (base: exec). Those should also generate patches,
     // but read-only subagents (e.g. explore) should not.
-    const childAgentIds = resolvePersistedAgentIdCandidates(childEntry?.workspace);
+    const childAgentIds = resolvePersistedAgentIdCandidates(childEntry.workspace);
     if (childAgentIds.length === 0) {
       return;
     }
@@ -410,6 +415,8 @@ export class GitPatchArtifactService {
         discoveryContexts,
         agentId: childAgentId,
         workspaceId: childWorkspaceId,
+        // #6426: from the config loaded above (no extra read).
+        projectPluginsTrusted: isProjectTrustedIn(cfg.projects, childEntry.projectPath),
       });
       if (editingCapability == null) {
         continue;
@@ -418,7 +425,7 @@ export class GitPatchArtifactService {
       break;
     }
 
-    if (!shouldGeneratePatch || !childEntry) {
+    if (!shouldGeneratePatch) {
       return;
     }
 

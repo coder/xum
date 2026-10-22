@@ -666,6 +666,62 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
+  test("Ctrl+Shift+K opens the Artifacts tab, and collapses the sidebar while it shows", async () => {
+    await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.ARTIFACTS, enabled: true });
+    const { sidebar, cleanup } = await setupRightSidebarView();
+    const chord = { key: "K", code: "KeyK", ctrlKey: true, shiftKey: true };
+    const collapsed = () => readPersistedState(getRightSidebarCollapsedKey(workspaceId), false);
+    const artifactsSelected = () =>
+      sidebar
+        .querySelector('[role="tab"][aria-controls*="artifacts"]')
+        ?.getAttribute("aria-selected") === "true";
+
+    try {
+      // The shortcut listens once the experiment reads on: the launcher then offers the tool.
+      const launcher = await openLauncher(sidebar);
+      await waitFor(
+        () => expect(within(launcher).getByRole("button", { name: /^Artifacts\b/ })).toBeTruthy(),
+        { timeout: 10_000 }
+      );
+
+      // Another tab shows: the key switches to Artifacts and keeps the sidebar open.
+      fireEvent.keyDown(window, chord);
+      await waitFor(() => expect(artifactsSelected()).toBe(true));
+      expect(collapsed()).toBe(false);
+
+      // A held key does not collapse it.
+      fireEvent.keyDown(window, { ...chord, repeat: true });
+      expect(collapsed()).toBe(false);
+
+      // Nor does a press in an overlay that blocks Ctrl+Shift+B (stand-ins, as in the Ctrl+Shift+B
+      // overlay test, but letting the key bubble to the window listener).
+      for (const attribute of ["cmdk-root", "data-radix-popper-content-wrapper"]) {
+        const root = document.createElement("div");
+        root.setAttribute(attribute, "");
+        const control = root.appendChild(document.createElement("button"));
+        document.body.append(root);
+        try {
+          fireEvent.keyDown(control, chord);
+          expect({ attribute, collapsed: collapsed() }).toEqual({ attribute, collapsed: false });
+        } finally {
+          root.remove();
+        }
+      }
+
+      // Artifacts shows: the key collapses the whole sidebar, like Ctrl+Shift+B.
+      fireEvent.keyDown(window, chord);
+      await waitFor(() => expect(collapsed()).toBe(true));
+
+      // Collapsed: the key opens the sidebar on Artifacts again.
+      fireEvent.keyDown(window, chord);
+      await waitFor(() => expect(collapsed()).toBe(false));
+      await waitFor(() => expect(artifactsSelected()).toBe(true));
+    } finally {
+      await cleanup();
+      await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.ARTIFACTS, enabled: null });
+    }
+  }, 60_000);
+
   test("Ctrl+Shift+B over an overlay is claimed but does not toggle", async () => {
     const { cleanup } = await setupRightSidebarView(() => {
       updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);

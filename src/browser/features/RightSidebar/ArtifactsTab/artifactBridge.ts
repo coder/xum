@@ -23,10 +23,10 @@ import {
  *   frame (focus then sits in it) made unreachable from the keyboard. It can turn annotate mode
  *   on, so the host honours it only during a live user gesture in this frame
  *   (hasLiveUserGesture, SandboxedArtifactFrame.tsx).
- * - Frame -> host: `{ type: "sidebarKey", ctrlKey, metaKey }`, the right-sidebar chord
- *   (KEYBINDS.TOGGLE_RIGHT_SIDEBAR), which a click into the frame also made unreachable: keys in
- *   the frame never reach the app's window listener. The host honours it only while the frame
- *   holds focus (SandboxedArtifactFrame.tsx).
+ * - Frame -> host: `{ type: "sidebarKey", chord, ctrlKey, metaKey }`, a right-sidebar chord
+ *   (ARTIFACT_FRAME_CHORDS: KEYBINDS.TOGGLE_RIGHT_SIDEBAR or KEYBINDS.OPEN_ARTIFACTS_TAB), which a
+ *   click into the frame also made unreachable: keys in the frame never reach the app's window
+ *   listener. The host honours it only while the frame holds focus (SandboxedArtifactFrame.tsx).
  * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) only fills the
  *   host-owned confirm strip, never sends by itself; `{ type: "setState", state }`
  *   (window.xum.setState) is persisted per artifact, for all its versions. Text and JSON sizes
@@ -123,14 +123,28 @@ const ArtifactAnnotateMessageSchema = z
   .strict();
 
 /**
- * The right-sidebar chord (KEYBINDS.TOGGLE_RIGHT_SIDEBAR) pressed inside the frame, with the
- * modifiers the host needs to match the keybind exactly (matchesKeybind). See the host side in
+ * The app chords the frame forwards, by name. Both act on the right sidebar that holds the frame:
+ * TOGGLE_RIGHT_SIDEBAR collapses it, and OPEN_ARTIFACTS_TAB collapses it too, since the frame
+ * only holds focus while the Artifacts tab shows (user request: that key toggles the tab, from
+ * anywhere in it).
+ */
+export const ARTIFACT_FRAME_CHORDS = {
+  sidebar: KEYBINDS.TOGGLE_RIGHT_SIDEBAR,
+  artifacts: KEYBINDS.OPEN_ARTIFACTS_TAB,
+} as const satisfies Record<string, Keybind>;
+export type ArtifactFrameChord = keyof typeof ARTIFACT_FRAME_CHORDS;
+
+/**
+ * A right-sidebar chord (ARTIFACT_FRAME_CHORDS) pressed inside the frame, with the modifiers the
+ * host needs to match the keybind exactly (matchesKeybind). See the host side in
  * SandboxedArtifactFrame.tsx.
  */
 const ArtifactSidebarKeyMessageSchema = z
   .object({
     ...bridgeEnvelope,
     type: z.literal("sidebarKey"),
+    // The host indexes ARTIFACT_FRAME_CHORDS with it, so a name without a keybind fails typecheck.
+    chord: z.enum(["sidebar", "artifacts"]),
     ctrlKey: z.boolean(),
     metaKey: z.boolean(),
   })
@@ -469,9 +483,9 @@ const ANNOTATE_KEY_LISTENER =
   });`;
 
 /**
- * The right-sidebar key the frame forwards, lowercased, from KEYBINDS.TOGGLE_RIGHT_SIDEBAR. The
- * shim checks only a Ctrl (Cmd on macOS) plus Shift chord of one key, so another keybind shape
- * turns forwarding off (null), like plainSingleKey. The shim tests send the keybind's key.
+ * A forwarded chord's key, lowercased. The shim checks only a Ctrl (Cmd on macOS) plus Shift chord
+ * of one key, so another keybind shape turns forwarding off (null), like plainSingleKey. The shim
+ * tests send the keybind's key.
  */
 function ctrlShiftKey(keybind: Keybind): string | null {
   const chord =
@@ -479,31 +493,46 @@ function ctrlShiftKey(keybind: Keybind): string | null {
     keybind.code == null &&
     keybind.ctrl === true &&
     keybind.shift === true &&
-    keybind.macCtrlBehavior === "command" &&
+    keybind.macCtrlBehavior !== "control" &&
     !keybind.alt &&
     !keybind.meta;
   return chord ? keybind.key.toLowerCase() : null;
 }
-const SIDEBAR_FRAME_KEY = ctrlShiftKey(KEYBINDS.TOGGLE_RIGHT_SIDEBAR);
+
+/** Lowercased key -> chord name, for the chords the shim can forward. */
+function frameChordKeys(): Record<string, ArtifactFrameChord> {
+  const keys: Record<string, ArtifactFrameChord> = {};
+  for (const chord of Object.keys(ARTIFACT_FRAME_CHORDS) as ArtifactFrameChord[]) {
+    const key = ctrlShiftKey(ARTIFACT_FRAME_CHORDS[chord]);
+    if (key != null) keys[key] = chord;
+  }
+  return keys;
+}
+const FRAME_CHORD_KEYS = frameChordKeys();
 
 /**
- * The right-sidebar chord, with this platform's modifier as matchesKeybind reads the keybind: on
- * macOS only Cmd (Ctrl may be held too), elsewhere only Ctrl. The shim claims nothing else, so the
- * other form of the chord stays the artifact's. The host matches the keybind again (it decides).
- * No editable exclusion: the chord types nothing, and the host's own handler works from the chat
- * input too. Built per frame: isMac() needs the window.
+ * The right-sidebar chords, with this platform's modifier as matchesKeybind reads the keybind: on
+ * macOS only Cmd (Ctrl may be held too), elsewhere only Ctrl. A keybind that also takes Ctrl on
+ * macOS (OPEN_ARTIFACTS_TAB) is forwarded in its Cmd form only. The shim claims nothing else, so
+ * the other form of each chord stays the artifact's. The host matches the keybind again (it
+ * decides). No editable exclusion: the chords type nothing, and the host's own handlers work from
+ * the chat input too. Built per frame: isMac() needs the window.
  */
 function sidebarKeyListener(): string {
-  if (SIDEBAR_FRAME_KEY == null) return "";
+  if (Object.keys(FRAME_CHORD_KEYS).length === 0) return "";
   const modifier = isMac() ? "event.metaKey" : "event.ctrlKey && !event.metaKey";
   return `
+  var chordKeys = ${JSON.stringify(FRAME_CHORD_KEYS)};
   window.addEventListener("keydown", function (event) {
     // A held key would flip the sidebar on every repeat and spend the frame's message budget.
     if (event.repeat || event.altKey || !event.shiftKey || !(${modifier})) return;
-    if (typeof event.key !== "string" || event.key.toLowerCase() !== ${JSON.stringify(SIDEBAR_FRAME_KEY)}) return;
-    // Claimed like the host claims it: in a browser, Chrome binds the chord to its bookmarks bar.
+    if (typeof event.key !== "string") return;
+    var key = event.key.toLowerCase();
+    // Own keys only: "constructor" and the like are on every object's prototype.
+    if (!Object.prototype.hasOwnProperty.call(chordKeys, key)) return;
+    // Claimed like the host claims it: in a browser, Chrome binds Ctrl+Shift+B to its bookmarks bar.
     event.preventDefault();
-    host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "sidebarKey", ctrlKey: event.ctrlKey, metaKey: event.metaKey }, "*");
+    host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "sidebarKey", chord: chordKeys[key], ctrlKey: event.ctrlKey, metaKey: event.metaKey }, "*");
   }, true);`;
 }
 

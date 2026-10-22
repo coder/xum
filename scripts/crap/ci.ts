@@ -105,11 +105,11 @@ export function incompleteCoverageReason(
 }
 
 // Workflow command escaping: https://github.com/actions/toolkit/blob/main/packages/core/src/command.ts
-function escapeData(text: string): string {
+export function escapeData(text: string): string {
   return text.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
 }
 
-function escapeProperty(text: string): string {
+export function escapeProperty(text: string): string {
   return escapeData(text).replace(/:/g, "%3A").replace(/,/g, "%2C");
 }
 
@@ -120,7 +120,7 @@ export function annotation(finding: Finding): string {
   return `::warning ${where},title=${title}::${escapeData(finding.message)}`;
 }
 
-function cell(text: string): string {
+export function cell(text: string): string {
   return text.replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
 

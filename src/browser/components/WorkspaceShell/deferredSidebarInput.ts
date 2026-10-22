@@ -48,8 +48,20 @@ export function holdSidebarInput(held: HeldSidebarInput[]): () => void {
     if (isDialogOpen()) return;
     e.preventDefault();
     e.stopImmediatePropagation();
-    const { target, key, code, ctrlKey, shiftKey, altKey, metaKey } = e;
-    const init = { key, code, ctrlKey, shiftKey, altKey, metaKey, bubbles: true, cancelable: true };
+    // The replay keeps `repeat`: a held OPEN_ARTIFACTS_TAB key must not replay as fresh presses,
+    // each of which would flip the sidebar.
+    const { target, key, code, ctrlKey, shiftKey, altKey, metaKey, repeat } = e;
+    const init = {
+      key,
+      code,
+      ctrlKey,
+      shiftKey,
+      altKey,
+      metaKey,
+      repeat,
+      bubbles: true,
+      cancelable: true,
+    };
     held.push(() => {
       const node = target instanceof Node && target.isConnected ? target : window;
       node.dispatchEvent(new window.KeyboardEvent("keydown", init));

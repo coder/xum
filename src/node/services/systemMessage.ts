@@ -305,6 +305,8 @@ export function extractToolInstructionsFromSources(
   const contextContents = collectInstructionContents(sources.context);
 
   return extractToolInstructionsCached(globalContents, contextContents, modelString, {
+    // No scratchWorkspace: instructions reach only the tools getToolsForModel creates, and the
+    // parse cache does not key enableGitPatches.
     ...getToolAvailabilityOptions({
       workspaceId: metadata.id,
       parentWorkspaceId: metadata.parentWorkspaceId,

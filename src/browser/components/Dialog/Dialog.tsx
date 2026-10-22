@@ -12,7 +12,31 @@ import { isEditableElement, MODAL_DIALOG_OVERLAY_ATTRIBUTE } from "@/browser/uti
  */
 const VisuallyHidden = VisuallyHiddenPrimitive.Root;
 
-const Dialog = DialogPrimitive.Root;
+/** Sets the root's open state, for DialogContent's early-Escape fallback (#7141). */
+const DialogOpenChangeContext = React.createContext<((open: boolean) => void) | undefined>(
+  undefined
+);
+
+/**
+ * Radix's Root, with an uncontrolled root's open state held here instead of inside Radix. The
+ * early-Escape fallback must close every dialog, and Radix keeps that state to itself.
+ */
+const Dialog = (props: React.ComponentProps<typeof DialogPrimitive.Root>) => {
+  const [uncontrolledOpen, setUncontrolledOpen] = React.useState(props.defaultOpen ?? false);
+  const setOpen = (open: boolean) => {
+    if (props.open === undefined) setUncontrolledOpen(open);
+    props.onOpenChange?.(open);
+  };
+  return (
+    <DialogOpenChangeContext.Provider value={setOpen}>
+      <DialogPrimitive.Root
+        {...props}
+        open={props.open ?? uncontrolledOpen}
+        onOpenChange={setOpen}
+      />
+    </DialogOpenChangeContext.Provider>
+  );
+};
 
 const DialogTrigger = DialogPrimitive.Trigger;
 
@@ -73,57 +97,84 @@ const DialogContent = React.forwardRef<
       skipEntryAnimation = false,
       style,
       onEscapeKeyDown,
+      onKeyDown,
       ...props
     },
     ref
-  ) => (
-    <DialogPortal>
-      <DialogOverlay style={skipEntryAnimation ? NO_ANIMATION : undefined} />
-      <DialogPrimitive.Content
-        ref={ref}
-        onEscapeKeyDown={(e) => {
-          // A focused, closed <select> has no use for Escape (an open native picker consumes it
-          // before the page sees it), so it must not block dismissal: Analytics autofocuses its
-          // project select, and exempting it made the first Escape after opening do nothing.
-          if (
-            allowEditableEscape &&
-            isEditableElement(e.target) &&
-            !(e.target instanceof HTMLElement && e.target.tagName === "SELECT")
-          ) {
-            // preventDefault keeps the dialog open; skipping stopPropagation lets the editor's
-            // own onKeyDown run. Global Escape handlers already ignore editable targets.
-            e.preventDefault();
-            return;
-          }
-          // Prevent Escape from propagating to global handlers (e.g., stream interrupt).
-          // Radix uses capture phase for Escape, so we must use onEscapeKeyDown (not onKeyDown).
-          e.stopPropagation();
-          onEscapeKeyDown?.(e);
-        }}
-        className={cn(
-          "bg-dark border-border fixed top-[50%] left-[50%] z-[1500] grid w-[90%] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%]",
-          !maxWidth && "max-w-lg",
-          maxHeight && "overflow-y-auto",
-          className
-        )}
-        style={{
-          ...(maxWidth && { maxWidth }),
-          ...(maxHeight && { maxHeight }),
-          ...(skipEntryAnimation && NO_ANIMATION),
-          ...style,
-        }}
-        {...props}
-      >
-        {children}
-        {showCloseButton && (
-          <DialogPrimitive.Close className="text-muted hover:text-foreground absolute top-4 right-4 rounded-sm transition-colors focus:outline-none disabled:pointer-events-none">
-            <X className="h-4 w-4" />
-            <span className="sr-only">Close</span>
-          </DialogPrimitive.Close>
-        )}
-      </DialogPrimitive.Content>
-    </DialogPortal>
-  )
+  ) => {
+    const onOpenChange = React.useContext(DialogOpenChangeContext);
+    /** Radix's Escape handler. Returns false when it leaves Escape to a focused editor. */
+    const handleEscape = (e: KeyboardEvent): boolean => {
+      // A focused, closed <select> has no use for Escape (an open native picker consumes it
+      // before the page sees it), so it must not block dismissal: Analytics autofocuses its
+      // project select, and exempting it made the first Escape after opening do nothing.
+      if (
+        allowEditableEscape &&
+        isEditableElement(e.target) &&
+        !(e.target instanceof HTMLElement && e.target.tagName === "SELECT")
+      ) {
+        // preventDefault keeps the dialog open; skipping stopPropagation lets the editor's
+        // own onKeyDown run. Global Escape handlers already ignore editable targets.
+        e.preventDefault();
+        return false;
+      }
+      // Prevent Escape from propagating to global handlers (e.g., stream interrupt).
+      // Radix uses capture phase for Escape, so we must use onEscapeKeyDown (not onKeyDown).
+      e.stopPropagation();
+      onEscapeKeyDown?.(e);
+      return true;
+    };
+    return (
+      <DialogPortal>
+        <DialogOverlay style={skipEntryAnimation ? NO_ANIMATION : undefined} />
+        <DialogPrimitive.Content
+          ref={ref}
+          onEscapeKeyDown={handleEscape}
+          onKeyDown={(e) => {
+            onKeyDown?.(e);
+            // Radix ignores Escape until its layer re-renders after mounting: it reads a stale
+            // stack index (@radix-ui/react-dismissable-layer 1.1.11, and 1.2.1 too). So an Escape
+            // in the first moments after opening reached here and the dialog stayed open (#7141).
+            // An Escape that Radix handled never gets here unprevented: handleEscape stops it, or
+            // Radix prevents its default when it closes. A key from a portaled child layer (a
+            // popover) bubbles here through React but is not inside this node: that layer owns it.
+            if (
+              e.key !== "Escape" ||
+              e.defaultPrevented ||
+              onOpenChange == null ||
+              !(e.target instanceof Node && e.currentTarget.contains(e.target))
+            ) {
+              return;
+            }
+            if (!handleEscape(e.nativeEvent)) return;
+            e.stopPropagation();
+            if (!e.nativeEvent.defaultPrevented) onOpenChange(false);
+          }}
+          className={cn(
+            "bg-dark border-border fixed top-[50%] left-[50%] z-[1500] grid w-[90%] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%]",
+            !maxWidth && "max-w-lg",
+            maxHeight && "overflow-y-auto",
+            className
+          )}
+          style={{
+            ...(maxWidth && { maxWidth }),
+            ...(maxHeight && { maxHeight }),
+            ...(skipEntryAnimation && NO_ANIMATION),
+            ...style,
+          }}
+          {...props}
+        >
+          {children}
+          {showCloseButton && (
+            <DialogPrimitive.Close className="text-muted hover:text-foreground absolute top-4 right-4 rounded-sm transition-colors focus:outline-none disabled:pointer-events-none">
+              <X className="h-4 w-4" />
+              <span className="sr-only">Close</span>
+            </DialogPrimitive.Close>
+          )}
+        </DialogPrimitive.Content>
+      </DialogPortal>
+    );
+  }
 );
 DialogContent.displayName = DialogPrimitive.Content.displayName;
 

@@ -6,6 +6,7 @@ import { SEND_DISPATCH_MODES } from "@/browser/features/ChatInput/sendDispatchMo
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import { ArtifactInteractionPill } from "@/browser/features/Messages/ArtifactInteractionPill";
 import { UserMessageContent } from "@/browser/features/Messages/UserMessageContent";
+import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { cn } from "@/common/lib/utils";
@@ -15,6 +16,8 @@ interface QueuedMessageProps {
   message: QueuedMessageType;
   className?: string;
   onEdit?: () => void;
+  /** Another message is being edited (#5934): Edit stays visible but does nothing, and says why. */
+  editBlocked?: boolean;
   onChangeDispatchMode?: (mode: QueueDispatchMode) => Promise<void>;
   onActionError?: (error: unknown) => void;
   actionError?: string | null;
@@ -35,6 +38,28 @@ function deriveQueuedPreview(message: QueuedMessageType): QueuedPreview {
     sanitizedText,
     fallbackLabel: "Queued message ready",
   };
+}
+
+/** The queued card's Edit; blocked while another message is being edited (#5934). */
+function QueuedEditButton(props: { onEdit: () => void; blocked: boolean }) {
+  return (
+    <TooltipIfPresent tooltip={props.blocked ? "Finish or cancel the open edit first" : undefined}>
+      {/* aria-disabled, not disabled: a disabled button gets no hover or focus, so its tooltip
+          could not explain why. */}
+      <button
+        type="button"
+        aria-disabled={props.blocked || undefined}
+        onClick={props.blocked ? undefined : props.onEdit}
+        className={cn(
+          "text-muted flex h-6 items-center gap-1 rounded-md px-1.5 font-medium transition-colors",
+          props.blocked ? "cursor-not-allowed opacity-50" : "hover:bg-hover hover:text-foreground"
+        )}
+      >
+        <Pencil className="size-3" />
+        Edit
+      </button>
+    </TooltipIfPresent>
+  );
 }
 
 export const QueuedMessage: React.FC<QueuedMessageProps> = (props) => {
@@ -126,14 +151,7 @@ export const QueuedMessage: React.FC<QueuedMessageProps> = (props) => {
           >
             {/* An artifact send is the artifact's message, not a draft: it cannot be edited. */}
             {props.onEdit && props.message.artifactInteraction == null && (
-              <button
-                type="button"
-                onClick={props.onEdit}
-                className="text-muted hover:bg-hover hover:text-foreground flex h-6 items-center gap-1 rounded-md px-1.5 font-medium transition-colors"
-              >
-                <Pencil className="size-3" />
-                Edit
-              </button>
+              <QueuedEditButton onEdit={props.onEdit} blocked={props.editBlocked === true} />
             )}
 
             <div

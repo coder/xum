@@ -411,6 +411,25 @@ describe("getToolsForModel", () => {
     expect(subAgentTools.review_pane_get).toBeUndefined();
   });
 
+  test("withholds repository tools from scratch chats", async () => {
+    const runtime = new LocalRuntime(process.cwd());
+    const build = (scratchWorkspace: boolean) =>
+      getToolsForModel(
+        "noop:model",
+        { cwd: process.cwd(), runtime, runtimeTempDir: "/tmp", scratchWorkspace },
+        "ws-1",
+        createInitStateManager()
+      );
+    const repositoryTools = ["review_pane_update", "review_pane_get", "task_apply_git_patch"];
+
+    const project = Object.keys(await build(false));
+    const scratch = Object.keys(await build(true));
+
+    expect(repositoryTools.filter((name) => !project.includes(name))).toEqual([]);
+    expect(scratch.filter((name) => repositoryTools.includes(name))).toEqual([]);
+    expect(scratch).toContain("task");
+  });
+
   test("only includes workflow tools when the workflow service is available", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();

@@ -89,6 +89,7 @@ import * as messagePipeline from "./messagePipeline";
 import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
+import { compactToolInputSchema } from "@/node/services/toolSchemaCompactionMiddleware";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
@@ -360,6 +361,7 @@ function resolvedAgentResultFor(
       shouldDisableTaskToolsForDepth: false,
       effectiveToolPolicy: undefined,
       switchableAgents: undefined,
+      projectPluginsTrusted: false,
     },
   };
 }
@@ -5068,22 +5070,31 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         label: "root exec",
         agentId: "exec",
         overrides: {},
-        toolChars: 47_100,
-        systemChars: 7_100,
+        toolChars: 46_000,
+        systemChars: 6_500,
       },
       {
         label: "explore sub-agent",
         agentId: "explore",
         overrides: { parentWorkspaceId: "parent-workspace", agentId: "explore" },
-        toolChars: 26_800,
+        toolChars: 26_500,
         systemChars: 6_500,
       },
       {
         label: "exec sub-agent",
         agentId: "exec",
         overrides: { parentWorkspaceId: "parent-workspace", agentId: "exec" },
-        toolChars: 42_900,
-        systemChars: 8_900,
+        toolChars: 42_000,
+        systemChars: 8_300,
+      },
+      {
+        label: "root scratch",
+        agentId: "exec",
+        overrides: { kind: "scratch" as const },
+        toolChars: 43_800,
+        systemChars: 6_700,
+        // A scratch chat has no repository, and its sub-agents never return patches.
+        absentTools: ["review_pane_get", "review_pane_update", "task_apply_git_patch"],
       },
     ];
 
@@ -5100,7 +5111,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     it.each(SCENARIOS)(
       "keeps the $label tool block and system prompt within budget",
-      async ({ agentId, overrides, toolChars, systemChars }) => {
+      async ({ agentId, overrides, toolChars, systemChars, absentTools = [] }) => {
         using xumHome = new DisposableTempDir("ai-service-size-budget");
         process.env.XUM_ROOT = xumHome.path;
         process.env.HOME = xumHome.path;
@@ -5157,19 +5168,31 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         });
         expect(result.success).toBe(true);
         const request = harness.startStreamCalls.at(-1)!;
+        expect(
+          Object.keys(request.tools ?? {}).filter((name) => absentTools.includes(name))
+        ).toEqual([]);
 
-        // Wire size per tool: name, description and input schema as sent.
-        const perTool = Object.entries(request.tools ?? {})
-          .filter(([, t]) => t.providerOptions?.anthropic?.deferLoading !== true)
-          .map(([name, t]) => ({
-            name,
-            chars:
-              name.length +
-              (t.description ?? "").length +
-              JSON.stringify(t.type === "provider" ? t.args : asSchema(t.inputSchema).jsonSchema)
-                .length,
-          }))
-          .sort((a, b) => b.chars - a.chars);
+        // Wire size per tool: name, description and input schema as sent to Anthropic.
+        const perTool = (
+          await Promise.all(
+            Object.entries(request.tools ?? {})
+              .filter(([, t]) => t.providerOptions?.anthropic?.deferLoading !== true)
+              .map(async ([name, t]) => ({
+                name,
+                chars:
+                  name.length +
+                  (t.description ?? "").length +
+                  JSON.stringify(
+                    t.type === "provider"
+                      ? t.args
+                      : compactToolInputSchema(
+                          { name, inputSchema: await asSchema(t.inputSchema).jsonSchema },
+                          { anthropicWire: true }
+                        )
+                  ).length,
+              }))
+          )
+        ).sort((a, b) => b.chars - a.chars);
         const measuredToolChars = perTool.reduce((sum, t) => sum + t.chars, 0);
         const measuredSystemChars = request.messages
           .filter((message) => message.role === "system")

@@ -1,4 +1,5 @@
 import { SESSION_MEMORY_VIRTUAL_DIR } from "@/common/constants/memory";
+import { isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import type { ContextWindowIds } from "./contextWindowRollover";
 /**
  * Owns provider prompt synthesis plus the plan and system context it consumes.
@@ -602,6 +603,8 @@ export interface BuildPlanInstructionsOptions {
   requestPayloadMessages: MuxMessage[];
   /** Per-request definition reuse shared with agent resolution. */
   agentDefinitionCache?: AgentDefinitionRequestCache;
+  /** #6426: only `true` lets project plugin agents load (the previous agent's definition). */
+  projectPluginsTrusted?: boolean;
 }
 
 /** Result of plan instructions assembly. */
@@ -719,7 +722,10 @@ export async function buildPlanInstructions(
               agentDiscoveryRuntime,
               agentDiscoveryPath,
               lastAgentId,
-              { cache: opts.agentDefinitionCache }
+              {
+                cache: opts.agentDefinitionCache,
+                projectPluginsTrusted: opts.projectPluginsTrusted,
+              }
             );
             const lastChain = await resolveAgentInheritanceChain({
               runtime: agentDiscoveryRuntime,
@@ -728,6 +734,7 @@ export async function buildPlanInstructions(
               agentDefinition: lastDefinition,
               workspaceId,
               cache: opts.agentDefinitionCache,
+              projectPluginsTrusted: opts.projectPluginsTrusted,
             });
             lastAgentIsPlanLike = isPlanLikeInResolvedChain(lastChain);
           } catch (error) {
@@ -1169,9 +1176,12 @@ export async function buildStreamSystemContext(
 
   const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
 
+  // #6426: project plugin agents load only in a trusted project. From the loaded config: no read.
+  const projectPluginsTrusted = isWorkspaceProjectTrustedIn(cfg.projects, metadata);
   const agentResolveOptions = {
     skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
     cache: opts.agentDefinitionCache,
+    projectPluginsTrusted,
   };
   const skillCtx = resolveSkillStorageContext({
     runtime,
@@ -1230,6 +1240,7 @@ export async function buildStreamSystemContext(
           cfg,
           loadDesktopCapability,
           cache: opts.agentDefinitionCache,
+          projectPluginsTrusted,
         }),
     // Discover available skills for tool description context
     discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
@@ -1368,6 +1379,8 @@ export async function discoverAvailableSubagentsForToolContext(args: {
   loadDesktopCapability?: () => Promise<DesktopCapability>;
   /** Per-request definition reuse shared with agent resolution. */
   cache?: AgentDefinitionRequestCache;
+  /** #6426: only `true` lists project plugin agents (used only without explicit `roots`). */
+  projectPluginsTrusted?: boolean;
 }): Promise<Awaited<ReturnType<typeof discoverAgentDefinitions>>> {
   assert(args, "discoverAvailableSubagentsForToolContext: args is required");
   assert(args.runtime, "discoverAvailableSubagentsForToolContext: runtime is required");
@@ -1379,6 +1392,7 @@ export async function discoverAvailableSubagentsForToolContext(args: {
 
   const discovered = await discoverAgentDefinitions(args.runtime, args.workspacePath, {
     roots: args.roots,
+    projectPluginsTrusted: args.projectPluginsTrusted,
   });
 
   let desktopAvailablePromise: Promise<boolean> | undefined;
@@ -1407,6 +1421,7 @@ export async function discoverAvailableSubagentsForToolContext(args: {
             roots: args.roots,
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
             cache: args.cache,
+            projectPluginsTrusted: args.projectPluginsTrusted,
           }
         );
 

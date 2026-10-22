@@ -3064,7 +3064,7 @@ export const TOOL_DEFINITIONS = {
   task_apply_git_patch: {
     resultSchema: TaskApplyGitPatchToolResultSchema,
     description:
-      "Apply a completed child task's git-format-patch artifact to this workspace with `git am`. Patches are never applied automatically.",
+      "Apply a completed child task's git-format-patch artifact to this workspace with `git am`. Patches are never applied automatically: a fork-isolated child's commits do not change your checkout, so apply its patch before relying on its changes or starting dependent validation.",
     schema: TaskApplyGitPatchToolArgsSchema,
   },
   task_await: {
@@ -3526,7 +3526,7 @@ export function getToolSchemas(): Record<string, ToolSchema> {
  */
 export function getAvailableTools(
   modelString: string,
-  options?: {
+  options: {
     enableAgentReport?: boolean;
     /**
      * Whether the RLM family messaging tools (task_message_parent /
@@ -3553,22 +3553,25 @@ export function getAvailableTools(
      * pinning code to a pane the user never sees. Defaults to true.
      */
     enableReviewPane?: boolean;
+    /** Whether task_apply_git_patch is available (false in scratch chats). Defaults to true. */
+    enableGitPatches?: boolean;
     /** @deprecated Xum global tools are always included. */
     enableMuxGlobalAgentsTools?: boolean;
-  }
+  } = {}
 ): string[] {
   const [provider] = modelString.split(":");
-  const enableAgentReport = options?.enableAgentReport ?? true;
-  const enableFamilyMessaging = options?.enableFamilyMessaging ?? false;
-  const enableAnalyticsQuery = options?.enableAnalyticsQuery ?? true;
-  const enableIntuition = options?.enableIntuition ?? false;
-  const enableDynamicWorkflows = options?.enableDynamicWorkflows ?? false;
-  const enableMemory = options?.enableMemory ?? false;
-  const enableTimelineEvent = options?.enableTimelineEvent ?? false;
-  const enableArtifacts = options?.enableArtifacts ?? false;
-  const enableToolSearch = options?.enableToolSearch ?? false;
-  const enableMcpPromptGet = options?.enableMcpPromptGet ?? false;
-  const enableReviewPane = options?.enableReviewPane ?? true;
+  const enableAgentReport = options.enableAgentReport ?? true;
+  const enableFamilyMessaging = options.enableFamilyMessaging ?? false;
+  const enableAnalyticsQuery = options.enableAnalyticsQuery ?? true;
+  const enableIntuition = options.enableIntuition ?? false;
+  const enableDynamicWorkflows = options.enableDynamicWorkflows ?? false;
+  const enableMemory = options.enableMemory ?? false;
+  const enableTimelineEvent = options.enableTimelineEvent ?? false;
+  const enableArtifacts = options.enableArtifacts ?? false;
+  const enableToolSearch = options.enableToolSearch ?? false;
+  const enableMcpPromptGet = options.enableMcpPromptGet ?? false;
+  const enableReviewPane = options.enableReviewPane ?? true;
+  const enableGitPatches = options.enableGitPatches ?? true;
 
   // Base tools available for all models
   // Note: Tool availability is controlled by agent tool policy (allowlist), not mode checks here.
@@ -3599,7 +3602,7 @@ export function getAvailableTools(
     "file_edit_replace_string",
     // "file_edit_replace_lines", // DISABLED: causes models to break repo state
     "file_edit_insert",
-    ...(options?.enableSessionHistory ? ["session_history", "new_context"] : []),
+    ...(options.enableSessionHistory ? ["session_history", "new_context"] : []),
     ...(enableMemory ? ["memory"] : []),
     ...(enableTimelineEvent ? ["timeline_event"] : []),
     ...(enableArtifacts ? ["artifact_list", "artifact", "artifact_read"] : []),
@@ -3611,7 +3614,7 @@ export function getAvailableTools(
     "bash",
     "task",
     "task_await",
-    "task_apply_git_patch",
+    ...(enableGitPatches ? ["task_apply_git_patch"] : []),
     "task_send_message",
     "task_retitle",
     "task_stop",

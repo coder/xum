@@ -107,6 +107,8 @@ import {
 } from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware } from "@/node/services/devToolsMiddleware";
 import { createToolInputDepthGuardMiddleware } from "@/node/services/toolInputDepthGuardMiddleware";
+import { mapToolSubschemas } from "@/common/utils/tools/schemaSanitizer";
+import { createToolSchemaCompactionMiddleware } from "@/node/services/toolSchemaCompactionMiddleware";
 import {
   attachLanguageModelCleanup,
   moveLanguageModelCleanup,
@@ -676,22 +678,9 @@ function createOpenAIModelWithPreservedOptions(
 // Ollama servers before v0.6.6 (ollama/ollama#9434) parse a tool schema `type` only as a string,
 // on /api/chat and on the OpenAI-compatible /v1 (both decode the same Go structs), so one `type`
 // array fails the whole request. zod >= 4.5 emits nullable fields as `type: [X, "null"]` (MCP
-// schemas can too), so these routes send the equivalent `anyOf`. Recurse only into subschemas:
-// const, enum, default and examples hold data. Draft-07 `dependencies` is a map whose values are
-// schemas or property-name lists; a list holds only strings, which the rewrite leaves alone.
-const TOOL_SUBSCHEMA_KEY =
-  /^(items|prefixItems|additionalItems|contains|additionalProperties|propertyNames|not|if|then|else|anyOf|allOf|oneOf|unevaluatedItems|unevaluatedProperties)$/;
-const TOOL_SCHEMA_MAP_KEY =
-  /^(properties|patternProperties|\$defs|definitions|dependentSchemas|dependencies)$/;
-function toolTypeArraysToAnyOf(node: unknown, depth: "schema" | "map" = "schema"): unknown {
-  if (Array.isArray(node)) return node.map((item) => toolTypeArraysToAnyOf(item));
-  if (node === null || typeof node !== "object") return node;
-  const entries = Object.entries(node as Record<string, unknown>).map(([key, value]) => {
-    if (depth === "map" || TOOL_SUBSCHEMA_KEY.test(key)) return [key, toolTypeArraysToAnyOf(value)];
-    return [key, TOOL_SCHEMA_MAP_KEY.test(key) ? toolTypeArraysToAnyOf(value, "map") : value];
-  });
-  const out = Object.fromEntries(entries) as { type?: unknown; allOf?: unknown };
-  if (depth === "map" || !Array.isArray(out.type)) return out;
+// schemas can too), so these routes send the equivalent `anyOf`.
+function typeArrayToAnyOf(out: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(out.type)) return out;
   const { type: types, ...rest } = out as { type: unknown[]; allOf?: unknown };
   if (types.length === 1) return { ...rest, type: types[0] };
   const union = types.map((type) => ({ type }));
@@ -718,7 +707,10 @@ function withToolTypeArraysAsAnyOf(model: Parameters<typeof wrapLanguageModel>[0
           tool.type === "function"
             ? {
                 ...tool,
-                inputSchema: toolTypeArraysToAnyOf(tool.inputSchema) as typeof tool.inputSchema,
+                inputSchema: mapToolSubschemas(
+                  tool.inputSchema,
+                  typeArrayToAnyOf
+                ) as typeof tool.inputSchema,
               }
             : tool
         );
@@ -1973,7 +1965,7 @@ export class ProviderModelFactory {
       // outside so it records what the SDK actually saw.
       let model: LanguageModel = wrapLanguageModel({
         model: coreModel,
-        middleware: createToolInputDepthGuardMiddleware(),
+        middleware: [createToolSchemaCompactionMiddleware(), createToolInputDepthGuardMiddleware()],
       });
       moveLanguageModelCleanup(coreModel, model);
 

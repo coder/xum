@@ -119,6 +119,23 @@ describe("QueuedMessage banner", () => {
     expect(onEdit).toHaveBeenCalledTimes(1);
   });
 
+  // #5934: while another message is being edited, Edit would replace that edit.
+  test("a blocked Edit does nothing and says why", async () => {
+    const onEdit = mock(() => undefined);
+    const view = render(
+      <QueuedMessage message={createQueuedMessage()} onEdit={onEdit} editBlocked />
+    );
+
+    const edit = view.getByRole("button", { name: "Edit" });
+    expect(edit.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(edit);
+    expect(onEdit).not.toHaveBeenCalled();
+    fireEvent.focus(edit);
+    await waitFor(() =>
+      expect(view.getAllByText("Finish or cancel the open edit first").length).toBeGreaterThan(0)
+    );
+  });
+
   test("selecting a deferred mode calls onChangeDispatchMode", async () => {
     const onChangeDispatchMode = mock((_mode: "tool-end" | "turn-end") => Promise.resolve());
     const view = render(

@@ -171,6 +171,7 @@ import {
   focusRightSidebarToggle,
   isRightSidebarResponsivelyHidden,
 } from "./rightSidebarVisibility";
+import { useArtifactsTabKey } from "./useArtifactsTabKey";
 import { usePaletteTabFocus } from "./usePaletteTabFocus";
 import { SideChatPanel } from "./SideChatPanel";
 import { NewTabLauncher } from "./NewTabLauncher";
@@ -1876,33 +1877,19 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     };
   }, [artifactsExperimentEnabled, mcpAppsExperimentEnabled, setCollapsed, setLayout, workspaceId]);
 
-  // Global shortcut: open (and un-collapse) the Artifacts tab. Works from the chat input
-  // too, because Ctrl+Shift+K inserts nothing there. While the narrow layout hides the
-  // sidebar, WorkspaceMenuBar shows the tab in the full-screen sidebar instead; this handler then
-  // stays out, so one keystroke never acts twice.
-  React.useEffect(() => {
-    if (!artifactsExperimentEnabled) return;
-    const handler = (e: KeyboardEvent) => {
-      const container = sidebarContainerRef.current;
-      if (
-        !matchesKeybind(e, KEYBINDS.OPEN_ARTIFACTS_TAB) ||
-        (container != null && isRightSidebarResponsivelyHidden(container)) ||
-        isDialogOpen() ||
-        // Remote desktops and terminals own their keystrokes.
-        isTerminalFocused(e.target) ||
-        isDesktopViewportFocused(e.target)
-      ) {
-        return;
-      }
-      e.preventDefault();
+  useArtifactsTabKey({
+    workspaceId,
+    enabled: artifactsExperimentEnabled,
+    collapsed,
+    sidebarContainerRef,
+    getLayout: getBaseLayout,
+    openArtifactsTab: () => {
       setCollapsed(false);
       const next = selectOrAddTab(getBaseLayout(), "artifacts");
       setLayout(() => next);
       setArtifactsFocusTabsetId(next.focusedTabsetId);
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [artifactsExperimentEnabled, getBaseLayout, setCollapsed, setLayout]);
+    },
+  });
 
   // Auto-surface the Workflows tab when a run starts: the tab is the primary
   // run-detail surface (the chat card stays collapsed while it exists), but a

@@ -13,24 +13,13 @@
 // Call the script, not `make crap-check`, when the exit code matters: make
 // turns every failing recipe into exit 2.
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { rmSync } from "node:fs";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
-import {
-  applyDebt,
-  evaluate,
-  parseChangedLines,
-  type DebtUse,
-  type Finding,
-  type FunctionRow,
-} from "./policy";
+import { changesSince, git, SCORED, writeBaseTree, type ChangedFile } from "./changes";
+import { applyDebt, evaluate, type DebtUse, type Finding, type FunctionRow } from "./policy";
 
 const ADAPTER = join(import.meta.dir, "crapper_report.py");
-
-function git(root: string, args: string[]): string {
-  return execFileSync("git", args, { cwd: root, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
-}
 
 function score(
   root: string,
@@ -48,42 +37,6 @@ function score(
     maxBuffer: 256 * 1024 * 1024,
   });
   return JSON.parse(out) as FunctionRow[];
-}
-
-// Cheap pre-filter so binaries and lockfiles never reach the temp tree. The
-// adapter applies the full production-file rule (crapper_report.py).
-const SCORED = /^src\/.*\.[cm]?[jt]sx?$/;
-
-/**
- * One changed file since `base`. `basePath` is null for an added file,
- * `headPath` null for a deleted one. `-M` pairs a renamed file's two paths so
- * its functions keep their identity (the policy keys on the path).
- */
-interface ChangedFile {
-  basePath: string | null;
-  headPath: string | null;
-}
-
-function parseNameStatus(output: string): ChangedFile[] {
-  const fields = output.split("\0");
-  const files: ChangedFile[] = [];
-  let i = 0;
-  while (i < fields.length && fields[i] !== "") {
-    const status = fields[i];
-    // `-M` without `-C` reports renames (R<similarity>) but never copies.
-    if (status.startsWith("R")) {
-      files.push({ basePath: fields[i + 1], headPath: fields[i + 2] });
-      i += 3;
-    } else {
-      const path = fields[i + 1];
-      files.push({
-        basePath: status === "A" ? null : path,
-        headPath: status === "D" ? null : path,
-      });
-      i += 2;
-    }
-  }
-  return files.filter((file) => [file.basePath, file.headPath].some((p) => p && SCORED.test(p)));
 }
 
 /** `Crap-Debt: <reason>` trailers on the commits in base..HEAD. */
@@ -116,21 +69,17 @@ function scoreBase(
   files: readonly ChangedFile[],
   lcov: readonly string[]
 ): FunctionRow[] {
-  const tree = mkdtempSync(join(tmpdir(), "crap-base-"));
+  const { tree, paths } = writeBaseTree(root, base, files);
   try {
-    const paths: string[] = [];
     const renames: Array<[string, string]> = [];
     for (const { basePath, headPath } of files) {
-      if (basePath === null) continue;
-      mkdirSync(dirname(join(tree, basePath)), { recursive: true });
-      const blob = execFileSync("git", ["show", `${base}:${basePath}`], {
-        cwd: root,
-        maxBuffer: 256 * 1024 * 1024,
-      });
-      writeFileSync(join(tree, basePath), blob);
-      paths.push(basePath);
       // A rename to an unscored type (foo.ts -> foo.txt) is a removal.
-      if (headPath !== null && headPath !== basePath && SCORED.test(headPath)) {
+      if (
+        basePath !== null &&
+        headPath !== null &&
+        headPath !== basePath &&
+        SCORED.test(headPath)
+      ) {
         renames.push([basePath, headPath]);
       }
     }
@@ -186,34 +135,8 @@ function main(argv: string[]): number {
     },
   });
   if (!values.base) throw new Error("--base <ref> is required");
-  const root = git(process.cwd(), ["rev-parse", "--show-toplevel"]).trim();
-  const base = git(root, [
-    "rev-parse",
-    "--verify",
-    "--end-of-options",
-    `${values.base}^{commit}`,
-  ]).trim();
-  // The working tree is the head: unstaged edits count, untracked files do not.
-  // Pin the output format against user config (diff.mnemonicPrefix,
-  // diff.noprefix, core.quotePath) so paths match the scorer's.
-  const diffArgs = [
-    "-c",
-    "core.quotePath=false",
-    "diff",
-    "-M",
-    "--default-prefix",
-    "--no-color",
-    "--no-ext-diff",
-    base,
-  ];
-  const files = parseNameStatus(git(root, [...diffArgs, "--name-status", "-z"])).filter(
-    (file) => file.headPath === null || existsSync(join(root, file.headPath))
-  );
+  const { root, base, files, changed } = changesSince(process.cwd(), values.base);
   const headPaths = files.flatMap((file) => (file.headPath ? [file.headPath] : []));
-  const pathspec = files.flatMap((file) =>
-    [file.basePath, file.headPath].filter((p) => p !== null)
-  );
-  const changed = parseChangedLines(git(root, [...diffArgs, "-U0", "--", ...new Set(pathspec)]));
   const { findings, totalComplexity } = evaluate(
     scoreBase(root, base, files, values["base-coverage"]),
     score(root, headPaths, values.coverage),

@@ -412,6 +412,18 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   );
 };
 
+/**
+ * The queued message the card's Edit may take back into the composer. None while another message
+ * is being edited (#5934): it would replace that edit, and a Cancel then lost it. The card shows
+ * Edit as blocked then; this also covers a click that races that render, before clearQueue runs.
+ */
+function queuedMessageToEdit(
+  queued: QueuedMessageData | null | undefined,
+  editing: EditingMessageState | undefined
+): QueuedMessageData | null | undefined {
+  return editing ? null : queued;
+}
+
 export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const {
     workspaceId,
@@ -1074,7 +1086,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   );
 
   const handleEditQueuedMessage = async () => {
-    const queuedMessage = workspaceState?.queuedMessage;
+    const queuedMessage = queuedMessageToEdit(workspaceState?.queuedMessage, editingMessage);
     if (!queuedMessage) return;
 
     await restoreQueuedDraft(queuedMessage);
@@ -1992,6 +2004,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
           <QueuedMessage
             message={props.queuedMessage}
             onEdit={() => void props.onEditQueuedMessage()}
+            editBlocked={props.editingMessage !== undefined}
             onChangeDispatchMode={props.onQueuedDispatchModeChange}
             onActionError={props.onQueuedActionError}
             actionError={props.queuedActionError}
