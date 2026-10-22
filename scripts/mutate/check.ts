@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { changesSince } from "../crap/changes";
+import { uvRunArgs } from "../crap/uv";
 
 const ADAPTER = join(import.meta.dir, "mutate_report.py");
 
@@ -164,7 +165,7 @@ export function runCheck(cwd: string, baseRef: string, options: CheckOptions): M
         encoding: "utf8",
       })
     );
-    const args = ["run", "--quiet", "--script", ADAPTER, "--root", root];
+    const args = [...uvRunArgs("mutate", ADAPTER), "--root", root];
     args.push("--changes", changes, "--lane", lane, "--no-coverage-tests", blind);
     for (const report of options.coverage) args.push("--lcov", report);
     if (options.workers) args.push("--workers", options.workers);

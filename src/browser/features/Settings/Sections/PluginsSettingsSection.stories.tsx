@@ -12,6 +12,7 @@ import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stor
 import type {
   AgentPluginHooks,
   AgentPluginInstallPreview,
+  AgentPluginMarketplaceListing,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
 } from "@/common/orpc/schemas/agentPlugins";
@@ -1408,5 +1409,183 @@ export const AddPluginInstallBlockedByName: Story = {
     await userEvent.click(canvas.getByRole("radio", { name: "Skills CLI" }));
     await expect(canvas.queryByText(/Xum cannot install this/)).toBeNull();
     await expect(canvas.getByRole("button", { name: "Show command (3)" })).toBeEnabled();
+  },
+};
+
+const MARKETPLACE_SOURCE = {
+  type: "git" as const,
+  url: "https://github.com/anthropics/skills.git",
+  ref: "main",
+  refType: "branch" as const,
+};
+
+/** A Claude Code marketplace shaped like anthropics/skills, plus an npm entry Xum refuses. */
+const MARKETPLACE_LISTING: AgentPluginMarketplaceListing = {
+  name: "anthropic-agent-skills",
+  description: "Anthropic example skills",
+  owner: "Keith Lazuka",
+  source: MARKETPLACE_SOURCE,
+  lockedSha: "dbd4588c2f1e0a9b8c7d6e5f4a3b2c1d0e9f8a7b",
+  entries: [
+    {
+      name: "document-skills",
+      description: "Excel, Word, PowerPoint and PDF",
+      sourceKind: "relative",
+      source: "./",
+      skillCount: 4,
+      installable: true,
+    },
+    {
+      name: "example-skills",
+      description: "Skill creation, MCP building, design, testing",
+      sourceKind: "relative",
+      source: "./",
+      skillCount: 12,
+      installable: true,
+    },
+    {
+      name: "claude-api",
+      description: "Claude API and SDK documentation",
+      sourceKind: "relative",
+      source: "./",
+      skillCount: 1,
+      installable: true,
+    },
+    {
+      name: "npm-tools",
+      description: "Tools published to npm",
+      sourceKind: "npm",
+      source: "npm",
+      installable: false,
+      reason: "Xum does not install npm packages. Only git sources install.",
+    },
+  ],
+  methods: [{ kind: "skills" }],
+  warnings: [],
+};
+
+const entryPreview = (name: string, skills: string[]): AgentPluginInstallPreview => ({
+  ...SKILLS_PREVIEW,
+  source: MARKETPLACE_SOURCE,
+  method: { kind: "claude-marketplace", entry: name },
+  methods: [{ kind: "claude-marketplace", entry: name }],
+  skillsCliSkills: [],
+  manifest: { name, description: `${name} from the marketplace` },
+  skills: skills.map((skill) => ({ name: skill, description: `The ${skill} skill.` })),
+  targetPath: `~/.mux/plugins/${name}`,
+});
+
+/**
+ * The first entry has a long name without a break point: entry names have no length limit, and
+ * the "Preview <name>" action must still fit the card at phone width.
+ */
+// Catalog text has no length limit: long separator-free words must wrap inside the card.
+const LONG_WORD = "averylongdescriptionwordwithoutanyspacesorhyphensthatmustwrapinsidethecard";
+const LONG_NAME_LISTING: AgentPluginMarketplaceListing = {
+  ...MARKETPLACE_LISTING,
+  description: LONG_WORD,
+  entries: [
+    {
+      ...MARKETPLACE_LISTING.entries[0],
+      name: "documentskillsforexcelwordpowerpointandpdffilesandmoredocumentskills",
+      description: LONG_WORD,
+    },
+    ...MARKETPLACE_LISTING.entries.slice(1),
+  ],
+};
+
+function marketplaceOptions(listing = MARKETPLACE_LISTING): MockORPCClientOptions {
+  return {
+    agentPlugins: {
+      items: [],
+      marketplace: listing,
+      previewsByEntry: {
+        "document-skills": entryPreview("document-skills", ["docx", "pdf", "pptx", "xlsx"]),
+        "example-skills": entryPreview("example-skills", ["frontend-design", "skill-creator"]),
+      },
+      previewsByMethod: { skills: SKILLS_PREVIEW },
+    },
+  };
+}
+
+async function openMarketplace(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  await userEvent.click(await canvas.findByRole("button", { name: /Add plugin/ }));
+  await userEvent.type(await canvas.findByLabelText(/Git URL or owner\/repo/), "anthropics/skills");
+  await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
+  await canvas.findByRole("group", { name: "Pick one plugin to install" });
+  return canvas;
+}
+
+/**
+ * A marketplace repository lists its plugins. The user picks one with the keyboard, previews
+ * it, goes back to the list, and the npm entry stays disabled with its reason.
+ */
+export const AddPluginMarketplace: Story = {
+  render: () => (
+    <PluginsSectionStoryShell options={marketplaceOptions()}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openMarketplace(canvasElement);
+    await canvas.findByText("anthropic-agent-skills");
+    const documents = canvas.getByRole("radio", { name: /document-skills/ });
+    await expect(documents).toBeChecked();
+    await expect(canvas.getByRole("radio", { name: /npm-tools/ })).toBeDisabled();
+    await canvas.findByText(/does not install npm packages/);
+
+    // Keyboard: arrow keys move the pick, Enter on the button previews it.
+    documents.focus();
+    await userEvent.keyboard("{ArrowDown}");
+    const examples = canvas.getByRole("radio", { name: /example-skills/ });
+    await expect(examples).toBeChecked();
+    await userEvent.click(canvas.getByRole("button", { name: "Preview example-skills" }));
+    await canvas.findByText("example-skills from the marketplace");
+    await canvas.findByText("skill-creator");
+    // One entry is one method: no Install as choice.
+    await expect(canvas.queryByRole("group", { name: "Install as" })).toBeNull();
+
+    // Back returns to the list, not to the source field.
+    await userEvent.click(canvas.getByRole("button", { name: /Back/ }));
+    await canvas.findByRole("group", { name: "Pick one plugin to install" });
+    await userEvent.click(canvas.getByRole("radio", { name: /document-skills/ }));
+    await userEvent.click(canvas.getByRole("button", { name: "Preview document-skills" }));
+    await canvas.findByText("pdf");
+    await userEvent.click(canvas.getByRole("button", { name: /Back/ }));
+    await userEvent.click(
+      await canvas.findByRole("button", { name: "Install the repository as Skills" })
+    );
+    await canvas.findByText("Skills from github.com/acme/review-kit");
+  },
+};
+
+/** The marketplace list at phone width: rows wrap and nothing overflows the card. */
+export const AddPluginMarketplacePhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <PluginsSectionStoryShell options={marketplaceOptions(LONG_NAME_LISTING)}>
+      {/* Fixed phone width: the CI test-runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = await openMarketplace(canvasElement);
+    const group = canvas.getByRole("group", { name: "Pick one plugin to install" });
+    const card = group.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) throw new Error("Add panel card not found");
+    if (card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("The marketplace list overflows the card at phone width");
+    }
   },
 };

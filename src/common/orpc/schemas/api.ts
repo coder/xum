@@ -214,7 +214,7 @@ import {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
   AgentPluginInstallMethodSchema,
-  AgentPluginInstallPreviewSchema,
+  AgentPluginSourcePreviewSchema,
   AgentPluginComponentsSchema,
   AgentPluginComponentRefSchema,
   AgentPluginHooksSchema,
@@ -1299,7 +1299,8 @@ export const agentPlugins = {
       /** Absent: the first method that fits (see AgentPluginInstallMethodSchema). */
       method: AgentPluginInstallMethodSchema.nullish(),
     }),
-    output: ResultSchema(AgentPluginInstallPreviewSchema, z.string()),
+    /** A plugin preview, or the entries of a Claude Code marketplace repository. */
+    output: ResultSchema(AgentPluginSourcePreviewSchema, z.string()),
   },
   /**
    * The pinned skills CLI command for the "Skills CLI" method, for the user to run in a terminal
