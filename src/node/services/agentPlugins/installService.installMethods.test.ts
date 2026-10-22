@@ -152,6 +152,17 @@ describe("AgentPluginInstallService install methods", () => {
     expect((await service.preview({ input: remoteDir })).skillsCliSkills).toEqual([]);
   });
 
+  test("two skill folders with one SKILL.md name are both left out of the Skills CLI choice", async () => {
+    // --skill alpha would install both copies under one name: a later one could replace alpha.
+    await write({ ".agents/skills/alpha-copy/SKILL.md": skillMd("alpha") });
+    await commit("second alpha");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.skillsCliSkills).toEqual(["beta"]);
+    expect(preview.warnings).toContain(
+      "Skills CLI: more than one skill folder has the SKILL.md name 'alpha', so the Skills CLI choice leaves it out"
+    );
+  });
+
   test("install refuses a method that does not fit its clone", async () => {
     const preview = await service.preview({ input: remoteDir });
     await expect(

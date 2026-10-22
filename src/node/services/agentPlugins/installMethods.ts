@@ -420,12 +420,14 @@ export function generatedPluginName(source: Pick<AgentPluginGitSource, "url" | "
  * Skill names for the skills CLI's `--skill` (valid skill names only, no repeats). The CLI names
  * a skill by its SKILL.md frontmatter `name` (skills@1.7.4 parseSkillMd, filterSkills), so these
  * are the frontmatter names, also for a root SKILL.md (not the repository name). A name that is
- * not a valid skill name cannot be passed safely, so that skill is not offered.
+ * not a valid skill name cannot be passed safely, so that skill is not offered. Two folders with
+ * the same name are both left out, with a warning: `--skill` would install every copy under that
+ * one name, so a later copy could replace the reviewed one.
  */
 export async function skillsCliSkillNames(
   stagedDir: string,
   roots: SkillsPackageRoot[]
-): Promise<string[]> {
+): Promise<{ names: string[]; warnings: string[] }> {
   const rootReal = await fsPromises.realpath(stagedDir);
   const names: string[] = [];
   for (const root of roots) {
@@ -441,7 +443,15 @@ export async function skillsCliSkillNames(
       if (name !== undefined) names.push(name);
     }
   }
-  return [...new Set(names)].filter((name) => SkillNameSchema.safeParse(name).success);
+  const valid = names.filter((name) => SkillNameSchema.safeParse(name).success);
+  const shared = new Set(valid.filter((name, index) => valid.indexOf(name) !== index));
+  return {
+    names: valid.filter((name) => !shared.has(name)),
+    warnings: [...shared].map(
+      (name) =>
+        `Skills CLI: more than one skill folder has the SKILL.md name '${name}', so the Skills CLI choice leaves it out`
+    ),
+  };
 }
 
 /** A Claude marketplace entry being previewed, installed or updated (claudeMarketplace.ts). */
@@ -568,11 +578,12 @@ export async function chooseStagedMethod(
     );
   }
   if (method === undefined) throw new Error(noInstallMethodMessage(source.subpath));
+  const cli = await skillsCliSkillNames(stagedDir, detected.skillsRoots);
   return {
     method,
     methods: detected.methods,
-    warnings: [],
-    skillsCliSkills: await skillsCliSkillNames(stagedDir, detected.skillsRoots),
+    warnings: cli.warnings,
+    skillsCliSkills: cli.names,
   };
 }
 
