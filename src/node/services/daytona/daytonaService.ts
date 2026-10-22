@@ -419,7 +419,11 @@ export class DaytonaService {
    */
   private readonly provenOwned = new Map<string, number>();
   private readonly ownershipRequests = new Map<string, Promise<"owned" | "notOwned" | "missing">>();
-  /** Why the setup of a sandbox Xum created (and then deleted) failed, for later turns. */
+  /**
+   * Why a workspace's setup of the sandbox Xum created for it failed, for its later turns. Per
+   * workspace, not per sandbox: a sandbox the failed setup could not delete may be attached by
+   * another workspace, whose own setup decides whether it works.
+   */
   private readonly setupFailures = new Map<string, string>();
   private readonly listWorkspaces?: () => DaytonaWorkspaceRef[];
   readonly getArchiveBehavior: () => CoderWorkspaceArchiveBehavior;
@@ -881,12 +885,17 @@ export class DaytonaService {
     if (ref?.pendingRemovalId) this.removedWorkspaces.set(workspaceId, ref.pendingRemovalId);
   }
 
-  recordSetupFailure(sandboxId: string, reason: string): void {
-    this.setupFailures.set(sandboxId, reason);
+  recordSetupFailure(workspaceId: string, reason: string): void {
+    this.setupFailures.set(workspaceId, reason);
   }
 
-  getSetupFailure(sandboxId: string): string | undefined {
-    return this.setupFailures.get(sandboxId);
+  getSetupFailure(workspaceId: string): string | undefined {
+    return this.setupFailures.get(workspaceId);
+  }
+
+  /** The workspace was removed: its id never comes back. */
+  clearSetupFailure(workspaceId: string): void {
+    this.setupFailures.delete(workspaceId);
   }
 
   async checkAvailability(): Promise<DaytonaAvailability> {

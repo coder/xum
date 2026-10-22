@@ -743,6 +743,53 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     }
   });
 
+  it("reports a failed setup only to its own workspace, not to one that attached the sandbox", async () => {
+    const sshDelete = spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
+      success: true,
+      deletedPath: "/path",
+    });
+    try {
+      const dedicated = { sandboxId: "xum-left", shared: false, ...SMALL };
+      rig.writer.writeError = new Error("No space left on device");
+      rig.plane.failingRoutes.add("DELETE /sandbox/xum-left");
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      await expect(makeRuntime(dedicated).postCreateSetup(initParams())).rejects.toThrow(
+        "setup failed"
+      );
+      expect(rig.plane.find("xum-left")).toBeDefined();
+      rig.plane.failingRoutes.clear();
+      rig.writer.writeError = undefined;
+
+      // The surviving sandbox is picked in the Existing picker for a new workspace.
+      const attached = { sandboxId: "xum-left", shared: true };
+      const attach = () => makeRuntime(attached, rig, { workspaceId: "ws-2" });
+      await attach().postCreateSetup(initParams());
+      expect(await attach().ensureReady()).toEqual({ ready: true });
+
+      const failed = await makeRuntime(dedicated).ensureReady();
+      expect(failed.ready).toBe(false);
+      if (!failed.ready) expect(failed.error).toContain("No space left on device");
+
+      // Removing the failed workspace forgets its failure.
+      rig.workspaces.splice(
+        0,
+        rig.workspaces.length,
+        { workspaceId: "ws-1", runtimeConfig: sshDaytonaConfig(dedicated) },
+        { workspaceId: "ws-2", runtimeConfig: sshDaytonaConfig(attached) }
+      );
+      claimRemovals();
+      const removal = await makeRuntime(dedicated).deleteWorkspace(
+        "/home/me/project",
+        "feature",
+        true
+      );
+      expect(removal.success).toBe(true);
+      expect(rig.service.getSetupFailure("ws-1")).toBeUndefined();
+    } finally {
+      sshDelete.mockRestore();
+    }
+  });
+
   it("refuses a settings change while it creates a sandbox, and takes one afterwards", async () => {
     const newAccount = rig.addAccount("new-key");
     // The user saves another account's key while the create request is in flight.

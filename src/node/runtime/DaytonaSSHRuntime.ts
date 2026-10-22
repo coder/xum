@@ -107,6 +107,7 @@ export type DaytonaRuntimeService = Pick<
   | "disownSandbox"
   | "recordSetupFailure"
   | "getSetupFailure"
+  | "clearSetupFailure"
 >;
 
 export interface DaytonaSSHRuntimeConfig extends SSHRuntimeConfig {
@@ -421,7 +422,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       // Before the ready cache too: another workspace (one that attached the sandbox) may have
       // made it ready.
       const refusal =
-        this.setupFailureResult(sandboxId) ??
+        this.setupFailureResult() ??
         (await this.refuseUnownedSandbox(sandboxId, emitStatus, options?.signal));
       if (refusal) return refusal;
       if (this.daytonaService.isSandboxReady(sandboxId)) {
@@ -444,8 +445,13 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     return result;
   }
 
-  private setupFailureResult(sandboxId: string): EnsureReadyResult | undefined {
-    const setupFailure = this.daytonaService.getSetupFailure(sandboxId);
+  private recordSetupFailure(reason: string): void {
+    if (this.workspaceId) this.daytonaService.recordSetupFailure(this.workspaceId, reason);
+  }
+
+  private setupFailureResult(): EnsureReadyResult | undefined {
+    if (!this.workspaceId) return undefined;
+    const setupFailure = this.daytonaService.getSetupFailure(this.workspaceId);
     if (!setupFailure) return undefined;
     return {
       ready: false,
@@ -976,11 +982,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         : redactDaytonaTokens(getErrorMessage(error));
       log.error("Daytona sandbox setup failed", { sandboxId, error: errorMsg });
       params.initLogger.logStderr(`Daytona sandbox setup failed: ${errorMsg}`);
-      if (creates) {
-        // Later turns report this reason instead of "deleted outside Xum", and never use a
-        // sandbox of that name that Xum did not create.
-        this.daytonaService.recordSetupFailure(sandboxId, errorMsg);
-      }
+      // This workspace's later turns report this reason instead of "deleted outside Xum", and
+      // never use a sandbox of that name that Xum did not create.
+      if (creates) this.recordSetupFailure(errorMsg);
       if (create.outcome !== "none") {
         await this.deleteCreatedSandbox(sandboxId, create, params.initLogger);
       }
@@ -1191,16 +1195,20 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     trusted?: boolean,
     options?: { keepBranch?: boolean }
   ): Promise<DeleteResult> {
-    return this.daytonaService.withAccountLease(() =>
-      this.deleteWorkspaceAndSandbox(
+    return this.daytonaService.withAccountLease(async () => {
+      const result = await this.deleteWorkspaceAndSandbox(
         projectPath,
         workspaceName,
         force,
         abortSignal,
         trusted,
         options
-      )
-    );
+      );
+      if (result.success && this.workspaceId) {
+        this.daytonaService.clearSetupFailure(this.workspaceId);
+      }
+      return result;
+    });
   }
 
   private async deleteWorkspaceAndSandbox(
