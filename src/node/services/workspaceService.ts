@@ -358,6 +358,7 @@ import {
   getSrcBaseDir,
   isSSHRuntime,
   isDedicatedDaytonaSandbox,
+  getDaytonaSandboxId,
   isDockerRuntime,
   isDevcontainerRuntime,
 } from "@/common/types/runtime";
@@ -1150,6 +1151,25 @@ const ARCHIVE_OWN_ACTIVITY_POLICY = {
   ignoreKinds: new Set<WorkspaceUseKind>(["turn", "terminal", "editor", "mcp", "exec"]),
   backgroundProcesses: "allow",
 } as const;
+
+/**
+ * An isolation: "none" task borrows another workspace's checkout, so its removal leaves the
+ * runtime alone. Except the last workspace on a Daytona sandbox: its owner was removed while
+ * this task borrowed the checkout, so that removal skipped the sandbox, and nothing else would
+ * ever delete it. This removal then runs the runtime deletion the owner's would have run (on
+ * the persisted path, the owner's checkout), deleting or releasing the sandbox.
+ */
+function borrowsLiveCheckout(config: ProjectsConfig, workspaceId: string): boolean {
+  const entry = findWorkspaceEntry(config, workspaceId);
+  if (entry?.workspace.taskIsolation !== "none") return false;
+  const sandboxId = getDaytonaSandboxId(entry.workspace.runtimeConfig);
+  if (sandboxId === undefined) return true;
+  return Array.from(config.projects.values()).some((project) =>
+    project.workspaces.some(
+      (ws) => ws.id !== workspaceId && getDaytonaSandboxId(ws.runtimeConfig) === sandboxId
+    )
+  );
+}
 
 /** What archive refusals call the dedicated remote box, so Daytona users are not told "Coder". */
 function dedicatedRemoteBoxLabel(metadata: WorkspaceMetadata | undefined): string {
@@ -8289,8 +8309,8 @@ export class WorkspaceService
         // parent's working tree, so skip runtime deletion and only remove config/session state.
         // Runtime deletion is keyed on the task's unique name today (a safe no-op), but guard
         // explicitly so this stays correct if runtime deletion ever resolves the persisted path.
-        const taskSharesParentCheckout =
-          findWorkspaceEntry(configSnapshot, workspaceId)?.workspace.taskIsolation === "none";
+        // borrowsLiveCheckout makes one exception, for a Daytona sandbox with no owner left.
+        const taskSharesParentCheckout = borrowsLiveCheckout(configSnapshot, workspaceId);
 
         // Inverse direction: this workspace's checkout may be shared by live isolation: "none"
         // descendants (their persisted path points at it). Deleting it would yank the cwd out
