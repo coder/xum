@@ -32,6 +32,13 @@ const pkg = (
   optionalDependencies,
 });
 
+interface FailureCase {
+  problem: string;
+  lock: string;
+  manifests: Record<string, RegistryVersion>;
+  error: string;
+}
+
 describe("buildShrinkwrap", () => {
   test("publishes the production tree at bun.lock's paths", async () => {
     const lock = bunLock({
@@ -102,7 +109,7 @@ describe("buildShrinkwrap", () => {
     expect(shrinkwrap.packages["node_modules/peer"].optional).toBeUndefined();
   });
 
-  test.each([
+  test.each<FailureCase>([
     {
       problem: "a dependency bun.lock does not have",
       lock: bunLock({ a: "a@1.0.0" }),

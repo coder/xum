@@ -7,7 +7,9 @@
 
 # Centralized patterns - single source of truth
 PRETTIER_PATTERNS := 'src/**/*.{ts,tsx,json}' 'src/node/workflowRuntime/*.js' 'scripts/lib/*.js' 'tests/**/*.ts' 'docs/**/*.mdx' 'package.json' 'tsconfig*.json' 'README.md'
-SHELL_SCRIPTS := scripts
+# shfmt also walks node_modules trees (scripts/mintlify/node_modules holds Mintlify's own
+# scripts), so the recipes format only the shell files it finds outside them.
+SHELL_SCRIPTS = $$(shfmt -f scripts | grep -v '/node_modules/')
 PYTHON_DIRS := benchmarks
 
 # Always use bun x prettier for reproducibility (uses package.json version)

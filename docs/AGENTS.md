@@ -58,6 +58,13 @@ description: Agent instructions for AI assistants working on the Xum codebase
 - `./scripts/wait_pr_checks.sh <pr_number>` is the checks watcher; `wait_pr_ready.sh` must execute `wait_pr_checks.sh --once` on each loop iteration.
 - `./scripts/wait_pr_codex.sh <pr_number>` is the Codex gate used by `wait_pr_ready.sh`.
 
+## Dependencies & Supply Chain
+
+- Every dependency comes from a lock: JS from `bun.lock` (the published package ships an `npm-shrinkwrap.json` generated from it), Python tools from the `pyproject.toml` dependency groups and `uv.lock`, Mintlify from `scripts/mintlify/bun.lock`, downloaded binaries by sha256, and GitHub Actions by commit SHA (`make pin-actions`).
+- Never add an unlocked install: `curl | sh`, `pip install`, `uvx`, `uv run --with`, `npx`/`bunx` of a package that no lockfile pins, `npm install -g`, or `bun install` without `--frozen-lockfile` in CI. Add the tool to a lockfile instead, and run Python tools with `uv run --locked --only-group <group>`.
+- New releases wait 7 days (`minimumReleaseAge` in each `bunfig.toml`, `exclude-newer` in `pyproject.toml`). bun still installs an exact pin of a newer release, so add one only for a security fix.
+- Pin a downloaded binary by the sha256 of your own download, and check it against the digest GitHub computed at upload (`gh api repos/<owner>/<repo>/releases/tags/<tag> --jq '.assets[] | .name + " " + .digest'`).
+
 ## Browser Automation
 
 Use `agent-browser` for web automation. Run `agent-browser --help` for all commands.

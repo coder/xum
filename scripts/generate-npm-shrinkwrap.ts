@@ -114,19 +114,18 @@ export function parseBunLock(text: string): Map<string, LockedPackage> {
     // A default-registry release is [spec, "", meta, digest]. Other kinds (git, tarball URL,
     // workspace, another registry, a dependency bundled in its parent's tarball) stay unreadable
     // here, and only fail generation if the published tree needs them.
-    const release =
+    let locked: LockedPackage = { name: "", version: "", integrity: "" };
+    if (
       entry.length === 4 &&
       registry === "" &&
       typeof spec === "string" &&
       typeof integrity === "string" &&
-      (meta as { bundled?: boolean } | null)?.bundled !== true;
-    const at = release ? spec.lastIndexOf("@") : -1;
-    packages.set(
-      key,
-      at > 0
-        ? { name: spec.slice(0, at), version: spec.slice(at + 1), integrity }
-        : { name: "", version: "", integrity: "" }
-    );
+      (meta as { bundled?: boolean } | null)?.bundled !== true
+    ) {
+      const at = spec.lastIndexOf("@");
+      if (at > 0) locked = { name: spec.slice(0, at), version: spec.slice(at + 1), integrity };
+    }
+    packages.set(key, locked);
   }
   return packages;
 }
