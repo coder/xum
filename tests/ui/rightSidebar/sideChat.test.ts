@@ -19,7 +19,7 @@ import { workspaceStore, useWorkspaceStoreRaw } from "@/browser/stores/Workspace
 import { SIDE_CHAT_PANE_ATTR } from "@/browser/utils/ui/keybinds";
 import { collectAllTabsWithTabset, dockTabToEdge } from "@/browser/utils/rightSidebarLayout";
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
-import { makeSideChatTabType } from "@/browser/types/rightSidebar";
+import { makeSideChatTabType, NEW_TAB } from "@/browser/types/rightSidebar";
 
 import { getRightSidebarCollapsedKey, getRightSidebarLayoutKey } from "@/common/constants/storage";
 import { updatePersistedState, readPersistedState } from "@/browser/hooks/usePersistedState";
@@ -120,6 +120,55 @@ async function waitForSideChatId(app: AppHarness): Promise<string> {
     },
     { timeout: SIDE_CHAT_CREATION_TIMEOUT_MS }
   );
+}
+
+/** The tabs of the sidebar layout saved for the main chat. */
+function getSavedSidebarTabs(app: AppHarness): string[] {
+  const layout = readPersistedState<RightSidebarLayoutState | null>(
+    getRightSidebarLayoutKey(app.workspaceId),
+    null
+  );
+  return layout == null ? [] : collectAllTabs(layout.root);
+}
+
+/** Open two side chats from the main chat. Their tabs are then the sidebar's only tabs. */
+async function openTwoSideChats(app: AppHarness): Promise<[string, string]> {
+  await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
+  const first = await waitForSideChatId(app);
+  // A pane mounts once the app has its chat's metadata. Until then a close is ignored, and a
+  // metadata update cannot drop the chat.
+  await waitFor(() => expect(getSidePane(app, first)).not.toBeNull(), { timeout: 10_000 });
+  await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
+  const second = await waitFor(
+    async () => {
+      const others = (await app.env.orpc.workspace.list()).filter(
+        (ws) => ws.sideChatParentWorkspaceId === app.workspaceId && ws.id !== first
+      );
+      expect(others).toHaveLength(1);
+      return others[0].id;
+    },
+    { timeout: SIDE_CHAT_CREATION_TIMEOUT_MS }
+  );
+  await waitFor(
+    () => {
+      expect(getSidePane(app, second)).not.toBeNull();
+      expect(getSavedSidebarTabs(app).toSorted()).toEqual(
+        [first, second].map((id) => makeSideChatTabType(id)).toSorted()
+      );
+      getSideChatCloseButton(app, first);
+      getSideChatCloseButton(app, second);
+    },
+    { timeout: 10_000 }
+  );
+  return [first, second];
+}
+
+function getSideChatCloseButton(app: AppHarness, workspaceId: string): HTMLButtonElement {
+  const button = app.view.container.querySelector<HTMLButtonElement>(
+    `[role="tab"][id$="-tab-side:${workspaceId}"] button[aria-label="Close side chat"]`
+  );
+  if (button == null) throw new Error(`Side chat ${workspaceId} has no close button`);
+  return button;
 }
 
 function isStreaming(workspaceId: string): boolean {
@@ -653,6 +702,68 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       });
       expect(await app.env.orpc.workspace.getInfo({ workspaceId: id })).toBeNull();
     } finally {
+      remove.mockRestore();
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("side chats whose discards finish together still close the sidebar", async () => {
+    const app = await createAppHarness({ branchPrefix: "side-close-together" });
+    const remove = jest.spyOn(app.env.services.toORPCContext().workspaceService, "remove");
+    try {
+      const ids = await openTwoSideChats(app);
+      // Both discards resolve in one batch, so the second tab's close runs before React commits
+      // the first one's. The chats stay in the backend: only the sidebar is under test.
+      let finish: () => void = () => undefined;
+      const finished = new Promise<void>((resolve) => (finish = resolve));
+      remove.mockImplementation(() =>
+        finished.then(() => ({ success: true as const, data: undefined }))
+      );
+      for (const id of ids) fireEvent.click(getSideChatCloseButton(app, id));
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(2));
+      await act(async () => finish());
+
+      // Both tabs go, and the sidebar closes with them. The next expand shows the New tab.
+      await waitFor(() => expect(getSavedSidebarTabs(app)).toEqual([NEW_TAB]), { timeout: 10_000 });
+      expect(readPersistedState(getRightSidebarCollapsedKey(app.workspaceId), false)).toBe(true);
+    } finally {
+      remove.mockRestore();
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("one metadata update that drops a closing side chat and the other still closes the sidebar", async () => {
+    const app = await createAppHarness({ branchPrefix: "side-close-one-update" });
+    const service = app.env.services.toORPCContext().workspaceService;
+    const remove = jest.spyOn(service, "remove");
+    // A new chat's init end refreshes its metadata. A refresh that landed with the drop below
+    // would bring its chat back, so the test waits for both chats' refreshes first.
+    const refresh = jest.spyOn(service, "refreshAndEmitMetadata");
+    try {
+      const [closing, other] = await openTwoSideChats(app);
+      await waitFor(() =>
+        expect(refresh.mock.calls.map(([id]) => id)).toEqual(
+          expect.arrayContaining([closing, other])
+        )
+      );
+      await Promise.all(
+        refresh.mock.results.flatMap((result) => (result.type === "return" ? [result.value] : []))
+      );
+      // The close waits on its discard while one update (a reconnect's snapshot, say) drops both
+      // chats. The chats stay in the backend: only the sidebar is under test.
+      remove.mockImplementation(() => new Promise<never>(() => undefined));
+      fireEvent.click(getSideChatCloseButton(app, closing));
+      await waitFor(() => expect(remove).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        for (const workspaceId of [closing, other]) {
+          service.emit("metadata", { workspaceId, metadata: null });
+        }
+      });
+
+      await waitFor(() => expect(getSavedSidebarTabs(app)).toEqual([NEW_TAB]), { timeout: 10_000 });
+      expect(readPersistedState(getRightSidebarCollapsedKey(app.workspaceId), false)).toBe(true);
+    } finally {
+      refresh.mockRestore();
       remove.mockRestore();
       await app.dispose();
     }

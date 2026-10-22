@@ -555,10 +555,11 @@ function getOnlyTab(node: RightSidebarLayoutNode): TabType | null {
  * User request: closing the last tab closes the sidebar instead of showing the New tab in its
  * place; the layout still falls back to the New tab, for the next expand. The returned function
  * acts only when `tab` is the only tab on screen (`layout` is the rendered layout, which can hide
- * stored tabs), and returns whether it did, so the caller skips its own focus move. The phone
- * full-screen view closes instead of collapsing: a collapse there left a blank view (bug bash
- * RS2). It sits in a ref: a side chat closes once its removal resolves, and the check must see the
- * sidebar as it is then.
+ * stored tabs) once the tabs that go with it are gone: `alsoRemoved`, and the tabs closed since
+ * the last commit, which `layout` still shows (two side chats can close in one batch). It returns
+ * whether it acted, so the caller skips its own focus move. The phone full-screen view closes
+ * instead of collapsing: a collapse there left a blank view (bug bash RS2). It sits in a ref: a
+ * side chat closes once its removal resolves, and the check must see the sidebar as it is then.
  */
 function useLastTabClosesSidebar(options: {
   layout: RightSidebarLayoutState;
@@ -567,11 +568,15 @@ function useLastTabClosesSidebar(options: {
   fullscreen: boolean;
   onCloseFullscreen: (() => void) | undefined;
   containerRef: React.RefObject<HTMLDivElement>;
-}): React.MutableRefObject<(tab: TabType) => boolean> {
+}): React.MutableRefObject<(tab: TabType, alsoRemoved?: readonly TabType[]) => boolean> {
   // The shell whose toggle takes focus once the collapse commits (see below).
   const deferredToggleFocusRef = React.useRef<Element | null>(null);
-  const closeSidebarIfLastTab = (tab: TabType): boolean => {
-    if (options.collapsed || getOnlyTab(options.layout.root) !== tab) return false;
+  const closedSinceCommitRef = React.useRef<TabType[]>([]);
+  const closeSidebarIfLastTab = (tab: TabType, alsoRemoved: readonly TabType[] = []): boolean => {
+    const others = [...closedSinceCommitRef.current, ...alsoRemoved].filter((t) => t !== tab);
+    closedSinceCommitRef.current.push(tab, ...alsoRemoved);
+    const left = others.reduce((acc, t) => removeTabEverywhere(acc, t), options.layout);
+    if (options.collapsed || getOnlyTab(left.root) !== tab) return false;
     if (options.fullscreen) {
       options.onCloseFullscreen?.();
       return true;
@@ -591,6 +596,7 @@ function useLastTabClosesSidebar(options: {
   const ref = React.useRef(closeSidebarIfLastTab);
   React.useLayoutEffect(() => {
     ref.current = closeSidebarIfLastTab;
+    closedSinceCommitRef.current = [];
   });
   // A passive effect, so it runs after the closed view's effect cleanup has un-pinned it.
   React.useEffect(() => {
@@ -2242,9 +2248,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         : !pending.has(id);
     });
     if (staleTabs.length === 0) return;
-    staleTabs
-      .filter((tab) => closingSideChatTabsRef.current.has(tab))
-      .forEach((tab) => closeSidebarIfLastTabRef.current(tab));
+    // One metadata update can drop several side chats: decide on the layout without all of them.
+    const closing = staleTabs.find((tab) => closingSideChatTabsRef.current.has(tab));
+    if (closing != null) closeSidebarIfLastTabRef.current(closing, staleTabs);
     setLayout((prev) => staleTabs.reduce((acc, tab) => removeTabEverywhere(acc, tab), prev));
   }, [
     allWorkspaceMetadata,
