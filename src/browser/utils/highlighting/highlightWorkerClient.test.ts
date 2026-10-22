@@ -230,8 +230,7 @@ describe("highlightCode caller cancellation", () => {
     const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       const controller = new AbortController();
-      // ini has no Highlights lexer, so this goes through Shiki's initialization.
-      const aborted = highlightCode("a = 1", "ini", "dark", controller.signal);
+      const aborted = highlightCode("const a = 1;", "typescript", "dark", controller.signal);
       // Shiki loads its regex engine asynchronously, so a few microtasks cannot finish it.
       await flushQueue();
       controller.abort();
@@ -240,7 +239,7 @@ describe("highlightCode caller cancellation", () => {
       await expect(aborted).rejects.toMatchObject({ name: "AbortError" });
 
       // The next request still runs after the aborted one.
-      await expect(highlightCode("b = 2", "ini", "dark")).resolves.toContain("<pre");
+      await expect(highlightCode("const b = 2;", "typescript", "dark")).resolves.toContain("<pre");
       const failureWarnings = warnSpy.mock.calls.filter((args) =>
         String(args[0]).includes("failed")
       );

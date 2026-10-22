@@ -282,14 +282,11 @@ async function highlightMainThread(
     );
   }
 
-  const shikiLang = mapToShikiLang(language);
-  // Same reason as getShikiHighlighter's import("shiki"): keep the engine (and its inlined
-  // ~183 KB Wasm module) out of the main bundle unless the worker is unavailable.
-  const engine = await import("./highlightsEngine");
-  signal?.throwIfAborted();
-  if (engine.canHighlight(shikiLang)) return engine.highlightToShikiHtml(code, shikiLang, theme);
-
+  // The worker uses @pierre/highlights first (highlightsEngine.ts); this fallback stays on Shiki.
+  // A static import of the engine would put its ~183 KB Wasm module into the main bundle and
+  // compile it at startup for every user, and a function-level import() is against repo rules.
   const highlighter = await getShikiHighlighter();
+  const shikiLang = mapToShikiLang(language);
 
   // Load language on-demand
   const loadedLangs = highlighter.getLoadedLanguages();
