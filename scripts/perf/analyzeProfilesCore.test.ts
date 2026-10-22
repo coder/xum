@@ -655,6 +655,35 @@ test("CLI maps scrubbed file://~ script URLs from a report bundle against the ho
   }
 });
 
+test("CLI maps <xum> script paths from a report bundle against --app-root only", () => {
+  const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
+  try {
+    const root = join(dir, "app");
+    mkdirSync(join(root, "dist", "node"), { recursive: true });
+    writeFileSync(join(root, "dist", "node", "main.js"), "function a(){}\n");
+    writeFileSync(join(root, "dist", "node", "main.js.map"), mapTo("orig.ts"));
+    writeFileSync(join(dir, "outside.js"), "function a(){}\n");
+    writeFileSync(join(dir, "outside.js.map"), mapTo("outside.ts"));
+    const run = (url: string, args: string[]) => {
+      const profile = join(dir, "p.cpuprofile");
+      writeFileSync(profile, JSON.stringify(oneFrame(url)));
+      const proc = runCli(["--format", "json", ...args, profile]);
+      expect(proc.exitCode).toBe(0);
+      return locations(proc.stdout);
+    };
+    for (const url of ["file://<xum>/dist/node/main.js", "<xum>/dist/node/main.js"]) {
+      expect(run(url, ["--app-root", root])).toEqual(["orig.ts"]);
+      expect(run(url, [])).toEqual([url]);
+    }
+    // Profiles are input data: a path must not climb out of --app-root.
+    for (const url of ["<xum>/../outside.js", "<xum>/%2e%2e%2foutside.js"]) {
+      expect(run(url, ["--app-root", root])).toEqual([url]);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("CLI never looks up --map-dir maps outside the directory", () => {
   const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
   try {

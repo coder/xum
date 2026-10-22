@@ -90,6 +90,8 @@ Options:
   --map-dir <dir>      Directory with source maps named <script basename>.map, for example a local
                        build of the same commit (repeatable). Local scripts are also mapped through
                        their sourceMappingURL comment or a sibling .map file.
+  --app-root <dir>     Checkout or install that a report bundle's <xum>/... script paths name, for
+                       example a local build of the same commit.
   --help               Show this help.
 
 Exit status: 0 on success, 1 when no valid profile was read on a required side, 2 on usage errors.`;
@@ -225,9 +227,20 @@ function isNetworkPath(path: string): boolean {
   return /^[\\/]{2}/.test(path);
 }
 
+/** --app-root: the checkout or install that a bundle's `<xum>/...` script paths name. */
+let appRoot: string | undefined;
+
 /** Local file path of a script URL; undefined for remote, network or unparseable locations. */
 function scriptPath(url: string): string | undefined {
   let path: string | undefined;
+  // A newer bundle writes Xum's own files as `<xum>/<path in the app>` (#7125). A malformed
+  // escape throws; the resolver reports it as a warning.
+  const app = /^(?:file:\/\/)?<xum>\//.exec(url);
+  if (app !== null) {
+    const parts = url.slice(app[0].length).split("/").map(decodeURIComponent);
+    const unsafe = parts.some((part) => part === ".." || /[\\/]/.test(part));
+    return appRoot === undefined || unsafe ? undefined : join(appRoot, ...parts);
+  }
   // A "Report slowness" bundle writes the home folder as "~" (`file://~/...`, or `file:///~/...`
   // for a Windows home), which URL parsing would read as host "~". Resolve it against this
   // machine's home, so the profile maps on the machine that recorded it (#5561).
@@ -478,6 +491,7 @@ function main(): number {
       "min-change": { type: "string" },
       "map-dir": { type: "string", multiple: true },
       "baseline-map-dir": { type: "string", multiple: true },
+      "app-root": { type: "string" },
       help: { type: "boolean" },
     },
   });
@@ -511,6 +525,7 @@ function main(): number {
         throw new UsageError(`${flag} is not a directory: ${dir}`);
     }
   }
+  appRoot = values["app-root"];
   const options: ReportOptions = {
     top: parsePositiveNumber(values.top, "--top", 25, true),
     sort,
