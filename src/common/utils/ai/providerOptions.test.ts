@@ -4151,10 +4151,9 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
     });
   });
 
-  // #5839: the selected level must reach Bedrock with the same per-model shape as
-  // the direct Anthropic route. Adaptive models get adaptive thinking plus effort
-  // (native-xhigh models also ask for summarized thinking); older models get a
-  // thinking budget and no effort.
+  // #5839: the selected level must reach Bedrock adaptive models with the same
+  // per-model shape as the direct Anthropic route: adaptive thinking plus effort
+  // (native-xhigh models also ask for summarized thinking).
   test.each([
     [
       "anthropic:claude-sonnet-5-5",
@@ -4200,22 +4199,6 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
       "off",
       { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "low" } },
     ],
-    [
-      "bedrock:anthropic.claude-sonnet-4-5",
-      "medium",
-      { thinking: { type: "enabled", budget_tokens: 10000 } },
-    ],
-    [
-      "bedrock:anthropic.claude-haiku-4-5",
-      "low",
-      { thinking: { type: "enabled", budget_tokens: 4000 } },
-    ],
-    // Opus 4.5 takes effort on the direct route, but Bedrock gets the budget only.
-    [
-      "bedrock:anthropic.claude-opus-4-5",
-      "high",
-      { thinking: { type: "enabled", budget_tokens: 20000 } },
-    ],
   ] as const)("%s at %s sends the matching reasoning fields", async (model, level, expected) => {
     const bedrockModelId = `anthropic.${model.slice(model.indexOf("claude-"))}`;
     const sent = await sentBedrockBody(bedrockModelId, bedrockOptions(model, level));
@@ -4243,11 +4226,6 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
       { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "low" } },
     ],
     [
-      "bedrock:anthropic.claude-sonnet-4-5-20250929-v1:0",
-      "medium",
-      { thinking: { type: "enabled", budget_tokens: 10000 } },
-    ],
-    [
       "bedrock:eu.anthropic.claude-haiku-5-5-v1:0",
       "off",
       { thinking: { type: "disabled" }, output_config: { effort: "low" } },
@@ -4267,27 +4245,29 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
     expect(bedrockOptions("bedrock:amazon.nova-pro-v1:0", "high")).toEqual({});
   });
 
-  // Production sends the catalog output ceiling as maxOutputTokens (64000 for
-  // Sonnet 4.5). The budget counts toward it, as on the direct API, so the
-  // request must not add the budget on top (84000 would be a Bedrock 400).
-  test("keeps the caller's output ceiling with a thinking budget", async () => {
-    const sent = await sentBedrockBody(
-      "anthropic.claude-sonnet-4-5",
-      bedrockOptions("bedrock:anthropic.claude-sonnet-4-5", "high"),
-      { maxOutputTokens: 64000, temperature: 0.5 }
-    );
-    expect(sent.body.additionalModelRequestFields).toEqual({
-      thinking: { type: "enabled", budget_tokens: 20000 },
-    });
-    // Thinking rejects sampling overrides; the SDK must still see thinking as on.
-    expect(sent.body.inferenceConfig).toEqual({ maxTokens: 64000 });
-  });
-
-  test("budget-thinking models at off keep the Bedrock default (no thinking)", async () => {
-    const sent = await sentBedrockBody(
-      "anthropic.claude-haiku-4-5",
-      bedrockOptions("bedrock:anthropic.claude-haiku-4-5", "off")
-    );
-    expect(sent.body.additionalModelRequestFields).toBeUndefined();
+  // Budget-thinking models keep main's Bedrock request exactly, at every level
+  // (#7180): no thinking or effort field, and the caller's output ceiling and
+  // sampling settings untouched.
+  test.each([
+    "bedrock:anthropic.claude-opus-4-5",
+    "anthropic:claude-sonnet-4-5",
+    "bedrock:us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "bedrock:anthropic.claude-haiku-4-5",
+    "bedrock:anthropic.claude-opus-4-1",
+    "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
+  ])("budget-thinking model %s keeps the Bedrock default at every level", async (model) => {
+    const bedrockModelId = model.startsWith("bedrock:")
+      ? model.slice("bedrock:".length)
+      : `anthropic.${model.slice(model.indexOf("claude-"))}`;
+    for (const level of ["off", "low", "medium", "high", "xhigh", "max"] as const) {
+      const options = bedrockOptions(model, level);
+      expect(options).toEqual({});
+      const sent = await sentBedrockBody(bedrockModelId, options, {
+        maxOutputTokens: 64000,
+        temperature: 0.5,
+      });
+      expect(sent.body.additionalModelRequestFields).toBeUndefined();
+      expect(sent.body.inferenceConfig).toEqual({ maxTokens: 64000, temperature: 0.5 });
+    }
   });
 });

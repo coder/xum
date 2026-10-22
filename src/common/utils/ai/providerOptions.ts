@@ -231,8 +231,7 @@ interface BedrockProviderOptions {
   [key: string]: JSONValue | undefined;
   additionalModelRequestFields?: Record<string, JSONValue>;
   reasoningConfig?: {
-    type?: "enabled" | "adaptive";
-    budgetTokens?: number;
+    type?: "adaptive";
     maxReasoningEffort?: AnthropicEffortLevel;
     display?: "summarized";
   };
@@ -345,35 +344,18 @@ function bedrockClaudeCapabilityModel(
 }
 
 /**
- * Bedrock Converse fields for one thinking shape. Adaptive thinking goes through
- * the SDK's typed `reasoningConfig`; a budget goes in the raw field (see below).
- * The SDK serializes `reasoningConfig: { type: "disabled" }` as nothing for Claude,
- * so "disabled" goes through additionalModelRequestFields verbatim.
+ * Bedrock Converse fields for one thinking shape. Adaptive thinking and effort go
+ * through the SDK's typed `reasoningConfig`. The SDK serializes
+ * `reasoningConfig: { type: "disabled" }` as nothing for Claude, so "disabled"
+ * goes through additionalModelRequestFields verbatim.
  *
- * Budget-thinking models get no effort on Bedrock, Opus 4.5 included (unlike the
- * direct route): Bedrock's acceptance of `output_config.effort` there is not
- * verified, and the budget alone already sets the level.
+ * Budget-thinking models (Opus 4.5, Sonnet 4.5, Haiku 4.5 and older) keep the
+ * Bedrock default, which is no thinking, at every level (#7180). A budget there
+ * must fit the request's max_tokens, which the SDK's reasoningConfig budget
+ * overshoots, and Bedrock reasoning signatures are not yet kept for replay.
  */
 function buildBedrockClaudeOptions(shape: AnthropicThinkingShape): ProviderOptions {
-  if (shape.usesAdaptiveThinking) {
-    return bedrockAdaptiveClaudeOptions(shape);
-  }
-  const thinking = shape.thinking;
-  // The budget goes in the raw field: as `reasoningConfig.budgetTokens` the SDK
-  // adds it on top of maxOutputTokens, which production sets to the catalog
-  // ceiling, so the request would exceed the model's output limit (a 400). The
-  // budget-free `reasoningConfig` still tells the SDK thinking is on, so it drops
-  // the sampling overrides (temperature, topP, topK) that thinking rejects.
-  return thinking?.type === "enabled"
-    ? {
-        bedrock: {
-          reasoningConfig: { type: "enabled" },
-          additionalModelRequestFields: {
-            thinking: { type: "enabled", budget_tokens: thinking.budgetTokens },
-          },
-        },
-      }
-    : {};
+  return shape.usesAdaptiveThinking ? bedrockAdaptiveClaudeOptions(shape) : {};
 }
 
 function bedrockAdaptiveClaudeOptions(shape: AnthropicThinkingShape): ProviderOptions {
