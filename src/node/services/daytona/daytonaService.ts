@@ -26,7 +26,8 @@ import {
   type RuntimeConfig,
 } from "@/common/types/runtime";
 import { log } from "@/node/services/log";
-import { raceAbort, sleepWithAbort } from "@/node/utils/abort";
+import { sleepWithAbort } from "@/node/utils/abort";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import {
   DaytonaApiError,
@@ -1093,7 +1094,9 @@ export class DaytonaService {
     if (provenAt !== undefined && this.now() - provenAt < DAYTONA_READY_CACHE_MS) return "owned";
     // Concurrent checks share one read, so they reach the shared start together.
     const request = this.ownershipRequests.get(sandboxId) ?? this.proveOwnership(sandboxId);
-    return raceAbort(request, options.signal);
+    const raced = await raceWithAbortAndTimeout(request, { signal: options.signal });
+    if (raced.kind !== "ok") throw new Error("Aborted");
+    return raced.value;
   }
 
   private proveOwnership(sandboxId: string): Promise<"owned" | "notOwned" | "missing"> {
@@ -1147,16 +1150,25 @@ export class DaytonaService {
    * block). Concurrent callers for one sandbox share a single request; each still gets its own
    * `onStarting` call. Throws a DaytonaApiError (`not_found` when the sandbox is gone).
    */
-  ensureSandboxReady(sandboxId: string, options: DaytonaEnsureReadyOptions = {}): Promise<void> {
+  async ensureSandboxReady(
+    sandboxId: string,
+    options: DaytonaEnsureReadyOptions = {}
+  ): Promise<void> {
     const request = this.readyRequests.get(sandboxId) ?? this.startReadyRequest(sandboxId);
     const { onStarting, signal } = options;
-    if (!onStarting || signal?.aborted) return raceAbort(request.promise, signal);
     // Per waiter, so the same callback passed twice is two waiters.
-    const listener = () => onStarting();
-    request.onStarting.add(listener);
-    if (request.starting) listener();
-    // A waiter that stopped waiting (cancelled) hears no later start: nothing would report its end.
-    return raceAbort(request.promise, signal).finally(() => request.onStarting.delete(listener));
+    const listener = onStarting && !signal?.aborted ? () => onStarting() : undefined;
+    if (listener) {
+      request.onStarting.add(listener);
+      if (request.starting) listener();
+    }
+    try {
+      const raced = await raceWithAbortAndTimeout(request.promise, { signal });
+      if (raced.kind !== "ok") throw new Error("Aborted");
+    } finally {
+      // A waiter that stopped waiting (cancelled) hears no later start: nothing would report its end.
+      if (listener) request.onStarting.delete(listener);
+    }
   }
 
   private startReadyRequest(sandboxId: string): SandboxReadyRequest {
