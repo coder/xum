@@ -31,8 +31,11 @@ import {
 } from "./sourceInput";
 
 export const CLAUDE_MARKETPLACE_RELATIVE_PATH = ".claude-plugin/marketplace.json";
-/** Marketplaces list many entries (the official one has more than 100), so the cap is above plugin.json's. */
-export const MAX_CLAUDE_MARKETPLACE_BYTES = 1024 * 1024;
+/**
+ * Marketplaces list many entries, so the cap is far above plugin.json's: anthropics/
+ * claude-plugins-community's marketplace.json is about 1.49 MB. The read stays bounded.
+ */
+export const MAX_CLAUDE_MARKETPLACE_BYTES = 8 * 1024 * 1024;
 /** Entries past this many are not listed (one warning names the count). */
 export const MAX_CLAUDE_MARKETPLACE_ENTRIES = 500;
 

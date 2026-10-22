@@ -2445,7 +2445,7 @@ export class AgentPluginInstallService {
     const size = Number((await runGit(["-C", dir, "cat-file", "-s", oid], { diskQuota })).trim());
     if (!Number.isSafeInteger(size) || size > MAX_CLAUDE_MARKETPLACE_BYTES) {
       throw new Error(
-        `${CLAUDE_MARKETPLACE_RELATIVE_PATH} is larger than ${MAX_CLAUDE_MARKETPLACE_BYTES / 1024} KiB.`
+        `${CLAUDE_MARKETPLACE_RELATIVE_PATH} is larger than ${MAX_CLAUDE_MARKETPLACE_BYTES / (1024 * 1024)} MiB.`
       );
     }
     return runGit(["-C", dir, "cat-file", "blob", oid], { diskQuota });
