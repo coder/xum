@@ -1241,6 +1241,17 @@ test("the agent repros read no judge: no judge env, and the proxy refuses its mo
   expect(requests).toHaveLength(1); // the probe only
 });
 
+test("a judge spec that a story job would refuse does not stop a non-story job", async () => {
+  const { code } = await mcpLaunch(
+    { RUN: "proxycall" },
+    { BUGBASH_JUDGE_MODEL: "openai:gpt-6.1-sol" },
+    undefined,
+    undefined,
+    AGENT_REPROS
+  );
+  expect(code).toBe(7);
+});
+
 test.each([
   ["an OpenAI judge", "openai:gpt-6.1-sol", /BUGBASH_JUDGE_MODEL .*only anthropic/],
   ["a judge the proxy cannot price", "anthropic:claude-x-9", /BUGBASH_JUDGE_MODEL .*no price/],

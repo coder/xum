@@ -24,6 +24,8 @@
  * that this process runs for the job, on a unix socket that the container gets read-only. The
  * provider key stays here, and BUGBASH_BUDGET_USD caps the spend at list price (not a billing
  * cap: the upstream key's own limit is the backstop); run.ts shares one budget across its jobs.
+ * A story job may also name a judge model (BUGBASH_JUDGE_MODEL) for its asserts: the launcher
+ * validates and probes it, and that job's proxy allows it too.
  * The proxy writes one record per call to `<output>.proxy.jsonl` on the host only, and a job with
  * its own budget writes its spend (settled costs plus kept reservations) to `<output>.spend.json`
  * at the end. In an explore job with the real app AI (run.ts resolves it with probeApp()), the
@@ -111,8 +113,6 @@ const MCP_APPS_MODEL = "anthropic:claude-sonnet-5-5";
 /** The explorer model, the spend cap and the upstream of a model-driven job. */
 export interface ModelJob {
   model: string;
-  /** BUGBASH_JUDGE_MODEL: the story configs' judge, a second model the proxy allows. */
-  judgeModel?: string;
   budgetUsd: number;
   upstream: { baseUrl: string; apiKey: string };
 }
@@ -135,11 +135,6 @@ export function modelJob(env: NodeJS.ProcessEnv, modelVar = "BUGBASH_MODEL"): Mo
   const spec = env.BUGBASH_MODEL ?? MCP_APPS_MODEL;
   // `modelVar` names the variable the user set (run.ts: a BUGBASH_MODELS entry).
   const model = pricedAnthropic(spec, `${modelVar} ${JSON.stringify(spec)}`);
-  const judgeSpec = env.BUGBASH_JUDGE_MODEL ?? "";
-  const judgeModel =
-    judgeSpec === ""
-      ? undefined
-      : pricedAnthropic(judgeSpec, `BUGBASH_JUDGE_MODEL ${JSON.stringify(judgeSpec)}`);
   const budget = env.BUGBASH_BUDGET_USD ?? "";
   if (!/^\d+(\.\d+)?$/.test(budget) || !(Number(budget) > 0))
     throw new Refusal("set BUGBASH_BUDGET_USD: the most this run may spend at list price, in $");
@@ -154,7 +149,7 @@ export function modelJob(env: NodeJS.ProcessEnv, modelVar = "BUGBASH_MODEL"): Mo
     throw new Refusal("ANTHROPIC_BASE_URL is not an http(s) URL");
   // Like the app's settings, the base URL may end in /v1; the proxy adds /v1/messages.
   const baseUrl = base.replace(/\/+$/, "").replace(/\/v1$/, "");
-  return { model, judgeModel, budgetUsd: Number(budget), upstream: { baseUrl, apiKey } };
+  return { model, budgetUsd: Number(budget), upstream: { baseUrl, apiKey } };
 }
 
 const usd = (nanoUsd: number) => `$${(nanoUsd / 1e9).toFixed(4)}`;
@@ -514,9 +509,14 @@ function checkJob(args: string[], o: LaunchOptions) {
   // The job's folder: its cwd in the container, and where its output comes back.
   const storyJob = stories || electron;
   const dir = storyJob ? storiesDir : bugbash;
-  // Only the story configs read a judge (storyConfig.ts). The other jobs keep their one model, so
-  // `make test-stories` can set it for all three of its jobs.
-  const judgeModel = storyJob ? driven?.judgeModel : undefined;
+  // BUGBASH_JUDGE_MODEL: the story configs' judge (storyConfig.ts), a second model their proxy
+  // allows. Only story jobs read it, so the others neither check nor get it: `make test-stories`
+  // sets it for all three of its jobs, and a stray value cannot refuse `make bug-bash`.
+  const judgeSpec = o.env.BUGBASH_JUDGE_MODEL ?? "";
+  const judgeModel =
+    storyJob && judgeSpec !== ""
+      ? pricedAnthropic(judgeSpec, `BUGBASH_JUDGE_MODEL ${JSON.stringify(judgeSpec)}`)
+      : undefined;
   return { dir, drivenRun, selfCheck, ai, driven, judgeModel, localBuild, storyJob, electron };
 }
 
