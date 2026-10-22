@@ -19,10 +19,7 @@ export interface DaytonaWorkspaceRef {
 export interface DaytonaReconcilerOptions {
   daytonaService: {
     account: Pick<DaytonaAccount, "checkAvailability" | "withAccountLease">;
-    sandboxes: Pick<
-      DaytonaSandboxes,
-      "listInstanceSandboxes" | "refreshActivity"
-    >;
+    sandboxes: Pick<DaytonaSandboxes, "listInstanceSandboxes" | "refreshActivity">;
     ssh: Pick<DaytonaSsh, "hasExpiringSshToken" | "ensureSshAccess">;
   };
   listWorkspaces: () => DaytonaWorkspaceRef[];
