@@ -150,9 +150,10 @@ describe("runPool", () => {
   });
 });
 
-test("recordName keeps a filtered or short run off the full record of a commit", () => {
+test("recordName keeps a filtered, short or other-jobs run off the full record of a commit", () => {
   const sha = "0123456789abcdef";
-  expect(recordName(sha, false, undefined, 10)).toBe("0123456789");
-  expect(recordName(sha, true, undefined, 10)).toBe("0123456789-dirty");
-  expect(recordName(sha, false, "tools/bash", 2)).toBe("0123456789-tools_bash-r2");
+  expect(recordName(sha, false, undefined, 10, 6)).toBe("0123456789");
+  expect(recordName(sha, true, undefined, 10, 6)).toBe("0123456789-dirty");
+  expect(recordName(sha, false, "tools/bash", 2, 6)).toBe("0123456789-tools_bash-r2");
+  expect(recordName(sha, false, undefined, 10, 8)).toBe("0123456789-j8");
 });
