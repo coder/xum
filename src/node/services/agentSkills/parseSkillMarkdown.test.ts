@@ -115,18 +115,23 @@ Body
 
   // The Claude Code docs write the hint unquoted, which YAML reads as a flow sequence ("[x]")
   // or as invalid YAML ("[a] [b]"); either way the skill failed to load (#7123 item 5).
-  test.each(["[issue-number]", "[filename] [format]"])(
-    "keeps an unquoted argument-hint %s as typed",
-    (hint) => {
-      const content = `---\nname: hinted-skill\ndescription: Takes arguments\nargument-hint: ${hint}\n---\nBody\n`;
-      const result = parseSkillMarkdown({
-        content,
-        byteSize: Buffer.byteLength(content, "utf-8"),
-        directoryName: SkillNameSchema.parse("hinted-skill"),
-      });
-      expect(result.frontmatter["argument-hint"]).toBe(hint);
-    }
-  );
+  test.each([
+    ["[issue-number]", "[issue-number]"],
+    ["[filename] [format]", "[filename] [format]"],
+    // JSON quoting keeps inner quotes and backslashes as typed.
+    ['[say "hi"] [C:\\dir]', '[say "hi"] [C:\\dir]'],
+    // A value that is already quoted is not quoted again.
+    ['"[pr]"', "[pr]"],
+    ["'[a] [b]'", "[a] [b]"],
+  ])("keeps argument-hint %s as typed", (line, hint) => {
+    const content = `---\nname: hinted-skill\ndescription: Takes arguments\nargument-hint: ${line}\n---\nBody\n`;
+    const result = parseSkillMarkdown({
+      content,
+      byteSize: Buffer.byteLength(content, "utf-8"),
+      directoryName: SkillNameSchema.parse("hinted-skill"),
+    });
+    expect(result.frontmatter["argument-hint"]).toBe(hint);
+  });
 
   test("parses kebab-case when-to-use spelling in frontmatter", () => {
     const content = `---

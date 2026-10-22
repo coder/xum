@@ -91,6 +91,20 @@ export function skillConsentFrontmatter(
  * - Enforces a 1MB max file size (consistent with existing file tools)
  * - Requires YAML frontmatter delimited by `---` on its own line at the top
  */
+/**
+ * The Claude Code docs write `argument-hint: [issue-number]` and `[filename] [format]` unquoted.
+ * YAML reads the first as a list and refuses the second, so the skill did not load (#7123 item 5),
+ * while Claude Code shows the hint as typed. Quote a bracketed top-level hint so it stays that
+ * text. JSON.stringify keeps a hint with quotes or backslashes valid YAML; an already quoted value
+ * does not start with `[`, so it is left alone.
+ */
+function quoteBracketedArgumentHint(yaml: string): string {
+  return yaml.replace(
+    /^argument-hint:[ \t]*(\[.*?)[ \t]*$/m,
+    (_line, hint: string) => `argument-hint: ${JSON.stringify(hint)}`
+  );
+}
+
 export function parseSkillMarkdown(input: {
   content: string;
   byteSize: number;
@@ -134,7 +148,7 @@ export function parseSkillMarkdown(input: {
 
   let raw: unknown;
   try {
-    raw = YAML.parse(yamlText);
+    raw = YAML.parse(quoteBracketedArgumentHint(yamlText));
   } catch (err) {
     const message = getErrorMessage(err);
     throw new AgentSkillParseError(`Failed to parse SKILL.md YAML frontmatter: ${message}`);
