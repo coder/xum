@@ -977,7 +977,7 @@ interface TurnRequestBuilderDependencies {
     set(workspaceId: string, snapshot: DebugLlmRequestSnapshot): unknown;
   };
   bindings: TurnRequestBuilderBindings;
-  hostServices?: LoopHostServices;
+  hostServices: LoopHostServices;
   emit: (event: string, ...args: unknown[]) => boolean;
   createAbortedTurnHandle: (messageId: string, signal?: AbortSignal) => TurnStreamHandle;
   createSettledTurnHandle: (messageId: string, completion: TurnCompletion) => TurnStreamHandle;
@@ -2895,7 +2895,7 @@ export class TurnRequestBuilder {
       strictAgentResolution,
       xumScope,
       timelineService: this.dependencies.bindings.timelineService,
-      desktopNotifications: this.dependencies.hostServices?.desktopNotifications,
+      desktopNotifications: this.dependencies.hostServices.desktopNotifications,
       // Agent-scheduled heartbeats start paid turns unattended, so they are user opt-in.
       workspaceHeartbeatService:
         this.dependencies.config.loadConfigOrDefault().agentHeartbeatsEnabled === true
