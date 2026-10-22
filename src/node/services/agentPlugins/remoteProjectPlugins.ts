@@ -29,11 +29,6 @@ import { execBuffered } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
 import { discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
 
-/**
- * Deep enough for `<plugin>/skills/<name>/SKILL.md` and `contributes` paths of up to 7 segments.
- * Deeper files are left out (the entry cap bounds the cost, not the depth).
- */
-const MAX_LISTING_DEPTH = 10;
 /** Entries per call; a bigger listing loads no remote plugins (fail closed). */
 export const MAX_REMOTE_PLUGIN_ENTRIES = 4000;
 const MAX_LISTING_OUTPUT_BYTES = 16 * 1024 * 1024;
@@ -67,7 +62,8 @@ export type RemoteProjectAgentPlugin = Pick<
  */
 export function buildRemotePluginListingScript(checkoutRoot: string, containers: string[]): string {
   const limit = MAX_REMOTE_PLUGIN_ENTRIES + 1;
-  const tree = `find -P "$1" -mindepth 1 -maxdepth "$2"`;
+  // No depth limit: skill files may sit at any depth, and the entry cap bounds the walk.
+  const tree = `find -P "$1" -mindepth 1`;
   // Regular files of at most MAX_FILE_SIZE bytes; the same predicate lists and reads them.
   const files = `${tree} -type f -size -${MAX_FILE_SIZE + 1}c`;
   return [
@@ -96,10 +92,10 @@ export function buildRemotePluginListingScript(checkoutRoot: string, containers:
     // A container that resolves outside the checkout is never walked, so none of its bytes leave.
     `  case "$real" in "$root"/*) ;; *) continue ;; esac`,
     `  printf 'K\\t0\\t%s\\t%s\\n' "$real" "$lex"`,
-    `  walk "$real" ${MAX_LISTING_DEPTH}`,
+    `  walk "$real"`,
     // A plugin folder may be a symlink to a directory elsewhere in the checkout.
     `  for e in "$real"/* "$real"/.[!.]*; do [ -L "$e" ] || continue; t=$(readlink -f "$e" 2>/dev/null) || continue`,
-    `    case "$t" in "$root"/*) [ -d "$t" ] && { printf 'D\\t0\\t\\t%s\\n' "$t"; walk "$t" ${MAX_LISTING_DEPTH - 1}; } ;; esac`,
+    `    case "$t" in "$root"/*) [ -d "$t" ] && { printf 'D\\t0\\t\\t%s\\n' "$t"; walk "$t"; } ;; esac`,
     `  done`,
     `done`,
     `printf 'ROOT\\t0\\t%s\\t\\n' "$root"`,
@@ -197,6 +193,29 @@ function consumeLine(state: ParseState, lines: string[], i: number): number {
   return end + 1;
 }
 
+/**
+ * True when two different paths are equal after NFC normalization and lowercasing. A
+ * case-insensitive host (APFS folds both) would map them to one mirror file, and the later write
+ * would win, so such a listing is refused. The same path listed twice (two containers that
+ * resolve to one directory) is not a collision.
+ */
+function hasFoldedCollision(entries: ListingEntry[]): boolean {
+  const byFolded = new Map<string, string>();
+  for (const remote of entries.flatMap((entry) => [entry.path, entry.target])) {
+    if (remote === "") continue;
+    const folded = remote.normalize("NFC").toLowerCase();
+    const seen = byFolded.get(folded);
+    if (seen !== undefined && seen !== remote) return true;
+    byFolded.set(folded, remote);
+  }
+  return false;
+}
+
+/** Within the entry cap and free of folded-name collisions. */
+function entriesAcceptable(entries: ListingEntry[]): boolean {
+  return entries.length <= MAX_REMOTE_PLUGIN_ENTRIES && !hasFoldedCollision(entries);
+}
+
 /** Parses the listing; null when it is cut off, too big or malformed (fail closed). */
 export function parseRemotePluginListing(stdout: string): Listing | null {
   const lines = listingLines(stdout);
@@ -209,7 +228,7 @@ export function parseRemotePluginListing(stdout: string): Listing | null {
   const { entries, pendingFiles, root } = state;
   // F lines without their blob mean the output was cut.
   if (pendingFiles.length > 0 || root === undefined || !isPlainRemotePath(root)) return null;
-  return entries.length <= MAX_REMOTE_PLUGIN_ENTRIES ? { root, entries } : null;
+  return entriesAcceptable(entries) ? { root, entries } : null;
 }
 
 /** `remote` relative to `root`, or null when it is not strictly inside it. */
@@ -443,7 +462,9 @@ async function createMirrorDir(): Promise<string> {
 /** One listing exec and a fresh mirror; null (and no mirror) on any failure. */
 async function createSnapshot(args: RemotePluginArgs): Promise<RemoteProjectPluginSnapshot | null> {
   assert(args.checkoutRoot.length > 0, "remote project plugins: checkoutRoot required");
-  if (args.containers.length === 0) return null;
+  // A Windows host's path rules (8.3 names, device names, trailing dots) can alias mirror paths,
+  // so a Windows host loads no remote project plugins (fail closed).
+  if (args.containers.length === 0 || process.platform === "win32") return null;
   let mirrorRoot: string | undefined;
   try {
     const listing = await readRemoteListing(args);
@@ -482,10 +503,10 @@ interface SnapshotEntry {
   failedAt?: number;
   /** Set once the read lands, so a clear can remove the mirror without waiting. */
   snapshot?: RemoteProjectPluginSnapshot;
-  /** A trust change dropped this entry while its read was in flight. */
-  cleared?: boolean;
 }
 const snapshots = new Map<string, SnapshotEntry>();
+/** Bumped by every clear: a read that a clear overtook is never published. */
+let trustGeneration = 0;
 
 /**
  * The cached snapshot of a TRUSTED remote checkout (the caller checks trust). One listing exec
@@ -506,10 +527,11 @@ export function getRemoteProjectPluginSnapshot(
   if (cached !== undefined && (cached.failedAt ?? Infinity) > Date.now() - FAILURE_RETRY_MS) {
     return cached.promise;
   }
+  const generation = trustGeneration;
   const entry: SnapshotEntry = {
     promise: createSnapshot({ runtime, checkoutRoot, containers }).then((snapshot) => {
       if (snapshot === null) entry.failedAt = Date.now();
-      else if (entry.cleared === true) {
+      else if (generation !== trustGeneration) {
         // Read under the old trust: drop it.
         removeMirror(snapshot.mirrorRoot);
         return null;
@@ -527,8 +549,8 @@ export function getRemoteProjectPluginSnapshot(
  * resolves to null.
  */
 export function clearRemoteProjectPluginSnapshots(): void {
+  trustGeneration++;
   for (const entry of snapshots.values()) {
-    entry.cleared = true;
     if (entry.snapshot !== undefined) removeMirror(entry.snapshot.mirrorRoot);
   }
   snapshots.clear();
