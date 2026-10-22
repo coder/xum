@@ -2618,15 +2618,16 @@ export class AgentPluginInstallService {
       }
       throw new Error(problem);
     }
+    const cli = await skillsCliSkillNames(stagedDir, detected.skillsRoots);
     return {
       plugin,
-      warnings: [...generatedWarnings, ...diagnostics.map((d) => d.message)],
+      warnings: [...generatedWarnings, ...diagnostics.map((d) => d.message), ...cli.warnings],
       method,
       methods: detected.methods,
       skillsCliSkills: await this.acceptedSkillsCliNames(
         stagedDir,
         detected.skillsRoots,
-        await skillsCliSkillNames(stagedDir, detected.skillsRoots)
+        cli.names
       ),
     };
   }
