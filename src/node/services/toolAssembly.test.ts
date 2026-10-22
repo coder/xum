@@ -273,13 +273,14 @@ describe("applyToolPolicyAndExperiments", () => {
 });
 
 describe("one tool set across agent-mode switches (#5253)", () => {
+  // Allowlists list code_execution so the PTC cases keep PTC (#7028).
   const planPolicy = [
     { regex_match: ".*", action: "disable" as const },
-    { regex_match: "file_read", action: "enable" as const },
+    { regex_match: "file_read|code_execution", action: "enable" as const },
   ];
   const execPolicy = [
     { regex_match: ".*", action: "disable" as const },
-    { regex_match: "file_read|mutate", action: "enable" as const },
+    { regex_match: "file_read|mutate|code_execution", action: "enable" as const },
   ];
 
   function toolsWithSideEffect() {
@@ -460,6 +461,106 @@ describe("one tool set across agent-mode switches (#5253)", () => {
     });
     expect(calls).toEqual([]);
   });
+});
+
+// #7028: a caller or agent deny of code_execution must also stop programmatic
+// tool calling (PTC). Before, the PTC branch synthesized a working
+// code_execution whatever the policy said about that name.
+describe("a policy that denies code_execution stops PTC (#7028)", () => {
+  const denyCodeExecution = [{ regex_match: "code_execution", action: "disable" as const }];
+  const options = { toolCallId: "call-1", messages: [], context: undefined };
+
+  function toolsWithSideEffect() {
+    const calls: unknown[] = [];
+    const allTools: Record<string, Tool> = {
+      mutate: {
+        description: "Change something",
+        inputSchema: z.object({}),
+        execute: (input: unknown) => {
+          calls.push(input);
+          return Promise.resolve({ success: true });
+        },
+      } as unknown as Tool,
+      file_read: executableTool("Read a file"),
+    };
+    return { allTools, calls };
+  }
+
+  test("with no agent allowing it, the model gets the policy-filtered flat tools", async () => {
+    const { allTools } = toolsWithSideEffect();
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: denyCodeExecution,
+      callerToolPolicy: denyCodeExecution,
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(tools)).toEqual(["mutate", "file_read"]);
+  });
+
+  // Grants are a ceiling that stubs bridged tools; they must not be read as a
+  // code_execution deny, or a least-privilege sandbox would lose PTC.
+  test("a grants ceiling that omits code_execution keeps it as the entry point", async () => {
+    const { allTools, calls } = toolsWithSideEffect();
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: undefined,
+      capabilityGrants: {
+        version: 1,
+        bridgeTools: { allow: ["mutate"] },
+        vars: false,
+        hostEvents: false,
+      },
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(tools)).toEqual(["code_execution"]);
+    expect(
+      await tools.code_execution.execute!({ code: "return mux.mutate({});" }, options)
+    ).toMatchObject({ success: true, result: { success: true } });
+    expect(calls).toHaveLength(1);
+  });
+
+  // Custom agents whose frontmatter lists tools without `.*` deny the name too.
+  test("an allowlist that does not list code_execution stops PTC", async () => {
+    const { allTools } = toolsWithSideEffect();
+    const tools = await applyToolPolicyAndExperiments({
+      allTools,
+      effectiveToolPolicy: [
+        { regex_match: ".*", action: "disable" },
+        { regex_match: "file_read", action: "enable" },
+      ],
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(tools)).toEqual(["file_read"]);
+  });
+
+  // Exclusive PTC moves bridgeable tools behind code_execution, so a refused
+  // code_execution would also hide the allowed tools behind it. An active deny
+  // therefore gives flat tools even when another switchable agent allows
+  // code_execution: one cache miss on that switch is the price (#5253).
+  test.each([
+    ["the active agent", undefined],
+    ["the caller", denyCodeExecution],
+  ] as const)(
+    "a deny by %s gives flat tools even when another agent allows code_execution",
+    async (_label, callerToolPolicy) => {
+      const { allTools, calls } = toolsWithSideEffect();
+      const tools = await applyToolPolicyAndExperiments({
+        allTools,
+        effectiveToolPolicy: denyCodeExecution,
+        switchableAgentToolPolicies: [callerToolPolicy ? [] : denyCodeExecution, []],
+        callerToolPolicy,
+        activeAgentId: "quiet",
+        experiments: { programmaticToolCalling: true },
+        emitNestedToolEvent: () => undefined,
+      });
+      expect(Object.keys(tools)).toEqual(["mutate", "file_read"]);
+      expect(await tools.mutate.execute!({}, options)).toEqual({ success: true });
+      expect(calls).toHaveLength(1);
+    }
+  );
 });
 
 describe("persistent kernel graduation (RLM mode)", () => {
@@ -942,6 +1043,8 @@ describe("token budget history policy", () => {
         { regex_match: ".*", action: "disable" },
         { regex_match: "file_read", action: "enable" },
         { regex_match: "session_history", action: "enable" },
+        // An allowlist must list code_execution to keep PTC (#7028).
+        { regex_match: "code_execution", action: "enable" },
       ],
       experiments: { tokenBudget: true, programmaticToolCalling: true },
       emitNestedToolEvent: () => undefined,

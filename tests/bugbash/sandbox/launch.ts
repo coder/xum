@@ -111,8 +111,20 @@ const MCP_APPS_MODEL = "anthropic:claude-sonnet-5-5";
 /** The explorer model, the spend cap and the upstream of a model-driven job. */
 export interface ModelJob {
   model: string;
+  /** BUGBASH_JUDGE_MODEL: the story configs' judge, a second model the proxy allows. */
+  judgeModel?: string;
   budgetUsd: number;
   upstream: { baseUrl: string; apiKey: string };
+}
+
+/** An `anthropic:<model>` spec the proxy can price, or a Refusal that names `named`. */
+function pricedAnthropic(spec: string, named: string): string {
+  const [provider, model] = spec.split(/:(.*)/s, 2);
+  if (provider !== "anthropic" || !model)
+    throw new Refusal(`${named}: only anthropic:<model> runs here`);
+  // The proxy refuses every call of a model it cannot price, so the job could only fail.
+  if (!priced(model)) throw new Refusal(`${named}: the proxy has no price for it`);
+  return model;
 }
 
 /**
@@ -121,13 +133,13 @@ export interface ModelJob {
  */
 export function modelJob(env: NodeJS.ProcessEnv, modelVar = "BUGBASH_MODEL"): ModelJob {
   const spec = env.BUGBASH_MODEL ?? MCP_APPS_MODEL;
-  const [provider, model] = spec.split(/:(.*)/s, 2);
   // `modelVar` names the variable the user set (run.ts: a BUGBASH_MODELS entry).
-  const named = `${modelVar} ${JSON.stringify(spec)}`;
-  if (provider !== "anthropic" || !model)
-    throw new Refusal(`${named}: only anthropic:<model> runs here`);
-  // The proxy refuses every call of a model it cannot price, so the job could only fail.
-  if (!priced(model)) throw new Refusal(`${named}: the proxy has no price for it`);
+  const model = pricedAnthropic(spec, `${modelVar} ${JSON.stringify(spec)}`);
+  const judgeSpec = env.BUGBASH_JUDGE_MODEL ?? "";
+  const judgeModel =
+    judgeSpec === ""
+      ? undefined
+      : pricedAnthropic(judgeSpec, `BUGBASH_JUDGE_MODEL ${JSON.stringify(judgeSpec)}`);
   const budget = env.BUGBASH_BUDGET_USD ?? "";
   if (!/^\d+(\.\d+)?$/.test(budget) || !(Number(budget) > 0))
     throw new Refusal("set BUGBASH_BUDGET_USD: the most this run may spend at list price, in $");
@@ -142,7 +154,7 @@ export function modelJob(env: NodeJS.ProcessEnv, modelVar = "BUGBASH_MODEL"): Mo
     throw new Refusal("ANTHROPIC_BASE_URL is not an http(s) URL");
   // Like the app's settings, the base URL may end in /v1; the proxy adds /v1/messages.
   const baseUrl = base.replace(/\/+$/, "").replace(/\/v1$/, "");
-  return { model, budgetUsd: Number(budget), upstream: { baseUrl, apiKey } };
+  return { model, judgeModel, budgetUsd: Number(budget), upstream: { baseUrl, apiKey } };
 }
 
 const usd = (nanoUsd: number) => `$${(nanoUsd / 1e9).toFixed(4)}`;
@@ -502,7 +514,10 @@ function checkJob(args: string[], o: LaunchOptions) {
   // The job's folder: its cwd in the container, and where its output comes back.
   const storyJob = stories || electron;
   const dir = storyJob ? storiesDir : bugbash;
-  return { dir, drivenRun, selfCheck, ai, driven, localBuild, storyJob, electron };
+  // Only the story configs read a judge (storyConfig.ts). The other jobs keep their one model, so
+  // `make test-stories` can set it for all three of its jobs.
+  const judgeModel = storyJob ? driven?.judgeModel : undefined;
+  return { dir, drivenRun, selfCheck, ai, driven, judgeModel, localBuild, storyJob, electron };
 }
 
 /** A job's checks and the Docker check, with no job: `--preflight` (Makefile, before the build). */
@@ -514,10 +529,8 @@ export async function preflight(args: string[], o: LaunchOptions): Promise<Clean
 /** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
 export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
   const log = o.log ?? logLine;
-  const { dir, drivenRun, selfCheck, ai, driven, localBuild, storyJob, electron } = checkJob(
-    args,
-    o
-  );
+  const { dir, drivenRun, selfCheck, ai, driven, judgeModel, localBuild, storyJob, electron } =
+    checkJob(args, o);
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
@@ -621,6 +634,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     };
     const drivenEnv = driven && {
       BUGBASH_MODEL: `anthropic:${driven.model}`,
+      ...(judgeModel != null && { BUGBASH_JUDGE_MODEL: `anthropic:${judgeModel}` }),
       BUGBASH_MODEL_DRIVEN: "1",
     };
     // entry.ts starts Xvfb for this job only.
@@ -688,8 +702,16 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
         // The job folder: not mounted (only stage/ and proxy/ are), and one place to clean up.
         privateParent: jobDir,
         upstream: driven.upstream,
-        // The explorer, and in real mode the app too: nothing else.
-        job: { models: [...new Set([driven.model, ...(ai.mode === "real" ? [ai.model] : [])])] },
+        // The explorer, its judge if set, and in real mode the app too: nothing else.
+        job: {
+          models: [
+            ...new Set([
+              driven.model,
+              ...(judgeModel != null ? [judgeModel] : []),
+              ...(ai.mode === "real" ? [ai.model] : []),
+            ]),
+          ],
+        },
         ledger,
         log: record,
         onFault: fault,

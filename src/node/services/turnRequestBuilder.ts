@@ -253,6 +253,7 @@ import {
   type SimulationContext,
 } from "./streamSimulation";
 import { applyToolPolicyAndExperiments, captureMcpToolTelemetry } from "./toolAssembly";
+
 import { applyCapabilityGrants } from "@/common/utils/tools/capabilityGrants";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 
@@ -308,6 +309,16 @@ import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/to
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+
+/**
+ * Whether PTC actually ran for this assembly. Policy can stop it (#7028), and
+ * then the MCP tools are flat again, so tool search must treat the request as
+ * non-PTC. code_execution is only ever synthesized by the PTC branch, so its
+ * presence says PTC ran.
+ */
+function ptcRanForTools(ptcEnabled: boolean, tools: Record<string, Tool>): boolean {
+  return ptcEnabled && tools.code_execution !== undefined;
+}
 
 /** Options used to prepare and execute a turn. */
 export interface StreamMessageOptions {
@@ -2994,6 +3005,7 @@ export class TurnRequestBuilder {
         // XUM_DISABLE_AGENT_TOOLS: drop every tool here, so tool search, the system prompt and the
         // context budgets all see the toolless request that StreamManager sends.
         if (isAgentToolsDisabled()) attemptTools = {};
+        const ptcActive = ptcRanForTools(ptcEnabled, attemptTools);
 
         // Intuition's internal memory_read must not bypass a policy denying memory
         // (a denied memory is never a refusal stub, see toolAssembly).
@@ -3035,7 +3047,7 @@ export class TurnRequestBuilder {
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
               toolPolicy: toolSearchPolicy,
-              ptcEnabled,
+              ptcEnabled: ptcActive,
               promptCacheActive: toolSearchPromptCacheActive,
               overviewMemo: toolCatalogOverviewMemo,
             });
@@ -3049,7 +3061,7 @@ export class TurnRequestBuilder {
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
               toolPolicy: toolSearchPolicy,
-              ptcEnabled,
+              ptcEnabled: ptcActive,
               promptCacheActive: toolSearchPromptCacheActive,
               overviewMemo: toolCatalogOverviewMemo,
             }).tools;
@@ -3113,7 +3125,7 @@ export class TurnRequestBuilder {
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
               toolPolicy: toolSearchPolicy,
-              ptcEnabled,
+              ptcEnabled: ptcActive,
               promptCacheActive: toolSearchPromptCacheActive,
               overviewMemo: toolCatalogOverviewMemo,
             }).tools;
