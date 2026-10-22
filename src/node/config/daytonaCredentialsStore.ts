@@ -8,7 +8,6 @@ import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isLoopbackHost } from "@/common/utils/loopbackHost";
 import { log } from "@/node/services/log";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
-import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 /**
@@ -187,29 +186,13 @@ export class DaytonaCredentialsStore {
     return run;
   }
 
-  /**
-   * Another backend on this Xum root (a desktop app next to `xum server`) has its own
-   * updateChain: the file lock spans the whole read-modify-write, or one backend's save of the
-   * key could be overwritten by the other's save of the URL, pairing the old key with the new
-   * deployment.
-   */
   private async applyUpdate(patch: DaytonaCredentialsPatch): Promise<void> {
     await ensurePrivateDir(this.rootDir);
-    const release = await acquireCrossProcessLock({
-      lockPath: `${this.filePath}.lock`,
-      acquireTimeoutMs: 30_000,
-      staleMs: 60_000,
-      timeoutMessage: "Another Xum process is saving Daytona settings.",
+    const next = applyPatch(await this.read(), patch);
+    await writeFileAtomic(this.filePath, JSON.stringify(next, null, 2), {
+      encoding: "utf-8",
+      mode: 0o600,
     });
-    try {
-      const next = applyPatch(await this.read(), patch);
-      await writeFileAtomic(this.filePath, JSON.stringify(next, null, 2), {
-        encoding: "utf-8",
-        mode: 0o600,
-      });
-    } finally {
-      await release();
-    }
   }
 
   /**

@@ -238,9 +238,7 @@ describe.skipIf(process.platform === "win32")(
           );
         expect(String(refused)).toContain("Host denied");
 
-        await writer.repointGateway({ ...gateway, hostKeys: [publicKeyLine(hostKey)] }, [
-          { sandboxId: "sb-1", token: "tokenA" },
-        ]);
+        await writer.repointGateway({ ...gateway, hostKeys: [publicKeyLine(hostKey)] });
         const entry = await new SSH2ConnectionPool().acquireConnection(daytona, { maxWaitMs: 0 });
         entry.client.end();
       });

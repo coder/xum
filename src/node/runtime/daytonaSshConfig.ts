@@ -13,7 +13,6 @@ import { ensureManagedSSHConfigBlock } from "@/node/runtime/muxSshConfigWriter";
 import { log } from "@/node/services/log";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
-import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 /**
@@ -281,33 +280,7 @@ function tokensIn(blocks: Map<string, string>): SandboxToken[] {
   return tokens;
 }
 
-function hostKeyAliasesIn(blocks: Map<string, string>): string[] {
-  return [...blocks.values()].flatMap(
-    (block) => /^\s*HostKeyAlias\s+(\S+)\s*$/m.exec(block)?.[1] ?? []
-  );
-}
-
-/** The hosts a known_hosts line (as renderDaytonaKnownHosts writes it) pins: `h` or `[h]:port`. */
-function knownHostsLineHosts(line: string): string[] {
-  const field = line.trim().split(/\s+/)[0] ?? "";
-  return field
-    .split(",")
-    .filter((entry) => entry.length > 0)
-    .map((entry) => /^\[(.+)\]:\d+$/.exec(entry)?.[1] ?? entry);
-}
-
-/** The known_hosts lines that pin `host` (in either form). */
-function linesPinning(content: string, host: string): string[] {
-  return content.split("\n").filter((line) => knownHostsLineHosts(line).includes(host));
-}
-
-function sameLines(lines: string[], expected: string): boolean {
-  const wanted = expected.split("\n").filter((line) => line.length > 0);
-  return lines.length === wanted.length && lines.every((line, index) => line === wanted[index]);
-}
-
-// One lock per include file across writer instances in this process (withIncludeFileLock adds
-// the cross-process one): blocks of different sandboxes share it.
+// One lock per include file across writer instances: blocks of different sandboxes share it.
 const includeFileLocks = new MutexMap<string>();
 
 export interface DaytonaSshConfigWriterOptions {
@@ -326,17 +299,13 @@ export class DaytonaSshConfigWriter {
     this.sshConfigPath = options.sshConfigPath;
   }
 
-  /**
-   * First write for a sandbox: known_hosts, its include block, and the managed ssh block. The
-   * other blocks in `owned` (the caller's own tokens) follow the gateway; see installGateway.
-   */
+  /** First write for a sandbox: known_hosts, its include block, and the managed ssh block. */
   async writeSandbox(input: {
     sandboxId: string;
     token: string;
     gateway: DaytonaSshGateway;
-    owned?: readonly SandboxToken[];
   }): Promise<void> {
-    await this.installGateway(input.gateway, input.owned ?? [], (blocks) =>
+    await this.installGateway(input.gateway, (blocks) =>
       blocks.set(toXumDaytonaHost(input.sandboxId), this.renderBlock(input))
     );
     await this.ensureManagedBlock();
@@ -360,74 +329,51 @@ export class DaytonaSshConfigWriter {
     });
   }
 
-  /** Daytona moved its gateway: repoint the caller's own blocks (keeping their tokens). */
-  async repointGateway(gateway: DaytonaSshGateway, owned: readonly SandboxToken[]): Promise<void> {
-    await this.installGateway(gateway, owned, () => undefined);
+  /** Daytona moved its gateway: repoint every sandbox's block (keeping its token) and pins. */
+  async repointGateway(gateway: DaytonaSshGateway): Promise<void> {
+    await this.installGateway(gateway, () => undefined);
   }
 
   /**
-   * known_hosts is shared by every alias: a gateway change repoints the caller's other blocks
-   * (each keeps its token) in the same step, or another sandbox's turn would dial the old host
-   * with new pins. Only blocks still holding a token in `owned` move: another backend on this
-   * root may have written the rest for another account (and deployment) after a settings
-   * change, and its block would keep its token, so that backend would never repair it. Pins of
-   * a gateway some remaining block still dials stay for the same reason.
+   * known_hosts is shared by every alias: a gateway change repoints them all (each keeps its
+   * token) in the same step, or another sandbox's turn would dial the old host with new pins.
    */
   private async installGateway(
     gateway: DaytonaSshGateway,
-    owned: readonly SandboxToken[],
     edit: (blocks: Map<string, string>) => void
   ): Promise<void> {
-    const gatewayLines = renderDaytonaKnownHosts(gateway);
+    const knownHosts = renderDaytonaKnownHosts(gateway);
     this.assertPathsReadLiterallyBySsh();
-    const ownedTokens = new Map(owned.map(({ sandboxId, token }) => [sandboxId, token]));
     await this.withIncludeFileLock(async () => {
       const blocks = await this.readBlocks();
       for (const other of tokensIn(blocks)) {
-        if (ownedTokens.get(other.sandboxId) !== other.token) continue;
         blocks.set(toXumDaytonaHost(other.sandboxId), this.renderBlock({ ...other, gateway }));
       }
       edit(blocks);
-      await this.writeKnownHosts(blocks, gateway.host, gatewayLines);
+      await this.writeKnownHosts(knownHosts);
       await this.writeBlocks(blocks);
     });
   }
 
   /**
-   * known_hosts was deleted or edited while this backend runs: an unchanged gateway would
-   * otherwise fail every ssh command until a restart. Rewrites the gateway's pins (from
-   * `/config`, never a key a server offers) when its lines differ, keeping the include file
-   * and other gateways' pins. True when it wrote.
+   * known_hosts was deleted or edited while Xum runs: an unchanged gateway would otherwise fail
+   * every ssh command until a restart. Rewrites the pins (from `/config`, never a key a server
+   * offers) when they differ. True when it wrote.
    */
   async restoreGatewayPins(gateway: DaytonaSshGateway): Promise<boolean> {
-    const gatewayLines = renderDaytonaKnownHosts(gateway);
+    const knownHosts = renderDaytonaKnownHosts(gateway);
     this.assertPathsReadLiterallyBySsh();
     let wrote = false;
     await this.withIncludeFileLock(async () => {
-      const current = await this.readKnownHosts();
-      if (sameLines(linesPinning(current, gateway.host), gatewayLines)) return;
-      await this.writeKnownHosts(await this.readBlocks(), gateway.host, gatewayLines);
+      if ((await this.readKnownHosts()) === knownHosts) return;
+      await this.writeKnownHosts(knownHosts);
       wrote = true;
     });
     return wrote;
   }
 
-  /** The gateway's lines replace every line pinning its host; other gateways' pins stay. */
-  private async writeKnownHosts(
-    blocks: Map<string, string>,
-    gatewayHost: string,
-    gatewayLines: string
-  ): Promise<void> {
-    const keptHosts = new Set(hostKeyAliasesIn(blocks));
-    keptHosts.delete(gatewayHost);
-    const keptLines = (await this.readKnownHosts())
-      .split("\n")
-      .filter((line) => knownHostsLineHosts(line).some((host) => keptHosts.has(host)));
-    await writeFileAtomic(
-      this.paths.knownHostsPath,
-      keptLines.length > 0 ? `${keptLines.join("\n")}\n${gatewayLines}` : gatewayLines,
-      { encoding: "utf-8", mode: 0o600 }
-    );
+  private async writeKnownHosts(content: string): Promise<void> {
+    await writeFileAtomic(this.paths.knownHostsPath, content, { encoding: "utf-8", mode: 0o600 });
   }
 
   /** Token refresh: rewrites only the include file, never `~/.ssh/config` or known_hosts. */
@@ -513,27 +459,10 @@ export class DaytonaSshConfigWriter {
     }
   }
 
-  /**
-   * Every read-modify-write of the include file (and known_hosts) runs under this. Another
-   * backend on the same Xum root (a desktop app next to `xum server`) has its own MutexMap:
-   * without the file lock, two writers read the same file and the later rename drops the
-   * other's alias. Callers never nest it.
-   */
+  /** Every read-modify-write of the include file (and known_hosts) runs under this. */
   private async withIncludeFileLock(fn: () => Promise<void>): Promise<void> {
     await ensurePrivateDir(this.paths.dir);
-    await includeFileLocks.withLock(this.paths.includePath, async () => {
-      const release = await acquireCrossProcessLock({
-        lockPath: `${this.paths.includePath}.lock`,
-        acquireTimeoutMs: 30_000,
-        staleMs: 60_000,
-        timeoutMessage: "Another Xum process is updating the Daytona ssh config.",
-      });
-      try {
-        await fn();
-      } finally {
-        await release();
-      }
-    });
+    await includeFileLocks.withLock(this.paths.includePath, fn);
   }
 
   private async readBlocks(): Promise<Map<string, string>> {

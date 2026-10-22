@@ -214,98 +214,6 @@ describe("DaytonaService", () => {
     }
   });
 
-  it("mints under credentials another Xum process saved, and not after its own change", async () => {
-    const mintKeys: string[] = [];
-    service = new DaytonaService({
-      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
-      rootDir,
-      fetch: ((input: string | URL | Request, init?: RequestInit) => {
-        const url = input instanceof Request ? input.url : input.toString();
-        if (init?.method === "POST" && url.includes("/ssh-access")) {
-          mintKeys.push((init.headers as Record<string, string>).Authorization);
-        }
-        return plane.fetch(input, init);
-      }) as typeof fetch,
-      now: () => clock,
-    });
-    const before = await service.getAccount();
-    const held = await service.getSshToken("sb-1");
-
-    // Another backend sharing this root saves another key.
-    await new DaytonaCredentialsStore(rootDir, {}).update({ apiKey: "other" });
-
-    expect((await service.getSshToken("sb-1")).token).not.toBe(held.token);
-    expect(mintKeys).toEqual(["Bearer k", "Bearer other"]);
-    expect(service.isAccountCurrent(before)).toBe(false);
-
-    // This process's own change is not taken for another one.
-    await service.setConfig({ apiKey: "third" });
-    const after = await service.getAccount();
-    await service.getSshToken("sb-1");
-    expect(service.isAccountCurrent(after)).toBe(true);
-    expect(mintKeys).toEqual(["Bearer k", "Bearer other", "Bearer third"]);
-  });
-
-  it("keeps a lease on its account when another process saves another key", async () => {
-    const lookupKeys: string[] = [];
-    service = new DaytonaService({
-      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
-      rootDir,
-      fetch: ((input: string | URL | Request, init?: RequestInit) => {
-        const url = input instanceof Request ? input.url : input.toString();
-        if ((init?.method ?? "GET") === "GET" && url.endsWith("/sandbox/sb-1")) {
-          lookupKeys.push((init?.headers as Record<string, string>).Authorization);
-        }
-        return plane.fetch(input, init);
-      }) as typeof fetch,
-      now: () => clock,
-    });
-    const generation = async () => (await service.getAccount()).generation;
-    await service.getSshToken("sb-1");
-    const before = await generation();
-
-    await service.withAccountLease(async () => {
-      await service.getSandboxState("sb-1");
-      await new DaytonaCredentialsStore(rootDir, {}).update({ apiKey: "other" });
-      await service.getSandboxState("sb-1");
-      expect(await generation()).toBe(before);
-    });
-    expect(lookupKeys).toEqual(["Bearer k", "Bearer k"]);
-
-    // The first resolve after the lease takes the new account and retires the old one once.
-    await service.getSandboxState("sb-1");
-    await service.getSandboxState("sb-1");
-    expect(lookupKeys.slice(2)).toEqual(["Bearer other", "Bearer other"]);
-    expect(await generation()).toBe(before + 1);
-  });
-
-  it("takes the account another process saved while idle from a lease's first call", async () => {
-    const lookupKeys: string[] = [];
-    service = new DaytonaService({
-      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
-      rootDir,
-      fetch: ((input: string | URL | Request, init?: RequestInit) => {
-        const url = input instanceof Request ? input.url : input.toString();
-        if ((init?.method ?? "GET") === "GET" && url.endsWith("/sandbox/sb-1")) {
-          lookupKeys.push((init?.headers as Record<string, string>).Authorization);
-        }
-        return plane.fetch(input, init);
-      }) as typeof fetch,
-      now: () => clock,
-    });
-    plane.states = ["started"];
-    await service.getSandboxState("sb-1");
-    const before = (await service.getAccount()).generation;
-
-    // Another backend sharing this root saves another key while no lease runs here.
-    await new DaytonaCredentialsStore(rootDir, {}).update({ apiKey: "other" });
-    await service.withAccountLease(() => service.getSandboxState("sb-1"));
-
-    expect(lookupKeys).toEqual(["Bearer k", "Bearer other"]);
-    await service.getSandboxState("sb-1");
-    expect((await service.getAccount()).generation).toBe(before + 1);
-  });
-
   it("fails a lease whose settings another process made unusable while idle", async () => {
     plane.states = ["started"];
     await service.getSandboxState("sb-1");
@@ -679,41 +587,6 @@ describe("DaytonaService", () => {
     expect(plane.revoked).toEqual(["earlier-process-token", minted ?? ""]);
   });
 
-  it("loads the include file's tokens before ssh access when the startup load failed", async () => {
-    let failedReads = 1;
-    const writer = {
-      writeSandbox: () => Promise.resolve(),
-      ensureManagedBlock: () => Promise.resolve(),
-      restoreGatewayPins: () => Promise.resolve(false),
-      updateToken: () => Promise.resolve(),
-      removeSandbox: () => Promise.resolve(),
-      removeSandboxTokens: () => Promise.resolve(),
-
-      readTokens: () =>
-        failedReads-- > 0
-          ? Promise.reject(new Error("EIO: i/o error, read"))
-          : Promise.resolve([{ sandboxId: "sb-1", token: "earlier-process-token" }]),
-      repointGateway: () => Promise.resolve(),
-    };
-    service = new DaytonaService({
-      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
-      rootDir,
-      fetch: plane.fetch,
-      now: () => clock,
-      sshConfigWriter: writer,
-    });
-    expect(
-      await service.loadPersistedTokens().then(
-        () => "loaded",
-        () => "failed"
-      )
-    ).toBe("failed");
-
-    // The retry knows the earlier token, so the new one replaces and revokes it.
-    await service.ensureSshAccess("sb-1");
-    expect(plane.revoked).toEqual(["earlier-process-token"]);
-  });
-
   it("puts back a removed ~/.ssh/config block on ssh access while the cached token is fresh", async () => {
     const sshConfigPath = path.join(rootDir, "home", ".ssh", "config");
     service = new DaytonaService({
@@ -836,31 +709,6 @@ describe("DaytonaService", () => {
     return { planeA, planeB, backend, writer, switchToB, blocks };
   }
 
-  // Another backend on this root switched accounts: this one cannot revoke the old tokens, so
-  // their aliases must leave the shared include file before it retires the connections, or a
-  // fresh ssh from an alias would keep reaching the old account's sandbox.
-  it("drops the old account's aliases from the include file when another process switches", async () => {
-    const rig = accountsOnOneRoot();
-    const desktop = rig.backend();
-    const server = rig.backend();
-    await server.loadPersistedTokens();
-    await desktop.ensureSshAccess("sb-1");
-    await desktop.ensureSshAccess("sb-3");
-    expect(Object.keys(await rig.blocks())).toEqual(["sb-1", "sb-3"]);
-
-    await server.setConfig(rig.switchToB);
-    await server.ensureSshAccess("sb-1");
-    await server.ensureSshAccess("sb-2");
-    const serverBlocks = await rig.blocks();
-    expect(Object.keys(serverBlocks).sort()).toEqual(["sb-1", "sb-2", "sb-3"]);
-
-    // A status probe is enough for the desktop to notice.
-    await desktop.getSandboxState("sb-2");
-
-    const { "sb-3": _desktopOnly, ...kept } = serverBlocks;
-    expect(await rig.blocks()).toEqual(kept);
-  });
-
   // The old key may already be invalid: its tokens stay live until they expire, so the aliases
   // that carry them must not outlive the connections the switch retires.
   it("drops the old account's aliases before retiring connections even when revoking fails", async () => {
@@ -881,45 +729,5 @@ describe("DaytonaService", () => {
     expect(rig.planeA.revokedTokens).toEqual([]);
     expect(aliasesAtRetire).toEqual([[], []]);
     expect(await rig.blocks()).toEqual({});
-  });
-
-  // The desktop's mint started under account A; the server then switched to B and wrote its
-  // own blocks for B's gateway. The desktop's late gateway install must not move B's blocks
-  // (which keep B's token, so the server would never repair them) back to A's gateway.
-  it("leaves another account's blocks alone when an old-account gateway install lands late", async () => {
-    const rig = accountsOnOneRoot();
-    const desktop = rig.backend();
-    const server = rig.backend();
-    await server.loadPersistedTokens();
-    await desktop.ensureSshAccess("sb-1");
-    await desktop.ensureSshAccess("sb-4");
-    let mintStarted!: () => void;
-    const started = new Promise<void>((resolve) => (mintStarted = resolve));
-    let releaseMint!: () => void;
-    const released = new Promise<void>((resolve) => (releaseMint = resolve));
-    rig.planeA.onRequest.set("POST /sandbox/sb-3/ssh-access", () => {
-      mintStarted();
-      return released;
-    });
-    const lateInstall = desktop.ensureSshAccess("sb-3");
-    await started;
-
-    await server.setConfig(rig.switchToB);
-    await server.ensureSshAccess("sb-1");
-    await server.ensureSshAccess("sb-2");
-    const serverBlocks = await rig.blocks();
-    releaseMint();
-    await lateInstall;
-
-    const after = await rig.blocks();
-    expect(after["sb-1"]).toBe(serverBlocks["sb-1"]);
-    expect(after["sb-2"]).toBe(serverBlocks["sb-2"]);
-    expect(after["sb-1"]).toEndWith("@ssh.b.daytona.test");
-    expect(after["sb-3"]).toMatch(/^a-tok\d+@ssh\.daytona\.test$/);
-    expect(after["sb-4"]).toMatch(/^a-tok\d+@ssh\.daytona\.test$/);
-    // Each gateway keeps its pins while a block dials it.
-    const knownHosts = await fs.readFile(rig.writer().paths.knownHostsPath, "utf8");
-    expect(knownHosts).toContain("ssh.b.daytona.test ssh-ed25519");
-    expect(knownHosts).toContain("ssh.daytona.test ssh-ed25519");
   });
 });

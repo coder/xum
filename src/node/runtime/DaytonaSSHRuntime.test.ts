@@ -1731,58 +1731,6 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
     const result = await runtimeHelpers.execBuffered(runtime, "true", { cwd: "/tmp", timeout: 10 });
     expect(result.exitCode).toBe(0);
   });
-
-  it("revokes the token another backend wrote as a sandbox's first alias once it replaces it", async () => {
-    rig.plane.addSandbox({ id: "sb-theirs-first" });
-    await rig.service.loadPersistedTokens();
-    // After this backend's startup load, another one sets the sandbox up first.
-    rig.writer.tokens.set("sb-theirs-first", "other-backend-first-token");
-
-    await rig.service.ensureSshAccess("sb-theirs-first");
-
-    expect(rig.writer.tokens.get("sb-theirs-first")).not.toBe("other-backend-first-token");
-    expect(rig.writer.fullWrites).toEqual(["sb-theirs-first"]);
-    expect(rig.plane.revokedTokens).toEqual(["other-backend-first-token"]);
-  });
-
-  it("follows the include file another backend sharing the root edits", async () => {
-    rig.plane.addSandbox({ id: "sb-both" });
-    await rig.service.ensureSshAccess("sb-both");
-    const ours = rig.writer.tokens.get("sb-both");
-
-    // Another backend archives a workspace on the sandbox and removes its alias.
-    rig.writer.tokens.delete("sb-both");
-    await rig.service.ensureSshAccess("sb-both");
-    expect(rig.writer.fullWrites).toEqual(["sb-both", "sb-both"]);
-    const rewritten = rig.writer.tokens.get("sb-both");
-    expect(rewritten).toBeDefined();
-    expect(rewritten).not.toBe(ours);
-
-    // Another backend mints and writes its own token; ssh now sends that one.
-    const theirs = "other-backend-token-5e2b";
-    rig.writer.tokens.set("sb-both", theirs);
-    const runtime = makeRuntime({ sandboxId: "sb-both" }, rig, {
-      transport: {
-        ...localShellTransport(rig.rootDir),
-        spawnRemoteProcess: () =>
-          Promise.reject(
-            new RuntimeError(`${theirs}@127.0.0.1: Permission denied (publickey).`, "network")
-          ),
-      },
-    });
-    const error = await runtime.exec("true", { cwd: "/tmp", timeout: 10 }).then(
-      () => new Error("exec unexpectedly succeeded"),
-      (rejection: unknown) => rejection
-    );
-    expect(String(error)).not.toContain(theirs);
-    expect(String(error)).toContain(DAYTONA_TOKEN_PLACEHOLDER);
-
-    // Held as the sandbox's token: a release revokes it with the block.
-    rig.writer.tokens.set("sb-both", theirs);
-    await rig.service.ensureSshAccess("sb-both");
-    await rig.service.releaseSshAccess("sb-both");
-    expect(rig.plane.revokedTokens).toContain(theirs);
-  });
 });
 
 describe("DaytonaSSHRuntime reconnect after a stop", () => {
