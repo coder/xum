@@ -18,7 +18,11 @@ import {
   type DaytonaResolvedCredentials,
 } from "@/node/config/daytonaCredentialsStore";
 import { loadOrCreateInstallationId } from "@/node/config/installationIdentity";
-import { DaytonaSshConfigWriter, type SandboxToken } from "@/node/runtime/daytonaSshConfig";
+import {
+  DaytonaSshConfigWriter,
+  getDaytonaSshPaths,
+  type SandboxToken,
+} from "@/node/runtime/daytonaSshConfig";
 import { retireSshConnections } from "@/node/runtime/transports";
 import { rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
 import {
@@ -399,6 +403,13 @@ export class DaytonaService {
    * backend, which may be on another account by now.
    */
   private readonly ownedTokens = new Set<string>();
+  /**
+   * Old-account blocks an account retirement could not remove (an unwritable include file).
+   * In memory only: until each is removed, or rewritten for the new account, ssh to its
+   * sandbox is refused (requireCurrentSshAlias), as it would reach the old account's sandbox
+   * with a token that stays live until it expires.
+   */
+  private staleAliases: SandboxToken[] = [];
   private readonly readyRequests = new Map<string, SandboxReadyRequest>();
   /**
    * When this process last proved a sandbox carries this install's label (never one that does
@@ -622,15 +633,49 @@ export class DaytonaService {
     this.ownedTokens.clear();
     this.sshConfigured.clear();
     this.readyAt.clear();
+    this.staleAliases.push(...owned);
+    await this.removeStaleAliases();
+    await this.retirePooledSsh(connected);
+    return tokens;
+  }
+
+  /** Remove the stale aliases (see staleAliases); a failure keeps them for the next attempt. */
+  private async removeStaleAliases(): Promise<void> {
+    const removing = this.staleAliases;
+    if (removing.length === 0) return;
     try {
-      await this.sshConfigWriter.removeSandboxTokens(owned);
+      await this.sshConfigWriter.removeSandboxTokens(removing);
     } catch (error) {
       log.warn("Could not remove the old Daytona account's ssh aliases", {
         error: getErrorMessage(error),
       });
+      return;
     }
-    await this.retirePooledSsh(connected);
-    return tokens;
+    // A retirement during the removal may have added more.
+    this.staleAliases = this.staleAliases.filter((alias) => !removing.includes(alias));
+  }
+
+  /**
+   * Run before every ssh to the sandbox: refuses while its include block may still hold an old
+   * account's token (see staleAliases), retrying the removal first. Nothing to do, and no
+   * I/O, in the common case.
+   */
+  async requireCurrentSshAlias(sandboxId: string): Promise<void> {
+    if (this.staleAliases.length === 0) return;
+    await this.removeStaleAliases();
+    if (this.staleAliases.some((alias) => alias.sandboxId === sandboxId)) {
+      throw new Error(
+        `Xum could not remove the old Daytona account's ssh alias for sandbox "${sandboxId}" ` +
+          `after a settings change, so it will not ssh to it until it can. ` +
+          `Check that ${getDaytonaSshPaths(this.rootDir).includePath} is writable.`
+      );
+    }
+  }
+
+  /** The sandbox's block now holds a token of the current account. */
+  private replacedStaleAlias(sandboxId: string): void {
+    if (this.staleAliases.length === 0) return;
+    this.staleAliases = this.staleAliases.filter((alias) => alias.sandboxId !== sandboxId);
   }
 
   /** The include blocks this process may change besides the one it writes (see ownedTokens). */
@@ -1439,16 +1484,20 @@ export class DaytonaService {
           const gateway = toSshGateway(await this.getGatewayConfig());
           if (this.sshConfigured.has(sandboxId)) {
             await this.sshConfigWriter.updateToken({ sandboxId, token, gateway });
-            return;
+          } else {
+            await this.sshConfigWriter.writeSandbox({
+              sandboxId,
+              token,
+              gateway,
+              owned: this.ownedSshTokens(),
+            });
           }
-          await this.sshConfigWriter.writeSandbox({
-            sandboxId,
-            token,
-            gateway,
-            owned: this.ownedSshTokens(),
-          });
+          // The new account's block replaced the old token: this sandbox is no longer blocked
+          // on a removal that may keep failing.
+          this.replacedStaleAlias(sandboxId);
         },
       });
+      await this.requireCurrentSshAlias(sandboxId);
       await this.sshConfigWriter.ensureManagedBlock();
       this.sshConfigured.add(sandboxId);
     });

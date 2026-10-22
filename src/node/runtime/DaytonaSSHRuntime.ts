@@ -92,6 +92,7 @@ export type DaytonaRuntimeService = Pick<
   | "gatewayGeneration"
   | "refreshGatewayAfterSshFailure"
   | "loadPersistedTokens"
+  | "requireCurrentSshAlias"
   | "findSnapshot"
   | "getGatewayConfig"
   | "sandboxReferencesElsewhere"
@@ -516,6 +517,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   /** What a recovery from this command's failure must compare against (see SshAttempt). */
   private async prepareSshAttempt(sandboxId: string | undefined): Promise<SshAttempt> {
     if (!sandboxId) return { tokenGeneration: 0, gatewayGeneration: 0 };
+    await this.daytonaService.requireCurrentSshAlias(sandboxId);
     // ssh may send a token an earlier process left in the include file: the redactor must
     // know it before ssh can quote it. Not every command runs after ensureReady.
     await this.daytonaService.loadPersistedTokens();
