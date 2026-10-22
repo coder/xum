@@ -2688,7 +2688,7 @@ export class AgentPluginInstallService {
     // Every manifest candidate, and the generated plugin.json, lives in the staged tree the
     // consent receipt hashes.
     const detected = await detectInstallMethods(stagedDir);
-    const choice = chooseStagedMethod(detected, request, source, marketplace);
+    const choice = await chooseStagedMethod(stagedDir, detected, request, source, marketplace);
     const method = choice.method;
 
     // The crash-recovery marker name is RESERVED: install/update write a
@@ -2769,8 +2769,9 @@ export class AgentPluginInstallService {
     names: string[]
   ): Promise<string[]> {
     if (names.length === 0) return names;
-    // A root SKILL.md makes the repository one skill, and its name (skillsCliSkillNames) is then
-    // the only name. The other roots never use pluginName.
+    // A root SKILL.md makes the repository one skill, and its frontmatter name
+    // (skillsCliSkillNames) is then the only name. The other roots never use pluginName. A skill
+    // whose frontmatter name is not its folder name drops out here: Xum knows it by the folder.
     const accepted = await this.acceptedSkillNames(stagedDir, {
       declared: roots.map((root) => root.root),
       pluginName: names[0],

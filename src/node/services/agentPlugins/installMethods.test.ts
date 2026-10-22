@@ -70,6 +70,33 @@ describe("findSkillsPackageRoots", () => {
     expect(await findSkillsPackageRoots(tmp.path)).toEqual([{ root: ".", skills: [] }]);
   });
 
+  test("mirrors the pinned CLI roots: the root one level deep, then its containers in order", async () => {
+    using tmp = new DisposableTempDir("install-methods");
+    await writeTree(tmp.path, [
+      "root-skill",
+      // The root is walked one level deep only.
+      "examples/too-deep",
+      ".github/skills/gh",
+      ".codex/skills/cx",
+      // Not a folder of skills@1.7.4.
+      ".aider-desk/skills/aider",
+    ]);
+    expect(await findSkillsPackageRoots(tmp.path)).toEqual([
+      { root: ".", skills: ["root-skill"] },
+      { root: ".codex/skills", skills: ["cx"] },
+      { root: ".github/skills", skills: ["gh"] },
+    ]);
+  });
+
+  test("an invalid root SKILL.md does not hide the skills below it", async () => {
+    using tmp = new DisposableTempDir("install-methods");
+    await writeTree(tmp.path, ["skills/foo"], { "SKILL.md": "# No frontmatter\n" });
+    expect(await findSkillsPackageRoots(tmp.path)).toEqual([{ root: "skills", skills: ["foo"] }]);
+    // The CLI also skips a root SKILL.md without a description.
+    await fs.writeFile(path.join(tmp.path, "SKILL.md"), "---\nname: repo\n---\n");
+    expect(await findSkillsPackageRoots(tmp.path)).toEqual([{ root: "skills", skills: ["foo"] }]);
+  });
+
   test("a nested container restarts its own three levels", async () => {
     using tmp = new DisposableTempDir("install-methods");
     await writeTree(tmp.path, ["skills/a", "skills/.curated/g1/g2/deep"]);
@@ -176,6 +203,8 @@ describe("generated plugin names", () => {
     expect(() => toPluginName("___")).toThrow("cannot make a plugin name");
     expect(generatedPluginName({ url: "git@github.com:acme/Team.Skills.git" })).toBe("team.skills");
     expect(generatedPluginName({ url: source.url, subpath: "packs/PDF Tools" })).toBe("pdf-tools");
+    // A Windows path: the last segment, not the whole path.
+    expect(generatedPluginName({ url: "C:\\Users\\me\\Repo\\" })).toBe("repo");
   });
 });
 
@@ -205,6 +234,18 @@ describe("writeGeneratedManifest", () => {
     expect(plugin?.skillsOnly).toBe(true);
     expect(plugin?.hooksPath).toBeUndefined();
     expect(plugin?.agentsDir).toBeUndefined();
+  });
+
+  test("root skill folders install through a declared root that discovery reads as a folder", async () => {
+    using tmp = new DisposableTempDir("install-methods");
+    await writeTree(tmp.path, ["pdf", "skills/a"]);
+    await writeGeneratedManifest(tmp.path, { kind: "skills" }, source);
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    if (plugin === null) throw new Error("the generated manifest is not a plugin");
+    expect(plugin.skillsDirs).toEqual([
+      { dir: plugin.rootPath },
+      { dir: path.join(plugin.rootPath, "skills") },
+    ]);
   });
 
   test("a build that ignores the marker still loads only the listed skills", async () => {
