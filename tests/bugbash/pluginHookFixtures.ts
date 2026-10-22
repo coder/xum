@@ -185,12 +185,15 @@ export async function seedPluginHooks(
   for (const name of PREINSTALLED_PLUGINS) {
     const source = sources.get(name);
     if (source == null) throw new Error(`plugin hook seed: no source for ${name}`);
-    const preview = ok<{
-      source: unknown;
-      method: unknown;
-      lockedSha: string;
-      consentDigest: string;
+    // A source previews as a plugin or as a Claude Code marketplace; these are plugins.
+    const found = ok<{
+      kind: string;
+      preview?: { source: unknown; method: unknown; lockedSha: string; consentDigest: string };
     }>(`preview ${name}`, await api("agentPlugins/preview", { input: source }));
+    const preview = found.preview;
+    if (found.kind !== "plugin" || preview === undefined) {
+      throw new Error(`plugin hook seed: ${name} previewed as a ${found.kind}, not a plugin`);
+    }
     ok(
       `install ${name}`,
       await api("agentPlugins/install", {

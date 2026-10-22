@@ -13,6 +13,7 @@ import * as path from "node:path";
 
 import {
   AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+  INERT_COMPONENT_PATH,
   MAX_SKILLS_ROOTS,
   isPlainObject,
   isSafeContributesPath,
@@ -32,6 +33,16 @@ export interface ClaudePluginComponents {
    */
   agentFiles?: string[];
 }
+
+/** How a Claude manifest is read: the file it came from, and the skills rule. */
+export interface ClaudeManifestOptions {
+  /** The source named in warnings. Default: `.claude-plugin/plugin.json`. */
+  label?: string;
+  /** Entry `skills` replace the default `skills/` (a root-source marketplace entry). */
+  replaceDefaultSkills?: boolean;
+}
+
+const CLAUDE_MANIFEST_LABEL = ".claude-plugin/plugin.json";
 
 export interface NormalizedClaudeManifest {
   manifest: unknown;
@@ -85,7 +96,13 @@ function asList(value: unknown): unknown[] {
  * The safe paths of a path-or-list key, at most `cap` of them. Inline objects and unsafe paths
  * are dropped with one warning each kind, so a long list cannot flood the preview.
  */
-function readPathList(key: string, value: unknown, cap: number, warnings: string[]): string[] {
+function readPathList(
+  key: string,
+  value: unknown,
+  cap: number,
+  warnings: string[],
+  label: string
+): string[] {
   const paths: string[] = [];
   let inline = 0;
   let invalid = 0;
@@ -99,8 +116,7 @@ function readPathList(key: string, value: unknown, cap: number, warnings: string
     if (normalized === undefined) invalid++;
     else if (!paths.includes(normalized)) paths.push(normalized);
   }
-  if (inline > 0)
-    warnings.push(`Inline '${key}' in .claude-plugin/plugin.json is not supported; ignoring`);
+  if (inline > 0) warnings.push(`Inline '${key}' in ${label} is not supported; ignoring`);
   if (invalid > 0) {
     warnings.push(
       `'${key}' must name relative paths inside the plugin; ignoring invalid entries (${invalid})`
@@ -218,11 +234,22 @@ function claudePluginName(name: string, warnings: string[]): string {
 
 /**
  * Claude `skills` adds to the default skills/ scan (Codex replaces it), so the default is listed
- * first. Without a usable entry, the default applies on its own.
+ * first. Without a usable entry, the default applies on its own. `replaceDefault` (a marketplace
+ * entry whose source is the marketplace root): only the listed paths load.
  */
-function skillsRoots(value: unknown, warnings: string[]): { skills?: string[] } {
+function skillsRoots(
+  value: unknown,
+  warnings: string[],
+  options: Required<ClaudeManifestOptions>
+): { skills?: string[] } {
   if (value === undefined) return {};
-  const extra = readPathList("skills", value, MAX_SKILLS_ROOTS - 1, warnings).filter(
+  if (options.replaceDefaultSkills) {
+    const roots = readPathList("skills", value, MAX_SKILLS_ROOTS, warnings, options.label);
+    // An empty list means "no skills", but validation drops an empty list and discovery would
+    // then scan the default skills/. The inert path keeps the set empty.
+    return { skills: roots.length > 0 ? roots : [INERT_COMPONENT_PATH] };
+  }
+  const extra = readPathList("skills", value, MAX_SKILLS_ROOTS - 1, warnings, options.label).filter(
     (root) => root !== "skills"
   );
   return extra.length > 0 ? { skills: ["skills", ...extra] } : {};
@@ -234,24 +261,27 @@ function skillsRoots(value: unknown, warnings: string[]): { skills?: string[] } 
  */
 function readClaudeComponents(
   raw: Record<string, unknown>,
-  warnings: string[]
+  warnings: string[],
+  label: string
 ): ClaudePluginComponents {
   const claude: ClaudePluginComponents = {};
   if (isPlainObject(raw.commands)) {
     warnings.push("An object map in 'commands' is not supported; ignoring it");
     claude.commands = [];
   } else if (raw.commands !== undefined) {
-    claude.commands = readPathList("commands", raw.commands, MAX_SKILLS_ROOTS, warnings);
+    claude.commands = readPathList("commands", raw.commands, MAX_SKILLS_ROOTS, warnings, label);
   }
   if (raw.hooks !== undefined) {
-    claude.hooks = readPathList("hooks", raw.hooks, MAX_HOOK_POINTER_ENTRIES, warnings);
+    claude.hooks = readPathList("hooks", raw.hooks, MAX_HOOK_POINTER_ENTRIES, warnings, label);
   }
   return claude;
 }
 
 /**
  * Rewrite a `.claude-plugin/plugin.json` document into the Agent Plugins 1.0.0 shape. Used ONLY
- * for that fallback file: the root `plugin.json` parse stays strict.
+ * for that fallback file and for a Claude marketplace entry that serves as the manifest
+ * (installMethods.ts writes the result as a generated plugin.json): the root `plugin.json` parse
+ * stays strict.
  *
  * Mapping: metadata keys keep their names. `skills` adds to the default `skills/` (Codex
  * replaces it). `agents` maps to one folder (agentsFolder). `mcpServers` maps to one MCP file
@@ -265,17 +295,24 @@ function readClaudeComponents(
  * hook tool grants) are dropped here. Discovery also skips the implicit hooks.js and workflows/
  * for these packages, and the hooks loader lists Claude hooks without running any of them.
  */
-export function normalizeClaudeManifest(raw: unknown): NormalizedClaudeManifest {
+export function normalizeClaudeManifest(
+  raw: unknown,
+  options: ClaudeManifestOptions = {}
+): NormalizedClaudeManifest {
   const warnings: string[] = [];
   if (!isPlainObject(raw)) return { manifest: raw, warnings, claude: {} };
+  const resolved: Required<ClaudeManifestOptions> = {
+    label: options.label ?? CLAUDE_MANIFEST_LABEL,
+    replaceDefaultSkills: options.replaceDefaultSkills ?? false,
+  };
   const manifest = readMetadata(raw, warnings);
   const agents = agentsFolder(raw.agents, warnings);
   manifest.contributes = {
-    ...skillsRoots(raw.skills, warnings),
+    ...skillsRoots(raw.skills, warnings, resolved),
     ...(agents.agents !== undefined ? { agents: agents.agents } : {}),
     ...mcpFile(raw.mcpServers, warnings),
   };
-  const claude = readClaudeComponents(raw, warnings);
+  const claude = readClaudeComponents(raw, warnings, resolved.label);
   if (agents.files !== undefined) claude.agentFiles = agents.files;
   return { manifest, warnings, claude };
 }
