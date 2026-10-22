@@ -66,8 +66,8 @@ async function archiveSandbox(
 
   // A start in flight would restart the sandbox after the stop below.
   await options.daytonaService.waitForSandboxReadiness(sandboxId);
-  // Only archived workspaces left on it: nobody works there now, so the policy applies, for
-  // this workspace's own sandbox or for one whose archived owner deferred it to this archive.
+  // Only archived workspaces left on it: nobody works there now, so the archive setting applies,
+  // for this workspace's own sandbox or for one whose archived owner left it to this archive.
   const owned =
     isDedicatedDaytonaSandbox(args.workspaceMetadata.runtimeConfig) || others === "archivedOwner";
   const result = owned
@@ -122,11 +122,11 @@ export function stoppedNotDeletedNotice(sandboxId: string): string {
 }
 
 /**
- * The policy an archived owner deferred (see archiveSandbox), applied by whatever ends the
- * last other use of the sandbox: with archived workspaces left on it, "delete" stops too.
+ * The archive setting for a sandbox whose last use just ended while archived workspaces stay on
+ * it (see archiveSandbox): "delete" stops too, since they still have their checkouts there.
  * The caller proved the sandbox is Xum's. Undefined when nothing was done, else the notice.
  */
-export async function applyDeferredArchivePolicy(
+export async function applyArchiveSettingToIdleSandbox(
   daytonaService: Pick<DaytonaService, "getSandboxState" | "stopAndWait">,
   behavior: CoderWorkspaceArchiveBehavior,
   sandboxId: string,
@@ -135,7 +135,7 @@ export async function applyDeferredArchivePolicy(
   if (behavior === "keep") return undefined;
   const { state } = await daytonaService.getSandboxState(sandboxId);
   if (!isRunning(state)) return undefined;
-  log.debug("Stopping a Daytona sandbox whose archived owner deferred its policy", { sandboxId });
+  log.debug("Stopping a Daytona sandbox that only archived workspaces use", { sandboxId });
   await daytonaService.stopAndWait(sandboxId, now() + DAYTONA_STOP_TIMEOUT_MS);
   return behavior === "delete" ? { notice: stoppedNotDeletedNotice(sandboxId) } : {};
 }

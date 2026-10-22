@@ -228,8 +228,8 @@ export interface DaytonaServiceOptions {
   /** Defaults to retiring the pooled OpenSSH and ssh2 connections of the sandbox's alias. */
   retireSshConnections?: (sandboxId: string) => Promise<void>;
   /**
-   * The archive behavior in Settings, for the removal that settles a policy an archived owner
-   * deferred (see the archive hook). Without it such a removal keeps the sandbox as it is.
+   * The archive behavior in Settings, for a removal that ends the last use of a sandbox an
+   * archived owner left alone (see the archive hook). Without it such a removal keeps it as is.
    */
   getArchiveBehavior?: () => CoderWorkspaceArchiveBehavior;
 }
@@ -643,7 +643,7 @@ export class DaytonaService {
   /**
    * For archive: whether another workspace still works in the sandbox ("active"), only
    * archived ones reference it ("archived", or "archivedOwner" when one of them is a workspace
-   * whose sandbox Xum created, which deferred its archive policy), or none does. Matched and
+   * whose sandbox Xum created, whose archive left the sandbox alone), or none does. Matched and
    * failing closed (as "active") like sandboxReferencesElsewhere; removal still counts
    * archived workspaces.
    */

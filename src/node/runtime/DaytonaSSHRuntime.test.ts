@@ -1415,14 +1415,14 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(rig.plane.find("sb-7")).toBeDefined();
   });
 
-  it("applies the archived owner's deferred policy when the last attached workspace is removed", async () => {
+  it("applies the archive setting when removing the last attached workspace leaves only an archived owner", async () => {
     const sshDelete = spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
       success: true,
       deletedPath: "/path",
     });
     try {
       const sandbox = rig.plane.addSandbox({ id: "xum-owner" });
-      // The owner was archived while the attached workspace worked there: it deferred its policy.
+      // The owner was archived while the attached workspace worked there: it left the sandbox alone.
       rig.workspaces.splice(0, rig.workspaces.length, {
         workspaceId: "ws-owner",
         runtimeConfig: sshDaytonaConfig({ sandboxId: "xum-owner", shared: false }),

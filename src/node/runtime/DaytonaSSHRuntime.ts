@@ -55,7 +55,7 @@ import {
   type DaytonaAccount,
   type DaytonaService,
 } from "@/node/services/daytona/daytonaService";
-import { applyDeferredArchivePolicy } from "@/node/services/daytona/daytonaLifecycleHooks";
+import { applyArchiveSettingToIdleSandbox } from "@/node/services/daytona/daytonaLifecycleHooks";
 import { log } from "@/node/services/log";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { seedAgentHome, type AgentHomeSeedSources } from "./daytonaAgentHomeSeed";
@@ -1429,15 +1429,16 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     }
     if (fate === "handOff") return this.handOffSandbox(sandboxId, result, removal);
     await this.releaseAccessOnDelete(sandboxId, fate);
-    return fate === "keep" ? this.settleDeferredArchivePolicy(sandboxId, result) : result;
+    return fate === "keep" ? this.applyArchiveSettingAfterLastUse(sandboxId, result) : result;
   }
 
   /**
    * A kept sandbox whose other workspaces are all archived, one of them its Xum owner: that
-   * owner's archive deferred its policy to the last use of the sandbox, which this removal
-   * ended. Applied as the archive hook does then; a failure is a warning, the removal stands.
+   * owner's archive left it alone while this workspace used it, and this removal ended that use.
+   * The archive setting in force now applies, as when the last user is archived (the archive
+   * hook reads it then too); a failure is a warning, the removal stands.
    */
-  private async settleDeferredArchivePolicy(
+  private async applyArchiveSettingAfterLastUse(
     sandboxId: string,
     result: RemovedCheckout
   ): Promise<RemovedCheckout> {
@@ -1448,14 +1449,15 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       const uses = await this.daytonaService.sandboxUseElsewhere(sandboxId, this.workspaceId);
       if (uses !== "archivedOwner") return result;
       if ((await this.daytonaService.sandboxOwnership(sandboxId)) !== "owned") return result;
-      notice = (await applyDeferredArchivePolicy(this.daytonaService, behavior, sandboxId))?.notice;
+      notice = (await applyArchiveSettingToIdleSandbox(this.daytonaService, behavior, sandboxId))
+        ?.notice;
     } catch (error) {
       const message = getErrorMessage(error);
-      log.warn("Failed to apply the deferred archive policy to a Daytona sandbox", {
+      log.warn("Failed to apply the archive setting to a Daytona sandbox", {
         sandboxId,
         error: message,
       });
-      notice = `Could not ${behavior} Daytona sandbox "${sandboxId}" as its archived workspace's policy asks: ${message}`;
+      notice = `Could not stop Daytona sandbox "${sandboxId}" as the archive setting asks: ${message}`;
     }
     if (!notice) return result;
     return { ...result, notice: [result.notice, notice].filter(Boolean).join(" ") };
