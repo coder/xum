@@ -1027,6 +1027,21 @@ export interface AgentSessionStreamManager {
   readonly hostClock?: HostClock;
 }
 
+/**
+ * One clock with the runner that supervises a session and runs RetryManager's sleeps: the
+ * explicit clock first, then the stream's, else the clock of the runner that supervise() uses.
+ */
+function resolveSessionHostClock(
+  options: Pick<AgentSessionOptions, "hostClock" | "effectRunner">,
+  streamManager: AgentSessionStreamManager
+): HostClock {
+  return (
+    options.hostClock ??
+    streamManager.hostClock ??
+    hostClockFor(options.effectRunner ?? streamManager.effectRunner ?? defaultEffectRunner)
+  );
+}
+
 /** Keeps AgentSession coupled only to the AI operations and events it consumes. */
 export interface AgentSessionAIService extends BranchSummaryAiService {
   createModelWithPinnedOptions: AIService["createModelWithPinnedOptions"];
@@ -1959,12 +1974,7 @@ export class AgentSession {
       "AgentSession requires stream lifecycle access"
     );
     this.streamManager = streamManagerCandidate as AgentSessionStreamManager;
-    // One clock with the runner that supervises this session and runs RetryManager's sleeps:
-    // the explicit clock first, then the stream's, else the clock of the runner of supervise().
-    this.hostClock =
-      options.hostClock ??
-      this.streamManager.hostClock ??
-      hostClockFor(options.effectRunner ?? this.streamManager.effectRunner ?? defaultEffectRunner);
+    this.hostClock = resolveSessionHostClock(options, this.streamManager);
     this.mcpServerManager = mcpServerManager;
     this.initStateManager = initStateManager;
     this.backgroundProcessManager = backgroundProcessManager;
