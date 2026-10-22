@@ -774,63 +774,148 @@ describe("DaytonaService", () => {
     expect(labels[DAYTONA_LABEL_PROJECT]).toBe("my-project");
   });
 
-  // Another backend on this root switched accounts: this one cannot revoke the old tokens, so
-  // their aliases must leave the shared include file before it retires the connections, or a
-  // fresh ssh from an alias would keep reaching the old account's sandbox.
-  it("drops the old account's aliases from the include file when another process switches", async () => {
+  /**
+   * Backends on one Xum root (a desktop app next to `xum server`) with two accounts: key-a on
+   * Daytona's default deployment, key-b on its own, with its own ssh gateway. They share the
+   * saved settings and the real include file under a temp home.
+   */
+  function accountsOnOneRoot() {
     const planes = new Map([
       ["Bearer key-a", new FakeDaytonaControlPlane(() => clock)],
       ["Bearer key-b", new FakeDaytonaControlPlane(() => clock)],
     ]);
     for (const [auth, accountPlane] of planes) {
       accountPlane.tokenPrefix = `${auth.slice(-1)}-tok`;
-      for (const id of ["sb-1", "sb-2", "sb-3"]) accountPlane.addSandbox({ id, state: "started" });
+      for (const id of ["sb-1", "sb-2", "sb-3", "sb-4"]) {
+        accountPlane.addSandbox({ id, state: "started" });
+      }
     }
+    const planeA = planes.get("Bearer key-a")!;
+    const planeB = planes.get("Bearer key-b")!;
+    planeB.gateway = {
+      host: "ssh.b.daytona.test",
+      port: 22,
+      hostKeys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAccountBKey"],
+    };
     const sshConfigPath = path.join(rootDir, "home", ".ssh", "config");
-    const backend = () =>
+    const writer = () => new DaytonaSshConfigWriter({ xumHome: rootDir, sshConfigPath });
+    const backend = (
+      options: { retireSshConnections?: (sandboxId: string) => Promise<void> } = {}
+    ) =>
       new DaytonaService({
         credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "key-a" }),
         rootDir,
-        sshConfigWriter: new DaytonaSshConfigWriter({ xumHome: rootDir, sshConfigPath }),
+        sshConfigWriter: writer(),
         fetch: ((input: string | URL | Request, init?: RequestInit) => {
-          const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
-          // GET /config is public: both accounts share one deployment.
-          return (planes.get(auth) ?? planes.get("Bearer key-a"))!.fetch(input, init);
+          const url = new URL(input instanceof Request ? input.url : input.toString());
+          const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
+          // GET /config is public: the URL names the deployment.
+          const deployment = url.hostname === "b.daytona.test" ? planeB : planeA;
+          return (auth === undefined ? deployment : planes.get(auth)!).fetch(input, init);
         }) as typeof fetch,
         now: () => clock,
+        ...options,
       });
-    const desktop = backend();
-    const server = backend();
-    const tokenOf = async (sandboxId: string): Promise<string> => {
-      const tokens = await new DaytonaSshConfigWriter({
-        xumHome: rootDir,
-        sshConfigPath,
-      }).readTokens();
-      const token = tokens.find((entry) => entry.sandboxId === sandboxId)?.token;
-      if (token === undefined) throw new Error(`No include block for ${sandboxId}`);
-      return token;
+    const switchToB = { apiKey: "key-b", apiUrl: "https://b.daytona.test/api" };
+    /** Token and gateway host per alias in the include file. */
+    const blocks = async () => {
+      const include = await fs.readFile(writer().paths.includePath, "utf8").catch(() => "");
+      return Object.fromEntries(
+        [...include.matchAll(/^Host (\S+)\.xum--daytona\n((?: {2}.*\n?)*)/gm)].map(
+          ([, sandboxId, body]) => [
+            sandboxId,
+            `${/User (\S+)/.exec(body)?.[1] ?? "?"}@${/HostName (\S+)/.exec(body)?.[1] ?? "?"}`,
+          ]
+        )
+      );
     };
+    return { planeA, planeB, backend, writer, switchToB, blocks };
+  }
+
+  // Another backend on this root switched accounts: this one cannot revoke the old tokens, so
+  // their aliases must leave the shared include file before it retires the connections, or a
+  // fresh ssh from an alias would keep reaching the old account's sandbox.
+  it("drops the old account's aliases from the include file when another process switches", async () => {
+    const rig = accountsOnOneRoot();
+    const desktop = rig.backend();
+    const server = rig.backend();
+    await server.loadPersistedTokens();
     await desktop.ensureSshAccess("sb-1");
     await desktop.ensureSshAccess("sb-3");
-    await tokenOf("sb-3");
+    expect(Object.keys(await rig.blocks())).toEqual(["sb-1", "sb-3"]);
 
-    await server.setConfig({ apiKey: "key-b" });
+    await server.setConfig(rig.switchToB);
     await server.ensureSshAccess("sb-1");
     await server.ensureSshAccess("sb-2");
-    const serverTokens: Record<string, string> = {
-      "sb-1": await tokenOf("sb-1"),
-      "sb-2": await tokenOf("sb-2"),
-    };
+    const serverBlocks = await rig.blocks();
+    expect(Object.keys(serverBlocks).sort()).toEqual(["sb-1", "sb-2", "sb-3"]);
 
     // A status probe is enough for the desktop to notice.
     await desktop.getSandboxState("sb-2");
 
-    const remaining = await new DaytonaSshConfigWriter({
-      xumHome: rootDir,
-      sshConfigPath,
-    }).readTokens();
-    expect(Object.fromEntries(remaining.map((entry) => [entry.sandboxId, entry.token]))).toEqual(
-      serverTokens
-    );
+    const { "sb-3": _desktopOnly, ...kept } = serverBlocks;
+    expect(await rig.blocks()).toEqual(kept);
+  });
+
+  // The old key may already be invalid: its tokens stay live until they expire, so the aliases
+  // that carry them must not outlive the connections the switch retires.
+  it("drops the old account's aliases before retiring connections even when revoking fails", async () => {
+    const rig = accountsOnOneRoot();
+    const aliasesAtRetire: string[][] = [];
+    const service = rig.backend({
+      retireSshConnections: async () => {
+        aliasesAtRetire.push(Object.keys(await rig.blocks()));
+      },
+    });
+    await service.ensureSshAccess("sb-1");
+    await service.ensureSshAccess("sb-2");
+    rig.planeA.failingRoutes.add("DELETE /sandbox/sb-1/ssh-access");
+    rig.planeA.failingRoutes.add("DELETE /sandbox/sb-2/ssh-access");
+
+    await service.setConfig(rig.switchToB);
+
+    expect(rig.planeA.revokedTokens).toEqual([]);
+    expect(aliasesAtRetire).toEqual([[], []]);
+    expect(await rig.blocks()).toEqual({});
+  });
+
+  // The desktop's mint started under account A; the server then switched to B and wrote its
+  // own blocks for B's gateway. The desktop's late gateway install must not move B's blocks
+  // (which keep B's token, so the server would never repair them) back to A's gateway.
+  it("leaves another account's blocks alone when an old-account gateway install lands late", async () => {
+    const rig = accountsOnOneRoot();
+    const desktop = rig.backend();
+    const server = rig.backend();
+    await server.loadPersistedTokens();
+    await desktop.ensureSshAccess("sb-1");
+    await desktop.ensureSshAccess("sb-4");
+    let mintStarted!: () => void;
+    const started = new Promise<void>((resolve) => (mintStarted = resolve));
+    let releaseMint!: () => void;
+    const released = new Promise<void>((resolve) => (releaseMint = resolve));
+    rig.planeA.onRequest.set("POST /sandbox/sb-3/ssh-access", () => {
+      mintStarted();
+      return released;
+    });
+    const lateInstall = desktop.ensureSshAccess("sb-3");
+    await started;
+
+    await server.setConfig(rig.switchToB);
+    await server.ensureSshAccess("sb-1");
+    await server.ensureSshAccess("sb-2");
+    const serverBlocks = await rig.blocks();
+    releaseMint();
+    await lateInstall;
+
+    const after = await rig.blocks();
+    expect(after["sb-1"]).toBe(serverBlocks["sb-1"]);
+    expect(after["sb-2"]).toBe(serverBlocks["sb-2"]);
+    expect(after["sb-1"]).toEndWith("@ssh.b.daytona.test");
+    expect(after["sb-3"]).toMatch(/^a-tok\d+@ssh\.daytona\.test$/);
+    expect(after["sb-4"]).toMatch(/^a-tok\d+@ssh\.daytona\.test$/);
+    // Each gateway keeps its pins while a block dials it.
+    const knownHosts = await fs.readFile(rig.writer().paths.knownHostsPath, "utf8");
+    expect(knownHosts).toContain("ssh.b.daytona.test ssh-ed25519");
+    expect(knownHosts).toContain("ssh.daytona.test ssh-ed25519");
   });
 });

@@ -130,7 +130,8 @@ describe("DaytonaSshConfigWriter", () => {
     };
 
     // sb-1 is refreshed first; sb-2 still has a turn on the shared known_hosts file.
-    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA2", gateway: moved });
+    const owned = [{ sandboxId: "sb-2", token: "tokenB" }];
+    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA2", gateway: moved, owned });
 
     const include = await fs.readFile(writer.paths.includePath, "utf8");
     expect(include).not.toContain("ssh.daytona.test");
@@ -148,10 +149,51 @@ describe("DaytonaSshConfigWriter", () => {
     ]);
 
     // Moved back without a token refresh: every block follows, tokens kept.
-    await writer.repointGateway(GATEWAY);
+    await writer.repointGateway(GATEWAY, [...owned, { sandboxId: "sb-1", token: "tokenA2" }]);
     expect(await fs.readFile(writer.paths.includePath, "utf8")).not.toContain("ssh2.daytona.test");
     expect(await writer.readTokens()).toHaveLength(2);
     expect(await fs.readFile(writer.paths.knownHostsPath, "utf8")).toContain("GatewayKey");
+  });
+
+  // Another backend on this root (maybe on another account and deployment) wrote sb-2: only
+  // blocks holding the caller's own tokens follow its gateway, and sb-2 keeps its pins.
+  it("leaves a block it does not own, and its pinned keys, alone when the gateway changes", async () => {
+    const other = {
+      host: "ssh.other.test",
+      port: 2200,
+      hostKeys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherKey"],
+    };
+    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxId: "sb-3", token: "tokenA3", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxId: "sb-2", token: "tokenB", gateway: other });
+    const otherBlock = /Host sb-2\.xum--daytona\n(?: {2}.*\n?)*/.exec(
+      await fs.readFile(writer.paths.includePath, "utf8")
+    )?.[0];
+
+    // A stale holder of sb-2's old token cannot claim the block either.
+    const owned = [
+      { sandboxId: "sb-3", token: "tokenA3" },
+      { sandboxId: "sb-2", token: "tokenB-old" },
+    ];
+    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA2", gateway: GATEWAY, owned });
+    await writer.repointGateway(GATEWAY, owned);
+
+    const include = await fs.readFile(writer.paths.includePath, "utf8");
+    expect(otherBlock).toContain("HostName ssh.other.test");
+    expect(include).toContain(otherBlock ?? "missing");
+    const knownHosts = await fs.readFile(writer.paths.knownHostsPath, "utf8");
+    expect(knownHosts).toContain(
+      "ssh.daytona.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGatewayKey"
+    );
+    expect(knownHosts).toContain("ssh.other.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherKey");
+    expect(knownHosts).toContain(
+      "[ssh.other.test]:2200 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherKey"
+    );
+
+    // Once nothing points at the other gateway, its pins go.
+    await writer.removeSandbox("sb-2");
+    await writer.repointGateway(GATEWAY, owned);
+    expect(await fs.readFile(writer.paths.knownHostsPath, "utf8")).not.toContain("OtherKey");
   });
 
   it("waits for another backend's include file update before reading the file", async () => {
@@ -159,7 +201,7 @@ describe("DaytonaSshConfigWriter", () => {
     const updates = [
       () => writer.writeSandbox({ sandboxId: "sb-2", token: "tokenB", gateway: GATEWAY }),
       () => writer.updateToken({ sandboxId: "sb-1", token: "tokenA2", gateway: GATEWAY }),
-      () => writer.repointGateway(GATEWAY),
+      () => writer.repointGateway(GATEWAY, []),
       () => writer.removeSandbox("sb-1"),
     ];
     for (const update of updates) {
@@ -234,7 +276,7 @@ describe("DaytonaSshConfigWriter", () => {
     for (const update of [
       () => tokenWriter.writeSandbox(input),
       () => tokenWriter.updateToken(input),
-      () => tokenWriter.repointGateway(GATEWAY),
+      () => tokenWriter.repointGateway(GATEWAY, []),
     ]) {
       // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
       await expect(update()).rejects.toThrow(

@@ -264,9 +264,14 @@ function renderIncludeFile(blocks: Map<string, string>): string {
   return `${[INCLUDE_FILE_HEADER, ...blocks.values()].join("\n\n")}\n`;
 }
 
-function tokensIn(blocks: Map<string, string>): Array<{ sandboxId: string; token: string }> {
+export interface SandboxToken {
+  sandboxId: string;
+  token: string;
+}
+
+function tokensIn(blocks: Map<string, string>): SandboxToken[] {
   const suffix = `.${XUM_DAYTONA_HOST_SUFFIX}`;
-  const tokens: Array<{ sandboxId: string; token: string }> = [];
+  const tokens: SandboxToken[] = [];
   for (const [alias, block] of blocks) {
     const token = /^\s*User\s+(\S+)\s*$/m.exec(block)?.[1];
     if (alias.endsWith(suffix) && token) {
@@ -274,6 +279,21 @@ function tokensIn(blocks: Map<string, string>): Array<{ sandboxId: string; token
     }
   }
   return tokens;
+}
+
+function hostKeyAliasesIn(blocks: Map<string, string>): string[] {
+  return [...blocks.values()].flatMap(
+    (block) => /^\s*HostKeyAlias\s+(\S+)\s*$/m.exec(block)?.[1] ?? []
+  );
+}
+
+/** The hosts a known_hosts line (as renderDaytonaKnownHosts writes it) pins: `h` or `[h]:port`. */
+function knownHostsLineHosts(line: string): string[] {
+  const field = line.trim().split(/\s+/)[0] ?? "";
+  return field
+    .split(",")
+    .filter((entry) => entry.length > 0)
+    .map((entry) => /^\[(.+)\]:\d+$/.exec(entry)?.[1] ?? entry);
 }
 
 // One lock per include file across writer instances in this process (withIncludeFileLock adds
@@ -296,13 +316,17 @@ export class DaytonaSshConfigWriter {
     this.sshConfigPath = options.sshConfigPath;
   }
 
-  /** First write for a sandbox: known_hosts, its include block, and the managed ssh block. */
+  /**
+   * First write for a sandbox: known_hosts, its include block, and the managed ssh block. The
+   * other blocks in `owned` (the caller's own tokens) follow the gateway; see installGateway.
+   */
   async writeSandbox(input: {
     sandboxId: string;
     token: string;
     gateway: DaytonaSshGateway;
+    owned?: readonly SandboxToken[];
   }): Promise<void> {
-    await this.installGateway(input.gateway, (blocks) =>
+    await this.installGateway(input.gateway, input.owned ?? [], (blocks) =>
       blocks.set(toXumDaytonaHost(input.sandboxId), this.renderBlock(input))
     );
     await this.ensureManagedBlock();
@@ -326,31 +350,44 @@ export class DaytonaSshConfigWriter {
     });
   }
 
-  /** Daytona moved its gateway: repoint every sandbox's block (keeping its token) and pins. */
-  async repointGateway(gateway: DaytonaSshGateway): Promise<void> {
-    await this.installGateway(gateway, () => undefined);
+  /** Daytona moved its gateway: repoint the caller's own blocks (keeping their tokens). */
+  async repointGateway(gateway: DaytonaSshGateway, owned: readonly SandboxToken[]): Promise<void> {
+    await this.installGateway(gateway, owned, () => undefined);
   }
 
   /**
-   * known_hosts is shared by every alias: a gateway change repoints them all (each keeps its
-   * token) in the same step, or another sandbox's turn would dial the old host with new pins.
+   * known_hosts is shared by every alias: a gateway change repoints the caller's other blocks
+   * (each keeps its token) in the same step, or another sandbox's turn would dial the old host
+   * with new pins. Only blocks still holding a token in `owned` move: another backend on this
+   * root may have written the rest for another account (and deployment) after a settings
+   * change, and its block would keep its token, so that backend would never repair it. Pins of
+   * a gateway some remaining block still dials stay for the same reason.
    */
   private async installGateway(
     gateway: DaytonaSshGateway,
+    owned: readonly SandboxToken[],
     edit: (blocks: Map<string, string>) => void
   ): Promise<void> {
-    const knownHosts = renderDaytonaKnownHosts(gateway);
+    const gatewayLines = renderDaytonaKnownHosts(gateway);
     this.assertPathsReadLiterallyBySsh();
+    const ownedTokens = new Map(owned.map(({ sandboxId, token }) => [sandboxId, token]));
     await this.withIncludeFileLock(async () => {
-      await writeFileAtomic(this.paths.knownHostsPath, knownHosts, {
-        encoding: "utf-8",
-        mode: 0o600,
-      });
       const blocks = await this.readBlocks();
       for (const other of tokensIn(blocks)) {
+        if (ownedTokens.get(other.sandboxId) !== other.token) continue;
         blocks.set(toXumDaytonaHost(other.sandboxId), this.renderBlock({ ...other, gateway }));
       }
       edit(blocks);
+      const keptHosts = new Set(hostKeyAliasesIn(blocks));
+      keptHosts.delete(gateway.host);
+      const keptLines = (await this.readKnownHosts())
+        .split("\n")
+        .filter((line) => knownHostsLineHosts(line).some((host) => keptHosts.has(host)));
+      await writeFileAtomic(
+        this.paths.knownHostsPath,
+        keptLines.length > 0 ? `${keptLines.join("\n")}\n${gatewayLines}` : gatewayLines,
+        { encoding: "utf-8", mode: 0o600 }
+      );
       await this.writeBlocks(blocks);
     });
   }
@@ -377,7 +414,7 @@ export class DaytonaSshConfigWriter {
    * Remove each alias whose block still holds the given token. Another backend that rewrote
    * the alias (a new token, maybe of another account) keeps its block.
    */
-  async removeSandboxTokens(held: ReadonlyArray<{ sandboxId: string; token: string }>) {
+  async removeSandboxTokens(held: readonly SandboxToken[]) {
     if (held.length === 0) return;
     const stale = new Map(held.map(({ sandboxId, token }) => [toXumDaytonaHost(sandboxId), token]));
     await this.withIncludeFileLock(async () => {
@@ -389,8 +426,17 @@ export class DaytonaSshConfigWriter {
     });
   }
 
+  private async readKnownHosts(): Promise<string> {
+    try {
+      return await fs.readFile(this.paths.knownHostsPath, "utf-8");
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return "";
+      throw error;
+    }
+  }
+
   /** The sandbox ids and tokens the include file holds (written by this or an earlier process). */
-  async readTokens(): Promise<Array<{ sandboxId: string; token: string }>> {
+  async readTokens(): Promise<SandboxToken[]> {
     return tokensIn(await this.readBlocks());
   }
 

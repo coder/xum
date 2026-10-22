@@ -18,7 +18,7 @@ import {
   type DaytonaResolvedCredentials,
 } from "@/node/config/daytonaCredentialsStore";
 import { loadOrCreateInstallationId } from "@/node/config/installationIdentity";
-import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
+import { DaytonaSshConfigWriter, type SandboxToken } from "@/node/runtime/daytonaSshConfig";
 import { retireSshConnections } from "@/node/runtime/transports";
 import { rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
 import {
@@ -392,6 +392,13 @@ export class DaytonaService {
   private readonly readyAt = new Map<string, number>();
   /** Whether the include file was read once, seeding the tokens an earlier process left. */
   private persistedTokensLoaded = false;
+  /**
+   * The cached tokens this process minted, or took over from an earlier run before any account
+   * change: the only include blocks it changes besides the one sandbox it writes (exact token
+   * match, as removeSandboxTokens does). A token it merely follows was written by another
+   * backend, which may be on another account by now.
+   */
+  private readonly ownedTokens = new Set<string>();
   private readonly readyRequests = new Map<string, SandboxReadyRequest>();
   /**
    * When this process last proved a sandbox carries this install's label (never one that does
@@ -461,9 +468,15 @@ export class DaytonaService {
       rememberDaytonaToken(token);
       tokens.set(sandboxId, token);
       // An earlier process's tokens: holding them lets a replacement, a settings change or an
-      // archive revoke them. The file has no expiry, so they are due for refresh at once.
+      // archive revoke them. The file has no expiry, so they are due for refresh at once. They
+      // are this process's own only while it has seen no account change: they then belong to
+      // the account it runs for (the saved credentials are shared by every backend on the root).
       if (!this.persistedTokensLoaded && !this.tokens.has(sandboxId)) {
-        this.cacheNewToken(sandboxId, { token, expiresAt: new Date(0).toISOString() });
+        this.cacheNewToken(
+          sandboxId,
+          { token, expiresAt: new Date(0).toISOString() },
+          { owned: this.credentialsGeneration === 0 }
+        );
       }
     }
     this.persistedTokensLoaded = true;
@@ -499,7 +512,11 @@ export class DaytonaService {
     }
     // Its expiry is unknown; it was minted after this process's, so that expiry is a bound.
     if (cached && cached.token !== fileToken) {
-      this.cacheNewToken(sandboxId, { token: fileToken, expiresAt: cached.expiresAt });
+      this.cacheNewToken(
+        sandboxId,
+        { token: fileToken, expiresAt: cached.expiresAt },
+        { owned: false }
+      );
     }
   }
 
@@ -511,7 +528,11 @@ export class DaytonaService {
    */
   private holdFirstSeenToken(sandboxId: string, fileToken: string | undefined): void {
     if (fileToken === undefined || this.tokens.has(sandboxId)) return;
-    this.cacheNewToken(sandboxId, { token: fileToken, expiresAt: new Date(0).toISOString() });
+    this.cacheNewToken(
+      sandboxId,
+      { token: fileToken, expiresAt: new Date(0).toISOString() },
+      { owned: false }
+    );
   }
 
   getPublicConfig(): Promise<DaytonaPublicConfig> {
@@ -583,21 +604,40 @@ export class DaytonaService {
    * Tokens and gateway data belong to the old account or deployment. A mint in flight
    * finishes under the old settings: it sees the bump and starts over. Returns the tokens
    * dropped, for the caller to revoke.
+   *
+   * The old account's aliases leave the shared include file before the connections are retired
+   * (as releaseSshAccess does), whether or not the caller then manages to revoke the tokens: a
+   * fresh ssh from an alias would otherwise keep reaching the old sandbox until its token
+   * expires. Only blocks still holding a token this process owns go: another backend may have
+   * rewritten an alias, maybe for the new account.
    */
-  private async retireAccountCaches(
-    beforeRetiringConnections?: (tokens: Array<[string, DaytonaSshAccess]>) => Promise<void>
-  ): Promise<Array<[string, DaytonaSshAccess]>> {
+  private async retireAccountCaches(): Promise<Array<[string, DaytonaSshAccess]>> {
     this.credentialsGeneration++;
     this.provenOwned.clear();
     const tokens = [...this.tokens];
+    const owned = this.ownedSshTokens();
     const connected = this.sandboxesWithSsh();
     this.gatewayCache = undefined;
     this.tokens.clear();
+    this.ownedTokens.clear();
     this.sshConfigured.clear();
     this.readyAt.clear();
-    await beforeRetiringConnections?.(tokens);
+    try {
+      await this.sshConfigWriter.removeSandboxTokens(owned);
+    } catch (error) {
+      log.warn("Could not remove the old Daytona account's ssh aliases", {
+        error: getErrorMessage(error),
+      });
+    }
     await this.retirePooledSsh(connected);
     return tokens;
+  }
+
+  /** The include blocks this process may change besides the one it writes (see ownedTokens). */
+  private ownedSshTokens(): SandboxToken[] {
+    return [...this.tokens]
+      .filter(([, access]) => this.ownedTokens.has(access.token))
+      .map(([sandboxId, access]) => ({ sandboxId, token: access.token }));
   }
 
   private async readSavedCredentials(): Promise<
@@ -623,25 +663,7 @@ export class DaytonaService {
     this.accountFingerprint = fingerprint;
     if (previous === undefined || previous === fingerprint) return;
     log.info("Daytona settings changed in another Xum process; dropping cached SSH access");
-    await this.retireAccountCaches((tokens) => this.removeOldAccountAliases(tokens));
-  }
-
-  /**
-   * The old account's tokens cannot be revoked here, so their aliases leave the shared include
-   * file before the connections are retired (as releaseSshAccess does): a fresh ssh from an
-   * alias would otherwise keep reaching the old sandbox until the token expires. Only blocks
-   * still holding this process's token go: the other backend may have rewritten an alias.
-   */
-  private async removeOldAccountAliases(tokens: Array<[string, DaytonaSshAccess]>) {
-    try {
-      await this.sshConfigWriter.removeSandboxTokens(
-        tokens.map(([sandboxId, access]) => ({ sandboxId, token: access.token }))
-      );
-    } catch (error) {
-      log.warn("Could not remove the old Daytona account's ssh aliases", {
-        error: getErrorMessage(error),
-      });
-    }
+    await this.retireAccountCaches();
   }
 
   private async getClientIfConfigured(): Promise<DaytonaClient | undefined> {
@@ -1004,7 +1026,7 @@ export class DaytonaService {
       this.tokens.set(sandboxId, { ...access, expiresAt: new Date(0).toISOString() });
     }
     try {
-      await this.sshConfigWriter.repointGateway(toSshGateway(config));
+      await this.sshConfigWriter.repointGateway(toSshGateway(config), this.ownedSshTokens());
     } catch (error) {
       // Each sandbox's next ssh access rewrites its setup anyway.
       log.warn("Could not repoint the Daytona ssh setup at the moved gateway", {
@@ -1419,7 +1441,12 @@ export class DaytonaService {
             await this.sshConfigWriter.updateToken({ sandboxId, token, gateway });
             return;
           }
-          await this.sshConfigWriter.writeSandbox({ sandboxId, token, gateway });
+          await this.sshConfigWriter.writeSandbox({
+            sandboxId,
+            token,
+            gateway,
+            owned: this.ownedSshTokens(),
+          });
         },
       });
       await this.sshConfigWriter.ensureManagedBlock();
@@ -1435,7 +1462,14 @@ export class DaytonaService {
     return this.tokenGenerations.get(sandboxId) ?? 0;
   }
 
-  private cacheNewToken(sandboxId: string, access: DaytonaSshAccess): void {
+  private cacheNewToken(
+    sandboxId: string,
+    access: DaytonaSshAccess,
+    options: { owned: boolean }
+  ): void {
+    const replaced = this.tokens.get(sandboxId)?.token;
+    if (replaced !== undefined) this.ownedTokens.delete(replaced);
+    if (options.owned) this.ownedTokens.add(access.token);
     this.tokens.set(sandboxId, access);
     this.tokenGenerations.set(sandboxId, ++this.lastTokenGeneration);
   }
@@ -1549,7 +1583,7 @@ export class DaytonaService {
     }
     const outdatedAfterWrite = this.settleOutdatedMint(mint, true);
     if (outdatedAfterWrite) return outdatedAfterWrite;
-    this.cacheNewToken(sandboxId, access);
+    this.cacheNewToken(sandboxId, access, { owned: true });
     if (previous && previous.token !== access.token) {
       await this.revokeQuietly(client, sandboxId, previous.token);
     }
@@ -1594,7 +1628,10 @@ export class DaytonaService {
     wroteIncludeFile: boolean
   ): Promise<never> {
     await this.revokeQuietly(client, sandboxId, access.token);
-    if (wroteIncludeFile) await this.sshConfigWriter.removeSandbox(sandboxId);
+    // Token-qualified: another backend may have written the alias since.
+    if (wroteIncludeFile) {
+      await this.sshConfigWriter.removeSandboxTokens([{ sandboxId, token: access.token }]);
+    }
     throw new Error(
       `Xum released its SSH access to Daytona sandbox "${sandboxId}" while a token was minted`
     );
@@ -1605,6 +1642,7 @@ export class DaytonaService {
     const cached = this.tokens.get(sandboxId);
     this.tokens.delete(sandboxId);
     if (!cached) return;
+    this.ownedTokens.delete(cached.token);
     const { client } = await this.getClient();
     await this.revokeQuietly(client, sandboxId, cached.token);
   }
