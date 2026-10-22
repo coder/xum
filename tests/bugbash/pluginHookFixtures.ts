@@ -132,6 +132,13 @@ function writeHooks(dir: string, hooks: unknown): void {
   fs.writeFileSync(path.join(dir, "hooks", "hooks.json"), text);
 }
 
+/** Makes `dir` a git repository with one commit ("v1") of everything in it. */
+export function commitFixture(dir: string, env: NodeJS.ProcessEnv): void {
+  git(dir, env, "init", "-q", "-b", "main");
+  git(dir, env, "add", ".");
+  git(dir, env, "commit", "-qm", "v1");
+}
+
 /** Writes each fixture as a one-commit git repository; returns name -> absolute path. */
 export function writePluginSources(root: string, env: NodeJS.ProcessEnv): Map<string, string> {
   const paths = new Map<string, string>();
@@ -152,9 +159,7 @@ export function writePluginSources(root: string, env: NodeJS.ProcessEnv): Map<st
       )
     );
     writeHooks(dir, fixture.hooks);
-    git(dir, env, "init", "-q", "-b", "main");
-    git(dir, env, "add", ".");
-    git(dir, env, "commit", "-qm", "v1");
+    commitFixture(dir, env);
     paths.set(fixture.name, dir);
   }
   return paths;

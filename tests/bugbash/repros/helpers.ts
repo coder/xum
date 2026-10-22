@@ -345,3 +345,18 @@ export async function expectNotifyOnAllResponses(
   await browser.keyboard.press("Escape");
   await expect(setting).toBeHidden();
 }
+
+/**
+ * The absolute path of the seeded plugin source `name` (tests/bugbash/pluginInstallFixtures.ts).
+ * Every source sits next to the seeded hook-review-demo plugin, whose install records its path.
+ */
+export async function pluginSourcePath(
+  app: { baseUrl: string | undefined },
+  name: string
+): Promise<string> {
+  const listed = await appClient(app).agentPlugins.list();
+  if (!listed.success) throw new Error(`agentPlugins.list failed: ${listed.error}`);
+  const demo = listed.data.find((item) => item.name === "hook-review-demo")?.source?.url;
+  if (demo === undefined) throw new Error("the seeded hook-review-demo plugin has no source");
+  return `${demo.slice(0, demo.lastIndexOf("/"))}/${name}`;
+}

@@ -24,6 +24,7 @@ import type {
   AgentPluginComponents,
   AgentPluginInstallMethod,
   AgentPluginInstallPreview,
+  AgentPluginMarketplaceListing,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
   AgentPluginPendingSignOuts,
@@ -53,6 +54,7 @@ import {
   installMethodLabel,
   offersSkillsCli,
 } from "./PluginInstallMethods";
+import { MarketplaceListing } from "./PluginMarketplaceListing";
 
 /**
  * Settings → Plugins (global scope only).
@@ -586,12 +588,20 @@ const AddPluginPanel: React.FC<{
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<AgentPluginInstallPreview | null>(null);
+  /** A Claude Code marketplace repository: the user picks an entry, then previews it. */
+  const [marketplace, setMarketplace] = useState<AgentPluginMarketplaceListing | null>(null);
   const [selected, setSelected] = useState<AgentPluginImportedComponents>({
     skills: [],
     mcpServers: [],
   });
   /** The "Skills CLI" choice of the Install as picker: not a managed install. */
   const [cliChosen, setCliChosen] = useState(false);
+  /**
+   * The marketplace entry of the current preview, if any. Its plugin can live in another
+   * repository or folder than the typed source, which the Skills CLI would install from, so an
+   * entry preview offers no Skills CLI choice. Back to the list picks this entry again.
+   */
+  const [previewedEntry, setPreviewedEntry] = useState<string | null>(null);
 
   /** `method`: the Install as choice; null takes the first method that fits. */
   const handlePreview = async (method: AgentPluginInstallMethod | null) => {
@@ -608,13 +618,11 @@ const AddPluginPanel: React.FC<{
       if (!result.success) {
         setError(result.error);
       } else if (result.data.kind === "marketplace") {
-        // The entry list arrives with the marketplace view; until then the panel names it.
-        setError(
-          `This repository is the Claude Code marketplace '${result.data.marketplace.name}'.`
-        );
+        setMarketplace(result.data.marketplace);
       } else {
         const next = result.data.preview;
         setPreview(next);
+        setPreviewedEntry(method?.kind === "claude-marketplace" ? method.entry : null);
         // An accepted preview starts a new consent decision; failed attempts retain choices.
         setSelected({
           skills: next.skills.map((skill) => skill.name),
@@ -632,6 +640,7 @@ const AddPluginPanel: React.FC<{
     if (e.key === "Enter") void handlePreview(null);
   };
 
+  /** Back from a preview: to the marketplace entries when they led here, else to the source. */
   const backToSource = () => {
     setPreview(null);
     setError(null);
@@ -667,7 +676,22 @@ const AddPluginPanel: React.FC<{
 
   return (
     <div className="border-border-medium bg-background-secondary space-y-3 rounded-md border p-3">
-      {preview === null ? (
+      {preview === null && marketplace !== null ? (
+        <MarketplaceListing
+          listing={marketplace}
+          busy={busy}
+          error={error}
+          initialEntry={previewedEntry}
+          onBack={() => {
+            setMarketplace(null);
+            setPreviewedEntry(null);
+            setError(null);
+          }}
+          onPickEntry={() => setError(null)}
+          onPreviewEntry={(entry) => void handlePreview({ kind: "claude-marketplace", entry })}
+          onPickMethod={(method) => void handlePreview(method)}
+        />
+      ) : preview === null ? (
         <>
           <div>
             <label htmlFor="plugin-source" className="text-muted mb-1 block text-xs">
@@ -744,7 +768,10 @@ const AddPluginPanel: React.FC<{
         <>
           <InstallMethodPicker
             preview={preview}
-            cliOffered={offersSkillsCli({ input, ref, subpath, skills: preview.skillsCliSkills })}
+            cliOffered={
+              previewedEntry === null &&
+              offersSkillsCli({ input, ref, subpath, skills: preview.skillsCliSkills })
+            }
             cliChosen={cliChosen}
             disabled={busy}
             onPickCurrent={() => {
@@ -768,29 +795,16 @@ const AddPluginPanel: React.FC<{
               onBack={backToSource}
             />
           ) : (
-            <>
-              <PreviewConsent
-                preview={preview}
-                selected={selected}
-                onSelect={setSelected}
-                busy={busy}
-                error={error}
-              />
-              <div className="flex gap-2">
-                <Button variant="ghost" size="sm" onClick={backToSource} disabled={busy}>
-                  <ArrowLeft className="h-3.5 w-3.5" />
-                  Back
-                </Button>
-                <Button
-                  size="sm"
-                  onClick={() => void handleInstall()}
-                  disabled={busy || preview.installBlockedReason !== undefined}
-                >
-                  {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-                  {busy ? "Installing…" : "Install"}
-                </Button>
-              </div>
-            </>
+            <PreviewConsent
+              preview={preview}
+              selected={selected}
+              onSelect={setSelected}
+              busy={busy}
+              error={error}
+              onBack={backToSource}
+              onInstall={() => void handleInstall()}
+              focusBack={previewedEntry !== null}
+            />
           )}
         </>
       )}
@@ -886,6 +900,13 @@ const PreviewConsent: React.FC<{
   onSelect: (selection: AgentPluginImportedComponents) => void;
   busy: boolean;
   error: string | null;
+  onBack: () => void;
+  onInstall: () => void;
+  /**
+   * An entry preview replaces the marketplace list and unmounts the focused Preview button, so
+   * Back takes the focus (as the list's picked radio does on the way back).
+   */
+  focusBack: boolean;
 }> = (props) => (
   <>
     <PreviewHeader preview={props.preview} />
@@ -938,6 +959,27 @@ const PreviewConsent: React.FC<{
         </span>
       </div>
     )}
+
+    <div className="flex gap-2">
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={props.onBack}
+        disabled={props.busy}
+        autoFocus={props.focusBack}
+      >
+        <ArrowLeft className="h-3.5 w-3.5" />
+        Back
+      </Button>
+      <Button
+        size="sm"
+        onClick={props.onInstall}
+        disabled={props.busy || props.preview.installBlockedReason !== undefined}
+      >
+        {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+        {props.busy ? "Installing…" : "Install"}
+      </Button>
+    </div>
   </>
 );
 

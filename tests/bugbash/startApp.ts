@@ -60,6 +60,7 @@ import { startScriptedModel } from "./scriptedModel";
 import { scriptedModelLogPath } from "./appControl";
 import { seedMcpChat, writeMcpConfig } from "./mcpapps/seed";
 import { seedPluginHooks, writePluginSources } from "./pluginHookFixtures";
+import { writeInstallSources } from "./pluginInstallFixtures";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "../..");
 const SERVER_ENTRY = path.join(REPO_ROOT, "dist/cli/index.js");
@@ -750,7 +751,13 @@ async function main(): Promise<void> {
     fs.mkdirSync(home, { recursive: true });
     if (ai.mode === "real") writeNoToolAgents(xumRoot);
     createDemoRepo(projectPath, env);
-    const pluginSources = writePluginSources(path.join(tempRoot, "plugin-sources"), env);
+    const sourcesRoot = path.join(tempRoot, "plugin-sources");
+    // Hook fixtures, then the install-method fixtures (Claude plugin, marketplace, skills repo):
+    // plugin-sources.md lists both.
+    const pluginSources = new Map([
+      ...writePluginSources(sourcesRoot, env),
+      ...writeInstallSources(sourcesRoot, env),
+    ]);
     if (mcpApps) writeMcpConfig(xumRoot);
 
     const seedPort = await getFreePort();
