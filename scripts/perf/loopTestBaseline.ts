@@ -311,7 +311,7 @@ function renderCompare(compare: LoopTestCompare): string {
     const rerun = check.rerun;
     lines.push(
       `${check.again === null ? "cleared" : "TRIP"} ${file}`,
-      `  stage 1 (whole set): ${describeFile(base, head, file, check.first)}`,
+      `  stage 1 (${base.rounds} paired rounds, load ${load(head)}): ${describeFile(base, head, file, check.first)}`,
       `  stage 2 (alone, ${rerun.head.rounds} paired rounds, load ${load(rerun.head)}): ` +
         describeFile(rerun.base, rerun.head, file, check.again)
     );
