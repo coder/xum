@@ -1751,60 +1751,72 @@ function isHitTarget(element: HTMLElement): boolean {
 }
 
 /**
- * A Windows/Linux titlebar-overlay inset wider than the pane (Linux e2e reported one larger than
- * the whole sidebar) must not squeeze the one-row strip to nothing: tabs stay clickable.
+ * The right sidebar under a Windows/Linux titlebar-overlay inset. The one-row strip must not be
+ * squeezed to nothing, and the selected tab shows whole: capped at the row's width, its label
+ * truncates (#7103). Tabs, "+" and All tabs stay clickable.
  */
-export const TabsReachableUnderWideTitlebarInset: Story = {
-  // Play-only: a regression check, nothing new to look at.
-  parameters: { pixel: PIXEL_DISABLED },
-  render: () => (
-    // On a wrapper, not :root, so the override cannot leak into later stories.
-    <div className="contents" style={{ "--titlebar-right-inset": "2000px" } as CSSProperties}>
-      <RightSidebarStoryShell
-        setup={() => {
-          localStorage.removeItem(RIGHT_SIDEBAR_TAB_KEY);
-          localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
-          seedSidebarLayout("ws-wide-inset", ["costs", "review"], "costs");
-
-          const client = setupSimpleChatStory({
-            workspaceId: "ws-wide-inset",
-            workspaceName: "feature/wide-inset",
-            projectName: "my-app",
-            messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
-          });
-          expandRightSidebar("ws-wide-inset");
-          return client;
-        }}
+function titlebarInsetStory(insetPx: number, sidebarWidthPx: number): Story {
+  const workspaceId = `ws-inset-${insetPx}`;
+  return {
+    // Play-only: a regression check, nothing new to look at.
+    parameters: { pixel: PIXEL_DISABLED },
+    render: () => (
+      // On a wrapper, not :root, so the override cannot leak into later stories.
+      <div
+        className="contents"
+        style={{ "--titlebar-right-inset": `${insetPx}px` } as CSSProperties}
       >
-        <RightSidebarStoryContent workspaceId="ws-wide-inset" />
-      </RightSidebarStoryShell>
-    </div>
-  ),
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    const stats = await canvas.findByRole("tab", { name: /^stats/i, selected: true });
-    const review = await canvas.findByRole("tab", { name: /^review/i });
-    // The capped inset leaves 10rem for the row, "+", All tabs and the toggle's room, so the
-    // selected Stats tab (with its cost badge) can be cut off at its end. Its start stays in
-    // view and takes the click.
-    // "+" (New tab) and All tabs must stay clickable too.
-    await waitFor(() => {
-      if (!isHitTarget(stats)) throw new Error("selected tab is not under the pointer");
-      for (const name of ["New tab", "All tabs"]) {
-        if (!isHitTarget(canvas.getByRole("button", { name }))) {
-          throw new Error(`${name} is not under the pointer`);
+        <RightSidebarStoryShell
+          setup={() => {
+            localStorage.removeItem(RIGHT_SIDEBAR_TAB_KEY);
+            localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, String(sidebarWidthPx));
+            seedSidebarLayout(workspaceId, ["costs", "review"], "costs");
+
+            const client = setupSimpleChatStory({
+              workspaceId,
+              workspaceName: "feature/wide-inset",
+              projectName: "my-app",
+              messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
+              // The cost badge makes Stats wider than the row the capped inset leaves.
+              sessionUsage: createSessionUsage(0.34),
+            });
+            expandRightSidebar(workspaceId);
+            return client;
+          }}
+        >
+          <RightSidebarStoryContent workspaceId={workspaceId} />
+        </RightSidebarStoryShell>
+      </div>
+    ),
+    play: async ({ canvasElement }) => {
+      const canvas = within(canvasElement);
+      const stats = await canvas.findByRole("tab", { name: /stats.*\$0\.34/i, selected: true });
+      const review = await canvas.findByRole("tab", { name: /^review/i });
+      await expectSelectedTabVisible(canvasElement);
+      // "+" (New tab) and All tabs must stay clickable too.
+      await waitFor(() => {
+        if (!isHitTarget(stats)) throw new Error("selected tab is not under the pointer");
+        for (const name of ["New tab", "All tabs"]) {
+          if (!isHitTarget(canvas.getByRole("button", { name }))) {
+            throw new Error(`${name} is not under the pointer`);
+          }
         }
-      }
-    });
-    // Like Playwright: bring the other tab into view, then it must take the click.
-    review.scrollIntoView({ block: "nearest", inline: "nearest" });
-    await waitFor(() => {
-      if (!isHitTarget(review)) throw new Error("unselected tab is not under the pointer");
-    });
-    await userEvent.click(review);
-    await canvas.findByRole("tab", { name: /^review/i, selected: true });
-  },
-};
+      });
+      // Like Playwright: bring the other tab into view, then it must take the click.
+      review.scrollIntoView({ block: "nearest", inline: "nearest" });
+      await waitFor(() => {
+        if (!isHitTarget(review)) throw new Error("unselected tab is not under the pointer");
+      });
+      await userEvent.click(review);
+      await canvas.findByRole("tab", { name: /^review/i, selected: true });
+    },
+  };
+}
+
+/** An inset wider than the pane (Linux e2e reported one larger than the whole sidebar). */
+export const TabsReachableUnderWideTitlebarInset = titlebarInsetStory(2000, 400);
+/** The 138 px Windows/Linux fallback inset at the sidebar's 300 px minimum width. */
+export const SelectedTabFitsUnderTitlebarInset = titlebarInsetStory(138, 300);
 
 const OVERVIEW_WORKSPACE_ID = "ws-overview";
 

@@ -88,7 +88,11 @@ const SortableTab: React.FC<{
   const sortableOnKeyDown = listeners?.onKeyDown;
 
   return (
-    <div className="relative shrink-0" style={style}>
+    // The selected tab is capped at the row's width, so it never shows cut off at the row's end
+    // when the row is narrower than the tab (a 300 px sidebar under the window-controls inset,
+    // #7103): its label truncates and its X stays in view. Only the selected one: a capped terminal
+    // tab is mostly its pop-out and close buttons, so a click on an unselected one would hit them.
+    <div className={cn("relative shrink-0", { "max-w-full": item.selected })} style={style}>
       <Tooltip>
         <TooltipTrigger asChild>
           <div
