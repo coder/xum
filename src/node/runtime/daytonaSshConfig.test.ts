@@ -37,7 +37,7 @@ describe("DaytonaSshConfigWriter", () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  it("appends a Host-scoped Include block after the user's config and writes 0600 files", async () => {
+  it("puts a Host-scoped Include block before the user's config and writes 0600 files", async () => {
     await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
     await fs.writeFile(sshConfigPath, "Host work\n  User me\n", "utf8");
 
@@ -45,12 +45,13 @@ describe("DaytonaSshConfigWriter", () => {
 
     expect(await fs.readFile(sshConfigPath, "utf8")).toBe(
       [
-        "Host work",
-        "  User me",
         XUM_DAYTONA_SSH_BLOCK_START,
         "Host *.xum--daytona",
         `  Include ${writer.paths.includePath}`,
+        "Host *",
         XUM_DAYTONA_SSH_BLOCK_END,
+        "Host work",
+        "  User me",
         "",
       ].join("\n")
     );
@@ -58,6 +59,10 @@ describe("DaytonaSshConfigWriter", () => {
     expect(include).toContain(
       [
         "Host sb-1.xum--daytona",
+        "  ProxyCommand none",
+        "  ForwardAgent no",
+        "  ForwardX11 no",
+        "  PermitLocalCommand no",
         "  HostName ssh.daytona.test",
         "  Port 22",
         "  User tokenA",
@@ -111,7 +116,6 @@ describe("DaytonaSshConfigWriter", () => {
     expect(include).not.toContain("ssh.daytona.test");
     expect(include).toContain(
       [
-        "Host sb-2.xum--daytona",
         "  HostName ssh2.daytona.test",
         "  Port 2222",
         "  User tokenB",
@@ -334,6 +338,91 @@ describe("DaytonaSshConfigWriter", () => {
       await fs.rm(markers, { recursive: true });
       await fs.mkdir(markers);
     }
+  });
+
+  // Editors (VS Code Remote-SSH, Zed) run the user's own ssh against ~/.ssh/config, without the
+  // `-F` Xum passes, and OpenSSH keeps the first value it reads for each option.
+  describe("an editor's ssh client reading the user's ssh config", () => {
+    const resolveFromUserConfig = (host: string) =>
+      spawnSync("ssh", ["-G", "-F", sshConfigPath, host]).stdout.toString();
+
+    it.skipIf(!hasOpenSsh)(
+      "applies Xum's hardening to the alias over an earlier user Host * entry",
+      async () => {
+        await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
+        await fs.writeFile(
+          sshConfigPath,
+          [
+            "Host *",
+            "  StrictHostKeyChecking no",
+            "  UserKnownHostsFile /dev/null",
+            "  ForwardAgent yes",
+            "  ForwardX11 yes",
+            "  PermitLocalCommand yes",
+            "  ProxyCommand nc -X connect -x gateway.example.com:3128 %h %p",
+            "  User me",
+            "",
+          ].join("\n"),
+          "utf8"
+        );
+        await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+
+        const daytona = resolveFromUserConfig(toXumDaytonaHost("sb-1"));
+        expect(daytona).toMatch(/^user tokenA$/m);
+        expect(daytona).toContain("\nstricthostkeychecking true\n");
+        expect(daytona).toContain(`\nuserknownhostsfile ${writer.paths.knownHostsPath}\n`);
+        expect(daytona).toContain("\nforwardagent no\n");
+        expect(daytona).toContain("\nforwardx11 no\n");
+        expect(daytona).toContain("\npermitlocalcommand no\n");
+        expect(daytona).not.toMatch(/\nproxy(command|jump) /);
+
+        const other = resolveFromUserConfig("other.example.com");
+        expect(other).toMatch(/^user me$/m);
+        expect(other).toContain("\nstricthostkeychecking false\n");
+        expect(other).toContain("\nuserknownhostsfile /dev/null\n");
+        expect(other).toContain("\nforwardagent yes\n");
+        expect(other).toContain("\nforwardx11 yes\n");
+        expect(other).toContain("\nproxycommand nc -X connect -x gateway.example.com:3128 %h %p\n");
+      }
+    );
+
+    it.skipIf(!hasOpenSsh)("ignores a ProxyJump the user sets for every host", async () => {
+      await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
+      await fs.writeFile(sshConfigPath, "Host *\n  ProxyJump jump.example.com\n", "utf8");
+      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+
+      expect(resolveFromUserConfig(toXumDaytonaHost("sb-1"))).not.toMatch(/\nproxy(command|jump) /);
+      expect(resolveFromUserConfig("other.example.com")).toContain(
+        "\nproxyjump jump.example.com\n"
+      );
+    });
+
+    it("moves a block an earlier Xum appended to the top of the file", async () => {
+      await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
+      const userConfig = "Host *\n  ForwardAgent yes\n";
+      await fs.writeFile(
+        sshConfigPath,
+        [
+          userConfig.trimEnd(),
+          XUM_DAYTONA_SSH_BLOCK_START,
+          "Host *.xum--daytona",
+          `  Include ${writer.paths.includePath}`,
+          XUM_DAYTONA_SSH_BLOCK_END,
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+
+      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+      const content = await fs.readFile(sshConfigPath, "utf8");
+      expect(content.startsWith(`${XUM_DAYTONA_SSH_BLOCK_START}\n`)).toBe(true);
+      expect(content.endsWith(`${XUM_DAYTONA_SSH_BLOCK_END}\n${userConfig}`)).toBe(true);
+      expect(content.split(XUM_DAYTONA_SSH_BLOCK_START)).toHaveLength(2);
+
+      // Already on top: rewriting it changes nothing.
+      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+      expect(await fs.readFile(sshConfigPath, "utf8")).toBe(content);
+    });
   });
 
   describe("a user Host * entry that weakens host key checking", () => {

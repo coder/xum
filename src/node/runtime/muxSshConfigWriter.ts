@@ -75,11 +75,11 @@ export interface ManagedBlockMarkers {
   label: string;
 }
 
-function replaceMuxBlock(
+/** The marked block's full lines: from its start marker's line through its end marker's newline. */
+function findBlockLines(
   existingContent: string,
-  nextMuxBlock: string,
   markers: ManagedBlockMarkers
-): string {
+): { start: number; end: number; hadTrailingNewline: boolean } {
   const startMarkerIndex = existingContent.indexOf(markers.start);
   const endMarkerIndex = existingContent.indexOf(markers.end, startMarkerIndex);
 
@@ -88,21 +88,44 @@ function replaceMuxBlock(
   }
 
   const lineStartIndex = existingContent.lastIndexOf("\n", startMarkerIndex);
-  const replaceStart = lineStartIndex === -1 ? 0 : lineStartIndex + 1;
-
   const lineEndIndex = existingContent.indexOf("\n", endMarkerIndex);
-  const replaceEnd = lineEndIndex === -1 ? existingContent.length : lineEndIndex + 1;
+  return {
+    start: lineStartIndex === -1 ? 0 : lineStartIndex + 1,
+    end: lineEndIndex === -1 ? existingContent.length : lineEndIndex + 1,
+    hadTrailingNewline: lineEndIndex !== -1,
+  };
+}
 
-  const beforeBlock = existingContent.slice(0, replaceStart);
-  const afterBlock = existingContent.slice(replaceEnd);
+function replaceMuxBlock(
+  existingContent: string,
+  nextMuxBlock: string,
+  markers: ManagedBlockMarkers
+): string {
+  const lines = findBlockLines(existingContent, markers);
+  const beforeBlock = existingContent.slice(0, lines.start);
+  const afterBlock = existingContent.slice(lines.end);
 
   if (afterBlock.length === 0) {
-    const blockHadTrailingNewline = lineEndIndex !== -1;
-    const suffix = blockHadTrailingNewline ? "\n" : "";
+    const suffix = lines.hadTrailingNewline ? "\n" : "";
     return `${beforeBlock}${nextMuxBlock}${suffix}`;
   }
 
   return `${beforeBlock}${nextMuxBlock}\n${afterBlock}`;
+}
+
+/** Puts the block on the first line, moving it there if it sits anywhere else. */
+function prependMuxBlock(
+  existingContent: string,
+  nextMuxBlock: string,
+  markers: ManagedBlockMarkers,
+  hasBlock: boolean
+): string {
+  let rest = existingContent;
+  if (hasBlock) {
+    const lines = findBlockLines(existingContent, markers);
+    rest = existingContent.slice(0, lines.start) + existingContent.slice(lines.end);
+  }
+  return `${nextMuxBlock}\n${rest}`;
 }
 
 function appendMuxBlock(existingContent: string, nextMuxBlock: string): string {
@@ -236,14 +259,20 @@ async function writeConfigAtomically(
 }
 
 /**
- * Write (or replace in place) one Xum-managed, marker-delimited block in the user's ssh config,
- * leaving every other line untouched. Shared by the Coder and Daytona providers.
+ * Write one Xum-managed, marker-delimited block in the user's ssh config, leaving every other
+ * line untouched. Shared by the Coder and Daytona providers.
  */
 export async function ensureManagedSSHConfigBlock(opts: {
   markers: ManagedBlockMarkers;
   /** Full block text, markers included. */
   block: string;
   sshConfigPath?: string;
+  /**
+   * "end" (default) appends a new block and replaces an existing one in place. "top" keeps the
+   * block on the first line, where OpenSSH's first-value-wins rule lets its options beat every
+   * user entry; a block found elsewhere moves there.
+   */
+  placement?: "top" | "end";
 }): Promise<void> {
   const { markers } = opts;
   const configuredSSHConfigPath = opts.sshConfigPath ?? path.join(os.homedir(), ".ssh", "config");
@@ -265,7 +294,7 @@ export async function ensureManagedSSHConfigBlock(opts: {
       timeoutMessage: "Another Xum process is updating the ssh config.",
     });
     try {
-      await writeManagedBlock(sshConfigPath, markers, opts.block);
+      await writeManagedBlock(sshConfigPath, markers, opts.block, opts.placement ?? "end");
     } finally {
       await release();
     }
@@ -275,7 +304,8 @@ export async function ensureManagedSSHConfigBlock(opts: {
 async function writeManagedBlock(
   sshConfigPath: string,
   markers: ManagedBlockMarkers,
-  block: string
+  block: string,
+  placement: "top" | "end"
 ): Promise<void> {
   const { content: existingContent, mode: existingMode } =
     await loadSSHConfigContent(sshConfigPath);
@@ -291,10 +321,15 @@ async function writeManagedBlock(
     throw new Error(`Corrupted SSH config: mismatched Xum ${markers.label} SSH markers detected.`);
   }
 
-  const nextContent =
-    startMarkerCount === 1
+  const hasBlock = startMarkerCount === 1;
+  let nextContent: string;
+  if (placement === "top") {
+    nextContent = prependMuxBlock(existingContent, block, markers, hasBlock);
+  } else {
+    nextContent = hasBlock
       ? replaceMuxBlock(existingContent, block, markers)
       : appendMuxBlock(existingContent, block);
+  }
 
   await writeConfigAtomically(sshConfigPath, nextContent, existingMode);
 }

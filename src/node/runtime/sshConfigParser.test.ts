@@ -2,6 +2,7 @@ import { spawnSync } from "child_process";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
+import { XUM_DAYTONA_SSH_BLOCK_START } from "@/common/constants/daytona";
 import { DaytonaSshConfigWriter } from "./daytonaSshConfig";
 import { resolveSSHConfig } from "./sshConfigParser";
 
@@ -139,6 +140,65 @@ describe("resolveSSHConfig", () => {
       expect(resolved.hostName).toBe("ssh.daytona.test");
       expect(resolved.port).toBe(2222);
       expect((await resolveSSHConfig("work")).user).toBe("me");
+    });
+  });
+
+  // The Daytona block goes first in the file; the user's global options, top-level Include and
+  // Host entries after it must resolve as they did before for every other host.
+  test("resolves other hosts the same after Xum puts its Daytona block on top", async () => {
+    await withTempHome(async (homeDir) => {
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.mkdir(path.join(homeDir, ".ssh", "conf.d"));
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "conf.d", "team.conf"),
+        "Host team-*\n  User teamuser\n  Port 2200\n",
+        "utf8"
+      );
+      await fs.writeFile(
+        configPath,
+        [
+          "User globaluser",
+          "ServerAliveInterval 30",
+          `Include ${path.join(homeDir, ".ssh", "conf.d", "*")}`,
+          "Host box",
+          "  HostName 10.0.0.1",
+          "  ProxyCommand nc %h %p",
+          "Host *",
+          "  Port 2222",
+          "  ForwardAgent yes",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+      const hosts = ["box", "team-a", "plain.example.com"];
+      const snapshot = async () =>
+        Promise.all(
+          hosts.map(async (host) => ({
+            parsed: await resolveSSHConfig(host),
+            openssh: hasOpenSsh
+              ? spawnSync("ssh", ["-G", "-F", configPath, host], { encoding: "utf8" }).stdout
+              : "",
+          }))
+        );
+      const before = await snapshot();
+
+      await new DaytonaSshConfigWriter({
+        xumHome: path.join(homeDir, ".xum"),
+        sshConfigPath: configPath,
+      }).writeSandbox({
+        sandboxId: "sb-1",
+        token: "tokenA",
+        gateway: { host: "ssh.daytona.test", port: 22, hostKeys: ["ssh-ed25519 AAAA"] },
+      });
+
+      expect((await fs.readFile(configPath, "utf8")).startsWith(XUM_DAYTONA_SSH_BLOCK_START)).toBe(
+        true
+      );
+      expect(await snapshot()).toEqual(before);
+      expect(before[0].parsed.user).toBe("globaluser");
+      expect(before[1].parsed.port).toBe(2200);
+      expect(before[2].parsed.port).toBe(2222);
+      expect((await resolveSSHConfig("sb-1.xum--daytona")).user).toBe("tokenA");
     });
   });
 

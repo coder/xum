@@ -309,6 +309,28 @@ describe("ensureMuxCoderSSHConfigFile", () => {
     expect(content).toBe(expected);
   });
 
+  it("moves a top-placed block from anywhere in the file to its first line", async () => {
+    const sshConfigPath = await makeSSHConfigPath();
+    const markers = { start: "# >>> top >>>", end: "# <<< top <<<", label: "Top" };
+    const render = (host: string) => [markers.start, `Host ${host}`, markers.end].join("\n");
+    const writeTop = (host: string) =>
+      ensureManagedSSHConfigBlock({
+        markers,
+        block: render(host),
+        sshConfigPath,
+        placement: "top",
+      });
+
+    await writeTop("first");
+    expect(await readSSHConfig(sshConfigPath)).toBe(`${render("first")}\n`);
+
+    const userBefore = "Host github.com\n  User git\n";
+    const userAfter = "Host internal\n  User dev";
+    await writeSSHConfig(sshConfigPath, `${userBefore}${render("old")}\n${userAfter}`);
+    await writeTop("new");
+    expect(await readSSHConfig(sshConfigPath)).toBe(`${render("new")}\n${userBefore}${userAfter}`);
+  });
+
   it("replaces mux block when it is at the very start of the file", async () => {
     const sshConfigPath = await makeSSHConfigPath();
     const originalBinaryPath = "/opt/coder-old";

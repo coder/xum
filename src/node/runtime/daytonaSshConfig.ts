@@ -115,15 +115,19 @@ function quoteConfigPath(filePath: string): string {
 }
 
 /**
- * The block in `~/.ssh/config`. OpenSSH scopes an Include to the Host/Match block above it and
- * the managed block sits at the end of the file, so a bare Include would land inside the user's
- * last Host block. Scoping it to `Host *.xum--daytona` keeps it from leaking to other hosts.
+ * The block in `~/.ssh/config`, which an editor's own ssh reads (Xum's ssh reads the include
+ * file alone, via `-F`). It goes first in the file: OpenSSH keeps the first value it reads for an
+ * option, so the alias's hardening beats any user entry such as a `Host *` that turns off host
+ * key checking or forwards the agent. The Include is scoped to `Host *.xum--daytona` so it
+ * reaches no other host, and the closing `Host *` puts the user's top-level lines that follow
+ * back in scope for every host, as they were before the block.
  */
 export function renderDaytonaManagedBlock(includePath: string): string {
   return [
     XUM_DAYTONA_SSH_BLOCK_START,
     `Host *.${XUM_DAYTONA_HOST_SUFFIX}`,
     `  Include ${quoteConfigPath(includePath)}`,
+    "Host *",
     XUM_DAYTONA_SSH_BLOCK_END,
   ].join("\n");
 }
@@ -165,8 +169,18 @@ export function renderDaytonaHostBlock(input: {
   assertValid(input.sandboxId, SANDBOX_ID_PATTERN, "sandbox id");
   assertValid(input.token, TOKEN_PATTERN, "SSH token");
   validateGateway(input.gateway);
+  // The sandbox and the network path to the gateway are untrusted, and an editor's ssh reads
+  // this block before the user's entries, so it must not inherit their proxy (which would see
+  // the token), agent, display or local commands. `ProxyCommand none` comes first: OpenSSH then
+  // ignores a later ProxyJump too. KnownHostsCommand is left alone: OpenSSH before 8.5 rejects it
+  // unless an `IgnoreUnknown` covers it, and ours would replace the user's own `IgnoreUnknown`
+  // (first value wins). Forwards an editor asks for on its command line are left alone.
   return [
     `Host ${toXumDaytonaHost(input.sandboxId)}`,
+    "  ProxyCommand none",
+    "  ForwardAgent no",
+    "  ForwardX11 no",
+    "  PermitLocalCommand no",
     `  HostName ${input.gateway.host}`,
     `  Port ${input.gateway.port}`,
     `  User ${input.token}`,
@@ -254,6 +268,7 @@ export class DaytonaSshConfigWriter {
       },
       block: renderDaytonaManagedBlock(this.paths.includePath),
       sshConfigPath: this.sshConfigPath,
+      placement: "top",
     });
   }
 
