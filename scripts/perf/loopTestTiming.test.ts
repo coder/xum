@@ -5,6 +5,7 @@ import {
   isTempDirCall,
   isTimedFsName,
   timed,
+  timedDelay,
   timedTimeout,
   unionMs,
 } from "./loopTestTiming";
@@ -72,6 +73,15 @@ describe("timed", () => {
     ]);
   });
 
+  test("a rejection the caller leaves unhandled stays unhandled", () => {
+    // In its own process: bun test fails any test that leaves a rejection unhandled.
+    const script = `import { timed } from ${JSON.stringify(`${import.meta.dir}/loopTestTiming.ts`)};
+      void timed(() => Promise.reject(new Error("left unhandled")), () => undefined, () => 0)();`;
+    const result = Bun.spawnSync(["bun", "-e", script], { stdout: "pipe", stderr: "pipe" });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr.toString()).toContain("left unhandled");
+  });
+
   test("a callback-style call records when its callback runs", () => {
     const seen: Interval[] = [];
     let later: (() => void) | undefined;
@@ -89,12 +99,16 @@ describe("timed", () => {
     expect(seen).toEqual([[3, 8]]);
   });
 
-  test("keeps own properties, symbols included", () => {
-    const custom = () => "custom";
-    const fn = Object.assign(() => 1, { native: () => 2, [promisify.custom]: custom });
-    const wrapped = timed(fn, () => undefined, clock(0, 0));
+  test("keeps own properties, symbols included, and times the callable ones", () => {
+    const seen: Interval[] = [];
+    const fn = Object.assign(() => 1, { native: () => 2, [promisify.custom]: () => "custom" });
+    const wrapped = timed(fn, (i) => seen.push(i), clock(1, 2, 3, 4));
     expect(wrapped.native()).toBe(2);
-    expect(promisify(wrapped)).toBe(custom);
+    expect((promisify(wrapped) as () => string)()).toBe("custom");
+    expect(seen).toEqual([
+      [1, 2],
+      [3, 4],
+    ]);
   });
 });
 
@@ -116,11 +130,31 @@ describe("timedTimeout", () => {
     expect(seen).toEqual([[2, 50]]);
   });
 
-  test("keeps util.promisify.custom", () => {
-    const custom = () => Promise.resolve();
+  test("times util.promisify.custom like a delay", async () => {
+    const seen: Interval[] = [];
+    const custom = (_ms: number, value?: unknown) => Promise.resolve(value);
     const fake = Object.assign(() => 0, { [promisify.custom]: custom });
-    expect(promisify(timedTimeout(fake, () => undefined, clock()))).toBe(custom);
+    const sleep = promisify(timedTimeout(fake, (i) => seen.push(i), clock(5, 9))) as typeof custom;
+    expect(await sleep(0, "yield")).toBe("yield");
+    expect(await sleep(4, "wait")).toBe("wait");
+    expect(seen).toEqual([[5, 9]]);
   });
+});
+
+test("timedDelay records delays of 1 ms or more and Dates, not event loop yields", async () => {
+  const seen: Interval[] = [];
+  const sleep = timedDelay(
+    (_ms: number | Date) => Promise.resolve(),
+    (i) => seen.push(i),
+    clock(1, 2, 3, 4)
+  );
+  await sleep(0);
+  await sleep(10);
+  await sleep(new Date());
+  expect(seen).toEqual([
+    [1, 2],
+    [3, 4],
+  ]);
 });
 
 test("isTimedFsName times functions, not classes, streams or watchers", () => {
@@ -143,6 +177,8 @@ test("isTempDirCall flags mkdir and mkdtemp under the temp dir only", () => {
   const tmp = "/tmp";
   expect(isTempDirCall("mkdtempSync", "/tmp/xum-", tmp)).toBe(true);
   expect(isTempDirCall("mkdir", new URL("file:///tmp/a"), tmp)).toBe(true);
+  expect(isTempDirCall("mkdir", "/tmp", tmp)).toBe(true);
   expect(isTempDirCall("mkdir", "/home/x", tmp)).toBe(false);
+  expect(isTempDirCall("mkdir", "/tmp-backup/a", tmp)).toBe(false);
   expect(isTempDirCall("writeFile", "/tmp/a", tmp)).toBe(false);
 });
