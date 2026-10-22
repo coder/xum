@@ -116,10 +116,14 @@ export function summary(
       `More unit tests import ${sources} than the run uses: only the nearest ran, so a survivor there can be a mutant that a skipped test kills.`
     );
   }
-  for (const row of report.mutants.filter((r) => r.outcome === "error")) {
+  // Error and accepted rows carry a reason: the runner's exception, or the
+  // marker's text, which reviewers audit here.
+  const label = { error: "Error", equivalent: "Accepted as equivalent" } as const;
+  for (const row of report.mutants) {
+    if (row.outcome !== "error" && row.outcome !== "equivalent") continue;
     lines.push(
       "",
-      `Error at \`${cell(row.path)}:${row.line}\` (\`${cell(describe(row))}\`): ${cell(row.reason ?? "unknown")}.`
+      `${label[row.outcome]} at \`${cell(row.path)}:${row.line}\` (\`${cell(describe(row))}\`): ${cell(row.reason ?? "unknown")}.`
     );
   }
   for (const dropped of report.droppedTests) {

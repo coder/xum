@@ -95,6 +95,17 @@ test("a unit test that ran without coverage makes coverage incomplete", () => {
   expect(unitCoverage(dir, 2)).toEqual({ files: [], complete: false });
 });
 
+test("the summary lists each accepted mutant with its marker reason", () => {
+  const row = {
+    ...report.mutants[0],
+    outcome: "equivalent" as const,
+    reason: "m[2] is never empty",
+  };
+  const text = summary({ ...report, mutants: [row] }, true, "");
+  expect(text).toContain(`${row.path}:${row.line}`);
+  expect(text).toContain("m[2] is never empty");
+});
+
 test("the summary names each error row and its reason", () => {
   const row = { ...report.mutants[0], outcome: "error" as const, reason: "OSError: disk full" };
   const text = summary({ ...report, mutants: [row] }, true, "");
