@@ -474,6 +474,7 @@ export default defineConfig([
       "src/browser/stories/**",
       "src/**/*StoryUtils.tsx",
       "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
       "src/**/test[A-Z]*.ts",
     ],
     rules: {
@@ -494,7 +495,13 @@ export default defineConfig([
     // Backend production code: required-member typeof guards only exist to tolerate partial
     // test doubles; tests must complete the doubles instead (see the rule's docs).
     files: ["src/node/services/**/*.ts"],
-    ignores: ["**/*.test.ts", "**/*.testHarness.ts", "**/*.testUtils.ts", "**/test*/**"],
+    ignores: [
+      "**/*.test.ts",
+      "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
+      "**/*.testUtils.ts",
+      "**/test*/**",
+    ],
     rules: {
       "local/no-required-member-typeof-guard": "error",
     },
@@ -801,6 +808,7 @@ export default defineConfig([
       "**/*.stories.tsx",
       "src/browser/stories/**",
       "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
       "src/**/test[A-Z]*.ts",
     ],
     rules: {
@@ -899,6 +907,7 @@ export default defineConfig([
       "**/*.test.tsx",
       "tests/**/*.{ts,tsx}",
       "src/**/*.testHarness.{ts,tsx}",
+      "src/**/*.hostProof.ts",
       "src/**/*.testUtils.{ts,tsx}",
       "src/**/test[A-Z]*.{ts,tsx}",
     ],
