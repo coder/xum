@@ -12,6 +12,9 @@
 # ==============================================================================
 # Stage 1: Build
 # ==============================================================================
+# node:22-slim is deliberately not pinned by digest (unlike the bug-bash sandbox): each release
+# build must pick up the newest Node 22 security release, as the unpinned apt packages below do
+# for Debian. Docker reviews and builds every Official Image update.
 FROM node:22-slim AS builder
 
 WORKDIR /app
@@ -19,8 +22,9 @@ WORKDIR /app
 # Optional release tag passed by CI to stamp src/version.ts in Docker builds.
 ARG RELEASE_TAG
 
-# Install bun (used for package management and build tooling)
-RUN npm install -g bun@1.4.3
+# Install bun (used for package management and build tooling) from its official image, pinned
+# by digest like the bug-bash sandbox's.
+COPY --from=oven/bun:1.4.3-slim@sha256:14a223fa35747ec728bce300ef85888bc5f7958164d15bbba6a54b22b52a3288 /usr/local/bin/bun /usr/local/bin/bun
 
 # Install git (needed for version generation) and build tools for native modules
 # bzip2 is required for lzma-native to extract its bundled xz source tarball

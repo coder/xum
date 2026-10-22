@@ -6,4 +6,5 @@ export const AGENT_PLUGIN_INSTALL_METHOD_LABELS: Record<AgentPluginInstallMethod
     "agent-plugin": "Agent Plugin",
     "claude-plugin": "Claude Code plugin",
     skills: "Skills",
+    "claude-marketplace": "Claude Code marketplace entry",
   };

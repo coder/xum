@@ -70,7 +70,8 @@ function setupPluginSettings(installed = false, conflict = false) {
         }),
     },
   };
-  client.agentPlugins.preview = () => Promise.resolve({ success: true, data: preview });
+  client.agentPlugins.preview = () =>
+    Promise.resolve({ success: true, data: { kind: "plugin", preview } });
   client.agentPlugins.checkUpdates = () => Promise.resolve({ success: true, data: [] });
   client.agentPlugins.list = () =>
     Promise.resolve({

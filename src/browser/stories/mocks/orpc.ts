@@ -60,6 +60,7 @@ import type { MCPHttpServerInfo, MCPServerIdentity, MCPServerInfo } from "@/comm
 import type {
   AgentPluginInstallMethod,
   AgentPluginInstallPreview,
+  AgentPluginMarketplaceListing,
   AgentPluginListItem,
   AgentPluginUpdateCheck,
   AgentPluginUpdateReview,
@@ -163,6 +164,10 @@ export interface MockORPCClientOptions {
     preview?: AgentPluginInstallPreview;
     /** Returned by agentPlugins.preview for an "Install as" method; others get `preview`. */
     previewsByMethod?: Partial<Record<AgentPluginInstallMethod["kind"], AgentPluginInstallPreview>>;
+    /** Returned by agentPlugins.preview without a method: a Claude Code marketplace listing. */
+    marketplace?: AgentPluginMarketplaceListing;
+    /** Returned by agentPlugins.preview for a marketplace entry, by entry name. */
+    previewsByEntry?: Record<string, AgentPluginInstallPreview>;
     /** Returned by agentPlugins.previewUpdate for the named plugin; omit to make it fail. */
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
@@ -1428,11 +1433,20 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       checkUpdates: () =>
         Promise.resolve({ success: true, data: agentPluginsMock?.updateChecks ?? [] }),
       preview: (input: { method?: AgentPluginInstallMethod | null }) => {
+        const method = input.method;
+        if (method == null && agentPluginsMock?.marketplace !== undefined) {
+          return Promise.resolve({
+            success: true as const,
+            data: { kind: "marketplace" as const, marketplace: agentPluginsMock.marketplace },
+          });
+        }
         const preview =
-          (input.method != null ? agentPluginsMock?.previewsByMethod?.[input.method.kind] : null) ??
-          agentPluginsMock?.preview;
+          method?.kind === "claude-marketplace"
+            ? agentPluginsMock?.previewsByEntry?.[method.entry]
+            : ((method != null ? agentPluginsMock?.previewsByMethod?.[method.kind] : null) ??
+              agentPluginsMock?.preview);
         return preview
-          ? Promise.resolve({ success: true as const, data: preview })
+          ? Promise.resolve({ success: true as const, data: { kind: "plugin" as const, preview } })
           : Promise.resolve({
               success: false as const,
               error: "No preview configured in this story",
