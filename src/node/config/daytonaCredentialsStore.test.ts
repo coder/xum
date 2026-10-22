@@ -3,6 +3,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { DAYTONA_DEFAULT_API_URL } from "@/common/constants/daytona";
+import { createDaytonaTestRig } from "@/node/services/daytona/daytona.testHarness";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { DaytonaCredentialsStore } from "./daytonaCredentialsStore";
 
@@ -132,6 +133,52 @@ describe("DaytonaCredentialsStore", () => {
       apiUrl: "https://byoc.example.com/api",
       target: "eu",
     });
+  });
+
+  // The file selects account A; DAYTONA_API_KEY/DAYTONA_API_URL name account B. Taking an
+  // unreadable file as empty would silently run create, start and delete on B.
+  it("refuses to fall back to the environment when the saved settings cannot be read", async () => {
+    const env = { DAYTONA_API_KEY: "env-key", DAYTONA_API_URL: "https://env.example.com/api" };
+    const store = new DaytonaCredentialsStore(rootDir, env);
+    await store.update({ apiKey: KEY, apiUrl: "https://byoc.example.com/api" });
+    const file = path.join(rootDir, "daytona.json");
+
+    await fs.chmod(file, 0o000);
+    try {
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+      await expect(store.resolve()).rejects.toThrow(/Could not read the Daytona settings/);
+      // Settings shows the read error instead of claiming the environment's key is in use.
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+      await expect(store.getPublicConfig()).rejects.toThrow(/Could not read the Daytona settings/);
+    } finally {
+      await fs.chmod(file, 0o600);
+    }
+    expect(await store.resolve()).toMatchObject({ apiKey: KEY, apiKeySource: "settings" });
+  });
+
+  it("runs no Daytona operation on the environment's account after a failed settings read", async () => {
+    const rig = await createDaytonaTestRig({ apiKey: "env-key" });
+    try {
+      const saved = rig.addAccount(KEY);
+      await rig.service.setConfig({ apiKey: KEY });
+      const file = path.join(rig.rootDir, "daytona.json");
+      await fs.chmod(file, 0o000);
+      try {
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+        await expect(
+          rig.service.withAccountLease(() => rig.service.listInstanceSandboxes())
+        ).rejects.toThrow(/Could not read the Daytona settings/);
+        expect((await rig.service.listSnapshots()).ok).toBe(false);
+      } finally {
+        await fs.chmod(file, 0o600);
+      }
+      expect(rig.plane.calls).toEqual([]);
+      await rig.service.withAccountLease(() => rig.service.listInstanceSandboxes());
+      expect(saved.calls.length).toBeGreaterThan(0);
+      expect(rig.plane.calls).toEqual([]);
+    } finally {
+      await rig.cleanup();
+    }
   });
 
   it("refuses a stored API URL that does not validate instead of sending the key elsewhere", async () => {
