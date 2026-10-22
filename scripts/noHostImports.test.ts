@@ -40,6 +40,11 @@ const MODULES = [
   "@/node/utils/writeFileAtomic",
   { module: "@/node/utils/fs", names: ["ensurePrivateDir", "ensurePrivateDirSync"] },
   "@/node/runtime/LocalBaseRuntime",
+  // The two builders make concrete runtimes. The path helpers and types of runtimeHelpers pass.
+  {
+    module: "@/node/runtime/runtimeHelpers",
+    names: ["createRuntimeForWorkspace", "createRuntimeContextForWorkspace"],
+  },
 ];
 
 /** The message IDs that the rule reports for `code` in src/node/services/tools/x.ts. */
@@ -83,6 +88,12 @@ test("passes type-only imports and pure helpers", () => {
   expect(ids(`export type { Stats } from "fs";`)).toEqual([]);
   expect(ids(`import { isErrnoWithCode } from "@/node/utils/fs";`)).toEqual([]);
   expect(ids(`import { ensurePrivateDir } from "@/node/utils/fs";`)).toEqual(["host"]);
+  expect(ids(`import { resolveWorkspaceRootPath } from "@/node/runtime/runtimeHelpers";`)).toEqual(
+    []
+  );
+  expect(ids(`import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";`)).toEqual(
+    ["host"]
+  );
   // A namespace or default import of a module with listed names counts as all names.
   expect(ids(`import * as fsUtils from "@/node/utils/fs";`)).toEqual(["host"]);
 });
