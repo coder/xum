@@ -51,8 +51,8 @@ import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.
 // No growth for the sidebar launcher: NewTabLauncherNarrow shares its scene with empty
 // Output, replacing the separate OutputTabEmpty captures. Launcher keyboard/mobile
 // contracts and additional strip-overflow stories remain play-only.
-// +1 snapshot: the Skills CLI run panel and its output (PluginsSettingsSection.stories.tsx
-// AddPluginSkillsCliRun, laptop in dark; no other story shows it). The other install-method
+// +1 snapshot: the Skills CLI panel and its command (PluginsSettingsSection.stories.tsx
+// AddPluginSkillsCliCommand, laptop in dark; no other story shows it). The other install-method
 // stories in that file are play-only.
 const MAX_SNAPSHOTS = 688;
 const MAX_SNAPSHOT_ENABLED_FILES = 120;
