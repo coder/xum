@@ -321,6 +321,47 @@ function sameImports(
   );
 }
 
+/**
+ * Escape from inside a panel acts like its Cancel button (#7122): it closes only the panel and
+ * drops the unsaved selection. Settings is a Radix dialog that closes on Escape in the document
+ * capture phase, so this listens one step earlier, on the window, and only for keys sent to the
+ * panel. An Escape from anywhere else in Settings still closes Settings.
+ */
+function useEscapeCancelsPanel(
+  rootRef: React.RefObject<HTMLElement | null>,
+  busy: boolean,
+  onCancel: () => void
+) {
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!matchesKeybind(event, KEYBINDS.CANCEL) || event.defaultPrevented || event.isComposing) {
+        return;
+      }
+      if (!(event.target instanceof Node) || rootRef.current?.contains(event.target) !== true) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      // Cancel is disabled while a load or save runs: Escape then only keeps Settings open.
+      if (!busy) onCancel();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [rootRef, busy, onCancel]);
+}
+
+/** Buttons by plugin name, so closing a row's panel can give focus back to the button that opened it. */
+function useButtonsByName() {
+  const buttonsRef = useRef(new Map<string, HTMLButtonElement>());
+  return {
+    refFor: (name: string) => (button: HTMLButtonElement | null) => {
+      if (button) buttonsRef.current.set(name, button);
+      else buttonsRef.current.delete(name);
+    },
+    focus: (name: string) => buttonsRef.current.get(name)?.focus(),
+  };
+}
+
 const ManageComponentsPanel: React.FC<{
   name: string;
   onSaved: () => Promise<void>;
@@ -339,28 +380,7 @@ const ManageComponentsPanel: React.FC<{
   const [saved, setSaved] = useState(false);
   const name = props.name;
   const rootRef = useRef<HTMLDivElement>(null);
-  const onClose = props.onClose;
-
-  // Escape from inside the panel acts like Cancel (#7122): it closes only the panel and drops the
-  // unsaved selection. Settings is a Radix dialog that closes on Escape in the document capture
-  // phase, so this listens one step earlier, on the window, and only for keys sent to the panel.
-  // An Escape from anywhere else in Settings still closes Settings.
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (!matchesKeybind(event, KEYBINDS.CANCEL) || event.defaultPrevented || event.isComposing) {
-        return;
-      }
-      if (!(event.target instanceof Node) || rootRef.current?.contains(event.target) !== true) {
-        return;
-      }
-      event.preventDefault();
-      event.stopPropagation();
-      // Cancel is disabled while a load or save runs: Escape then only keeps Settings open.
-      if (!busy) onClose();
-    };
-    window.addEventListener("keydown", onKeyDown, true);
-    return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [busy, onClose]);
+  useEscapeCancelsPanel(rootRef, busy, props.onClose);
 
   useEffect(() => {
     let ignore = false;
@@ -1570,10 +1590,10 @@ export const PluginsSettingsSection: React.FC = () => {
   );
   // Managed rows' "Manage components" buttons by plugin name: closing the panel (Escape, Cancel,
   // Done) gives focus back to the button that opens it, not to the Settings dialog (#7122).
-  const manageButtonsRef = useRef(new Map<string, HTMLButtonElement>());
+  const manageButtons = useButtonsByName();
   const closeComponents = (pluginName: string) => {
     setComponentsTarget(null);
-    manageButtonsRef.current.get(pluginName)?.focus();
+    manageButtons.focus(pluginName);
   };
   const [hooksTarget, setHooksTarget] = useState<string | null>(
     initialIntent?.type === "review-hooks" ? initialIntent.name : null
@@ -1972,10 +1992,7 @@ export const PluginsSettingsSection: React.FC = () => {
                             className="h-7 px-2 text-xs"
                             disabled={busyPlugin !== null}
                             onClick={() => setComponentsTarget(item.name)}
-                            ref={(button) => {
-                              if (button) manageButtonsRef.current.set(item.name, button);
-                              else manageButtonsRef.current.delete(item.name);
-                            }}
+                            ref={manageButtons.refFor(item.name)}
                             aria-label={`Manage components for ${item.name}`}
                           >
                             Manage components
