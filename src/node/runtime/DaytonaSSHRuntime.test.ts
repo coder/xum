@@ -66,11 +66,6 @@ function makeRuntime(
     workspaceId: options.workspaceId ?? "ws-1",
     projectPath: options.projectPath,
     workspaceName: options.workspaceName,
-    // Empty by default: tests that seed write files here.
-    agentHomeSeedSources: {
-      xumHome: path.join(testRig.rootDir, "host-xum"),
-      home: path.join(testRig.rootDir, "host-home"),
-    },
   });
 }
 
@@ -897,25 +892,6 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     } finally {
       sshDelete.mockRestore();
     }
-  });
-
-  it("seeds the agent home of a created sandbox but never of an attached one", async () => {
-    const hostXum = path.join(rig.rootDir, "host-xum");
-    await fs.mkdir(hostXum, { recursive: true });
-    await fs.writeFile(path.join(hostXum, "tool_env"), "export JOBS=4\n");
-    const seedCalls = () => execSpy.mock.calls.filter(([, command]) => command === "sh -s");
-
-    await makeRuntime({ sandboxId: "xum-seeded", shared: false, ...SMALL }).postCreateSetup(
-      initParams()
-    );
-    expect(seedCalls()).toHaveLength(1);
-    expect(seedCalls()[0][2].stdin).toContain('"$HOME/.mux/tool_env"');
-
-    rig.plane.addSandbox({ id: "sb-users", state: "stopped" });
-    await makeRuntime({ sandboxId: "sb-users", shared: true }).postCreateSetup(initParams());
-    expect(seedCalls()).toHaveLength(1);
-    expect(rig.plane.countCalls("POST /sandbox")).toBe(1);
-    expect(rig.plane.find("sb-users")?.state).toBe("started");
   });
 });
 

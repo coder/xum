@@ -45,7 +45,6 @@ describeDaytona("Daytona runtime (real control plane)", () => {
       projectPath,
       workspaceName,
       workspaceId: `daytona-test-${workspaceName}`,
-      agentHomeSeedSources: { xumHome: path.join(tempRoot, "xum"), home: tempRoot },
     });
   }
 
@@ -55,7 +54,6 @@ describeDaytona("Daytona runtime (real control plane)", () => {
     process.env.HOME = tempRoot;
     const xumHome = path.join(tempRoot, "xum");
     await fs.mkdir(xumHome, { recursive: true });
-    await fs.writeFile(path.join(xumHome, "tool_env"), "export XUM_DAYTONA_TEST=1\n");
     service = new DaytonaService({
       credentialsStore: new DaytonaCredentialsStore(xumHome),
       rootDir: xumHome,
@@ -114,11 +112,10 @@ describeDaytona("Daytona runtime (real control plane)", () => {
     expect((await runtime.initWorkspace(initParams)).success).toBe(true);
     expect(await runtime.ensureReady()).toEqual({ ready: true });
 
-    const echo = await execBuffered(runtime, "cat ~/.mux/tool_env && echo ok", {
+    const echo = await execBuffered(runtime, "echo ok", {
       cwd: created.workspacePath,
       timeout: 60,
     });
-    expect(echo.stdout).toContain("XUM_DAYTONA_TEST=1");
     expect(echo.stdout).toContain("ok");
 
     const filePath = `${created.workspacePath}/note.txt`;

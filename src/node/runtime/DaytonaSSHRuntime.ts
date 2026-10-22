@@ -9,7 +9,6 @@
  * host alias (`<sandboxId>.xum--daytona`) is then known before persist, like Coder's.
  */
 
-import * as os from "os";
 import * as path from "path";
 import { randomBytes } from "crypto";
 import type {
@@ -37,7 +36,6 @@ import {
   toXumDaytonaHost,
   type DaytonaSizePreset,
 } from "@/common/constants/daytona";
-import { getXumHome } from "@/common/constants/paths";
 import type { DaytonaSandboxConfig, DaytonaSandboxState } from "@/common/orpc/schemas/daytona";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { isSSHRuntime } from "@/common/types/runtime";
@@ -57,7 +55,6 @@ import {
 import { applyArchiveSettingToIdleSandbox } from "@/node/services/daytona/daytonaLifecycleHooks";
 import { log } from "@/node/services/log";
 import { execBuffered } from "@/node/utils/runtime/helpers";
-import { seedAgentHome, type AgentHomeSeedSources } from "./daytonaAgentHomeSeed";
 import { expandTildeForSSH } from "./tildeExpansion";
 import {
   redactChildStderr,
@@ -116,8 +113,6 @@ export interface DaytonaSSHRuntimeOptions {
   workspacePath?: string;
   /** Labels the created sandbox, so the reconciler can tell which workspace it belongs to. */
   workspaceId?: string;
-  /** Host directories the agent home is seeded from (default: the Xum home and user home). */
-  agentHomeSeedSources?: AgentHomeSeedSources;
 }
 
 /** Idle sandboxes stop after 30 minutes and archive after a day stopped; never auto-delete. */
@@ -322,7 +317,6 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   private readonly daytonaConfig: DaytonaSandboxConfig;
   private readonly daytonaService: DaytonaRuntimeService;
   private readonly workspaceId?: string;
-  private readonly agentHomeSeedSources?: AgentHomeSeedSources;
   /**
    * Set once ensureReady runs its checks on this instance. Only such a runtime (a turn's or a
    * terminal's) restarts a sandbox that stopped under it; UI and background runtimes never
@@ -360,7 +354,6 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     this.sshTransport = transport;
     this.daytonaService = daytonaService;
     this.workspaceId = options?.workspaceId;
-    this.agentHomeSeedSources = options?.agentHomeSeedSources;
   }
 
   private sandboxMissing(sandboxId: string): EnsureReadyResult {
@@ -937,8 +930,8 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   }
 
   /**
-   * Provision the sandbox (unless attaching), wait until it runs, configure ssh, seed the
-   * agent home and prepare the workspace directory. initWorkspace then runs the normal SSH
+   * Provision the sandbox (unless attaching), wait until it runs, configure ssh and prepare
+   * the workspace directory. initWorkspace then runs the normal SSH
    * sync, worktree creation and init hook. If anything fails after the create request was
    * sent, the sandbox this call created is deleted again so it cannot linger and bill.
    */
@@ -961,7 +954,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         await this.createSandbox(sandboxId, params, create);
         params.initLogger.logStep("Daytona sandbox created");
       }
-      await this.connectAndSeed(sandboxId, creates, params);
+      await this.connect(sandboxId, params);
       await this.prepareWorkspaceDirectory(params);
     } catch (error) {
       const errorMsg = redactDaytonaTokens(getErrorMessage(error));
@@ -977,26 +970,14 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     }
   }
 
-  /** Wait until the sandbox runs, write ssh access, and seed the home of a box Xum created. */
-  private async connectAndSeed(
-    sandboxId: string,
-    seed: boolean,
-    params: WorkspaceInitParams
-  ): Promise<void> {
+  /** Wait until the sandbox runs and write ssh access. */
+  private async connect(sandboxId: string, params: WorkspaceInitParams): Promise<void> {
     const { initLogger, abortSignal } = params;
     initLogger.logStep("Waiting for the sandbox to start and configuring SSH...");
     await this.daytonaService.ensureSandboxReady(sandboxId, {
       onStarting: () => initLogger.logStep("Starting sandbox..."),
       signal: abortSignal,
     });
-    if (!seed) return;
-    initLogger.logStep("Copying agent hooks and global skills into the sandbox...");
-    const count = await seedAgentHome(
-      this,
-      this.agentHomeSeedSources ?? { xumHome: getXumHome(), home: os.homedir() },
-      abortSignal
-    );
-    initLogger.logStep(`Copied ${count} agent file(s)`);
   }
 
   /** git clone does not create the parent directory of the workspace. */
