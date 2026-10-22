@@ -3,26 +3,32 @@
  * `bun test` processes and records time, failed runs, temp-dir use, time patching, and the share
  * of time with an fs call or a real timer open (scripts/perf/loopTests.preload.ts).
  *
- * Usage: make test-loop-baseline [RUNS=10] [FILTER=<substring>] [JOBS=6], or
+ * Usage: make test-loop-baseline [RUNS=10] [FILTER=<substring>] [JOBS=6] [BASE=<ref>], or
  *        bun scripts/perf/loopTestBaseline.ts [--runs 10] [--jobs 6] [--filter <substring>]
+ *          [--base <ref>]
  *
  * It writes artifacts/loop-tests/<sha>[-dirty].json and .md (git-ignored: never commit a record,
- * it goes stale). The numbers are tripwire data for the refactor, not targets. The script exits 0
- * after it writes the record, 2 on bad input or a runner error, and prints "loop-tests: ..." last.
+ * it goes stale). With --base it also measures <ref> in a temporary worktree, pairs the rounds of
+ * each file, and writes compare-<base>-<head>.json and .md with the trips of loopTestStats.ts.
+ * The numbers are tripwire data for the refactor, not targets: a trip pauses the PR for review.
+ * Exit codes: 0 no trip (or a record), 1 a trip, 2 bad input or a runner error. The last line is
+ * "loop-tests: ...". make reports every failure as 2, so gates call this script directly.
  */
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
-import { gitState, repoRoot } from "./bench";
+import { git, gitState, repoRoot } from "./bench";
 import {
+  type LoopTestCompare,
   type LoopTestFileRecord,
   type LoopTestRecord,
   type LoopTestRun,
   median,
   type PreloadOutput,
   summarizeFile,
+  trips,
 } from "./loopTestStats";
 
 const S = "src/node/services/";
@@ -162,60 +168,188 @@ export function renderRecord(record: LoopTestRecord): string {
   ].join("\n");
 }
 
+/** Slow test files that a short (RUNS below 5) compare runs only when its own code changed. */
+export const HEAVY_TESTS: Record<string, readonly string[]> = {
+  // 250 s per process in the spike, a third of all loop test time.
+  "src/node/services/backgroundProcessManager.test.ts": [
+    "src/node/services/backgroundProcessManager.ts",
+    "src/node/services/backgroundProcessManager.test.ts",
+  ],
+};
+export const FULL_RUNS = 5;
+
+/** The heavy tests to leave out of a compare with `runs` rounds and these changed files. */
+export function heavySkips(runs: number, changedFiles: readonly string[]): string[] {
+  if (runs >= FULL_RUNS) return [];
+  return Object.entries(HEAVY_TESTS)
+    .filter(([, sources]) => !sources.some((source) => changedFiles.includes(source)))
+    .map(([test]) => test);
+}
+
+/** Files that differ between the merge base of `baseSha` and HEAD, plus working-tree edits. */
+function changedFiles(root: string, baseSha: string): string[] {
+  const committed = git(root, ["diff", "--name-only", `${baseSha}...HEAD`]).split("\n");
+  const edited = git(root, ["status", "--porcelain"])
+    .split("\n")
+    .map((line) => line.slice(3));
+  return [...committed, ...edited].filter(Boolean);
+}
+
+/** A detached worktree of `sha` in `dir`, with the caller's node_modules and src/version.ts. */
+function addWorktree(root: string, dir: string, sha: string): void {
+  git(root, ["worktree", "add", "--detach", dir, sha]);
+  fs.symlinkSync(path.join(root, "node_modules"), path.join(dir, "node_modules"), "dir");
+  // src/version.ts is generated and git-ignored; without it some loop tests fail at import.
+  const versionFile = path.join(root, "src", "version.ts");
+  if (fs.existsSync(versionFile)) fs.copyFileSync(versionFile, path.join(dir, "src", "version.ts"));
+}
+
+interface Side {
+  label: "base" | "head";
+  root: string;
+  commit: string;
+  dirty: boolean;
+}
+
+function renderCompare(compare: LoopTestCompare): string {
+  const lines = [
+    `Loop test compare: base ${compare.base.commit.slice(0, 10)}, head ${compare.head.commit.slice(0, 10)}` +
+      `${compare.head.dirty ? " (dirty)" : ""}, ${compare.head.files.length} files, ${compare.head.rounds} paired rounds`,
+    "",
+  ];
+  for (const file of compare.skipped) lines.push(`skip ${file} (no change to it)`);
+  for (const file of compare.newFiles) lines.push(`new ${file} (no base, no trip)`);
+  for (const trip of compare.trips) {
+    const c = trip.comparison;
+    const b = compare.base.files.find((f) => f.file === trip.file);
+    const h = compare.head.files.find((f) => f.file === trip.file);
+    const kinds = [trip.slower ? "slower" : "", trip.failsMore ? "fails more" : ""].filter(Boolean);
+    lines.push(
+      `TRIP ${trip.file} ${kinds.join(", ")}: ${c.deltaPct.toFixed(0)}% ` +
+        `[${c.ciLowPct.toFixed(0)}%, ${c.ciHighPct.toFixed(0)}%], ` +
+        `${c.baseMedian.toFixed(0)} ms -> ${c.headMedian.toFixed(0)} ms, ` +
+        `failed base ${b?.failedRuns}/${b?.wallMs.length} head ${h?.failedRuns}/${h?.wallMs.length}`
+    );
+  }
+  lines.push("", "Base", "", renderRecord(compare.base), "Head", "", renderRecord(compare.head));
+  return lines.join("\n");
+}
+
 async function main(): Promise<number> {
   const { values } = parseArgs({
     options: {
       runs: { type: "string", default: "10" },
       jobs: { type: "string", default: "6" },
       filter: { type: "string" },
+      base: { type: "string" },
     },
   });
   const runs = Number(values.runs);
   const jobs = Number(values.jobs);
   assert(Number.isInteger(runs) && runs >= 1, `invalid --runs ${values.runs}`);
+  assert(values.base === undefined || runs >= 2, "a compare needs --runs 2 or more");
   const root = repoRoot();
-  const files = loopTestFiles(root, values.filter);
-  assert(files.length > 0, `no loop test files match --filter ${values.filter}`);
-  // Scan first, so a scan error stops the run before any test process starts.
-  const timePatched = files.map((file) => patchesGlobalTime(root, file));
   const state = gitState(root);
   const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), "loop-tests-"));
+  const baseDir = path.join(scratchDir, "base");
+  let worktreeAdded = false;
+  const cleanup = () => {
+    if (worktreeAdded) git(root, ["worktree", "remove", "--force", baseDir]);
+    worktreeAdded = false;
+    fs.rmSync(scratchDir, { recursive: true, force: true });
+  };
+  for (const [signal, code] of [
+    ["SIGINT", 130],
+    ["SIGTERM", 143],
+  ] as const) {
+    process.once(signal, () => {
+      cleanup();
+      process.exit(code);
+    });
+  }
   const loadavg = [os.loadavg()[0]];
   const sampler = setInterval(() => loadavg.push(os.loadavg()[0]), 60_000);
-  console.error(`loop tests · ${files.length} files · ${runs} rounds · ${jobs} jobs`);
   try {
-    // Round-major order, as the spike ran: the rounds of one file do not run side by side.
-    const tasks = Array.from({ length: runs }, () =>
-      files.map((file) => () => runFile(root, file, scratchDir))
+    const sides: Side[] = [{ label: "head", root, commit: state.gitSha, dirty: state.dirty }];
+    let skipped: string[] = [];
+    let newFiles: string[] = [];
+    let files = loopTestFiles(root, values.filter);
+    if (values.base !== undefined) {
+      const baseSha = git(root, ["rev-parse", "--verify", `${values.base}^{commit}`]);
+      addWorktree(root, baseDir, baseSha);
+      worktreeAdded = true;
+      sides.unshift({ label: "base", root: baseDir, commit: baseSha, dirty: false });
+      const baseFiles = new Set(loopTestFiles(baseDir, values.filter));
+      newFiles = files.filter((file) => !baseFiles.has(file));
+      skipped = heavySkips(runs, changedFiles(root, baseSha)).filter((file) =>
+        files.includes(file)
+      );
+      files = files.filter((file) => baseFiles.has(file) && !skipped.includes(file));
+    }
+    assert(files.length > 0, `no loop test files match --filter ${values.filter}`);
+    // Scan first, so a scan error stops the run before any test process starts.
+    const timePatched = sides.map((side) =>
+      files.map((file) => patchesGlobalTime(side.root, file))
+    );
+    console.error(
+      `loop tests · ${files.length} files · ${runs} ${sides.length > 1 ? "paired " : ""}rounds · ${jobs} jobs`
+    );
+    // Round-major order, as the spike ran: the rounds of one file do not run side by side. In a
+    // compare each task runs one file on base, then on head (the order flips each round), so
+    // host load drift hits both sides of a round alike.
+    const tasks = Array.from({ length: runs }, (_, round) =>
+      files.map((file) => async () => {
+        const order = round % 2 === 0 ? sides : [...sides].reverse();
+        const byLabel = new Map<Side["label"], LoopTestRun>();
+        for (const side of order)
+          byLabel.set(side.label, await runFile(side.root, file, scratchDir));
+        return byLabel;
+      })
     ).flat();
     const results = await runPool(tasks, jobs);
-    const record: LoopTestRecord = {
-      commit: state.gitSha,
-      dirty: state.dirty,
-      bun: Bun.version,
-      loadavg,
-      rounds: runs,
-      files: files.map((file, i) =>
-        summarizeFile(
-          file,
-          Array.from({ length: runs }, (_, round) => results[round * files.length + i]),
-          timePatched[i]
-        )
-      ),
-    };
+    const records = sides.map(
+      (side, s): LoopTestRecord => ({
+        commit: side.commit,
+        dirty: side.dirty,
+        bun: Bun.version,
+        loadavg,
+        rounds: runs,
+        files: files.map((file, i) => {
+          const fileRuns = Array.from({ length: runs }, (_, round) => {
+            const run = results[round * files.length + i].get(side.label);
+            assert(run, `${side.label} ${file} round ${round}: no run`);
+            return run;
+          });
+          return summarizeFile(file, fileRuns, timePatched[s][i]);
+        }),
+      })
+    );
     const outDir = path.join(root, "artifacts", "loop-tests");
     fs.mkdirSync(outDir, { recursive: true });
-    const name = `${state.gitSha.slice(0, 10)}${state.dirty ? "-dirty" : ""}`;
-    const markdown = renderRecord(record);
-    fs.writeFileSync(path.join(outDir, `${name}.json`), `${JSON.stringify(record, null, 2)}\n`);
+    const headName = `${state.gitSha.slice(0, 10)}${state.dirty ? "-dirty" : ""}`;
+    const head = records[records.length - 1];
+    if (records.length === 1) {
+      const markdown = renderRecord(head);
+      fs.writeFileSync(path.join(outDir, `${headName}.json`), `${JSON.stringify(head, null, 2)}\n`);
+      fs.writeFileSync(path.join(outDir, `${headName}.md`), markdown);
+      console.log(markdown);
+      console.log(`wrote artifacts/loop-tests/${headName}.json and .md`);
+      console.log("loop-tests: record");
+      return 0;
+    }
+    const base = records[0];
+    const compare: LoopTestCompare = { base, head, skipped, trips: trips(base, head), newFiles };
+    const name = `compare-${base.commit.slice(0, 10)}-${headName}`;
+    const markdown = renderCompare(compare);
+    fs.writeFileSync(path.join(outDir, `${name}.json`), `${JSON.stringify(compare, null, 2)}\n`);
     fs.writeFileSync(path.join(outDir, `${name}.md`), markdown);
     console.log(markdown);
     console.log(`wrote artifacts/loop-tests/${name}.json and .md`);
-    console.log("loop-tests: record");
-    return 0;
+    console.log(`loop-tests: ${compare.trips.length} trips`);
+    return compare.trips.length > 0 ? 1 : 0;
   } finally {
     clearInterval(sampler);
-    fs.rmSync(scratchDir, { recursive: true, force: true });
+    cleanup();
   }
 }
 

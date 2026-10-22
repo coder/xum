@@ -7,6 +7,7 @@
  * named the fields medianMs and realWaitShare; this record keeps wallMs[] and timerShare instead.
  */
 import assert from "node:assert/strict";
+import { type BenchComparison, compareBenchRounds } from "./benchStats";
 
 /** What scripts/perf/loopTests.preload.ts writes for one process. */
 export interface PreloadOutput {
@@ -80,4 +81,48 @@ export function summarizeFile(
     fsShare: share((preload) => preload.fsMs),
     timerShare: share((preload) => preload.timerMs),
   };
+}
+
+/**
+ * The trip margins. They are fixed in the phase 1 plan before work starts: no worker changes them
+ * to clear a trip. A paired same-code (A/A) spike of 5 rounds gave a highest lower bound of +2.7%,
+ * and tools/bash_output.test.ts failed 1 of 2 runs with no change, so one more failed run is noise.
+ */
+export const SLOWER_LOW_BOUND_PCT = 10;
+export const SLOWER_MIN_DELTA_MS = 250;
+export const MORE_FAILED_RUNS = 2;
+
+export interface Trip {
+  file: string;
+  slower: boolean;
+  failsMore: boolean;
+  comparison: BenchComparison;
+}
+
+export interface LoopTestCompare {
+  base: LoopTestRecord;
+  head: LoopTestRecord;
+  /** Files left out of this run (backgroundProcessManager.test.ts at RUNS below 5). */
+  skipped: string[];
+  trips: Trip[];
+  /** Head test files with no base: listed, never a trip. */
+  newFiles: string[];
+}
+
+/**
+ * A head file trips when its paired 95% lower bound is above +SLOWER_LOW_BOUND_PCT and its median
+ * grew by more than SLOWER_MIN_DELTA_MS, or when it failed MORE_FAILED_RUNS more runs than base.
+ * A trip pauses the PR for review; it never fails the PR by itself.
+ */
+export function trips(base: LoopTestRecord, head: LoopTestRecord): Trip[] {
+  return head.files.flatMap((h) => {
+    const b = base.files.find((f) => f.file === h.file);
+    if (b === undefined) return [];
+    const comparison = compareBenchRounds(b.wallMs, h.wallMs);
+    const slower =
+      comparison.ciLowPct > SLOWER_LOW_BOUND_PCT &&
+      comparison.headMedian - comparison.baseMedian > SLOWER_MIN_DELTA_MS;
+    const failsMore = h.failedRuns >= b.failedRuns + MORE_FAILED_RUNS;
+    return slower || failsMore ? [{ file: h.file, slower, failsMore, comparison }] : [];
+  });
 }

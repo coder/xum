@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { type LoopTestRun, summarizeFile } from "./loopTestStats";
+import { type LoopTestRecord, type LoopTestRun, summarizeFile, trips } from "./loopTestStats";
 
 const run = (wallMs: number, exitCode: number, fsMs?: number, timerMs = 0): LoopTestRun => ({
   wallMs,
@@ -34,5 +34,57 @@ describe("summarizeFile", () => {
     const record = summarizeFile("a.test.ts", [run(800, 1), run(900, 1)], false);
     expect(record).toMatchObject({ fsShare: null, timerShare: null, usesTempDir: false });
     expect(record.failedRuns).toBe(2);
+  });
+});
+
+describe("trips", () => {
+  const record = (files: Array<[string, number[], number]>): LoopTestRecord => ({
+    commit: "c",
+    dirty: false,
+    bun: "1.4.3",
+    loadavg: [1],
+    rounds: 3,
+    files: files.map(([file, wallMs, failedRuns]) => ({
+      file,
+      wallMs,
+      failedRuns,
+      usesTempDir: true,
+      patchesGlobalTime: false,
+      fsShare: 0.1,
+      timerShare: 0,
+    })),
+  });
+
+  test("no trip on equal rounds or for a new file", () => {
+    const base = record([["a", [1000, 1010, 990], 0]]);
+    const head = record([
+      ["a", [1000, 1010, 990], 0],
+      ["new", [9000, 9000, 9000], 3],
+    ]);
+    expect(trips(base, head)).toEqual([]);
+  });
+
+  test("a slowdown far above the noise trips as slower", () => {
+    const base = record([["a", [1000, 1010, 990], 0]]);
+    const head = record([["a", [2000, 2030, 1990], 0]]);
+    expect(trips(base, head)).toMatchObject([{ file: "a", slower: true, failsMore: false }]);
+  });
+
+  test("a large share that adds 250 ms or less does not trip", () => {
+    const base = record([["a", [100, 101, 99], 0]]);
+    const head = record([["a", [340, 342, 338], 0]]);
+    expect(trips(base, head)).toEqual([]);
+  });
+
+  test("two more failed runs trip as fails more, one more does not", () => {
+    const base = record([
+      ["a", [1000, 1000, 1000], 0],
+      ["b", [1000, 1000, 1000], 1],
+    ]);
+    const head = record([
+      ["a", [1000, 1000, 1000], 2],
+      ["b", [1000, 1000, 1000], 2],
+    ]);
+    expect(trips(base, head)).toMatchObject([{ file: "a", slower: false, failsMore: true }]);
   });
 });

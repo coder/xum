@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loopTestFiles, patchesGlobalTime, runFile } from "./loopTestBaseline";
+import { heavySkips, loopTestFiles, patchesGlobalTime, runFile } from "./loopTestBaseline";
 import { summarizeFile } from "./loopTestStats";
 
 let root: string;
@@ -101,4 +101,34 @@ describe("runFile", () => {
     expect(crash.exitCode).not.toBe(0);
     expect(summarizeFile("f", [ok, crash], false).failedRuns).toBe(1);
   });
+});
+
+describe("heavySkips", () => {
+  const heavy = "src/node/services/backgroundProcessManager.test.ts";
+
+  test("a short compare skips backgroundProcessManager.test.ts unless its code changed", () => {
+    expect(heavySkips(3, ["src/node/services/historyService.ts"])).toEqual([heavy]);
+    expect(heavySkips(3, ["src/node/services/backgroundProcessManager.ts"])).toEqual([]);
+    expect(heavySkips(3, [heavy])).toEqual([]);
+  });
+
+  test("a full compare never skips it", () => {
+    expect(heavySkips(5, [])).toEqual([]);
+  });
+});
+
+test("an unknown --base exits 2 with a last loop-tests line", () => {
+  const result = Bun.spawnSync(
+    [
+      "bun",
+      "scripts/perf/loopTestBaseline.ts",
+      "--base",
+      "no-such-ref-for-loop-tests",
+      "--runs",
+      "3",
+    ],
+    { cwd: path.join(import.meta.dir, "..", ".."), stdout: "pipe", stderr: "pipe" }
+  );
+  expect(result.exitCode).toBe(2);
+  expect(result.stdout.toString().trim().split("\n").at(-1)).toBe("loop-tests: error");
 });
