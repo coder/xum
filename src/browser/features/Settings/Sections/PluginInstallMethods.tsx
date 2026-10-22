@@ -31,7 +31,7 @@ export function installMethodLabel(method: AgentPluginInstallMethod): string {
 
 /** A stable choice value per method. A method with fields (a marketplace entry) adds them here. */
 function methodKey(method: AgentPluginInstallMethod): string {
-  return method.kind;
+  return method.kind === "claude-marketplace" ? `${method.kind}:${method.entry}` : method.kind;
 }
 
 /**

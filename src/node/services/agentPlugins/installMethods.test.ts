@@ -11,11 +11,10 @@ import {
   detectInstallMethods,
   findSkillsPackageRoots,
   generatedPluginName,
-  INERT_COMPONENT_PATH,
   toPluginName,
   writeGeneratedManifest,
 } from "./installMethods";
-import { AGENT_PLUGIN_SCHEMA_ID_1_0_0, MAX_SKILLS_ROOTS } from "./manifest";
+import { AGENT_PLUGIN_SCHEMA_ID_1_0_0, INERT_COMPONENT_PATH, MAX_SKILLS_ROOTS } from "./manifest";
 
 const SKILL = (name: string) => `---\nname: ${name}\ndescription: ${name}\n---\n`;
 
