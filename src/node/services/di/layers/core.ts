@@ -32,6 +32,7 @@ import {
   BackgroundProcessManagerTag,
   ConfigTag,
   ContextManagement,
+  DesktopNotificationsTag,
   Evaluation,
   ExtensionMetadata,
   FileLeaseManagerTag,
@@ -328,7 +329,8 @@ export const AILive = Layer.effect(
       yield* StreamManagerTag,
       yield* TurnRequestBuilderBindingsTag,
       yield* ProvidersConfigStoreTag,
-      yield* SecretsStoreTag
+      yield* SecretsStoreTag,
+      { desktopNotifications: yield* DesktopNotificationsTag }
     );
   })
 );

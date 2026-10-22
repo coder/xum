@@ -27,6 +27,7 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { ensurePrivateDir } from "@/node/utils/fs";
 import {
   TurnRequestBuilder,
+  type LoopHostServices,
   type TurnRequestBuilderBindings,
   resolveXumToolScope,
   type StreamMessageOptions,
@@ -215,7 +216,9 @@ export class AIService extends EventEmitter {
     providersConfigStore?: ProvidersConfigStore,
     private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
       config.rootDir
-    )
+    ),
+    /** Absent members: the Node layer (`new AIService(` in tests passes none). */
+    hostServices: LoopHostServices = {}
   ) {
     super();
     // No listener cap: every live AgentSession adds one listener per forwarded event, and a
@@ -268,6 +271,7 @@ export class AIService extends EventEmitter {
       experimentsService: this.experimentsService,
       lastLlmRequestByWorkspace: this.lastLlmRequestByWorkspace,
       bindings: this.turnRequestBuilderBindings,
+      hostServices,
       emit: (event, ...args) => this.emit(event, ...args),
       createAbortedTurnHandle: (messageId, signal) =>
         this.createAbortedTurnHandle(messageId, signal),

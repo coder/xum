@@ -133,7 +133,6 @@ const FROZEN_ALLOW_PAIRS = [
   "src/node/services/tools/agent_skill_list.ts os",
   "src/node/services/tools/agent_skill_write.ts fs/promises",
   "src/node/services/tools/bash.ts fs",
-  "src/node/services/tools/notify.ts electron",
   "src/node/services/tools/review_pane.ts @/node/utils/writeFileAtomic",
   "src/node/services/tools/review_pane.ts fs/promises",
   "src/node/services/tools/shared/configReadWrite.ts @/node/utils/writeFileAtomic",

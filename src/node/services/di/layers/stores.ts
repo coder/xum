@@ -7,8 +7,10 @@ import {
   type ConfigStores,
 } from "@/node/config";
 import type { CoreServicesOptions } from "@/node/services/coreServices";
+import { electronDesktopNotifications } from "@/node/services/desktopNotifications/electronDesktopNotifications";
 import {
   ConfigTag,
+  DesktopNotificationsTag,
   FileLeaseManagerTag,
   ProvidersConfigStoreTag,
   SecretsStoreTag,
@@ -28,7 +30,8 @@ export function StoresLive(stores: ConfigStores): Layer.Layer<StoreTags> {
     Layer.succeed(SessionLocatorTag)(stores.sessionLocator),
     Layer.succeed(ProvidersConfigStoreTag)(stores.providersConfigStore),
     Layer.succeed(SecretsStoreTag)(stores.secretsStore),
-    Layer.succeed(FileLeaseManagerTag)(stores.fileLeaseManager)
+    Layer.succeed(FileLeaseManagerTag)(stores.fileLeaseManager),
+    Layer.succeed(DesktopNotificationsTag)(electronDesktopNotifications)
   );
 }
 

@@ -91,6 +91,7 @@ import * as os from "os";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { DesktopNotifications } from "@/node/services/desktopNotifications/desktopNotifications";
 import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
@@ -162,6 +163,8 @@ export interface ToolConfiguration {
   hookTurn?: HookTurn;
   /** Runtime environment for executing commands and file operations */
   runtime: Runtime;
+  /** OS notifications for the notify tool. Absent: the Node layer (configs that tests build by hand). */
+  desktopNotifications?: DesktopNotifications;
   /** Project roots in this workspace (single- or multi-project context for tool descriptions) */
   projects?: ProjectRef[];
   /** Environment secrets to inject (optional) */

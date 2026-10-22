@@ -27,6 +27,7 @@ import type { AutoModelRouter } from "@/node/services/autoModelRouter";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { BackupService } from "@/node/services/backup/backupService";
+import type { DesktopNotifications } from "@/node/services/desktopNotifications/desktopNotifications";
 import type { AgentBrowserSessionDiscoveryService } from "@/node/services/browser/AgentBrowserSessionDiscoveryService";
 import type { BrowserBridgeServer } from "@/node/services/browser/BrowserBridgeServer";
 import type { BrowserBridgeTokenManager } from "@/node/services/browser/BrowserBridgeTokenManager";
@@ -106,6 +107,11 @@ export class ProvidersConfigStoreTag extends Context.Service<
 export class SecretsStoreTag extends Context.Service<SecretsStoreTag, SecretsStore>()(
   "xum/SecretsStore"
 ) {}
+/** OS notifications of the notify tool (desktopNotifications/). */
+export class DesktopNotificationsTag extends Context.Service<
+  DesktopNotificationsTag,
+  DesktopNotifications
+>()("xum/DesktopNotifications") {}
 export class FileLeaseManagerTag extends Context.Service<FileLeaseManagerTag, FileLeaseManager>()(
   "xum/FileLeaseManager"
 ) {}
@@ -312,13 +318,17 @@ export class BashAiProxy extends Context.Service<BashAiProxy, BashAiProxyService
   "xum/BashAiProxy"
 ) {}
 
-/** The process's config stores (`ConfigStores`), one tag per store. */
+/**
+ * The process's config stores (`ConfigStores`), one tag per store, and the Node layers of the
+ * host services that agent-loop code reads instead of importing host modules.
+ */
 export type StoreTags =
   | ConfigTag
   | SessionLocatorTag
   | ProvidersConfigStoreTag
   | SecretsStoreTag
-  | FileLeaseManagerTag;
+  | FileLeaseManagerTag
+  | DesktopNotificationsTag;
 
 /**
  * The runtime seams provided at the base of every graph (`./effectRunner.ts`,
