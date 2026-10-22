@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { parseChangedLines, type ChangedLines } from "./policy";
+import { diffHeaders, parseChangedLines, type ChangedLines, type Hunk } from "./policy";
 
 export function git(root: string, args: string[]): string {
   return execFileSync("git", args, { cwd: root, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
@@ -47,11 +47,6 @@ export function parseNameStatus(output: string): ChangedFile[] {
   return files.filter((file) => [file.basePath, file.headPath].some((p) => p && SCORED.test(p)));
 }
 
-/** One `git diff -U0` hunk: [baseStart, baseCount, headStart, headCount]. */
-export type Hunk = [number, number, number, number];
-
-const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
-
 /**
  * Hunks per head path, both sides, so a gate can map a head line back to its
  * base line (dry/dryer_report.py). Paths follow parseChangedLines in policy.ts.
@@ -59,17 +54,13 @@ const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 export function parseHunks(diff: string): Map<string, Hunk[]> {
   const hunks = new Map<string, Hunk[]>();
   let current: Hunk[] | null = null;
-  for (const line of diff.split("\n")) {
-    if (line.startsWith("+++ ")) {
-      const target = line.slice(4).replace(/\t$/, "");
-      current = target === "/dev/null" ? null : [];
-      if (current) hunks.set(target.replace(/^b\//, ""), current);
-      continue;
+  for (const header of diffHeaders(diff)) {
+    if (header.kind === "file") {
+      current = header.path === null ? null : [];
+      if (current && header.path !== null) hunks.set(header.path, current);
+    } else if (current) {
+      current.push(header.hunk);
     }
-    const match = HUNK.exec(line);
-    if (!match || !current) continue;
-    const count = (value: string | undefined) => (value === undefined ? 1 : Number(value));
-    current.push([Number(match[1]), count(match[2]), Number(match[3]), count(match[4])]);
   }
   return hunks;
 }

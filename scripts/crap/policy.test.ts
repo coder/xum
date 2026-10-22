@@ -6,6 +6,7 @@ import {
   type ChangedLines,
   type FunctionRow,
 } from "./policy";
+import { parseHunks } from "./changes";
 
 const PATH = "src/demo/mod.ts";
 
@@ -330,6 +331,19 @@ describe("CRAP tax", () => {
     // Deleting between head lines 20 and 21 is on the boundary of both.
     const between = parseChangedLines(`+++ b/${PATH}\n@@ -21,3 +20,0 @@\n`);
     expect(verdicts([left, right], [left, right], between)).toEqual([]);
+  });
+
+  test("an added line that starts with ++ is not a file header", () => {
+    // Git renders the added source line `++ counter;` as `+++ counter;`.
+    const diff = `+++ b/${PATH}\n@@ -1,0 +2 @@\n+++ counter;\n@@ -9,0 +11 @@\n+x;\n`;
+    expect(parseChangedLines(diff).get(PATH)).toEqual([
+      [2, 2],
+      [11, 11],
+    ]);
+    expect(parseHunks(diff).get(PATH)).toEqual([
+      [1, 0, 2, 1],
+      [9, 0, 11, 1],
+    ]);
   });
 
   test("a path with a space keeps its spans despite Git's trailing tab", () => {
