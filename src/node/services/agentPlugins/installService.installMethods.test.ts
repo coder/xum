@@ -139,6 +139,19 @@ describe("AgentPluginInstallService install methods", () => {
     ).rejects.toThrow("A managed plugin named 'acme-skills' is already installed");
   });
 
+  test("the Skills CLI choice names each skill by its frontmatter name, also a root skill", async () => {
+    // The CLI matches --skill against the frontmatter name, not the repository or folder name.
+    await fsPromises.rm(path.join(remoteDir, "skills"), { recursive: true });
+    await write({ "SKILL.md": skillMd("pdf") });
+    await commit("root skill");
+    expect((await service.preview({ input: remoteDir })).skillsCliSkills).toEqual(["pdf"]);
+
+    // A name that is not a valid skill name cannot be passed safely: no CLI choice for it.
+    await write({ "SKILL.md": skillMd("PDF Tools") });
+    await commit("display name");
+    expect((await service.preview({ input: remoteDir })).skillsCliSkills).toEqual([]);
+  });
+
   test("install refuses a method that does not fit its clone", async () => {
     const preview = await service.preview({ input: remoteDir });
     await expect(

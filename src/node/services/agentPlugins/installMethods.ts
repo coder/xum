@@ -388,19 +388,31 @@ export function generatedPluginName(source: Pick<AgentPluginGitSource, "url" | "
   );
 }
 
-/** Skill names for the skills CLI's `--skill` (valid skill names only, no repeats). */
-export function skillsCliSkillNames(
-  roots: SkillsPackageRoot[],
-  source: Pick<AgentPluginGitSource, "url" | "subpath">
-): string[] {
-  const names = roots.flatMap((root) => {
-    if (root.root !== ".") return root.skills;
-    try {
-      return [generatedPluginName(source)];
-    } catch {
-      return [];
+/**
+ * Skill names for the skills CLI's `--skill` (valid skill names only, no repeats). The CLI names
+ * a skill by its SKILL.md frontmatter `name` (skills@1.7.4 parseSkillMd, filterSkills), so these
+ * are the frontmatter names, also for a root SKILL.md (not the repository name). A name that is
+ * not a valid skill name cannot be passed safely, so that skill is not offered.
+ */
+export async function skillsCliSkillNames(
+  stagedDir: string,
+  roots: SkillsPackageRoot[]
+): Promise<string[]> {
+  const rootReal = await fsPromises.realpath(stagedDir);
+  const names: string[] = [];
+  for (const root of roots) {
+    const rootDir = path.join(rootReal, root.root);
+    // A root that holds SKILL.md is one skill (the repository root, or a container path).
+    const own = await readSkillsCliName(rootReal, rootDir);
+    if (own !== undefined) {
+      names.push(own);
+      continue;
     }
-  });
+    for (const skill of root.skills) {
+      const name = await readSkillsCliName(rootReal, path.join(rootDir, skill));
+      if (name !== undefined) names.push(name);
+    }
+  }
   return [...new Set(names)].filter((name) => SkillNameSchema.safeParse(name).success);
 }
 
