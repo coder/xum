@@ -34,6 +34,7 @@ import {
 import type { BashMonitorProcessSnapshot, BashMonitorTailLine } from "./bashMonitorWakeReconciler";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 
 const DEFAULT_BACKGROUND_BASH_TAIL_BYTES = 64_000;
 const MAX_BACKGROUND_BASH_TAIL_BYTES = 1_000_000;
@@ -137,7 +138,7 @@ export function parseSpawnRecordMeta(raw: string): { pid: number; status: string
  * Throws when the directory cannot be probed, so callers fail closed instead of looping over
  * candidates.
  */
-async function recordDirIsFree(recordDir: string): Promise<boolean> {
+async function recordDirIsFree(recordDir: string, clock: HostClock): Promise<boolean> {
   let stat: Stats;
   try {
     stat = await fsPromises.lstat(recordDir);
@@ -145,7 +146,7 @@ async function recordDirIsFree(recordDir: string): Promise<boolean> {
     if (isErrnoWithCode(error, "ENOENT")) return true;
     throw error;
   }
-  return stat.isDirectory() && (await pruneOldSettledRecord(recordDir));
+  return stat.isDirectory() && (await pruneOldSettledRecord(recordDir, clock));
 }
 
 // A settled record is pruned only once its exit marker is at least this old (#4893).
@@ -170,7 +171,7 @@ const SETTLED_RECORD_PRUNE_AGE_MS = 24 * 60 * 60 * 1000;
  *   the new command's output past its old offset. Read-only, and only for such old records.
  * Any failure keeps the record (the caller moves on to a suffixed name).
  */
-async function pruneOldSettledRecord(recordDir: string): Promise<boolean> {
+async function pruneOldSettledRecord(recordDir: string, clock: HostClock): Promise<boolean> {
   try {
     // Regular files only (lstat): never follow a symlink planted in the shared temp records
     // root, and never block on a FIFO while holding the spawn-name lock.
@@ -185,7 +186,7 @@ async function pruneOldSettledRecord(recordDir: string): Promise<boolean> {
     const marker = await fsPromises.lstat(nodePath.join(recordDir, BG_EXIT_CODE_FILENAME));
     if (!marker.isFile() || !metaStat.isFile()) return false;
     const settledAtMs = Math.max(marker.mtimeMs, metaStat.mtimeMs);
-    if (Date.now() - settledAtMs < SETTLED_RECORD_PRUNE_AGE_MS) return false;
+    if (clock.nowMs() - settledAtMs < SETTLED_RECORD_PRUNE_AGE_MS) return false;
     await fsPromises.rm(recordDir, { recursive: true });
     return true;
   } catch (error) {
@@ -365,7 +366,8 @@ export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorC
   droppedLines: number;
   totalDroppedLines: number;
   lastLines: string[];
-  flushTimer?: ReturnType<typeof setTimeout>;
+  /** Cancels the pending cooldown flush (HostClock.setTimer). */
+  flushTimer?: () => void;
   lastReadOffset: number;
   /**
    * File byte offset at the end of the last complete line that produced a match. Unlike
@@ -701,8 +703,8 @@ const DECIDED_ON_HEAD_NOTE = `A line over ${MAX_RETAINED_UNREAD_BYTES} bytes was
 
 const OUTPUT_POLL_INTERVAL_MS = 100;
 
-function sleepMs(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleepMs(clock: HostClock, ms: number): Promise<void> {
+  return new Promise((resolve) => clock.setTimer(resolve, ms));
 }
 
 /** What getOutput's read collected: see readOutputWindow. */
@@ -993,13 +995,17 @@ function nextWaitStep(
  * Without a final drain, we can return "exited" with empty output even though output becomes
  * available moments later.
  */
-async function drainAfterExit(proc: BackgroundProcess, window: OutputWindow): Promise<void> {
+async function drainAfterExit(
+  proc: BackgroundProcess,
+  window: OutputWindow,
+  clock: HostClock
+): Promise<void> {
   if (window.status === "running") return;
   // A read made before the exit was seen can have held back a split character: this read
   // (bounded by the window's room) takes it, even when the window is not at the end.
   if ((await readIntoWindow(proc, window)) || !window.reachedEnd) return;
   // We didn't observe any new output: wait one poll interval and try once more.
-  await sleepMs(OUTPUT_POLL_INTERVAL_MS);
+  await sleepMs(clock, OUTPUT_POLL_INTERVAL_MS);
   await readIntoWindow(proc, window);
 }
 
@@ -1085,7 +1091,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   // were lost. Never reset: the manager does not outlive a shutdown.
   private shuttingDown = false;
 
-  constructor(bgOutputDir: string) {
+  // Agent-loop time (timestamps, polls, cooldowns, deadlines) reads this clock, so tests can
+  // drive it with a TestClock. The default is today's Date.now() and setTimeout().
+  constructor(
+    bgOutputDir: string,
+    private readonly hostClock: HostClock = nodeClock
+  ) {
     super();
     // Background bash status can have many concurrent subscribers (e.g. multiple workspaces).
     // Raise the default listener cap to avoid noisy MaxListenersExceededWarning.
@@ -1180,7 +1191,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     if (monitor.settled) return;
 
     if (monitor.flushTimer) {
-      clearTimeout(monitor.flushTimer);
+      monitor.flushTimer();
       monitor.flushTimer = undefined;
     }
 
@@ -1271,7 +1282,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       ...(update.tailLines !== undefined ? { tailLines: update.tailLines } : {}),
       totalMatches: monitor.matchesCount,
       ...(update.droppedLines > 0 ? { droppedLines: update.droppedLines } : {}),
-      timestamp: Date.now(),
+      timestamp: this.hostClock.nowMs(),
       ...(update.matchedThroughOffset !== undefined
         ? { matchedThroughOffset: update.matchedThroughOffset }
         : {}),
@@ -1316,7 +1327,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         : undefined;
     monitor.stopped = true;
     if (monitor.flushTimer) {
-      clearTimeout(monitor.flushTimer);
+      monitor.flushTimer();
       monitor.flushTimer = undefined;
     }
     if (reason === "failed") {
@@ -1420,7 +1431,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     monitor.settled = true;
     // A stale cooldown timer must not fire while the settlement helper awaits its final reads.
     if (monitor.flushTimer) {
-      clearTimeout(monitor.flushTimer);
+      monitor.flushTimer();
       monitor.flushTimer = undefined;
     }
     return { proc, monitor };
@@ -1455,7 +1466,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // Emitting then would let WorkspaceService persist or queue a synthetic turn during
     // ServiceContainer.dispose; returning instead leaves the armed registry record for the
     // restart monitor-lost recovery (in-memory pending matches are lost, crash-equivalent).
-    await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
+    await sleepMs(this.hostClock, monitor.pollIntervalMs);
     if (monitor.stopped || this.shuttingDown) return;
 
     // Final monitor scan: matches printed after the last poll (or sitting in the chunk the tail
@@ -1513,7 +1524,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     monitor.settlementDisposition = {
       status: terminal.status,
       ...(terminal.exitCode !== undefined ? { exitCode: terminal.exitCode } : {}),
-      settledAt: new Date().toISOString(),
+      settledAt: new Date(this.hostClock.nowMs()).toISOString(),
       wakeOnExit: monitor.wakeOnExit,
       terminalStatusShown: proc.terminalStatusShownToAgent,
       ...(retainedMatchedThroughOffset != null
@@ -1594,7 +1605,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       return;
     }
 
-    monitor.flushTimer ??= setTimeout(() => {
+    monitor.flushTimer ??= this.hostClock.setTimer(() => {
       monitor.flushTimer = undefined;
       if (!monitor.stopped && !monitor.settled) {
         this.emitMonitorMatch(proc, monitor);
@@ -1935,7 +1946,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         if (proc.status === "running") {
           proc.status = "exited";
           proc.exitCode = exitCode;
-          proc.exitTime = Date.now();
+          proc.exitTime = this.hostClock.nowMs();
           await this.updateMetaFile(proc).catch((err: unknown) => {
             log.debug(
               `BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`
@@ -1950,7 +1961,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           monitor.lastReadOffset = read.newOffset;
           this.processMonitorContent(proc, read.content, { chunkStartOffset });
           // stdout/stderr redirection can lag exit-code observation by a tick.
-          await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
+          await sleepMs(this.hostClock, monitor.pollIntervalMs);
           const finalChunkStartOffset = monitor.lastReadOffset;
           const finalRead = await proc.handle.readOutput(finalChunkStartOffset);
           monitor.lastReadOffset = finalRead.newOffset;
@@ -1974,7 +1985,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       monitor.lastReadOffset = read.newOffset;
       this.processMonitorContent(proc, read.content, { chunkStartOffset });
 
-      await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
+      await sleepMs(this.hostClock, monitor.pollIntervalMs);
     }
   }
 
@@ -2087,9 +2098,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       }
       return;
     }
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancelTimer: (() => void) | undefined;
     const timedOut = new Promise<"timed-out">((resolve) => {
-      timer = setTimeout(() => resolve("timed-out"), Math.max(0, deadline - Date.now()));
+      cancelTimer = this.hostClock.setTimer(
+        () => resolve("timed-out"),
+        Math.max(0, deadline - this.hostClock.nowMs())
+      );
     });
     try {
       for (
@@ -2107,7 +2121,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         }
       }
     } finally {
-      clearTimeout(timer);
+      cancelTimer?.();
     }
   }
 
@@ -2187,7 +2201,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     this.reservedProcessIds.add(processId);
     try {
       let suffix = 2;
-      while (!(await recordDirIsFree(nodePath.join(workspaceDir, processId)))) {
+      while (!(await recordDirIsFree(nodePath.join(workspaceDir, processId), this.hostClock))) {
         this.reservedProcessIds.delete(processId);
         do {
           processId = `${displayName} (${suffix})`;
@@ -2311,7 +2325,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       let suffix = 2;
       try {
         while (
-          !(await recordDirIsFree(nodePath.join(localBgWorkspaceDir(workspaceId), processId)))
+          !(await recordDirIsFree(
+            nodePath.join(localBgWorkspaceDir(workspaceId), processId),
+            this.hostClock
+          ))
         ) {
           this.reservedProcessIds.delete(processId);
           do {
@@ -2406,7 +2423,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }
 
     const { handle, pid, outputDir } = result;
-    const startTime = Date.now();
+    const startTime = this.hostClock.nowMs();
 
     // Write meta.json with process info
     const meta: BackgroundProcessMeta = {
@@ -2474,7 +2491,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         filter: config.monitor.filter,
         filterExclude: config.monitor.exclude,
         script,
-        createdAt: new Date().toISOString(),
+        createdAt: new Date(this.hostClock.nowMs()).toISOString(),
       };
       proc.monitor = this.createMonitorState(config.monitor, { pollIntervalMs, armMetadata });
       this.startMonitorTail(proc);
@@ -2490,7 +2507,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // Schedule auto-termination for background processes with timeout
     const timeoutSecs = config.timeoutSecs;
     if (!config.isForeground && timeoutSecs !== undefined && timeoutSecs > 0) {
-      setTimeout(() => {
+      this.hostClock.setTimer(() => {
         void this.terminate(processId, { monitorDisposition: "flush" }).then((result) => {
           if (result.success) {
             log.debug(`Process ${processId} auto-terminated after ${timeoutSecs}s timeout`);
@@ -2571,7 +2588,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     outputDir: string,
     displayName?: string
   ): void {
-    const startTime = Date.now();
+    const startTime = this.hostClock.nowMs();
 
     const proc: BackgroundProcess = {
       id: processId,
@@ -2689,7 +2706,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         log.debug(`Background process ${proc.id} has exited`);
         proc.status = "exited";
         proc.exitCode = exitCode;
-        proc.exitTime = Date.now();
+        proc.exitTime = this.hostClock.nowMs();
         await this.updateMetaFile(proc).catch((err: unknown) => {
           log.debug(
             `BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`
@@ -2972,7 +2989,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     if (proc.unreadLineFilter !== lineFilter) proc.unreadLineDecision = undefined;
     proc.unreadLineFilter = lineFilter;
 
-    const startTime = Date.now();
+    const startTime = this.hostClock.nowMs();
     // File offset where this read's processable content begins (start cursor minus the buffered
     // output that cursor already advanced past). Used below to detect a gap left by a prior
     // filtered read so the shown-frontier never jumps over lines this read never showed.
@@ -2991,7 +3008,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         success: true,
         status: "interrupted",
         output: "(waiting interrupted)",
-        elapsed_ms: Date.now() - startTime,
+        elapsed_ms: this.hostClock.nowMs() - startTime,
       };
     }
     const currentStatus = window.status;
@@ -3090,7 +3107,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         currentStatus !== "running"
           ? ((await this.getProcess(processId))?.exitCode ?? undefined)
           : undefined,
-      elapsed_ms: Date.now() - startTime,
+      elapsed_ms: this.hostClock.nowMs() - startTime,
       note: appendDecidedOnHeadNote(note, filterRegex != null, [window, page]),
     };
   }
@@ -3105,7 +3122,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     proc: BackgroundProcess,
     options: OutputWaitOptions
   ): Promise<OutputWindow | null> {
-    const startTime = Date.now();
+    const startTime = this.hostClock.nowMs();
     const window: OutputWindow = {
       pending: proc.incompleteLineBuffer,
       decision: proc.unreadLineDecision,
@@ -3125,11 +3142,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       window.status = await this.refreshedStatus(proc);
       if (!options.filtered && lineRunsOnInWindow(window)) continue;
       if (windowHasOutputToReturn(window, options)) break;
-      if (nextWaitStep(window, Date.now() - startTime, options.timeoutMs) === "stop") break;
+      if (nextWaitStep(window, this.hostClock.nowMs() - startTime, options.timeoutMs) === "stop")
+        break;
       if (isInterrupted()) return keepInterruptedWindow(proc, window);
-      await sleepMs(OUTPUT_POLL_INTERVAL_MS);
+      await sleepMs(this.hostClock, OUTPUT_POLL_INTERVAL_MS);
     }
-    await drainAfterExit(proc, window);
+    await drainAfterExit(proc, window, this.hostClock);
     return window;
   }
 
@@ -3612,7 +3630,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         log.debug(`Background process ${proc.id} has exited`);
         proc.status = "exited";
         proc.exitCode = exitCode;
-        proc.exitTime = Date.now();
+        proc.exitTime = this.hostClock.nowMs();
         await this.updateMetaFile(proc).catch((err: unknown) => {
           log.debug(
             `BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`
@@ -3678,7 +3696,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // Update process status and exit code
       proc.status = "killed";
       proc.exitCode = (await proc.handle.getExitCode()) ?? undefined;
-      proc.exitTime ??= Date.now();
+      proc.exitTime ??= this.hostClock.nowMs();
 
       // Update meta.json
       await this.updateMetaFile(proc).catch((err: unknown) => {
@@ -3709,7 +3727,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       log.debug(`Error terminating process ${processId}: ${errorMessage}`);
       // Mark as killed even if there was an error (process likely already dead)
       proc.status = "killed";
-      proc.exitTime ??= Date.now();
+      proc.exitTime ??= this.hostClock.nowMs();
       // Update meta.json
       await this.updateMetaFile(proc).catch((err: unknown) => {
         log.debug(`BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`);
@@ -3765,7 +3783,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     log.debug(`BackgroundProcessManager.cleanup(${workspaceId}) called`);
     const drainDeadline =
       options?.failClosedAfterDrainTimeout === true
-        ? Date.now() + PENDING_ADMISSION_DRAIN_TIMEOUT_MS
+        ? this.hostClock.nowMs() + PENDING_ADMISSION_DRAIN_TIMEOUT_MS
         : null;
     // #4967, B2: no migration or spawn may begin while cleanup runs; a migration that tries is
     // refused and its command terminated, a spawn is refused. The seal lifts when cleanup
