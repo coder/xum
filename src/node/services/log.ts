@@ -511,7 +511,10 @@ function getCallerLocation(stackTop: LogEntryFunction): string {
  * @param level - Log level
  * @param args - Arguments to log
  */
-function formatLogLine(level: LogLevel, stackTop: LogEntryFunction): {
+function formatLogLine(
+  level: LogLevel,
+  stackTop: LogEntryFunction
+): {
   timestamp: string;
   location: string;
   useColor: boolean;
@@ -721,13 +724,12 @@ function appendFieldsToArgs(args: unknown[], fields?: LogFields): unknown[] {
 
 function createLogger(boundFields?: LogFields): Logger {
   const normalizedFields = normalizeFields(boundFields);
-  const logAtLevel =
-    (level: LogLevel) => {
-      const entry = (...args: unknown[]): void => {
-        safePipeLog(level, entry, ...appendFieldsToArgs(args, normalizedFields));
-      };
-      return entry;
+  const logAtLevel = (level: LogLevel) => {
+    const entry = (...args: unknown[]): void => {
+      safePipeLog(level, entry, ...appendFieldsToArgs(args, normalizedFields));
     };
+    return entry;
+  };
 
   return {
     ...baseLogger,
