@@ -346,6 +346,13 @@ export class DockerRuntime extends RemoteRuntime {
 
   protected readonly commandPrefix = "Docker";
 
+  override getAgentHostKey(): string | undefined {
+    // Each workspace has its own container; without a name the container is not known yet.
+    return this.containerName !== undefined
+      ? JSON.stringify(["docker", this.containerName])
+      : undefined;
+  }
+
   protected getBasePath(): string {
     return CONTAINER_SRC_DIR;
   }

@@ -1,4 +1,5 @@
 import { SecretsStore, type Config, type ProjectConfig, type ProjectsConfig } from "@/node/config";
+import { clearRemoteProjectPluginSnapshots } from "@/node/services/agentPlugins/remoteProjectPlugins";
 import { formatSshEndpoint } from "@/common/utils/ssh/formatSshEndpoint";
 import { SSH_PROTOCOL_SCHEMES } from "@/constants/git";
 import { spawn } from "child_process";
@@ -2067,6 +2068,8 @@ export class ProjectService {
         affectedPaths.push(candidatePath);
       }
     }
+    // #6426: snapshots of remote project plugins exist only for trusted projects.
+    await clearRemoteProjectPluginSnapshots();
     this.mcpServerManager?.applyProjectTrust(
       affectedPaths.map((candidatePath) => ({
         projectPath: candidatePath,

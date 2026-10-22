@@ -123,6 +123,15 @@ export abstract class RemoteRuntime implements Runtime {
   protected abstract readonly commandPrefix: string;
 
   /**
+   * #6426: a key for the host or container that holds this runtime's files, computed from its
+   * config only (no exec). Caches of remote checkout content key on it so two workspaces never
+   * share an entry. Undefined: no stable identity, so such caches are not used.
+   */
+  getAgentHostKey(): string | undefined {
+    return undefined;
+  }
+
+  /**
    * Execute command with streaming I/O.
    * Shared implementation that delegates process spawning to subclass.
    */

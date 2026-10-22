@@ -1,10 +1,17 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
+import { DockerRuntime } from "@/node/runtime/DockerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import type { ExecOptions, ExecStream } from "@/node/runtime/Runtime";
+import { SSHRuntime } from "@/node/runtime/SSHRuntime";
+import { ShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { createSSHTransport } from "@/node/runtime/transports";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
+  clearRemoteProjectPluginSnapshots,
   discoverRemoteProjectAgentPlugins,
+  getRemoteProjectPluginSnapshot,
   parseRemotePluginListing,
 } from "./remoteProjectPlugins";
 
@@ -136,7 +143,94 @@ describe("parseRemotePluginListing", () => {
     expect(parseRemotePluginListing("ROOT\t0\t/r\t\n")).toBeNull();
     // A name with a tab adds a field.
     expect(parseRemotePluginListing("D\t0\t\t/r/a\tb\nROOT\t0\t/r\t\nEND\n")).toBeNull();
-    // An F line without its content line.
+    // An F line without its blob.
     expect(parseRemotePluginListing("ROOT\t0\t/r\t\nF\t2\t\t/r/x/plugin.json\nEND\n")).toBeNull();
+  });
+
+  test("splits a blob among its files in order, and fails closed when the sizes do not add up", () => {
+    const listing = (sizes: [number, number], blob: string) =>
+      `F\t${sizes[0]}\t\t/r/p/a\nF\t${sizes[1]}\t\t/r/p/b\nB\t0\t\t/r/p\n${blob}\n.\nROOT\t0\t/r\t\nEND\n`;
+    const blob = Buffer.from("hello").toString("base64");
+    const parsed = parseRemotePluginListing(listing([2, 3], blob));
+    expect(parsed?.entries.map((entry) => entry.data?.toString())).toEqual(["he", "llo"]);
+    // A file that changed between the size pass and the read pass.
+    expect(parseRemotePluginListing(listing([2, 4], blob))).toBeNull();
+    expect(parseRemotePluginListing(listing([2, 3], "not base64!"))).toBeNull();
+  });
+});
+
+/** A remote runtime that runs its commands in a local shell and counts them. */
+class CountingRemoteRuntime extends ShellRemoteRuntime {
+  execs = 0;
+  constructor(
+    loginDir: string,
+    private readonly hostKey: string
+  ) {
+    super(loginDir);
+  }
+  override getAgentHostKey(): string {
+    return this.hostKey;
+  }
+  override exec(command: string, options: ExecOptions): Promise<ExecStream> {
+    this.execs++;
+    return super.exec(command, options);
+  }
+}
+
+describe("getRemoteProjectPluginSnapshot", () => {
+  test("one exec per key until trust changes; the cleared mirror is removed", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-cache");
+    const root = await fs.realpath(checkout.path);
+    const container = path.join(root, ".xum", "plugins");
+    await writeSkill(
+      path.join(await writePlugin(container, "cached", manifest("cached")), "skills"),
+      "review"
+    );
+    const runtime = new CountingRemoteRuntime(root, `test:${root}`);
+
+    const [first, second] = await Promise.all([
+      getRemoteProjectPluginSnapshot(runtime, root, [container]),
+      getRemoteProjectPluginSnapshot(runtime, root, [container]),
+    ]);
+    expect(await getRemoteProjectPluginSnapshot(runtime, root, [container])).toBe(first);
+    expect(second).toBe(first);
+    expect(runtime.execs).toBe(1);
+    expect(first?.plugins.map((plugin) => plugin.name)).toEqual(["cached"]);
+    const mirror = first?.mirrorRoot ?? "";
+
+    await clearRemoteProjectPluginSnapshots();
+    expect(await fs.stat(mirror).catch(() => null)).toBeNull();
+    await getRemoteProjectPluginSnapshot(runtime, root, [container]);
+    expect(runtime.execs).toBe(2);
+    await clearRemoteProjectPluginSnapshots();
+  });
+
+  test("a failed read is not retried at once and leaves no mirror", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-fail");
+    const runtime = new CountingRemoteRuntime(checkout.path, "test:failing");
+    runtime.exec = () => {
+      runtime.execs++;
+      return Promise.reject(new Error("ssh: connection refused"));
+    };
+    const container = path.join(checkout.path, ".xum", "plugins");
+    expect(await getRemoteProjectPluginSnapshot(runtime, checkout.path, [container])).toBeNull();
+    expect(await getRemoteProjectPluginSnapshot(runtime, checkout.path, [container])).toBeNull();
+    expect(runtime.execs).toBe(1);
+    await clearRemoteProjectPluginSnapshots();
+  });
+
+  test("two Docker containers or two SSH users with the same checkout path get different host keys", () => {
+    const keyOf = (containerName?: string) =>
+      new DockerRuntime({ image: "node:22", containerName }).getAgentHostKey();
+    expect(keyOf("xum-a")).not.toBe(keyOf("xum-b"));
+    // A container that is not created yet has no identity: no snapshot is used.
+    expect(keyOf(undefined)).toBeUndefined();
+
+    const sshKeyOf = (host: string) => {
+      const config = { host, srcBaseDir: "/home/shared/src" };
+      return new SSHRuntime(config, createSSHTransport(config, false)).getAgentHostKey();
+    };
+    expect(sshKeyOf("alice@build.example")).not.toBe(sshKeyOf("bob@build.example"));
+    expect(sshKeyOf("alice@build.example")).toBe(sshKeyOf("alice@build.example"));
   });
 });

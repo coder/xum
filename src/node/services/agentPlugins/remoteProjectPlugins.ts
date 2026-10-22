@@ -4,27 +4,30 @@
  *
  * discoverAgentPlugins reads the host filesystem. To apply its exact manifest, containment and
  * component rules to a remote checkout, one remote command lists each plugin container (entry
- * types, sizes, symlink targets, and the bytes of plugin.json and SKILL.md files under their
- * caps). The host rebuilds that listing in a private temp directory, runs the unchanged
- * discoverAgentPlugins on it, and maps the result back to remote paths:
- * - Regular files become sparse files of their remote size, so every size cap still applies.
+ * types, symlink targets, and the bytes of every regular file of at most MAX_FILE_SIZE). The host
+ * rebuilds that listing in a private temp directory (the "mirror"), runs the unchanged
+ * discoverAgentPlugins on it, and keeps the mirror as a snapshot that the host-local plugin
+ * readers parse. Nothing in the mirror ever runs.
+ * - A bigger file is left out, as if missing (the skill tools refuse such files anyway).
  * - A symlink is rebuilt only when its remote realpath stays inside the checkout root. Any other
  *   symlink (outside the root, dangling) is left out, so discovery sees nothing there.
  * Plugin MCP servers, hooks, workflows and slash commands run code, so they are dropped from the
- * result (#7218). Any failure returns no plugins: remote plugins are best-effort and must never
- * block a turn. The caller gates on project trust.
+ * result (#7218). Any failure gives no remote plugins at all, never a partial set: remote plugins
+ * are best-effort and must never block a turn. The caller gates on project trust.
  */
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
 import { shellQuote } from "@/common/utils/shell";
+import * as fs from "node:fs";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
-import { MAX_PLUGIN_MANIFEST_BYTES, discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
+import { discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
 
 /** Deep enough for `<plugin>/skills/<name>/SKILL.md` and nested `contributes` paths. */
 const MAX_LISTING_DEPTH = 6;
@@ -51,31 +54,36 @@ export type RemoteProjectAgentPlugin = Pick<
 
 /**
  * One POSIX sh script for every container: a single remote round trip. Output lines are
- * tab-separated: `K 0 real lexical` per container (lexical under the real checkout root), then
- * `D|F|f|L size target path` per entry (`F` is followed by one base64 content line), then
- * `ROOT 0 <real checkout root>` and `END`. Names with a tab or a newline produce lines the host
- * rejects, which fails the whole listing closed. `head` bounds the walk of each tree; the host
- * refuses a listing over MAX_REMOTE_PLUGIN_ENTRIES.
+ * tab-separated: `K 0 real lexical` per container (lexical under the real checkout root), then per
+ * walked tree `D|L 0 target path` lines, `F size  path` lines and one `B 0  tree` line that is
+ * followed by the base64 bytes of those F files, in order, up to a `.` line. Then `ROOT 0 <real
+ * checkout root>` and `END`. The walk runs a fixed number of processes per tree, not per entry:
+ * a per-file `wc`/`base64` took ~20 s for 4000 entries. A name with a tab produces a line the host
+ * rejects, and a name with a newline exits the script: both fail the whole listing closed. `head`
+ * bounds the walk of each tree; the host refuses a listing over MAX_REMOTE_PLUGIN_ENTRIES.
  */
 export function buildRemotePluginListingScript(checkoutRoot: string, containers: string[]): string {
-  const contentCase = (name: string, cap: number) =>
-    `${name}) if [ "$s" -le ${cap} ]; then printf 'F\\t%s\\t\\t%s\\n' "$s" "$p"; base64 < "$p" | tr -d '\\n'; printf '\\n'; return; fi ;;`;
   const limit = MAX_REMOTE_PLUGIN_ENTRIES + 1;
+  const tree = `find -P "$1" -mindepth 1 -maxdepth "$2"`;
+  // Regular files of at most MAX_FILE_SIZE bytes; the same predicate lists and reads them.
+  const files = `${tree} -type f -size -${MAX_FILE_SIZE + 1}c`;
   return [
     `set -- ${[checkoutRoot, ...containers].map(shellQuote).join(" ")}`,
     `rootarg=$1`,
     `root=$(readlink -f "$1") || exit 3`,
     `shift`,
-    `emit() {`,
-    `  p=$1`,
-    `  if [ -L "$p" ]; then t=$(readlink -f "$p" 2>/dev/null) || t=; printf 'L\\t0\\t%s\\t%s\\n' "$t" "$p"`,
-    `  elif [ -d "$p" ]; then printf 'D\\t0\\t\\t%s\\n' "$p"`,
-    `  elif [ -f "$p" ]; then s=$(wc -c < "$p" | tr -d ' ')`,
-    `    case "\${p##*/}" in ${contentCase("plugin.json", MAX_PLUGIN_MANIFEST_BYTES)} ${contentCase("SKILL.md", MAX_FILE_SIZE)} esac`,
-    `    printf 'f\\t%s\\t\\t%s\\n' "$s" "$p"`,
-    `  fi`,
+    `tab=$(printf '\\t')`,
+    `nl='`,
+    `'`,
+    `walk() {`,
+    `  [ -z "$(${tree} -name "*$nl*" | head -n 1)" ] || exit 4`,
+    `  ${tree} -type d | head -n ${limit} | sed "s|^|D\${tab}0\${tab}\${tab}|"`,
+    `  ${tree} -type l | head -n ${limit} | while IFS= read -r e; do t=$(readlink -f "$e" 2>/dev/null) || t=; printf 'L\\t0\\t%s\\t%s\\n' "$t" "$e"; done`,
+    String.raw`  ${files} -exec wc -c {} + | sed -n "s|^ *\([0-9][0-9]*\) \(/.*\)\$|F${"$"}{tab}\1${"$"}{tab}${"$"}{tab}\2|p"`,
+    `  printf 'B\\t0\\t\\t%s\\n' "$1"`,
+    `  ${files} -exec cat {} + | base64`,
+    `  printf '.\\n'`,
     `}`,
-    `walk() { find -P "$1" -mindepth 1 -maxdepth "$2" | head -n ${limit} | while IFS= read -r e; do emit "$e"; done; }`,
     `for c in "$@"; do`,
     `  case "$c" in "$rootarg"/*) lex="$root/\${c#"$rootarg"/}" ;; *) continue ;; esac`,
     `  real=$(readlink -f "$c" 2>/dev/null) || continue`,
@@ -93,26 +101,29 @@ export function buildRemotePluginListingScript(checkoutRoot: string, containers:
 }
 
 interface ListingEntry {
-  kind: "K" | "D" | "F" | "f" | "L";
+  kind: "K" | "D" | "F" | "L";
   size: number;
   target: string;
   path: string;
-  content?: string;
+  data?: Buffer;
 }
 
-const ENTRY_KINDS = new Set<string>(["K", "D", "F", "f", "L"]);
+const ENTRY_KINDS = new Set<string>(["K", "D", "F", "L", "B"]);
+const BASE64_LINE = /^[A-Za-z0-9+/=]*$/;
 
 interface Listing {
   root: string;
   entries: ListingEntry[];
 }
 
-/** One entry line's fields as an entry; null when they are malformed. */
-function parseEntryFields(fields: string[]): ListingEntry | null {
+/** One line's fields as an entry, "B" for a blob header, or null when they are malformed. */
+function parseEntryFields(fields: string[]): ListingEntry | "B" | null {
+  if (fields.length !== 4) return null;
   const [kind, size, target, entryPath] = fields;
   if (!ENTRY_KINDS.has(kind) || !path.posix.isAbsolute(entryPath) || !/^\d+$/.test(size)) {
     return null;
   }
+  if (kind === "B") return "B";
   return { kind: kind as ListingEntry["kind"], size: Number(size), target, path: entryPath };
 }
 
@@ -123,36 +134,58 @@ function listingLines(stdout: string): string[] | null {
   return lines.pop() === "END" ? lines : null;
 }
 
-/** Line `i` (with the base64 content line after an F line); null when malformed. */
-function parseLineAt(
-  lines: string[],
-  i: number
-): { entry?: ListingEntry; root?: string; next: number } | null {
+/** Gives each F entry its bytes from the blob, in order; false when the sizes do not add up. */
+function assignBlob(files: ListingEntry[], base64Lines: string[]): boolean {
+  if (!base64Lines.every((line) => BASE64_LINE.test(line))) return false;
+  const blob = Buffer.from(base64Lines.join(""), "base64");
+  let offset = 0;
+  for (const file of files) {
+    file.data = blob.subarray(offset, offset + file.size);
+    offset += file.size;
+  }
+  // A file that changed between the size pass and the read pass shifts every later file.
+  return offset === blob.length;
+}
+
+interface ParseState {
+  entries: ListingEntry[];
+  /** F entries whose bytes come with the next B blob. */
+  pendingFiles: ListingEntry[];
+  root?: string;
+}
+
+/** Consumes line `i` (with the blob lines after a B line); the next index, or -1 if malformed. */
+function consumeLine(state: ParseState, lines: string[], i: number): number {
   const fields = lines[i].split("\t");
-  if (fields.length !== 4) return null;
-  if (fields[0] === "ROOT") return { root: fields[2], next: i + 1 };
+  if (fields[0] === "ROOT" && fields.length === 4) {
+    state.root = fields[2];
+    return i + 1;
+  }
   const entry = parseEntryFields(fields);
-  if (entry === null) return null;
-  if (entry.kind !== "F") return { entry, next: i + 1 };
-  // A missing content line means the output was cut.
-  if (i + 1 >= lines.length) return null;
-  return { entry: { ...entry, content: lines[i + 1] }, next: i + 2 };
+  if (entry === null) return -1;
+  if (entry !== "B") {
+    state.entries.push(entry);
+    if (entry.kind === "F") state.pendingFiles.push(entry);
+    return i + 1;
+  }
+  const end = lines.indexOf(".", i + 1);
+  if (end === -1 || !assignBlob(state.pendingFiles, lines.slice(i + 1, end))) return -1;
+  state.pendingFiles = [];
+  return end + 1;
 }
 
 /** Parses the listing; null when it is cut off, too big or malformed (fail closed). */
 export function parseRemotePluginListing(stdout: string): Listing | null {
   const lines = listingLines(stdout);
   if (lines === null) return null;
-  const entries: ListingEntry[] = [];
-  let root: string | undefined;
+  const state: ParseState = { entries: [], pendingFiles: [] };
   for (let i = 0; i < lines.length; ) {
-    const parsed = parseLineAt(lines, i);
-    if (parsed === null) return null;
-    if (parsed.entry !== undefined) entries.push(parsed.entry);
-    else root = parsed.root;
-    i = parsed.next;
+    i = consumeLine(state, lines, i);
+    if (i === -1) return null;
   }
-  if (root === undefined || !path.posix.isAbsolute(root)) return null;
+  const { entries, pendingFiles, root } = state;
+  // F lines without their blob mean the output was cut.
+  if (pendingFiles.length > 0 || root === undefined || !path.posix.isAbsolute(root)) return null;
   return entries.length <= MAX_REMOTE_PLUGIN_ENTRIES ? { root, entries } : null;
 }
 
@@ -187,11 +220,7 @@ async function mirrorEntry(entry: ListingEntry, local: string, toMirror: ToMirro
     const target = entry.target === "" ? null : toMirror(entry.target);
     if (target !== null) await fsPromises.symlink(target, local).catch(() => undefined);
   } else if (entry.kind === "F") {
-    await fsPromises.writeFile(local, Buffer.from(entry.content ?? "", "base64"));
-  } else if (entry.kind === "f") {
-    // Sparse: no bytes are copied, yet stat reports the remote size for the caps.
-    await fsPromises.writeFile(local, "");
-    await fsPromises.truncate(local, entry.size);
+    await fsPromises.writeFile(local, entry.data ?? Buffer.alloc(0));
   }
 }
 
@@ -261,12 +290,24 @@ async function readRemoteListing(args: RemotePluginArgs): Promise<Listing | null
   return listing;
 }
 
-/** Runs local discovery on the mirror and maps its plugins back to remote paths. */
+/**
+ * A remote checkout's project plugins, parsed from a host mirror. `plugins` carry MIRROR paths
+ * (for the host-local plugin readers); `toRemote` maps a mirror path to its remote path, which
+ * is what tool output and the agent see.
+ */
+export interface RemoteProjectPluginSnapshot {
+  mirrorRoot: string;
+  remoteRoot: string;
+  plugins: RemoteProjectAgentPlugin[];
+  toRemote: (local: string) => string;
+}
+
+/** Runs local discovery on the mirror; its plugins keep mirror paths. */
 async function discoverInMirror(
   args: RemotePluginArgs,
   listing: Listing,
   mirrorRoot: string
-): Promise<RemoteProjectAgentPlugin[]> {
+): Promise<RemoteProjectPluginSnapshot> {
   const mirrored = await buildMirror(mirrorRoot, listing);
   // The script reports each container under the REAL checkout root.
   const localContainers = args.containers.flatMap((remote) => {
@@ -283,36 +324,140 @@ async function discoverInMirror(
     assert(relative !== "" && !relative.startsWith(".."), `remote plugin mirror escaped: ${local}`);
     return path.posix.join(listing.root, ...relative.split(path.sep));
   };
-  return plugins.map((plugin) => {
-    const container = localContainers.find(({ local }) => local === plugin.containerPath);
-    assert(container !== undefined, "remote plugin from an unknown container");
-    return toRemotePlugin(plugin, container.remote, toRemote);
-  });
+  return {
+    mirrorRoot,
+    remoteRoot: listing.root,
+    plugins: plugins.map((plugin) => toRemotePlugin(plugin, plugin.containerPath, (p) => p)),
+    toRemote,
+  };
+}
+
+/** Mirror dirs alive in this process: removed on clear and at exit. */
+const liveMirrors = new Set<string>();
+let exitHookInstalled = false;
+const MIRROR_PREFIX = "xum-remote-plugins-";
+
+function removeMirror(mirrorRoot: string): void {
+  liveMirrors.delete(mirrorRoot);
+  fs.rmSync(mirrorRoot, { recursive: true, force: true });
+}
+
+/** Best effort: mirrors a crashed process left behind (older than 1 h). Never throws. */
+async function sweepStaleMirrors(): Promise<void> {
+  try {
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    for (const name of await fsPromises.readdir(os.tmpdir())) {
+      if (!name.startsWith(MIRROR_PREFIX)) continue;
+      const dir = path.join(os.tmpdir(), name);
+      const stat = await fsPromises.lstat(dir).catch(() => null);
+      if (stat?.isDirectory() === true && stat.mtimeMs < cutoff && !liveMirrors.has(dir)) {
+        await fsPromises.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      }
+    }
+  } catch (error) {
+    log.debug(`Remote project plugins: stale mirror sweep failed: ${getErrorMessage(error)}`);
+  }
+}
+
+async function createMirrorDir(): Promise<string> {
+  if (!exitHookInstalled) {
+    exitHookInstalled = true;
+    process.once("exit", () => {
+      for (const mirrorRoot of [...liveMirrors]) {
+        try {
+          removeMirror(mirrorRoot);
+        } catch {
+          // Exit cleanup is best effort; the next start sweeps leftovers.
+        }
+      }
+    });
+    await sweepStaleMirrors();
+  }
+  // mkdtemp creates the directory with mode 0700.
+  const mirrorRoot = await fsPromises.realpath(
+    await fsPromises.mkdtemp(path.join(os.tmpdir(), MIRROR_PREFIX))
+  );
+  liveMirrors.add(mirrorRoot);
+  return mirrorRoot;
+}
+
+/** One listing exec and a fresh mirror; null (and no mirror) on any failure. */
+async function createSnapshot(args: RemotePluginArgs): Promise<RemoteProjectPluginSnapshot | null> {
+  assert(args.checkoutRoot.length > 0, "remote project plugins: checkoutRoot required");
+  if (args.containers.length === 0) return null;
+  let mirrorRoot: string | undefined;
+  try {
+    const listing = await readRemoteListing(args);
+    if (listing === null) return null;
+    mirrorRoot = await createMirrorDir();
+    return await discoverInMirror(args, listing, mirrorRoot);
+  } catch (error) {
+    log.debug(`Remote project plugins: discovery failed: ${getErrorMessage(error)}`);
+    if (mirrorRoot !== undefined) removeMirror(mirrorRoot);
+    return null;
+  }
 }
 
 /**
- * The project Agent Plugins (skills and agents only) of a remote checkout. Every path in the
- * result is a remote path. Returns [] on any failure.
+ * The project Agent Plugins (skills and agents only) of a remote checkout, with remote paths
+ * and no cache. Returns [] on any failure.
  */
 export async function discoverRemoteProjectAgentPlugins(
   args: RemotePluginArgs
 ): Promise<RemoteProjectAgentPlugin[]> {
-  assert(args.checkoutRoot.length > 0, "discoverRemoteProjectAgentPlugins: checkoutRoot required");
-  if (args.containers.length === 0) return [];
-  let mirrorRoot: string | undefined;
+  const snapshot = await createSnapshot(args);
+  if (snapshot === null) return [];
   try {
-    const listing = await readRemoteListing(args);
-    if (listing === null) return [];
-    mirrorRoot = await fsPromises.realpath(
-      await fsPromises.mkdtemp(path.join(os.tmpdir(), "xum-remote-plugins-"))
+    return snapshot.plugins.map((plugin) =>
+      toRemotePlugin(plugin, snapshot.toRemote(plugin.containerPath), snapshot.toRemote)
     );
-    return await discoverInMirror(args, listing, mirrorRoot);
-  } catch (error) {
-    log.debug(`Remote project plugins: discovery failed: ${getErrorMessage(error)}`);
-    return [];
   } finally {
-    if (mirrorRoot !== undefined) {
-      await fsPromises.rm(mirrorRoot, { recursive: true, force: true }).catch(() => undefined);
-    }
+    removeMirror(snapshot.mirrorRoot);
+  }
+}
+
+/** A failed snapshot is not retried for this long, so a down host costs no exec per turn. */
+const FAILURE_RETRY_MS = 60_000;
+const snapshots = new Map<
+  string,
+  { promise: Promise<RemoteProjectPluginSnapshot | null>; failedAt?: number }
+>();
+
+/**
+ * The cached snapshot of a TRUSTED remote checkout (the caller checks trust). One listing exec
+ * per cache key until clearRemoteProjectPluginSnapshots (a trust change) or the process ends;
+ * concurrent callers share one in-flight read. The key is the runtime's agent host (from its
+ * config: an SSH host, a Docker container), the checkout root and the containers, so two
+ * workspaces never share a snapshot. A runtime without a host key gets no remote plugins.
+ */
+export function getRemoteProjectPluginSnapshot(
+  runtime: Runtime,
+  checkoutRoot: string,
+  containers: string[]
+): Promise<RemoteProjectPluginSnapshot | null> {
+  const hostKey = runtime instanceof RemoteRuntime ? runtime.getAgentHostKey() : undefined;
+  if (hostKey === undefined) return Promise.resolve(null);
+  const key = JSON.stringify([hostKey, checkoutRoot, containers, "trusted"]);
+  const cached = snapshots.get(key);
+  if (cached !== undefined && (cached.failedAt ?? Infinity) > Date.now() - FAILURE_RETRY_MS) {
+    return cached.promise;
+  }
+  const entry: { promise: Promise<RemoteProjectPluginSnapshot | null>; failedAt?: number } = {
+    promise: createSnapshot({ runtime, checkoutRoot, containers }).then((snapshot) => {
+      if (snapshot === null) entry.failedAt = Date.now();
+      return snapshot;
+    }),
+  };
+  snapshots.set(key, entry);
+  return entry.promise;
+}
+
+/** Drops every snapshot and its mirror (project trust changed). */
+export async function clearRemoteProjectPluginSnapshots(): Promise<void> {
+  const entries = [...snapshots.values()];
+  snapshots.clear();
+  for (const entry of entries) {
+    const snapshot = await entry.promise;
+    if (snapshot !== null) removeMirror(snapshot.mirrorRoot);
   }
 }
