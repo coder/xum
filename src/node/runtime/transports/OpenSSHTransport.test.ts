@@ -9,6 +9,7 @@ import { RuntimeError, isRuntimeTransportError } from "../Runtime";
 import { sshConnectionPool } from "../sshConnectionPool";
 import { getDaytonaSshConfigPath } from "../daytonaSshConfig";
 import { OpenSSHTransport, retireOpenSSHMasters } from "./OpenSSHTransport";
+import { retireSshConnections } from "./index";
 
 const BACKOFF_MESSAGE =
   "SSH connection to example.test is in backoff for 2s. Last error: Connection refused";
@@ -142,3 +143,71 @@ describe("retireOpenSSHMasters", () => {
     }
   });
 });
+
+describe("OpenSSH reverse forwards", () => {
+  it("ends a forward an earlier process left when its host is retired", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-fake-ssh-"));
+    // A fake ssh: `-N` runs a master that holds its ControlPath until it exits; the control
+    // commands (`-O check|forward|exit|stop`) act on the master at `-S`.
+    await fs.writeFile(
+      path.join(dir, "ssh"),
+      `#!/bin/sh
+socket=""; op=""; prev=""; master=no
+for arg in "$@"; do
+  case "$prev" in -S) socket="$arg" ;; -O) op="$arg" ;; esac
+  case "$arg" in ControlPath=*) socket="\${arg#ControlPath=}" ;; -N) master=yes ;; esac
+  prev="$arg"
+done
+if [ "$master" = yes ]; then
+  echo $$ > "$socket.pid"; echo $$ > "${dir}/master.pid"; : > "$socket"
+  trap 'rm -f "$socket" "$socket.pid"; exit 0' TERM
+  while :; do sleep 0.05; done
+fi
+case "$op" in
+  check|forward) [ -e "$socket" ] ;;
+  exit) [ -e "$socket.pid" ] && kill "$(cat "$socket.pid")" ;;
+  *) exit 0 ;;
+esac
+`,
+      { mode: 0o755 }
+    );
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${dir}:${originalPath ?? ""}`;
+    spyOn(sshConnectionPool, "acquireConnection").mockResolvedValue(undefined);
+    const config = { host: toXumDaytonaHost("sb-forwarded") };
+    let masterPid: number | undefined;
+    try {
+      const forward = await new OpenSSHTransport(config).openReverseForward(40123, 40124);
+      const pid = Number(await fs.readFile(path.join(dir, "master.pid"), "utf-8"));
+      masterPid = pid;
+      expect(isAlive(pid)).toBe(true);
+      // A restart: the new process holds no handle to the forward, which it adopts.
+      void forward;
+
+      await retireSshConnections(config);
+
+      await waitFor(() => !isAlive(pid));
+      expect(isAlive(pid)).toBe(false);
+    } finally {
+      if (masterPid !== undefined && isAlive(masterPid)) process.kill(masterPid);
+      process.env.PATH = originalPath;
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitFor(condition: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}

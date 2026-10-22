@@ -1,6 +1,10 @@
 import { ssh2ConnectionPool } from "../SSH2ConnectionPool";
 import type { SSHConnectionConfig } from "../sshConnectionPool";
-import { OpenSSHTransport, retireOpenSSHMasters } from "./OpenSSHTransport";
+import {
+  OpenSSHTransport,
+  closeOpenSSHReverseForward,
+  retireOpenSSHMasters,
+} from "./OpenSSHTransport";
 import { SSH2Transport } from "./SSH2Transport";
 import type { SSHTransport } from "./SSHTransport";
 
@@ -27,5 +31,6 @@ export function onSshHostRetired(listener: (host: string) => void): () => void {
 export async function retireSshConnections(config: SSHConnectionConfig): Promise<void> {
   ssh2ConnectionPool.retireConnection(config);
   for (const listener of retiredHostListeners) listener(config.host);
-  await retireOpenSSHMasters(config);
+  // The listeners close forwards this process owns; one adopted after a restart has no handle.
+  await Promise.all([retireOpenSSHMasters(config), closeOpenSSHReverseForward(config)]);
 }
