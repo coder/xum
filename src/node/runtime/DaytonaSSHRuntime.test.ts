@@ -810,21 +810,6 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     expect((await rig.service.setConfig({ apiKey: "new-key" })).apiKeySource).toBe("settings");
   });
 
-  it("deletes its sandbox in the account that created it if the settings still change", async () => {
-    // Defense behind the refusal above: setup fails, and cleans up where it created.
-    spyOn(rig.service, "isAccountCurrent").mockReturnValue(false);
-
-    const failure = await makeRuntime({ sandboxId: "xum-moved", shared: false, ...SMALL })
-      .postCreateSetup(initParams())
-      .then(
-        () => undefined,
-        (error: unknown) => error
-      );
-
-    expect(String(failure)).toContain("Daytona settings changed");
-    expect(rig.plane.find("xum-moved")).toBeUndefined();
-  });
-
   it("never deletes a sandbox that took its name before the create request", async () => {
     // Another Xum install created this name between validateBeforePersist and the create.
     const other = rig.plane.addSandbox({
@@ -1662,74 +1647,6 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
     expect(readsWhenSpawned).toBe(2);
     expect(String(error)).not.toContain(stale);
     expect(String(error)).toContain(`${DAYTONA_TOKEN_PLACEHOLDER}@127.0.0.1: Permission denied`);
-  });
-
-  // A settings change must not leave an alias behind that a UI runtime's next ssh (which never
-  // runs ensureReady) would use to reach the old account's sandbox with a still-live token.
-  it("refuses ssh to an old account's alias until the settings change removed it", async () => {
-    execSpy.mockRestore();
-    rig.plane.addSandbox({ id: "sb-old" });
-    rig.addAccount("new-key");
-    await rig.service.ensureSshAccess("sb-old");
-    const oldToken = rig.writer.tokens.get("sb-old");
-    const unwritable = () => new Error("EACCES: permission denied, open 'daytona.conf'");
-    const removeTokens = spyOn(rig.writer, "removeSandboxTokens")
-      .mockImplementationOnce(() => Promise.reject(unwritable()))
-      .mockImplementationOnce(() => Promise.reject(unwritable()));
-    await rig.service.setConfig({ apiKey: "new-key" });
-    expect(rig.writer.tokens.get("sb-old")).toBe(oldToken);
-    let spawned = 0;
-    const local = localShellTransport(rig.rootDir);
-    const runtime = makeRuntime({ sandboxId: "sb-old" }, rig, {
-      transport: {
-        ...local,
-        spawnRemoteProcess: (command, options) => {
-          spawned++;
-          return local.spawnRemoteProcess(command, options);
-        },
-      },
-    });
-
-    const refused = await runtime.exec("true", { cwd: "/tmp", timeout: 10 }).then(
-      () => new Error("exec unexpectedly succeeded"),
-      (rejection: unknown) => rejection
-    );
-    expect(String(refused)).toContain("old Daytona account");
-    expect(String(refused)).not.toContain(oldToken ?? "missing");
-    expect(spawned).toBe(0);
-    expect(removeTokens).toHaveBeenCalledTimes(2);
-
-    // Writable again: the next attempt removes the alias first, then goes on.
-    const result = await runtimeHelpers.execBuffered(runtime, "true", { cwd: "/tmp", timeout: 10 });
-    expect(result.exitCode).toBe(0);
-    expect(removeTokens).toHaveBeenCalledTimes(3);
-    expect(rig.writer.tokens.has("sb-old")).toBe(false);
-    expect(spawned).toBe(1);
-  });
-
-  // Writing the sandbox's block for the new account replaces the old token, which is all the
-  // removal was for: a removal that keeps failing does not block that sandbox for good.
-  it("lets the new account set a sandbox up again while the old alias cleanup fails", async () => {
-    execSpy.mockRestore();
-    rig.plane.addSandbox({ id: "sb-both" });
-    const next = rig.addAccount("new-key");
-    next.tokenPrefix = "new-tok";
-    next.addSandbox({ id: "sb-both" });
-    await rig.service.ensureSshAccess("sb-both");
-    const oldToken = rig.writer.tokens.get("sb-both");
-    spyOn(rig.writer, "removeSandboxTokens").mockImplementation(() =>
-      Promise.reject(new Error("EACCES: permission denied, open 'daytona.conf'"))
-    );
-    await rig.service.setConfig({ apiKey: "new-key" });
-
-    await rig.service.ensureSshAccess("sb-both");
-
-    expect(rig.writer.tokens.get("sb-both")).not.toBe(oldToken);
-    const runtime = makeRuntime({ sandboxId: "sb-both" }, rig, {
-      transport: localShellTransport(rig.rootDir),
-    });
-    const result = await runtimeHelpers.execBuffered(runtime, "true", { cwd: "/tmp", timeout: 10 });
-    expect(result.exitCode).toBe(0);
   });
 });
 

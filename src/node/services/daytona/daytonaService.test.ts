@@ -7,7 +7,6 @@ import { XUM_DAYTONA_SSH_BLOCK_START } from "@/common/constants/daytona";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { log } from "@/node/services/log";
 import { DaytonaApiError } from "./daytonaClient";
-import { FakeDaytonaControlPlane } from "./daytona.testHarness";
 import {
   DAYTONA_BUSY_MESSAGE,
   DAYTONA_LABEL_INSTANCE,
@@ -214,71 +213,6 @@ describe("DaytonaService", () => {
     }
   });
 
-  it("fails a lease whose settings another process made unusable while idle", async () => {
-    plane.states = ["started"];
-    await service.getSandboxState("sb-1");
-    const requests = plane.calls.length;
-
-    // A hand edit (or another backend) saves an API URL that must not get the key.
-    await fs.writeFile(
-      path.join(rootDir, "daytona.json"),
-      JSON.stringify({ apiKey: "k", apiUrl: "http://remote.example.com/api" })
-    );
-    const failure = await service
-      .withAccountLease(() => service.getSandboxState("sb-1"))
-      .then(
-        () => undefined,
-        (error: unknown) => error
-      );
-
-    expect(failure).toBeInstanceOf(DaytonaApiError);
-    expect((failure as DaytonaApiError).kind).toBe("not_configured");
-    expect(plane.calls.length).toBe(requests);
-  });
-
-  it("leaves a resolve during its own settings save to that save", async () => {
-    const revokeKeys: string[] = [];
-    const store = new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" });
-    service = new DaytonaService({
-      credentialsStore: store,
-      rootDir,
-      fetch: ((input: string | URL | Request, init?: RequestInit) => {
-        const url = input instanceof Request ? input.url : input.toString();
-        if (init?.method === "DELETE" && url.includes("/ssh-access")) {
-          revokeKeys.push((init.headers as Record<string, string>).Authorization);
-        }
-        return plane.fetch(input, init);
-      }) as typeof fetch,
-      now: () => clock,
-    });
-    const held = await service.getSshToken("sb-1");
-    const before = (await service.getAccount()).generation;
-    // Hold the save after the new key is on disk, before setConfig goes on.
-    let releaseSave = () => undefined as void;
-    const saveGate = new Promise<void>((resolve) => (releaseSave = resolve));
-    let saved = () => undefined as void;
-    const savedOnDisk = new Promise<void>((resolve) => (saved = resolve));
-    const realUpdate = store.update.bind(store);
-    spyOn(store, "update").mockImplementation(async (patch) => {
-      const result = await realUpdate(patch);
-      saved();
-      await saveGate;
-      return result;
-    });
-
-    const change = service.setConfig({ apiKey: "new-key" });
-    await savedOnDisk;
-    const token = service.getSshToken("sb-1");
-    await service.checkAvailability();
-    releaseSave();
-    await change;
-    await token;
-
-    expect(plane.revoked).toEqual([held.token]);
-    expect(revokeKeys).toEqual(["Bearer k"]);
-    expect((await service.getAccount()).generation).toBe(before + 1);
-  });
-
   /** A service whose first token mint waits until `releaseMint`; `includeFile` is its writer. */
   function serviceWithHeldMint() {
     let mintStarted!: () => void;
@@ -317,7 +251,6 @@ describe("DaytonaService", () => {
           includeFile.delete(sandboxId);
           return Promise.resolve();
         },
-        removeSandboxTokens: () => Promise.resolve(),
 
         readTokens: () => Promise.resolve([]),
       },
@@ -383,7 +316,6 @@ describe("DaytonaService", () => {
           order.push(`repoint ${gateway.host} ${gateway.hostKeys.join(",")}`);
           return Promise.resolve();
         },
-        removeSandboxTokens: () => Promise.resolve(),
 
         readTokens: () =>
           Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
@@ -509,15 +441,6 @@ describe("DaytonaService", () => {
     expect(staleAtRetire).toEqual([true]);
   });
 
-  it("retires the pooled ssh connections of its sandboxes on a settings change", async () => {
-    const { service: changing, retired } = serviceRecordingWrites();
-    await changing.ensureSshAccess("sb-1");
-
-    await changing.setConfig({ target: "eu" });
-
-    expect(retired).toEqual(["sb-1"]);
-  });
-
   it("retires a released sandbox's ssh connections once its include block is gone", async () => {
     const { service: releasing, order } = serviceRecordingWrites();
     await releasing.ensureSshAccess("sb-1");
@@ -558,7 +481,6 @@ describe("DaytonaService", () => {
       restoreGatewayPins: () => Promise.resolve(false),
       updateToken: store,
       removeSandbox: () => Promise.resolve(),
-      removeSandboxTokens: () => Promise.resolve(),
 
       readTokens: () =>
         Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
@@ -649,85 +571,5 @@ describe("DaytonaService", () => {
     });
     expect(labels[DAYTONA_LABEL_INSTANCE]).toBe(again[DAYTONA_LABEL_INSTANCE]);
     expect(labels[DAYTONA_LABEL_PROJECT]).toBe("my-project");
-  });
-
-  /**
-   * Backends on one Xum root (a desktop app next to `xum server`) with two accounts: key-a on
-   * Daytona's default deployment, key-b on its own, with its own ssh gateway. They share the
-   * saved settings and the real include file under a temp home.
-   */
-  function accountsOnOneRoot() {
-    const planes = new Map([
-      ["Bearer key-a", new FakeDaytonaControlPlane(() => clock)],
-      ["Bearer key-b", new FakeDaytonaControlPlane(() => clock)],
-    ]);
-    for (const [auth, accountPlane] of planes) {
-      accountPlane.tokenPrefix = `${auth.slice(-1)}-tok`;
-      for (const id of ["sb-1", "sb-2", "sb-3", "sb-4"]) {
-        accountPlane.addSandbox({ id, state: "started" });
-      }
-    }
-    const planeA = planes.get("Bearer key-a")!;
-    const planeB = planes.get("Bearer key-b")!;
-    planeB.gateway = {
-      host: "ssh.b.daytona.test",
-      port: 22,
-      hostKeys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAccountBKey"],
-    };
-    const sshConfigPath = path.join(rootDir, "home", ".ssh", "config");
-    const writer = () => new DaytonaSshConfigWriter({ xumHome: rootDir, sshConfigPath });
-    const backend = (
-      options: { retireSshConnections?: (sandboxId: string) => Promise<void> } = {}
-    ) =>
-      new DaytonaService({
-        credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "key-a" }),
-        rootDir,
-        sshConfigWriter: writer(),
-        fetch: ((input: string | URL | Request, init?: RequestInit) => {
-          const url = new URL(input instanceof Request ? input.url : input.toString());
-          const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
-          // GET /config is public: the URL names the deployment.
-          const deployment = url.hostname === "b.daytona.test" ? planeB : planeA;
-          return (auth === undefined ? deployment : planes.get(auth)!).fetch(input, init);
-        }) as typeof fetch,
-        now: () => clock,
-        ...options,
-      });
-    const switchToB = { apiKey: "key-b", apiUrl: "https://b.daytona.test/api" };
-    /** Token and gateway host per alias in the include file. */
-    const blocks = async () => {
-      const include = await fs.readFile(writer().paths.includePath, "utf8").catch(() => "");
-      return Object.fromEntries(
-        [...include.matchAll(/^Host (\S+)\.xum--daytona\n((?: {2}.*\n?)*)/gm)].map(
-          ([, sandboxId, body]) => [
-            sandboxId,
-            `${/User (\S+)/.exec(body)?.[1] ?? "?"}@${/HostName (\S+)/.exec(body)?.[1] ?? "?"}`,
-          ]
-        )
-      );
-    };
-    return { planeA, planeB, backend, writer, switchToB, blocks };
-  }
-
-  // The old key may already be invalid: its tokens stay live until they expire, so the aliases
-  // that carry them must not outlive the connections the switch retires.
-  it("drops the old account's aliases before retiring connections even when revoking fails", async () => {
-    const rig = accountsOnOneRoot();
-    const aliasesAtRetire: string[][] = [];
-    const service = rig.backend({
-      retireSshConnections: async () => {
-        aliasesAtRetire.push(Object.keys(await rig.blocks()));
-      },
-    });
-    await service.ensureSshAccess("sb-1");
-    await service.ensureSshAccess("sb-2");
-    rig.planeA.failingRoutes.add("DELETE /sandbox/sb-1/ssh-access");
-    rig.planeA.failingRoutes.add("DELETE /sandbox/sb-2/ssh-access");
-
-    await service.setConfig(rig.switchToB);
-
-    expect(rig.planeA.revokedTokens).toEqual([]);
-    expect(aliasesAtRetire).toEqual([[], []]);
-    expect(await rig.blocks()).toEqual({});
   });
 });

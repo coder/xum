@@ -283,7 +283,6 @@ export class FakeDaytonaSshConfigWriter implements Pick<
   | "updateToken"
   | "repointGateway"
   | "removeSandbox"
-  | "removeSandboxTokens"
   | "readTokens"
   | "restoreGatewayPins"
 > {
@@ -352,13 +351,6 @@ export class FakeDaytonaSshConfigWriter implements Pick<
   removeSandbox(sandboxId: string): Promise<void> {
     this.removed.push(sandboxId);
     this.tokens.delete(sandboxId);
-    return Promise.resolve();
-  }
-
-  removeSandboxTokens(held: ReadonlyArray<{ sandboxId: string; token: string }>): Promise<void> {
-    for (const { sandboxId, token } of held) {
-      if (this.tokens.get(sandboxId) === token) this.tokens.delete(sandboxId);
-    }
     return Promise.resolve();
   }
 

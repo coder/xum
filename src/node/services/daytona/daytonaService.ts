@@ -17,11 +17,7 @@ import {
   type DaytonaResolvedCredentials,
 } from "@/node/config/daytonaCredentialsStore";
 import { loadOrCreateInstallationId } from "@/node/config/installationIdentity";
-import {
-  DaytonaSshConfigWriter,
-  getDaytonaSshPaths,
-  type SandboxToken,
-} from "@/node/runtime/daytonaSshConfig";
+import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { retireSshConnections } from "@/node/runtime/transports";
 import { rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
 import {
@@ -174,15 +170,6 @@ function sandboxStateError(sandboxId: string, sandbox: DaytonaSandbox): DaytonaA
   );
 }
 
-/**
- * The client of the settings at one moment, stamped with their generation: work that must stay
- * in one Daytona account (a create and its cleanup) holds it across a settings change.
- */
-export interface DaytonaAccount {
-  client: DaytonaClient;
-  generation: number;
-}
-
 export const DAYTONA_BUSY_MESSAGE =
   "Daytona is busy creating, starting, deleting or checking sandboxes. Save these settings " +
   "again when it is done.";
@@ -190,19 +177,6 @@ export const DAYTONA_BUSY_MESSAGE =
 /** Wait until `promise` settles; its outcome belongs to whoever started it. */
 async function settled(promise: Promise<unknown>): Promise<void> {
   await Promise.allSettled([promise]);
-}
-
-interface MintStamp {
-  generation: number;
-  release: number;
-}
-
-interface OutdatedMintInput {
-  client: DaytonaClient;
-  sandboxId: string;
-  access: DaytonaSshAccess;
-  stamp: MintStamp;
-  options: DaytonaSshTokenOptions;
 }
 
 function startTimeoutError(sandboxId: string, sandbox: DaytonaSandbox): DaytonaApiError {
@@ -243,7 +217,6 @@ export interface DaytonaServiceOptions {
     | "updateToken"
     | "repointGateway"
     | "removeSandbox"
-    | "removeSandboxTokens"
     | "readTokens"
     | "restoreGatewayPins"
   >;
@@ -345,13 +318,11 @@ export class DaytonaService {
   private gatewayMoves = 0;
   private gatewayCache?: {
     apiUrl: string;
-    generation: number;
     fetchedAt: number;
     config: DaytonaGatewayConfig;
   };
   private gatewayRequest?: {
     apiUrl: string;
-    generation: number;
     promise: Promise<DaytonaGatewayConfig>;
   };
   private readonly tokens = new Map<string, DaytonaSshAccess>();
@@ -359,18 +330,8 @@ export class DaytonaService {
   private readonly tokenGenerations = new Map<string, number>();
   private lastTokenGeneration = 0;
   private readonly tokenRequests = new Map<string, Promise<DaytonaSshAccess>>();
-  /** Bumped by every settings change, so a mint that spans one can tell. */
-  private credentialsGeneration = 0;
-  /**
-   * The credentials last resolved. While an account lease or this process's settings save
-   * runs, every resolve returns these, so an operation never mixes two accounts when another
-   * process saves new ones mid-way; the first resolve once idle reads the store again.
-   */
-  private credentialsSnapshot?: { credentials: DaytonaResolvedCredentials | null };
   /** Operations running under withAccountLease; setConfig refuses while any runs. */
   private accountLeases = 0;
-  /** The settings read a lease claimed while idle runs first. */
-  private idleRefresh?: Promise<void>;
   /** The settings change being saved; new leases wait for it. */
   private settingsChange?: Promise<DaytonaPublicConfig>;
   /** Per sandbox: bumped by every release of its SSH access, so a mint that spans one can tell. */
@@ -382,13 +343,6 @@ export class DaytonaService {
   private readonly readyAt = new Map<string, number>();
   /** Whether the include file was read once, seeding the tokens an earlier process left. */
   private persistedTokensLoaded = false;
-  /**
-   * Old-account blocks an account retirement could not remove (an unwritable include file).
-   * In memory only: until each is removed, or rewritten for the new account, ssh to its
-   * sandbox is refused (requireCurrentSshAlias), as it would reach the old account's sandbox
-   * with a token that stays live until it expires.
-   */
-  private staleAliases: SandboxToken[] = [];
   private readonly readyRequests = new Map<string, SandboxReadyRequest>();
   /**
    * When this process last proved a sandbox carries this install's label (never one that does
@@ -473,19 +427,8 @@ export class DaytonaService {
    * settings change; one that starts while a change is saved waits for it. Leases nest.
    */
   async withAccountLease<T>(fn: () => Promise<T>): Promise<T> {
-    for (;;) {
-      while (this.settingsChange) await settled(this.settingsChange);
-      // A held lease pins the account; the outer one must not pin a stale snapshot, so it
-      // first takes what another Xum process may have saved since this one last read.
-      if (this.accountLeases > 0) break;
-      // Shared, so concurrent claimers resume (and start their operations) in call order.
-      this.idleRefresh ??= this.refreshIdleCredentials().finally(() => {
-        this.idleRefresh = undefined;
-      });
-      await this.idleRefresh;
-      // No await between this check and the claim (as in setConfig).
-      if (!this.settingsChange) break;
-    }
+    // No await between this check and the claim (as in setConfig).
+    while (this.settingsChange) await settled(this.settingsChange);
     this.accountLeases++;
     try {
       return await fn();
@@ -508,13 +451,20 @@ export class DaytonaService {
     }
   }
 
+  /**
+   * Tokens and gateway data belong to the old account or deployment: revoke the tokens with the
+   * old credentials (which may not work for the new ones) and drop the caches. Connections
+   * already open may reach the old account until they end.
+   */
   private async applyConfig(patch: DaytonaCredentialsPatch): Promise<DaytonaPublicConfig> {
     const previousClient = await this.getClientIfConfigured();
     await this.credentialsStore.update(patch);
-    this.credentialsSnapshot = await this.readSavedCredentials();
-    // Revoke the old account's tokens with the old credentials, which may not work for the
-    // new ones.
-    const tokens = await this.retireAccountCaches();
+    const tokens = [...this.tokens];
+    this.tokens.clear();
+    this.sshConfigured.clear();
+    this.readyAt.clear();
+    this.provenOwned.clear();
+    this.gatewayCache = undefined;
     if (previousClient) {
       await Promise.all(
         tokens.map(([sandboxId, access]) =>
@@ -523,83 +473,6 @@ export class DaytonaService {
       );
     }
     return this.credentialsStore.getPublicConfig();
-  }
-
-  /**
-   * Tokens and gateway data belong to the old account or deployment. A mint in flight
-   * finishes under the old settings: it sees the bump and starts over. Returns the tokens
-   * dropped, for the caller to revoke.
-   *
-   * The old account's aliases leave the shared include file before the connections are retired
-   * (as releaseSshAccess does), whether or not the caller then manages to revoke the tokens: a
-   * fresh ssh from an alias would otherwise keep reaching the old sandbox until its token
-   * expires. Only blocks still holding a token this process owns go: another backend may have
-   * rewritten an alias, maybe for the new account.
-   */
-  private async retireAccountCaches(): Promise<Array<[string, DaytonaSshAccess]>> {
-    this.credentialsGeneration++;
-    this.provenOwned.clear();
-    const tokens = [...this.tokens];
-    const owned = tokens.map(([sandboxId, access]) => ({ sandboxId, token: access.token }));
-    const connected = this.sandboxesWithSsh();
-    this.gatewayCache = undefined;
-    this.tokens.clear();
-    this.sshConfigured.clear();
-    this.readyAt.clear();
-    this.staleAliases.push(...owned);
-    await this.removeStaleAliases();
-    await this.retirePooledSsh(connected);
-    return tokens;
-  }
-
-  /** Remove the stale aliases (see staleAliases); a failure keeps them for the next attempt. */
-  private async removeStaleAliases(): Promise<void> {
-    const removing = this.staleAliases;
-    if (removing.length === 0) return;
-    try {
-      await this.sshConfigWriter.removeSandboxTokens(removing);
-    } catch (error) {
-      log.warn("Could not remove the old Daytona account's ssh aliases", {
-        error: getErrorMessage(error),
-      });
-      return;
-    }
-    // A retirement during the removal may have added more.
-    this.staleAliases = this.staleAliases.filter((alias) => !removing.includes(alias));
-  }
-
-  /**
-   * Run before every ssh to the sandbox: refuses while its include block may still hold an old
-   * account's token (see staleAliases), retrying the removal first. Nothing to do, and no
-   * I/O, in the common case.
-   */
-  async requireCurrentSshAlias(sandboxId: string): Promise<void> {
-    if (this.staleAliases.length === 0) return;
-    await this.removeStaleAliases();
-    if (this.staleAliases.some((alias) => alias.sandboxId === sandboxId)) {
-      throw new Error(
-        `Xum could not remove the old Daytona account's ssh alias for sandbox "${sandboxId}" ` +
-          `after a settings change, so it will not ssh to it until it can. ` +
-          `Check that ${getDaytonaSshPaths(this.rootDir).includePath} is writable.`
-      );
-    }
-  }
-
-  /** The sandbox's block now holds a token of the current account. */
-  private replacedStaleAlias(sandboxId: string): void {
-    if (this.staleAliases.length === 0) return;
-    this.staleAliases = this.staleAliases.filter((alias) => alias.sandboxId !== sandboxId);
-  }
-
-  private async readSavedCredentials(): Promise<
-    { credentials: DaytonaResolvedCredentials | null } | undefined
-  > {
-    try {
-      return { credentials: await this.credentialsStore.resolve() };
-    } catch (error) {
-      log.debug("Could not read the saved Daytona settings", { error: getErrorMessage(error) });
-      return undefined;
-    }
   }
 
   private async getClientIfConfigured(): Promise<DaytonaClient | undefined> {
@@ -802,33 +675,10 @@ export class DaytonaService {
     return { available: true };
   }
 
-  /** The idle read before a lease; unusable settings fail the lease's own first call. */
-  private async refreshIdleCredentials(): Promise<void> {
-    try {
-      await this.resolveCredentials();
-    } catch (error) {
-      log.debug("Could not read the Daytona settings before an operation", {
-        error: getErrorMessage(error),
-      });
-      // The lease must not pin the account this process used before: unusable settings must
-      // make Daytona unusable, so its first resolve reads them again and fails.
-      this.credentialsSnapshot = undefined;
-    }
-  }
-
   /** Unusable settings (an http DAYTONA_API_URL) throw a `not_configured` DaytonaApiError. */
   private async resolveCredentials(): Promise<DaytonaResolvedCredentials | null> {
-    const pinned = () =>
-      (this.accountLeases > 0 || this.settingsChange !== undefined) && this.credentialsSnapshot;
-    const held = pinned();
-    if (held) return held.credentials;
     try {
-      const credentials = await this.credentialsStore.resolve();
-      // A lease or save that started during the read keeps the account it started with.
-      const heldNow = pinned();
-      if (heldNow) return heldNow.credentials;
-      this.credentialsSnapshot = { credentials };
-      return credentials;
+      return await this.credentialsStore.resolve();
     } catch (error) {
       if (error instanceof DaytonaConfigError) {
         throw new DaytonaApiError("not_configured", error.message);
@@ -856,31 +706,14 @@ export class DaytonaService {
     };
   }
 
-  /** Stamped before the lookup, so a change during it reads as a change. */
-  async getAccount(): Promise<DaytonaAccount> {
-    const generation = this.credentialsGeneration;
-    const { client } = await this.getClient();
-    return { client, generation };
-  }
-
-  /** Whether the settings changed since `account` was taken. */
-  isAccountCurrent(account: DaytonaAccount): boolean {
-    return account.generation === this.credentialsGeneration;
-  }
-
-  private async clientOf(account: DaytonaAccount | undefined): Promise<DaytonaClient> {
-    return account?.client ?? (await this.getClient()).client;
-  }
-
   /** `force` refetches a cached `/config` that is still fresh (an in-flight fetch is shared). */
   async getGatewayConfig(options: { force?: boolean } = {}): Promise<DaytonaGatewayConfig> {
-    const generation = this.credentialsGeneration;
     const { client, credentials } = await this.getClient();
-    const cached = this.cachedGateway(credentials.apiUrl, generation);
+    const cached = this.cachedGateway(credentials.apiUrl);
     if (cached && !options.force && this.now() - cached.fetchedAt < DAYTONA_GATEWAY_CONFIG_TTL_MS) {
       return cached.config;
     }
-    return this.sharedGatewayRefresh(client, credentials.apiUrl, generation, cached);
+    return this.sharedGatewayRefresh(client, credentials.apiUrl, cached);
   }
 
   /**
@@ -890,31 +723,25 @@ export class DaytonaService {
   private sharedGatewayRefresh(
     client: DaytonaClient,
     apiUrl: string,
-    generation: number,
     cached: ReturnType<DaytonaService["cachedGateway"]>
   ): Promise<DaytonaGatewayConfig> {
     const inFlight = this.gatewayRequest;
-    if (inFlight?.apiUrl === apiUrl && inFlight.generation === generation) {
-      return inFlight.promise;
-    }
-    const promise = this.refreshGateway(client, apiUrl, generation, cached).finally(() => {
+    if (inFlight?.apiUrl === apiUrl) return inFlight.promise;
+    const promise = this.refreshGateway(client, apiUrl, cached).finally(() => {
       if (this.gatewayRequest?.promise === promise) this.gatewayRequest = undefined;
     });
-    this.gatewayRequest = { apiUrl, generation, promise };
+    this.gatewayRequest = { apiUrl, promise };
     return promise;
   }
 
   private async refreshGateway(
     client: DaytonaClient,
     apiUrl: string,
-    generation: number,
     cached: ReturnType<DaytonaService["cachedGateway"]>
   ): Promise<DaytonaGatewayConfig> {
     const config = await client.getConfig();
-    // Fetched across a settings change: never cache it for lookups under the new settings.
-    if (this.credentialsGeneration !== generation) return config;
     const moved = cached && gatewayIdentity(cached.config) !== gatewayIdentity(config);
-    this.gatewayCache = { apiUrl, generation, fetchedAt: this.now(), config };
+    this.gatewayCache = { apiUrl, fetchedAt: this.now(), config };
     if (moved) {
       await this.retireSshSetup(config);
       this.gatewayMoves++;
@@ -957,9 +784,9 @@ export class DaytonaService {
   }
 
   /** The cached `/config` of these settings, fresh or not. */
-  private cachedGateway(apiUrl: string, generation: number) {
+  private cachedGateway(apiUrl: string) {
     const cached = this.gatewayCache;
-    return cached?.apiUrl === apiUrl && cached.generation === generation ? cached : undefined;
+    return cached?.apiUrl === apiUrl ? cached : undefined;
   }
 
   /**
@@ -1106,10 +933,9 @@ export class DaytonaService {
   }
 
   async getSandboxState(
-    sandboxId: string,
-    account?: DaytonaAccount
+    sandboxId: string
   ): Promise<{ state: DaytonaSandboxState; sandbox?: DaytonaSandbox }> {
-    const client = await this.clientOf(account);
+    const { client } = await this.getClient();
     try {
       const sandbox = await client.getSandbox(sandboxId);
       return { state: mapDaytonaSandboxState(sandbox.state), sandbox };
@@ -1170,11 +996,8 @@ export class DaytonaService {
     return (await this.resolveCredentials())?.target;
   }
 
-  async createSandbox(
-    request: DaytonaCreateSandboxRequest,
-    account?: DaytonaAccount
-  ): Promise<DaytonaSandbox> {
-    return (await this.clientOf(account)).createSandbox(request);
+  async createSandbox(request: DaytonaCreateSandboxRequest): Promise<DaytonaSandbox> {
+    return (await this.getClient()).client.createSandbox(request);
   }
 
   async resizeSandbox(sandboxId: string, request: DaytonaResizeRequest): Promise<void> {
@@ -1251,11 +1074,8 @@ export class DaytonaService {
    * naming a sandbox someone else holds. So only a sandbox with this install's label is
    * deleted; "notOwned" leaves it, and its access, to the caller.
    */
-  async deleteSandbox(
-    sandboxId: string,
-    account?: DaytonaAccount
-  ): Promise<"deleted" | "notOwned"> {
-    const client = await this.clientOf(account);
+  async deleteSandbox(sandboxId: string): Promise<"deleted" | "notOwned"> {
+    const { client } = await this.getClient();
     if ((await this.ownershipWith(client, sandboxId)) === "notOwned") return "notOwned";
     this.provenOwned.delete(sandboxId);
     // Revoke first: Daytona refuses to revoke a token of a sandbox that no longer exists.
@@ -1287,13 +1107,10 @@ export class DaytonaService {
   }
 
   private proveOwnership(sandboxId: string): Promise<"owned" | "notOwned" | "missing"> {
-    const generation = this.credentialsGeneration;
     const request = (async () => {
       const ownership = await this.ownershipWith((await this.getClient()).client, sandboxId);
-      // A proof from before a settings change belongs to the old account.
       if (ownership !== "owned") this.provenOwned.delete(sandboxId);
-      else if (generation === this.credentialsGeneration)
-        this.provenOwned.set(sandboxId, this.now());
+      else this.provenOwned.set(sandboxId, this.now());
       return ownership;
     })().finally(() => this.ownershipRequests.delete(sandboxId));
     this.ownershipRequests.set(sandboxId, request);
@@ -1386,20 +1203,14 @@ export class DaytonaService {
       // A cached token was written by the mint that produced it, so only a mint writes files.
       await this.getSshToken(sandboxId, {
         onNewToken: async ({ token }) => {
-          // Looked up after the mint, so a settings change before it cannot pair this token with
-          // the old deployment's gateway; one after it makes the mint start over.
           const gateway = toSshGateway(await this.getGatewayConfig());
           if (this.sshConfigured.has(sandboxId)) {
             await this.sshConfigWriter.updateToken({ sandboxId, token, gateway });
-          } else {
-            await this.sshConfigWriter.writeSandbox({ sandboxId, token, gateway });
+            return;
           }
-          // The new account's block replaced the old token: this sandbox is no longer blocked
-          // on a removal that may keep failing.
-          this.replacedStaleAlias(sandboxId);
+          await this.sshConfigWriter.writeSandbox({ sandboxId, token, gateway });
         },
       });
-      await this.requireCurrentSshAlias(sandboxId);
       await this.sshConfigWriter.ensureManagedBlock();
       this.sshConfigured.add(sandboxId);
     });
@@ -1509,13 +1320,14 @@ export class DaytonaService {
     previous: DaytonaSshAccess | undefined,
     options: DaytonaSshTokenOptions
   ): Promise<DaytonaSshAccess> {
-    const stamp = this.accessStamp(sandboxId);
+    const release = this.accessReleases.get(sandboxId) ?? 0;
+    const released = () => (this.accessReleases.get(sandboxId) ?? 0) !== release;
     const { client } = await this.getClient();
     const access = await client.createSshAccess(sandboxId, DAYTONA_SSH_TOKEN_TTL_MINUTES);
     rememberDaytonaToken(access.token);
-    const mint = { client, sandboxId, access, stamp, options };
-    const outdated = this.settleOutdatedMint(mint, false);
-    if (outdated) return outdated;
+    // A mint that spans a release of the sandbox's access is never cached or kept in the
+    // include file: the caller's access was taken away.
+    if (released()) return this.discardReleasedMint(client, sandboxId, access, false);
     try {
       await options.onNewToken?.(access);
     } catch (error) {
@@ -1523,44 +1335,12 @@ export class DaytonaService {
       await this.revokeQuietly(client, sandboxId, access.token);
       throw error;
     }
-    const outdatedAfterWrite = this.settleOutdatedMint(mint, true);
-    if (outdatedAfterWrite) return outdatedAfterWrite;
+    if (released()) return this.discardReleasedMint(client, sandboxId, access, true);
     this.cacheNewToken(sandboxId, access);
     if (previous && previous.token !== access.token) {
       await this.revokeQuietly(client, sandboxId, previous.token);
     }
     return access;
-  }
-
-  /** What a mint must still match when it completes: the settings and the sandbox's access. */
-  private accessStamp(sandboxId: string): MintStamp {
-    return {
-      generation: this.credentialsGeneration,
-      release: this.accessReleases.get(sandboxId) ?? 0,
-    };
-  }
-
-  /**
-   * Undefined while the mint is current. A mint that spans a settings change or a release of
-   * the sandbox's access is never cached or kept in the include file: its token is revoked
-   * with the client that minted it. After a settings change it mints again under the new
-   * settings; after a release it fails, since the caller's access was taken away.
-   */
-  private settleOutdatedMint(
-    mint: OutdatedMintInput,
-    wroteIncludeFile: boolean
-  ): Promise<DaytonaSshAccess> | undefined {
-    const { client, sandboxId, access, stamp, options } = mint;
-    if ((this.accessReleases.get(sandboxId) ?? 0) !== stamp.release) {
-      return this.discardReleasedMint(client, sandboxId, access, wroteIncludeFile);
-    }
-    if (this.credentialsGeneration !== stamp.generation) {
-      // The retry's onNewToken overwrites whatever this one wrote.
-      return this.revokeQuietly(client, sandboxId, access.token).then(() =>
-        this.mintSshToken(sandboxId, undefined, options)
-      );
-    }
-    return undefined;
   }
 
   private async discardReleasedMint(
