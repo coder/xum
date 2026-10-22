@@ -297,6 +297,27 @@ function sourceRef(source: Record<string, unknown>): string | undefined {
   return ref;
 }
 
+/** Throws when a marketplace at `marketplaceUrl` may not name the git source `url` (`value` as written). */
+function assertMarketplaceMayName(value: string, url: string, marketplaceUrl: string): void {
+  // SECURITY: a marketplace fetched from the network must not point Xum at a repository on this
+  // machine (a private checkout the user never chose), by path or by a loopback host such as
+  // `ssh://localhost/...`. A marketplace on this machine may.
+  if (pointsAtThisMachine(url) && !pointsAtThisMachine(marketplaceUrl)) {
+    throw new Error(
+      `'${value}' is a path on this machine; a remote marketplace cannot install it.`
+    );
+  }
+  // SECURITY: an ssh or scp source from a network marketplace makes git sign in with the user's
+  // SSH agent to whatever host the catalog names, also a DNS alias of this machine or of a private
+  // host. Git resolves the name itself, so Xum cannot check the address first (DNS rebinding).
+  // Such a marketplace may name only https sources; a marketplace on this machine may name any.
+  if (!pointsAtThisMachine(marketplaceUrl) && !url.startsWith("https://")) {
+    throw new Error(
+      `'${value}' is not an https URL; a remote marketplace can name only https git sources.`
+    );
+  }
+}
+
 /** A git URL from an entry (`git-subdir` also takes owner/repo), without a ref or folder in it. */
 function entryGitUrl(raw: unknown, marketplaceUrl: string): string {
   const value = optionalString(raw);
@@ -309,14 +330,7 @@ function entryGitUrl(raw: unknown, marketplaceUrl: string): string {
       `'${value}' must be a git URL or owner/repo; put the ref and folder in 'ref' and 'path'.`
     );
   }
-  // SECURITY: a marketplace fetched from the network must not point Xum at a repository on this
-  // machine (a private checkout the user never chose), by path or by a loopback host such as
-  // `ssh://localhost/...`. A marketplace on this machine may.
-  if (pointsAtThisMachine(parsed.url) && !pointsAtThisMachine(marketplaceUrl)) {
-    throw new Error(
-      `'${value}' is a path on this machine; a remote marketplace cannot install it.`
-    );
-  }
+  assertMarketplaceMayName(value, parsed.url, marketplaceUrl);
   return parsed.url;
 }
 
