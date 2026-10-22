@@ -569,8 +569,8 @@ describe("compaction cancellation runtime", () => {
     const stopped = await h.storage.read();
     expect(stopped?.version).toBe(2);
     let failed = false;
-    const readFile = fs.promises.readFile;
-    const read = spyOn(fs.promises, "readFile").mockImplementation(
+    const readFile = fileIO.readFile;
+    const read = spyOn(fileIO, "readFile").mockImplementation(
       new Proxy(readFile, {
         apply(target, receiver, args) {
           if (!failed && args[0] === generationPath) {
@@ -593,6 +593,7 @@ describe("compaction cancellation runtime", () => {
       expect(await h.storage.read()).toEqual(stopped);
       expect(await Promise.all(durablePaths.map((file) => fileIO.readFile(file)))).toEqual(before);
       expect(h.stream).not.toHaveBeenCalled();
+      expect(read).toHaveBeenCalled();
     } finally {
       read.mockRestore();
     }

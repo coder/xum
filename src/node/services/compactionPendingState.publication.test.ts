@@ -88,8 +88,8 @@ describe("inactive atomic pending/history publication", () => {
     const attempted = Promise.withResolvers<void>();
     const order: string[] = [];
     let paused = false;
-    const rm = syncFs.promises.rm;
-    spyOn(syncFs.promises, "rm").mockImplementation(async (file, options) => {
+    const rm = fs.rm;
+    const removing = spyOn(fs, "rm").mockImplementation(async (file, options) => {
       if (String(file).startsWith(`${pendingPath}.continuous-`) && !paused) {
         paused = true;
         order.push("A prepared");
@@ -135,6 +135,7 @@ describe("inactive atomic pending/history publication", () => {
     expect((await a).success).toBe(true);
     expect((await b).success).toBe(false);
     expect(order).toEqual(["A prepared", "A committed", "B prepared"]);
+    expect(removing).toHaveBeenCalled();
     expect(await historyIds()).toEqual(["A"]);
     expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/A.ts"]);
   });
@@ -167,8 +168,8 @@ describe("inactive atomic pending/history publication", () => {
         expect(rows).toContain('"compactionBoundary":true');
         if (tail) expect(rows).toContain('"id":"tail"');
       };
-      const rm = syncFs.promises.rm;
-      spyOn(syncFs.promises, "rm").mockImplementation((file, options) => {
+      const rm = fs.rm;
+      const removing = spyOn(fs, "rm").mockImplementation((file, options) => {
         if (String(file).startsWith(`${chatPath}.continuous-`)) {
           expect(committed).toBeDefined();
           cleanupObserved = true;
@@ -181,6 +182,7 @@ describe("inactive atomic pending/history publication", () => {
       assert(result.data);
       expect(result.data).toBe(committed);
       expect(cleanupObserved).toBe(true);
+      expect(removing).toHaveBeenCalled();
       expect(await historyIds()).toEqual(tail ? ["boundary", "tail"] : ["boundary"]);
       expect(request.summaryMessage.metadata?.historySequence).toBe(1);
       expect((await restart().load(() => true))?.attachments.readFiles).toEqual(["/boundary.ts"]);
@@ -356,8 +358,8 @@ describe("inactive atomic pending/history publication", () => {
     async (previous) => {
       if (previous) assert((await store.publishBoundary(input("A"))).success);
       let crashImage: string | undefined;
-      const rm = syncFs.promises.rm;
-      spyOn(syncFs.promises, "rm").mockImplementation(async (file, options) => {
+      const rm = fs.rm;
+      const removing = spyOn(fs, "rm").mockImplementation(async (file, options) => {
         if (String(file).startsWith(`${pendingPath}.continuous-`) && crashImage === undefined)
           crashImage = await fs.readFile(pendingPath, "utf8");
         return rm(file, options);
@@ -366,6 +368,7 @@ describe("inactive atomic pending/history publication", () => {
         (await store.publishBoundary(input("uncommitted", { shouldPersist: () => false }))).success
       ).toBe(false);
       assert(crashImage);
+      expect(removing).toHaveBeenCalled();
       // Reproduce the exact durable bytes captured after pending rename but before history commit.
       // A process crash at this point skips in-process rollback and leaves this image on disk.
       await fs.writeFile(pendingPath, crashImage);
@@ -565,8 +568,8 @@ describe("inactive atomic pending/history publication", () => {
           },
         })
       );
-      const rm = syncFs.promises.rm;
-      spyOn(syncFs.promises, "rm").mockImplementation(async (file, options) => {
+      const rm = fs.rm;
+      const removing = spyOn(fs, "rm").mockImplementation(async (file, options) => {
         if (
           phase === "postcommit" &&
           committed &&
@@ -593,6 +596,7 @@ describe("inactive atomic pending/history publication", () => {
         expect(successor).toBeDefined();
         expect(committed).toBe(["postcommit", "archive read", "rotation stage"].includes(phase));
         expect(result.success).toBe(committed);
+        expect(removing).toHaveBeenCalled();
         for (const target of targets)
           expect(await fs.readFile(target, "utf8")).toBe(`successor:${target}`);
       } finally {
@@ -605,8 +609,8 @@ describe("inactive atomic pending/history publication", () => {
     "a postcommit %s failure cannot roll back pending attachments",
     async (failure) => {
       let committed: CompactionPendingReceipt | undefined;
-      const rm = syncFs.promises.rm;
-      spyOn(syncFs.promises, "rm").mockImplementation((file, options) => {
+      const rm = fs.rm;
+      const removing = spyOn(fs, "rm").mockImplementation((file, options) => {
         if (failure === "cleanup" && String(file).startsWith(`${chatPath}.continuous-`))
           return Promise.reject(new Error("cleanup observer failed"));
         return rm(file, options);
@@ -623,6 +627,7 @@ describe("inactive atomic pending/history publication", () => {
       assert(committed);
       assert(result.data);
       expect(result.data).toBe(committed);
+      expect(removing).toHaveBeenCalled();
       const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
       assert(history.success);
       expect(history.data.map((row) => row.id)).toEqual(["A", "tail"]);

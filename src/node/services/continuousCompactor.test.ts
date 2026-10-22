@@ -1,4 +1,5 @@
 import type { ContinuousPrefixSwap } from "./continuousCompactionJournal";
+import * as fsPromises from "node:fs/promises";
 import { stat, writeFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as atomicWrite from "@/node/utils/writeFileAtomic";
@@ -518,8 +519,8 @@ describe("ContinuousCompactor", () => {
     await stage();
     const entered = deferred();
     const release = deferred();
-    const remove = syncFs.promises.rm;
-    spyOn(syncFs.promises, "rm").mockImplementation(async (file, options) => {
+    const remove = fsPromises.rm;
+    const removing = spyOn(fsPromises, "rm").mockImplementation(async (file, options) => {
       if (
         String(file).startsWith(
           path.join(store.tempDir, "pending", "post-compaction.json.continuous-")
@@ -540,6 +541,7 @@ describe("ContinuousCompactor", () => {
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(completed).not.toHaveBeenCalled();
     expect((await rows())[0].id).toBe("old-user");
+    expect(removing).toHaveBeenCalled();
   });
 
   it("does not publish after reset during the staged history file write", async () => {
