@@ -215,7 +215,12 @@ export interface DaytonaServiceOptions {
   /** Defaults to a writer for the real `~/.ssh/config`; tests pass one aimed at a temp dir. */
   sshConfigWriter?: Pick<
     DaytonaSshConfigWriter,
-    "writeSandbox" | "updateToken" | "repointGateway" | "removeSandbox" | "readTokens"
+    | "writeSandbox"
+    | "ensureManagedBlock"
+    | "updateToken"
+    | "repointGateway"
+    | "removeSandbox"
+    | "readTokens"
   >;
   fetch?: typeof fetch;
   now?: () => number;
@@ -1326,6 +1331,8 @@ export class DaytonaService {
   /**
    * A valid token in the include file for this sandbox. The first write in this process also
    * writes known_hosts and the `~/.ssh/config` block; a refresh rewrites only the include file.
+   * The `~/.ssh/config` block is checked every time: another tool may have removed it while a
+   * cached token stays fresh, and an external editor needs it to resolve the alias.
    */
   ensureSshAccess(sandboxId: string): Promise<void> {
     return this.withAccountLease(async () => {
@@ -1345,6 +1352,7 @@ export class DaytonaService {
           await this.sshConfigWriter.writeSandbox({ sandboxId, token, gateway });
         },
       });
+      await this.sshConfigWriter.ensureManagedBlock();
       this.sshConfigured.add(sandboxId);
     });
   }

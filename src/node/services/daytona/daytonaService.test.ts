@@ -3,6 +3,8 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
+import { XUM_DAYTONA_SSH_BLOCK_START } from "@/common/constants/daytona";
+import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { log } from "@/node/services/log";
 import { DaytonaApiError } from "./daytonaClient";
 import {
@@ -398,6 +400,7 @@ describe("DaytonaService", () => {
       now: () => clock,
       sshConfigWriter: {
         writeSandbox: store,
+        ensureManagedBlock: () => Promise.resolve(),
         updateToken: store,
         repointGateway: () => Promise.resolve(),
         removeSandbox: (sandboxId: string) => {
@@ -456,6 +459,7 @@ describe("DaytonaService", () => {
       now: () => clock,
       sshConfigWriter: {
         writeSandbox: record,
+        ensureManagedBlock: () => Promise.resolve(),
         updateToken: record,
         removeSandbox: (sandboxId) => {
           includeFile.delete(sandboxId);
@@ -635,6 +639,7 @@ describe("DaytonaService", () => {
     };
     const writer = {
       writeSandbox: store,
+      ensureManagedBlock: () => Promise.resolve(),
       updateToken: store,
       removeSandbox: () => Promise.resolve(),
       readTokens: () =>
@@ -668,6 +673,7 @@ describe("DaytonaService", () => {
     let failedReads = 1;
     const writer = {
       writeSandbox: () => Promise.resolve(),
+      ensureManagedBlock: () => Promise.resolve(),
       updateToken: () => Promise.resolve(),
       removeSandbox: () => Promise.resolve(),
       readTokens: () =>
@@ -693,6 +699,28 @@ describe("DaytonaService", () => {
     // The retry knows the earlier token, so the new one replaces and revokes it.
     await service.ensureSshAccess("sb-1");
     expect(plane.revoked).toEqual(["earlier-process-token"]);
+  });
+
+  it("puts back a removed ~/.ssh/config block on ssh access while the cached token is fresh", async () => {
+    const sshConfigPath = path.join(rootDir, "home", ".ssh", "config");
+    service = new DaytonaService({
+      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
+      rootDir,
+      fetch: plane.fetch,
+      now: () => clock,
+      sshConfigWriter: new DaytonaSshConfigWriter({ xumHome: rootDir, sshConfigPath }),
+    });
+    await service.ensureSshAccess("sb-1");
+    expect(await fs.readFile(sshConfigPath, "utf8")).toContain(XUM_DAYTONA_SSH_BLOCK_START);
+    // A dotfiles tool replaces the file: the include file and the cached token stay.
+    await fs.writeFile(sshConfigPath, "Host work\n  User me\n", "utf8");
+
+    await service.ensureSshAccess("sb-1");
+
+    const restored = await fs.readFile(sshConfigPath, "utf8");
+    expect(restored.startsWith(XUM_DAYTONA_SSH_BLOCK_START)).toBe(true);
+    expect(restored).toContain("Host work\n  User me\n");
+    expect(plane.calls.filter((call) => call === "POST /sandbox/sb-1/ssh-access")).toHaveLength(1);
   });
 
   it("reports test-connection failures as typed results", async () => {

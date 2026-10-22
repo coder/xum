@@ -526,9 +526,10 @@ describe("ensureMuxCoderSSHConfigFile", () => {
     const writeFileSpy = spyOn(fs, "writeFile");
 
     try {
+      // Different binaries, so the second call changes the block: an unchanged one is not written.
       await Promise.all([
         ensureMuxCoderSSHConfigFile({ coderBinaryPath, sshConfigPath }),
-        ensureMuxCoderSSHConfigFile({ coderBinaryPath, sshConfigPath }),
+        ensureMuxCoderSSHConfigFile({ coderBinaryPath: "/opt/coder/bin/coder", sshConfigPath }),
       ]);
 
       const tempPaths = writeFileSpy.mock.calls

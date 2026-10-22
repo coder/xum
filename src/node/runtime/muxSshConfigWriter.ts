@@ -331,6 +331,8 @@ async function writeManagedBlock(
       : appendMuxBlock(existingContent, block);
   }
 
+  // Daytona checks its block on every ssh access: leave an unchanged file alone.
+  if (nextContent === existingContent) return;
   await writeConfigAtomically(sshConfigPath, nextContent, existingMode);
 }
 

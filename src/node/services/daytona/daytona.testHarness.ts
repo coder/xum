@@ -276,7 +276,12 @@ export class FakeDaytonaControlPlane {
 /** Records ssh config writes instead of touching `~/.ssh/config`. */
 export class FakeDaytonaSshConfigWriter implements Pick<
   DaytonaSshConfigWriter,
-  "writeSandbox" | "updateToken" | "repointGateway" | "removeSandbox" | "readTokens"
+  | "writeSandbox"
+  | "ensureManagedBlock"
+  | "updateToken"
+  | "repointGateway"
+  | "removeSandbox"
+  | "readTokens"
 > {
   /** Current token per sandbox alias, as the include file would hold it. */
   readonly tokens = new Map<string, string>();
@@ -298,6 +303,10 @@ export class FakeDaytonaSshConfigWriter implements Pick<
     this.fullWrites.push(input.sandboxId);
     this.gateway = input.gateway;
     this.tokens.set(input.sandboxId, input.token);
+    return Promise.resolve();
+  }
+
+  ensureManagedBlock(): Promise<void> {
     return Promise.resolve();
   }
 

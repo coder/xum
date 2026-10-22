@@ -100,6 +100,20 @@ describe("DaytonaSshConfigWriter", () => {
     expect(afterRemove).toContain("Host sb-2.xum--daytona");
   });
 
+  it("puts back a removed managed block, and leaves an unchanged config untouched", async () => {
+    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+    const written = await fs.readFile(sshConfigPath, "utf8");
+    const { ino } = await fs.stat(sshConfigPath);
+
+    await writer.ensureManagedBlock();
+    // The atomic write renames a new file into place, so an unchanged inode means no write.
+    expect((await fs.stat(sshConfigPath)).ino).toBe(ino);
+
+    await fs.writeFile(sshConfigPath, "Host work\n  User me\n", "utf8");
+    await writer.ensureManagedBlock();
+    expect(await fs.readFile(sshConfigPath, "utf8")).toBe(`${written}Host work\n  User me\n`);
+  });
+
   it("repoints every sandbox at a new gateway in the write that replaces its host keys", async () => {
     await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
     await writer.writeSandbox({ sandboxId: "sb-2", token: "tokenB", gateway: GATEWAY });

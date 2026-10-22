@@ -260,6 +260,15 @@ export class DaytonaSshConfigWriter {
     await this.installGateway(input.gateway, (blocks) =>
       blocks.set(toXumDaytonaHost(input.sandboxId), this.renderBlock(input))
     );
+    await this.ensureManagedBlock();
+  }
+
+  /**
+   * The `~/.ssh/config` block that includes the sandboxes' file for the user's own ssh clients.
+   * Another tool may remove it while the include file and its tokens stay; no write when it is
+   * already in place.
+   */
+  async ensureManagedBlock(): Promise<void> {
     await ensureManagedSSHConfigBlock({
       markers: {
         start: XUM_DAYTONA_SSH_BLOCK_START,
