@@ -38,9 +38,12 @@ test(
     await expect(screen.getByRole("button", "Notifications")).toBeVisible({ timeout: 30_000 });
     await expect(expandToggle).toBeVisible({ timeout: 15_000 });
     await expect(toolList).toBeHidden();
+    // Only what one screen shows, not "collapsed": the collapsed sidebar still shows the
+    // overview card (its Changes and Side chats regions), and the judge could not call that
+    // collapsed (PR lane, run 39671182309: ASSERTION_INCONCLUSIVE). The toggle check covers it.
     await agent.assert(
-      `the '${SECOND}' workspace is shown with its right sidebar collapsed: no 'Open a tool' ` +
-        "list of tools is shown next to the chat"
+      `the '${SECOND}' workspace is shown, and no 'Open a tool' list of tools is shown next to ` +
+        "the chat"
     );
 
     await openPlayground(screen);

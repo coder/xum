@@ -30,6 +30,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -227,7 +228,17 @@ function isNetworkPath(path: string): boolean {
 /** Local file path of a script URL; undefined for remote, network or unparseable locations. */
 function scriptPath(url: string): string | undefined {
   let path: string | undefined;
-  if (url.startsWith("file:")) {
+  // A "Report slowness" bundle writes the home folder as "~" (`file://~/...`, or `file:///~/...`
+  // for a Windows home), which URL parsing would read as host "~". Resolve it against this
+  // machine's home, so the profile maps on the machine that recorded it (#5561).
+  const home = /^file:\/\/\/?~\//.exec(url);
+  if (home !== null) {
+    try {
+      path = join(homedir(), ...decodeURIComponent(url.slice(home[0].length)).split("/"));
+    } catch {
+      return undefined;
+    }
+  } else if (url.startsWith("file:")) {
     let host: string;
     try {
       host = new URL(url).hostname;

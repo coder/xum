@@ -924,6 +924,13 @@ const HAND_EDITABLE_STRING_PROJECT_FIELDS = [
   "icon",
 ] as const;
 
+/** Store the valid limits in `value` on the project, or remove its limits when there are none. */
+function setProjectAgentResourceLimits(project: ProjectConfig, value: unknown): void {
+  const normalized = normalizeAgentResourceLimits(value);
+  if (normalized) project.agentResourceLimits = normalized;
+  else delete project.agentResourceLimits;
+}
+
 function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectConfig {
   // Per-project runtime overrides are optional; keep config.json sparse by persisting only explicit
   // overrides (false enablement + explicit default runtime selections).
@@ -989,6 +996,9 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
       delete next[field];
     }
   }
+
+  // Hand-editable too: an out-of-range limit is dropped instead of failing projects.list.
+  setProjectAgentResourceLimits(next, record.agentResourceLimits);
 
   // Legacy named workflow schedules are intentionally dropped while workflow
   // scheduling is disabled during the explicit script_path migration.
@@ -3834,6 +3844,28 @@ export class Config {
     await this.editConfig((config) => {
       if (enabled) config.agentResourceLimitsEnabled = true;
       else delete config.agentResourceLimitsEnabled;
+      return config;
+    });
+  }
+
+  /** Replaces both limits of one project: an omitted field removes that limit. */
+  async updateProjectAgentResourceLimits(
+    projectPath: string,
+    limits: AgentResourceLimits
+  ): Promise<void> {
+    await this.editConfig((config) => {
+      const project = config.projects.get(projectPath);
+      if (!project) {
+        throw new Error(`Project not found: ${projectPath}`);
+      }
+      // Sub-project workspaces belong to the parent's checkout, and their commands join the
+      // parent's cgroup, so a limit of its own would never apply. Clearing one is still allowed.
+      if (project.parentProjectPath && normalizeAgentResourceLimits(limits)) {
+        throw new Error(
+          `Sub-project ${projectPath} shares the resource limits of its parent project ${project.parentProjectPath}.`
+        );
+      }
+      setProjectAgentResourceLimits(project, limits);
       return config;
     });
   }

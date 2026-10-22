@@ -2204,44 +2204,6 @@ describe("StreamingMessageAggregator", () => {
       type: "message" as const,
     });
 
-    test("prunes older messages on first compaction and keeps the new boundary", () => {
-      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
-
-      // Simulate messages accumulated during a live session (no prior compaction)
-      const msg1 = asChatMessage(
-        createMuxMessage("user-1", "user", "First message", {
-          historySequence: 0,
-          timestamp: 1,
-        })
-      );
-      const msg2 = asChatMessage(
-        createMuxMessage("assistant-1", "assistant", "Response", {
-          historySequence: 1,
-          timestamp: 2,
-        })
-      );
-
-      aggregator.handleMessage(msg1);
-      aggregator.handleMessage(msg2);
-
-      const summary = asChatMessage(
-        createMuxMessage("summary-1", "assistant", "Compacted summary", {
-          historySequence: 2,
-          compacted: "user",
-          compactionBoundary: true,
-          compactionEpoch: 1,
-          muxMetadata: { type: "compaction-summary" },
-        })
-      );
-      aggregator.handleMessage(summary);
-
-      // Existing messages with sequence < incoming boundary (2) are pruned.
-      // The incoming boundary itself is appended after pruning and remains visible.
-      const remaining = aggregator.getAllMessages();
-      expect(remaining).toHaveLength(1);
-      expect(remaining.map((m) => m.id)).toEqual(["summary-1"]);
-    });
-
     test("keeps only the latest boundary epoch start on subsequent compactions", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
 

@@ -33,8 +33,7 @@ import { getWorkspaceLastReadKey } from "@/common/constants/storage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 
-import { installDom } from "../dom";
-import { cleanupView, setupWorkspaceView } from "../helpers";
+import { cleanupView, setupTestDom, setupWorkspaceView } from "../helpers";
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
 
 function getWorkspaceRow(container: HTMLElement, workspaceId: string): HTMLElement | null {
@@ -141,7 +140,8 @@ async function createSubagentSidebarHarness(): Promise<SubagentSidebarHarness> {
         return result.metadata;
       },
       async render(metadata, beforeRender) {
-        cleanupDom = installDom();
+        // setupTestDom turns tutorials off: their bubble would take focus and end the rename.
+        cleanupDom = setupTestDom();
         beforeRender?.();
         view = renderApp({ apiClient: env.orpc, metadata });
         await setupWorkspaceView(view, metadata, metadata.id);

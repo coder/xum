@@ -30,6 +30,7 @@ export const Tasks: Story = {
           agentResourceLimits: {
             enabled: true,
             limits: { cpuCores: 8, memoryGiB: 16 },
+            projects: {},
             status: { state: "active", cgroup: "/xum/xum-agents" },
             support: { state: "ready", cgroup: "/xum" },
           },

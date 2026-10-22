@@ -40,7 +40,9 @@ const THREADED_CONTROLLERS = new Set(["cpu", "cpuset", "perf_event", "pids"]);
  * - Enabling only threaded controllers such as cpu succeeds there, and the cgroup becomes a thread
  *   root: enabling a domain controller then fails with EOPNOTSUPP, and its children are
  *   "domain invalid", so moving a process into one fails with EOPNOTSUPP.
- * - Writing a PID to `cgroup.procs` moves that process out of every other cgroup.
+ * - Writing a PID to `cgroup.procs` moves that process out of every other cgroup, and fails with
+ *   EBUSY in a cgroup that enables a domain controller for its children (no internal processes).
+ * - Removing a cgroup fails with EBUSY while it holds processes or children.
  */
 export async function createFakeCgroupTree(options: {
   own: string;
@@ -125,6 +127,11 @@ export async function createFakeCgroupTree(options: {
     (await readWords(path.join(dir, "cgroup.subtree_control"))).some((controller) =>
       THREADED_CONTROLLERS.has(controller)
     );
+  /** Whether the cgroup enables a domain controller for its children, so it holds no process. */
+  const enablesDomainController = async (dir: string) =>
+    (await readWords(path.join(dir, "cgroup.subtree_control"))).some(
+      (controller) => !THREADED_CONTROLLERS.has(controller)
+    );
   const writes: FakeCgroupTree["writes"] = [];
   const sudoCalls: string[] = [];
   const host: AgentCgroupHost = {
@@ -160,6 +167,9 @@ export async function createFakeCgroupTree(options: {
         if (await isThreadRoot(path.dirname(path.dirname(file)))) {
           throw errnoError("EOPNOTSUPP");
         }
+        if (await enablesDomainController(path.dirname(file))) {
+          throw errnoError("EBUSY");
+        }
         await movePid(file, value.trim());
       } else {
         await fs.writeFile(file, value);
@@ -172,12 +182,23 @@ export async function createFakeCgroupTree(options: {
         return custom;
       }
       // The test shell starts in xum's cgroup and stays there when the kernel refuses the move.
-      if (await isThreadRoot(path.dirname(path.dirname(procsFile)))) {
+      const target = path.dirname(procsFile);
+      if ((await isThreadRoot(path.dirname(target))) || (await enablesDomainController(target))) {
         return `0::${await ownCgroup()}\n`;
       }
       return `0::/${path.relative(root, path.dirname(procsFile))}\n`;
     },
     isSystemdBooted: () => Promise.resolve(options.systemdBooted ?? false),
+    removeCgroup: async (cgroupDir) => {
+      const entries = await fs.readdir(cgroupDir, { withFileTypes: true });
+      const busy =
+        entries.some((entry) => entry.isDirectory()) ||
+        (await readWords(path.join(cgroupDir, "cgroup.procs"))).length > 0;
+      if (busy) {
+        throw errnoError("EBUSY");
+      }
+      await fs.rm(cgroupDir, { recursive: true });
+    },
     // What the sudo step does as root: give the cgroup to the user, which makes it writable.
     delegateWithSudo: async (cgroupDir) => {
       sudoCalls.push(path.relative(root, cgroupDir));

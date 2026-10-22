@@ -4,10 +4,10 @@ import { getSettingsSectionRedirect, getSettingsSections } from "./SettingsPage"
 
 describe("SettingsPage", () => {
   test("keeps Goals out of settings navigation", () => {
-    const labels = getSettingsSections(true).map((section) => section.label);
+    const ids = getSettingsSections(true).map((section) => section.id);
 
-    expect(labels).not.toContain("Goals");
-    expect(labels).toContain("Experiments");
+    expect(ids).not.toContain("goals");
+    expect(ids).toContain("experiments");
   });
 
   test("normalizes stale Goals routes to Experiments with replace navigation", () => {

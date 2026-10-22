@@ -28,6 +28,7 @@ import {
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { MCP_APP_ENTRYPOINT_NOT_CONNECTED } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import { CommandIds } from "@/browser/utils/commandIds";
+import { QuotaLimitedStorage } from "../../../../tests/ui/quotaLimitedStorage";
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { withAppViewTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
@@ -2484,6 +2485,57 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
           { workspaceId: "w1", tabsetId: newPane, tab: "review" },
         ]);
       } finally {
+        window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      }
+    });
+  });
+
+  // A refused layout write (localStorage full, or setItem throwing) changes nothing on screen, so
+  // a focus request would move focus to the tab the focused pane showed before. A request that
+  // the old layout already shows still gets focus.
+  test("a refused layout write sends a focus request only when the screen already shows it", async () => {
+    await withTestWindow(async () => {
+      const layoutKey = getRightSidebarLayoutKey("w1");
+      // Every layout write throws, like setItem when storage is blocked (SecurityError).
+      class LayoutRefusingStorage extends QuotaLimitedStorage {
+        override setItem(key: string, value: string): void {
+          if (key === layoutKey)
+            throw new DOMException("The operation is insecure.", "SecurityError");
+          super.setItem(key, value);
+        }
+      }
+      const storage = new LayoutRefusingStorage(Number.POSITIVE_INFINITY);
+      // A terminal session to focus, behind the Stats tab.
+      const before = selectOrAddTab(
+        getDefaultRightSidebarLayoutState("terminal:session-1"),
+        "costs"
+      );
+      storage.seed(layoutKey, JSON.stringify(before));
+      Object.defineProperty(window, "localStorage", { configurable: true, value: storage });
+
+      const requests: unknown[] = [];
+      const record = (event: Event) => requests.push((event as CustomEvent).detail);
+      window.addEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const actions = getActions();
+        const find = (id: string) => actions.find((entry) => entry.id === id)!;
+        const addTool = (tool: string) =>
+          find(CommandIds.navRightSidebarAddTool()).prompt!.onSubmit({ tool });
+        await find(CommandIds.navRightSidebarSplitVertical()).run();
+        await addTool("review");
+        await find(CommandIds.navRightSidebarFocusTerminal()).run();
+        // Nothing was stored, and none of these three would have shown its target.
+        expect(readRightSidebarLayout("w1")).toEqual(before);
+        expect(requests).toEqual([]);
+
+        // Stats is already the focused pane's tab: the request still gets focus there.
+        await addTool("costs");
+        expect(requests).toEqual([
+          { workspaceId: "w1", tabsetId: before.focusedTabsetId, tab: "costs" },
+        ]);
+      } finally {
+        consoleError.mockRestore();
         window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
       }
     });

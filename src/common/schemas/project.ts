@@ -1,4 +1,5 @@
 import { RuntimeConfigSchema } from "@/common/orpc/schemas/runtime";
+import { AgentResourceLimitsSchema } from "@/common/config/schemas/agentResourceLimits";
 import { WorkspaceMCPOverridesSchema } from "@/common/orpc/schemas/mcp";
 import {
   AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
@@ -450,6 +451,10 @@ export const ProjectConfigSchema = z.object({
   codeWorkspaceSyncPath: z.string().optional().meta({
     description:
       "Path to a VS Code .code-workspace file kept in sync with this project's active worktrees (relative paths resolve against the project root). Unset = sync disabled.",
+  }),
+  agentResourceLimits: AgentResourceLimitsSchema.optional().meta({
+    description:
+      "CPU and memory that the local agent commands of this project share (Linux cgroup v2), inside the limit that all projects share. Absent = no project limit.",
   }),
 });
 

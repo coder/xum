@@ -92,7 +92,8 @@ type CaptureSkipReason =
   | "not-a-regular-file"
   | "missing"
   | "unreadable"
-  | "unscrubbable";
+  | "unscrubbable"
+  | "size-mismatch";
 
 interface IncludedCapture {
   metadata: PerfCaptureMetadata;
@@ -258,6 +259,25 @@ const STACK_FRAME_PREFIX = /^\s*at\s+/;
 const PLAIN_FUNCTION_NAME = /^[\w$.<>[\] -]{1,200}$/;
 
 /**
+ * Why an opened capture profile must not be copied, or undefined when it may be. `checked` is
+ * the lstat taken before opening.
+ */
+function openedProfileProblem(
+  stat: { dev: number; ino: number; size: number; nlink: number; isFile(): boolean },
+  checked: { dev: number; ino: number },
+  recordedBytes: number | undefined
+): CaptureSkipReason | undefined {
+  // The opened file must be the one checked above, not one swapped in since.
+  const sameFile = stat.dev === checked.dev && stat.ino === checked.ino;
+  if (!sameFile || !stat.isFile() || stat.nlink > 1) return "not-a-regular-file";
+  // A profile whose size differs from the one recorded at capture time was changed since (or
+  // its metadata was): it is not the capture the metadata describes (#5561). Metadata without
+  // profileBytes is not checked.
+  if (recordedBytes !== undefined && stat.size !== recordedBytes) return "size-mismatch";
+  return undefined;
+}
+
+/**
  * The function names of a JS stack, one per line. Every URL, file path, `:line:col` and
  * eval origin is dropped, and so is any non-frame line (the error message), so nothing
  * from a frame location can reach the bundle. The full stack stays in the local log.
@@ -326,7 +346,8 @@ captures/          The newest CPU profile captures (*.cpuprofile, open them in t
                    at most ${PERF_REPORT_MAX_CAPTURES}, and the whole folder stays under ${PERF_REPORT_MAX_TOTAL_BYTES / (1024 * 1024)} MiB.
                    manifest.json lists the captures included and the ones left out
                    and why ("count-cap": over the ${PERF_REPORT_MAX_CAPTURES}-capture limit; "size-cap": over
-                   the size limit). A capture triggered by a trip shows the activity AFTER
+                   the size limit; "size-mismatch": the profile file no longer has
+                   the size its metadata records). A capture triggered by a trip shows the activity AFTER
                    its trigger, not the stall itself.
 environment.json   Xum version, platform, runtime versions, enabled experiments
                    and the recorder status.
@@ -561,9 +582,8 @@ export class PerfReportService {
     let wrote = false;
     try {
       const stat = await source.stat();
-      // The opened file must be the one checked above, not one swapped in since.
-      const sameFile = stat.dev === checked.dev && stat.ino === checked.ino;
-      if (!sameFile || !stat.isFile() || stat.nlink > 1) return { reason: "not-a-regular-file" };
+      const problem = openedProfileProblem(stat, checked, metadata.profileBytes);
+      if (problem !== undefined) return { reason: problem };
       if (metadataBytes + stat.size > budget) return { reason: "size-cap" };
       wrote = true;
       const copied = await copyScrubbed(source, profilePath, stat.size, this.homeSpellings);

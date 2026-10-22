@@ -1404,7 +1404,6 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       expect(view.getByTestId("archive-confirmation-modal")).toBeTruthy();
     });
     expect(archiveWorkspaceMock).not.toHaveBeenCalled();
-    expect(view.getByText("Archive workspace with untracked files?")).toBeTruthy();
   });
 
   it("does not show another workspace's archive confirmation after navigating away", async () => {

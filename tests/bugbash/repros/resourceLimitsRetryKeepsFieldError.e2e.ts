@@ -26,7 +26,9 @@ test(
     const cpu = settings.getByRole("spinbutton", "CPU limit");
     const memory = settings.getByRole("spinbutton", "Memory limit");
     const retry = settings.getByRole("button", "Try again");
-    await toggle.tap();
+    // The tests of one target share the app, so another repro can have turned the switch on.
+    await expect(toggle).toBeVisible({ timeout: 15_000 });
+    if (!(await toggle.isChecked())) await toggle.tap();
     await expect(cpu).toBeEnabled({ timeout: 15_000 });
     await cpu.fill("2");
     await browser.keyboard.press("Tab");

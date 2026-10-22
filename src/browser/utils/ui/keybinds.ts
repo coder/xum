@@ -498,6 +498,11 @@ export const KEYBINDS = {
   // macOS: Cmd+P, Win/Linux: Ctrl+P
   TOGGLE_SIDEBAR: { key: "P", ctrl: true },
 
+  /** Collapse or expand the right sidebar */
+  // VS Code uses this letter for its sidebars. "command": on macOS only Cmd matches, so the
+  // Ctrl form of the chord stays free.
+  TOGGLE_RIGHT_SIDEBAR: { key: "B", ctrl: true, shift: true, macCtrlBehavior: "command" },
+
   /** Cycle through configured models */
   CYCLE_MODEL: { key: "/", ctrl: true },
 

@@ -2450,6 +2450,34 @@ describe("Config", () => {
       );
     });
 
+    it("discards a malformed project agentResourceLimits and keeps a valid one", () => {
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          projects: [
+            ["/home/user/zero", { workspaces: [], agentResourceLimits: { cpuCores: 0 } }],
+            ["/home/user/text", { workspaces: [], agentResourceLimits: "14 cores" }],
+            ["/home/user/empty", { workspaces: [], agentResourceLimits: {} }],
+            [
+              "/home/user/valid",
+              { workspaces: [], agentResourceLimits: { cpuCores: 14, memoryGiB: 32 } },
+            ],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.projects.get("/home/user/zero")?.agentResourceLimits).toBeUndefined();
+      expect(loaded.projects.get("/home/user/text")?.agentResourceLimits).toBeUndefined();
+      expect(loaded.projects.get("/home/user/empty")?.agentResourceLimits).toBeUndefined();
+      expect(loaded.projects.get("/home/user/valid")?.agentResourceLimits).toEqual({
+        cpuCores: 14,
+        memoryGiB: 32,
+      });
+    });
+
     it("discards malformed icons and keeps any icon name string", () => {
       const configFile = path.join(tempDir, "config.json");
       fs.writeFileSync(

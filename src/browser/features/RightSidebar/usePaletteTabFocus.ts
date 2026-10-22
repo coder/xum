@@ -10,8 +10,8 @@ interface PaletteTabFocusOptions {
   focusLauncher: (tabsetId: string) => void;
   /** Focus this terminal tab's terminal. */
   focusTerminalTab: (tab: TabType) => void;
-  /** The launcher's follow-ups for a picked tool: its panel or its tab button. */
-  focusTool: (tab: TabType) => void;
+  /** The launcher's follow-ups for a picked tool in this tabset: its panel or its tab button. */
+  focusTool: (tabsetId: string, tab: TabType) => void;
 }
 
 /**
@@ -44,7 +44,7 @@ function focusTab(options: PaletteTabFocusOptions, tabsetId: string, tab: TabTyp
   if (!isSidebarShown(options.sidebarContainerRef.current)) return;
   if (isNewTab(tab)) options.focusLauncher(tabsetId);
   else if (isTerminalTab(tab)) options.focusTerminalTab(tab);
-  else options.focusTool(tab);
+  else options.focusTool(tabsetId, tab);
 }
 
 function isSidebarShown(container: HTMLElement | null): boolean {

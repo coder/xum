@@ -5,13 +5,14 @@ import type {
 } from "@/common/orpc/schemas/agentResourceLimits";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Config } from "@/node/config";
-import { setAgentCgroupEnrollmentTarget } from "@/node/runtime/agentCgroupEnrollment";
+import { setAgentCgroupEnrollmentTargets } from "@/node/runtime/agentCgroupEnrollment";
 import { log } from "@/node/services/log";
 import {
   applyAgentCgroupLimits,
   checkAgentCgroupSupport,
   linuxAgentCgroupHost,
   type AgentCgroupHost,
+  type ProjectAgentResourceLimits,
 } from "./agentCgroup";
 
 /**
@@ -21,6 +22,8 @@ import {
  */
 export class AgentResourceLimitsService {
   private status: AgentResourceLimitsStatus = { state: "off" };
+  /** The cgroup of each project with a limit of its own, while the limits are active. */
+  private projectCgroups: ReadonlyMap<string, string> = new Map();
   /** The limits of the last apply, so unrelated config changes do not re-run it. */
   private appliedLimits: string | undefined;
   /** The limits that the last apply read, which a save does not reset. */
@@ -51,10 +54,17 @@ export class AgentResourceLimitsService {
   async get(): Promise<AgentResourceLimitsState> {
     await this.applying;
     const setting = this.readSetting();
+    const projects: AgentResourceLimitsState["projects"] = {};
+    for (const [projectPath, limits] of setting.projects) {
+      const cgroup = this.projectCgroups.get(projectPath);
+      projects[projectPath] = cgroup === undefined ? { limits } : { limits, cgroup };
+    }
     return {
-      ...setting,
+      enabled: setting.enabled,
+      limits: setting.limits,
+      projects,
       status: this.status,
-      support: await checkAgentCgroupSupport(setting.limits, this.host),
+      support: await checkAgentCgroupSupport(setting.limits, this.host, setting.projects),
     };
   }
 
@@ -68,6 +78,21 @@ export class AgentResourceLimitsService {
     return this.get();
   }
 
+  /**
+   * Saves the limits of one project and applies them, even when unchanged, so saving again retries
+   * a failure. Empty `limits` remove the project's own limit.
+   */
+  async setProject(
+    projectPath: string,
+    limits: AgentResourceLimits
+  ): Promise<AgentResourceLimitsState> {
+    const sudoApplies = this.sudoApplies;
+    this.appliedLimits = undefined;
+    await this.config.updateProjectAgentResourceLimits(projectPath, limits);
+    await this.apply(sudoApplies);
+    return this.get();
+  }
+
   /** Turns the saved limits on or off, without changing them. */
   async setEnabled(enabled: boolean): Promise<AgentResourceLimitsState> {
     const sudoApplies = this.sudoApplies;
@@ -76,11 +101,24 @@ export class AgentResourceLimitsService {
     return this.get();
   }
 
-  private readSetting(): Pick<AgentResourceLimitsState, "enabled" | "limits"> {
+  private readSetting(): {
+    enabled: boolean;
+    limits: AgentResourceLimits;
+    projects: ProjectAgentResourceLimits;
+  } {
     const config = this.config.loadConfigOrDefault();
+    const projects = new Map<string, AgentResourceLimits>();
+    for (const [projectPath, project] of config.projects) {
+      // A sub-project's commands join its parent's cgroup, so a limit saved for it by hand
+      // would get a cgroup that no command joins.
+      if (project.agentResourceLimits !== undefined && !project.parentProjectPath) {
+        projects.set(projectPath, project.agentResourceLimits);
+      }
+    }
     return {
       enabled: config.agentResourceLimitsEnabled === true,
       limits: config.agentResourceLimits ?? {},
+      projects,
     };
   }
 
@@ -97,10 +135,12 @@ export class AgentResourceLimitsService {
     this.applying = this.applying.then(async () => {
       const previous = this.status;
       try {
-        const { enabled, limits } = this.readSetting();
-        // Off keeps the saved limits but applies none.
+        const { enabled, limits, projects } = this.readSetting();
+        // Off keeps the saved limits, also those of projects, but applies none.
         const applied = enabled ? limits : {};
-        const key = JSON.stringify(applied);
+        const appliedProjects: ProjectAgentResourceLimits = enabled ? projects : new Map();
+        // The key holds the project limits too, so a save of one project applies.
+        const key = JSON.stringify({ limits: applied, projects: [...appliedProjects] });
         const changed = key !== this.seenLimits;
         this.seenLimits = key;
         // Limits that failed to apply retry on any config change: Try again in another
@@ -114,12 +154,19 @@ export class AgentResourceLimitsService {
         if (trySudo) {
           this.sudoApplies += 1;
         }
-        const result = await applyAgentCgroupLimits(applied, this.host, { trySudo });
+        const result = await applyAgentCgroupLimits(applied, this.host, {
+          trySudo,
+          projects: appliedProjects,
+          // Commands started while the apply changes the layout join the new targets.
+          publishEnrollment: setAgentCgroupEnrollmentTargets,
+        });
         this.status = result.status;
-        setAgentCgroupEnrollmentTarget(result.enrollmentTarget);
+        this.projectCgroups = result.projectCgroups;
+        setAgentCgroupEnrollmentTargets(result.enrollment);
       } catch (error) {
         this.status = { state: "unavailable", reason: getErrorMessage(error) };
-        setAgentCgroupEnrollmentTarget(null);
+        this.projectCgroups = new Map();
+        setAgentCgroupEnrollmentTargets(null);
       }
       if (isNewFailure(previous, this.status)) {
         log.warn("Agent resource limits are not applied", { reason: this.status.reason });

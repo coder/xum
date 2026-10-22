@@ -3001,6 +3001,12 @@ export const router = (authToken?: string) => {
         .input(schemas.agentResourceLimits.set.input)
         .output(schemas.agentResourceLimits.set.output)
         .handler(({ context, input }) => context.agentResourceLimits.set(input)),
+      setProject: t
+        .input(schemas.agentResourceLimits.setProject.input)
+        .output(schemas.agentResourceLimits.setProject.output)
+        .handler(({ context, input }) =>
+          context.agentResourceLimits.setProject(input.projectPath, input.limits)
+        ),
       setEnabled: t
         .input(schemas.agentResourceLimits.setEnabled.input)
         .output(schemas.agentResourceLimits.setEnabled.output)

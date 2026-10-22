@@ -4,7 +4,8 @@ import * as os from "os";
 import * as path from "path";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
-import { setAgentCgroupEnrollmentTarget } from "./agentCgroupEnrollment";
+import { LocalRuntime } from "./LocalRuntime";
+import { setAgentCgroupEnrollmentTargets } from "./agentCgroupEnrollment";
 import type {
   InitLogger,
   WorkspaceCreationParams,
@@ -236,7 +237,7 @@ describe("LocalBaseRuntime agent cgroup enrollment", () => {
   it("moves each command's shell into the agent cgroup before the command runs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-enroll-"));
     const procsFile = path.join(dir, "cgroup.procs");
-    setAgentCgroupEnrollmentTarget(procsFile);
+    setAgentCgroupEnrollmentTargets({ fallback: procsFile, byProject: new Map() });
     try {
       const stream = await new TestLocalRuntime().exec("echo $$", { cwd: dir, timeout: 5 });
       await stream.stdin.close();
@@ -249,7 +250,37 @@ describe("LocalBaseRuntime agent cgroup enrollment", () => {
       expect(stdout).toMatch(/^\d+\n$/);
       expect(await fs.readFile(procsFile, "utf-8")).toBe(stdout);
     } finally {
-      setAgentCgroupEnrollmentTarget(null);
+      setAgentCgroupEnrollmentTargets(null);
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("moves a command into the cgroup of its project, and others into the shared one", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-enroll-"));
+    const sharedProcs = path.join(dir, "shared.procs");
+    const projectProcs = path.join(dir, "project.procs");
+    const otherProject = path.join(dir, "other");
+    await fs.mkdir(otherProject);
+    setAgentCgroupEnrollmentTargets({
+      fallback: sharedProcs,
+      byProject: new Map([[dir, projectProcs]]),
+    });
+    const run = async (projectPath: string) => {
+      const stream = await new LocalRuntime(projectPath).exec("echo $$", {
+        cwd: projectPath,
+        timeout: 5,
+      });
+      await stream.stdin.close();
+      return readStreamAsString(stream.stdout);
+    };
+    try {
+      const projectPid = await run(dir);
+      const otherPid = await run(otherProject);
+
+      expect(await fs.readFile(projectProcs, "utf-8")).toBe(projectPid);
+      expect(await fs.readFile(sharedProcs, "utf-8")).toBe(otherPid);
+    } finally {
+      setAgentCgroupEnrollmentTargets(null);
       await fs.rm(dir, { recursive: true, force: true });
     }
   });
@@ -267,7 +298,7 @@ describe("LocalBaseRuntime agent cgroup enrollment", () => {
       logStderr: () => undefined,
       logComplete: (exitCode: number) => exitCodes.push(exitCode),
     };
-    setAgentCgroupEnrollmentTarget(procsFile);
+    setAgentCgroupEnrollmentTargets({ fallback: procsFile, byProject: new Map() });
     try {
       await new InitHookTestRuntime().runHook(dir, hookPath, logger);
 
@@ -276,7 +307,7 @@ describe("LocalBaseRuntime agent cgroup enrollment", () => {
       const [hookPid, hookParentPid] = (stdoutLines[0] ?? "").split(" ");
       expect([hookPid, hookParentPid]).toContain((await fs.readFile(procsFile, "utf-8")).trim());
     } finally {
-      setAgentCgroupEnrollmentTarget(null);
+      setAgentCgroupEnrollmentTargets(null);
       await fs.rm(dir, { recursive: true, force: true });
     }
   });

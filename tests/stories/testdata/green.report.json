@@ -1,0 +1,820 @@
+{
+ "schemaVersion": "report-1",
+ "run": {
+  "id": "01a15fca-efbc-7640-8c46-07727ac79af6",
+  "specVersion": "0.1",
+  "runner": {
+   "name": "e2e",
+   "version": "0.20.0"
+  },
+  "status": "passed",
+  "exitCode": 0,
+  "startedAt": "2026-10-21T18:48:18.061Z",
+  "finishedAt": "2026-10-21T18:48:38.472Z",
+  "project": {
+   "id": "xum-bugbash",
+   "configDigest": "a50e16bd52eeb3c046e24a892aa58512c200439c9002a129bcb821bf81c0011e"
+  },
+  "environment": {
+   "ci": false,
+   "trustNoticeShown": false,
+   "os": "linux 6.8.0-139-generic",
+   "arch": "x64",
+   "runtime": "node v22.23.3"
+  },
+  "targets": [
+   {
+    "id": "electron",
+    "index": 0,
+    "platform": "web",
+    "baseOrigin": "http://127.0.0.1:44467",
+    "environment": "test",
+    "engine": {
+     "name": "web",
+     "version": "0.14.0",
+     "spiVersion": 1
+    },
+    "capabilities": [
+     "actions",
+     "artifacts",
+     "browser",
+     "keyboard",
+     "location",
+     "observation",
+     "pointer"
+    ],
+    "artifactCapabilities": [
+     "screenshot",
+     "video"
+    ],
+    "stateCapability": false
+   }
+  ],
+  "serialGroups": [],
+  "results": [
+   {
+    "id": "a461eee815ffbb19229ef740a976fcdb04f26d0bddcb755f54086e555838c5ab",
+    "testId": "electron/deepLink.e2e.ts::a%20deep%20link%20of%20a%20second%20launch%20starts%20a%20chat%20in%20the%20running%20app",
+    "kind": "test",
+    "declarationIndex": 0,
+    "titlePath": [
+     "a deep link of a second launch starts a chat in the running app"
+    ],
+    "file": "electron/deepLink.e2e.ts",
+    "source": {
+     "file": "electron/deepLink.e2e.ts",
+     "line": 12,
+     "column": 1
+    },
+    "targetId": "electron",
+    "platform": "web",
+    "agent": "default",
+    "repeat": 0,
+    "tags": [
+     "story"
+    ],
+    "selected": true,
+    "status": "passed",
+    "attempts": [
+     {
+      "id": "01a15fcb-00ef-78bd-9b1f-8f9b172146f4",
+      "index": 0,
+      "status": "passed",
+      "startedAt": "2026-10-21T18:48:21.999Z",
+      "durationMs": 5044,
+      "artifacts": [
+       {
+        "id": "01a15fcb-00ef-78bd-9b1f-8f9b172146f4:artifact:0",
+        "kind": "screenshot",
+        "mediaType": "image/png",
+        "redaction": "complete",
+        "producer": {
+         "kind": "step",
+         "stepId": "01a15fcb-00ef-78bd-9b1f-8f9b172146f4:3"
+        },
+        "path": "deeplink-a-deep-link-of-a-second-launch-a461eee815ffbb19/attempt-1/screenshots/001-assert.png",
+        "size": 44077,
+        "sha256": "2e31014693a6c001e5b2fc6a6e11625b9a1244ea56a240a5154c25949abd5e85"
+       }
+      ],
+      "secondaryErrors": [],
+      "cleanup": "complete",
+      "environment": {
+       "browser": "chromium 152.0.7977.130",
+       "user agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) xum/0.31.0 Chrome/152.0.7977.130 Electron/44.5.1 Safari/537.36"
+      },
+      "steps": [
+       {
+        "id": "01a15fcb-00ef-78bd-9b1f-8f9b172146f4:0",
+        "index": 0,
+        "kind": "app",
+        "api": "app.open",
+        "label": "/",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:23.955Z",
+        "durationMs": 419,
+        "events": [],
+        "artifacts": [],
+        "screen": {
+         "location": "http://127.0.0.1:44467/project?project=demo-app-2d461aeb",
+         "nodes": 4,
+         "changes": []
+        },
+        "source": {
+         "file": "electron/deepLink.e2e.ts",
+         "line": 16,
+         "column": 15
+        }
+       },
+       {
+        "id": "01a15fcb-00ef-78bd-9b1f-8f9b172146f4:1",
+        "index": 1,
+        "kind": "assertion",
+        "api": "expect.toBeVisible",
+        "label": "getByRole(\"navigation\", name: \"Projects\") >> getByText(\"demo-app\").first()",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:24.375Z",
+        "durationMs": 64,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "helpers.ts",
+         "line": 15,
+         "column": 5
+        }
+       },
+       {
+        "id": "01a15fcb-00ef-78bd-9b1f-8f9b172146f4:2",
+        "index": 2,
+        "kind": "assertion",
+        "api": "expect.toHaveValue",
+        "label": "getByRole(\"textbox\", name: \"Message\")",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:24.815Z",
+        "durationMs": 6,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "electron/deepLink.e2e.ts",
+         "line": 23,
+         "column": 58
+        }
+       },
+       {
+        "id": "01a15fcb-00ef-78bd-9b1f-8f9b172146f4:3",
+        "index": 3,
+        "kind": "agent",
+        "api": "agent.assert",
+        "label": "the form that creates a new workspace in the project demo-app is open, and its message box holds the text 'deep link 72219c23'",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:24.821Z",
+        "durationMs": 1891,
+        "events": [],
+        "agent": "default",
+        "artifacts": [
+         "01a15fcb-00ef-78bd-9b1f-8f9b172146f4:artifact:0"
+        ],
+        "metrics": {
+         "modelCalls": 1,
+         "actionSteps": 0,
+         "observationBytes": 2055,
+         "contextBytes": 624,
+         "ledgerBytes": 0
+        },
+        "model": {
+         "provider": "anthropic.messages",
+         "model": "claude-haiku-5-5",
+         "endpoint": "provider-default",
+         "adapterVersion": "ai-sdk/0.20.0",
+         "policyVersion": "policy-0.3",
+         "calls": 1,
+         "tokenAccounting": "provider",
+         "inputTokens": 2352,
+         "outputTokens": 147,
+         "peakTokensPerCall": 2499,
+         "cacheReadTokens": 0,
+         "cacheWriteTokens": 861
+        },
+        "observationRevision": "b1",
+        "explanation": "The observation shows a main-pane form for creating a workspace: project selector set to demo-app, a 'Workspace name' textbox, workspace type and source branch controls, and a 'Message' textbox (#n3042) whose text and value are both 'deep link 72219c23'. The instruction's form is open and its message box holds the required text, so it holds.",
+        "screen": {
+         "location": "http://127.0.0.1:44467/project?project=demo-app-2d461aeb&draft=c3581414-d8fa-4c33-be48-363b6f86772a",
+         "nodes": 61,
+         "since": 0,
+         "changes": [
+          "changed document \"xum\" (was: document \"xum - coding agent multiplexer\")",
+          "added testid=\"left-sidebar-toggle-bar\"",
+          "added button \"Collapse sidebar\"",
+          "added testid=\"left-sidebar\"",
+          "added button \"Open about dialog\"",
+          "added text=\"v0.31.1-nightly.762-18-g17e1de98e1\"",
+          "added button \"Open analytics\" testid=\"analytics-button\"",
+          "added button \"Open settings\" testid=\"settings-button\"",
+          "added navigation \"Projects\"",
+          "added button \"Home\"",
+          "added button \"Add project\"",
+          "added text=\"+\""
+         ],
+         "more": 50
+        },
+        "source": {
+         "file": "electron/deepLink.e2e.ts",
+         "line": 27,
+         "column": 17
+        }
+       }
+      ],
+      "appLog": [
+       {
+        "source": "console",
+        "level": "warning",
+        "text": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of this app to unnecessary security risks. For more information and help, consult https://elec\u2026",
+        "at": "2026-10-21T18:48:24.018Z",
+        "step": 0
+       },
+       {
+        "source": "console",
+        "level": "warning",
+        "text": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of this app to unnecessary security risks. For more information and help, consult https://elec\u2026",
+        "at": "2026-10-21T18:48:24.034Z",
+        "step": 0
+       },
+       {
+        "source": "console",
+        "level": "warning",
+        "text": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of this app to unnecessary security risks. For more information and help, consult https://elec\u2026",
+        "at": "2026-10-21T18:48:24.145Z",
+        "step": 0
+       },
+       {
+        "source": "console",
+        "level": "info",
+        "text": "Service Worker registered: ServiceWorkerRegistration (at http://127.0.0.1:44467/main-COfiL5NP.js:2)",
+        "at": "2026-10-21T18:48:24.145Z",
+        "step": 0
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "id": "43af2eed0da12e6c358ebeb879e4c0eab3ed7c8f3b5549c4e25af409a1b5997e",
+    "testId": "electron/menuBar.e2e.ts::the%20workspace%20menu%20bar%20is%20the%20desktop%20title%20bar",
+    "kind": "test",
+    "declarationIndex": 0,
+    "titlePath": [
+     "the workspace menu bar is the desktop title bar"
+    ],
+    "file": "electron/menuBar.e2e.ts",
+    "source": {
+     "file": "electron/menuBar.e2e.ts",
+     "line": 11,
+     "column": 1
+    },
+    "targetId": "electron",
+    "platform": "web",
+    "agent": "default",
+    "repeat": 0,
+    "tags": [
+     "story"
+    ],
+    "selected": true,
+    "status": "passed",
+    "attempts": [
+     {
+      "id": "01a15fcb-14a7-7740-a9a1-6bd52c7afe29",
+      "index": 0,
+      "status": "passed",
+      "startedAt": "2026-10-21T18:48:27.047Z",
+      "durationMs": 6927,
+      "artifacts": [
+       {
+        "id": "01a15fcb-14a7-7740-a9a1-6bd52c7afe29:artifact:0",
+        "kind": "screenshot",
+        "mediaType": "image/png",
+        "redaction": "complete",
+        "producer": {
+         "kind": "step",
+         "stepId": "01a15fcb-14a7-7740-a9a1-6bd52c7afe29:6"
+        },
+        "path": "menubar-the-workspace-menu-bar-is-the-43af2eed0da12e6c/attempt-1/screenshots/001-assert.png",
+        "size": 43459,
+        "sha256": "13dcded16701720ec03de2bd0a2dcd00684323095a2b365c4ed33cc6a5e50fd8"
+       }
+      ],
+      "secondaryErrors": [],
+      "cleanup": "complete",
+      "environment": {
+       "browser": "chromium 152.0.7977.130",
+       "user agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) xum/0.31.0 Chrome/152.0.7977.130 Electron/44.5.1 Safari/537.36"
+      },
+      "steps": [
+       {
+        "id": "01a15fcb-14a7-7740-a9a1-6bd52c7afe29:0",
+        "index": 0,
+        "kind": "app",
+        "api": "app.open",
+        "label": "/",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:28.856Z",
+        "durationMs": 341,
+        "events": [],
+        "artifacts": [],
+        "screen": {
+         "location": "http://127.0.0.1:44467/project?project=demo-app-2d461aeb",
+         "nodes": 4,
+         "changes": []
+        },
+        "source": {
+         "file": "electron/menuBar.e2e.ts",
+         "line": 15,
+         "column": 15
+        }
+       },
+       {
+        "id": "01a15fcb-14a7-7740-a9a1-6bd52c7afe29:1",
+        "index": 1,
+        "kind": "assertion",
+        "api": "expect.toBeVisible",
+        "label": "getByRole(\"navigation\", name: \"Projects\") >> getByText(\"demo-app\").first()",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:29.197Z",
+        "durationMs": 150,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "helpers.ts",
+         "line": 15,
+         "column": 5
+        }
+       },
+       {
+        "id": "01a15fcb-14a7-7740-a9a1-6bd52c7afe29:2",
+        "index": 2,
+        "kind": "locator",
+        "api": "locator.tap",
+        "label": "getByRole(\"button\", name: \"Expand project demo-app\")",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:29.354Z",
+        "durationMs": 205,
+        "events": [],
+        "artifacts": [],
+        "screen": {
+         "location": "http://127.0.0.1:44467/project?project=demo-app-2d461aeb",
+         "nodes": 72,
+         "since": 0,
+         "changes": [
+          "changed document \"xum\" (was: document \"xum - coding agent multiplexer\")",
+          "added testid=\"left-sidebar-toggle-bar\"",
+          "added button \"Collapse sidebar\"",
+          "added testid=\"left-sidebar\"",
+          "added button \"Open about dialog\"",
+          "added text=\"v0.31.1-nightly.762-18-g17e1de98e1\"",
+          "added button \"Open analytics\" testid=\"analytics-button\"",
+          "added button \"Open settings\" testid=\"settings-button\"",
+          "added navigation \"Projects\"",
+          "added button \"Home\"",
+          "added button \"Add project\"",
+          "added text=\"+\""
+         ],
+         "more": 61
+        },
+        "source": {
+         "file": "helpers.ts",
+         "line": 23,
+         "column": 46
+        }
+       },
+       {
+        "id": "01a15fcb-14a7-7740-a9a1-6bd52c7afe29:3",
+        "index": 3,
+        "kind": "locator",
+        "api": "locator.tap",
+        "label": "getByRole(\"navigation\", name: \"Projects\") >> getByText(\"Bug bash playground\").first()",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:29.560Z",
+        "durationMs": 137,
+        "events": [],
+        "artifacts": [],
+        "screen": {
+         "location": "http://127.0.0.1:44467/workspace/78a9713550",
+         "nodes": 37,
+         "since": 2,
+         "changes": [
+          "changed document \"Bug bash playground - demo-app - xum\" (was: document \"xum\")",
+          "added status \"Opening page...\"",
+          "added text=\"Opening page...\"",
+          "removed box",
+          "removed combobox \"Select project\" testid=\"project-selector\"",
+          "removed text=\"demo-app\"",
+          "removed text=\"/\"",
+          "removed textbox \"Workspace name\"",
+          "removed button \"Disable auto-naming\"",
+          "removed text=\"This workspace will use\"",
+          "removed text=\"Workspace Type\"",
+          "removed group \"Runtime type\""
+         ],
+         "more": 28
+        },
+        "source": {
+         "file": "helpers.ts",
+         "line": 24,
+         "column": 87
+        }
+       },
+       {
+        "id": "01a15fcb-14a7-7740-a9a1-6bd52c7afe29:4",
+        "index": 4,
+        "kind": "assertion",
+        "api": "expect.toBeVisible",
+        "label": "getByRole(\"button\", name: \"Notifications\")",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:29.698Z",
+        "durationMs": 139,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "helpers.ts",
+         "line": 26,
+         "column": 61
+        }
+       },
+       {
+        "id": "01a15fcb-14a7-7740-a9a1-6bd52c7afe29:5",
+        "index": 5,
+        "kind": "assertion",
+        "api": "expect.toBeVisible",
+        "label": "getByTestId(\"workspace-menu-bar\")",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:29.837Z",
+        "durationMs": 10,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "electron/menuBar.e2e.ts",
+         "line": 18,
+         "column": 23
+        }
+       },
+       {
+        "id": "01a15fcb-14a7-7740-a9a1-6bd52c7afe29:6",
+        "index": 6,
+        "kind": "agent",
+        "api": "agent.assert",
+        "label": "a bar along the top of the window shows the workspace title 'Bug bash playground' and its buttons in one row",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:29.944Z",
+        "durationMs": 3795,
+        "events": [],
+        "agent": "default",
+        "artifacts": [
+         "01a15fcb-14a7-7740-a9a1-6bd52c7afe29:artifact:0"
+        ],
+        "metrics": {
+         "modelCalls": 1,
+         "actionSteps": 0,
+         "observationBytes": 0,
+         "contextBytes": 624,
+         "ledgerBytes": 0,
+         "pixelBytes": 23112
+        },
+        "model": {
+         "provider": "anthropic.messages",
+         "model": "claude-haiku-5-5",
+         "endpoint": "provider-default",
+         "adapterVersion": "ai-sdk/0.20.0",
+         "policyVersion": "policy-0.3",
+         "calls": 1,
+         "tokenAccounting": "provider",
+         "inputTokens": 2627,
+         "outputTokens": 139,
+         "peakTokensPerCall": 2766,
+         "cacheReadTokens": 861,
+         "cacheWriteTokens": 0
+        },
+        "observationRevision": "b1",
+        "explanation": "The top bar across the main window shows the title 'Bug bash playground' at the left of the content area, with its info icon, and a row of buttons (bell, graduation cap, edit, terminal, more, sidebar toggle) on the same line at the right. The title and buttons are in one row along the top of the window, so the instruction holds.",
+        "visionInput": true,
+        "visionOnly": true,
+        "screen": {
+         "location": "http://127.0.0.1:44467/workspace/78a9713550",
+         "nodes": 78,
+         "since": 3,
+         "changes": [
+          "added testid=\"workspace-menu-bar\"",
+          "added text=\"Bug bash playground\" testid=\"workspace-title\"",
+          "added button \"Workspace details\"",
+          "added button \"Notifications\" testid=\"notify-on-response-button\"",
+          "added button \"Open in editor\"",
+          "added button \"New terminal\"",
+          "added button \"Workspace actions\" testid=\"workspace-more-actions\"",
+          "added testid=\"message-window\"",
+          "added log \"Conversation transcript\"",
+          "added testid=\"chat-message\"",
+          "added button \"Workspace created in 68ms\"",
+          "added text=\"Workspace created in 68ms\""
+         ],
+         "more": 33
+        },
+        "source": {
+         "file": "electron/menuBar.e2e.ts",
+         "line": 22,
+         "column": 17
+        }
+       }
+      ],
+      "appLog": [
+       {
+        "source": "console",
+        "level": "warning",
+        "text": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of this app to unnecessary security risks. For more information and help, consult https://elec\u2026",
+        "at": "2026-10-21T18:48:28.894Z",
+        "step": 0
+       },
+       {
+        "source": "console",
+        "level": "warning",
+        "text": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of this app to unnecessary security risks. For more information and help, consult https://elec\u2026",
+        "at": "2026-10-21T18:48:29.064Z",
+        "step": 0
+       },
+       {
+        "source": "console",
+        "level": "info",
+        "text": "Service Worker registered: ServiceWorkerRegistration (at http://127.0.0.1:44467/main-COfiL5NP.js:2)",
+        "at": "2026-10-21T18:48:29.065Z",
+        "step": 0
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "id": "a5eab42f5158f1f689085cafb22f252d4db91382e41f4648b8b51224543ad34b",
+    "testId": "electron/smoke.e2e.ts::Xum%20Electron%20opens%20the%20playground%20workspace",
+    "kind": "test",
+    "declarationIndex": 0,
+    "titlePath": [
+     "Xum Electron opens the playground workspace"
+    ],
+    "file": "electron/smoke.e2e.ts",
+    "source": {
+     "file": "electron/smoke.e2e.ts",
+     "line": 11,
+     "column": 1
+    },
+    "targetId": "electron",
+    "platform": "web",
+    "agent": "default",
+    "repeat": 0,
+    "tags": [
+     "story"
+    ],
+    "selected": true,
+    "status": "passed",
+    "attempts": [
+     {
+      "id": "01a15fcb-2fb9-7e57-bdaf-d9060ec29b20",
+      "index": 0,
+      "status": "passed",
+      "startedAt": "2026-10-21T18:48:33.977Z",
+      "durationMs": 4458,
+      "artifacts": [
+       {
+        "id": "01a15fcb-2fb9-7e57-bdaf-d9060ec29b20:artifact:0",
+        "kind": "screenshot",
+        "mediaType": "image/png",
+        "redaction": "complete",
+        "producer": {
+         "kind": "step",
+         "stepId": "01a15fcb-2fb9-7e57-bdaf-d9060ec29b20:4"
+        },
+        "path": "smoke-xum-electron-opens-the-a5eab42f5158f1f6/attempt-1/screenshots/001-assert.png",
+        "size": 43459,
+        "sha256": "d395e25ddd72dcfac07c7e78d7f17423b64413eafa8c0038f784a2ad468c939c"
+       }
+      ],
+      "secondaryErrors": [],
+      "cleanup": "complete",
+      "environment": {
+       "browser": "chromium 152.0.7977.130",
+       "user agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) xum/0.31.0 Chrome/152.0.7977.130 Electron/44.5.1 Safari/537.36"
+      },
+      "steps": [
+       {
+        "id": "01a15fcb-2fb9-7e57-bdaf-d9060ec29b20:0",
+        "index": 0,
+        "kind": "app",
+        "api": "app.open",
+        "label": "/",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:35.727Z",
+        "durationMs": 334,
+        "events": [],
+        "artifacts": [],
+        "screen": {
+         "location": "http://127.0.0.1:44467/project?project=demo-app-2d461aeb",
+         "nodes": 4,
+         "changes": []
+        },
+        "source": {
+         "file": "electron/smoke.e2e.ts",
+         "line": 15,
+         "column": 15
+        }
+       },
+       {
+        "id": "01a15fcb-2fb9-7e57-bdaf-d9060ec29b20:1",
+        "index": 1,
+        "kind": "assertion",
+        "api": "expect.toBeVisible",
+        "label": "getByRole(\"navigation\", name: \"Projects\") >> getByText(\"demo-app\").first()",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:36.061Z",
+        "durationMs": 137,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "helpers.ts",
+         "line": 15,
+         "column": 5
+        }
+       },
+       {
+        "id": "01a15fcb-2fb9-7e57-bdaf-d9060ec29b20:2",
+        "index": 2,
+        "kind": "locator",
+        "api": "locator.tap",
+        "label": "getByRole(\"navigation\", name: \"Projects\") >> getByText(\"Bug bash playground\").first()",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:36.219Z",
+        "durationMs": 160,
+        "events": [],
+        "artifacts": [],
+        "screen": {
+         "location": "http://127.0.0.1:44467/workspace/78a9713550",
+         "nodes": 37,
+         "since": 0,
+         "changes": [
+          "changed document \"Bug bash playground - demo-app - xum\" (was: document \"xum - coding agent multiplexer\")",
+          "added testid=\"left-sidebar-toggle-bar\"",
+          "added button \"Collapse sidebar\"",
+          "added testid=\"left-sidebar\"",
+          "added button \"Open about dialog\"",
+          "added text=\"v0.31.1-nightly.762-18-g17e1de98e1\"",
+          "added button \"Open analytics\" testid=\"analytics-button\"",
+          "added button \"Open settings\" testid=\"settings-button\"",
+          "added navigation \"Projects\"",
+          "added button \"Home\"",
+          "added button \"Add project\"",
+          "added text=\"+\""
+         ],
+         "more": 26
+        },
+        "source": {
+         "file": "helpers.ts",
+         "line": 24,
+         "column": 87
+        }
+       },
+       {
+        "id": "01a15fcb-2fb9-7e57-bdaf-d9060ec29b20:3",
+        "index": 3,
+        "kind": "assertion",
+        "api": "expect.toBeVisible",
+        "label": "getByRole(\"button\", name: \"Notifications\")",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:36.379Z",
+        "durationMs": 142,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "helpers.ts",
+         "line": 26,
+         "column": 61
+        }
+       },
+       {
+        "id": "01a15fcb-2fb9-7e57-bdaf-d9060ec29b20:4",
+        "index": 4,
+        "kind": "agent",
+        "api": "agent.assert",
+        "label": "the chat of the 'Bug bash playground' workspace is shown, with its message box",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:48:36.521Z",
+        "durationMs": 1686,
+        "events": [],
+        "agent": "default",
+        "artifacts": [
+         "01a15fcb-2fb9-7e57-bdaf-d9060ec29b20:artifact:0"
+        ],
+        "metrics": {
+         "modelCalls": 1,
+         "actionSteps": 0,
+         "observationBytes": 2914,
+         "contextBytes": 624,
+         "ledgerBytes": 0
+        },
+        "model": {
+         "provider": "anthropic.messages",
+         "model": "claude-haiku-5-5",
+         "endpoint": "provider-default",
+         "adapterVersion": "ai-sdk/0.20.0",
+         "policyVersion": "policy-0.3",
+         "calls": 1,
+         "tokenAccounting": "provider",
+         "inputTokens": 2711,
+         "outputTokens": 126,
+         "peakTokensPerCall": 2837,
+         "cacheReadTokens": 861,
+         "cacheWriteTokens": 0
+        },
+        "observationRevision": "b1",
+        "explanation": "The observation shows the 'Bug bash playground' workspace selected in the sidebar and its main view contains a conversation transcript log (testid message-window) with a chat composer dock that includes a textbox labeled 'Message'. The chat and message box are visible, so the instruction holds.",
+        "screen": {
+         "location": "http://127.0.0.1:44467/workspace/78a9713550",
+         "nodes": 79,
+         "since": 2,
+         "changes": [
+          "added testid=\"workspace-menu-bar\"",
+          "added text=\"Bug bash playground\" testid=\"workspace-title\"",
+          "added button \"Workspace details\"",
+          "added button \"Notifications\" testid=\"notify-on-response-button\"",
+          "added button \"Open in editor\"",
+          "added button \"New terminal\"",
+          "added button \"Workspace actions\" testid=\"workspace-more-actions\"",
+          "added testid=\"message-window\"",
+          "added log \"Conversation transcript\"",
+          "added testid=\"chat-message\"",
+          "added button \"Workspace created in 68ms\"",
+          "added text=\"Workspace created in 68ms\""
+         ],
+         "more": 34
+        },
+        "source": {
+         "file": "electron/smoke.e2e.ts",
+         "line": 17,
+         "column": 17
+        }
+       }
+      ],
+      "appLog": [
+       {
+        "source": "console",
+        "level": "warning",
+        "text": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of this app to unnecessary security risks. For more information and help, consult https://elec\u2026",
+        "at": "2026-10-21T18:48:35.742Z",
+        "step": 0
+       },
+       {
+        "source": "console",
+        "level": "warning",
+        "text": "%cElectron Security Warning (Insecure Content-Security-Policy) font-weight: bold; This renderer process has either no Content Security Policy set or a policy with \"unsafe-eval\" enabled. This exposes users of this app to unnecessary security risks. For more information and help, consult https://elec\u2026",
+        "at": "2026-10-21T18:48:35.958Z",
+        "step": 0
+       },
+       {
+        "source": "console",
+        "level": "info",
+        "text": "Service Worker registered: ServiceWorkerRegistration (at http://127.0.0.1:44467/main-COfiL5NP.js:2)",
+        "at": "2026-10-21T18:48:35.959Z",
+        "step": 0
+       }
+      ]
+     }
+    ]
+   }
+  ],
+  "errors": [],
+  "summary": {
+   "discovered": 3,
+   "selected": 3,
+   "executed": 3,
+   "passed": 3,
+   "failed": 0,
+   "interrupted": 0,
+   "flaky": 0,
+   "skipped": 0
+  },
+  "limits": {
+   "maxAgentContextBytes": 16384,
+   "maxLedgerBytes": 8192,
+   "maxObservationBytes": 262144,
+   "maxEventsPerStep": 1000,
+   "maxModelTokensPerCall": 64000
+  },
+  "usage": {
+   "discoveredResults": 3,
+   "maxAgentContextBytes": 624,
+   "maxLedgerBytes": 0,
+   "maxObservationBytes": 2914,
+   "artifactBytes": 130995,
+   "downloads": 0,
+   "events": 23,
+   "modelTokens": 8102,
+   "maxModelCallsInStep": 1,
+   "maxActionStepsInStep": 0,
+   "modelCachedTokens": 1722
+  }
+ }
+}

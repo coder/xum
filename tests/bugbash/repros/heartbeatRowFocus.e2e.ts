@@ -24,8 +24,18 @@ test(
         await row.focus();
         await browser.keyboard.press(key);
         await expect(dialog).toBeVisible();
-        await browser.keyboard.press("Escape");
-        await expect(dialog).toBeHidden();
+        // Radix's dismissable layer drops an Escape that arrives before its deferred rerender
+        // registers the new dialog as the top layer (#7141). With the chunk already loaded, the
+        // second open is fast enough for CI to hit that window (#7136), so press Escape again
+        // while the dialog is still visible. A press that lands as the dialog unmounts reaches
+        // the page, where Escape on the focused row does nothing.
+        await expect
+          .poll(async () => {
+            if (await dialog.isHidden()) return true;
+            await browser.keyboard.press("Escape");
+            return dialog.isHidden();
+          })
+          .toBe(true);
         await expect(row).toBeFocused();
       }
     } finally {

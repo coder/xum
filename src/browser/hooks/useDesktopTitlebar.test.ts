@@ -110,7 +110,7 @@ describe("initTitlebarInsets", () => {
   test("reserves the traffic lights on darwin", () => {
     enableDesktopApi("darwin");
     initTitlebarInsets();
-    expect(insets()).toEqual({ left: "80px", right: "0px" });
+    expect(insets()).toEqual({ left: `${MAC_TRAFFIC_LIGHTS_INSET}px`, right: "0px" });
   });
 
   test("reserves nothing in browser mode", () => {
