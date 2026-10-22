@@ -149,3 +149,12 @@ def test_a_crash_that_leaves_the_copy_mutated_retires_the_worker(tmp_path):
     rows = run_all(root, two_sites(), {"src/m.ts": ["t"]}, queue_of(worker), 1, {}, 0.0, runner)
     assert [r["outcome"] for r in rows] == ["error", "error"]
     assert rows[1]["reason"].startswith("no worker left")
+
+
+def test_zero_workers_is_a_usage_error(tmp_path):
+    import pytest
+    from mutate_report import main
+
+    with pytest.raises(SystemExit) as stop:
+        main(["--root", str(tmp_path), "--changes", "c.json", "--lane", "l.txt", "--workers", "0"])
+    assert stop.value.code == 2

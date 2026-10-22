@@ -24,14 +24,19 @@ export function annotation(row: MutantRow): string {
   return `::warning ${where},title=${title}::${escapeData(message)}`;
 }
 
-/** Unit shard LCOV files, or none when a shard is missing (then every site runs). */
+/**
+ * Unit shard LCOV files, or none when coverage is incomplete (then every site
+ * runs): a shard is missing, or a unit run fell back to no coverage
+ * (scripts/test-unit-ci.sh), so lines only it ran would look uncovered.
+ */
 export function unitCoverage(
   dir: string,
   expectedUnit: number
 ): { files: string[]; complete: boolean } {
-  const { artifacts, files } = lcovFiles(dir);
+  const { artifacts, files, withoutCoverage } = lcovFiles(dir);
   const unit = artifacts.filter((name) => name.startsWith("crap-lcov-unit-"));
-  const complete = expectedUnit > 0 && unit.length === expectedUnit;
+  const fellBack = withoutCoverage.some((label) => label.startsWith("crap-lcov-unit-"));
+  const complete = expectedUnit > 0 && unit.length === expectedUnit && !fellBack;
   return {
     files: complete
       ? files.filter((file) => relative(dir, file).startsWith("crap-lcov-unit-"))
@@ -61,6 +66,13 @@ export function summary(report: MutateReport | null, coverage: boolean, toolErro
         `| \`${cell(row.path)}:${row.line}\` | \`${cell(describe(row))}\` | ${cell(row.function)} |`
       );
     }
+  }
+  if (report.cappedTests.length > 0) {
+    const sources = report.cappedTests.map((path) => `\`${cell(path)}\``).join(", ");
+    lines.push(
+      "",
+      `More unit tests import ${sources} than the run uses: only the nearest ran, so a survivor there can be a mutant that a skipped test kills.`
+    );
   }
   for (const dropped of report.droppedTests) {
     lines.push("", `Dropped \`${cell(dropped.path)}\`: ${dropped.reason}.`);
