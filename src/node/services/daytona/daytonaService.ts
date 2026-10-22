@@ -9,6 +9,7 @@ import type {
   DaytonaTestConnectionResult,
 } from "@/common/orpc/schemas/daytona";
 import { toXumDaytonaHost } from "@/common/constants/daytona";
+import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   DaytonaConfigError,
@@ -226,6 +227,11 @@ export interface DaytonaServiceOptions {
   listWorkspaces?: () => DaytonaWorkspaceRef[];
   /** Defaults to retiring the pooled OpenSSH and ssh2 connections of the sandbox's alias. */
   retireSshConnections?: (sandboxId: string) => Promise<void>;
+  /**
+   * The archive behavior in Settings, for the removal that settles a policy an archived owner
+   * deferred (see the archive hook). Without it such a removal keeps the sandbox as it is.
+   */
+  getArchiveBehavior?: () => CoderWorkspaceArchiveBehavior;
 }
 
 export interface DaytonaStartAndWaitOptions {
@@ -372,6 +378,7 @@ export class DaytonaService {
   /** Why the setup of a sandbox Xum created (and then deleted) failed, for later turns. */
   private readonly setupFailures = new Map<string, string>();
   private readonly listWorkspaces?: () => DaytonaWorkspaceRef[];
+  readonly getArchiveBehavior: () => CoderWorkspaceArchiveBehavior;
   /**
    * Serializes "is this its last workspace" decisions. One key for every sandbox: workspaces
    * may name one sandbox by its name or by its id, so a per-string key would not serialize them.
@@ -395,6 +402,7 @@ export class DaytonaService {
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? sleepWithAbort;
     this.listWorkspaces = options.listWorkspaces;
+    this.getArchiveBehavior = options.getArchiveBehavior ?? (() => "keep");
     this.retireSshConnections =
       options.retireSshConnections ??
       ((sandboxId) => retireSshConnections({ host: toXumDaytonaHost(sandboxId) }));

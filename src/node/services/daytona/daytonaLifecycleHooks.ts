@@ -113,12 +113,31 @@ async function stopInsteadOfDelete(
   sandboxId: string
 ): Promise<Result<void>> {
   const stopped = await stopForArchive(options, args, sandboxId);
-  if (stopped.success) {
-    args.reportWarning?.(
-      `Daytona sandbox "${sandboxId}" was stopped, not deleted: an archived workspace still has its checkout on it.`
-    );
-  }
+  if (stopped.success) args.reportWarning?.(stoppedNotDeletedNotice(sandboxId));
   return stopped;
+}
+
+export function stoppedNotDeletedNotice(sandboxId: string): string {
+  return `Daytona sandbox "${sandboxId}" was stopped, not deleted: an archived workspace still has its checkout on it.`;
+}
+
+/**
+ * The policy an archived owner deferred (see archiveSandbox), applied by whatever ends the
+ * last other use of the sandbox: with archived workspaces left on it, "delete" stops too.
+ * The caller proved the sandbox is Xum's. Undefined when nothing was done, else the notice.
+ */
+export async function applyDeferredArchivePolicy(
+  daytonaService: Pick<DaytonaService, "getSandboxState" | "stopAndWait">,
+  behavior: CoderWorkspaceArchiveBehavior,
+  sandboxId: string,
+  now: () => number = Date.now
+): Promise<{ notice?: string } | undefined> {
+  if (behavior === "keep") return undefined;
+  const { state } = await daytonaService.getSandboxState(sandboxId);
+  if (!isRunning(state)) return undefined;
+  log.debug("Stopping a Daytona sandbox whose archived owner deferred its policy", { sandboxId });
+  await daytonaService.stopAndWait(sandboxId, now() + DAYTONA_STOP_TIMEOUT_MS);
+  return behavior === "delete" ? { notice: stoppedNotDeletedNotice(sandboxId) } : {};
 }
 
 /** The sandbox as the archived workspace stores it (its name or its id). */

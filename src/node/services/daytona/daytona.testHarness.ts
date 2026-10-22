@@ -2,6 +2,7 @@ import { spawn } from "child_process";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
+import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
 import type { DaytonaSshConfigWriter, DaytonaSshGateway } from "@/node/runtime/daytonaSshConfig";
 import type { SSHTransport } from "@/node/runtime/transports";
@@ -338,6 +339,8 @@ export interface DaytonaTestRig {
   clock: { now: number };
   /** The workspaces the service sees (it deletes a sandbox only with its last one). */
   workspaces: DaytonaWorkspaceRef[];
+  /** The archive behavior in Settings the service reports; "keep" unless a test sets it. */
+  archiveBehavior: CoderWorkspaceArchiveBehavior;
   cleanup: () => Promise<void>;
 }
 
@@ -372,12 +375,13 @@ export async function createDaytonaTestRig(
       return Promise.resolve();
     },
     listWorkspaces: () => workspaces,
+    getArchiveBehavior: () => rig.archiveBehavior,
   });
   // Sandboxes a test adds count as ones Xum created, as most tests need; a foreign one sets
   // its own labels.
   const ownLabels = { [DAYTONA_LABEL_INSTANCE]: await service.getInstanceId() };
   plane.defaultLabels = ownLabels;
-  return {
+  const rig: DaytonaTestRig = {
     rootDir,
     plane,
     addAccount: (apiKey) => {
@@ -390,8 +394,10 @@ export async function createDaytonaTestRig(
     service,
     clock,
     workspaces,
+    archiveBehavior: "keep",
     cleanup: () => fs.rm(rootDir, { recursive: true, force: true }),
   };
+  return rig;
 }
 
 /** Runs each "remote" command in a local bash whose HOME is `home`: the sandbox end of ssh. */

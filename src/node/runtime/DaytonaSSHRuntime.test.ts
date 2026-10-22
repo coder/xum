@@ -1415,6 +1415,43 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(rig.plane.find("sb-7")).toBeDefined();
   });
 
+  it("applies the archived owner's deferred policy when the last attached workspace is removed", async () => {
+    const sshDelete = spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
+      success: true,
+      deletedPath: "/path",
+    });
+    try {
+      const sandbox = rig.plane.addSandbox({ id: "xum-owner" });
+      // The owner was archived while the attached workspace worked there: it deferred its policy.
+      rig.workspaces.splice(0, rig.workspaces.length, {
+        workspaceId: "ws-owner",
+        runtimeConfig: sshDaytonaConfig({ sandboxId: "xum-owner", shared: false }),
+        archived: true,
+      });
+      const attached = { sandboxId: "xum-owner", shared: true };
+      for (const [behavior, expected] of [
+        ["stop", "stopped"],
+        ["delete", "stopped"],
+        ["keep", "started"],
+      ] as const) {
+        sandbox.state = "started";
+        rig.archiveBehavior = behavior;
+        const removal = await makeRuntime(attached, rig, {
+          workspaceId: "ws-attached",
+        }).deleteWorkspace("/home/me/project", "feature", false);
+        expect(removal.success).toBe(true);
+        expect(sandbox.state).toBe(expected);
+        if (behavior === "delete" && removal.success) {
+          expect(removal.notice).toContain("stopped, not deleted");
+        }
+      }
+      // The archived owner's checkout is still on it: never deleted.
+      expect(rig.plane.find("xum-owner")).toBe(sandbox);
+    } finally {
+      sshDelete.mockRestore();
+    }
+  });
+
   it("never deletes an attached sandbox, even with its last workspace", async () => {
     rig.plane.addSandbox({ id: "sb-users" });
     rig.workspaces.push({

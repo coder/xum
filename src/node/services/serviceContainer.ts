@@ -66,7 +66,10 @@ import {
   listDaytonaWorkspaceRefs,
 } from "@/node/services/daytona/daytonaReconciler";
 import { createDaytonaArchiveHook } from "@/node/services/daytona/daytonaLifecycleHooks";
-import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
+import {
+  DEFAULT_CODER_ARCHIVE_BEHAVIOR,
+  type CoderWorkspaceArchiveBehavior,
+} from "@/common/config/coderArchiveBehavior";
 import { createRuntime, setGlobalDaytonaService } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { DaytonaSSHRuntime } from "@/node/runtime/DaytonaSSHRuntime";
@@ -353,6 +356,7 @@ export class ServiceContainer {
       credentialsStore: new DaytonaCredentialsStore(this.config.rootDir),
       rootDir: this.config.rootDir,
       listWorkspaces: () => listDaytonaWorkspaceRefs(this.config.loadConfigOrDefault()),
+      getArchiveBehavior: () => this.archiveBehavior(),
     });
     this.perfCaptures = new PerfCaptureService({
       dir: getXumPerfCapturesDir(this.config.rootDir),
@@ -450,9 +454,7 @@ export class ServiceContainer {
     lifecycleHooks.registerBeforeArchive(
       createDaytonaArchiveHook({
         daytonaService: this.daytonaService,
-        getArchiveBehavior: () =>
-          this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
-          DEFAULT_CODER_ARCHIVE_BEHAVIOR,
+        getArchiveBehavior: () => this.archiveBehavior(),
         hasUnsettledRemoteBackgroundJobs: (workspaceMetadata) =>
           this.backgroundProcessManager.hasUnsettledRemoteSpawnRecords(
             createRuntimeForWorkspace(workspaceMetadata),
@@ -916,6 +918,14 @@ export class ServiceContainer {
   }
 
   /** Starts or stops the perf flight recorder to match the persisted experiment state. */
+  /** Settings' archive behavior for Daytona sandboxes (shared with Coder workspaces). */
+  private archiveBehavior(): CoderWorkspaceArchiveBehavior {
+    return (
+      this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
+      DEFAULT_CODER_ARCHIVE_BEHAVIOR
+    );
+  }
+
   private syncPerfFlightRecorder(): void {
     const enabled = this.experimentsService.isExperimentEnabled(
       EXPERIMENT_IDS.PERF_FLIGHT_RECORDER
