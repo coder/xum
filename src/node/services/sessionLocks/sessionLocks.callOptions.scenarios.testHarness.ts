@@ -18,18 +18,43 @@ import { HistoryService } from "@/node/services/historyService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService } from "@/node/services/memoryService";
 import { RefineService } from "@/node/services/refinement/refineService";
+import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import { markRemotePlanMigratedForDeletion } from "@/node/utils/runtime/planLocation";
 import type { AgentSessionAIService } from "../agentSession";
 import { createAgentSessionHarness } from "../agentSession.testHarness";
+import { recordArtifactVersion } from "../artifactVersionStore";
 import {
   awaitPendingBranchSummary,
   startAbandonedBranchSummaryInBackground,
 } from "../branchSummary";
+import { InitStateManager } from "../initStateManager";
+import { addPinnedPath } from "../pinnedArtifactFiles";
+import { acquireRollbackFileLock } from "../refinement/refinementRollback";
+import { SessionTimingService } from "../sessionTimingService";
+import { SessionUsageService } from "../sessionUsageService";
+import { upsertSubagentFailureArtifact } from "../subagentFailureArtifacts";
+import { updateSubagentGitPatchArtifactsFile } from "../subagentGitPatchArtifacts";
+import {
+  updateSubagentReportArtifactsFile,
+  upsertSubagentReportArtifact,
+} from "../subagentReportArtifacts";
+import { updateSubagentTranscriptArtifactsFile } from "../subagentTranscriptArtifacts";
+import { TaskHandleStore } from "../taskHandleStore";
 import { createTestConfig, createWorkspaceServiceMocks } from "../taskService.testHarness";
 import { setTodosForSessionDir } from "../tools/todo";
 import { createReviewPaneUpdateTool } from "../tools/review_pane";
 import { createTestToolConfig, mockToolCallOptions } from "../tools/testHelpers";
+import type { TelemetryService } from "../telemetryService";
+import { createTestHistoryService } from "../testHistoryService";
+import { WorkflowRunStore } from "../workflows/WorkflowRunStore";
+import { WorkspaceGoalService } from "../workspaceGoalService";
+import {
+  createMockAIService,
+  createWorkspaceServiceHarness,
+} from "../workspaceService.testHarness";
 import {
   createWorkspaceTurnManagerHarness,
   startWorkspaceTurnForTest,
@@ -252,5 +277,171 @@ export async function oneFork(
     await waitCall;
     await marker[Symbol.asyncDispose]();
     await waiting;
+  });
+}
+
+/**
+ * Usage, timing and goal files (sessionUsageService.test.ts,
+ * sessionTimingService.test.ts, workspaceGoalService.board.test.ts): a
+ * headless usage row takes the session-dir target lock and then the usage
+ * file lock; a timing clear and a serialized goal read take their file locks.
+ */
+export async function oneUsageAndGoal(): Promise<void> {
+  const workspaceId = "ws-record-usage";
+  const { config, historyService, cleanup } = await createTestHistoryService();
+  try {
+    const recorded = await new SessionUsageService(config, historyService).recordHeadlessUsage(
+      workspaceId,
+      "anthropic:claude-haiku-4-5",
+      { inputTokens: 40, outputTokens: 10, totalTokens: 50 },
+      undefined,
+      { analyticsSource: "memory_consolidation" }
+    );
+    // recordHeadlessUsage never throws: a missing result means the ledger write was skipped.
+    if (recorded === undefined) throw new Error("headless usage was not recorded");
+    const telemetry = { capture: () => undefined } as unknown as TelemetryService;
+    await new SessionTimingService(config, telemetry).clearTimingFile(workspaceId);
+    const extensionMetadata = new ExtensionMetadataService(
+      path.join(config.rootDir, "extensionMetadata.json")
+    );
+    const goals = new WorkspaceGoalService(config, historyService, extensionMetadata);
+    await goals.readGoalSerialized(workspaceId);
+  } finally {
+    await cleanup();
+  }
+}
+
+/**
+ * One child report (subagent*Artifacts.test.ts): the parent's artifact index
+ * writes, and the publication lock a delegated turn takes to publish its
+ * outcome (taskService.delegatedTurnRepro.test.ts).
+ */
+export async function oneChildReport(): Promise<void> {
+  await withTempDir("child", async (dir) => {
+    const workspaceId = "ws-record-parent";
+    const workspaceSessionDir = path.join(dir, "sessions", workspaceId);
+    const child = {
+      workspaceId,
+      workspaceSessionDir,
+      childTaskId: "ws-record-child",
+      parentWorkspaceId: workspaceId,
+      ancestorWorkspaceIds: [workspaceId],
+    };
+    await upsertSubagentReportArtifact({ ...child, reportMarkdown: "Done." });
+    await upsertSubagentFailureArtifact({ ...child, errorType: "unknown", errorMessage: "down" });
+    const unchanged = { workspaceId, workspaceSessionDir, update: () => undefined };
+    await updateSubagentReportArtifactsFile(unchanged);
+    await updateSubagentTranscriptArtifactsFile(unchanged);
+    await updateSubagentGitPatchArtifactsFile(unchanged);
+    await new TaskHandleStore(new Config(dir)).withWorkspaceTurnPublicationLock("wst_record", () =>
+      Promise.resolve()
+    );
+  });
+}
+
+/**
+ * One init seen by two backends (initStateManager.test.ts, "while another
+ * backend on the same root runs the init"), then the plan-migration lock of
+ * an SSH row before its plan is deleted.
+ */
+export async function oneInitAndPlan(): Promise<void> {
+  await withTempDir("init", async (dir) => {
+    const workspaceId = "ws-record-init";
+    const backendA = new InitStateManager(new Config(dir));
+    const backendB = new InitStateManager(new Config(dir));
+    backendA.startInit(workspaceId, "/path/to/hook");
+    // startInit queues its "running" write on the workspace file lock (after its record lock):
+    // a no-op turn on that lock waits for the write, with no polling.
+    await workspaceFileLocks.withLock(workspaceId, () => Promise.resolve());
+    // B finds the running record: it probes the init lease, then A's record lock (held).
+    await backendB.replayInit(workspaceId);
+    const replayed = await backendB.readInitStatus(workspaceId);
+    if (replayed?.status !== "running") throw new Error("B must leave A's running init alone");
+    // The final write, then releaseRecordClaim's barrier on the workspace file lock.
+    await backendA.endInit(workspaceId, 0);
+
+    await markRemotePlanMigratedForDeletion(
+      {
+        getInstallationId: () => Promise.resolve("install-record"),
+        isRemotePlanMigrated: () => false,
+        markRemotePlanMigrated: () => Promise.resolve(),
+        sessionsDir: path.join(dir, "sessions"),
+      },
+      {
+        id: workspaceId,
+        runtimeConfig: { type: "ssh", host: "plans.invalid", srcBaseDir: "~/xum" },
+      }
+    );
+  });
+}
+
+/**
+ * One full clear (workspaceService.planReviewFeedback.test.ts): it holds the
+ * refine serialization lock across the truncation.
+ */
+export async function oneWorkspaceRefine(): Promise<void> {
+  const harness = await createWorkspaceServiceHarness({
+    aiService: createMockAIService({ isStreaming: mock(() => false) }),
+  });
+  try {
+    const workspaceId = "ws-record-clear";
+    const projectPath = "/tmp/xum-lock-record/project";
+    await harness.config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: "clear",
+      projectName: "project",
+      projectPath,
+      runtimeConfig: { type: "local" },
+    });
+    await harness.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("row-1", "user", "Clear me.", { timestamp: 1_000 })
+    );
+    const cleared = await harness.service.truncateHistory(workspaceId, 1.0);
+    if (!cleared.success) throw new Error(`full clear failed: ${cleared.error}`);
+  } finally {
+    await harness.cleanup();
+  }
+}
+
+/**
+ * Session-dir stores (pinnedArtifactFiles, artifactVersionStore and
+ * WorkflowRunStore tests): a pin, an artifact version, a workflow run with
+ * its lease, the rollback lock and one journal append.
+ */
+export async function oneArtifactAndRun(): Promise<void> {
+  await withTempDir("artifact", async (dir) => {
+    const workspaceId = "ws-record-artifact";
+    const sessionDir = path.join(dir, "sessions", workspaceId);
+    await addPinnedPath(sessionDir, "report.md");
+    await recordArtifactVersion({
+      sessionDir,
+      relPath: "report.md",
+      bytes: Buffer.from("# Report\n"),
+      label: null,
+    });
+    const runs = new WorkflowRunStore({ sessionDir });
+    // createRun and acquireLease: the deadline-based locks (createRunIfAbsent, releaseLease)
+    // pass the time left as acquireTimeoutMs, which differs by a millisecond from run to run.
+    await runs.createRun({
+      id: "wfr_record",
+      workspaceId,
+      workflow: { name: "record", description: "Record", scope: "built-in", executable: true },
+      source: "export default function workflow() { return {}; }\n",
+      args: {},
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    if (!(await runs.acquireLease("wfr_record", "record-owner"))) {
+      throw new Error("the lease of a new run must be free");
+    }
+    const rollback = await acquireRollbackFileLock(sessionDir);
+    await rollback[Symbol.asyncDispose]();
+    const journal = new DurableEventJournal(sessionDir);
+    const { ref, size } = await journal.blobs.put("handle payload");
+    await journal.append({
+      workspaceId,
+      kind: "result-handle",
+      data: { handle: "vars.__h1", preview: "p", blobHash: ref, size },
+    });
   });
 }
