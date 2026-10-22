@@ -23,4 +23,10 @@ export type XumToolScope =
        * ancestor through it. Host-local Agent Plugins also anchor here.
        */
       readonly checkoutRoot?: string;
+      /**
+       * #6426: whether the project's own Agent Plugins (.xum/plugins, .agents/plugins) may
+       * contribute skills. Only `true` loads them; absent means untrusted (fail closed), the
+       * same rule their MCP servers, hooks and slash commands follow.
+       */
+      readonly projectPluginsTrusted?: boolean;
     };

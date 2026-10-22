@@ -13,6 +13,7 @@ import {
   buildProjectSkillRoots,
   getDefaultAgentSkillsRoots,
   getLegacyMuxGlobalSkillsRoot,
+  projectPluginsAllowed,
   type AgentSkillsRoots,
 } from "./agentSkillsService";
 
@@ -51,13 +52,18 @@ function buildProjectLocalRoots(
     // Read-only Agent Plugins containers at lowest precedence within each scope.
     // Containers anchor at the CHECKOUT root: for subProjectPath workspaces
     // `projectRoot` is the execution subdirectory, but plugins live (and are
-    // listed by the UI) at the checkout level.
-    projectPluginRoots: [
-      ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
-        path.join(projectSearchRoot, relativePath)
-      ),
-      path.join(projectSearchRoot, ".agents", "plugins"),
-    ],
+    // listed by the UI) at the checkout level. #6426: project containers only in a
+    // trusted project, so an untrusted repo's plugin skills are neither listed nor read.
+    ...(projectPluginsAllowed(xumScope.projectPluginsTrusted)
+      ? {
+          projectPluginRoots: [
+            ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
+              path.join(projectSearchRoot, relativePath)
+            ),
+            path.join(projectSearchRoot, ".agents", "plugins"),
+          ],
+        }
+      : {}),
     globalPluginRoots: [path.join(xumScope.xumHome, "plugins"), "~/.agents/plugins"],
   };
 }
@@ -130,6 +136,7 @@ export function resolveSkillStorageContext(input: {
       roots: getDefaultAgentSkillsRoots(input.runtime, input.workspacePath, {
         includeClaudeSkills: input.includeClaudeSkills,
         projectSearchRoot,
+        projectPluginsTrusted: input.xumScope.projectPluginsTrusted,
       }),
       containment: {
         kind: "runtime",

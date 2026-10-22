@@ -2388,6 +2388,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- **Workspace-local**: `.xum/plugins/<plugin>/` and `.agents/plugins/<plugin>/`",
       "- **Global**: `~/.xum/plugins/<plugin>/` and `~/.agents/plugins/<plugin>/`",
       "",
+      "Project plugins load their skills only in a trusted project, as their MCP servers, hooks and slash commands already do. In an untrusted project, Xum neither lists nor reads the skills of `.xum/plugins` and `.agents/plugins`, and it skips them under the project-automation kill switch too. Plain project skills (`.xum/skills`, `.agents/skills`) and global plugins do not depend on Project Trust. To use a repository's plugin skills, trust the project in **Settings → Security**.",
+      "",
       "Xum reads plugins from the Xum host only. SSH, Docker, and devcontainer workspaces load the global plugins (their skills, agents, and workflows) from the Xum host. Xum does not load project plugins inside an SSH or Docker checkout, because that checkout is not on the Xum host.",
       "",
       "As in Claude Code, a skills path (`contributes.skills`) that holds a `SKILL.md` itself is one skill. Its name is the folder name, or the plugin name when the path is the plugin root (`.`). The default `skills/` folder always holds skill folders.",

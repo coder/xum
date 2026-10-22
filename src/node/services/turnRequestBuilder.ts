@@ -299,6 +299,8 @@ export function resolveXumToolScope(
     projectStorageAuthority:
       runtimeType === "ssh" || runtimeType === "docker" ? "runtime" : "host-local",
     ...(checkoutRoot != null ? { checkoutRoot } : {}),
+    // #6426: the project's own plugins contribute skills only once the project is trusted.
+    projectPluginsTrusted: isWorkspaceProjectTrusted(config, metadata),
   };
 }
 

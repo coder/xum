@@ -52,6 +52,8 @@ import {
   parseSkillLookupName,
 } from "@/common/utils/agentSkills/skillLookupName";
 import { log } from "@/node/services/log";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { ensureRuntimePathWithinWorkspace } from "@/node/services/tools/runtimeSkillPathUtils";
 import {
@@ -185,6 +187,15 @@ export function buildProjectSkillRoots(
   ]);
 }
 
+/**
+ * #6426: a project's own Agent Plugins are one trust unit. Their skills load only in a trusted
+ * project, as their MCP servers, hooks and slash commands do (computeAgentPluginContainers),
+ * and never under the project-automation kill switch. Missing trust means untrusted.
+ */
+export function projectPluginsAllowed(projectPluginsTrusted: boolean | undefined): boolean {
+  return projectPluginsTrusted === true && !projectAutomationDisabled();
+}
+
 export function getDefaultAgentSkillsRoots(
   runtime: Runtime,
   workspacePath: string,
@@ -192,6 +203,8 @@ export function getDefaultAgentSkillsRoots(
     includeClaudeSkills?: boolean;
     /** Inclusive checkout/repository root for subproject ancestor discovery. */
     projectSearchRoot?: string;
+    /** #6426: only `true` adds the project's plugin containers (see projectPluginsAllowed). */
+    projectPluginsTrusted?: boolean;
   }
 ): AgentSkillsRoots {
   if (!workspacePath) {
@@ -222,12 +235,16 @@ export function getDefaultAgentSkillsRoots(
     // never a path derived from the remote globalRoot (Docker: /var/mux).
     ...(!(runtime instanceof RemoteRuntime)
       ? {
-          projectPluginRoots: [
-            ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
-              runtime.normalizePath(relativePath, projectSearchRoot)
-            ),
-            runtime.normalizePath(".agents/plugins", projectSearchRoot),
-          ],
+          ...(projectPluginsAllowed(options?.projectPluginsTrusted)
+            ? {
+                projectPluginRoots: [
+                  ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
+                    runtime.normalizePath(relativePath, projectSearchRoot)
+                  ),
+                  runtime.normalizePath(".agents/plugins", projectSearchRoot),
+                ],
+              }
+            : {}),
           globalPluginRoots: [`${runtime.getXumHome()}/plugins`, UNIVERSAL_PLUGINS_ROOT],
         }
       : {
@@ -961,6 +978,8 @@ export async function discoverAgentSkills(
     includeClaudeSkills?: boolean;
     /** Inclusive checkout/repository root for subproject ancestor discovery. */
     projectSearchRoot?: string;
+    /** #6426: only `true` adds project plugin containers (used only when `roots` is absent). */
+    projectPluginsTrusted?: boolean;
   }
 ): Promise<AgentSkillDiscoveryResult> {
   if (!workspacePath) {
@@ -972,6 +991,7 @@ export async function discoverAgentSkills(
     getDefaultAgentSkillsRoots(runtime, workspacePath, {
       includeClaudeSkills: options?.includeClaudeSkills,
       projectSearchRoot: options?.projectSearchRoot,
+      projectPluginsTrusted: options?.projectPluginsTrusted,
     });
 
   const containment = resolveProjectSkillContainment(options);
@@ -1360,6 +1380,8 @@ export async function readAgentSkill(
     includeClaudeSkills?: boolean;
     /** Inclusive checkout/repository root for subproject ancestor discovery. */
     projectSearchRoot?: string;
+    /** #6426: only `true` adds project plugin containers (used only when `roots` is absent). */
+    projectPluginsTrusted?: boolean;
   }
 ): Promise<ResolvedAgentSkill> {
   if (!workspacePath) {
@@ -1371,6 +1393,7 @@ export async function readAgentSkill(
     getDefaultAgentSkillsRoots(runtime, workspacePath, {
       includeClaudeSkills: options?.includeClaudeSkills,
       projectSearchRoot: options?.projectSearchRoot,
+      projectPluginsTrusted: options?.projectPluginsTrusted,
     });
 
   const containment = resolveProjectSkillContainment(options);
@@ -1431,6 +1454,9 @@ async function resolveAgentSkillDiscoveryContext(
         projectRoot: resolved.discoveryPath,
         projectStorageAuthority: "host-local",
         checkoutRoot: creationScope.projectPath,
+        // #6426: no workspace yet, so the project's config trust decides (isProjectTrusted
+        // resolves a sub-project to its parent).
+        projectPluginsTrusted: isProjectTrusted(context.config, projectPath),
       },
       ...options,
     });

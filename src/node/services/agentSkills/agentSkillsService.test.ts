@@ -19,6 +19,7 @@ import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import {
   discoverAgentSkills,
   requireReachableSkills,
@@ -1585,6 +1586,73 @@ describe("agentSkillsService agent plugins", () => {
     ).rejects.toThrow("not found");
   });
 
+  // #6426: a project plugin is one trust unit. Its skills load only in a trusted project, like
+  // its MCP servers, hooks and slash commands. Plain project skills and global plugins do not
+  // change. Both the listing and a read by name go through the turn's skill storage context.
+  test.each([false, true])(
+    "project plugin skills are listed and read only in a trusted project (trusted: %s)",
+    async (projectPluginsTrusted) => {
+      using tmp = new DisposableTempDir("plugin-skill-trust");
+      const project = path.join(tmp.path, "project");
+      const xumHome = path.join(tmp.path, "home");
+      await writeSkill(path.join(project, ".xum", "skills"), "plain-project", "from .xum/skills");
+      await writePlugin(path.join(project, ".xum", "plugins"), "repo-plugin", [
+        { name: "repo-plugin-skill", description: "from a project plugin" },
+      ]);
+      await writePlugin(path.join(xumHome, "plugins"), "home-plugin", [
+        { name: "home-plugin-skill", description: "from a global plugin" },
+      ]);
+      const ctx = resolveSkillStorageContext({
+        runtime: new LocalRuntime(project),
+        workspacePath: project,
+        xumScope: {
+          type: "project",
+          xumHome,
+          projectRoot: project,
+          projectStorageAuthority: "host-local",
+          projectPluginsTrusted,
+        },
+      });
+      const options = { roots: ctx.roots, containment: ctx.containment };
+
+      const names = (await discoverAgentSkills(ctx.runtime, ctx.workspacePath, options)).skills.map(
+        (skill) => skill.name
+      );
+      expect(names).toContain("plain-project");
+      expect(names).toContain("home-plugin-skill");
+      expect(names.includes("repo-plugin-skill")).toBe(projectPluginsTrusted);
+
+      // A read by name must not reach the plugin either (agent_skill_read, /skill).
+      const read = readAgentSkill(
+        ctx.runtime,
+        ctx.workspacePath,
+        SkillNameSchema.parse("repo-plugin-skill"),
+        options
+      ).then((resolved) => resolved.package.frontmatter.description);
+      if (projectPluginsTrusted) expect(await read).toBe("from a project plugin");
+      else await expect(read).rejects.toThrow("Agent skill not found");
+    }
+  );
+
+  test("default skill roots add project plugin containers only when trusted", () => {
+    const runtime = new LocalRuntime("/repo");
+    const pluginRoots = (projectPluginsTrusted?: boolean) =>
+      getDefaultAgentSkillsRoots(runtime, "/repo", { projectPluginsTrusted }).projectPluginRoots;
+    // Missing trust is untrusted (fail closed).
+    expect(pluginRoots()).toBeUndefined();
+    expect(pluginRoots(false)).toBeUndefined();
+    expect(pluginRoots(true)).toContain(path.join("/repo", ".agents", "plugins"));
+    // The project-automation kill switch wins over trust.
+    const saved = process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+    process.env[DISABLE_PROJECT_AUTOMATION_ENV] = "1";
+    try {
+      expect(pluginRoots(true)).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+      else process.env[DISABLE_PROJECT_AUTOMATION_ENV] = saved;
+    }
+  });
+
   test("a plugin with several skills roots serves each root's skills; the first root wins a name", async () => {
     using tmp = new DisposableTempDir("plugin-skill-roots");
     const container = path.join(tmp.path, "plugins");
@@ -2031,11 +2099,13 @@ describe("agentSkillsService agent plugins", () => {
     }
   });
 
-  test("getDefaultAgentSkillsRoots includes plugin containers for local runtimes", () => {
+  test("getDefaultAgentSkillsRoots includes plugin containers for trusted local runtimes", () => {
     using project = new DisposableTempDir("agent-skills-plugin-roots");
     const runtime = new LocalRuntime(project.path);
 
-    const roots = getDefaultAgentSkillsRoots(runtime, project.path);
+    const roots = getDefaultAgentSkillsRoots(runtime, project.path, {
+      projectPluginsTrusted: true,
+    });
     expect(roots.projectPluginRoots).toEqual([
       path.join(project.path, ".xum", "plugins"),
       path.join(project.path, ".mux", "plugins"),
@@ -2143,7 +2213,7 @@ describe("agentSkillsService agent plugins", () => {
 
     const runtime = new LocalRuntime(project.path);
     const roots = {
-      ...getDefaultAgentSkillsRoots(runtime, project.path),
+      ...getDefaultAgentSkillsRoots(runtime, project.path, { projectPluginsTrusted: true }),
       globalRoot: global.path,
       universalRoot: "",
       globalPluginRoots: [],
@@ -2186,7 +2256,7 @@ describe("agentSkillsService agent plugins", () => {
 
     const runtime = new LocalRuntime(project.path);
     const roots = {
-      ...getDefaultAgentSkillsRoots(runtime, project.path),
+      ...getDefaultAgentSkillsRoots(runtime, project.path, { projectPluginsTrusted: true }),
       globalRoot: global.path,
       universalRoot: "",
       globalPluginRoots: [],

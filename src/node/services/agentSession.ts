@@ -1,5 +1,6 @@
 import type { CompactionHistoryDeletion } from "./compactionCancellation";
 import { getSendProviderOptions } from "@/common/utils/ai/chatServiceTier";
+import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import { resolvePlanFileLocation } from "@/node/utils/runtime/planLocation";
 import type { ContinuousCompactionPublication } from "./continuousCompactionJournal";
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
@@ -13744,6 +13745,8 @@ export class AgentSession {
               ? { roots: skillCtx.roots, containment: skillCtx.containment }
               : {}),
             includeClaudeSkills,
+            // #6426: the default roots (no storage context) add project plugins only when trusted.
+            projectPluginsTrusted: isWorkspaceProjectTrusted(this.config, metadata),
           },
         };
         resolved = await readAgentSkill(

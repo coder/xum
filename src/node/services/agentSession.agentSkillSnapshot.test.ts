@@ -68,7 +68,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       namedWorkspacePath: args.workspacePath,
       runtimeConfig: args.runtimeConfig ?? { type: "local" },
     } as unknown as FrontendWorkspaceMetadata;
-    const { session, historyService, cleanup } = await createAgentSessionHarness({
+    const { session, historyService, cleanup, config } = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: {
         getWorkspaceMetadata: mock((_workspaceId: string) => Promise.resolve(Ok(workspaceMeta))),
@@ -76,6 +76,11 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       },
     });
     historyCleanup = cleanup;
+    // #6426: these tests use project plugin skills, which load only in a trusted project.
+    await config.editConfig((cfg) => {
+      cfg.projects.set(workspaceMeta.projectPath, { workspaces: [], trusted: true });
+      return cfg;
+    });
 
     const messages: MuxMessage[] = [];
     const send = session.sendMessage.bind(session);
@@ -350,6 +355,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
           projectRoot: subprojectPath,
           projectStorageAuthority: "host-local",
           checkoutRoot: checkout,
+          projectPluginsTrusted: true,
         }),
       },
     });

@@ -75,6 +75,7 @@ describe("resolveSkillStorageContext", () => {
       xumHome: tempDir.path,
       projectRoot,
       projectStorageAuthority: "host-local",
+      projectPluginsTrusted: true,
     };
 
     const context = resolveSkillStorageContext({
@@ -118,6 +119,7 @@ describe("resolveSkillStorageContext", () => {
       xumHome: tempDir.path,
       projectRoot,
       projectStorageAuthority: "host-local",
+      projectPluginsTrusted: true,
     };
 
     const projectContext = resolveSkillStorageContext({
@@ -178,6 +180,7 @@ describe("resolveSkillStorageContext", () => {
       xumHome: tempDir.path,
       projectRoot,
       projectStorageAuthority: "host-local",
+      projectPluginsTrusted: true,
     };
 
     const projectContext = resolveSkillStorageContext({
@@ -230,6 +233,7 @@ describe("resolveSkillStorageContext", () => {
         xumHome,
         projectRoot,
         projectStorageAuthority: "host-local",
+        projectPluginsTrusted: true,
       },
     });
 

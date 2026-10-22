@@ -280,6 +280,7 @@ export async function discoverWorkflowPlugins(input: {
     input.skillStorageContext?.roots ??
     getDefaultAgentSkillsRoots(input.runtime, input.workspacePath, {
       projectSearchRoot: input.projectSearchRoot,
+      projectPluginsTrusted: input.projectTrusted,
     });
   const projectContainmentRoot =
     input.skillStorageContext?.containment.kind === "local"
