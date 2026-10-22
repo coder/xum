@@ -361,6 +361,13 @@ export class DaytonaService {
   /** Whether the include file was read once, seeding the tokens an earlier process left. */
   private persistedTokensLoaded = false;
   private readonly readyRequests = new Map<string, SandboxReadyRequest>();
+  /**
+   * Sandboxes this process proved carry this install's label (never ones that do not), so a
+   * turn pays one label read per sandbox per process. Dropped with a delete or a handoff, and
+   * with the account.
+   */
+  private readonly provenOwned = new Set<string>();
+  private readonly ownershipRequests = new Map<string, Promise<"owned" | "notOwned" | "missing">>();
   /** Why the setup of a sandbox Xum created (and then deleted) failed, for later turns. */
   private readonly setupFailures = new Map<string, string>();
   private readonly listWorkspaces?: () => DaytonaWorkspaceRef[];
@@ -528,6 +535,7 @@ export class DaytonaService {
    */
   private async retireAccountCaches(): Promise<Array<[string, DaytonaSshAccess]>> {
     this.credentialsGeneration++;
+    this.provenOwned.clear();
     const tokens = [...this.tokens];
     const connected = this.sandboxesWithSsh();
     this.gatewayCache = undefined;
@@ -1103,6 +1111,7 @@ export class DaytonaService {
    */
   async disownSandbox(sandboxId: string): Promise<void> {
     const { client } = await this.getClient();
+    this.provenOwned.delete(sandboxId);
     const labels = (await client.getSandbox(sandboxId)).labels ?? {};
     if (!(DAYTONA_LABEL_INSTANCE in labels)) return;
     const kept = Object.entries(labels).filter(([key]) => key !== DAYTONA_LABEL_INSTANCE);
@@ -1170,6 +1179,7 @@ export class DaytonaService {
   ): Promise<"deleted" | "notOwned"> {
     const client = await this.clientOf(account);
     if ((await this.ownershipWith(client, sandboxId)) === "notOwned") return "notOwned";
+    this.provenOwned.delete(sandboxId);
     // Revoke first: Daytona refuses to revoke a token of a sandbox that no longer exists.
     await this.releaseSshAccess(sandboxId);
     try {
@@ -1185,8 +1195,30 @@ export class DaytonaService {
    * any step that changes it (a start, a checkout delete, a stop or a delete): a create of
    * unknown outcome may have left the workspace naming someone else's sandbox.
    */
-  async sandboxOwnership(sandboxId: string): Promise<"owned" | "notOwned" | "missing"> {
-    return this.ownershipWith((await this.getClient()).client, sandboxId);
+  async sandboxOwnership(
+    sandboxId: string,
+    options: { reuseProof?: boolean; signal?: AbortSignal } = {}
+  ): Promise<"owned" | "notOwned" | "missing"> {
+    // Only a turn or terminal reuses a proof: removals and archives read the label again.
+    if (!options.reuseProof) return this.ownershipWith((await this.getClient()).client, sandboxId);
+    if (this.provenOwned.has(sandboxId)) return "owned";
+    // Concurrent checks share one read, so they reach the shared start together.
+    const request = this.ownershipRequests.get(sandboxId) ?? this.proveOwnership(sandboxId);
+    return raceAbort(request, options.signal);
+  }
+
+  private proveOwnership(sandboxId: string): Promise<"owned" | "notOwned" | "missing"> {
+    const generation = this.credentialsGeneration;
+    const request = (async () => {
+      const ownership = await this.ownershipWith((await this.getClient()).client, sandboxId);
+      // A proof from before a settings change belongs to the old account.
+      if (ownership === "owned" && generation === this.credentialsGeneration) {
+        this.provenOwned.add(sandboxId);
+      }
+      return ownership;
+    })().finally(() => this.ownershipRequests.delete(sandboxId));
+    this.ownershipRequests.set(sandboxId, request);
+    return request;
   }
 
   private async ownershipWith(

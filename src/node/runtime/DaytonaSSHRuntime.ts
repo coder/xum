@@ -645,6 +645,8 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     emitStatus: StatusEmitter,
     signal: AbortSignal | undefined
   ): Promise<EnsureReadyResult | undefined> {
+    const refusal = await this.refuseUnownedSandbox(sandboxId, emitStatus, signal);
+    if (refusal) return refusal;
     try {
       await this.daytonaService.ensureSandboxReady(sandboxId, {
         onStarting: () => emitStatus("starting", "Starting sandbox..."),
@@ -655,6 +657,37 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       emitStatus("error");
       return this.ensureReadyFailure(sandboxId, error, signal);
     }
+  }
+
+  /**
+   * A sandbox this workspace says Xum created must carry this install's label before Xum starts
+   * it, mints for it or runs anything in it: a create of unknown outcome may have left the
+   * workspace naming someone else's sandbox (after a restart, no setup failure says so). A
+   * missing sandbox goes on, so the start reports it.
+   */
+  private async refuseUnownedSandbox(
+    sandboxId: string,
+    emitStatus: StatusEmitter,
+    signal: AbortSignal | undefined
+  ): Promise<EnsureReadyResult | undefined> {
+    if (this.daytonaConfig.shared === true) return undefined;
+    let ownership: Awaited<ReturnType<DaytonaRuntimeService["sandboxOwnership"]>>;
+    try {
+      ownership = await this.daytonaService.sandboxOwnership(sandboxId, {
+        reuseProof: true,
+        signal,
+      });
+    } catch (error) {
+      emitStatus("error");
+      return this.ensureReadyFailure(sandboxId, error, signal);
+    }
+    if (ownership !== "notOwned") return undefined;
+    const error =
+      `Daytona sandbox "${sandboxId}" does not carry this Xum install's ` +
+      `"${DAYTONA_LABEL_INSTANCE}" label, so Xum does not use it for this workspace. Delete ` +
+      "this workspace (the sandbox is kept).";
+    emitStatus("error", error);
+    return { ready: false, error, errorType: "runtime_not_ready" };
   }
 
   private async markReadyIfRepoPresent(

@@ -195,6 +195,58 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
     expect(rig.plane.countCalls("POST /sandbox/sb-archived/ssh-access")).toBe(1);
   });
 
+  it("never starts, mints for or runs ssh in a sandbox without this install's label", async () => {
+    // After a restart: no setup failure is remembered for the workspace whose create lost the
+    // name to another install's sandbox.
+    rig.plane.addSandbox({
+      id: "xum-theirs",
+      state: "stopped",
+      labels: { "xum.instance": "another-install" },
+    });
+    let spawned = 0;
+    const local = localShellTransport(rig.rootDir);
+    const transport: SSHTransport = {
+      ...local,
+      spawnRemoteProcess: (command, options) => {
+        spawned++;
+        return local.spawnRemoteProcess(command, options);
+      },
+    };
+    const phases: string[] = [];
+
+    const result = await makeRuntime({ sandboxId: "xum-theirs", shared: false }, rig, {
+      transport,
+      projectPath: "/home/me/project",
+      workspaceName: "feature",
+    }).ensureReady({ statusSink: (event) => phases.push(event.phase) });
+
+    expect(result.ready).toBe(false);
+    if (!result.ready) {
+      expect(result.errorType).toBe("runtime_not_ready");
+      expect(result.error).toContain("xum.instance");
+    }
+    expect(phases.at(-1)).toBe("error");
+    expect(rig.plane.countCalls("POST /sandbox/xum-theirs/start")).toBe(0);
+    expect(rig.plane.countCalls("POST /sandbox/xum-theirs/ssh-access")).toBe(0);
+    expect(spawned).toBe(0);
+  });
+
+  it("proves a sandbox is this install's once per process", async () => {
+    rig.plane.addSandbox({ id: "sb-own" });
+    const lookups = () => rig.plane.countCalls("GET /sandbox/sb-own");
+    const perCheck: number[] = [];
+    for (let check = 0; check < 2; check++) {
+      rig.service.invalidateSandboxReady("sb-own");
+      const before = lookups();
+      expect(await makeRuntime({ sandboxId: "sb-own", shared: false }).ensureReady()).toEqual({
+        ready: true,
+      });
+      perCheck.push(lookups() - before);
+    }
+    // The start's own state read, plus the label read on the first check only.
+    expect(perCheck).toEqual([2, 1]);
+  });
+
   it("reports a sandbox removed outside Xum as runtime_not_ready and never recreates it", async () => {
     const result = await makeRuntime({ sandboxId: "sb-gone" }).ensureReady();
 
