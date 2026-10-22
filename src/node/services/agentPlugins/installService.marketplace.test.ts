@@ -193,6 +193,24 @@ describe("AgentPluginInstallService Claude marketplaces", () => {
     );
   });
 
+  test("a relative entry whose folder is missing is listed as not installable", async () => {
+    await writeFiles(marketDir, {
+      ".claude-plugin/marketplace.json": marketplace([
+        DOCS,
+        { name: "gone", source: "./plugins/gone", skills: ["./skills/x"] },
+      ]),
+    });
+    await commit(marketDir, "an entry without its folder");
+    const listed = await service.previewSource({ input: marketDir });
+    if (listed.kind !== "marketplace") throw new Error("expected a marketplace listing");
+    expect(
+      listed.marketplace.entries.map((entry) => [entry.name, entry.installable, entry.reason])
+    ).toEqual([
+      ["docs", true, undefined],
+      ["gone", false, "Xum cannot install the entry's folder 'plugins/gone': it does not exist"],
+    ]);
+  });
+
   test("a skill that Xum rejects counts nowhere: not in the listing, not for the Skills CLI", async () => {
     // Like anthropics/skills `claude-api`: a description over 1024 characters.
     await writeFiles(marketDir, {
