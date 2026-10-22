@@ -1,0 +1,8 @@
+{
+  "name": "xum-docs-mintlify",
+  "private": true,
+  "description": "The Mintlify CLI behind make check-docs-links and make docs-server, locked by bun.lock",
+  "dependencies": {
+    "mintlify": "4.2.680"
+  }
+}

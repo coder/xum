@@ -8063,9 +8063,7 @@ describe("AgentPluginInstallService", () => {
       await fsPromises.mkdir(path.join(notPlugin, ".claude-plugin"), { recursive: true });
       await fsPromises.writeFile(path.join(notPlugin, ".claude-plugin", "marketplace.json"), "{}");
       await commitAll(notPlugin, "claude marketplace");
-      await expect(service.preview({ input: notPlugin })).rejects.toThrow(
-        /Claude Code plugin marketplace .* does not install marketplaces/
-      );
+      await expect(service.preview({ input: notPlugin })).rejects.toThrow(/has no .plugins. list/);
     } finally {
       await fsPromises.rm(notPlugin, { recursive: true, force: true });
     }
