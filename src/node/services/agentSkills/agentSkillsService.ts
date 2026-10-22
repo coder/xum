@@ -365,18 +365,24 @@ async function buildRemotePluginScanCandidates(
   const mirrorRuntime = new LocalRuntime(snapshot.mirrorRoot);
   const remote = { runtime, toRemote: snapshot.toRemote };
   return snapshot.plugins.flatMap((plugin) =>
-    (plugin.skillsDirs ?? []).map((root) => ({
-      scope: "project" as const,
-      root: root.dir,
-      runtime: mirrorRuntime,
-      pluginRoot: plugin.rootPath,
-      pluginName: plugin.name,
-      singleSkillName: root.name,
-      commandSkill: root.command,
-      skillsOnlyPlugin: plugin.skillsOnly,
-      claudePackagePlugin: plugin.claudeFallback,
-      remote,
-    }))
+    // Slash commands (Claude `commands/*.md`) of remote plugins do not load (#7218).
+    (plugin.skillsDirs ?? []).flatMap((root) =>
+      root.command === true
+        ? []
+        : [
+            {
+              scope: "project" as const,
+              root: root.dir,
+              runtime: mirrorRuntime,
+              pluginRoot: plugin.rootPath,
+              pluginName: plugin.name,
+              singleSkillName: root.name,
+              skillsOnlyPlugin: plugin.skillsOnly,
+              claudePackagePlugin: plugin.claudeFallback,
+              remote,
+            },
+          ]
+    )
   );
 }
 

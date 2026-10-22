@@ -1544,6 +1544,43 @@ describe("agentSkillsService agent plugins", () => {
     60_000
   );
 
+  // #6426/#7218: slash commands of remote plugins do not load, but their skills do.
+  test("a remote checkout's Claude plugin loads its skills but not its commands", async () => {
+    using checkout = new DisposableTempDir("plugin-remote-commands");
+    const root = await fs.realpath(checkout.path);
+    const pluginDir = path.join(root, ".xum", "plugins", "kit");
+    await fs.mkdir(path.join(pluginDir, ".claude-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".claude-plugin", "plugin.json"),
+      JSON.stringify({ name: "kit" })
+    );
+    await fs.mkdir(path.join(pluginDir, "commands"));
+    await fs.writeFile(path.join(pluginDir, "commands", "ship.md"), "Ship it.\n");
+    await writeSkill(path.join(pluginDir, "skills"), "review", "A skill");
+    const runtime = new (class extends ShellRemoteRuntime {
+      override getAgentHostKey() {
+        return `test:${root}`;
+      }
+      protected override getBasePath() {
+        return root;
+      }
+    })(root);
+    const roots = getDefaultAgentSkillsRoots(runtime, root, {
+      projectSearchRoot: root,
+      projectPluginsTrusted: true,
+    });
+    try {
+      const { skills } = await discoverAgentSkills(runtime, root, {
+        roots,
+        containment: { kind: "runtime", root },
+      });
+      const kit = skills.filter((skill) => skill.pluginName === "kit").map((skill) => skill.name);
+      expect(kit).toEqual(["review"]);
+    } finally {
+      clearRemoteProjectPluginSnapshots();
+    }
+  }, 60_000);
+
   test.each([
     [".xum", false],
     [".mux", false],

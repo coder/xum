@@ -162,8 +162,8 @@ export async function buildWorkspaceComposition(
   // below intentionally keep execution-path defaults — production derives
   // their plugin containers from the discovery path, so checkout-anchoring
   // them here would report artifacts production never loads. Like production,
-  // these runtime-based loaders give RemoteRuntime only the global host plugin
-  // roots (no project plugin roots).
+  // a RemoteRuntime gets the global host plugin roots plus, in a trusted
+  // project, its checkout's plugin skills and agents (#6426).
   const defaultSkillRoots =
     args.hostCheckoutRoot != null
       ? getDefaultAgentSkillsRoots(args.runtime, args.workspacePath, {
@@ -195,6 +195,7 @@ export async function buildWorkspaceComposition(
   const skillDescriptors = requireReachableSkills(
     await discoverAgentSkills(args.runtime, args.workspacePath, {
       dedupeByName: false,
+      projectPluginsTrusted: args.projectTrusted,
       ...(checkoutSkillRoots ?? {}),
     })
   );
