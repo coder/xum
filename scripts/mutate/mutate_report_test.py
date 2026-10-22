@@ -238,3 +238,30 @@ def test_windows_is_a_tool_error_before_any_work(tmp_path, monkeypatch):
     monkeypatch.setattr(mutate_report.os, "name", "nt")
     missing = str(tmp_path / "missing.json")  # never read
     assert mutate_report.main(["--root", str(tmp_path), "--changes", missing, "--lane", missing]) == 2
+
+
+def test_a_site_in_a_bun_false_zero_window_runs_instead_of_uncovered():
+    # Bun 1.4.3 zeroes every line from an inlined const down to an uncalled
+    # user (scripts/crap/crapper_report.py). check() ran, but LCOV shows 0.
+    from mutate_report import false_zero_windows, triage
+
+    source = "\n".join(
+        [
+            "const LIMIT = 2;",  # 1
+            "export function check(n: number): boolean {",  # 2
+            "  return n < 1;",  # 3
+            "}",  # 4
+            "export function unused(n: number): number {",  # 5
+            "  return n + LIMIT;",  # 6
+            "}",  # 7
+        ]
+    )
+    reports = [{1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}]
+    windows = false_zero_windows(source, "src/m.ts", reports)
+    assert windows == [(1, 4)]
+    plan = {"src/m.ts": ["src/m.test.ts"]}
+    rows, to_run = triage([site(3)], plan, {"src/m.ts": reports}, set(), {"src/m.ts": windows})
+    assert rows == [] and to_run == [site(3)]
+    # Outside the window, a zero still means uncovered.
+    rows, _ = triage([site(6)], plan, {"src/m.ts": reports}, set(), {"src/m.ts": windows})
+    assert [r["outcome"] for r in rows] == ["uncovered"]
