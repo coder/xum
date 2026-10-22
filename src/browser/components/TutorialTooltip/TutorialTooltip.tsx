@@ -63,8 +63,9 @@ function useBubbleFocus(
     const bubble = tooltipRef.current;
     if (!isPositioned || !bubble) return;
     const previous = document.activeElement;
-    if (isEditableElement(previous) || isBubbleCovered(bubble)) return;
-    bubble.focus();
+    if (!isEditableElement(previous) && !isBubbleCovered(bubble)) bubble.focus();
+    // Registered even when the bubble left focus alone: a click on Skip or Next still moves focus
+    // into the bubble, and it must go back to the composer when the bubble closes.
     return () => {
       const active = document.activeElement;
       const focusLost = active === document.body || bubble.contains(active);

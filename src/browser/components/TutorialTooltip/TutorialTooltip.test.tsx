@@ -127,6 +127,16 @@ describe("TutorialTooltip", () => {
     expect(document.activeElement).toBe(composer);
   });
 
+  test("after a click in the bubble, closing it returns focus to the composer (#7114)", () => {
+    const { view, close } = renderTooltip("composer");
+    // A click on Skip moves focus from the composer into the bubble before the bubble closes.
+    view.getByRole("button", { name: "Skip" }).focus();
+
+    close();
+
+    expect(document.activeElement).toBe(view.getByRole("textbox", { name: "Composer" }));
+  });
+
   test("the bubble does not take focus while a full-screen layer covers it (#7114)", () => {
     // The full-screen Artifacts and App View panels (z-1500) draw over the bubble. Layout is not
     // computed here, so the browser's hit test is stubbed to report that panel on top.
