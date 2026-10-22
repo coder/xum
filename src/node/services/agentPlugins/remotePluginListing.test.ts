@@ -94,6 +94,9 @@ describe("parseRemotePluginListing", () => {
   test("malformed, outside-the-root, oversized or cut-off listings are refused", () => {
     const ok = [`D\t\t${root}/p`, `L\t${root}/a\t${root}/l`, `L\t${root}/a\t${root}/l`];
     expect(parseRemotePluginListing(listing(ok, []))).not.toBeNull();
+    // Paths count toward the cache's byte cap even without any file.
+    const dirs = Array.from({ length: 100 }, (_, i) => `D\t\t${root}/${"x".repeat(1000)}${i}`);
+    expect(parseRemotePluginListing(listing(dirs, []))?.bytes).toBeGreaterThan(200_000);
     for (const bad of [
       [`D\t\t${root}/p/../../etc`],
       [`D\t\t/etc`],
@@ -103,6 +106,9 @@ describe("parseRemotePluginListing", () => {
       // One link listed twice with two targets (retargeted between two walks).
       [`L\t${root}/a\t${root}/p`, `L\t${root}/b\t${root}/p`],
       Array.from({ length: MAX_REMOTE_PLUGIN_ENTRIES + 1 }, (_, i) => `D\t\t${root}/d${i}`),
+      // A path over PATH_MAX, and deep paths that imply more nodes than any real listing.
+      [`D\t\t${root}/${"a/".repeat(2100)}b`],
+      Array.from({ length: 3 }, (_, i) => `D\t\t${root}/${i}${"/a".repeat(1600)}`),
     ]) {
       expect(parseRemotePluginListing(listing(bad, []))).toBeNull();
     }

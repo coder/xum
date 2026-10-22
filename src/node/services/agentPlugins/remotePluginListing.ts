@@ -15,6 +15,11 @@ import { isCanonicalRemotePath, isInsideRoot, type MemoryNode } from "./memoryPl
 
 /** Entries (directories, symlinks, files) per listing; more loads no remote plugins. */
 export const MAX_REMOTE_PLUGIN_ENTRIES = 4000;
+/**
+ * Nodes per listing, the implied ancestor directories included. A real listing implies only the
+ * few directories above its walked trees, so more means a crafted listing (refused).
+ */
+const MAX_LISTING_NODES = MAX_REMOTE_PLUGIN_ENTRIES + 512;
 
 function tarString(field: Buffer): string {
   const end = field.indexOf(0);
@@ -98,7 +103,7 @@ export function parseTarFiles(tar: Buffer): Map<string, Buffer> | null {
   return null;
 }
 
-/** A parsed listing: the real checkout root, its nodes, and the decoded tar size. */
+/** A parsed listing: the real checkout root, its nodes, and the memory they keep (estimate). */
 export interface RemotePluginListing {
   root: string;
   nodes: Map<string, MemoryNode>;
@@ -126,6 +131,7 @@ function addNode(nodes: Map<string, MemoryNode>, remote: string, node: MemoryNod
   // A tree listed twice (two containers that resolve to one directory) repeats its lines. A
   // repeat that differs (a link retargeted between the two walks) refuses the listing.
   if (existing !== undefined && !isSameNode(existing, node)) return false;
+  if (existing === undefined && nodes.size >= MAX_LISTING_NODES) return false;
   nodes.set(remote, node);
   return true;
 }
@@ -206,6 +212,15 @@ function decodeTar(base64Lines: string[]): { tar: Buffer; files: Map<string, Buf
 }
 
 /**
+ * An estimate of the memory a parsed listing keeps: the tar, the path strings (2 bytes per
+ * char) and a fixed cost per node, so a listing of many long paths and no files still counts.
+ */
+function retainedBytes(tar: Buffer, entryLines: string[], nodes: Map<string, MemoryNode>): number {
+  const chars = entryLines.reduce((total, line) => total + line.length, 0);
+  return tar.length + 2 * chars + 64 * nodes.size;
+}
+
+/**
  * Parses the listing; null when it is cut off, too big, malformed, or its tar does not hold
  * exactly the listed files (fail closed). The base64 is decoded once and then dropped.
  */
@@ -221,6 +236,10 @@ export function parseRemotePluginListing(stdout: string): RemotePluginListing | 
   // Each F line found its member; an extra member means the tar read something not listed.
   const listedFiles = [...context.nodes.values()].filter((node) => node.kind === "file").length;
   return listedFiles === decoded.files.size
-    ? { root: parts.root, nodes: context.nodes, bytes: decoded.tar.length }
+    ? {
+        root: parts.root,
+        nodes: context.nodes,
+        bytes: retainedBytes(decoded.tar, parts.entryLines, context.nodes),
+      }
     : null;
 }

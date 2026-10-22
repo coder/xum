@@ -25,12 +25,16 @@ export type MemoryNode =
 /** Same bound as Linux (MAXSYMLINKS) on symlink hops in one resolution. */
 const MAX_SYMLINK_HOPS = 40;
 
+/** Linux PATH_MAX. A longer path (from a hostile host) is refused before any per-ancestor work. */
+export const MAX_REMOTE_PATH_LENGTH = 4096;
+
 /**
- * An absolute, normalized POSIX path other than "/": no `.`, `..` or empty segment, and no NUL,
- * tab or newline (the listing's separators).
+ * An absolute, normalized POSIX path other than "/", of at most MAX_REMOTE_PATH_LENGTH chars: no
+ * `.`, `..` or empty segment, and no NUL, tab or newline (the listing's separators).
  */
 export function isCanonicalRemotePath(remote: string): boolean {
   return (
+    remote.length <= MAX_REMOTE_PATH_LENGTH &&
     remote.startsWith("/") &&
     remote !== "/" &&
     !remote.endsWith("/") &&
