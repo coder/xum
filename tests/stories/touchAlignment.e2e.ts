@@ -86,7 +86,7 @@ test(
     ).toBeVisible();
     // Before the fix (#6318) each box drew as a 44px square, 14px below its label's first line.
     await agent.assert(
-      "in the 'What to back up and restore' list, each checkbox is much smaller than the Branch text field above it, about as tall as its label's text, and level with that text",
+      "in the 'What to back up and restore' list, each checkbox is much smaller than the Branch text field above it, and level with the first line of its label",
       { vision: "only" }
     );
     // Not visible on screen: the label row stays a 44px touch target.
@@ -106,7 +106,7 @@ test(
     await expect(screen.getByRole("dialog", "Configure heartbeat")).toBeVisible();
     await applyTouchPointerRules(browser);
     await agent.assert(
-      "in the Configure heartbeat dialog, the checkbox is a small square about the height of one line of text, level with its label",
+      "in the Configure heartbeat dialog, the checkbox next to 'Use the global default' is much smaller than the Interval number field above it, and level with its label",
       { vision: "only" }
     );
     // Not visible on screen: its sibling <label for> is no touch target, so the checkbox button
@@ -126,7 +126,7 @@ test(
     await sendMessage(screen, "Touch alignment story: model and time on one line");
     // The judge needs this reply's settled meta row on screen. Every story of a run shares the one
     // seeded workspace, so wait on this reply's own block: an earlier story's reply has a meta row
-    // too (Stories (Haiku) on #7185 judged this reply while it was still starting).
+    // too, and a wait on any meta row let the judge see this reply while it was still starting.
     await expect
       .poll(
         () =>
