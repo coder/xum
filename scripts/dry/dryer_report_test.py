@@ -211,3 +211,22 @@ def test_marker_text_inside_a_string_is_not_a_marker():
     assert marker_reason(lines, 2, 2, "dry-duplicate-ok") is None
     assert marker_reason(lines, 3, 3, "mutation-equivalent") == "real reason"
     assert marker_reason(lines, 4, 4, "dry-duplicate-ok") == "block comment"
+
+
+def test_a_marker_is_a_whole_token_and_a_jsx_comment_counts():
+    from markers import Comments
+
+    def marker_reason(lines, first, path="a.ts"):
+        return Comments("\n".join(lines), path).reason(first, first, "mutation-equivalent")
+
+    assert marker_reason(["x; // no-mutation-equivalent: not actually equivalent"], 1) is None
+    assert marker_reason(["x; // see mutation-equivalent: a reason"], 1) == "a reason"
+    jsx = [
+        "const v = (",  # 1
+        "  <div>",  # 2
+        "    {/* mutation-equivalent: the label is never empty */}",  # 3
+        "    {label || 'none'}",  # 4
+        "  </div>",  # 5
+        ");",  # 6
+    ]
+    assert marker_reason(jsx, 4, "a.tsx") == "the label is never empty"

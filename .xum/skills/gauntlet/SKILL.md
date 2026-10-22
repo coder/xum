@@ -16,8 +16,9 @@ warn mode, where the job only reports. With `block`:
 - `Quality / Mutation` fails while a survivor that no marker accepts remains.
   `Required` does not wait for it, in either mode.
 
-A tool error, a timeout, a baseline failure, an `error` row or a mutant that
-did not run never blocks.
+A tool error, a timeout, a baseline failure, an `error` row, a mutant that
+did not run, or a survivor in a source with more importing tests than the run
+used never blocks.
 
 ## Accept markers
 

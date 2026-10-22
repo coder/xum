@@ -60,10 +60,16 @@ export function unitCoverage(
  * 1 only in block mode with a complete report that has unaccepted survivors.
  * A dropped baseline test makes the report partial: a survivor there can be a
  * mutant that the dropped test kills, and a baseline failure never blocks.
+ * A survivor in a capped source (more importing tests than the run used) can
+ * be one that a skipped test kills, so it warns and never blocks.
  */
 export function exitCode(mode: CrapMode, report: MutateReport | null): number {
   if (mode !== "block" || report === null || report.droppedTests.length > 0) return 0;
-  return counts(report).survived > 0 ? 1 : 0;
+  const capped = new Set(report.cappedTests);
+  const blocking = report.mutants.filter(
+    (row) => row.outcome === "survived" && !capped.has(row.path)
+  );
+  return blocking.length > 0 ? 1 : 0;
 }
 
 export function summary(

@@ -53,14 +53,16 @@ class Comments:
             raw = bytearray(self.lines[line - 1].encode("utf-8"))
             for start, end in ranges:
                 raw[start:end] = b" " * (end - start)
-            if not raw.strip():
+            # `{/* marker: reason */}` is how TSX writes a comment between elements.
+            if bytes(raw).translate(None, b" \t\r") in (b"", b"{}"):
                 self.comment_only.add(line)
 
     def reason(self, first: int, last: int, marker: str) -> str | None:
         """The reason of the first `marker:` in a comment on lines first..last
         or on the comment-only lines directly above `first`, or None."""
 
-        pattern = re.compile(rf"{re.escape(marker)}:\s*(.*?)\s*(?:\*/)?\s*$")
+        # A whole token: `no-mutation-equivalent:` is another word, not the marker.
+        pattern = re.compile(rf"(?<![\w-]){re.escape(marker)}:\s*(.*?)\s*(?:\*/)?\s*$")
         above = first - 1
         while above >= 1 and above in self.comment_only:
             above -= 1
