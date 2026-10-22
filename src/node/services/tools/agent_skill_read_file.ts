@@ -19,8 +19,7 @@ import {
 } from "@/node/services/agentSkills/skillStorageContext";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { readBuiltInSkillFile } from "@/node/services/agentSkills/builtInSkillDefinitions";
-import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
-import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
+import { RuntimeError, isRemoteRuntime, type Runtime } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
 import { resolveContainedSkillFilePath } from "./skillFileUtils";
 import { resolveContainedSkillFilePathOnRuntime } from "./runtimeSkillPathUtils";
@@ -148,7 +147,7 @@ export async function resolveSkillFileTarget(
   filePath: string
 ): Promise<string> {
   const shouldUseRuntimeContainment =
-    skillRuntime instanceof RemoteRuntime ||
+    isRemoteRuntime(skillRuntime) ||
     (resolvedSkill.package.scope === "project" && containment.kind === "runtime");
   const { resolvedPath } = shouldUseRuntimeContainment
     ? await resolveContainedSkillFilePathOnRuntime(skillRuntime, resolvedSkill.skillDir, filePath)
