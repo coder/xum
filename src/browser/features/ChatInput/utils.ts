@@ -19,7 +19,6 @@ import {
 } from "@/common/utils/tools/mcpPromptCommandKey";
 import type { ParsedRuntime } from "@/common/types/runtime";
 import type { CoderWorkspaceConfig } from "@/common/orpc/schemas/coder";
-import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
 import {
   buildAgentSkillMetadata,
   dedupeAgentSkillRefs,
@@ -37,8 +36,7 @@ export type CreationRuntimeValidationError =
   | { mode: "ssh"; kind: "missingHost" }
   | { mode: "ssh"; kind: "missingCoderWorkspace" }
   | { mode: "ssh"; kind: "missingCoderTemplate" }
-  | { mode: "ssh"; kind: "missingCoderPreset" }
-  | { mode: "ssh"; kind: "missingDaytonaSandbox" };
+  | { mode: "ssh"; kind: "missingCoderPreset" };
 
 export interface SkillInvocation {
   descriptor: InvocableSkill;
@@ -472,18 +470,6 @@ function validateCoderRuntime(
   return null;
 }
 
-/**
- * A new sandbox needs nothing more (snapshot and size have defaults); attaching (shared)
- * needs the picked sandbox.
- */
-function validateDaytonaRuntime(
-  daytona: DaytonaSandboxConfig
-): CreationRuntimeValidationError | null {
-  return daytona.shared === true && isBlank(daytona.sandboxId)
-    ? { mode: "ssh", kind: "missingDaytonaSandbox" }
-    : null;
-}
-
 export function validateCreationRuntime(
   runtime: ParsedRuntime,
   coderPresetCount: number
@@ -493,7 +479,8 @@ export function validateCreationRuntime(
   }
 
   if (runtime.mode === "ssh") {
-    if (runtime.daytona) return validateDaytonaRuntime(runtime.daytona);
+    // Xum creates the sandbox, and snapshot and size have defaults.
+    if (runtime.daytona) return null;
     if (runtime.coder) return validateCoderRuntime(runtime.coder, coderPresetCount);
     return runtime.host.trim() ? null : { mode: "ssh", kind: "missingHost" };
   }

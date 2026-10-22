@@ -90,7 +90,6 @@ import type {
   CoderWorkspace,
 } from "@/common/orpc/schemas/coder";
 import type {
-  DaytonaListSandboxesResult,
   DaytonaListSnapshotsResult,
   DaytonaPublicConfig,
   DaytonaTestConnectionResult,
@@ -424,7 +423,6 @@ export interface MockORPCClientOptions {
   daytonaConfig?: DaytonaPublicConfig;
   daytonaTestConnectionResult?: DaytonaTestConnectionResult;
   daytonaSnapshotsResult?: DaytonaListSnapshotsResult;
-  daytonaSandboxesResult?: DaytonaListSandboxesResult;
   /** Available agent skills (descriptors) */
   agentSkills?: AgentSkillDescriptor[];
   /** Agent skills that were discovered but couldn't be loaded (SKILL.md parse errors, etc.) */
@@ -598,7 +596,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     },
     daytonaTestConnectionResult = { ok: true },
     daytonaSnapshotsResult = { ok: true, snapshots: [] },
-    daytonaSandboxesResult = { ok: true, sandboxes: [] },
     agentSkills = [],
     invalidAgentSkills = [],
     unavailableAgentSkillSources = [],
@@ -2447,7 +2444,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       testConnection: () => Promise.resolve(daytonaTestConnectionResult),
       listSnapshots: () => Promise.resolve(daytonaSnapshotsResult),
-      listSandboxes: () => Promise.resolve(daytonaSandboxesResult),
     },
     nameGeneration: {
       generate: () => {

@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useState } from "react";
-import { expect, userEvent, within } from "storybook/test";
+import { expect, within } from "storybook/test";
 import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import {
   EMPTY_DAYTONA_RESOURCES,
@@ -18,10 +18,6 @@ const READY_RESOURCES: DaytonaResources = {
     target: null,
   },
   snapshots: ["daytonaio/sandbox:0.4.3", "xum-node-22-with-a-long-snapshot-name"],
-  sandboxes: [
-    { id: "sb-1", name: "shared-build-box", state: "started", cpu: 4, memoryGiB: 8 },
-    { id: "sb-2", name: "nightly-ci", state: "stopped" },
-  ],
 };
 
 const PHONE_VIEWPORT = {
@@ -50,19 +46,13 @@ type Story = StoryObj<typeof meta>;
 function StatefulForm(props: {
   initialConfig: DaytonaSandboxConfig;
   resources: DaytonaResources;
-  allowExisting: boolean;
   /** Phone stories force the width: the test-runner plays at desktop size. */
   width?: number;
 }) {
   const [config, setConfig] = useState(props.initialConfig);
   return (
     <div className="bg-background p-4" style={props.width ? { width: props.width } : undefined}>
-      <DaytonaSandboxForm
-        config={config}
-        onConfigChange={setConfig}
-        resources={props.resources}
-        allowExisting={props.allowExisting}
-      />
+      <DaytonaSandboxForm config={config} onConfigChange={setConfig} resources={props.resources} />
     </div>
   );
 }
@@ -70,7 +60,7 @@ function StatefulForm(props: {
 /** New sandbox: snapshot (Daytona default first) and a size preset, as on workspace creation. */
 export const NewSandbox: Story = {
   globals: { viewport: { value: "desktop", isRotated: false } },
-  render: () => <StatefulForm initialConfig={{}} resources={READY_RESOURCES} allowExisting />,
+  render: () => <StatefulForm initialConfig={{}} resources={READY_RESOURCES} />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(canvas.getByRole("combobox", { name: "Daytona snapshot" })).toHaveTextContent(
@@ -94,30 +84,12 @@ export const NewSandboxPhone: Story = {
         diskGiB: 40,
       }}
       resources={READY_RESOURCES}
-      allowExisting
       width={390}
     />
   ),
   play: async ({ canvasElement }) => {
     const form = within(canvasElement).getByTestId("daytona-sandbox-form");
     await expect(form.scrollWidth).toBeLessThanOrEqual(form.clientWidth);
-  },
-};
-
-/** Existing: picking a sandbox attaches the workspace to it (shared, never deleted by Xum). */
-export const ExistingSandbox: Story = {
-  globals: { viewport: { value: "desktop", isRotated: false } },
-  render: () => <StatefulForm initialConfig={{}} resources={READY_RESOURCES} allowExisting />,
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    await userEvent.click(canvas.getByRole("button", { name: "Existing" }));
-    await userEvent.click(canvas.getByRole("combobox", { name: "Existing Daytona sandbox" }));
-    await userEvent.click(
-      await within(document.body).findByRole("option", { name: /shared-build-box/ })
-    );
-    await expect(
-      canvas.getByRole("combobox", { name: "Existing Daytona sandbox" })
-    ).toHaveTextContent("shared-build-box");
   },
 };
 
@@ -136,7 +108,6 @@ export const NoApiKeyPhone: Story = {
           target: null,
         },
       }}
-      allowExisting
       width={390}
     />
   ),
@@ -158,7 +129,6 @@ export const ListErrors: Story = {
         snapshots: [],
         snapshotsError: "Daytona rejected the API key (401: Invalid credentials)",
       }}
-      allowExisting
     />
   ),
 };

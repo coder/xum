@@ -373,18 +373,18 @@ describe("useDraftWorkspaceSettings", () => {
     );
     await waitFor(() => expect(result.current.daytonaConfigFallback.snapshot).toBe("base"));
 
-    // An existing sandbox picked in this draft, then another runtime.
-    const attached = { sandboxId: "sb-mine", shared: true };
+    // A larger sandbox picked in this draft, then another runtime.
+    const picked = { snapshot: "base", cpu: 4, memoryGiB: 8, diskGiB: 20 };
     act(() => {
-      result.current.setSelectedRuntime({ mode: "ssh", host: "placeholder", daytona: attached });
+      result.current.setSelectedRuntime({ mode: "ssh", host: "placeholder", daytona: picked });
     });
     act(() => {
       result.current.setSelectedRuntime({ mode: "worktree" });
     });
 
     // Switching back to Daytona starts from this fallback.
-    expect(result.current.daytonaConfigFallback).toEqual(attached);
-    // The attached sandbox never becomes a project default.
+    expect(result.current.daytonaConfigFallback).toEqual(picked);
+    // The draft's pick never becomes a project default.
     expect(readDaytonaOptionDefaults(readRuntimeOptionDefaults(projectPath))).toEqual(
       projectDefaults.ssh.daytona
     );

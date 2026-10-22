@@ -179,7 +179,7 @@ function readDraftDaytonaFallback(
   return execution?.lastDaytona ?? readDaytonaOptionDefaults(defaults);
 }
 
-/** Only in the draft: an attached sandbox must never become a project default. */
+/** Only in the draft: Daytona project defaults change only in Settings > Runtimes. */
 function rememberedDaytonaPatch(runtime: ParsedRuntime): { lastDaytona?: DaytonaSandboxConfig } {
   return runtime.mode === RUNTIME_MODE.SSH && runtime.daytona
     ? { lastDaytona: runtime.daytona }

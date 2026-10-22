@@ -1025,7 +1025,6 @@ function CreationControlsContent(props: CreationControlsProps) {
                 })
               }
               disabled={props.disabled}
-              hasError={props.runtimeFieldError === "ssh"}
             />
           </div>
         )}

@@ -40,14 +40,11 @@ describe("useDaytonaResources", () => {
       daytona: {
         getConfig,
         listSnapshots: () => Promise.resolve({ ok: true as const, snapshots: [{ name: "base" }] }),
-        listSandboxes: () => Promise.resolve({ ok: true as const, sandboxes: [] }),
       },
     });
     const wrapper = (props: { children: ReactNode }) =>
       createElement(APIProvider, { client } as ComponentProps<typeof APIProvider>, props.children);
-    const { result } = renderHook(() => useDaytonaResources({ loadSandboxes: true }), {
-      wrapper,
-    });
+    const { result } = renderHook(() => useDaytonaResources(), { wrapper });
     await waitFor(() => expect(result.current.config?.apiKeySet).toBe(false));
     expect(result.current.snapshots).toEqual([]);
 
@@ -74,13 +71,10 @@ describe("useDaytonaResources", () => {
             target: null,
           }),
         listSnapshots: () => whenLive({ ok: true as const, snapshots: [{ name: "base" }] }),
-        listSandboxes: () => whenLive({ ok: true as const, sandboxes: [] }),
       },
     });
     const connection = createKeptClientConnection(client);
-    const { result } = renderHook(() => useDaytonaResources({ loadSandboxes: true }), {
-      wrapper: connection.Wrapper,
-    });
+    const { result } = renderHook(() => useDaytonaResources(), { wrapper: connection.Wrapper });
     // A reconnect gap is not a Daytona error: the form waits instead of reporting one.
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -95,7 +89,7 @@ describe("useDaytonaResources", () => {
     expect(result.current.configError).toBeNull();
   });
 
-  // Kept, the old account's config would keep the form ready with its snapshots and sandboxes.
+  // Kept, the old account's config would keep the form ready with its snapshots.
   test("drops what the previous load found when a reload cannot read the config", async () => {
     let failing = false;
     const client = createTestApiClient({
@@ -110,20 +104,12 @@ describe("useDaytonaResources", () => {
                 target: null,
               }),
         listSnapshots: () => Promise.resolve({ ok: true as const, snapshots: [{ name: "base" }] }),
-        listSandboxes: () =>
-          Promise.resolve({
-            ok: true as const,
-            sandboxes: [{ id: "sb-old", name: "old", state: "started", labels: {} }],
-          }),
       },
     });
     const wrapper = (props: { children: ReactNode }) =>
       createElement(APIProvider, { client } as ComponentProps<typeof APIProvider>, props.children);
-    const { result } = renderHook(() => useDaytonaResources({ loadSandboxes: true }), {
-      wrapper,
-    });
-    await waitFor(() => expect(result.current.sandboxes).toHaveLength(1));
-    expect(result.current.snapshots).toEqual(["base"]);
+    const { result } = renderHook(() => useDaytonaResources(), { wrapper });
+    await waitFor(() => expect(result.current.snapshots).toEqual(["base"]));
 
     failing = true;
     act(() => {
@@ -133,13 +119,11 @@ describe("useDaytonaResources", () => {
     await waitFor(() => expect(result.current.configError).toBe("backend unreachable"));
     expect(result.current.config).toBeNull();
     expect(result.current.snapshots).toEqual([]);
-    expect(result.current.sandboxes).toEqual([]);
     const form = render(
       createElement(DaytonaSandboxForm, {
         config: {},
         onConfigChange: () => undefined,
         resources: result.current,
-        allowExisting: true,
       })
     );
     expect(form.getByRole("alert").textContent).toContain("backend unreachable");

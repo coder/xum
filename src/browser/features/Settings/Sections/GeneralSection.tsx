@@ -1152,9 +1152,8 @@ export function GeneralSection() {
             <div className="flex-1">
               <div className="text-foreground text-sm">Remote box on archive</div>
               <div className="text-muted text-xs">
-                Action to take on dedicated Coder workspaces and Daytona sandboxes when archiving a
-                chat. Delete is permanent; a Daytona sandbox with uncommitted or unpushed work is
-                stopped instead.
+                Action to take on dedicated Coder workspaces when archiving a chat. Delete is
+                permanent. Archiving a Daytona chat always deletes the sandbox it created.
               </div>
             </div>
             <Select

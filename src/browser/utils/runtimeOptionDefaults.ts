@@ -176,8 +176,8 @@ export function writeSshCoderDefaultsPreservingMode(
 
 /**
  * Project Daytona defaults (snapshot and size preset), set in Settings > Runtimes and used to
- * prefill new Daytona workspaces. Only the creation-time fields: an id or shared flag would
- * attach every new workspace to one sandbox.
+ * prefill new Daytona workspaces. Only the creation-time fields: a sandbox id would point
+ * every new workspace at one sandbox.
  */
 export function readDaytonaOptionDefaults(defaults: RuntimeOptionDefaults): DaytonaSandboxConfig {
   const parsed = DaytonaSandboxConfigSchema.safeParse(
