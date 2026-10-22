@@ -74,6 +74,12 @@ export function summary(report: MutateReport | null, coverage: boolean, toolErro
       `More unit tests import ${sources} than the run uses: only the nearest ran, so a survivor there can be a mutant that a skipped test kills.`
     );
   }
+  for (const row of report.mutants.filter((r) => r.outcome === "error")) {
+    lines.push(
+      "",
+      `Error at \`${cell(row.path)}:${row.line}\` (\`${cell(describe(row))}\`): ${cell(row.reason ?? "unknown")}.`
+    );
+  }
   for (const dropped of report.droppedTests) {
     lines.push("", `Dropped \`${cell(dropped.path)}\`: ${dropped.reason}.`);
   }

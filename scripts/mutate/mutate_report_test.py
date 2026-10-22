@@ -205,3 +205,12 @@ def test_zero_workers_is_a_usage_error(tmp_path):
     with pytest.raises(SystemExit) as stop:
         main(["--root", str(tmp_path), "--changes", "c.json", "--lane", "l.txt", "--workers", "0"])
     assert stop.value.code == 2
+
+
+def test_windows_is_a_tool_error_before_any_work(tmp_path, monkeypatch):
+    # Process groups (os.killpg) and the bash helpers are POSIX-only.
+    import mutate_report
+
+    monkeypatch.setattr(mutate_report.os, "name", "nt")
+    missing = str(tmp_path / "missing.json")  # never read
+    assert mutate_report.main(["--root", str(tmp_path), "--changes", missing, "--lane", missing]) == 2
