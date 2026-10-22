@@ -246,6 +246,11 @@ function gitUrlHost(url: string): string | undefined {
   return /^(?:[^@/]+@)?(\[[^\]]+\]|[^:/]+):/.exec(url)?.[1];
 }
 
+// 127.0.0.0/8, and its IPv4-mapped IPv6 form after WHATWG normalization (::ffff:7f00:1).
+const LOOPBACK_ADDRESS_PATTERN = /^(?:127\.|::ffff:7f)/;
+// 0.0.0.0 and :: reach this machine on Linux and macOS.
+const LOOPBACK_ADDRESSES = new Set(["0.0.0.0", "::1", "::", "::ffff:0:0"]);
+
 /** localhost, 127.0.0.0/8, 0.0.0.0 and the IPv6 loopback, in any spelling git accepts. */
 function isLoopbackHost(rawHost: string): boolean {
   const host = rawHost
@@ -261,14 +266,7 @@ function isLoopbackHost(rawHost: string): boolean {
     return false;
   }
   normalized = normalized.replace(/^\[|\]$/g, "");
-  return (
-    normalized.startsWith("127.") ||
-    normalized === "0.0.0.0" ||
-    normalized === "::1" ||
-    normalized === "::" ||
-    normalized.startsWith("::ffff:7f") ||
-    normalized === "::ffff:0:0"
-  );
+  return LOOPBACK_ADDRESS_PATTERN.test(normalized) || LOOPBACK_ADDRESSES.has(normalized);
 }
 
 /**
