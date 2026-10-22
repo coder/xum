@@ -24,6 +24,8 @@ export interface MemoryHotSetCandidate {
   pinned: boolean;
   accessCount: number;
   lastAccessedAt: number | null;
+  /** Sidecar provenance (MemoryMetaEntry.carriesProjectSkillContent). */
+  carriesProjectSkillContent?: boolean;
 }
 
 export interface MemoryHotSetItem {
@@ -33,6 +35,8 @@ export interface MemoryHotSetItem {
   /** True when content was cut to the per-item byte budget. */
   truncated: boolean;
   content: string;
+  /** Sidecar provenance carried through selection (see MemoryMetaEntry). */
+  carriesProjectSkillContent?: boolean;
 }
 
 /**
@@ -138,7 +142,13 @@ export async function selectHotMemories(args: {
     // Binary data is useless as prompt context; leave it to cold tool reads.
     if (content.includes("\u0000")) continue;
     const { text, truncated } = truncateToBytes(content, maxItemBytes);
-    const item = { path: candidate.path, pinned: candidate.pinned, truncated, content: text };
+    const item = {
+      path: candidate.path,
+      pinned: candidate.pinned,
+      truncated,
+      content: text,
+      carriesProjectSkillContent: candidate.carriesProjectSkillContent === true,
+    };
     // The budget applies to the exact injected <hot_memories> block, so
     // wrapper and truncation-marker overhead cannot exceed it near the boundary.
     if (

@@ -28,6 +28,8 @@ export interface CachedMemoryContext {
   includesHotMemories: boolean;
   memoryEnabled: boolean;
   hotSetEnabled: boolean;
+  /** Built for a routed turn without Project Trust: memories with project skill provenance withheld. */
+  excludesProjectSkillContent: boolean;
 }
 
 const CachedMemoryContextSchema = z.object({
@@ -35,11 +37,15 @@ const CachedMemoryContextSchema = z.object({
     .object({
       indexEntries: z.array(z.object({ path: z.string(), description: z.string() })),
       hotMemoriesBlock: z.string().nullable(),
+      // Provenance survives a restart: a routed turn's consent gate arms on it.
+      carriesProjectSkillContent: z.boolean().optional(),
     })
     .nullable(),
   includesHotMemories: z.boolean(),
   memoryEnabled: z.boolean(),
   hotSetEnabled: z.boolean(),
+  // Files written before the field existed were built without exclusion.
+  excludesProjectSkillContent: z.boolean().default(false),
 });
 
 const MemoryContextFileSchema = z.object({
@@ -62,6 +68,7 @@ function toFile(
       includesHotMemories: cached.includesHotMemories,
       memoryEnabled: cached.memoryEnabled,
       hotSetEnabled: cached.hotSetEnabled,
+      excludesProjectSkillContent: cached.excludesProjectSkillContent,
       context:
         cached.context == null
           ? null
@@ -71,6 +78,9 @@ function toFile(
                 description: entry.description,
               })),
               hotMemoriesBlock: cached.context.hotMemoriesBlock,
+              ...(cached.context.carriesProjectSkillContent === true
+                ? { carriesProjectSkillContent: true }
+                : {}),
             },
     };
   }

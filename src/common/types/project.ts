@@ -144,6 +144,19 @@ export interface ProjectsConfig {
   /** Difficulty tiers for the auto-model-routing experiment; always normalized on load. */
   autoModelRouting?: AutoModelRoutingConfig;
 
+  /**
+   * Named model classes (e.g. large/medium/small → a model alias or
+   * "provider:model" id with an optional "+thinking" suffix, one-shot syntax).
+   * Indirection layer so bindings survive model churn; consumed by per-skill
+   * model routing.
+   */
+  modelClasses?: Record<string, string>;
+  /**
+   * Per-skill routing table (skill name → class name in modelClasses). Wins
+   * over a skill's own frontmatter metadata "model-class" binding.
+   */
+  skillModelClasses?: Record<string, string>;
+
   /** Default model used for new workspaces (shared via ~/.xum/config.json). */
   defaultModel?: string;
   /** Hidden model IDs (shared via ~/.xum/config.json). */

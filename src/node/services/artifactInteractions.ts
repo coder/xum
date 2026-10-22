@@ -205,7 +205,7 @@ export interface ArtifactInteractionDeps {
     message: string,
     options: SendMessageOptions,
     internal?: SendMessageInternalOptions
-  ): Promise<Result<void, unknown>>;
+  ): Promise<Result<unknown, unknown>>;
   getDefaultSendOptions(workspaceId: string): Promise<SendMessageOptions>;
   getLastMessages(workspaceId: string, n: number): Promise<MuxMessage[]>;
   now?: () => number;

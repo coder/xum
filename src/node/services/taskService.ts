@@ -1,3 +1,4 @@
+import { messagesCarryProjectSkillContent } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { ServiceTierSchema, type ServiceTier } from "@/common/config/schemas/providersConfig";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { randomUUID } from "node:crypto";
@@ -314,7 +315,7 @@ import {
 import { secretsToRecord } from "@/common/types/secrets";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibility";
-import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
+import type { SendMessageAccepted, SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { StartupRecoveryState } from "@/node/services/startupRecovery";
@@ -588,7 +589,7 @@ export interface TaskCreateResult {
  * prepends a kept taskPrompt only while no history row does.
  */
 type TaskLaunchStart =
-  | { kind: "sendMessage"; prompt: string; sendId: string }
+  | { kind: "sendMessage"; prompt: string; sendId: string; carriesProjectSkillContent?: boolean }
   | { kind: "resumeStream" };
 
 /**
@@ -616,6 +617,11 @@ export interface AgentTaskReport {
   planFilePath?: string;
   model?: string;
   thinkingLevel?: ThinkingLevel;
+  /**
+   * The child's context carried project skill content when it reported
+   * (a legacy persisted report of unknown provenance reads as carrying).
+   */
+  carriesProjectSkillContent?: boolean;
 }
 
 /**
@@ -1072,6 +1078,8 @@ export type SendAgentTreeMessageError = SendAgentTaskMessageError | AgentPeerMes
 interface TrustedDescendantMessageOptions {
   messageLabel?: string;
   preTurnMessages?: MuxMessage[];
+  /** The sender's context carried project skill content: stamped on the target's row(s). */
+  carriesProjectSkillContent?: boolean;
 }
 
 type TreeMessageSpec =
@@ -1082,6 +1090,7 @@ type TreeMessageSpec =
       message: string;
       queueDispatchMode: TaskMessageQueueDispatchMode;
       options?: TrustedDescendantMessageOptions;
+      carriesProjectSkillContent?: boolean;
     }
   | {
       relation: "peer";
@@ -1090,6 +1099,8 @@ type TreeMessageSpec =
       message: string;
       targetRelation: Exclude<AgentTreeTargetRelation, "target_descendant">;
       queueDispatchMode?: TaskMessageQueueDispatchMode;
+      /** The sender's context carried project skill content: stamped on the payload and trigger rows. */
+      carriesProjectSkillContent?: boolean;
       /** Set on the retry of a message that waited for a delegated turn (#4997). */
       awaitedDelegatedTurn?: PeerDelegatedTurnWait;
     }
@@ -1098,6 +1109,7 @@ type TreeMessageSpec =
       senderWorkspaceId: string;
       message: string;
       queueDispatchMode: TaskMessageQueueDispatchMode;
+      carriesProjectSkillContent?: boolean;
     }
   | {
       relation: "sibling-family";
@@ -1105,6 +1117,7 @@ type TreeMessageSpec =
       targetId: string;
       message: string;
       queueDispatchMode: TaskMessageQueueDispatchMode;
+      carriesProjectSkillContent?: boolean;
     };
 
 type TreeMessagePipelineResult =
@@ -1206,6 +1219,13 @@ export interface DescendantAgentTaskInfo {
   modelString?: string;
   thinkingLevel?: ThinkingLevel;
   bestOf?: WorkspaceMetadata["bestOf"];
+  /**
+   * The task's prompt or title was authored from a context carrying project
+   * skill content (WorkspaceConfigEntry.taskCarriesProjectSkillContent):
+   * task_list withholds the title from a turn that excludes such content and
+   * stamps its result otherwise.
+   */
+  carriesProjectSkillContent?: boolean;
   depth: number;
 }
 
@@ -1600,6 +1620,8 @@ interface PendingTaskStartWaiter {
 
 interface CompletedAgentReportCacheEntry {
   reportMarkdown: string;
+  /** Report provenance (see SubagentReportArtifactIndexEntry.carriesProjectSkillContent). */
+  carriesProjectSkillContent?: boolean;
   planFilePath?: string;
   structuredOutput?: unknown;
   title?: string;
@@ -6047,7 +6069,8 @@ export class TaskService implements AgentTaskIntegration {
         ).data,
       };
       if (pendingGuidance.length > 0) {
-        let sendResult: Result<void, SendMessageError> = Ok(undefined);
+        // sendMessage reports the accepted-send payload (routing, queued); only success matters here.
+        let sendResult: Result<SendMessageAccepted | undefined, SendMessageError> = Ok(undefined);
         for (const guidance of pendingGuidance) {
           const token = fenceStartupSend();
           if (token == null) {
@@ -7108,7 +7131,14 @@ export class TaskService implements AgentTaskIntegration {
         parentMeta: plan.parentMeta,
         agentId: plan.agentId,
         agentType: plan.agentId,
-        start: { kind: "sendMessage", prompt: plan.prompt, sendId: mintTaskBriefSendId() },
+        start: {
+          kind: "sendMessage",
+          prompt: plan.prompt,
+          sendId: mintTaskBriefSendId(),
+          ...(plan.args.carriesProjectSkillContent === true
+            ? { carriesProjectSkillContent: true }
+            : {}),
+        },
         title: plan.args.title,
         workspaceName,
         createdAt,
@@ -7421,6 +7451,9 @@ export class TaskService implements AgentTaskIntegration {
           taskLaunchError: canceledInsideCommit ? TASK_RESERVATION_CANCELED_MESSAGE : undefined,
           taskAttemptId: plan.attemptId,
           taskPrompt: plan.start.kind === "sendMessage" ? plan.start.prompt : undefined,
+          ...(plan.start.kind === "sendMessage" && plan.start.carriesProjectSkillContent === true
+            ? { taskCarriesProjectSkillContent: true }
+            : {}),
           // A queued row's id is replaced by its launch's own (maybeStartQueuedTasks).
           taskPromptSendId: plan.start.kind === "sendMessage" ? plan.start.sendId : undefined,
           taskTrunkBranch: trunkBranch,
@@ -8523,6 +8556,9 @@ export class TaskService implements AgentTaskIntegration {
             acceptanceOrigin: "automatic",
             allowQueuedAgentTask: true,
             agentInitiated: true,
+            ...(plan.start.carriesProjectSkillContent === true
+              ? { userRowCarriesProjectSkillContent: true }
+              : {}),
             turnAdmission: admission.token,
             admissionStale: () => admission.token.admissionStale(),
             // The row that accepts the brief carries its id: only that row, never this
@@ -8991,6 +9027,11 @@ export class TaskService implements AgentTaskIntegration {
               // Never admitted: the queue drain's launch CAS rotates it and takes ownership.
               taskAttemptId: newTaskAttemptId(),
               taskPrompt: prompt,
+              // The launch context's provenance survives the queue with the
+              // prompt: the deferred start stamps the opening row from it.
+              ...(args.carriesProjectSkillContent === true
+                ? { taskCarriesProjectSkillContent: true }
+                : {}),
               taskTrunkBranch: trunkBranch,
               taskModelString,
               taskThinkingLevel: effectiveThinkingLevel,
@@ -9347,6 +9388,11 @@ export class TaskService implements AgentTaskIntegration {
           workflowTask: args.workflowTask,
           bestOf: normalizedBestOf,
           taskStatus: "running",
+          // The launch context's provenance covers the title too (authored
+          // alongside the prompt): task_list withholds or stamps it.
+          ...(args.carriesProjectSkillContent === true
+            ? { taskCarriesProjectSkillContent: true }
+            : {}),
           // Direct (unqueued) launch: this write is the admission, so it stamps the attempt id the
           // send below is fenced against (WorkspaceService binds the obligation at handoff).
           taskAttemptId: attemptId,
@@ -9496,6 +9542,11 @@ export class TaskService implements AgentTaskIntegration {
               {
                 acceptanceOrigin: "automatic",
                 agentInitiated: true,
+                // The opening row carries the launch context's provenance like a group
+                // launch's does.
+                ...(args.carriesProjectSkillContent === true
+                  ? { userRowCarriesProjectSkillContent: true }
+                  : {}),
                 turnAdmission: admission.token,
                 admissionStale: () => admission.token.admissionStale(),
               }
@@ -9525,7 +9576,14 @@ export class TaskService implements AgentTaskIntegration {
   async retitleDescendantAgentTask(
     ancestorWorkspaceId: string,
     taskId: string,
-    title: string
+    title: string,
+    options?: {
+      /**
+       * The retitling context carried project skill content: the title is
+       * repository-derived text, so the task is stamped (sticky) for task_list.
+       */
+      carriesProjectSkillContent?: boolean;
+    }
   ): Promise<Result<RetitleAgentTaskResult, RetitleAgentTaskError>> {
     assert(ancestorWorkspaceId.length > 0, "retitleDescendantAgentTask: ancestor ID is required");
     assert(taskId.length > 0, "retitleDescendantAgentTask: task ID is required");
@@ -9547,6 +9605,19 @@ export class TaskService implements AgentTaskIntegration {
         return Err({ code: "invalid_scope" as const });
       }
 
+      // Provenance is committed AHEAD of the title (like a memory write's
+      // taint ahead of its content): a repository-derived title must never be
+      // readable with a clean marker, so a failed stamp refuses the retitle,
+      // while a stamp whose title write then fails only over-approximates.
+      if (options?.carriesProjectSkillContent === true) {
+        try {
+          await this.editWorkspaceEntry(taskId, (workspace) => {
+            workspace.taskCarriesProjectSkillContent = true;
+          });
+        } catch (error) {
+          return Err({ code: "update_failed" as const, message: getErrorMessage(error) });
+        }
+      }
       const result = await this.workspaceService.updateTitle(taskId, trimmedTitle);
       if (!result.success) {
         return Err({ code: "update_failed" as const, message: result.error });
@@ -10245,6 +10316,11 @@ export class TaskService implements AgentTaskIntegration {
             // Live target: pre-turn rows ride the send through AgentSession
             // turn admission (queued with the trigger when the target is busy).
             preTurnMessages: options?.preTurnMessages,
+            // The sender's context carried project skill content: the target's
+            // row starts its provenance tracking tainted.
+            ...(options?.carriesProjectSkillContent === true
+              ? { userRowCarriesProjectSkillContent: true }
+              : {}),
             // If the replacement turn cannot start, remove the settlement reservation and restore
             // an idle child to completion recovery instead of leaving it permanently running.
             onAcceptedPreStreamFailure: (error) =>
@@ -10344,7 +10420,15 @@ export class TaskService implements AgentTaskIntegration {
     senderWorkspaceId: string,
     targetId: string,
     message: string,
-    queueDispatchMode: TaskMessageQueueDispatchMode = "tool-end"
+    queueDispatchMode: TaskMessageQueueDispatchMode = "tool-end",
+    options?: {
+      /**
+       * The sender's context carries project skill content (request rows under
+       * trust or a live read): the delivered rows are stamped so the target's
+       * provenance tracking inherits it.
+       */
+      carriesProjectSkillContent?: boolean;
+    }
   ): Promise<
     Result<
       SendAgentTaskMessageResult & { relation: AgentTreeTargetRelation },
@@ -10379,6 +10463,9 @@ export class TaskService implements AgentTaskIntegration {
         targetId,
         message,
         queueDispatchMode,
+        ...(options?.carriesProjectSkillContent === true
+          ? { carriesProjectSkillContent: true }
+          : {}),
       });
       return result.success ? Ok({ ...result.data, relation }) : result;
     }
@@ -10390,6 +10477,7 @@ export class TaskService implements AgentTaskIntegration {
       message,
       targetRelation: relation,
       queueDispatchMode,
+      ...(options?.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
     });
   }
 
@@ -10511,6 +10599,9 @@ export class TaskService implements AgentTaskIntegration {
           synthetic: true,
           uiVisible: true,
           muxMetadata: { type: "family-message" },
+          // Sender context provenance rides the payload row (withheld whole by
+          // an untrusted routed request) and the trigger row below.
+          ...(spec.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
         }
       );
       if (spec.relation === "parent-family") {
@@ -10523,6 +10614,9 @@ export class TaskService implements AgentTaskIntegration {
           queueDispatchMode: spec.queueDispatchMode,
           resolveRecipientHold: true,
           preTurnMessages: [payloadRow],
+          ...(spec.carriesProjectSkillContent === true
+            ? { userRowCarriesProjectSkillContent: true }
+            : {}),
         });
         if (!wakeResult.success) {
           return Err({ code: "send_failed" as const, message: wakeResult.error });
@@ -10546,6 +10640,7 @@ export class TaskService implements AgentTaskIntegration {
         {
           messageLabel: triggerLabel,
           preTurnMessages: [payloadRow],
+          ...(spec.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
         }
       );
       if (sendResult.success) {
@@ -10636,7 +10731,9 @@ export class TaskService implements AgentTaskIntegration {
         message,
         spec.queueDispatchMode,
         "ancestor",
-        spec.options
+        spec.carriesProjectSkillContent === true
+          ? { ...spec.options, carriesProjectSkillContent: true }
+          : spec.options
       );
     }
 
@@ -11111,6 +11208,10 @@ export class TaskService implements AgentTaskIntegration {
         synthetic: true,
         uiVisible: true,
         muxMetadata,
+        // Sender context provenance: the envelope can restate project skill
+        // content the sender's turn read, so the row is stamped (withheld
+        // whole by an untrusted routed request) like the trigger row below.
+        ...(spec.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
       });
 
       // Admission staleness probe: neither interruptStream nor stopDescendantAgentTask takes
@@ -11341,6 +11442,9 @@ export class TaskService implements AgentTaskIntegration {
         removableQueueDedupeKey: true,
         workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
         preTurnMessages: [payloadRow],
+        ...(spec.carriesProjectSkillContent === true
+          ? { userRowCarriesProjectSkillContent: true }
+          : {}),
         onAccepted: () => {
           accepted = true;
         },
@@ -13338,6 +13442,14 @@ export class TaskService implements AgentTaskIntegration {
           timestamp,
           synthetic: true,
           uiVisible: true,
+          // Same provenance stamp as the live delivery path.
+          ...(report != null
+            ? {
+                carriesProjectSkillContent: await this.reportCarriesProjectSkillContent(
+                  notification.sourceId
+                ),
+              }
+            : {}),
           ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
         }
       );
@@ -14222,7 +14334,14 @@ export class TaskService implements AgentTaskIntegration {
   async reportAgentProgress(
     childWorkspaceId: string,
     toolCallId: string,
-    report: { reportMarkdown: string; title?: string; structuredOutput?: unknown }
+    report: { reportMarkdown: string; title?: string; structuredOutput?: unknown },
+    options?: {
+      /**
+       * The child's live per-stream provenance at the call: a project skill
+       * read earlier in the SAME stream is not in its committed history yet.
+       */
+      carriesProjectSkillContent?: boolean;
+    }
   ): Promise<void> {
     assert(childWorkspaceId.length > 0, "reportAgentProgress requires childWorkspaceId");
     assert(toolCallId.length > 0, "reportAgentProgress requires toolCallId");
@@ -14347,6 +14466,12 @@ export class TaskService implements AgentTaskIntegration {
         parentWorkspaceId,
         parentEntry,
         content: reportContent,
+        // The update is distilled from the child's context: the wake row carries
+        // its provenance like the terminal report row does. The caller's live
+        // verdict covers the current stream; the scan, the child's history.
+        userRowCarriesProjectSkillContent:
+          options?.carriesProjectSkillContent === true ||
+          (await this.reportCarriesProjectSkillContent(childWorkspaceId)),
         queueDedupeKey: `${dedupePrefix}${toolCallId}`,
         // Reports are agent messages too (#4737): a parent that holds agent messages until its
         // turn ends gets this update at turn end instead of being cut at the next step.
@@ -14414,6 +14539,8 @@ export class TaskService implements AgentTaskIntegration {
     resolveRecipientHold?: boolean;
     /** Synthetic assistant rows persisted just before the wake's user row (family payloads). */
     preTurnMessages?: MuxMessage[];
+    /** Stamp the wake's user row as carrying project skill content (source context provenance). */
+    userRowCarriesProjectSkillContent?: boolean;
     /** Invoked once the wake turn is durably accepted. */
     onAccepted?: () => void;
   }): Promise<Result<void, string>> {
@@ -14489,6 +14616,9 @@ export class TaskService implements AgentTaskIntegration {
         agentInitiated: true,
         startStreamInBackground: true,
         workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
+        ...(params.userRowCarriesProjectSkillContent === true
+          ? { userRowCarriesProjectSkillContent: true }
+          : {}),
         ...(params.resolveRecipientHold === true ? { honorRecipientHold: true } : {}),
         ...(params.preTurnMessages != null ? { preTurnMessages: params.preTurnMessages } : {}),
         ...(params.onAccepted != null ? { onAccepted: params.onAccepted } : {}),
@@ -14539,7 +14669,11 @@ export class TaskService implements AgentTaskIntegration {
   async sendMessageToParentFromAgentTask(
     childWorkspaceId: string,
     message: string,
-    queueDispatchMode: TaskMessageQueueDispatchMode
+    queueDispatchMode: TaskMessageQueueDispatchMode,
+    options?: {
+      /** The sender's context carried project skill content: stamped on the target rows. */
+      carriesProjectSkillContent?: boolean;
+    }
   ): Promise<Result<SendParentAgentMessageResult, SendParentAgentMessageError>> {
     assert(
       childWorkspaceId.length > 0,
@@ -14550,6 +14684,7 @@ export class TaskService implements AgentTaskIntegration {
       senderWorkspaceId: childWorkspaceId,
       message,
       queueDispatchMode,
+      ...(options?.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
     });
   }
 
@@ -14566,7 +14701,11 @@ export class TaskService implements AgentTaskIntegration {
     senderWorkspaceId: string,
     targetTaskId: string,
     message: string,
-    queueDispatchMode: TaskMessageQueueDispatchMode
+    queueDispatchMode: TaskMessageQueueDispatchMode,
+    options?: {
+      /** The sender's context carried project skill content: stamped on the target rows. */
+      carriesProjectSkillContent?: boolean;
+    }
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     assert(
       senderWorkspaceId.length > 0,
@@ -14582,6 +14721,7 @@ export class TaskService implements AgentTaskIntegration {
       targetId: targetTaskId,
       message,
       queueDispatchMode,
+      ...(options?.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
     });
   }
 
@@ -14810,6 +14950,7 @@ export class TaskService implements AgentTaskIntegration {
         structuredOutput: cached.structuredOutput,
         model: cached.model,
         thinkingLevel: cached.thinkingLevel,
+        carriesProjectSkillContent: cached.carriesProjectSkillContent,
       };
     }
 
@@ -15877,6 +16018,9 @@ export class TaskService implements AgentTaskIntegration {
           modelString: entry.aiSettings?.model,
           thinkingLevel: entry.aiSettings?.thinkingLevel,
           ...(entry.bestOf != null ? { bestOf: { ...entry.bestOf } } : {}),
+          ...(entry.taskCarriesProjectSkillContent === true
+            ? { carriesProjectSkillContent: true }
+            : {}),
           depth: next.depth,
         });
       }
@@ -17182,7 +17326,14 @@ export class TaskService implements AgentTaskIntegration {
 
         const queuedPrompt = coerceNonEmptyString(task.taskPrompt);
         const start: TaskLaunchStart = queuedPrompt
-          ? { kind: "sendMessage", prompt: queuedPrompt, sendId: mintTaskBriefSendId() }
+          ? {
+              kind: "sendMessage",
+              prompt: queuedPrompt,
+              sendId: mintTaskBriefSendId(),
+              ...(task.taskCarriesProjectSkillContent === true
+                ? { carriesProjectSkillContent: true }
+                : {}),
+            }
           : { kind: "resumeStream" };
         if (start.kind === "resumeStream") {
           // Older queued task records stored the initial prompt only in chat history.
@@ -21093,8 +21244,13 @@ export class TaskService implements AgentTaskIntegration {
       reportArgs
     );
 
+    // Same classification the persisted artifact received (the child's
+    // history still exists at this point); the kernel event below shares it.
+    const reportCarriesProjectSkillContent =
+      await this.reportCarriesProjectSkillContent(childWorkspaceId);
     const hadForegroundWaiters = this.resolveWaiters(childWorkspaceId, {
       ...reportArgs,
+      carriesProjectSkillContent: reportCarriesProjectSkillContent,
       model: latestChildEntry?.workspace.taskModelString,
       thinkingLevel: latestChildEntry?.workspace.taskThinkingLevel,
     });
@@ -21113,6 +21269,10 @@ export class TaskService implements AgentTaskIntegration {
           taskId: childWorkspaceId,
           status: "completed",
           reportMarkdown: reportArgs.reportMarkdown,
+          // The queue is another channel for the report: the verdict rides the
+          // event so a drain by a turn that excludes project skill content is
+          // withheld and a trusted drain taints the kernel (SandboxMount).
+          carriesProjectSkillContent: reportCarriesProjectSkillContent,
         })
         .catch((error: unknown) => {
           log.warn("Failed to post task terminal event to sandbox mount", {
@@ -21347,6 +21507,14 @@ export class TaskService implements AgentTaskIntegration {
 
     const isWorkflowOwnedChildReport = latestChildEntry?.workspace.workflowTask != null;
 
+    // Report provenance, classified once from the child's context while its
+    // history still exists (the workspace may be cleaned up before a later
+    // task_await refetch): persisted with every artifact copy and handed to
+    // foreground waiters, so task / task_await results can stamp or withhold
+    // the report like the parent-row delivery does.
+    const reportCarriesProjectSkillContent =
+      await this.reportCarriesProjectSkillContent(childWorkspaceId);
+
     const indexAfterReport = this.buildAgentTaskIndex(cfgAfterReport);
     const ancestorWorkspaceIds = this.listAncestorWorkspaceIdsUsingParentById(
       indexAfterReport.parentById,
@@ -21381,6 +21549,7 @@ export class TaskService implements AgentTaskIntegration {
           title: reportArgs.title,
           planFilePath: reportArgs.planFilePath,
           structuredOutput: reportArgs.structuredOutput,
+          carriesProjectSkillContent: reportCarriesProjectSkillContent,
           nowMs: persistedAtMs,
           taskAttemptId: reportedAttemptId,
         });
@@ -21437,6 +21606,7 @@ export class TaskService implements AgentTaskIntegration {
     title?: string;
     model?: string;
     thinkingLevel?: ThinkingLevel;
+    carriesProjectSkillContent?: boolean;
   } | null> {
     if (!requestingWorkspaceId) {
       return null;
@@ -21459,6 +21629,8 @@ export class TaskService implements AgentTaskIntegration {
     // Cache for the current process (best-effort). Disk is the source of truth.
     this.completedReportsByTaskId.set(taskId, {
       reportMarkdown: artifact.reportMarkdown,
+      // A legacy artifact has no provenance: unknown, treated as carrying.
+      carriesProjectSkillContent: artifact.carriesProjectSkillContent ?? true,
       title: artifact.title,
       planFilePath: artifact.planFilePath,
       structuredOutput: artifact.structuredOutput,
@@ -21496,6 +21668,7 @@ export class TaskService implements AgentTaskIntegration {
       structuredOutput: artifact.structuredOutput,
       model: artifact.model,
       thinkingLevel: artifact.thinkingLevel,
+      carriesProjectSkillContent: artifact.carriesProjectSkillContent ?? true,
     };
   }
   /**
@@ -21567,6 +21740,7 @@ export class TaskService implements AgentTaskIntegration {
       planFilePath?: string;
       model?: string;
       thinkingLevel?: ThinkingLevel;
+      carriesProjectSkillContent?: boolean;
     }
   ): boolean {
     this.markTaskForegroundRelevant(taskId);
@@ -21586,6 +21760,7 @@ export class TaskService implements AgentTaskIntegration {
 
     this.completedReportsByTaskId.set(taskId, {
       reportMarkdown: report.reportMarkdown,
+      carriesProjectSkillContent: report.carriesProjectSkillContent,
       title: report.title,
       planFilePath: report.planFilePath,
       structuredOutput: report.structuredOutput,
@@ -22267,6 +22442,9 @@ export class TaskService implements AgentTaskIntegration {
       timestamp: Date.now(),
       synthetic: true,
       uiVisible: true,
+      // The child's report can restate project skill content its own context
+      // carried; the parent's routed requests withhold it after a revocation.
+      carriesProjectSkillContent: await this.reportCarriesProjectSkillContent(childWorkspaceId),
       ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     });
 
@@ -22288,6 +22466,27 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     return [];
+  }
+
+  /**
+   * Provenance of a child's report: its whole active context is what the
+   * report distills, so any project skill content there taints the report;
+   * an unreadable child history reads as carrying (fail closed). The child's
+   * open partial counts too: a progress update is sent while its row is still
+   * open, and stream-end settlement runs concurrently with the session's
+   * commit of the ended stream's row.
+   */
+  private async reportCarriesProjectSkillContent(childWorkspaceId: string): Promise<boolean> {
+    const childHistory = await this.historyService.getHistoryFromLatestBoundary(childWorkspaceId);
+    if (!childHistory.success || messagesCarryProjectSkillContent(childHistory.data)) return true;
+    try {
+      const partial = await this.historyService.readPartial(childWorkspaceId, {
+        throwOnError: true,
+      });
+      return partial !== null && messagesCarryProjectSkillContent([partial]);
+    } catch {
+      return true;
+    }
   }
 
   private async tryFinalizePendingTaskToolCallInPartial(

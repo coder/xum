@@ -3,6 +3,12 @@ import { tool } from "ai";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { readSubagentGitPatchArtifact } from "@/node/services/subagentGitPatchArtifacts";
+import { toolExcludesProjectSkillContent } from "@/node/services/tools/projectSkillContentGate";
+import {
+  applyTaskReportProvenance,
+  taskReportWithheld,
+  workspaceHistoryCarriesProjectSkillContent,
+} from "@/node/services/tools/taskReportProvenance";
 import { WorkflowRunRecordSchema } from "@/common/orpc/schemas";
 import {
   COMPLETED_REPORT_REFETCH_NOTE,
@@ -632,13 +638,29 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           // several await paths (immediate snapshot, task-signal abort race, timeout
           // race, and generic wait rejection). Build the shared shape once so those
           // paths cannot drift on the reported fields or fallback copy.
-          const completedWorkspaceTurnResult = (record: WorkspaceTurnTaskHandleRecord) => ({
+          // Report provenance: the turn ran in the target workspace, whose active
+          // segment is the report's context (see taskReportProvenance).
+          // Classified when a completed result is BUILT, never ahead of a wait:
+          // the turn can read a project skill while this call awaits it, and a
+          // verdict cached before the wait would miss that read. Workspace-turn
+          // handles persist no report provenance, so the target's history is
+          // the source each time.
+          const classifyWorkspaceTurnReport = async (targetWorkspaceId: string) => ({
+            carries: await workspaceHistoryCarriesProjectSkillContent(config, targetWorkspaceId),
+            excludes: await toolExcludesProjectSkillContent(config),
+          });
+          const completedWorkspaceTurnResult = async (record: WorkspaceTurnTaskHandleRecord) => ({
             status: "completed" as const,
             taskId,
             ...workspaceTurnIdentityFields(record.workspaceId),
-            reportMarkdown:
-              record.reportMarkdown ?? "Workspace turn completed without final text output.",
-            title: record.title,
+            ...applyTaskReportProvenance(
+              {
+                reportMarkdown:
+                  record.reportMarkdown ?? "Workspace turn completed without final text output.",
+                title: record.title,
+              },
+              await classifyWorkspaceTurnReport(record.workspaceId)
+            ),
             messageId: record.messageId,
             finalMessageRef: record.finalMessageRef,
             note: COMPLETED_REPORT_REFETCH_NOTE,
@@ -658,7 +680,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           if (timeoutMs === 0 || !isActiveWorkspaceTurnTaskStatus(snapshot.status)) {
             if (snapshot.status === "completed") {
               await markWorkspaceTurnTerminalAttentionConsumed(snapshot);
-              return completedWorkspaceTurnResult(snapshot);
+              return await completedWorkspaceTurnResult(snapshot);
             }
             if (snapshot.status === "interrupted") {
               await markWorkspaceTurnTerminalAttentionConsumed(snapshot);
@@ -697,8 +719,10 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               status: "completed" as const,
               taskId,
               ...workspaceTurnIdentityFields(report.workspaceId),
-              reportMarkdown: report.reportMarkdown,
-              title: report.title,
+              ...applyTaskReportProvenance(
+                { reportMarkdown: report.reportMarkdown, title: report.title },
+                await classifyWorkspaceTurnReport(report.workspaceId)
+              ),
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
               note: COMPLETED_REPORT_REFETCH_NOTE,
@@ -728,7 +752,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               if (latest == null) return { status: "not_found" as const, taskId };
               if (latest.status === "completed") {
                 await markWorkspaceTurnTerminalAttentionConsumed(latest);
-                return completedWorkspaceTurnResult(latest);
+                return await completedWorkspaceTurnResult(latest);
               }
               if (latest.status === "error") {
                 await markWorkspaceTurnTerminalAttentionConsumed(latest);
@@ -754,7 +778,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               if (latest == null) return { status: "not_found" as const, taskId };
               if (latest.status === "completed") {
                 await markWorkspaceTurnTerminalAttentionConsumed(latest);
-                return completedWorkspaceTurnResult(latest);
+                return await completedWorkspaceTurnResult(latest);
               }
               if (latest.status === "error") {
                 await markWorkspaceTurnTerminalAttentionConsumed(latest);
@@ -780,7 +804,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             const latest = await getWorkspaceTurnSnapshotForAwait().catch(() => null);
             if (latest?.status === "completed") {
               await markWorkspaceTurnTerminalAttentionConsumed(latest);
-              return completedWorkspaceTurnResult(latest);
+              return await completedWorkspaceTurnResult(latest);
             }
             if (latest?.status === "error") {
               await markWorkspaceTurnTerminalAttentionConsumed(latest);
@@ -843,16 +867,29 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             });
 
             const gitFormatPatch = await readGitFormatPatchArtifact(taskId);
+            const provenance = {
+              carries: report.carriesProjectSkillContent === true,
+              excludes: await toolExcludesProjectSkillContent(config),
+            };
             return {
               status: "completed" as const,
               taskId,
-              reportMarkdown: report.reportMarkdown,
-              structuredOutput: report.structuredOutput,
-              title: report.title,
+              ...applyTaskReportProvenance(
+                {
+                  reportMarkdown: report.reportMarkdown,
+                  structuredOutput: report.structuredOutput,
+                  title: report.title,
+                },
+                provenance
+              ),
               ...(report.model != null ? { modelString: report.model } : {}),
               ...(report.thinkingLevel != null ? { thinkingLevel: report.thinkingLevel } : {}),
               ...getAgentTaskElapsedField(taskId),
-              ...(gitFormatPatch ? { artifacts: { gitFormatPatch } } : {}),
+              // The patch can embed the same derived text (a commit message, a
+              // file the child wrote): withheld together with the report.
+              ...(gitFormatPatch && !taskReportWithheld(provenance)
+                ? { artifacts: { gitFormatPatch } }
+                : {}),
               note: COMPLETED_REPORT_REFETCH_NOTE,
             };
           } catch (error: unknown) {
@@ -873,16 +910,32 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           });
 
           const gitFormatPatch = await readGitFormatPatchArtifact(taskId);
+          // Provenance persisted with the report (TaskService reads a legacy
+          // report as carrying): withheld when this turn excludes project
+          // skill content, stamped otherwise.
+          const provenance = {
+            carries: report.carriesProjectSkillContent === true,
+            excludes: await toolExcludesProjectSkillContent(config),
+          };
           return {
             status: "completed" as const,
             taskId,
-            reportMarkdown: report.reportMarkdown,
-            structuredOutput: report.structuredOutput,
-            title: report.title,
+            ...applyTaskReportProvenance(
+              {
+                reportMarkdown: report.reportMarkdown,
+                structuredOutput: report.structuredOutput,
+                title: report.title,
+              },
+              provenance
+            ),
             ...(report.model != null ? { modelString: report.model } : {}),
             ...(report.thinkingLevel != null ? { thinkingLevel: report.thinkingLevel } : {}),
             ...getAgentTaskElapsedField(taskId),
-            ...(gitFormatPatch ? { artifacts: { gitFormatPatch } } : {}),
+            // The patch can embed the same derived text (a commit message, a
+            // file the child wrote): withheld together with the report.
+            ...(gitFormatPatch && !taskReportWithheld(provenance)
+              ? { artifacts: { gitFormatPatch } }
+              : {}),
             note: COMPLETED_REPORT_REFETCH_NOTE,
           };
         } catch (error: unknown) {

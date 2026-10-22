@@ -236,7 +236,7 @@ describe("idempotent sends (real host)", () => {
     await h.startBusyTurn("first");
     // The client sends no id: the backend mints one, and the queued entry keeps it.
     expect(await h.workspaceService.sendMessage(workspaceId, "follow-up", sendOptions)).toEqual(
-      Ok(undefined)
+      Ok({ queued: true })
     );
     expect(await h.workspaceService.interruptStream(workspaceId)).toMatchObject({ success: true });
     await h.until(() => h.session.getHeldInputs().length === 1, "Stop to hold the queued send");
@@ -269,7 +269,7 @@ describe("idempotent sends (real host)", () => {
     const h = await createStack();
     await h.startBusyTurn("first");
     expect(await h.workspaceService.sendMessage(workspaceId, "follow-up", sendOptions)).toEqual(
-      Ok(undefined)
+      Ok({ queued: true })
     );
     expect(await h.workspaceService.interruptStream(workspaceId)).toMatchObject({ success: true });
     await h.until(() => h.session.getHeldInputs().length === 1, "Stop to hold the queued send");
@@ -337,7 +337,8 @@ describe("idempotent sends (real host)", () => {
       await h.until(() => hookCalls >= 1, "a send to reach the hooks");
       release.resolve();
       expect(await first).toEqual(Ok(undefined));
-      expect(await retry).toEqual(Ok(undefined));
+      // The retry was accepted behind the first send, and the ack says so (frontend attribution).
+      expect(await retry).toEqual(Ok({ queued: true }));
       // The retry was queued behind the first send: end that turn and let the queue dispatch it
       // (Codex PRRT_kwDOPxxmWM6s4Eb5), so a hook run at dispatch would show here.
       await h.until(() => h.streamCalls() === 1, "the first send to stream");
@@ -363,7 +364,7 @@ describe("idempotent sends (real host)", () => {
     ]) {
       expect(
         await h.workspaceService.sendMessage(workspaceId, text, { ...sendOptions, sendId })
-      ).toEqual(Ok(undefined));
+      ).toEqual(Ok({ queued: true }));
     }
     // Another backend on the same session dir accepts b2 (same payload) while the batch waits.
     await acceptElsewhere("b2", "two");
@@ -396,13 +397,13 @@ describe("idempotent sends (real host)", () => {
         sendId: "c1",
         muxMetadata: compactMetadata,
       })
-    ).toEqual(Ok(undefined));
+    ).toEqual(Ok({ queued: true }));
     expect(
       await h.workspaceService.sendMessage(workspaceId, "follow-up", {
         ...sendOptions,
         sendId: "c2",
       })
-    ).toEqual(Ok(undefined));
+    ).toEqual(Ok({ queued: true }));
     const other = new HistoryService(fixture.config);
     const capture = await other.captureCompactionReplacement(workspaceId);
     if (!capture.success) throw new Error(capture.error);
@@ -436,12 +437,12 @@ describe("idempotent sends (real host)", () => {
     await h.startBusyTurn("first");
     const send = (text: string, sendId: string) =>
       h.workspaceService.sendMessage(workspaceId, text, { ...sendOptions, sendId });
-    expect(await send("one", "q1")).toEqual(Ok(undefined));
+    expect(await send("one", "q1")).toEqual(Ok({ queued: true }));
     // The same send again (a client retry): the queued copy covers it.
-    expect(await send("one", "q1")).toEqual(Ok(undefined));
-    expect(await send("two", "q2")).toEqual(Ok(undefined));
+    expect(await send("one", "q1")).toEqual(Ok({ queued: true }));
+    expect(await send("two", "q2")).toEqual(Ok({ queued: true }));
     // The same id with another payload is never batched with the first copy.
-    expect(await send("changed", "q1")).toEqual(Ok(undefined));
+    expect(await send("changed", "q1")).toEqual(Ok({ queued: true }));
     await h.endStream();
     await h.until(() => h.streamCalls() === 2, "the first batch to dispatch");
     await h.endStream();
@@ -458,7 +459,7 @@ describe("idempotent sends (real host)", () => {
     const h = await createStack();
     await h.startBusyTurn("first");
     expect(await h.workspaceService.sendMessage(workspaceId, "held", sendOptions)).toEqual(
-      Ok(undefined)
+      Ok({ queued: true })
     );
     expect(await h.workspaceService.interruptStream(workspaceId)).toMatchObject({ success: true });
     await h.until(() => h.session.getHeldInputs().length === 1, "Stop to hold the queued send");
@@ -468,7 +469,7 @@ describe("idempotent sends (real host)", () => {
     await h.startBusyTurn("second");
     expect(await h.workspaceService.sendHeldInput(workspaceId, held.id)).toEqual(Ok(undefined));
     expect(await h.workspaceService.sendMessage(workspaceId, "later", sendOptions)).toEqual(
-      Ok(undefined)
+      Ok({ queued: true })
     );
     await h.endStream();
     await h.until(() => h.streamCalls() === 3, "the held re-send to dispatch");
@@ -549,7 +550,7 @@ describe("idempotent sends (real host)", () => {
       h.workspaceService.sendMessage(workspaceId, text, { ...sendOptions, sendId });
     expect(await send("on a row", "s-row")).toEqual(Ok(undefined));
     await h.until(() => h.streamCalls() === 1, "the first send to stream");
-    expect(await send("queued", "s-queued")).toEqual(Ok(undefined));
+    expect(await send("queued", "s-queued")).toEqual(Ok({ queued: true }));
     const lookup = (ids: string[], receiverId?: string) =>
       h.workspaceService.getSendStatus(workspaceId, ids, receiverId);
 
@@ -655,7 +656,7 @@ describe("idempotent sends (real host)", () => {
         ...sendOptions,
         sendId: "s-dispatch",
       })
-    ).toEqual(Ok(undefined));
+    ).toEqual(Ok({ queued: true }));
     gate = gatePublications();
     await h.endStream();
     await gate.reached;

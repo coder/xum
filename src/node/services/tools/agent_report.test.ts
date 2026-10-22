@@ -28,14 +28,44 @@ describe("agent_report tool", () => {
 
     expect(first).toEqual({ success: true, message: "Update sent to the parent workspace." });
     expect(second).toEqual({ success: true, message: "Update sent to the parent workspace." });
-    expect(reportAgentProgress).toHaveBeenNthCalledWith(1, "task-workspace", "test-call-id", {
-      reportMarkdown: "first finding",
-      title: "Finding",
+    expect(reportAgentProgress).toHaveBeenNthCalledWith(
+      1,
+      "task-workspace",
+      "test-call-id",
+      { reportMarkdown: "first finding", title: "Finding" },
+      { carriesProjectSkillContent: false }
+    );
+    expect(reportAgentProgress).toHaveBeenNthCalledWith(
+      2,
+      "task-workspace",
+      "test-call-id",
+      { reportMarkdown: "second finding", title: undefined },
+      { carriesProjectSkillContent: false }
+    );
+  });
+
+  it("forwards the live project skill provenance of the child's stream with each update", async () => {
+    // A skill read earlier in the same stream is not in the child's committed
+    // history yet: the service learns it from the tool's live verdict.
+    using tempDir = new TestTempDir("test-agent-report-tool-provenance");
+    const reportAgentProgress = mock(() => Promise.resolve());
+    const taskService = { reportAgentProgress } as unknown as TaskService;
+    const tool = createAgentReportTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "task-workspace" }),
+      taskService,
+      projectSkillContentInContext: () => true,
     });
-    expect(reportAgentProgress).toHaveBeenNthCalledWith(2, "task-workspace", "test-call-id", {
-      reportMarkdown: "second finding",
-      title: undefined,
-    });
+
+    await Promise.resolve(
+      tool.execute!({ reportMarkdown: "quotes the skill", title: null }, mockToolCallOptions)
+    );
+
+    expect(reportAgentProgress).toHaveBeenCalledWith(
+      "task-workspace",
+      "test-call-id",
+      { reportMarkdown: "quotes the skill", title: undefined },
+      { carriesProjectSkillContent: true }
+    );
   });
 
   it("omits structuredOutput from non-workflow agent_report input", async () => {

@@ -33,6 +33,12 @@ export interface SubagentReportArtifactIndexEntry {
   /** Estimated token count of delivered report markdown (~4 chars/token). */
   reportTokenEstimate?: number;
   /**
+   * The child's context carried project skill content when it reported
+   * (classified at finalize, while its history still existed). Absent on
+   * legacy entries: unknown, treated as carrying by readers.
+   */
+  carriesProjectSkillContent?: boolean;
+  /**
    * The child's taskAttemptId whose report this is (#7003). Absent on legacy artifacts and on
    * entries an older Xum rewrote: those are unbound, so readers never settle an attempt from them.
    */
@@ -175,9 +181,14 @@ export async function readSubagentReportArtifactStrict(
       workflowOwnedAncestorWorkspaceIds?: unknown;
       structuredOutput?: unknown;
       planFilePath?: unknown;
+      carriesProjectSkillContent?: unknown;
       reportMarkdown?: unknown;
       taskAttemptId?: unknown;
     };
+    const carriesProjectSkillContent =
+      typeof obj.carriesProjectSkillContent === "boolean"
+        ? obj.carriesProjectSkillContent
+        : undefined;
 
     const reportMarkdown = typeof obj.reportMarkdown === "string" ? obj.reportMarkdown : null;
     if (!reportMarkdown || reportMarkdown.length === 0) {
@@ -213,6 +224,12 @@ export async function readSubagentReportArtifactStrict(
           title: title ?? meta.title,
           structuredOutput: obj.structuredOutput,
           planFilePath: planFilePath ?? meta.planFilePath,
+          ...((carriesProjectSkillContent ?? meta.carriesProjectSkillContent) !== undefined
+            ? {
+                carriesProjectSkillContent:
+                  carriesProjectSkillContent ?? meta.carriesProjectSkillContent,
+              }
+            : {}),
           // From the body, which holds the markdown it labels: the index is a separate, later
           // write that a reader can see stale (or that failed). An older Xum's rewrite drops both.
           taskAttemptId: coerceAttemptId(obj.taskAttemptId),
@@ -240,6 +257,7 @@ export async function readSubagentReportArtifactStrict(
         childTaskId,
         parentWorkspaceId,
         createdAtMs,
+        ...(carriesProjectSkillContent !== undefined ? { carriesProjectSkillContent } : {}),
         updatedAtMs,
         model,
         thinkingLevel,
@@ -299,6 +317,7 @@ export async function upsertSubagentReportArtifact(params: {
   planFilePath?: string;
   structuredOutput?: unknown;
   title?: string;
+  carriesProjectSkillContent?: boolean;
   nowMs?: number;
   /** The reporting attempt (see SubagentReportArtifactIndexEntry.taskAttemptId). */
   taskAttemptId?: string;
@@ -345,6 +364,7 @@ export async function upsertSubagentReportArtifact(params: {
             workflowOwnedAncestorWorkspaceIds: params.workflowOwnedAncestorWorkspaceIds,
             planFilePath,
             structuredOutput: params.structuredOutput,
+            carriesProjectSkillContent: params.carriesProjectSkillContent,
             taskAttemptId: params.taskAttemptId,
             reportMarkdown: params.reportMarkdown,
           },
@@ -373,6 +393,9 @@ export async function upsertSubagentReportArtifact(params: {
       planFilePath,
       structuredOutput: params.structuredOutput,
       ancestorWorkspaceIds: params.ancestorWorkspaceIds,
+      ...(params.carriesProjectSkillContent !== undefined
+        ? { carriesProjectSkillContent: params.carriesProjectSkillContent }
+        : {}),
       taskAttemptId: params.taskAttemptId,
     };
     updated.reportTokenEstimate = Math.ceil(

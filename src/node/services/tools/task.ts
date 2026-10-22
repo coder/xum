@@ -16,6 +16,14 @@ import {
   type RuntimeMode,
 } from "@/common/types/runtime";
 import type { TaskCreatedEvent } from "@/common/types/stream";
+import {
+  contextProjectSkillContentWithheld,
+  toolExcludesProjectSkillContent,
+} from "@/node/services/tools/projectSkillContentGate";
+import {
+  applyTaskReportProvenance,
+  workspaceHistoryCarriesProjectSkillContent,
+} from "@/node/services/tools/taskReportProvenance";
 import { log } from "@/node/services/log";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 
@@ -268,6 +276,8 @@ interface PendingTaskInfo {
 interface CompletedTaskInfo {
   taskId: string;
   reportMarkdown: string;
+  /** The report's context carried project skill content (see taskReportProvenance). */
+  carriesProjectSkillContent?: boolean;
   structuredOutput?: unknown;
   title?: string;
   agentId: string;
@@ -329,6 +339,7 @@ function serializeCompletedReport(report: CompletedTaskInfo) {
     reportMarkdown: page.text,
     nextCharOffset: page.nextCharOffset,
     note: page.note,
+    ...(report.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
     structuredOutput: report.structuredOutput,
     title: report.title,
     agentId: report.agentId,
@@ -436,6 +447,7 @@ function buildCompletedTaskResult(params: {
       reportMarkdown: report.reportMarkdown,
       nextCharOffset: report.nextCharOffset,
       note: report.note,
+      ...(report.carriesProjectSkillContent === true ? { carriesProjectSkillContent: true } : {}),
       structuredOutput: report.structuredOutput,
       title: report.title,
       agentId: report.agentId,
@@ -450,6 +462,10 @@ function buildCompletedTaskResult(params: {
     status: "completed",
     taskIds: serializedReports.map((report) => report.taskId),
     reports: serializedReports,
+    // The grouped result is classified as a whole (one carrying report taints it).
+    ...(serializedReports.some((report) => report.carriesProjectSkillContent === true)
+      ? { carriesProjectSkillContent: true }
+      : {}),
   };
 }
 
@@ -491,6 +507,15 @@ function normalizePendingTaskStatuses(params: {
     };
   });
 }
+
+/**
+ * Refusal for a spawn from a turn that must not carry project skill content
+ * while its context holds some: the child's request is outside this turn's
+ * consent gate, so the content would reach a model the routed request withheld
+ * it from.
+ */
+export const TASK_PROJECT_SKILL_CONTENT_WITHHELD_ERROR =
+  "This turn's context holds project skill content that Project Trust does not allow to leave the workspace; a subagent cannot be started from it. Restore Project Trust or start the subagent from a turn that has not read project skills.";
 
 export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
   // Only advertise the `isolation` parameter where sharing the parent checkout is supported (see
@@ -548,6 +573,19 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
 
       const parentRuntimeAiSettings = buildParentRuntimeAiSettings(config);
 
+      // Provenance of the launch (sub-agent or workspace turn): project skill
+      // content in this turn's context (request rows, or a read earlier in
+      // this stream — inside a PTC program too, observed at the tool's return)
+      // reaches the target through its prompt. A turn that must not carry it
+      // refuses; under trust the sub-agent's opening row is stamped so its own
+      // provenance tracking inherits it.
+      const contextCarriesProjectSkillContent =
+        config.memoryWriteCarriesProjectSkillContent === true ||
+        config.projectSkillContentInContext?.() === true;
+      if (await contextProjectSkillContentWithheld(config)) {
+        throw new Error(TASK_PROJECT_SKILL_CONTENT_WITHHELD_ERROR);
+      }
+
       if (config.planFileOnly && kind === "workspace") {
         throw new Error(PLAN_AGENT_EXPLORE_ONLY_ERROR);
       }
@@ -557,6 +595,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           ownerWorkspaceId: workspaceId,
           prompt,
           title,
+          ...(contextCarriesProjectSkillContent ? { carriesProjectSkillContent: true } : {}),
           // Agent mode for the launched turn (e.g. "plan"); createWorkspaceTurn defaults to exec.
           ...(agentId != null ? { agentId } : {}),
           ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
@@ -612,19 +651,33 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
             requestingWorkspaceId: workspaceId,
             backgroundOnMessageQueued: true,
           });
+          const targetWorkspaceId = report.workspaceId ?? created.data.workspaceId;
+          // The turn ran in the target workspace: its active segment is the
+          // report's context. Provenance applies before paging, so a withheld
+          // report is what the first page (and task_await's later pages) carry.
+          const gatedReport = applyTaskReportProvenance(
+            { reportMarkdown: report.reportMarkdown, title: report.title },
+            {
+              carries: await workspaceHistoryCarriesProjectSkillContent(config, targetWorkspaceId),
+              excludes: await toolExcludesProjectSkillContent(config),
+            }
+          );
           return parseToolResult(
             TaskToolResultSchema,
             {
               status: "completed" as const,
               taskId: created.data.taskId,
-              workspaceId: report.workspaceId ?? created.data.workspaceId,
+              workspaceId: targetWorkspaceId,
               handleKind: "workspace_turn" as const,
-              title: report.title,
+              title: gatedReport.title,
+              ...(gatedReport.carriesProjectSkillContent === true
+                ? { carriesProjectSkillContent: true }
+                : {}),
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
               ...pageWorkspaceTurnReport(
                 created.data.taskId,
-                report.reportMarkdown,
+                gatedReport.reportMarkdown,
                 completedSupersedeNote
               ),
             },
@@ -693,6 +746,26 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
         if (abortSignal?.aborted) {
           throw new Error("Interrupted");
         }
+        // Trust is re-read before EVERY launch: a revocation while an earlier
+        // create awaited must not let the remaining members of the group ship
+        // the project-derived prompt (possibly to another provider). Members
+        // already launched keep running on their stamped opening rows.
+        if (await contextProjectSkillContentWithheld(config)) {
+          if (createdTasks.length > 0) {
+            return parseToolResult(
+              TaskToolResultSchema,
+              buildPendingTaskResult({
+                tasks: createdTasks,
+                note:
+                  `Grouped task creation stopped after spawning ${createdTasks.length} of ${taskGroupCount} task(s): ${TASK_PROJECT_SKILL_CONTENT_WITHHELD_ERROR} ` +
+                  "Use task_await on the returned task metadata before retrying, or you may duplicate work.",
+                forceGrouped: taskGroupCount > 1,
+              }),
+              "task"
+            );
+          }
+          throw new Error(TASK_PROJECT_SKILL_CONTENT_WITHHELD_ERROR);
+        }
 
         const created = await taskService.create({
           parentWorkspaceId: workspaceId,
@@ -702,6 +775,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           agentType: requestedAgentId,
           prompt: launch.prompt,
           title,
+          ...(contextCarriesProjectSkillContent ? { carriesProjectSkillContent: true } : {}),
           ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
           ...(aiOverrides.thinkingLevel != null
             ? { thinkingLevel: aiOverrides.thinkingLevel }
@@ -778,13 +852,30 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               backgroundOnMessageQueued: true,
             });
 
+            // Provenance persisted with the report (TaskService reads a legacy
+            // report of unknown provenance as carrying): withheld when this turn
+            // excludes project skill content, stamped otherwise.
+            const classified = applyTaskReportProvenance(
+              {
+                reportMarkdown: report.reportMarkdown,
+                title: report.title,
+                structuredOutput: report.structuredOutput,
+              },
+              {
+                carries: report.carriesProjectSkillContent === true,
+                excludes: await toolExcludesProjectSkillContent(config),
+              }
+            );
             return {
               kind: "completed",
               report: {
                 taskId: createdTask.taskId,
-                reportMarkdown: report.reportMarkdown,
-                structuredOutput: report.structuredOutput,
-                title: report.title,
+                reportMarkdown: classified.reportMarkdown,
+                ...(classified.carriesProjectSkillContent === true
+                  ? { carriesProjectSkillContent: true }
+                  : {}),
+                structuredOutput: classified.structuredOutput,
+                title: classified.title,
                 agentId: requestedAgentId,
                 agentType: requestedAgentId,
                 // Prefer the settings the report was produced with: a plan child that

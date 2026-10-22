@@ -7,7 +7,7 @@ import type { ExperimentId } from "@/common/constants/experiments";
 import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { ArchivePreflightResult, ArchiveWorkspaceResult } from "@/common/orpc/schemas/api";
 import type { FilePart, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
-import type { SendMessageError } from "@/common/types/errors";
+import type { SendMessageAccepted, SendMessageError } from "@/common/types/errors";
 import type {
   MuxMessage,
   MuxMessageMetadata,
@@ -129,6 +129,12 @@ export interface TaskCreateArgs {
    * Defaults to blocking when omitted.
    */
   attentionPolicy?: BackgroundWorkAttentionPolicy;
+  /**
+   * The spawning turn's context carried project skill content (request rows
+   * or a read earlier in its stream): stamped on the child's opening row so
+   * the child's provenance tracking inherits it.
+   */
+  carriesProjectSkillContent?: boolean;
 }
 
 export function formatSubagentReportUserMessage(params: {
@@ -358,6 +364,14 @@ export type TurnAcceptanceOrigin = "manual" | "automatic";
 
 export interface SendMessageInternalOptions {
   /**
+   * True when this send is a QUEUE-DISPATCHED entry (sendQueuedMessages):
+   * pre-stream gate rejections preserve the user row only then — the
+   * composer already cleared on queue accept, so the row is the only
+   * record. A direct renderer send gets its Err back and restores the
+   * draft; preserving would double-record the prompt.
+   */
+  dequeued?: boolean;
+  /**
    * Set only by the artifact-interaction sender (Artifacts M5b). Generic sends refuse
    * `muxMetadata.artifactInteraction`, so the "from artifact" label cannot be spoofed.
    */
@@ -421,6 +435,8 @@ export interface SendMessageInternalOptions {
    * inside another turn's PREPARING window (see AgentSession.sendMessage).
    */
   preTurnMessages?: MuxMessage[];
+  /** Stamp the turn's user row as carrying project skill content (see AgentSession). */
+  userRowCarriesProjectSkillContent?: boolean;
   /** Return once the user message is accepted; stream startup continues asynchronously. */
   startStreamInBackground?: boolean;
   /** When true, reject instead of queueing if the workspace is busy. */
@@ -477,7 +493,7 @@ export interface WorkspaceTurnHost {
     message: string,
     options: SendMessageOptions & { fileParts?: FilePart[] },
     internal?: SendMessageInternalOptions
-  ): Promise<Result<void, SendMessageError>>;
+  ): Promise<Result<SendMessageAccepted | undefined, SendMessageError>>;
   resumeStream(
     workspaceId: string,
     options: SendMessageOptions,

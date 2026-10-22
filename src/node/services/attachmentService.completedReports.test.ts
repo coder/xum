@@ -20,6 +20,7 @@ async function writeTaskReport(
     parentWorkspaceId?: string;
     workflowOwnedAncestorWorkspaceIds?: string[];
     title?: string;
+    carriesProjectSkillContent?: boolean;
   }
 ): Promise<void> {
   await upsertSubagentReportArtifact({
@@ -33,6 +34,9 @@ async function writeTaskReport(
       ? { workflowOwnedAncestorWorkspaceIds: params.workflowOwnedAncestorWorkspaceIds }
       : {}),
     ...(params.title !== undefined ? { title: params.title } : {}),
+    ...(params.carriesProjectSkillContent !== undefined
+      ? { carriesProjectSkillContent: params.carriesProjectSkillContent }
+      : {}),
     nowMs: params.updatedAtMs,
   });
 }
@@ -150,6 +154,43 @@ describe("AttachmentService.generateCompletedReportsAttachment", () => {
     expect(taskEntry?.kind).toBe("task");
     expect(taskEntry?.title).toBe("Old exploration");
     expect(taskEntry?.reportTokenEstimate).toBeGreaterThan(0);
+  });
+
+  test("carries each report's persisted provenance, reading a legacy entry as carrying", async () => {
+    using tmp = new DisposableTempDir("completed-reports");
+    const cutoffMs = Date.parse("2026-06-02T00:00:00.000Z");
+
+    await writeTaskReport(tmp.path, {
+      childTaskId: "task-clean",
+      updatedAtMs: cutoffMs - 30_000,
+      title: "Mapped the tooling",
+      carriesProjectSkillContent: false,
+    });
+    await writeTaskReport(tmp.path, {
+      childTaskId: "task-carrying",
+      updatedAtMs: cutoffMs - 20_000,
+      title: "Applied the conventions",
+      carriesProjectSkillContent: true,
+    });
+    // Persisted before the verdict existed: unknown provenance, fail closed.
+    await writeTaskReport(tmp.path, {
+      childTaskId: "task-legacy",
+      updatedAtMs: cutoffMs - 10_000,
+      title: "Legacy report",
+    });
+
+    const attachment = await AttachmentService.generateCompletedReportsAttachment({
+      workspaceId: WORKSPACE_ID,
+      sessionDir: tmp.path,
+      completedBeforeMs: cutoffMs,
+    });
+
+    const byId = new Map(attachment?.reports.map((report) => [report.id, report]));
+    expect(byId.get("task-clean")).not.toHaveProperty("carriesProjectSkillContent");
+    expect(byId.get("task-carrying")?.carriesProjectSkillContent).toBe(true);
+    expect(byId.get("task-legacy")?.carriesProjectSkillContent).toBe(true);
+    // Titles still ride the index under trust; the routed-turn filter decides.
+    expect(byId.get("task-carrying")?.title).toBe("Applied the conventions");
   });
 
   test("excludes non-direct-children, workflow-owned reports, and non-completed runs", async () => {

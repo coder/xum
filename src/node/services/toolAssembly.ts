@@ -128,6 +128,13 @@ export interface ApplyToolPolicyAndExperimentsOptions {
    */
   sandbox?: { workspaceId: string; sessionDir: string; kernelFileLoader?: KernelFileLoader };
   /**
+   * Whether the turn must leave project skill content out of what
+   * code_execution returns (toolExcludesProjectSkillContent over the turn's
+   * ToolConfiguration): a queued child report distilled from it is withheld
+   * when the kernel drains it. Re-read at each call, like the tools' own gates.
+   */
+  excludesProjectSkillContent?: () => Promise<boolean>;
+  /**
    * Capability grants for this assembly (registry-with-filters posture).
    * Omitted = session-scope full grants (identical to pre-grants behavior).
    * Enforced here (tool visibility) and at the sandbox bridge boundary
@@ -425,6 +432,7 @@ export async function applyToolPolicyAndExperiments(
         {
           kernelFirst: rlmActive,
           loadFile: kernelFileLoaderAllowedBy(effectiveToolPolicy, sandbox?.kernelFileLoader),
+          excludesProjectSkillContent: opts.excludesProjectSkillContent,
         }
       );
 

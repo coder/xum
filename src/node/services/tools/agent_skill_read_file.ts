@@ -206,17 +206,24 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           includeClaudeSkills,
         });
 
+        // The consent scan of routed requests identifies a project skill's
+        // referenced files from the persisted result, so it carries the scope.
+        const tagScope = (result: AgentSkillReadFileToolResult): AgentSkillReadFileToolResult =>
+          result.success ? { ...result, skillScope: resolvedSkill.package.scope } : result;
+
         // Built-in skills are embedded in the app bundle (no filesystem access).
         if (resolvedSkill.package.scope === "built-in") {
           assert(lookup.pluginName == null, "qualified skill lookups never resolve to built-ins");
           const builtIn = readBuiltInSkillFile(lookup.skillName, filePath);
-          return readContentWithFileReadLimits({
-            fullContent: builtIn.content,
-            fileSize: Buffer.byteLength(builtIn.content, "utf-8"),
-            modifiedTime: new Date(0).toISOString(),
-            offset,
-            limit,
-          });
+          return tagScope(
+            readContentWithFileReadLimits({
+              fullContent: builtIn.content,
+              fileSize: Buffer.byteLength(builtIn.content, "utf-8"),
+              modifiedTime: new Date(0).toISOString(),
+              offset,
+              limit,
+            })
+          );
         }
 
         const skillRuntime = resolvedSkill.sourceRuntime;
@@ -325,16 +332,18 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           throw err;
         }
 
-        return withPluginSkillNote(
-          readContentWithFileReadLimits({
-            fullContent,
-            fileSize: resultFileSize,
-            modifiedTime: resultModifiedTime,
-            offset,
-            limit,
-          }),
-          resolvedSkill,
-          config.availableSkills
+        return tagScope(
+          withPluginSkillNote(
+            readContentWithFileReadLimits({
+              fullContent,
+              fileSize: resultFileSize,
+              modifiedTime: resultModifiedTime,
+              offset,
+              limit,
+            }),
+            resolvedSkill,
+            config.availableSkills
+          )
         );
       } catch (error) {
         return {
