@@ -20,6 +20,7 @@ import {
 } from "@/common/config/schemas/taskSettings";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 
@@ -6159,6 +6160,26 @@ describe("Config", () => {
         parentWorkspaceId: undefined,
         pendingAutoTitle: undefined,
       });
+    });
+
+    it("reports a scratch chat's kind", async () => {
+      await config.editConfig((cfg) => {
+        cfg.projects.set(SCRATCH_PROJECT_CONFIG_KEY, {
+          workspaces: [
+            {
+              kind: "scratch",
+              path: path.join(config.rootDir, "scratch", "chat"),
+              id: "scratch-1",
+              name: "chat",
+            },
+          ],
+          projectKind: "system",
+          trusted: true,
+        });
+        return cfg;
+      });
+
+      expect(config.findWorkspace("scratch-1")?.kind).toBe("scratch");
     });
   });
 
