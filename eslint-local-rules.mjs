@@ -678,8 +678,9 @@ const localPlugin = {
         // One form per module: "node:" stripped, "@shared/" (an alias of "@/" in tsconfig.json)
         // and relative paths as "@/...", and no file extension on a repo module.
         const canonical = (specifier) => {
-          if (specifier.startsWith("node:")) return specifier.slice("node:".length);
-          let module = specifier;
+          // A Bun query or hash (`?fresh=1`) still loads the module itself.
+          let module = specifier.replace(/[?#].*$/, "");
+          if (module.startsWith("node:")) return module.slice("node:".length);
           if (module.startsWith("@shared/")) module = "@/" + module.slice("@shared/".length);
           if (module.startsWith(".")) {
             const abs = path.resolve(path.dirname(context.filename), module);
@@ -694,8 +695,15 @@ const localPlugin = {
         const seen = new Set();
         // names: the value names taken from the module; null means the whole module.
         const check = (node, source, names) => {
-          if (source?.type !== "Literal" || typeof source.value !== "string") return;
-          const module = canonical(source.value);
+          // A string literal, or a template literal without substitutions (`require(\`fs\`)`).
+          const specifier =
+            source?.type === "Literal"
+              ? source.value
+              : source?.type === "TemplateLiteral" && source.expressions.length === 0
+                ? source.quasis[0].value.cooked
+                : null;
+          if (typeof specifier !== "string") return;
+          const module = canonical(specifier);
           const hostNames = named.get(module);
           const isHost =
             whole.has(module) ||

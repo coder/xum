@@ -63,6 +63,9 @@ test("reports value imports in bare and node: forms", () => {
   expect(ids(`export { readFile } from "fs/promises";`)).toEqual(["host"]);
   expect(ids(`export * from "os";`)).toEqual(["host"]);
   expect(ids(`export {} from "fs";`)).toEqual(["host"]);
+  expect(ids("const fs = require(`fs`);")).toEqual(["host"]);
+  expect(ids("await import(`node:fs/promises`);")).toEqual(["host"]);
+  expect(ids(`require("@/node/utils/writeFileAtomic?fresh=1");`)).toEqual(["host"]);
 });
 
 test("resolves relative specifiers, the @shared alias and extensions to @/ modules", () => {
