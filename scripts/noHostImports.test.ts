@@ -4,9 +4,20 @@
 // imports and pure helpers pass. A file's allow-map entries are today's debt, and an entry the
 // file no longer needs fails, so the map only shrinks.
 import { expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { Linter, type Rule } from "eslint";
 import tseslint from "typescript-eslint";
 import config from "../eslint.config.mjs";
+
+/** The config entry that turns the rule on for the agent-loop files. */
+function ruleEntry() {
+  const entry = config.find(
+    (candidate) => candidate.rules?.["local/no-host-imports"] !== undefined
+  );
+  if (entry === undefined) throw new Error("local/no-host-imports is in no config entry");
+  return entry;
+}
 
 function findRule(): Rule.RuleModule {
   for (const entry of config) {
@@ -81,4 +92,65 @@ test("allows listed modules and fails stale entries", () => {
   expect(ids(`import { readFile } from "fs/promises";`, allow)).toEqual([]);
   expect(ids(`import os from "os";`, allow)).toEqual(["host", "stale"]);
   expect(ids(`export {};`, allow)).toEqual(["stale"]);
+});
+
+// The allow map is frozen: a PR adds a (file, module) pair only when its phase plan lists it.
+// Phases 2 to 5 remove pairs until the map is empty.
+const FROZEN_ALLOW_PAIRS = [
+  "src/node/services/agentSession.ts fs/promises",
+  "src/node/services/aiService.ts @/node/runtime/multiProjectRuntime",
+  "src/node/services/aiService.ts @/node/runtime/runtimeFactory",
+  "src/node/services/aiService.ts @/node/utils/fs",
+  "src/node/services/aiService.ts fs/promises",
+  "src/node/services/tools/agent_skill_delete.ts fs/promises",
+  "src/node/services/tools/agent_skill_list.ts fs/promises",
+  "src/node/services/tools/agent_skill_list.ts os",
+  "src/node/services/tools/agent_skill_read_file.ts @/node/runtime/RemoteRuntime",
+  "src/node/services/tools/agent_skill_write.ts fs/promises",
+  "src/node/services/tools/bash.ts @/node/runtime/LocalBaseRuntime",
+  "src/node/services/tools/bash.ts fs",
+  "src/node/services/tools/notify.ts electron",
+  "src/node/services/tools/review_pane.ts @/node/utils/writeFileAtomic",
+  "src/node/services/tools/review_pane.ts fs/promises",
+  "src/node/services/tools/shared/configReadWrite.ts @/node/utils/writeFileAtomic",
+  "src/node/services/tools/shared/configReadWrite.ts fs/promises",
+  "src/node/services/tools/skillFileHint.ts @/node/runtime/RemoteRuntime",
+  "src/node/services/tools/skillFileUtils.ts fs/promises",
+  "src/node/services/tools/skillsCatalogFetch.ts fs/promises",
+  "src/node/services/tools/skillsCatalogFetch.ts os",
+  "src/node/services/tools/todo.ts @/node/utils/writeFileAtomic",
+  "src/node/services/tools/todo.ts fs/promises",
+  "src/node/services/tools/web_fetch.ts net",
+  "src/node/services/tools/xum_agents_path.ts fs/promises",
+  "src/node/services/tools/xum_agents_read.ts fs/promises",
+  "src/node/services/tools/xum_agents_write.ts fs/promises",
+];
+
+function allowMap(): Record<string, string[]> {
+  const setting = ruleEntry().rules?.["local/no-host-imports"] as [
+    string,
+    { allow: Record<string, string[]> },
+  ];
+  return setting[1].allow;
+}
+
+test("the allow map holds only the frozen (file, module) pairs", () => {
+  const pairs = Object.entries(allowMap()).flatMap(([file, modules]) =>
+    modules.map((module) => `${file} ${module}`)
+  );
+  expect(pairs.sort()).toEqual([...FROZEN_ALLOW_PAIRS].sort());
+});
+
+test("each allow key is an agent-loop file", () => {
+  const entry = ruleEntry();
+  const root = path.join(import.meta.dir, "..");
+  const matches = (globs: unknown, file: string) =>
+    (globs as string[]).some((glob) => new Bun.Glob(glob).match(file));
+  for (const file of Object.keys(allowMap())) {
+    expect({ file, exists: fs.existsSync(path.join(root, file)) }).toEqual({ file, exists: true });
+    expect({ file, loop: matches(entry.files, file) && !matches(entry.ignores, file) }).toEqual({
+      file,
+      loop: true,
+    });
+  }
 });
