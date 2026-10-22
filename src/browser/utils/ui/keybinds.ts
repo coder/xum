@@ -627,7 +627,7 @@ export const KEYBINDS = {
   STATUS_START_HERE: { key: "h", code: "KeyH", ctrl: true, alt: true, shift: true },
 
   /** Open (or focus) the Plan tab in the right sidebar */
-  OPEN_PLAN_TAB: { key: "B", ctrl: true, shift: true },
+  OPEN_PLAN_TAB: { key: "p", code: "KeyP", ctrl: true, alt: true, shift: true },
 
   // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,
   // like the Review panel's single-key hunk navigation.
