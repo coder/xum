@@ -394,9 +394,7 @@ export const ArrowKeys: Story = {
     const tabs = within(row).getAllByRole("tab");
     const [first, second] = tabs;
     const last = tabs[tabs.length - 1];
-    const tabStops = () => tabs.filter((tab) => tab.tabIndex === 0);
     await expect(first).toHaveAttribute("aria-selected", "true");
-    await expect(tabStops()).toEqual([first]);
 
     first.focus();
     await userEvent.keyboard("{ArrowRight}");
@@ -412,7 +410,13 @@ export const ArrowKeys: Story = {
     await frame();
     await frame();
     await expectFullyInRow(row, last);
+    // The same while focus is on a button inside that tab (the terminal's close button).
+    last.querySelector<HTMLButtonElement>('button[aria-label="Close terminal"]')!.focus();
     first.style.paddingLeft = "";
+    await frame();
+    await frame();
+    await expectFullyInRow(row, last);
+    last.focus();
     await userEvent.keyboard("{ArrowRight}");
     await expect(first).toHaveFocus();
     await userEvent.keyboard("{ArrowLeft}");
@@ -422,7 +426,6 @@ export const ArrowKeys: Story = {
 
     await userEvent.keyboard("{ArrowRight}{Enter}");
     await expect(second).toHaveAttribute("aria-selected", "true");
-    await expect(tabStops()).toEqual([second]);
   },
 };
 

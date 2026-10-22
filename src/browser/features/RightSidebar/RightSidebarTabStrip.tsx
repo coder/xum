@@ -67,9 +67,7 @@ const SortableTab: React.FC<{
   item: RightSidebarTabStripItem;
   index: number;
   tabsetId: string;
-  /** The one tab that Tab reaches (roving tabindex); arrow keys reach the others. */
-  isTabStop: boolean;
-}> = ({ item, index, tabsetId, isTabStop }) => {
+}> = ({ item, index, tabsetId }) => {
   // Create a unique sortable ID that encodes tabset + tab
   const sortableId = `${tabsetId}:${item.tab}`;
 
@@ -148,7 +146,7 @@ const SortableTab: React.FC<{
             aria-selected={item.selected}
             aria-controls={item.panelId}
             aria-disabled={item.disabled ? true : undefined}
-            tabIndex={!item.disabled && isTabStop ? 0 : -1}
+            tabIndex={item.disabled ? -1 : (attributes.tabIndex ?? 0)}
           >
             {/* Long labels truncate inside the tab instead of stretching the strip. */}
             <span className="flex min-w-0 items-center gap-1.5 truncate">{item.label}</span>
@@ -405,37 +403,25 @@ const TabScrollRow: React.FC<{
   items: RightSidebarTabStripItem[];
   tabsetId: string;
   isDesktop: boolean;
-}> = ({ rowRef, ...props }) => {
-  // Tab reaches the selected tab, or the first enabled one when none is selected.
-  const tabStopId =
-    props.items.find((item) => item.selected && !item.disabled)?.id ??
-    props.items.find((item) => !item.disabled)?.id;
-  return (
-    <div className="relative flex min-w-0">
-      {props.isDesktop && (
-        <div aria-hidden className="titlebar-no-drag pointer-events-none absolute inset-0" />
-      )}
-      <div
-        ref={rowRef}
-        data-tab-scroll-row
-        role="tablist"
-        aria-label={props.ariaLabel}
-        className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
-        onKeyDown={handleTabStripKeyDown}
-      >
-        {props.items.map((item, index) => (
-          <SortableTab
-            key={item.id}
-            item={item}
-            index={index}
-            tabsetId={props.tabsetId}
-            isTabStop={item.id === tabStopId}
-          />
-        ))}
-      </div>
+}> = ({ rowRef, ...props }) => (
+  <div className="relative flex min-w-0">
+    {props.isDesktop && (
+      <div aria-hidden className="titlebar-no-drag pointer-events-none absolute inset-0" />
+    )}
+    <div
+      ref={rowRef}
+      data-tab-scroll-row
+      role="tablist"
+      aria-label={props.ariaLabel}
+      className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
+      onKeyDown={handleTabStripKeyDown}
+    >
+      {props.items.map((item, index) => (
+        <SortableTab key={item.id} item={item} index={index} tabsetId={props.tabsetId} />
+      ))}
     </div>
-  );
-};
+  </div>
+);
 
 /** Width of the `.scroll-fade-x` edge fade (scrollbar-none.css): a tab under it looks cut off. */
 const SCROLL_FADE_PX = 24;
@@ -446,13 +432,9 @@ const SCROLL_FADE_PX = 24;
  * to the selected tab would hide where the user is.
  */
 function revealSelectedTabOnResize(row: HTMLElement): void {
-  const active = row.ownerDocument.activeElement;
-  if (
-    active instanceof HTMLElement &&
-    row.contains(active) &&
-    active.getAttribute("role") === "tab" &&
-    active.getAttribute("aria-selected") !== "true"
-  ) {
+  // Focus on a control inside a tab (its close button) counts as focus on that tab.
+  const active = row.ownerDocument.activeElement?.closest<HTMLElement>('[role="tab"]');
+  if (active != null && row.contains(active) && active.getAttribute("aria-selected") !== "true") {
     revealTab(row, active);
   } else {
     revealSelectedTab(row);
