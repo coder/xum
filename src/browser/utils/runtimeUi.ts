@@ -8,6 +8,7 @@ import {
   DockerIcon,
   DevcontainerIcon,
   CoderIcon,
+  DaytonaIcon,
 } from "@/browser/components/icons/RuntimeIcons/RuntimeIcons";
 
 export interface RuntimeIconProps {
@@ -79,7 +80,7 @@ export interface RuntimeUiSpec {
   };
 }
 
-export type RuntimeChoice = RuntimeMode | "coder";
+export type RuntimeChoice = RuntimeMode | "coder" | "daytona";
 
 export const RUNTIME_UI = {
   local: {
@@ -211,9 +212,19 @@ const CODER_RUNTIME_UI: RuntimeUiSpec = {
   Icon: CoderIcon,
 };
 
+const DAYTONA_RUNTIME_UI: RuntimeUiSpec = {
+  ...RUNTIME_UI.ssh,
+  label: "Daytona",
+  description: "Managed cloud sandbox from Daytona",
+  options: "Snapshot and box size",
+  docsPath: "/runtime/daytona",
+  Icon: DaytonaIcon,
+};
+
 export const RUNTIME_CHOICE_UI = {
   ...RUNTIME_UI,
   coder: CODER_RUNTIME_UI,
+  daytona: DAYTONA_RUNTIME_UI,
 } satisfies Record<RuntimeChoice, RuntimeUiSpec>;
 
 export const RUNTIME_BADGE_UI = {
@@ -224,6 +235,10 @@ export const RUNTIME_BADGE_UI = {
   coder: {
     Icon: CODER_RUNTIME_UI.Icon,
     badge: CODER_RUNTIME_UI.badge,
+  },
+  daytona: {
+    Icon: DAYTONA_RUNTIME_UI.Icon,
+    badge: DAYTONA_RUNTIME_UI.badge,
   },
   worktree: {
     Icon: RUNTIME_UI.worktree.Icon,
@@ -243,10 +258,15 @@ export const RUNTIME_BADGE_UI = {
   },
 } satisfies Record<RuntimeChoice, Pick<RuntimeUiSpec, "Icon" | "badge">>;
 
-export interface DevcontainerStatusChip {
+export interface RuntimeStatusChip {
   label: string;
   className: string;
 }
+
+// Theme success tokens: raw emerald text was below WCAG AA in the light themes (#6882).
+const RUNNING_CHIP_CLASS = "bg-success/10 text-success-text";
+// The /50 muted tint left even foreground text at 4.17:1 in flexoki-dark (#6544).
+const STOPPED_CHIP_CLASS = "bg-muted/15 text-foreground";
 
 /**
  * Returns the titlebar chip presentation for a devcontainer runtime status,
@@ -254,23 +274,37 @@ export interface DevcontainerStatusChip {
  * Only `running` and `stopped` produce a chip; `unknown`, `unsupported`,
  * and null (not yet loaded) suppress the chip to avoid misreporting.
  */
-export function getDevcontainerStatusChip(
-  status: RuntimeStatus | null
-): DevcontainerStatusChip | null {
+export function getDevcontainerStatusChip(status: RuntimeStatus | null): RuntimeStatusChip | null {
   switch (status) {
     case "running":
       return {
         label: "Devcontainer Running",
-        // Theme success tokens: raw emerald text was below WCAG AA in the light themes (#6882).
-        className: "bg-success/10 text-success-text",
+        className: RUNNING_CHIP_CLASS,
       };
     case "stopped":
       return {
         label: "Devcontainer Stopped",
-        // The /50 muted tint left even foreground text at 4.17:1 in flexoki-dark (#6544).
-        className: "bg-muted/15 text-foreground",
+        className: STOPPED_CHIP_CLASS,
       };
     default:
       return null;
   }
+}
+
+const DAYTONA_STATUS_CHIPS: Record<RuntimeStatus, RuntimeStatusChip | null> = {
+  running: { label: "Sandbox Running", className: RUNNING_CHIP_CLASS },
+  starting: { label: "Sandbox Starting", className: "bg-warning/10 text-warning" },
+  stopped: { label: "Sandbox Stopped", className: STOPPED_CHIP_CLASS },
+  archived: { label: "Sandbox Archived", className: STOPPED_CHIP_CLASS },
+  error: { label: "Sandbox Error", className: "bg-destructive/10 text-destructive" },
+  unknown: null,
+  unsupported: null,
+};
+
+/**
+ * Titlebar chip for a Daytona sandbox status, or null while unknown. Daytona auto-stops idle
+ * sandboxes, so stopped and archived are normal states (the next turn starts the sandbox).
+ */
+export function getDaytonaStatusChip(status: RuntimeStatus | null): RuntimeStatusChip | null {
+  return status ? DAYTONA_STATUS_CHIPS[status] : null;
 }

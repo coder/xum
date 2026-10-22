@@ -74,6 +74,7 @@ Use this index to find a page's:
       - Worktree Runtime (`/runtime/worktree`) → `references/docs/runtime/worktree.mdx`: Isolated git worktree environments for parallel agent work
       - SSH Runtime (`/runtime/ssh`) → `references/docs/runtime/ssh.mdx`: Run agents on remote hosts over SSH for security and performance
       - Coder Runtime (`/runtime/coder`) → `references/docs/runtime/coder.mdx`: Run agents on Coder workspaces
+      - Daytona Runtime (`/runtime/daytona`) → `references/docs/runtime/daytona.mdx`: Run agents in Daytona Cloud sandboxes
       - Docker Runtime (`/runtime/docker`) → `references/docs/runtime/docker.mdx`: Run agents in isolated Docker containers
       - Dev Container Runtime (`/runtime/devcontainer`) → `references/docs/runtime/devcontainer.mdx`: Run agents in containers defined by devcontainer.json
     - **Hooks**

@@ -969,6 +969,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const [removingWorkspaceIds, setRemovingWorkspaceIds] = useState<Set<string>>(new Set());
   const workspaceArchiveError = usePopoverError();
+  // Kept until dismissed: it reports a kept remote box the user may want to clean up.
+  const workspaceArchiveWarning = usePopoverError(null);
   const workspaceForkError = usePopoverError();
   const workspaceStopRuntimeError = usePopoverError();
   const workspaceRemoveError = usePopoverError();
@@ -1147,6 +1149,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     // left-sidebar row that may be far from their current focus. Use the shared toast fallback
     // position so archive errors match other top-right UI error surfaces.
     showError: (workspaceId, error) => workspaceArchiveError.showError(workspaceId, error),
+    showWarning: (workspaceId, warning) => workspaceArchiveWarning.showError(workspaceId, warning),
   });
   const handleArchiveWorkspace = archiveFlow.requestArchive;
 
@@ -3774,6 +3777,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             error={workspaceArchiveError.error}
             prefix="Failed to archive workspace"
             onDismiss={workspaceArchiveError.clearError}
+          />
+          <PopoverError
+            error={workspaceArchiveWarning.error}
+            prefix="Workspace archived with a warning"
+            onDismiss={workspaceArchiveWarning.clearError}
           />
           <PopoverError
             error={workspaceStopRuntimeError.error}

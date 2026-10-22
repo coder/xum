@@ -10,9 +10,12 @@ import {
   buildRuntimeString,
   RUNTIME_MODE,
   CODER_RUNTIME_PLACEHOLDER,
+  DAYTONA_RUNTIME_PLACEHOLDER,
 } from "@/common/types/runtime";
+import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import {
+  readDaytonaOptionDefaults,
   readOptionField,
   readSshOptionDefaults,
   type RuntimeOptionDefaults,
@@ -50,6 +53,7 @@ export interface DraftWorkspaceSettings {
 interface SshRuntimeConfig {
   host: string;
   coder?: CoderWorkspaceConfig;
+  daytona?: DaytonaSandboxConfig;
 }
 
 interface SshRuntimeState {
@@ -89,6 +93,9 @@ const buildRuntimeForMode = (
       const effectiveHost =
         sshConfig.coder && !sshConfig.host.trim() ? CODER_RUNTIME_PLACEHOLDER : sshConfig.host;
 
+      if (sshConfig.daytona) {
+        return { mode: "ssh", host: DAYTONA_RUNTIME_PLACEHOLDER, daytona: sshConfig.daytona };
+      }
       return {
         mode: "ssh",
         host: effectiveHost,
@@ -109,6 +116,18 @@ const buildRuntimeForMode = (
   }
 };
 
+const mergeRememberedSsh = (
+  nextRuntime: Extract<ParsedRuntime, { mode: "ssh" }>,
+  remembered: RememberedRuntimeValues["ssh"]
+): ParsedRuntime => ({
+  ...nextRuntime,
+  host: !nextRuntime.host.trim() && remembered.host.trim() ? remembered.host : nextRuntime.host,
+  coder:
+    nextRuntime.coder === undefined && remembered.coder != null
+      ? remembered.coder
+      : nextRuntime.coder,
+});
+
 const mergeRememberedRuntimeConfig = (
   nextRuntime: ParsedRuntime,
   previousMode: RuntimeMode,
@@ -120,17 +139,9 @@ const mergeRememberedRuntimeConfig = (
 
   switch (nextRuntime.mode) {
     case RUNTIME_MODE.SSH:
-      return {
-        ...nextRuntime,
-        host:
-          !nextRuntime.host.trim() && remembered.ssh.host.trim()
-            ? remembered.ssh.host
-            : nextRuntime.host,
-        coder:
-          nextRuntime.coder === undefined && remembered.ssh.coder != null
-            ? remembered.ssh.coder
-            : nextRuntime.coder,
-      };
+      // A Daytona selection takes no remembered host or Coder config: its host is a
+      // placeholder, and one managed backend per workspace (the runtime schema rejects both).
+      return nextRuntime.daytona ? nextRuntime : mergeRememberedSsh(nextRuntime, remembered.ssh);
     case RUNTIME_MODE.DOCKER:
       return {
         ...nextRuntime,
@@ -160,9 +171,37 @@ const mergeRememberedRuntimeConfig = (
   }
 };
 
+/** The draft's last Daytona choice, else the project's Daytona defaults. */
+function readDraftDaytonaFallback(
+  execution: { lastDaytona?: DaytonaSandboxConfig } | null | undefined,
+  defaults: RuntimeOptionDefaults
+): DaytonaSandboxConfig {
+  return execution?.lastDaytona ?? readDaytonaOptionDefaults(defaults);
+}
+
+/** Only in the draft: Daytona project defaults change only in Settings > Runtimes. */
+function rememberedDaytonaPatch(runtime: ParsedRuntime): { lastDaytona?: DaytonaSandboxConfig } {
+  return runtime.mode === RUNTIME_MODE.SSH && runtime.daytona
+    ? { lastDaytona: runtime.daytona }
+    : {};
+}
+
+/** The default runtime-type button: Coder and Daytona are SSH sub-choices. */
+const resolveDefaultRuntimeChoice = (
+  settingsDefaultRuntime: RuntimeChoice,
+  defaultRuntimeMode: RuntimeMode,
+  coderDefaultFromString: boolean
+): RuntimeChoice => {
+  if (settingsDefaultRuntime === "daytona") return "daytona";
+  return defaultRuntimeMode === RUNTIME_MODE.SSH && coderDefaultFromString
+    ? "coder"
+    : defaultRuntimeMode;
+};
+
 const normalizeRuntimeChoice = (value: unknown): RuntimeChoice | null => {
   if (
     value === "coder" ||
+    value === "daytona" ||
     value === RUNTIME_MODE.LOCAL ||
     value === RUNTIME_MODE.WORKTREE ||
     value === RUNTIME_MODE.SSH ||
@@ -179,6 +218,8 @@ const buildRuntimeFromChoice = (choice: RuntimeChoice): ParsedRuntime => {
   switch (choice) {
     case "coder":
       return { mode: RUNTIME_MODE.SSH, host: CODER_RUNTIME_PLACEHOLDER };
+    case "daytona":
+      return { mode: RUNTIME_MODE.SSH, host: DAYTONA_RUNTIME_PLACEHOLDER };
     case RUNTIME_MODE.LOCAL:
       return { mode: RUNTIME_MODE.LOCAL };
     case RUNTIME_MODE.WORKTREE:
@@ -222,6 +263,8 @@ export function useDraftWorkspaceSettings(
   coderConfigFallback: CoderWorkspaceConfig;
   /** Preserves the last SSH host when leaving Coder so the input stays populated. */
   sshHostFallback: string;
+  /** Project Daytona defaults (Settings > Runtimes) that start a Daytona selection. */
+  daytonaConfigFallback: DaytonaSandboxConfig;
   /** Set the currently selected runtime (discriminated union) */
   setSelectedRuntime: (runtime: ParsedRuntime) => void;
   setTrunkBranch: (branch: string) => void;
@@ -348,12 +391,7 @@ export function useDraftWorkspaceSettings(
 
   const coderDefaultFromString =
     parsedDefault?.mode === RUNTIME_MODE.SSH && parsedDefault.host === CODER_RUNTIME_PLACEHOLDER;
-  // Defaults must stay explicit and sticky; last-used SSH state should only seed inputs.
-  const defaultRuntimeChoice: RuntimeChoice =
-    defaultRuntimeMode === RUNTIME_MODE.SSH && coderDefaultFromString
-      ? "coder"
-      : defaultRuntimeMode;
-
+  const daytonaDefault = settingsDefaultRuntime === "daytona";
   const setLastRuntimeConfig = useCallback(
     // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     (mode: RuntimeMode, field: string, value: string | boolean | object | null) => {
@@ -413,9 +451,15 @@ export function useDraftWorkspaceSettings(
   // `setSelectedRuntime` changed on every keystroke and re-rendered CreationControls (#5937).
   // useDraftWorkspaceSettings.compiler.test.tsx guards their identity.
   // Uses discriminated union: SSH has host, Docker has image.
+  // Parsed into a fresh object, so it too must follow the last hook to keep its identity.
+  const daytonaConfigFallback = readDraftDaytonaFallback(execution, lastRuntimeConfigs);
   const defaultRuntime = buildRuntimeForMode(
     defaultRuntimeMode,
-    { host: defaultSshHost, coder: defaultSshCoder },
+    {
+      host: defaultSshHost,
+      coder: defaultSshCoder,
+      daytona: daytonaDefault ? daytonaConfigFallback : undefined,
+    },
     defaultDockerImage,
     lastShareCredentials,
     defaultDevcontainerConfigPath,
@@ -440,7 +484,10 @@ export function useDraftWorkspaceSettings(
       devcontainerShareCredentials: lastDevcontainerShareCredentials,
     });
 
-    getCreationDraftStore().updateExecution(draftId, { runtime: mergedRuntime });
+    getCreationDraftStore().updateExecution(draftId, {
+      runtime: mergedRuntime,
+      ...rememberedDaytonaPatch(mergedRuntime),
+    });
 
     // Persist host/image/coder so they're remembered when switching modes.
     // Avoid wiping the remembered value when the UI switches modes with an empty field.
@@ -484,11 +531,17 @@ export function useDraftWorkspaceSettings(
       reasoningMode,
       agentId,
       selectedRuntime,
-      defaultRuntimeMode: defaultRuntimeChoice,
+      // Defaults must stay explicit and sticky; last-used SSH state should only seed inputs.
+      defaultRuntimeMode: resolveDefaultRuntimeChoice(
+        settingsDefaultRuntime,
+        defaultRuntimeMode,
+        coderDefaultFromString
+      ),
       trunkBranch,
     },
     coderConfigFallback,
     sshHostFallback,
+    daytonaConfigFallback,
     setSelectedRuntime,
     setTrunkBranch,
     getRuntimeString,

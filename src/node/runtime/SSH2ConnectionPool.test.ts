@@ -14,6 +14,7 @@ import {
 } from "./SSH2ConnectionPool";
 import type { SSHConnectionConfig } from "./sshConnectionPool";
 import { SSH2Transport } from "./transports/SSH2Transport";
+import { DaytonaSshConfigWriter } from "./daytonaSshConfig";
 
 const PROXY_TOKENS = { host: "example.test", port: 2222, user: "alice" };
 
@@ -112,8 +113,11 @@ describe.skipIf(process.platform === "win32")(
     // ECDSA keys: ssh2's ed25519 generator emits an unparseable key ~0.4% of the time under Bun.
     const newPrivateKey = () => utils.generateKeyPairSync("ecdsa", { bits: 256 }).private;
 
-    async function startServer(onConnection: ConstructorParameters<typeof Server>[1]) {
-      const server = new Server({ hostKeys: [newPrivateKey()] }, onConnection);
+    async function startServer(
+      onConnection: ConstructorParameters<typeof Server>[1],
+      hostKey = newPrivateKey()
+    ) {
+      const server = new Server({ hostKeys: [hostKey] }, onConnection);
       await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh2-pool-"));
       const identityFile = path.join(dir, "id_ecdsa");
@@ -173,6 +177,187 @@ describe.skipIf(process.platform === "win32")(
       const { waits, result } = acquire(pool, config, 2_500);
       expect(String(await result)).toContain("ECONNREFUSED");
       expect(waits.length).toBeGreaterThan(0);
+    });
+
+    const publicKeyLine = (privateKey: string) => {
+      const parsed = utils.parseKey(privateKey);
+      if (parsed instanceof Error) throw parsed;
+      return `${parsed.type} ${parsed.getPublicSSH().toString("base64")}`;
+    };
+
+    /** A home whose ssh config is `userConfig` plus Xum's Daytona block for sb-1 at `port`. */
+    async function withDaytonaHome(
+      userConfig: string,
+      fn: (writer: DaytonaSshConfigWriter, home: string) => Promise<void>
+    ): Promise<void> {
+      const home = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh2-daytona-home-"));
+      // The ssh config parser reads USERPROFILE first (sshConfigParser.test.ts does the same).
+      const originalUserProfile = process.env.USERPROFILE;
+      process.env.USERPROFILE = home;
+      try {
+        const sshConfigPath = path.join(home, ".ssh", "config");
+        await fs.mkdir(path.dirname(sshConfigPath));
+        await fs.writeFile(sshConfigPath, userConfig);
+        // A space, as in "/Users/John Smith": daytonaSshConfig quotes the paths.
+        const writer = new DaytonaSshConfigWriter({
+          xumHome: path.join(home, "John Smith", ".xum"),
+          sshConfigPath,
+        });
+        await fn(writer, home);
+      } finally {
+        if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = originalUserProfile;
+        await fs.rm(home, { recursive: true, force: true });
+      }
+    }
+
+    // ssh2 reads no known_hosts: without this check a Daytona alias accepted any gateway key.
+    it("connects to a Daytona alias only when the gateway key matches the pinned one", async () => {
+      const hostKey = newPrivateKey();
+      const { config } = await startServer((conn) => {
+        conn.on("authentication", (ctx) => ctx.accept());
+        conn.on("error", () => undefined);
+      }, hostKey);
+      await withDaytonaHome("", async (writer) => {
+        const gateway = { host: "127.0.0.1", port: config.port ?? 22 };
+        const daytona: SSHConnectionConfig = {
+          host: "sb-1.xum--daytona",
+          identityFile: config.identityFile,
+        };
+
+        await writer.writeSandbox({
+          sandboxId: "sb-1",
+          token: "tokenA",
+          gateway: { ...gateway, hostKeys: [publicKeyLine(newPrivateKey())] },
+        });
+        const refused = await new SSH2ConnectionPool()
+          .acquireConnection(daytona, { maxWaitMs: 0 })
+          .then(
+            () => new Error("acquisition unexpectedly succeeded"),
+            (error: unknown) => error
+          );
+        expect(String(refused)).toContain("Host denied");
+
+        await writer.repointGateway({ ...gateway, hostKeys: [publicKeyLine(hostKey)] });
+        const entry = await new SSH2ConnectionPool().acquireConnection(daytona, { maxWaitMs: 0 });
+        entry.client.end();
+      });
+    });
+
+    // A user directive with %r would get the token, and ProxyCommand could route anywhere.
+    it("runs no user ssh config directive for a Daytona alias, only for other hosts", async () => {
+      const hostKey = newPrivateKey();
+      const { config } = await startServer((conn) => {
+        conn.on("authentication", (ctx) => ctx.accept());
+        conn.on("error", () => undefined);
+      }, hostKey);
+      const marker = path.join(os.tmpdir(), `xum-ssh2-ran-${String(process.pid)}-${Date.now()}`);
+      const plainHost = [
+        "Host plain-host",
+        "  HostName 127.0.0.1",
+        `  Port ${String(config.port)}`,
+        "  User plainuser",
+        "",
+      ].join("\n");
+      for (const userConfig of [
+        `Host *\n  ProxyCommand sh -c 'echo %r >> ${marker}; exit 1'\n${plainHost}`,
+        `Match host 127.0.0.1 !exec "echo %r >> ${marker}"\n${plainHost}`,
+      ]) {
+        await withDaytonaHome(userConfig, async (writer) => {
+          await writer.writeSandbox({
+            sandboxId: "sb-1",
+            token: "tokenA",
+            gateway: {
+              host: "127.0.0.1",
+              port: config.port ?? 22,
+              hostKeys: [publicKeyLine(hostKey)],
+            },
+          });
+
+          const entry = await new SSH2ConnectionPool().acquireConnection(
+            { host: "sb-1.xum--daytona", identityFile: config.identityFile },
+            { maxWaitMs: 0 }
+          );
+          entry.client.end();
+          expect(await Bun.file(marker).exists()).toBe(false);
+
+          await new SSH2ConnectionPool()
+            .acquireConnection(
+              { host: "plain-host", identityFile: config.identityFile },
+              { maxWaitMs: 0 }
+            )
+            .then(
+              (plain) => plain.client.end(),
+              () => undefined
+            );
+          expect(await fs.readFile(marker, "utf8")).toContain("plainuser");
+          await fs.rm(marker);
+        });
+      }
+    });
+
+    it("a retired connection carries no new work and closes once its channels do", async () => {
+      const { config } = await startServer((conn) => {
+        conn.on("authentication", (ctx) => ctx.accept());
+        conn.on("error", () => undefined);
+      });
+      const pool = new SSH2ConnectionPool();
+      const first = await pool.acquireConnection(config);
+      const slot = pool.reserveChannel(config, first);
+      let closed = false;
+      const firstClosed = new Promise<void>((resolve) =>
+        first.client.once("close", () => {
+          closed = true;
+          resolve();
+        })
+      );
+
+      pool.retireConnection(config);
+      const second = await pool.acquireConnection(config, { maxWaitMs: 0 });
+      expect(second === first).toBe(false);
+      // A command still running on it keeps it open.
+      expect(closed).toBe(false);
+      slot.release();
+      await firstClosed;
+      second.client.end();
+    });
+
+    it("never pools a connection that was still connecting when its host was retired", async () => {
+      // The first connection's authentication waits until the test lets it through.
+      let releaseFirst!: () => void;
+      const firstAuth = new Promise<void>((resolve) => (releaseFirst = resolve));
+      const serverConns: Array<{ closed: boolean }> = [];
+      const { config } = await startServer((conn) => {
+        const record = { closed: false };
+        serverConns.push(record);
+        const held = serverConns.length === 1 ? firstAuth : Promise.resolve();
+        conn.on("authentication", (ctx) => void held.then(() => ctx.accept()));
+        conn.on("close", () => (record.closed = true));
+        conn.on("error", () => undefined);
+      });
+      const pool = new SSH2ConnectionPool();
+
+      // Joined by both waiters, then retired (a settings change) before it authenticates.
+      const waiters = [
+        pool.acquireConnection(config),
+        pool.acquireConnection(config, { maxWaitMs: 0 }),
+      ];
+      const settle = async (done: () => boolean) => {
+        for (let i = 0; i < 400 && !done(); i++) await new Promise((r) => setTimeout(r, 5));
+      };
+      await settle(() => serverConns.length > 0);
+      pool.retireConnection(config);
+      releaseFirst();
+      const [a, b] = await Promise.all(waiters);
+
+      // Both got the connection made after the retirement; the old one was closed.
+      expect(a).toBe(b);
+      expect(serverConns).toHaveLength(2);
+      await settle(() => serverConns[0].closed);
+      expect(serverConns[0].closed).toBe(true);
+      expect(serverConns[1].closed).toBe(false);
+      expect(await pool.acquireConnection(config)).toBe(a);
+      a.client.end();
     });
 
     it("a retired client's late error does not put the host into backoff", async () => {

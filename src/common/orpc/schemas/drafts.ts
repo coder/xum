@@ -4,6 +4,7 @@ import { ServiceTierSchema } from "@/common/config/schemas/providersConfig";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "@/common/types/thinking";
 import { AgentDefinitionScopeSchema } from "./agentDefinition";
 import { CoderWorkspaceConfigSchema } from "./coder";
+import { DaytonaSandboxConfigSchema } from "./daytona";
 import { SendIdSchema, SendMessageOptionsSchema } from "./stream";
 
 /**
@@ -257,6 +258,7 @@ const ParsedRuntimeSchema = z.discriminatedUnion("mode", [
     mode: z.literal("ssh"),
     host: z.string(),
     coder: CoderWorkspaceConfigSchema.optional(),
+    daytona: DaytonaSandboxConfigSchema.optional(),
   }),
   z.object({
     mode: z.literal("docker"),
@@ -278,6 +280,11 @@ export const CreationDraftExecutionSchema = z.object({
   agent: z.object({ id: z.string().min(1), scope: AgentDefinitionScopeSchema }).nullable(),
   runtime: ParsedRuntimeSchema.nullable(),
   trunkBranch: z.string().nullable(),
+  /**
+   * The draft's last Daytona choice (a snapshot, a size), restored when
+   * the user switches to another runtime and back. Never written to the project defaults.
+   */
+  lastDaytona: DaytonaSandboxConfigSchema.optional(),
 });
 
 /**

@@ -6,6 +6,9 @@ import {
   isSSHRuntime,
   type RuntimeConfig,
 } from "@/common/types/runtime";
+import { Err, Ok, type Result } from "@/common/types/result";
+import { getErrorMessage } from "@/common/utils/errors";
+import { hasInheritedRemoteForward } from "./daytonaSshConfig";
 import type { Runtime } from "./Runtime";
 import { createRuntime } from "./runtimeFactory";
 
@@ -161,4 +164,45 @@ export function createRuntimeForWorkspace(metadata: WorkspaceMetadataForRuntime)
     workspacePath: metadata.namedWorkspacePath,
     workspaceId: metadata.id,
   });
+}
+
+/**
+ * A Daytona sandbox may be stopped, or its token (the ssh user name) due for refresh: bring it
+ * up before something outside Xum (a native terminal, an external editor) connects to its ssh
+ * alias. Only explicit user actions call this, so starting a stopped sandbox is fine. A no-op
+ * for every other runtime.
+ */
+export async function ensureDaytonaSandboxReady(
+  metadata: WorkspaceMetadataForRuntime
+): Promise<Result<void>> {
+  if (!isSSHRuntime(metadata.runtimeConfig) || !metadata.runtimeConfig.daytona) {
+    return Ok(undefined);
+  }
+  const ready = await createRuntimeForWorkspace(metadata).ensureReady({ externalSshClient: true });
+  return ready.ready ? Ok(undefined) : Err(ready.error);
+}
+
+/**
+ * An external editor reads the user's ssh config for a Daytona alias (Xum's own ssh does not),
+ * and a RemoteForward there would give the untrusted sandbox a tunnel to a local service: such
+ * an open is refused. Fails closed when ssh cannot resolve the alias. A no-op for every other
+ * runtime.
+ */
+export async function refuseDaytonaEditorRemoteForward(
+  runtimeConfig: WorkspaceMetadataForRuntime["runtimeConfig"]
+): Promise<Result<void>> {
+  if (!isSSHRuntime(runtimeConfig) || !runtimeConfig.daytona) return Ok(undefined);
+  let forwarded: boolean;
+  try {
+    forwarded = await hasInheritedRemoteForward(runtimeConfig.host);
+  } catch (error) {
+    return Err(`${getErrorMessage(error)}; not opening an editor on the Daytona sandbox.`);
+  }
+  return forwarded
+    ? Err(
+        "A RemoteForward in your SSH config applies to Daytona sandboxes, so the editor would " +
+          "open a tunnel from the sandbox to this machine. Scope it to the hosts that need it " +
+          "(a narrower Host entry) and open the editor again."
+      )
+    : Ok(undefined);
 }

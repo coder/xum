@@ -28,6 +28,68 @@ import {
   withSshBackoffJitter,
 } from "./sshBackoff";
 import { isPermanentSSHFailure } from "./Runtime";
+import { isXumDaytonaHost } from "@/common/constants/daytona";
+import { getDaytonaSshConfigPath } from "./daytonaSshConfig";
+
+/**
+ * Daytona aliases pin the gateway key in Xum's own known_hosts (UserKnownHostsFile in the
+ * include block). ssh2 reads no known_hosts, so check the server key against those lines here.
+ * Fails closed: no readable pinned key for the gateway accepts no server.
+ */
+async function createPinnedHostKeyVerifier(
+  resolved: Pick<ResolvedSSHConfig, "hostName" | "port" | "userKnownHostsFile" | "hostKeyAlias">
+): Promise<(key: Buffer) => boolean> {
+  const content = await readPinnedKnownHosts(resolved.userKnownHostsFile);
+  const lookupHost = resolved.hostKeyAlias ?? resolved.hostName;
+  const pinned = parsePinnedHostKeys(
+    content,
+    new Set([lookupHost, `[${lookupHost}]:${resolved.port}`])
+  );
+  return (key) => pinned.some((pinnedKey) => pinnedKey.equals(key));
+}
+
+/** Unreadable or unset reads as empty: no pinned key, so no server is accepted. */
+async function readPinnedKnownHosts(file: string | undefined): Promise<string> {
+  if (!file) return "";
+  try {
+    return await fs.readFile(file, "utf8");
+  } catch (error) {
+    log.warn("Could not read the pinned known_hosts of a Daytona gateway", {
+      file,
+      error: getErrorMessage(error),
+    });
+    return "";
+  }
+}
+
+/** The keys of the known_hosts lines whose (unhashed) host field names one of `hostPatterns`. */
+function parsePinnedHostKeys(content: string, hostPatterns: ReadonlySet<string>): Buffer[] {
+  const pinned: Buffer[] = [];
+  for (const line of content.split("\n")) {
+    const [hosts, , key] = line.trim().split(/\s+/);
+    if (!hosts || !key || hosts.startsWith("#")) continue;
+    if (hosts.split(",").some((host) => hostPatterns.has(host))) {
+      pinned.push(Buffer.from(key, "base64"));
+    }
+  }
+  return pinned;
+}
+
+// TODO(ethanndickson): Implement known_hosts support for SSH2 and restore interactive host key
+// verification once approvals can be persisted between connections.
+function createHostVerifier(
+  host: string,
+  resolved: Parameters<typeof createPinnedHostKeyVerifier>[0]
+): Promise<(key: Buffer) => boolean> {
+  return isXumDaytonaHost(host)
+    ? createPinnedHostKeyVerifier(resolved)
+    : Promise.resolve(() => true);
+}
+
+/** As OpenSSH's `-F` (appendDaytonaOpenSSHArgs): a Daytona alias reads Xum's include file alone. */
+function sshConfigFileFor(host: string): string | undefined {
+  return isXumDaytonaHost(host) ? getDaytonaSshConfigPath() : undefined;
+}
 
 let sshPromptService: SshPromptService | undefined;
 
@@ -55,6 +117,8 @@ interface SSH2ConnectionEntry {
   idleTimer?: ReturnType<typeof setTimeout>;
   /** Exec/shell channels still open on this connection (see trackChannel). */
   openChannels: number;
+  /** Out of the pool (retireConnection): it closes when its last channel does. */
+  retired?: boolean;
 }
 
 /**
@@ -305,10 +369,20 @@ async function resolvePrivateKeys(identityFiles: string[]): Promise<Buffer[]> {
   return keys;
 }
 
+/** A pooled connect whose host was retired (retireConnection) before it finished. */
+class RetiredConnectError extends Error {
+  constructor(key: string) {
+    super(`SSH connection ${key} was retired while it connected`);
+    this.name = "RetiredConnectError";
+  }
+}
+
 export class SSH2ConnectionPool {
   private health = new Map<string, ConnectionHealth>();
   private inflight = new Map<string, Promise<SSH2ConnectionEntry>>();
   private connections = new Map<string, SSH2ConnectionEntry>();
+  /** Bumped by retireConnection: a connect that started before then is never pooled. */
+  private retirements = new Map<string, number>();
   private idleTimeoutMs = IDLE_TIMEOUT_MS;
 
   async acquireConnection(
@@ -372,20 +446,11 @@ export class SSH2ConnectionPool {
         throw budgetExceeded;
       }
 
-      let inflight = this.inflight.get(key);
-      if (!inflight) {
-        // The connect is shared, so it takes no caller's abort signal: one caller aborting
-        // must not fail every waiter (#5101). Each caller races only its own wait against its
-        // abort and budget below. A connect nobody waits for any more still finishes (bounded
-        // by readyTimeout) and is cached, then closes after the idle timeout like any other.
-        inflight = this.connect(config, timeoutMs);
-        this.inflight.set(key, inflight);
-        // Attach no-op catch to prevent unhandled rejection when singleflighted
-        // promise rejects before any caller awaits it. Actual errors are
-        // propagated to callers via the await below.
-        // eslint-disable-next-line @typescript-eslint/no-empty-function
-        void inflight.catch(() => {}).finally(() => this.inflight.delete(key));
-      }
+      // The connect is shared, so it takes no caller's abort signal: one caller aborting
+      // must not fail every waiter (#5101). Each caller races only its own wait against its
+      // abort and budget below. A connect nobody waits for any more still finishes (bounded
+      // by readyTimeout) and is cached, then closes after the idle timeout like any other.
+      const inflight = this.inflight.get(key) ?? this.startConnect(key, config, timeoutMs);
 
       try {
         const entry = await waitForAbortable(
@@ -436,6 +501,11 @@ export class SSH2ConnectionPool {
       backoffUntil: new Date(Date.now() + backoffSeconds * 1000),
       lastSuccess: current?.lastSuccess,
     });
+  }
+
+  /** The credentials changed (a replaced Daytona token): the next acquire connects at once. */
+  forgetHealth(config: SSHConnectionConfig): void {
+    this.health.delete(makeConnectionKey(config));
   }
 
   /**
@@ -500,6 +570,8 @@ export class SSH2ConnectionPool {
       // dead client only held the event loop open until it fired as a no-op (#5507).
       if (entry.openChannels === 0 && this.connections.get(key) === entry) {
         this.touchConnection(entry, key);
+      } else if (entry.openChannels === 0 && entry.retired) {
+        this.endClient(entry);
       }
     };
     return {
@@ -531,18 +603,79 @@ export class SSH2ConnectionPool {
     }
 
     this.connections.delete(key);
+    this.endClient(entry);
+  }
 
+  /**
+   * The host's credentials or gateway changed (Daytona settings, a moved gateway): later
+   * acquires connect anew instead of reusing this client. Commands still running on it finish;
+   * it closes with its last channel.
+   */
+  retireConnection(config: SSHConnectionConfig): void {
+    const key = makeConnectionKey(config);
+    this.health.delete(key);
+    // A connect in flight may authenticate with the old credentials: it closes instead of
+    // joining the pool, and its waiters get a fresh one (startConnect).
+    this.retirements.set(key, this.retirementOf(key) + 1);
+    const entry = this.connections.get(key);
+    if (!entry) return;
+    this.connections.delete(key);
+    if (entry.idleTimer) clearTimeout(entry.idleTimer);
+    entry.retired = true;
+    if (entry.openChannels === 0) this.endClient(entry);
+  }
+
+  /** The shared connect of `key`, connecting once more for its waiters if a retirement overtook it. */
+  private startConnect(
+    key: string,
+    config: SSHConnectionConfig,
+    timeoutMs: number
+  ): Promise<SSH2ConnectionEntry> {
+    const started = this.connect(config, timeoutMs).catch((error: unknown) => {
+      if (error instanceof RetiredConnectError) return this.connect(config, timeoutMs);
+      throw error;
+    });
+    this.inflight.set(key, started);
+    // Attach no-op catch to prevent unhandled rejection when singleflighted
+    // promise rejects before any caller awaits it. Actual errors are
+    // propagated to callers via the await in acquireConnection.
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
+    void started.catch(() => {}).finally(() => this.inflight.delete(key));
+    return started;
+  }
+
+  private retirementOf(key: string): number {
+    return this.retirements.get(key) ?? 0;
+  }
+
+  /** A connect that started before its host was retired closes instead of joining the pool. */
+  private throwIfRetiredSince(key: string, retirement: number, entry: SSH2ConnectionEntry): void {
+    if (this.retirementOf(key) === retirement) return;
+    this.endClient(entry);
+    throw new RetiredConnectError(key);
+  }
+
+  /** A retired connect says nothing about the host's health. */
+  private reportConnectFailure(config: SSHConnectionConfig, error: unknown): void {
+    if (!(error instanceof RetiredConnectError)) this.reportFailure(config, getErrorMessage(error));
+  }
+
+  private endClient(entry: SSH2ConnectionEntry): void {
     try {
       entry.client.end();
-    } catch {
-      // Ignore errors closing the connection
+    } catch (error) {
+      log.debug("Ignoring an error while closing an ssh2 connection", {
+        error: getErrorMessage(error),
+      });
     }
 
     if (entry.proxyProcess?.exitCode === null) {
       try {
         entry.proxyProcess.kill();
-      } catch {
-        // Ignore errors killing proxy
+      } catch (error) {
+        log.debug("Ignoring an error while killing an ssh2 ProxyCommand", {
+          error: getErrorMessage(error),
+        });
       }
     }
   }
@@ -567,8 +700,9 @@ export class SSH2ConnectionPool {
     mode: "pooled" | "dedicated" = "pooled"
   ): Promise<SSH2ConnectionEntry> {
     const key = makeConnectionKey(config);
+    const retirement = this.retirementOf(key);
     try {
-      const resolved = await resolveSSHConfig(config.host);
+      const resolved = await resolveSSHConfig(config.host, sshConfigFileFor(config.host));
       const resolvedConfig: ResolvedSSHConfig = {
         ...resolved,
         port: config.port ?? resolved.port,
@@ -584,6 +718,7 @@ export class SSH2ConnectionPool {
           ? baseIdentityFiles
           : DEFAULT_IDENTITY_FILES.map((file) => expandLocalPath(file));
       const username = resolvedConfig.user ?? getDefaultUsername();
+      const hostVerifier = await createHostVerifier(config.host, resolvedConfig);
       const proxyTokens = {
         host: resolvedConfig.hostName,
         port: resolvedConfig.port,
@@ -761,10 +896,7 @@ export class SSH2ConnectionPool {
               keepaliveInterval: 5000,
               keepaliveCountMax: 2,
               ...(privateKey ? { privateKey } : {}),
-              // TODO(ethanndickson): Implement known_hosts support for SSH2
-              // and restore interactive host key verification once approvals
-              // can be persisted between connections.
-              hostVerifier: () => true,
+              hostVerifier,
             };
 
             client.connect(connectOptions);
@@ -774,6 +906,7 @@ export class SSH2ConnectionPool {
           // `registered` also keeps a dedicated client's later errors out of the host health.
           registered = true;
           if (mode === "dedicated") return entry;
+          this.throwIfRetiredSince(key, retirement, entry);
           this.connections.set(key, entry);
           entry.idleTimer = setTimeout(() => {
             this.closeIdleConnection(key, entry);
@@ -810,7 +943,7 @@ export class SSH2ConnectionPool {
       const agentForFallback = shouldTryAgentOnly ? undefined : agent;
       return await attemptConnection(fallbackIdentityFiles, agentForFallback);
     } catch (error) {
-      this.reportFailure(config, getErrorMessage(error));
+      this.reportConnectFailure(config, error);
       throw error;
     }
   }

@@ -60,6 +60,7 @@ import type { DevToolsService } from "@/node/services/devToolsService";
 import type { ReviewStateService } from "@/node/services/reviewStateService";
 import type { DraftService } from "@/node/services/draftService";
 import type { CoderService } from "@/node/services/coderService";
+import type { DaytonaService } from "@/node/services/daytona/daytonaService";
 import type { ServerAuthService } from "@/node/services/serverAuthService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
@@ -135,6 +136,7 @@ export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   browserControlService: BrowserControlService;
   browserSessionStateHub: BrowserSessionStateHub;
   coderService: CoderService;
+  daytonaService: DaytonaService;
   serverAuthService: ServerAuthService;
   sshPromptService: SshPromptService;
   analyticsService: AnalyticsService;

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { createTestApiClient } from "@/browser/testUtils";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { RuntimeStatusEvent } from "@/common/types/stream";
 import { RuntimeStatusStore, type RuntimeStatus } from "./RuntimeStatusStore";
 
 const DEVCONTAINER_RUNTIME = {
@@ -133,5 +134,49 @@ describe("RuntimeStatusStore refresh triggers (#5573)", () => {
     await settle();
 
     expect(getRuntimeStatuses).toHaveBeenCalledTimes(calls);
+  });
+
+  test("a turn that starts a displayed Daytona sandbox refetches when the start begins and ends", async () => {
+    await setupDisplayed(
+      new Map([
+        [
+          "ws-1",
+          createMetadata("ws-1", {
+            runtimeConfig: {
+              type: "ssh",
+              host: "sb-1.xum--daytona",
+              srcBaseDir: "~/mux",
+              daytona: { sandboxId: "sb-1" },
+            },
+          }),
+        ],
+      ])
+    );
+    let emit: (event: RuntimeStatusEvent) => void = () => undefined;
+    store.subscribeToRuntimeStatusEvents((listener) => {
+      emit = listener;
+      return () => undefined;
+    });
+    const runtimeEvent = (phase: RuntimeStatusEvent["phase"]): RuntimeStatusEvent => ({
+      type: "runtime-status",
+      workspaceId: "ws-1",
+      phase,
+      runtimeType: "ssh",
+      source: "runtime",
+    });
+
+    // A turn on a running sandbox: nothing changed.
+    emit(runtimeEvent("checking"));
+    emit(runtimeEvent("ready"));
+    await settle();
+    expect(getRuntimeStatuses).toHaveBeenCalledTimes(1);
+
+    emit(runtimeEvent("starting"));
+    await settle();
+    expect(getRuntimeStatuses).toHaveBeenCalledTimes(2);
+
+    emit(runtimeEvent("ready"));
+    await settle();
+    expect(getRuntimeStatuses).toHaveBeenCalledTimes(3);
   });
 });

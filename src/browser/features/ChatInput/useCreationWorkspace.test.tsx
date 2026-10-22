@@ -12,6 +12,7 @@ import {
 } from "@/browser/utils/aiSelectionIntent";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as RouterContextModule from "@/browser/contexts/RouterContext";
@@ -794,6 +795,42 @@ describe("useCreationWorkspace", () => {
       await waitFor(() => expect(resultRef.current?.branches).toEqual(["main", "next"]));
       expect(resultRef.current?.branchLoad).toBe("loaded");
     });
+  });
+
+  test("reloads runtime availability when Daytona access is saved in Settings", async () => {
+    setupWindow();
+    const previous = currentORPCClient;
+    if (!previous) throw new Error("setupWindow() sets the client");
+    let daytonaAvailable = false;
+    currentORPCClient = {
+      ...previous,
+      projects: {
+        ...previous.projects,
+        runtimeAvailability: async (input) => ({
+          ...(await previous.projects.runtimeAvailability(input)),
+          daytona: daytonaAvailable
+            ? { available: true }
+            : { available: false, reason: "Set a Daytona API key" },
+        }),
+      },
+    };
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+    });
+    const daytonaStatus = () => {
+      const state = getHook().runtimeAvailabilityState;
+      return state.status === "loaded" ? state.data.daytona?.available : undefined;
+    };
+    await waitFor(() => expect(daytonaStatus()).toBe(false));
+
+    // Settings covers the creation view, which stays mounted while the key is saved.
+    daytonaAvailable = true;
+    act(() => {
+      window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.DAYTONA_CONFIG_CHANGED));
+    });
+
+    await waitFor(() => expect(daytonaStatus()).toBe(true));
   });
 
   test("loads branches when projectPath is provided", async () => {

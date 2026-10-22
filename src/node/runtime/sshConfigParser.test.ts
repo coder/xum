@@ -1,7 +1,27 @@
+import { spawnSync } from "child_process";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
+import { XUM_DAYTONA_SSH_BLOCK_START } from "@/common/constants/daytona";
+import { DaytonaSshConfigWriter } from "./daytonaSshConfig";
 import { resolveSSHConfig } from "./sshConfigParser";
+
+const hasOpenSsh = spawnSync("ssh", ["-V"]).status === 0;
+
+/** What OpenSSH resolves for `host` from `configPath` alone: the parity reference. */
+function opensshOptions(configPath: string, host: string) {
+  const output = spawnSync("ssh", ["-G", "-F", configPath, host], { encoding: "utf8" }).stdout;
+  return (key: string) =>
+    output
+      .split("\n")
+      .find((line) => line.startsWith(`${key} `))
+      ?.slice(key.length + 1);
+}
+
+function opensshUserAndProxy(configPath: string, host: string) {
+  const value = opensshOptions(configPath, host);
+  return { user: value("user"), proxyCommand: value("proxycommand") };
+}
 
 describe("resolveSSHConfig", () => {
   test("applies Host + Match host proxy rules", async () => {
@@ -82,5 +102,543 @@ describe("resolveSSHConfig", () => {
 
       await fs.rm(tempDir, { recursive: true, force: true });
     }
+  });
+
+  async function withTempHome(fn: (homeDir: string) => Promise<void>): Promise<void> {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-ssh-config-"));
+    const previousUserProfile = process.env.USERPROFILE;
+    process.env.USERPROFILE = tempDir;
+    try {
+      await fs.mkdir(path.join(tempDir, ".ssh"), { recursive: true });
+      await fn(tempDir);
+    } finally {
+      if (previousUserProfile === undefined) {
+        delete process.env.USERPROFILE;
+      } else {
+        process.env.USERPROFILE = previousUserProfile;
+      }
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  test("resolves a Daytona sandbox through the managed Host-scoped Include", async () => {
+    await withTempHome(async (homeDir) => {
+      await fs.writeFile(path.join(homeDir, ".ssh", "config"), "Host work\n  User me\n", "utf8");
+      const writer = new DaytonaSshConfigWriter({
+        xumHome: path.join(homeDir, ".xum"),
+        sshConfigPath: path.join(homeDir, ".ssh", "config"),
+      });
+      await writer.writeSandbox({
+        sandboxId: "sb-1",
+        token: "tokenA",
+        gateway: { host: "ssh.daytona.test", port: 2222, hostKeys: ["ssh-ed25519 AAAA"] },
+      });
+
+      const resolved = await resolveSSHConfig("sb-1.xum--daytona");
+
+      expect(resolved.user).toBe("tokenA");
+      expect(resolved.hostName).toBe("ssh.daytona.test");
+      expect(resolved.port).toBe(2222);
+      expect((await resolveSSHConfig("work")).user).toBe("me");
+    });
+  });
+
+  // The Daytona block goes first in the file; the user's global options, top-level Include and
+  // Host entries after it must resolve as they did before for every other host.
+  test("resolves other hosts the same after Xum puts its Daytona block on top", async () => {
+    await withTempHome(async (homeDir) => {
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.mkdir(path.join(homeDir, ".ssh", "conf.d"));
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "conf.d", "team.conf"),
+        "Host team-*\n  User teamuser\n  Port 2200\n",
+        "utf8"
+      );
+      await fs.writeFile(
+        configPath,
+        [
+          "User globaluser",
+          "ServerAliveInterval 30",
+          `Include ${path.join(homeDir, ".ssh", "conf.d", "*")}`,
+          "Host box",
+          "  HostName 10.0.0.1",
+          "  ProxyCommand nc %h %p",
+          "Host *",
+          "  Port 2222",
+          "  ForwardAgent yes",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+      const hosts = ["box", "team-a", "plain.example.com"];
+      const snapshot = async () =>
+        Promise.all(
+          hosts.map(async (host) => ({
+            parsed: await resolveSSHConfig(host),
+            openssh: hasOpenSsh
+              ? spawnSync("ssh", ["-G", "-F", configPath, host], { encoding: "utf8" }).stdout
+              : "",
+          }))
+        );
+      const before = await snapshot();
+
+      await new DaytonaSshConfigWriter({
+        xumHome: path.join(homeDir, ".xum"),
+        sshConfigPath: configPath,
+      }).writeSandbox({
+        sandboxId: "sb-1",
+        token: "tokenA",
+        gateway: { host: "ssh.daytona.test", port: 22, hostKeys: ["ssh-ed25519 AAAA"] },
+      });
+
+      expect((await fs.readFile(configPath, "utf8")).startsWith(XUM_DAYTONA_SSH_BLOCK_START)).toBe(
+        true
+      );
+      expect(await snapshot()).toEqual(before);
+      expect(before[0].parsed.user).toBe("globaluser");
+      expect(before[1].parsed.port).toBe(2200);
+      expect(before[2].parsed.port).toBe(2222);
+      expect((await resolveSSHConfig("sb-1.xum--daytona")).user).toBe("tokenA");
+    });
+  });
+
+  test("keeps a space in a quoted UserKnownHostsFile and splits unquoted files", async () => {
+    await withTempHome(async (homeDir) => {
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.writeFile(
+        configPath,
+        "Host plain\n  UserKnownHostsFile ~/kh1 ~/kh2\n" +
+          'Host quoted-first\n  UserKnownHostsFile "~/J S/kh" ~/kh2\n',
+        "utf8"
+      );
+      // Rendered as daytonaSshConfig does for a home dir like "/Users/John Smith".
+      const writer = new DaytonaSshConfigWriter({
+        xumHome: path.join(homeDir, "John Smith", ".xum"),
+        sshConfigPath: configPath,
+      });
+      await writer.writeSandbox({
+        sandboxId: "sb-1",
+        token: "tokenA",
+        gateway: { host: "ssh.daytona.test", port: 22, hostKeys: ["ssh-ed25519 AAAA"] },
+      });
+
+      expect((await resolveSSHConfig("sb-1.xum--daytona")).userKnownHostsFile).toBe(
+        writer.paths.knownHostsPath
+      );
+      expect((await resolveSSHConfig("plain")).userKnownHostsFile).toBe(path.join(homeDir, "kh1"));
+      expect((await resolveSSHConfig("quoted-first")).userKnownHostsFile).toBe(
+        path.join(homeDir, "J S", "kh")
+      );
+    });
+  });
+
+  test("resolves relative and wildcard Includes and keeps later lines in the enclosing block", async () => {
+    await withTempHome(async (homeDir) => {
+      await fs.mkdir(path.join(homeDir, ".ssh", "conf.d"));
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "conf.d", "10-box.conf"),
+        // Lines before the first Host apply to the enclosing block, as in OpenSSH.
+        "HostName 10.0.0.5\nHost other\n  User otheruser\n",
+        "utf8"
+      );
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        ["Host box", "  Include conf.d/*.conf", "  User boxuser", ""].join("\n"),
+        "utf8"
+      );
+
+      const resolved = await resolveSSHConfig("box");
+
+      expect(resolved.hostName).toBe("10.0.0.5");
+      expect(resolved.user).toBe("boxuser");
+    });
+  });
+
+  // OpenSSH globs an Include's whole pathname (glob(3), sorted), not only its file name.
+  test("reads every file an Include's directory wildcard matches, in sorted order", async () => {
+    await withTempHome(async (homeDir) => {
+      // Written out of order: the sorted first match sets HostName (the first value wins).
+      for (const [dir, hostName] of [
+        ["b", "10.0.0.2"],
+        ["a", "10.0.0.1"],
+      ]) {
+        await fs.mkdir(path.join(homeDir, ".ssh", "conf.d", dir), { recursive: true });
+        await fs.writeFile(
+          path.join(homeDir, ".ssh", "conf.d", dir, "hosts.conf"),
+          `Host box\n  HostName ${hostName}\nHost only-${dir}\n  User user-${dir}\n`,
+          "utf8"
+        );
+      }
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        "Include conf.d/*/hosts.conf\n",
+        "utf8"
+      );
+
+      expect((await resolveSSHConfig("box")).hostName).toBe("10.0.0.1");
+      expect((await resolveSSHConfig("only-a")).user).toBe("user-a");
+      expect((await resolveSSHConfig("only-b")).user).toBe("user-b");
+    });
+  });
+
+  test("expands wildcards in several segments of an absolute Include path", async () => {
+    await withTempHome(async (homeDir) => {
+      const dir = path.join(homeDir, "teams", "team-1", "nested");
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "box.conf"), "Host box\n  User teamuser\n", "utf8");
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        `Include ${path.join(homeDir, "te?ms", "team-*", "nested", "*.conf")}\n`,
+        "utf8"
+      );
+
+      expect((await resolveSSHConfig("box")).user).toBe("teamuser");
+    });
+  });
+
+  test("includes nothing for an Include pattern no path matches", async () => {
+    await withTempHome(async (homeDir) => {
+      await fs.mkdir(path.join(homeDir, ".ssh", "conf.d", "a"), { recursive: true });
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "conf.d", "a", "hosts.conf"),
+        "Host box\n  User wrong\n",
+        "utf8"
+      );
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        ["Include conf.d/*/other.conf missing/*/hosts.conf", "Host box", "  User right", ""].join(
+          "\n"
+        ),
+        "utf8"
+      );
+
+      expect((await resolveSSHConfig("box")).user).toBe("right");
+    });
+  });
+
+  test("expands glob(3) bracket expressions in an Include path", async () => {
+    await withTempHome(async (homeDir) => {
+      const confDir = path.join(homeDir, ".ssh", "conf.d");
+      await fs.mkdir(confDir);
+      // Each file sets User for its own host; the pattern decides which ones are read.
+      for (const name of ["a", "b", "c", "m", "x", "[odd"]) {
+        await fs.writeFile(
+          path.join(confDir, `${name}.conf`),
+          `Host host-${name}\n  User user-${name}\n`,
+          "utf8"
+        );
+      }
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        [
+          "Include conf.d/[ab].conf conf.d/[k-n].conf conf.d/[!a-m].conf conf.d/[odd.conf",
+          "Host *",
+          "  User none",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+
+      const user = async (name: string) => (await resolveSSHConfig(`host-${name}`)).user;
+      expect(await user("a")).toBe("user-a");
+      expect(await user("b")).toBe("user-b");
+      expect(await user("m")).toBe("user-m");
+      expect(await user("x")).toBe("user-x");
+      // An unclosed "[" is a literal character.
+      expect(await user("[odd")).toBe("user-[odd");
+      expect(await user("c")).toBe("none");
+    });
+  });
+
+  // OpenSSH's glob(3) unescapes every segment, with or without a real wildcard in it.
+  test("reads an Include's escaped glob characters as the literal file names OpenSSH opens", async () => {
+    // Windows file names cannot hold "*" or "?".
+    if (process.platform === "win32") return;
+    await withTempHome(async (homeDir) => {
+      const confDir = path.join(homeDir, ".ssh", "conf.d");
+      await fs.mkdir(confDir);
+      const files = ["foo*", "foo?", "foo[", "foo\\", "fooX", "foo[*"];
+      for (const [i, name] of files.entries()) {
+        await fs.writeFile(path.join(confDir, name), `Host host-${i}\n  User user-${i}\n`);
+      }
+      const configPath = path.join(homeDir, ".ssh", "config");
+      // Four backslashes in the config text name one: the config parser and glob(3) each unescape.
+      const patterns = ["foo\\*", "foo\\?", "foo\\[", "foo\\\\\\\\", "fo\\o\\X", "foo[\\*"];
+      await fs.writeFile(
+        configPath,
+        `${patterns.map((pattern) => `Include ${confDir}/${pattern}`).join("\n")}\nHost *\n  User none\n`
+      );
+
+      for (const i of files.keys()) {
+        expect((await resolveSSHConfig(`host-${i}`)).user).toBe(`user-${i}`);
+        if (hasOpenSsh) expect(opensshOptions(configPath, `host-${i}`)("user")).toBe(`user-${i}`);
+      }
+    });
+  });
+
+  // glob(3) matches a leading "." with a literal one, escaped or not, never with a wildcard
+  // or a bracket expression.
+  test("matches dot files with an escaped leading dot in an Include pattern", async () => {
+    // Windows file names and paths differ (and the escape is a separator there).
+    if (process.platform === "win32") return;
+    await withTempHome(async (homeDir) => {
+      // Absolute: OpenSSH resolves a relative Include against the real user's ~/.ssh.
+      const confDir = path.join(homeDir, ".ssh", "conf.d");
+      await fs.mkdir(confDir);
+      for (const [name, host] of [
+        [".escaped.conf", "escaped"],
+        [".plain.conf", "plain"],
+        [".bracket.conf", "bracket"],
+      ]) {
+        await fs.writeFile(path.join(confDir, name), `Host ${host}\n  User user-${host}\n`, "utf8");
+      }
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.writeFile(
+        configPath,
+        [
+          `Include ${confDir}/\\.e*.conf ${confDir}/.p*.conf ${confDir}/[.]b*.conf`,
+          "Host *",
+          "  User none",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+
+      for (const [host, user] of [
+        ["escaped", "user-escaped"],
+        ["plain", "user-plain"],
+        ["bracket", "none"],
+      ]) {
+        expect((await resolveSSHConfig(host)).user).toBe(user);
+        if (hasOpenSsh) expect(opensshOptions(configPath, host)("user")).toBe(user);
+      }
+    });
+  });
+
+  test("matches an Include wildcard as glob(3) does: ? is one character, * skips dot files", async () => {
+    await withTempHome(async (homeDir) => {
+      const confDir = path.join(homeDir, ".ssh", "conf.d");
+      await fs.mkdir(confDir);
+      for (const [name, host] of [
+        ["1.conf", "one"],
+        ["12.conf", "two"],
+        [".hidden.conf", "hidden"],
+      ]) {
+        await fs.writeFile(path.join(confDir, name), `Host ${host}\n  User user-${host}\n`, "utf8");
+      }
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        ["Include conf.d/1?.conf conf.d/*hidden.conf", "Host *", "  User none", ""].join("\n"),
+        "utf8"
+      );
+
+      expect((await resolveSSHConfig("one")).user).toBe("none");
+      expect((await resolveSSHConfig("two")).user).toBe("user-two");
+      expect((await resolveSSHConfig("hidden")).user).toBe("none");
+    });
+  });
+
+  test("matches glob(3) named classes in an Include path; an unknown class matches nothing", async () => {
+    await withTempHome(async (homeDir) => {
+      const confDir = path.join(homeDir, ".ssh", "conf.d");
+      await fs.mkdir(confDir);
+      for (const [name, host] of [
+        ["1", "one"],
+        ["a", "letter"],
+      ]) {
+        await fs.writeFile(
+          path.join(confDir, `${name}.conf`),
+          `Host ${host}\n  User user-${host}\n`
+        );
+      }
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        [
+          "Include conf.d/[[:digit:]].conf conf.d/[[:bogus:]a].conf",
+          "Host *",
+          "  User none",
+          "",
+        ].join("\n")
+      );
+
+      expect((await resolveSSHConfig("one")).user).toBe("user-one");
+      expect((await resolveSSHConfig("letter")).user).toBe("none");
+    });
+  });
+
+  test("expands environment variables and local %-tokens in an Include path (OpenSSH 9.9+)", async () => {
+    const variable = "XUM_SSH_CONFIG_TEST_DIR";
+    await withTempHome(async (homeDir) => {
+      const confDir = path.join(homeDir, ".ssh", "conf.d");
+      await fs.mkdir(confDir);
+      process.env[variable] = confDir;
+      const unset = `\${XUM_SSH_CONFIG_TEST_UNSET}`;
+      await fs.mkdir(path.join(confDir, unset));
+      const files = [
+        ["env.conf", "env-host"],
+        ["home.conf", "home-host"],
+        ["named-host.conf", "named-host"],
+        // Only a literal reading of an unset variable or the port token finds these files.
+        [`${unset}/unset.conf`, "unset-host"],
+        ["%p.conf", "port-host"],
+      ];
+      for (const [file, host] of files) {
+        await fs.writeFile(path.join(confDir, file), `Host ${host}\n  User user-${host}\n`);
+      }
+      await fs.writeFile(
+        path.join(homeDir, ".ssh", "config"),
+        [
+          `Include \${${variable}}/env.conf %d/.ssh/conf.d/home.conf conf.d/%n.conf`,
+          `Include conf.d/${unset}/unset.conf conf.d/%p.conf`,
+          "Host *",
+          "  User none",
+          "",
+        ].join("\n")
+      );
+
+      try {
+        expect((await resolveSSHConfig("env-host")).user).toBe("user-env-host");
+        expect((await resolveSSHConfig("home-host")).user).toBe("user-home-host");
+        expect((await resolveSSHConfig("named-host")).user).toBe("user-named-host");
+        expect((await resolveSSHConfig("unset-host")).user).toBe("none");
+        expect((await resolveSSHConfig("port-host")).user).toBe("none");
+      } finally {
+        Reflect.deleteProperty(process.env, variable);
+      }
+    });
+  });
+
+  // OpenSSH 8.6+ splits config arguments with argv_split (misc.c): backslash escapes, quotes
+  // anywhere in an argument, and a # that starts an argument ends the line.
+  test("reads Include paths with escaped spaces and quotes as OpenSSH does", async () => {
+    await withTempHome(async (homeDir) => {
+      const sshDir = path.join(homeDir, ".ssh");
+      const files = {
+        a: path.join(sshDir, "conf dir", "a.conf"),
+        b: path.join(sshDir, 'say "hi"', "b.conf"),
+        c: path.join(sshDir, "single dir", "c.conf"),
+      };
+      for (const [host, file] of Object.entries(files)) {
+        await fs.mkdir(path.dirname(file), { recursive: true });
+        await fs.writeFile(file, `Host ${host}\n  User ${host}user\n`, "utf8");
+      }
+      const configPath = path.join(sshDir, "config");
+      await fs.writeFile(
+        configPath,
+        [
+          // Absolute: ssh -G resolves a relative Include against the real ~/.ssh.
+          `Include ${sshDir}/conf\\ dir/a.conf`,
+          `Include "${sshDir}/say \\"hi\\"/b.conf"`,
+          `Include ${sshDir}/'single dir'/c.conf # not a path`,
+          "Host *",
+          "  User fallback",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+
+      for (const host of ["a", "b", "c"]) {
+        expect((await resolveSSHConfig(host)).user).toBe(`${host}user`);
+        if (hasOpenSsh) {
+          expect(opensshUserAndProxy(configPath, host).user).toBe(`${host}user`);
+        }
+      }
+    });
+  });
+
+  test("applies an Include inside a Host block only to the hosts that block matches", async () => {
+    await withTempHome(async (homeDir) => {
+      const included = path.join(homeDir, ".ssh", "gated.conf");
+      await fs.writeFile(included, "Host *\n  User gateduser\n  ProxyCommand nc %h %p\n", "utf8");
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.writeFile(
+        configPath,
+        ["Host gated !gated-not", `  Include ${included}`, "Host *", "  User fallback", ""].join(
+          "\n"
+        ),
+        "utf8"
+      );
+
+      const resolve = async (host: string) => {
+        const { user, proxyCommand } = await resolveSSHConfig(host);
+        return { user, proxyCommand };
+      };
+      expect(await resolve("gated")).toEqual({ user: "gateduser", proxyCommand: "nc %h %p" });
+      for (const host of ["elsewhere", "gated-not"]) {
+        expect(await resolve(host)).toEqual({ user: "fallback", proxyCommand: undefined });
+      }
+      if (hasOpenSsh) {
+        for (const host of ["gated", "elsewhere", "gated-not"]) {
+          expect(await resolve(host)).toEqual(opensshUserAndProxy(configPath, host));
+        }
+      }
+    });
+  });
+
+  // OpenSSH restores the including file's scope when an Include returns.
+  test("keeps lines after a top-level Include global when the included file ends in a Host block", async () => {
+    await withTempHome(async (homeDir) => {
+      const included = path.join(homeDir, ".ssh", "inc.conf");
+      await fs.writeFile(included, "Host other\n  User otheruser\n", "utf8");
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.writeFile(configPath, `Include ${included}\nPort 2222\n`, "utf8");
+
+      expect((await resolveSSHConfig("target")).port).toBe(2222);
+      if (hasOpenSsh) expect(opensshOptions(configPath, "target")("port")).toBe("2222");
+    });
+  });
+
+  test("restores the includer's block after every file an Include reads", async () => {
+    await withTempHome(async (homeDir) => {
+      const incDir = path.join(homeDir, ".ssh", "inc");
+      await fs.mkdir(incDir);
+      await fs.writeFile(path.join(incDir, "a"), "Host other\n  User otheruser\n", "utf8");
+      await fs.writeFile(path.join(incDir, "b"), "Port 2222\n", "utf8");
+      const separate = path.join(homeDir, ".ssh", "c.conf");
+      await fs.writeFile(separate, "User cuser\n", "utf8");
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.writeFile(
+        configPath,
+        // One glob matching two files, then two arguments on one Include line.
+        ["Host target", `  Include ${incDir}/*`, `  Include ${incDir}/a ${separate}`, ""].join(
+          "\n"
+        ),
+        "utf8"
+      );
+
+      const resolved = await resolveSSHConfig("target");
+      expect(resolved.port).toBe(2222);
+      expect(resolved.user).toBe("cuser");
+      if (hasOpenSsh) {
+        const openssh = opensshOptions(configPath, "target");
+        expect(openssh("port")).toBe("2222");
+        expect(openssh("user")).toBe("cuser");
+      }
+    });
+  });
+
+  test("restores the includer's block after an Include nested in an included file", async () => {
+    await withTempHome(async (homeDir) => {
+      const inner = path.join(homeDir, ".ssh", "b.conf");
+      const outer = path.join(homeDir, ".ssh", "a.conf");
+      await fs.writeFile(inner, "Host other\n  User otheruser\n", "utf8");
+      await fs.writeFile(outer, `Include ${inner}\nUser x\n`, "utf8");
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.writeFile(
+        configPath,
+        ["Host target", `  Include ${outer}`, "Host *", "  User fallback", ""].join("\n"),
+        "utf8"
+      );
+
+      expect((await resolveSSHConfig("target")).user).toBe("x");
+      expect((await resolveSSHConfig("elsewhere")).user).toBe("fallback");
+      if (hasOpenSsh) {
+        for (const host of ["target", "elsewhere"]) {
+          expect((await resolveSSHConfig(host)).user).toBe(
+            opensshUserAndProxy(configPath, host).user
+          );
+        }
+      }
+    });
   });
 });

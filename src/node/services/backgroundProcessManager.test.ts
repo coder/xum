@@ -16,6 +16,7 @@ import { localBgWorkspaceDir, spawnProcess } from "./backgroundProcessExecutor";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { BackgroundHandle, Runtime } from "@/node/runtime/Runtime";
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -2917,6 +2918,27 @@ describe("BackgroundProcessManager", () => {
       expect(ws2Processes.length).toBeGreaterThanOrEqual(1);
       expect(ws1Processes.every((p) => p.workspaceId === testWorkspaceId)).toBe(true);
       expect(ws2Processes.every((p) => p.workspaceId === testWorkspaceId2)).toBe(true);
+    });
+  });
+
+  describe("hasLiveBackgroundProcesses", () => {
+    it("reports a job that exited without Xum noticing as not running", async () => {
+      // A job killed from a terminal still reads as running in the lazy snapshot; keepalive of a
+      // remote sandbox must not trust it.
+      const result = await manager.spawn(runtime, testWorkspaceId, "exit 0", {
+        cwd: process.cwd(),
+        displayName: "test-live-exited",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const exitCodeFile = path.join(result.outputDir, "exit_code");
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(exitCodeFile) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(manager.hasRunningBackgroundProcesses(testWorkspaceId)).toBe(true);
+
+      expect(await manager.hasLiveBackgroundProcesses(testWorkspaceId)).toBe(false);
     });
   });
 

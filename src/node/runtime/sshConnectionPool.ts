@@ -31,6 +31,9 @@ import {
   withSshBackoffJitter,
 } from "./sshBackoff";
 import { isPermanentSSHFailure } from "./Runtime";
+import { isXumDaytonaHost } from "@/common/constants/daytona";
+import { getDaytonaSshConfigPath } from "./daytonaSshConfig";
+import { redactDaytonaHostStderr } from "./daytonaTokenRedaction";
 
 export type OpenSSHHostKeyPolicyMode = "strict" | "headless-fallback";
 
@@ -49,7 +52,32 @@ export function isInteractiveHostKeyApprovalAvailable(): boolean {
   return sshPromptService?.hasInteractiveResponder() === true;
 }
 
-export function appendOpenSSHHostKeyPolicyArgs(args: string[]): void {
+/**
+ * A Daytona alias is resolved from Xum's include file alone (getDaytonaSshConfigPath), never
+ * from ~/.ssh/config or /etc/ssh/ssh_config: no user entry can shadow the pinned gateway, run a
+ * local command with the token or forward anything into the untrusted sandbox. `quote` renders
+ * the path for a shell command string (GIT_SSH_COMMAND).
+ */
+export function appendDaytonaOpenSSHArgs(
+  args: string[],
+  host: string,
+  quote: (value: string) => string = (value) => value
+): void {
+  if (isXumDaytonaHost(host)) {
+    args.push("-F", quote(getDaytonaSshConfigPath()));
+  }
+}
+
+/** Daytona aliases never get the headless fallback, which would accept any gateway key. */
+export function appendOpenSSHHostKeyPolicyArgs(
+  args: string[],
+  host: string,
+  quote?: (value: string) => string
+): void {
+  if (isXumDaytonaHost(host)) {
+    appendDaytonaOpenSSHArgs(args, host, quote);
+    return;
+  }
   if (hostKeyPolicyMode === "strict") {
     return;
   }
@@ -445,6 +473,13 @@ export class SSHConnectionPool {
     }
   }
 
+  /** The credentials changed (a replaced Daytona token): drop the backoff, probe at once. */
+  forgetHealth(config: SSHConnectionConfig): void {
+    const key = makeConnectionKey(config);
+    this.health.delete(key);
+    this.clearReadyControlPaths(key);
+  }
+
   /**
    * Mark connection as healthy by key (internal use)
    */
@@ -531,7 +566,7 @@ export class SSHConnectionPool {
     // Scope insecure host-key fallback to explicitly headless contexts where
     // no verification service is wired (e.g. CLI/test harness without UI).
     // Responder liveness only affects askpass prompt mechanics, not trust policy.
-    appendOpenSSHHostKeyPolicyArgs(args);
+    appendOpenSSHHostKeyPolicyArgs(args, config.host);
 
     args.push(config.host, "echo ok");
 
@@ -568,6 +603,8 @@ export class SSHConnectionPool {
         stdio: ["ignore", "pipe", "pipe"],
         ...(askpass ? { env: { ...process.env, ...askpass.env } } : {}),
       });
+      // The probe's stderr becomes the pool's last error, which reaches the UI and logs.
+      redactDaytonaHostStderr(proc, config.host);
 
       let timedOut = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -646,7 +683,22 @@ export const sshConnectionPool = new SSHConnectionPool();
 export function getControlPath(config: SSHConnectionConfig): string {
   const key = makeConnectionKey(config);
   const hash = hashKey(key);
-  return path.join(os.tmpdir(), `mux-ssh-${hash}`);
+  const retirements = controlPathRetirements.get(key) ?? 0;
+  return path.join(os.tmpdir(), `mux-ssh-${hash}${retirements > 0 ? `-r${retirements}` : ""}`);
+}
+
+/** Per connection key: how often its ControlPaths were retired in this process. */
+const controlPathRetirements = new Map<string, number>();
+
+/**
+ * Move the host's later commands to new ControlPaths (credentials or gateway changed). A
+ * ControlMaster still connecting at an old path when its host was retired listens there once
+ * it is up, after the retirement stopped the masters it could see; no command uses it, and it
+ * exits after ControlPersist.
+ */
+export function retireControlPath(config: SSHConnectionConfig): void {
+  const key = makeConnectionKey(config);
+  controlPathRetirements.set(key, (controlPathRetirements.get(key) ?? 0) + 1);
 }
 
 /**

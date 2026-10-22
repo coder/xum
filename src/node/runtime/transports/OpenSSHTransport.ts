@@ -1,21 +1,27 @@
 import { spawn } from "child_process";
-import { randomBytes } from "crypto";
+import { createHash } from "crypto";
+import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 
 import { spawnPtyProcess } from "../ptySpawn";
 import { cdThenExecShell, runInPosixShell } from "../streamUtils";
 import { expandTildeForSSH } from "../tildeExpansion";
+import { redactDaytonaHostStderr } from "../daytonaTokenRedaction";
 import {
+  appendDaytonaOpenSSHArgs,
   appendOpenSSHHostKeyPolicyArgs,
+  retireControlPath,
   sshConnectionPool,
   type SSHConnectionConfig,
 } from "../sshConnectionPool";
 import type { SpawnResult } from "../RemoteRuntime";
 import { RuntimeError } from "../Runtime";
+import { getXumHome } from "@/common/constants/paths";
 import { assert } from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import {
   ReverseForwardRefusedError,
   type SSHTransport,
@@ -50,6 +56,78 @@ function getShardedControlPath(config: SSHConnectionConfig): string {
   return `${baseControlPath}-${nextShard}`;
 }
 
+/**
+ * The host's credentials or gateway changed (Daytona settings, a moved gateway): stop its exec
+ * ControlMasters, so the next command connects anew instead of multiplexing onto the old
+ * connection. `-O stop` makes a master remove its socket and refuse new sessions while running
+ * ones finish. Reverse forwards keep their own connections.
+ */
+export async function retireOpenSSHMasters(config: SSHConnectionConfig): Promise<void> {
+  const base = sshConnectionPool.getControlPath(config);
+  // Before stopping: a command spawned meanwhile, or a master still connecting, is never shared.
+  retireControlPath(config);
+  sshConnectionPool.forgetHealth(config);
+  const shards = Array.from({ length: OPENSSH_EXEC_SHARD_COUNT }, (_, shard) => `${base}-${shard}`);
+  await Promise.all(
+    [base, ...shards].map(async (controlPath) => {
+      if (!(await pathExists(controlPath))) return;
+      const result = await runSshClient(
+        ["-F", "/dev/null", "-S", controlPath, "-O", "stop", config.host],
+        config.host
+      );
+      if (result.code !== 0) {
+        log.debug("[ssh] could not stop a ControlMaster", { controlPath, stderr: result.stderr });
+      }
+    })
+  );
+}
+
+/**
+ * The ControlPath of the host's reverse-forward master, per Xum root and host. Not random: a
+ * forward outlives a crash or a restart of the process that opened it (the next one adopts it),
+ * and only a path a later process can compute lets it end that forward.
+ */
+function reverseForwardControlPath(config: SSHConnectionConfig): string {
+  const key = [
+    getXumHome(),
+    os.userInfo().username,
+    config.host,
+    config.port ?? 22,
+    config.identityFile ?? "",
+  ].join("\0");
+  const hash = createHash("sha256").update(key).digest("hex").slice(0, 16);
+  return path.join(os.tmpdir(), `xum-fwd-${hash}`);
+}
+
+/**
+ * End the host's reverse-forward master, whether this process opened it or adopted it from an
+ * earlier one: a retired host's forward would keep reaching the old machine, and its remote
+ * port would keep reaching the bash AI proxy.
+ */
+export async function closeOpenSSHReverseForward(config: SSHConnectionConfig): Promise<void> {
+  const controlPath = reverseForwardControlPath(config);
+  if (!(await pathExists(controlPath))) return;
+  const result = await runSshClient(
+    ["-F", "/dev/null", "-S", controlPath, "-O", "exit", config.host],
+    config.host
+  );
+  if (result.code !== 0) {
+    log.debug("[ssh] could not end a reverse forward", { controlPath, stderr: result.stderr });
+  }
+  // A socket left without a master would keep the next master from listening there.
+  await fs.rm(controlPath, { force: true });
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.lstat(filePath);
+    return true;
+  } catch (error) {
+    if (isErrnoWithCode(error, "ENOENT")) return false;
+    throw error;
+  }
+}
+
 export class OpenSSHTransport implements SSHTransport {
   constructor(private readonly config: SSHConnectionConfig) {}
 
@@ -59,6 +137,10 @@ export class OpenSSHTransport implements SSHTransport {
 
   getConfig(): SSHTransportConfig {
     return this.config;
+  }
+
+  resetConnectionHealth(): void {
+    sshConnectionPool.forgetHealth(this.config);
   }
 
   async acquireConnection(options?: SSHTransportAcquireOptions): Promise<void> {
@@ -108,7 +190,7 @@ export class OpenSSHTransport implements SSHTransport {
     sshArgs.push("-o", "ServerAliveInterval=5");
     sshArgs.push("-o", "ServerAliveCountMax=2");
     sshArgs.push("-o", "BatchMode=yes");
-    appendOpenSSHHostKeyPolicyArgs(sshArgs);
+    appendOpenSSHHostKeyPolicyArgs(sshArgs, this.config.host);
     sshArgs.push(this.config.host, fullCommand);
 
     const process = spawn("ssh", sshArgs, {
@@ -146,6 +228,8 @@ export class OpenSSHTransport implements SSHTransport {
     args.push("-o", "ServerAliveInterval=5");
     args.push("-o", "ServerAliveCountMax=2");
     args.push("-t");
+    // Not the full host key policy: a terminal on another host may ask about an unknown key.
+    appendDaytonaOpenSSHArgs(args, this.config.host);
     args.push(this.config.host);
 
     // expandTildeForSSH already returns a quoted string (e.g., "$HOME/path")
@@ -180,7 +264,9 @@ export class OpenSSHTransport implements SSHTransport {
     assert(Number.isInteger(localPort) && localPort > 0 && localPort < 65536, "bad localPort");
     await this.acquireConnection({ maxWaitMs: 0 });
 
-    const controlPath = path.join(os.tmpdir(), `xum-fwd-${randomBytes(8).toString("hex")}`);
+    // Only after adoption failed: whatever master is still there no longer works.
+    await closeOpenSSHReverseForward(this.config);
+    const controlPath = reverseForwardControlPath(this.config);
     const args: string[] = [];
     if (this.config.port) args.push("-p", this.config.port.toString());
     if (this.config.identityFile) args.push("-i", this.config.identityFile);
@@ -208,10 +294,11 @@ export class OpenSSHTransport implements SSHTransport {
       "-o",
       "LogLevel=ERROR"
     );
-    appendOpenSSHHostKeyPolicyArgs(args);
+    appendOpenSSHHostKeyPolicyArgs(args, this.config.host);
     args.push(this.config.host);
 
     const master = spawn("ssh", args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    redactDaytonaHostStderr(master, this.config.host);
     let stderr = "";
     master.stderr?.on("data", (chunk: Buffer) => {
       if (stderr.length < 4096) stderr += chunk.toString();
@@ -235,7 +322,10 @@ export class OpenSSHTransport implements SSHTransport {
       if (master.exitCode === null && master.signalCode === null) master.kill();
     };
     const control = (...command: string[]) =>
-      runSshClient(["-F", "/dev/null", "-S", controlPath, ...command, this.config.host]);
+      runSshClient(
+        ["-F", "/dev/null", "-S", controlPath, ...command, this.config.host],
+        this.config.host
+      );
 
     const deadline = Date.now() + REVERSE_FORWARD_READY_TIMEOUT_MS;
     while ((await control("-O", "check")).code !== 0) {
@@ -277,9 +367,13 @@ export class OpenSSHTransport implements SSHTransport {
 }
 
 /** Runs a short ssh control command (`-O ...`) and reports its exit code and stderr. */
-function runSshClient(args: string[]): Promise<{ code: number | null; stderr: string }> {
+function runSshClient(
+  args: string[],
+  host: string
+): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn("ssh", args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    redactDaytonaHostStderr(child, host);
     let stderr = "";
     child.stderr?.on("data", (chunk: Buffer) => {
       if (stderr.length < 4096) stderr += chunk.toString();

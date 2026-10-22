@@ -519,8 +519,9 @@ export const WorkspaceRemovalDescendantSchema = z.object({
   active: z.boolean(),
 });
 /**
- * Something a successful (forced) removal could not clean up (#5143). Forced paths that skip the
- * Force Delete dialog (bulk delete, cancel-creation, shift-click) show these to the user.
+ * Something a successful (forced) removal could not clean up (#5143), or kept on purpose for the
+ * user to own (#7100). Forced paths that skip the Force Delete dialog (bulk delete,
+ * cancel-creation, shift-click) show these to the user.
  */
 export const WorkspaceRemoveWarningSchema = z.discriminatedUnion("kind", [
   z.object({

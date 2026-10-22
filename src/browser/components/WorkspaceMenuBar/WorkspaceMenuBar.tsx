@@ -239,6 +239,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const titleEdit = useHeaderTitleEdit(workspaceId, moreActionsButtonRef);
   const archiveError = usePopoverError();
+  const archiveWarning = usePopoverError(null);
   const forkError = usePopoverError();
   const stopRuntimeError = usePopoverError();
 
@@ -525,6 +526,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
       );
     },
+    showWarning: (warningWorkspaceId, warning) =>
+      archiveWarning.showError(warningWorkspaceId, warning),
   });
   // The menu bar is reused across workspaces. Render-time adjustment (not an effect): a
   // confirmation for another workspace, including one opened by a preflight that resolved after
@@ -1087,6 +1090,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         error={archiveError.error}
         prefix="Failed to archive workspace"
         onDismiss={archiveError.clearError}
+      />
+      <PopoverError
+        error={archiveWarning.error}
+        prefix="Workspace archived with a warning"
+        onDismiss={archiveWarning.clearError}
       />
     </div>
   );

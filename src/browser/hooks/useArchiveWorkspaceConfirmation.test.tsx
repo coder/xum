@@ -40,6 +40,7 @@ function setup(overrides: Partial<UseArchiveWorkspaceConfirmationOptions> = {}) 
     isStreaming: () => false,
     getDisplayTitle: () => "Feature work",
     showError,
+    showWarning: () => undefined,
     ...overrides,
   };
   const view = renderHook(() => useArchiveWorkspaceConfirmation(options));
@@ -77,6 +78,28 @@ describe("useArchiveWorkspaceConfirmation", () => {
 
     expect(archiveWorkspace.mock.calls).toEqual([[WORKSPACE_ID, undefined]]);
     expect(view.result.current.modalProps.isOpen).toBe(false);
+  });
+
+  test("shows the warnings of an archive that succeeded, and nothing for a clean one", async () => {
+    const showWarning = mock(
+      (_workspaceId: string, _warning: string, _anchorEl?: HTMLElement) => undefined
+    );
+    const anchor = document.createElement("button");
+    const warned = setup({
+      showWarning,
+      archiveWorkspace: () =>
+        Promise.resolve({
+          success: true,
+          data: { kind: "archived" as const, warnings: ["Sandbox kept", "Stopped instead"] },
+        }),
+    });
+
+    await warned.request(anchor);
+    await setup({ showWarning }).request();
+
+    expect(showWarning.mock.calls).toEqual([
+      [WORKSPACE_ID, "Sandbox kept\nStopped instead", anchor],
+    ]);
   });
 
   test("does nothing while an archive for the workspace is already in flight", async () => {

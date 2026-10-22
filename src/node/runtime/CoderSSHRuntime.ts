@@ -29,9 +29,6 @@ import type { CoderService, WorkspaceStatusResult } from "@/node/services/coderS
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import { log } from "@/node/services/log";
-import { execBuffered } from "@/node/utils/runtime/helpers";
-import { expandTildeForSSH } from "./tildeExpansion";
-import * as path from "path";
 import { getErrorMessage } from "@/common/utils/errors";
 
 export interface CoderSSHRuntimeConfig extends SSHRuntimeConfig {
@@ -901,20 +898,7 @@ export class CoderSSHRuntime extends SSHRuntime {
       throw new Error(`Failed to configure SSH for Coder: ${errorMsg}`);
     }
 
-    // Create parent directory for workspace (git clone won't create it)
     // This must happen after ensureXumCoderSSHConfig() so SSH is configured
-    initLogger.logStep("Preparing workspace directory...");
-    const parentDir = path.posix.dirname(params.workspacePath);
-    const mkdirResult = await execBuffered(this, `mkdir -p ${expandTildeForSSH(parentDir)}`, {
-      cwd: "/tmp",
-      timeout: 10,
-      abortSignal,
-    });
-    if (mkdirResult.exitCode !== 0) {
-      const errorMsg = mkdirResult.stderr || mkdirResult.stdout || "Unknown error";
-      log.error("Failed to create workspace parent directory", { parentDir, error: errorMsg });
-      initLogger.logStderr(`Failed to prepare workspace directory: ${errorMsg}`);
-      throw new Error(`Failed to prepare workspace directory: ${errorMsg}`);
-    }
+    await this.prepareWorkspaceParentDirectory(params);
   }
 }

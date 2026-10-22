@@ -1,9 +1,15 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { shellQuote } from "@/common/utils/shell";
 import type { TerminalService } from "@/node/services/terminalService";
+import type { EnsureReadyOptions, Runtime } from "@/node/runtime/Runtime";
+import * as daytonaSshConfig from "@/node/runtime/daytonaSshConfig";
+import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import type { DaytonaRuntimeService } from "@/node/runtime/DaytonaSSHRuntime";
+import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import {
   createWorkspaceServiceHarness,
   type WorkspaceServiceHarness,
@@ -221,3 +227,228 @@ describe.skipIf(process.platform === "win32")(
     });
   }
 );
+
+describe("WorkspaceService.getRuntimeStatuses for Daytona workspaces", () => {
+  let harness: WorkspaceServiceHarness;
+  let projectPath: string;
+  let globalService: { mockRestore: () => void };
+  const getSandboxState = mock((sandboxId: string) =>
+    sandboxId === "sb-broken"
+      ? Promise.reject(new Error("throttled"))
+      : Promise.resolve({
+          state: sandboxId === "sb-1" ? ("started" as const) : ("stopped" as const),
+        })
+  );
+
+  beforeEach(async () => {
+    harness = await createWorkspaceServiceHarness();
+    projectPath = path.join(harness.rootDir, "project");
+    await fs.mkdir(projectPath);
+    getSandboxState.mockClear();
+    globalService = spyOn(runtimeFactory, "getGlobalDaytonaService").mockReturnValue({
+      sandboxes: { getSandboxState },
+    } as unknown as DaytonaRuntimeService);
+  });
+
+  afterEach(async () => {
+    globalService.mockRestore();
+    await harness.cleanup();
+  });
+
+  async function addDaytonaWorkspaces(sandboxByWorkspace: Record<string, string>): Promise<void> {
+    await harness.config.editConfig((config) => {
+      config.projects.set(projectPath, {
+        trusted: true,
+        workspaces: Object.entries(sandboxByWorkspace).map(([id, sandboxId]) => ({
+          id,
+          name: id,
+          path: path.join(harness.rootDir, "checkouts", id),
+          runtimeConfig: {
+            type: "ssh",
+            host: `${sandboxId}.xum--daytona`,
+            srcBaseDir: "/home/daytona/xum",
+            daytona: { sandboxId },
+          },
+          createdAt: "2026-01-01T00:00:00.000Z",
+        })),
+      });
+      return config;
+    });
+  }
+
+  // Forks and attachments share one sandbox: a large fork tree must not burst the control plane.
+  test("reads each sandbox's state once and gives it to every workspace on it", async () => {
+    await addDaytonaWorkspaces({
+      parent: "sb-1",
+      fork1: "sb-1",
+      fork2: "sb-1",
+      other: "sb-2",
+      broken1: "sb-broken",
+      broken2: "sb-broken",
+    });
+
+    expect(
+      await harness.service.getRuntimeStatuses([
+        "parent",
+        "fork1",
+        "fork2",
+        "other",
+        "broken1",
+        "broken2",
+      ])
+    ).toEqual({
+      parent: "running",
+      fork1: "running",
+      fork2: "running",
+      other: "stopped",
+      broken1: "unknown",
+      broken2: "unknown",
+    });
+    expect(getSandboxState.mock.calls.map(([sandboxId]) => sandboxId).sort()).toEqual([
+      "sb-1",
+      "sb-2",
+      "sb-broken",
+    ]);
+  });
+});
+
+describe("WorkspaceService.recordExternalEditorOpen for a Daytona workspace", () => {
+  let harness: WorkspaceServiceHarness;
+  let projectPath: string;
+  let createRuntime: { mockRestore: () => void };
+  let forwardCheck: ReturnType<typeof spyOn<typeof daytonaSshConfig, "hasInheritedRemoteForward">>;
+  /** The editor use leases held on the workspace while each readiness check ran. */
+  let leasesDuringReadiness: number[];
+  let readiness: { ready: true } | { ready: false; error: string };
+  const ensureReady = mock((_options?: EnsureReadyOptions) => {
+    leasesDuringReadiness.push(workspaceUseLeasesFor(harness.config).heldCount("dt", "editor"));
+    return Promise.resolve(
+      readiness.ready ? readiness : { ...readiness, errorType: "runtime_not_ready" as const }
+    );
+  });
+
+  beforeEach(async () => {
+    harness = await createWorkspaceServiceHarness();
+    projectPath = path.join(harness.rootDir, "project");
+    await fs.mkdir(projectPath);
+    ensureReady.mockClear();
+    leasesDuringReadiness = [];
+    readiness = { ready: true };
+    createRuntime = spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue({
+      ensureReady,
+    } as unknown as Runtime);
+    // The user's real ssh config must not decide these tests.
+    forwardCheck = spyOn(daytonaSshConfig, "hasInheritedRemoteForward").mockResolvedValue(false);
+  });
+
+  afterEach(async () => {
+    createRuntime.mockRestore();
+    forwardCheck.mockRestore();
+    await harness.cleanup();
+  });
+
+  async function addDaytonaWorkspace(archivedAt?: string): Promise<void> {
+    await harness.config.editConfig((config) => {
+      config.projects.set(projectPath, {
+        trusted: true,
+        workspaces: [
+          {
+            id: "dt",
+            name: "dt",
+            path: path.join(harness.rootDir, "checkouts", "dt"),
+            runtimeConfig: {
+              type: "ssh",
+              host: "sb-1.xum--daytona",
+              srcBaseDir: "/home/daytona/xum",
+              daytona: { sandboxId: "sb-1" },
+            },
+            createdAt: "2026-01-01T00:00:00.000Z",
+            archivedAt,
+          },
+        ],
+      });
+      return config;
+    });
+  }
+
+  // An archive cannot run while the editor use is held, so a sandbox started here cannot be
+  // left running by an archive that saw it stopped.
+  test("brings the sandbox up only once the editor use is admitted", async () => {
+    await addDaytonaWorkspace();
+
+    expect(await harness.service.recordExternalEditorOpen("dt", "tok-1")).toEqual({
+      success: true,
+      data: undefined,
+    });
+    expect(leasesDuringReadiness).toEqual([1]);
+    // The editor reads the user's ssh config, which the ready cache does not cover.
+    expect(ensureReady).toHaveBeenCalledWith({ externalSshClient: true });
+  });
+
+  test("refuses the open and releases the use when the sandbox cannot come up", async () => {
+    await addDaytonaWorkspace();
+    readiness = { ready: false, error: 'Daytona sandbox "sb-1" no longer exists' };
+
+    expect(await harness.service.recordExternalEditorOpen("dt", "tok-1")).toEqual({
+      success: false,
+      error: 'Daytona sandbox "sb-1" no longer exists',
+    });
+    expect(leasesDuringReadiness).toEqual([1]);
+    expect(workspaceUseLeasesFor(harness.config).heldCount("dt", "editor")).toBe(0);
+  });
+
+  // A workspace created with the default srcBaseDir keeps its ~ path (the sandbox did not exist
+  // yet); the editor needs it absolute, which only the running sandbox can tell.
+  test("resolves a checkout path under ~ on the sandbox once it is ready", async () => {
+    await addDaytonaWorkspace();
+    const markerPath = path.join(harness.config.sessionsDir, "dt", "external-editor-opened");
+    const resolvePath = mock((p: string) => {
+      // Only once the sandbox is ready under the editor use.
+      expect(leasesDuringReadiness.length).toBeGreaterThan(0);
+      return Promise.resolve(p.replace(/^~/, "/home/daytona"));
+    });
+    createRuntime.mockRestore();
+    createRuntime = spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue({
+      ensureReady,
+      resolvePath,
+    } as unknown as Runtime);
+
+    // A path that cannot be resolved opens nothing and leaves no marker behind.
+    resolvePath.mockImplementationOnce(() => Promise.reject(new Error("ssh: connection refused")));
+    const refused = await harness.service.recordExternalEditorOpen("dt", "tok-1", "~/mux/x");
+    expect(refused.success).toBe(false);
+    expect(await Bun.file(markerPath).exists()).toBe(false);
+
+    expect(
+      await harness.service.recordExternalEditorOpen("dt", "tok-2", "~/mux/project/dt")
+    ).toEqual({ success: true, data: { remotePath: "/home/daytona/mux/project/dt" } });
+  });
+
+  // The editor reads the user's ssh config, where a matching RemoteForward would give the
+  // sandbox a tunnel to a local service.
+  test("refuses the open when the user's ssh config forwards into the sandbox", async () => {
+    await addDaytonaWorkspace();
+    const markerPath = path.join(harness.config.sessionsDir, "dt", "external-editor-opened");
+    for (const check of [
+      () => Promise.resolve(true),
+      () => Promise.reject(new daytonaSshConfig.DaytonaSshConfigError("ssh -G failed")),
+    ]) {
+      forwardCheck.mockImplementationOnce(check);
+
+      const result = await harness.service.recordExternalEditorOpen("dt", "tok-1");
+
+      expect(result.success).toBe(false);
+      expect(forwardCheck).toHaveBeenLastCalledWith("sb-1.xum--daytona");
+      expect(workspaceUseLeasesFor(harness.config).heldCount("dt", "editor")).toBe(0);
+      expect(await Bun.file(markerPath).exists()).toBe(false);
+    }
+    expect(leasesDuringReadiness).toEqual([1, 1]);
+  });
+
+  test("refuses an archived workspace without starting its sandbox", async () => {
+    await addDaytonaWorkspace("2026-01-02T00:00:00.000Z");
+
+    expect((await harness.service.recordExternalEditorOpen("dt", "tok-1")).success).toBe(false);
+    expect(ensureReady).not.toHaveBeenCalled();
+  });
+});

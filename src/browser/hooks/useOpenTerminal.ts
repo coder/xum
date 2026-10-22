@@ -1,5 +1,6 @@
 import { useCallback } from "react";
 import { useAPI } from "@/browser/contexts/API";
+import { getRuntimeStatusStoreInstance } from "@/browser/stores/RuntimeStatusStore";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { isSSHRuntime, isDevcontainerRuntime } from "@/common/types/runtime";
 import {
@@ -71,6 +72,7 @@ export function useOpenTerminal() {
           await openTerminalPopout(api, workspaceId, session.sessionId);
         } else {
           await api.terminal.openNative({ workspaceId });
+          getRuntimeStatusStoreInstance().refreshAfterTerminalOpen(workspaceId);
         }
       } catch (err) {
         if (err instanceof TerminalPopupBlockedError && createdSessionId != null) {

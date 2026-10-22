@@ -442,6 +442,13 @@ export interface EnsureReadyOptions {
    * Abort signal to cancel long-running operations.
    */
   signal?: AbortSignal;
+
+  /**
+   * An ssh client outside Xum (an external editor, a native terminal) connects next, so
+   * runtimes whose readiness cache skips the user's ssh setup redo it (Daytona: the
+   * `~/.ssh/config` block and the alias's token).
+   */
+  externalSshClient?: boolean;
 }
 
 /**
@@ -736,7 +743,12 @@ export interface Runtime {
     /** keepBranch: remove only the checkout, e.g. a rollback on a branch it did not create (#4775). */
     options?: { keepBranch?: boolean }
   ): Promise<
-    | { success: true; deletedPath: string }
+    | {
+        success: true;
+        deletedPath: string;
+        /** For the user: something the removal kept on purpose that they now own (#7100). */
+        notice?: string;
+      }
     | {
         success: false;
         error: string;

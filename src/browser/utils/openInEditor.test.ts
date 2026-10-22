@@ -51,7 +51,7 @@ describe("openInEditor", () => {
   // navigations and close() calls, mirroring a real popup.
   function createBrowserModeWindow(
     calls: OpenCall[],
-    opts?: { popupBlocked?: boolean; denyEditorPlaceholders?: boolean }
+    opts?: { popupBlocked?: boolean; denyEditorPlaceholders?: boolean; hostname?: string }
   ) {
     const placeholder = {
       closed: false,
@@ -68,7 +68,7 @@ describe("openInEditor", () => {
     });
     const windowValue = {
       localStorage: { getItem: () => null },
-      location: { hostname: "localhost" },
+      location: { hostname: opts?.hostname ?? "localhost" },
       open: (url: string, target?: string) => {
         calls.push([url, target]);
         const wrapperBlocked =
@@ -117,6 +117,80 @@ describe("openInEditor", () => {
     expect(target).toBe("_blank");
     expect(url.includes("ssh-remote+devbox")).toBe(true);
     expect(url.endsWith(`${filePath}:1:1`)).toBe(true);
+  });
+
+  describe("Daytona SSH workspaces", () => {
+    const daytonaConfig: RuntimeConfig = {
+      type: "ssh",
+      host: "xum-daytona-sb-1",
+      srcBaseDir: "/home/daytona/xum",
+      daytona: { sandboxId: "sb-1" },
+    };
+
+    test("remote browser: refuses before recording or launching", async () => {
+      const calls: OpenCall[] = [];
+      const { windowValue, placeholder } = createBrowserModeWindow(calls, {
+        hostname: "xum.example.com",
+      });
+      const recordEditorOpen = mock(() =>
+        Promise.resolve({ success: true as const, data: undefined })
+      );
+      const api = createTestApiClient({ general: { recordEditorOpen } });
+
+      const result = await withWindow(windowValue, () =>
+        openInEditor({ api, workspaceId, targetPath: parentDir, runtimeConfig: daytonaConfig })
+      );
+
+      expect(result.success).toBe(false);
+      expect(recordEditorOpen).not.toHaveBeenCalled();
+      expect(placeholder.navigations).toEqual([]);
+      expect(placeholder.closed).toBe(true);
+    });
+
+    test("a browser on the server's machine opens the sandbox", async () => {
+      const calls: OpenCall[] = [];
+      const { windowValue, placeholder } = createBrowserModeWindow(calls);
+
+      const result = await withWindow(windowValue, () =>
+        openInEditor({
+          api: createApiStub(),
+          workspaceId,
+          targetPath: parentDir,
+          runtimeConfig: daytonaConfig,
+        })
+      );
+
+      expect(result).toEqual({ success: true });
+      expect(placeholder.navigations[0]).toContain("ssh-remote+xum-daytona-sb-1");
+    });
+
+    // The default srcBaseDir (~/mux) is persisted unresolved: the sandbox may not exist yet when
+    // the workspace is created, so only the backend can resolve it once the sandbox is up.
+    test("opens the path the backend resolved for a checkout under ~", async () => {
+      const calls: OpenCall[] = [];
+      const recordEditorOpen = mock((_input: { workspaceId: string; remotePath?: string | null }) =>
+        Promise.resolve({
+          success: true as const,
+          data: { remotePath: "/home/daytona/mux/project/feature" },
+        })
+      );
+      const api = createTestApiClient({ general: { recordEditorOpen } });
+
+      const result = await withWindow(createMockWindow(calls), () =>
+        openInEditor({
+          api,
+          workspaceId,
+          targetPath: "~/mux/project/feature",
+          runtimeConfig: { ...daytonaConfig, srcBaseDir: "~/mux" },
+        })
+      );
+
+      expect(result).toEqual({ success: true });
+      expect(recordEditorOpen.mock.calls[0]?.[0].remotePath).toBe("~/mux/project/feature");
+      expect(calls.map(([url]) => url)).toEqual([
+        "vscode://vscode-remote/ssh-remote+xum-daytona-sb-1/home/daytona/mux/project/feature",
+      ]);
+    });
   });
 
   test("opens devcontainer deep links with mapped container path", async () => {

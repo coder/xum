@@ -19,6 +19,7 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  * providerService.ts and startDesktopFlowEffect in muxGatewayOauthService.ts).
  */
 import { ORPCError, os, type ProcedureConfig } from "@orpc/server";
+import { DaytonaConfigError } from "@/node/config/daytonaCredentialsStore";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
 import { PerfCaptureRefusedError } from "@/node/services/perf/perfCaptureService";
 import { PerfReportRefusedError } from "@/node/services/perf/perfReportService";
@@ -209,6 +210,14 @@ import { readWorkspaceViewTail } from "@/node/services/workspaceViewTail";
 function rethrowDraftTooLarge(error: unknown): never {
   if (isDraftTooLargeError(error)) {
     throw new ORPCError("BAD_REQUEST", { message: (error as Error).message });
+  }
+  throw error;
+}
+
+/** Transports mask plain errors as "Internal Server Error"; invalid settings need the reason. */
+function rethrowDaytonaConfigError(error: unknown): never {
+  if (error instanceof DaytonaConfigError) {
+    throw new ORPCError("BAD_REQUEST", { message: error.message });
   }
   throw error;
 }
@@ -1243,7 +1252,11 @@ export const router = (authToken?: string) => {
         .input(schemas.general.recordEditorOpen.input)
         .output(schemas.general.recordEditorOpen.output)
         .handler(async ({ context, input }) =>
-          context.workspaceService.recordExternalEditorOpen(input.workspaceId, input.launchToken)
+          context.workspaceService.recordExternalEditorOpen(
+            input.workspaceId,
+            input.launchToken,
+            input.remotePath
+          )
         ),
       rollbackEditorOpen: t
         .input(schemas.general.rollbackEditorOpen.input)
@@ -1796,6 +1809,26 @@ export const router = (authToken?: string) => {
         .input(schemas.coder.listWorkspaces.input)
         .output(schemas.coder.listWorkspaces.output)
         .handler(async ({ context }) => context.coderService.listWorkspaces()),
+    },
+    daytona: {
+      getConfig: t
+        .input(schemas.daytona.getConfig.input)
+        .output(schemas.daytona.getConfig.output)
+        .handler(async ({ context }) => context.daytonaService.account.getPublicConfig()),
+      setConfig: t
+        .input(schemas.daytona.setConfig.input)
+        .output(schemas.daytona.setConfig.output)
+        .handler(async ({ context, input }) =>
+          context.daytonaService.account.setConfig(input).catch(rethrowDaytonaConfigError)
+        ),
+      testConnection: t
+        .input(schemas.daytona.testConnection.input)
+        .output(schemas.daytona.testConnection.output)
+        .handler(async ({ context }) => context.daytonaService.account.testConnection()),
+      listSnapshots: t
+        .input(schemas.daytona.listSnapshots.input)
+        .output(schemas.daytona.listSnapshots.output)
+        .handler(async ({ context }) => context.daytonaService.account.listSnapshots()),
     },
     artifacts: {
       list: t

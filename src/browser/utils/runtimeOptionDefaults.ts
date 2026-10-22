@@ -5,7 +5,11 @@ import {
 } from "@/browser/stores/AppConfigStore";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import type { CoderWorkspaceConfig } from "@/common/orpc/schemas/coder";
-import { CODER_RUNTIME_PLACEHOLDER, RUNTIME_MODE, type RuntimeMode } from "@/common/types/runtime";
+import {
+  DaytonaSandboxConfigSchema,
+  type DaytonaSandboxConfig,
+} from "@/common/orpc/schemas/daytona";
+import { isManagedSshPlaceholder, RUNTIME_MODE, type RuntimeMode } from "@/common/types/runtime";
 
 export type RuntimeOptionDefaults = Partial<Record<RuntimeMode, unknown>>;
 
@@ -142,7 +146,7 @@ export function writeSshOptionDefaults(
 ): RuntimeOptionDefaults {
   let updated = writeOptionValue(prev, RUNTIME_MODE.SSH, "coderEnabled", next.coderEnabled);
 
-  if (next.host.trim().length > 0 && next.host !== CODER_RUNTIME_PLACEHOLDER) {
+  if (next.host.trim().length > 0 && !isManagedSshPlaceholder(next.host)) {
     updated = writeOptionField(updated, RUNTIME_MODE.SSH, "host", next.host);
   }
 
@@ -167,5 +171,32 @@ export function writeSshCoderDefaultsPreservingMode(
     ...latest,
     coderEnabled: latest.coderEnabled,
     coderConfig: nextCoderConfig,
+  });
+}
+
+/**
+ * Project Daytona defaults (snapshot and size preset), set in Settings > Runtimes and used to
+ * prefill new Daytona workspaces. Only the creation-time fields: a sandbox id would point
+ * every new workspace at one sandbox.
+ */
+export function readDaytonaOptionDefaults(defaults: RuntimeOptionDefaults): DaytonaSandboxConfig {
+  const parsed = DaytonaSandboxConfigSchema.safeParse(
+    readOptionValue(defaults, RUNTIME_MODE.SSH, "daytona")
+  );
+  if (!parsed.success) return {};
+  const { snapshot, cpu, memoryGiB, diskGiB } = parsed.data;
+  return { snapshot, cpu, memoryGiB, diskGiB };
+}
+
+export function writeDaytonaOptionDefaults(
+  prev: RuntimeOptionDefaults,
+  next: DaytonaSandboxConfig
+): RuntimeOptionDefaults {
+  const { snapshot, cpu, memoryGiB, diskGiB } = next;
+  return writeOptionValue(prev, RUNTIME_MODE.SSH, "daytona", {
+    snapshot,
+    cpu,
+    memoryGiB,
+    diskGiB,
   });
 }

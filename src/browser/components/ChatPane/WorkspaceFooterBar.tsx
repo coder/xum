@@ -3,10 +3,10 @@ import { ArrowLeftRight, Github, MessageCircle } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
-import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
+import { isDevcontainerRuntime, isSSHRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/common/types/project";
-import { getDevcontainerStatusChip } from "@/browser/utils/runtimeUi";
+import { getDaytonaStatusChip, getDevcontainerStatusChip } from "@/browser/utils/runtimeUi";
 import { formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { isMultiProject } from "@/common/utils/multiProject";
@@ -138,6 +138,7 @@ function DriftModeToggle(props: { showLabel: boolean }) {
   );
 }
 
+// Devcontainer and Daytona sandbox status chips share one shape.
 type DevcontainerChip = ReturnType<typeof getDevcontainerStatusChip>;
 
 function WorkspaceBranchControls(props: {
@@ -430,7 +431,9 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
   const runtimeStatus = useRuntimeStatus(props.workspaceId);
   const devcontainerChip = isDevcontainerRuntime(props.runtimeConfig)
     ? getDevcontainerStatusChip(runtimeStatus)
-    : null;
+    : isSSHRuntime(props.runtimeConfig) && props.runtimeConfig.daytona != null
+      ? getDaytonaStatusChip(runtimeStatus)
+      : null;
   // One JS source for the phone layout, so the hidden drift label and the tap-to-toggle diff
   // numbers can never disagree about the width.
   const isNarrow = useNarrowViewport();

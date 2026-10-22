@@ -110,19 +110,25 @@ import {
   stripClientPluginSendHookFields,
 } from "@/common/utils/messages/pluginSendHookFields";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { DAYTONA_ARCHIVE_NEEDS_USER } from "@/common/constants/daytona";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
   createRuntime,
+  getGlobalDaytonaService,
   IncompatibleRuntimeError,
   runBackgroundInit,
   withInitUseLease,
   runFullInit,
 } from "@/node/runtime/runtimeFactory";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
+import type { DaytonaSandboxState } from "@/common/orpc/schemas/daytona";
+import type { WorkspaceRuntimeStatus } from "@/common/orpc/schemas/runtime";
 import { DockerRuntime, getContainerName } from "@/node/runtime/DockerRuntime";
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
+  ensureDaytonaSandboxReady,
+  refuseDaytonaEditorRemoteForward,
   resolveWorkspaceExecutionPath,
   resolveWorkspaceRootPath,
 } from "@/node/runtime/runtimeHelpers";
@@ -353,7 +359,9 @@ import type {
 import {
   hasSrcBaseDir,
   getSrcBaseDir,
+  getDaytonaSandboxId,
   isSSHRuntime,
+  ownsDaytonaSandbox,
   isDockerRuntime,
   isDevcontainerRuntime,
 } from "@/common/types/runtime";
@@ -634,6 +642,37 @@ export function nameRestartBlockerWorkspaces(
  * whose registration write does not re-check it (#5181 and the rename race), registers between
  * the registry read and the delete. Their locked re-checks close it.
  */
+/**
+ * What a runtime's removal reports to the user: what it kept on purpose for them to own
+ * (#7100), or what a forced removal left behind (#5143). A container left behind still holds
+ * this workspace's plan: the plan step cannot reach it once the worktree is gone. Forced paths
+ * that skip the Force Delete dialog (bulk delete, cancel-creation, shift-click) never saw the
+ * non-forced error that names it.
+ */
+function runtimeRemovalWarnings(
+  deleteResult: Awaited<ReturnType<Runtime["deleteWorkspace"]>>,
+  planContainer: string | undefined,
+  workspaceId: string
+): WorkspaceRemoveWarning[] {
+  if (deleteResult.success) {
+    return deleteResult.notice ? [{ kind: "leftover", description: deleteResult.notice }] : [];
+  }
+  const leftovers = deleteResult.leftoverPaths ?? [];
+  if (leftovers.length > 0) {
+    log.warn("Forced removal left these behind; a container may still hold the plan", {
+      workspaceId,
+      leftovers,
+    });
+  }
+  return leftovers.map((leftover) => ({
+    kind: "leftover",
+    description:
+      leftover === planContainer
+        ? `The ${leftover} was left behind and may still hold this workspace's plan file; remove the container.`
+        : `${leftover} was left behind; remove it manually.`,
+  }));
+}
+
 function findWorkspaceSharingPlanPath(
   registry: readonly FrontendWorkspaceMetadata[],
   workspaceId: string,
@@ -1049,7 +1088,59 @@ function withEffectiveHeartbeatInterval(
   return { ...settings, intervalMs: settings.intervalMs ?? defaultIntervalMs };
 }
 
-type WorkspaceRuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
+const DAYTONA_RUNTIME_STATUS: Record<DaytonaSandboxState, WorkspaceRuntimeStatus> = {
+  started: "running",
+  stopped: "stopped",
+  starting: "starting",
+  archived: "archived",
+  error: "error",
+  // Deleted outside Xum: ensureReady refuses it, so show it as an error, not unknown.
+  missing: "error",
+};
+
+/**
+ * Sandbox states of the requested Daytona workspaces, probed in parallel. Forks share their
+ * source's sandbox, so each sandbox is read once and its status given to all of its workspaces:
+ * a large fork tree must not send a burst of identical control-plane requests.
+ */
+async function probeDaytonaRuntimeStatuses(
+  workspaceIds: string[],
+  metadataById: Map<string, WorkspaceMetadata>
+): Promise<Record<string, WorkspaceRuntimeStatus>> {
+  const workspacesBySandbox = new Map<string, string[]>();
+  for (const workspaceId of workspaceIds) {
+    const runtimeConfig = metadataById.get(workspaceId)?.runtimeConfig;
+    const sandboxId = isSSHRuntime(runtimeConfig) ? runtimeConfig.daytona?.sandboxId : undefined;
+    if (!sandboxId) continue;
+    const workspaces = workspacesBySandbox.get(sandboxId) ?? [];
+    workspaces.push(workspaceId);
+    workspacesBySandbox.set(sandboxId, workspaces);
+  }
+  const statuses: Record<string, WorkspaceRuntimeStatus> = {};
+  await Promise.all(
+    [...workspacesBySandbox].map(async ([sandboxId, workspaces]) => {
+      const status = await probeDaytonaRuntimeStatus(sandboxId);
+      for (const workspaceId of workspaces) statuses[workspaceId] = status;
+    })
+  );
+  return statuses;
+}
+
+/** Passive Daytona probe: reads the sandbox state, never starts it. */
+async function probeDaytonaRuntimeStatus(sandboxId: string): Promise<WorkspaceRuntimeStatus> {
+  const service = getGlobalDaytonaService();
+  if (!service) return "unknown";
+  try {
+    const { state } = await service.sandboxes.getSandboxState(sandboxId);
+    return DAYTONA_RUNTIME_STATUS[state];
+  } catch (error) {
+    log.debug("Failed to read Daytona sandbox state for runtime status", {
+      sandboxId,
+      error: getErrorMessage(error),
+    });
+    return "unknown";
+  }
+}
 
 /** Narrow DevTools cleanup surface used on archive/remove and by the startup sweep. */
 type WorkspaceDevToolsCleanup = Pick<DevToolsService, "hasWorkspaceData" | "removeWorkspaceData">;
@@ -1076,6 +1167,27 @@ const ARCHIVE_OWN_ACTIVITY_POLICY = {
   backgroundProcesses: "allow",
 } as const;
 
+function isHomeRelativePath(remotePath: string | null | undefined): remotePath is string {
+  return remotePath === "~" || remotePath?.startsWith("~/") === true;
+}
+
+/** What archive refusals call the dedicated remote box, so Daytona users are not told "Coder". */
+function dedicatedRemoteBoxLabel(metadata: WorkspaceMetadata | undefined): string {
+  return getDaytonaSandboxId(metadata?.runtimeConfig) ? "Daytona sandbox" : "Coder workspace";
+}
+
+/** The archive success value; warnings are outcomes that did not fail it (a sandbox kept). */
+function archivedResult(warnings: string[]): { kind: "archived"; warnings?: string[] } {
+  return warnings.length > 0 ? { kind: "archived", warnings } : { kind: "archived" };
+}
+
+function toBulkArchiveWarnings(
+  workspaceId: string,
+  warnings: string[] | undefined
+): Array<{ workspaceId: string; warning: string }> {
+  return (warnings ?? []).map((warning) => ({ workspaceId, warning }));
+}
+
 /** A Coder workspace Xum created for this workspace (not an existing one it connected to). */
 function isDedicatedCoderRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
   return (
@@ -1088,8 +1200,21 @@ function isDedicatedCoderRuntime(runtimeConfig: RuntimeConfig | undefined): bool
 }
 
 /**
+ * What archiving does to the remote box Xum created for this workspace: a dedicated Coder
+ * workspace follows the Coder archive setting, and the Daytona sandbox a workspace created is
+ * always deleted.
+ */
+function remoteBoxArchiveBehavior(
+  metadata: WorkspaceMetadata | undefined,
+  coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior
+): CoderWorkspaceArchiveBehavior {
+  if (metadata != null && ownsDaytonaSandbox(metadata)) return "delete";
+  return isDedicatedCoderRuntime(metadata?.runtimeConfig) ? coderWorkspaceArchiveBehavior : "keep";
+}
+
+/**
  * Whether archiving takes the structural mutation gate (#4476): it deletes the managed checkout,
- * or stops or deletes a dedicated Coder workspace (#4871).
+ * or stops or deletes a dedicated remote box (#4871).
  */
 function archiveTakesMutationGate(
   metadata: WorkspaceMetadata,
@@ -1098,7 +1223,7 @@ function archiveTakesMutationGate(
 ): boolean {
   return (
     archiveDeletesManagedWorktree(metadata, worktreeArchiveBehavior) ||
-    (isDedicatedCoderRuntime(metadata.runtimeConfig) && coderWorkspaceArchiveBehavior !== "keep")
+    remoteBoxArchiveBehavior(metadata, coderWorkspaceArchiveBehavior) !== "keep"
   );
 }
 // #4476: removal stops this backend's own stream, terminals, MCP servers, init hook and background
@@ -1248,6 +1373,7 @@ interface ArchiveMergedInProjectResult {
   archivedWorkspaceIds: string[];
   skippedWorkspaceIds: string[];
   errors: Array<{ workspaceId: string; error: string }>;
+  warnings: Array<{ workspaceId: string; warning: string }>;
 }
 
 interface ProjectGitStatusResult {
@@ -8518,10 +8644,12 @@ export class WorkspaceService
           });
         } else {
           const projectPath = metadata.projectPath;
+          // The id lets a Daytona runtime tell whether other workspaces still use the sandbox.
           const runtime = createRuntime(metadata.runtimeConfig, {
             projectPath,
             workspaceName: metadata.name,
             workspacePath: persistedWorkspacePath,
+            workspaceId,
           });
 
           // Delete workspace from runtime first - if this fails with force=false, we abort
@@ -8555,28 +8683,12 @@ export class WorkspaceService
             log.error(
               `Failed to delete workspace from disk, but force=true. Removing from config. Error: ${deleteResult.error}`
             );
-            // A container left behind still holds this workspace's plan (#5143): the plan step
-            // below cannot reach it once the worktree is gone. Name it for the user's logs, and
-            // return it as a warning: forced paths that skip the Force Delete dialog (bulk delete,
-            // cancel-creation, shift-click) never saw the non-forced error that names it.
-            if (deleteResult.leftoverPaths?.length) {
-              log.warn("Forced removal left these behind; a container may still hold the plan", {
-                workspaceId,
-                leftovers: deleteResult.leftoverPaths,
-              });
-              const planContainer =
-                runtime instanceof DevcontainerRuntime
-                  ? containerLabel(runtime.getWorkspacePath(projectPath, metadata.name))
-                  : undefined;
-              removalWarnings = deleteResult.leftoverPaths.map((leftover) => ({
-                kind: "leftover",
-                description:
-                  leftover === planContainer
-                    ? `The ${leftover} was left behind and may still hold this workspace's plan file; remove the container.`
-                    : `${leftover} was left behind; remove it manually.`,
-              }));
-            }
           }
+          const planContainer =
+            runtime instanceof DevcontainerRuntime
+              ? containerLabel(runtime.getWorkspacePath(projectPath, metadata.name))
+              : undefined;
+          removalWarnings = runtimeRemovalWarnings(deleteResult, planContainer, workspaceId);
 
           // Note: Coder workspace deletion is handled by CoderSSHRuntime.deleteWorkspace()
         }
@@ -11835,10 +11947,20 @@ export class WorkspaceService
    * first refuses the open while an open recorded first is observed by the sink's
    * untrackable-app check before snapshot capture.
    */
-  async recordExternalEditorOpen(workspaceId: string, launchToken: string): Promise<Result<void>> {
+  async recordExternalEditorOpen(
+    workspaceId: string,
+    launchToken: string,
+    remotePath?: string | null
+  ): Promise<Result<{ remotePath: string } | undefined>> {
     const admitted = await this.recordExternalEditorOpenForLaunch(workspaceId);
     if (!admitted.success) {
       return admitted;
+    }
+    // Before the tombstone check below: a rollback that arrives meanwhile is still consumed.
+    const resolved = await this.resolveEditorRemotePath(workspaceId, remotePath);
+    if (!resolved.success) {
+      await admitted.data.rollbackAfterFailedLaunch();
+      return resolved;
     }
     // A rollback for this token that raced ahead of the recording (the renderer saw the RPC
     // reject while this handler was still persisting the marker) is consumed here, in the
@@ -11861,7 +11983,37 @@ export class WorkspaceService
       workspaceId,
       rollback: admitted.data.rollbackAfterFailedLaunch,
     });
-    return Ok(undefined);
+    return Ok(resolved.data);
+  }
+
+  /**
+   * SSH workspaces whose runtime is provisioned after creation (Daytona, Coder) keep the
+   * unresolved default srcBaseDir (`~/mux`), so their checkout path starts with `~`. An
+   * editor's ssh deep link needs it absolute: resolve it on the host, which the admission
+   * above has made ready. Older records keep working, since nothing is rewritten.
+   */
+  private async resolveEditorRemotePath(
+    workspaceId: string,
+    remotePath: string | null | undefined
+  ): Promise<Result<{ remotePath: string } | undefined>> {
+    if (!isHomeRelativePath(remotePath)) return Ok(undefined);
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    const runtimeConfig = entry?.workspace.runtimeConfig;
+    if (entry == null || !isSSHRuntime(runtimeConfig)) return Ok(undefined);
+    try {
+      const runtime = createRuntimeForWorkspace({
+        id: workspaceId,
+        runtimeConfig,
+        projectPath: entry.projectPath,
+        name: entry.workspace.name ?? workspaceId,
+        namedWorkspacePath: entry.workspace.path,
+      });
+      return Ok({ remotePath: await runtime.resolvePath(remotePath) });
+    } catch (error) {
+      return Err(
+        `Could not resolve ${remotePath} on the workspace's host: ${getErrorMessage(error)}`
+      );
+    }
   }
 
   /**
@@ -11961,6 +12113,38 @@ export class WorkspaceService
     }
   }
 
+  /**
+   * Refusals once the editor use lease is held, all before the durable marker write so a
+   * refused open cannot permanently gate future snapshot archives of this workspace.
+   */
+  private async refuseAdmittedEditorOpen(
+    workspaceId: string,
+    entry: { projectPath: string; workspace: Workspace }
+  ): Promise<string | undefined> {
+    const { workspace } = entry;
+    // Persisted archived state (not just an in-progress archive): a stale renderer can request
+    // an editor for an already-archived workspace whose checkout may already be snapshot and
+    // removed (mirrors TerminalService.openNative and the send/PTY/desktop admissions).
+    if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
+      return `Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`;
+    }
+    if (workspace.runtimeConfig == null) return undefined;
+    // The editor connects to a Daytona sandbox's ssh alias on its own, so start a stopped
+    // sandbox and refresh its token first. Only under the lease, as for a native terminal: an
+    // archive cannot run meanwhile, so it cannot see the sandbox stopped and leave it running.
+    const ready = await ensureDaytonaSandboxReady({
+      id: workspaceId,
+      runtimeConfig: workspace.runtimeConfig,
+      projectPath: entry.projectPath,
+      name: workspace.name ?? workspaceId,
+      namedWorkspacePath: workspace.path,
+    });
+    if (!ready.success) return ready.error;
+    // After readiness, so the alias resolves with the managed block and a current token.
+    const forwarding = await refuseDaytonaEditorRemoteForward(workspace.runtimeConfig);
+    return forwarding.success ? undefined : forwarding.error;
+  }
+
   /** Body of recordExternalEditorOpenForLaunch after pending-recording admission. */
   private async recordExternalEditorOpenAdmitted(
     workspaceId: string
@@ -11992,19 +12176,10 @@ export class WorkspaceService
       await lease.release();
       return Err(`Workspace not found: ${workspaceId}`);
     }
-    // Persisted archived state (not just an in-progress archive): a stale renderer can request
-    // an editor for an already-archived workspace whose checkout may already be snapshot and
-    // removed (mirrors TerminalService.openNative and the send/PTY/desktop admissions).
-    // Checked before the durable marker write so a refused open cannot permanently gate
-    // future snapshot archives of this workspace.
-    if (
-      isWorkspaceArchived(
-        workspaceEntry.workspace.archivedAt,
-        workspaceEntry.workspace.unarchivedAt
-      )
-    ) {
+    const refusal = await this.refuseAdmittedEditorOpen(workspaceId, workspaceEntry);
+    if (refusal != null) {
       await lease.release();
-      return Err(`Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`);
+      return Err(refusal);
     }
     // Before any durable effect: one share per workspace is kept, after a failed launch too
     // (fail closed).
@@ -12998,15 +13173,16 @@ export class WorkspaceService
         options?.coderWorkspaceArchiveBehaviorOverride ??
         this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
         DEFAULT_CODER_ARCHIVE_BEHAVIOR;
-      const isDedicatedCoderWorkspace = isDedicatedCoderRuntime(
-        beforeArchiveMetadata?.runtimeConfig
+      const remoteBoxBehavior = remoteBoxArchiveBehavior(
+        beforeArchiveMetadata,
+        coderWorkspaceArchiveBehavior
       );
-      if (options?.forbidCoderWorkspaceDeletion === true) {
-        if (isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior === "delete") {
-          return Err(
-            'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior.'
-          );
-        }
+      if (options?.forbidCoderWorkspaceDeletion === true && remoteBoxBehavior === "delete") {
+        return Err(
+          beforeArchiveMetadata != null && ownsDaytonaSandbox(beforeArchiveMetadata)
+            ? DAYTONA_ARCHIVE_NEEDS_USER
+            : 'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior.'
+        );
       }
 
       const canSnapshotManagedWorktree =
@@ -13025,17 +13201,16 @@ export class WorkspaceService
       // the managed worktree — or stop a dedicated remote Coder workspace the user may still
       // be connected to through such an app — a model-driven archive must not pull the
       // environment out from under a user's live shell or editor. Mirrors the lifecycle
-      // caller's early refusal against the same pinned behavior reads. ("delete" for a
-      // dedicated Coder workspace is refused outright above, so non-"keep" here means stop.)
-      const stopsDedicatedCoderWorkspace =
-        isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior !== "keep";
+      // caller's early refusal against the same pinned behavior reads. ("delete" is refused
+      // outright above for model-driven archives, so non-"keep" here means stop.)
+      const stopsDedicatedCoderWorkspace = remoteBoxBehavior !== "keep";
       if (
         options?.refuseLiveUserActivity === true &&
         (needsSnapshotCapture || stopsDedicatedCoderWorkspace) &&
         (await this.hasUntrackableExternalAppOpen(workspaceId))
       ) {
         return Err(
-          "A native terminal or external editor was opened for this workspace and its lifetime cannot be tracked; the archive policy would remove the checkout or stop the dedicated remote Coder workspace under it. Ask the user to archive this workspace manually."
+          `A native terminal or external editor was opened for this workspace and its lifetime cannot be tracked; the archive policy would remove the checkout or stop the dedicated remote ${dedicatedRemoteBoxLabel(beforeArchiveMetadata)} under it. Ask the user to archive this workspace manually.`
         );
       }
 
@@ -13121,6 +13296,7 @@ export class WorkspaceService
       //
       // NOTE: Archiving is typically a quick UI action, but it can fail if a hook needs to perform
       // cleanup (e.g., stopping a dedicated mux-created Coder workspace) and that cleanup fails.
+      const archiveWarnings: string[] = [];
       if (this.workspaceLifecycleHooks && beforeArchiveMetadata) {
         const hookResult = await this.workspaceLifecycleHooks.runBeforeArchive({
           workspaceId,
@@ -13129,6 +13305,7 @@ export class WorkspaceService
           // Model-facing archives (refuseLiveUserActivity) must not stop a running remote
           // workspace under a surviving detached job the host-local orphan scans cannot see.
           refuseStopUnderUnverifiedRemoteJobs: options?.refuseLiveUserActivity === true,
+          reportWarning: (warning) => archiveWarnings.push(warning),
         });
         if (!hookResult.success) {
           return Err(hookResult.error);
@@ -13323,7 +13500,7 @@ export class WorkspaceService
         subProjectPath: beforeArchiveMetadata?.subProjectPath,
       });
       eventSpine.emit("workspace.archived", { workspaceId });
-      return Ok({ kind: "archived" as const });
+      return Ok(archivedResult(archiveWarnings));
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to archive workspace: ${message}`);
@@ -13786,6 +13963,9 @@ export class WorkspaceService
       }
     }
 
+    // Daytona workspaces were marked "unsupported" with the other SSH ones above.
+    Object.assign(statuses, await probeDaytonaRuntimeStatuses(workspaceIds, metadataById));
+
     // Passive status probes must not call ensureReady(); Docker labels are enough to tell
     // whether devcontainers are already running. Probe all requested paths with one docker ps.
     const probeResults = await probeDevcontainerStatuses(
@@ -13960,6 +14140,7 @@ export class WorkspaceService
     const archivedWorkspaceIds: string[] = [];
     const skippedWorkspaceIds: string[] = [];
     const errors: Array<{ workspaceId: string; error: string }> = [];
+    const warnings: Array<{ workspaceId: string; warning: string }> = [];
 
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -14054,16 +14235,19 @@ export class WorkspaceService
           continue;
         }
         archivedWorkspaceIds.push(workspaceId);
+        warnings.push(...toBulkArchiveWarnings(workspaceId, result.data.warnings));
       }
 
       archivedWorkspaceIds.sort();
       skippedWorkspaceIds.sort();
       errors.sort((a, b) => a.workspaceId.localeCompare(b.workspaceId));
+      warnings.sort((a, b) => a.workspaceId.localeCompare(b.workspaceId));
 
       return Ok({
         archivedWorkspaceIds,
         skippedWorkspaceIds,
         errors,
+        warnings,
       });
     } catch (error) {
       const message = getErrorMessage(error);
