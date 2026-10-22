@@ -5,6 +5,7 @@ import {
 } from "@/common/utils/ai/models";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
 import type { MuxMessage } from "@/common/types/message";
+import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { WorkspaceViewTail, WorkspaceViewTailRow } from "@/common/orpc/schemas/api";
 import type { AIService } from "./aiService";
@@ -48,8 +49,13 @@ const isPlainSend = (value: unknown) =>
     value.type === "normal" &&
     Object.keys(value).every((key) => key === "type" || key === "requestedModel"));
 
+// The live replay parses each row with the wire schema, which drops the keys it does not define
+// (such as a field an older build wrote), so only wire keys can change how a replayed row draws.
+const WIRE_METADATA_KEYS = new Set(Object.keys(MuxMessageSchema.shape.metadata.unwrap().shape));
+
 function hasOnlySafeMetadata(role: "user" | "assistant", metadata: Record<string, unknown>) {
-  if (!Object.keys(metadata).every((key) => SAFE_KEYS[role].has(key))) return false;
+  const wireKeys = Object.keys(metadata).filter((key) => WIRE_METADATA_KEYS.has(key));
+  if (!wireKeys.every((key) => SAFE_KEYS[role].has(key))) return false;
   // Other finish reasons add a notice under the reply (length, refusal, content filter).
   if (role === "user") return isPlainSend(metadata.muxMetadata);
   return metadata.finishReason === undefined || metadata.finishReason === "stop";

@@ -153,6 +153,18 @@ describe("readWorkspaceViewTail", () => {
       last: "fine",
     });
   });
+
+  test("a key the wire schema does not define, as older builds wrote, does not block a row", async () => {
+    await append([
+      msg("old-user", "user", "hi", { retiredFlag: false }),
+      msg("old-reply", "assistant", "yo", { retiredFlag: false }),
+    ]);
+    const rows = (await read())!.rows;
+    expect(rows.map((row) => [row.id, row.text])).toEqual([
+      ["old-user", "hi"],
+      ["old-reply", "yo"],
+    ]);
+  });
 });
 
 describe("row trees", () => {
