@@ -803,6 +803,19 @@ export async function loadPluginMcpServers(
       continue;
     }
     const { rawEntry } = shape;
+    // Claude Code skips a remote entry without `type` as a configuration error, so Xum does not
+    // infer a transport for it as the Codex dialect does.
+    if (
+      plugin.mcpConfigDialect === "claude" &&
+      rawEntry.type === undefined &&
+      rawEntry.url !== undefined
+    ) {
+      reportEntry(
+        "warning",
+        "a 'url' entry needs a 'type' ('http' or 'sse') in a Claude .mcp.json"
+      );
+      continue;
+    }
     const codex = codexDialect
       ? translateCodexMcpEntry(rawEntry)
       : { entry: rawEntry, ignored: [], warnings: [], hasClientSecret: false };

@@ -11,6 +11,8 @@
  */
 import YAML from "yaml";
 
+import { AgentSkillParseError } from "@/node/services/agentSkills/parseSkillMarkdown";
+import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { SKILL_FILENAME } from "@/node/services/tools/skillFileUtils";
 import { normalizeNewlines, stripUtf8Bom } from "@/node/utils/markdownFrontmatter";
 import { isPlainObject } from "./manifest";
@@ -67,7 +69,8 @@ function quoteBracketedArgumentHint(yaml: string): string {
  * A command file as SKILL.md text: its frontmatter with `name` set to the file name,
  * `disable-model-invocation: true` forced (a Claude command is for the user), and a description
  * taken from the first body line when it has none. Text whose frontmatter does not parse as a
- * mapping stays unchanged, so the skill parser reports the error.
+ * mapping stays unchanged, so the skill parser reports the error. Throws AgentSkillParseError
+ * when the rewritten text is over the SKILL.md size cap.
  */
 export function claudeCommandSkillMarkdown(name: string, content: string): string {
   const parts = splitFrontmatter(normalizeNewlines(stripUtf8Bom(content)));
@@ -89,5 +92,13 @@ export function claudeCommandSkillMarkdown(name: string, content: string): strin
         : firstLineDescription(name, parts.body),
     "disable-model-invocation": true,
   };
-  return `---\n${YAML.stringify(frontmatter)}---\n${parts.body}`;
+  const rewritten = `---\n${YAML.stringify(frontmatter)}---\n${parts.body}`;
+  // YAML aliases can repeat one large value many times, so the rewritten text can be far bigger
+  // than the file. Every caller parses it with the file's byteSize, so check the same cap here.
+  if (Buffer.byteLength(rewritten, "utf8") > MAX_FILE_SIZE) {
+    throw new AgentSkillParseError(
+      `Command /${name} is larger than ${MAX_FILE_SIZE} bytes once its frontmatter is rewritten as a skill; it does not load.`
+    );
+  }
+  return rewritten;
 }
