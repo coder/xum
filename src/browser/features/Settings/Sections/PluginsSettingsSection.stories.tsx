@@ -1538,12 +1538,16 @@ const entryPreview = (name: string, skills: string[]): AgentPluginInstallPreview
  * The first entry has a long name without a break point: entry names have no length limit, and
  * the "Preview <name>" action must still fit the card at phone width.
  */
+// Catalog text has no length limit: long separator-free words must wrap inside the card.
+const LONG_WORD = "averylongdescriptionwordwithoutanyspacesorhyphensthatmustwrapinsidethecard";
 const LONG_NAME_LISTING: AgentPluginMarketplaceListing = {
   ...MARKETPLACE_LISTING,
+  description: LONG_WORD,
   entries: [
     {
       ...MARKETPLACE_LISTING.entries[0],
       name: "documentskillsforexcelwordpowerpointandpdffilesandmoredocumentskills",
+      description: LONG_WORD,
     },
     ...MARKETPLACE_LISTING.entries.slice(1),
   ],

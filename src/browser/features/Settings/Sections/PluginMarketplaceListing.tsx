@@ -110,7 +110,10 @@ const MarketplaceHeader: React.FC<{ listing: AgentPluginMarketplaceListing }> = 
           Claude Code marketplace · {count === 1 ? "1 plugin" : `${count} plugins`}
         </span>
       </div>
-      {listing.description && <p className="text-muted text-xs">{listing.description}</p>}
+      {/* Catalog text has no length limit: a long word breaks inside instead of overflowing. */}
+      {listing.description && (
+        <p className="text-muted text-xs break-words">{listing.description}</p>
+      )}
       {/* break-words: the line wraps at spaces, and only a word too long for a line (a long
           URL on phone widths) breaks inside, so the owner name stays whole. */}
       <p className="text-muted text-[11px] break-words">
@@ -158,8 +161,12 @@ const EntryRow: React.FC<{
           )}
           <span className="text-muted text-[11px] break-all">{entry.source}</span>
         </span>
-        {entry.description && <span className="text-muted block text-xs">{entry.description}</span>}
-        {entry.reason && <span className="text-warning block text-xs">{entry.reason}</span>}
+        {entry.description && (
+          <span className="text-muted block text-xs break-words">{entry.description}</span>
+        )}
+        {entry.reason && (
+          <span className="text-warning block text-xs break-words">{entry.reason}</span>
+        )}
       </span>
     </label>
   );
