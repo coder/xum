@@ -17,7 +17,11 @@ describe("nodeSessionFiles reads node:fs at call time", () => {
 
   test("a spy on the node:fs/promises namespace reaches files.promises", async () => {
     const stat = spyOn(nodeFsPromises, "stat").mockRejectedValueOnce(new Error("injected"));
-    await expect(nodeSessionFiles.promises.stat(os.tmpdir())).rejects.toThrow("injected");
+    const error = await nodeSessionFiles.promises.stat(os.tmpdir()).then(
+      () => undefined,
+      (reason: unknown) => reason
+    );
+    expect(error).toEqual(new Error("injected"));
     expect(stat).toHaveBeenCalledTimes(1);
   });
 
