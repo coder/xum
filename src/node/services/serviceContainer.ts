@@ -917,7 +917,6 @@ export class ServiceContainer {
     await this.telemetryService.shutdown();
   }
 
-  /** Starts or stops the perf flight recorder to match the persisted experiment state. */
   /** Settings' archive behavior for Daytona sandboxes (shared with Coder workspaces). */
   private archiveBehavior(): CoderWorkspaceArchiveBehavior {
     return (
@@ -926,6 +925,7 @@ export class ServiceContainer {
     );
   }
 
+  /** Starts or stops the perf flight recorder to match the persisted experiment state. */
   private syncPerfFlightRecorder(): void {
     const enabled = this.experimentsService.isExperimentEnabled(
       EXPERIMENT_IDS.PERF_FLIGHT_RECORDER
