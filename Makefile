@@ -548,12 +548,17 @@ static-check-full: lint-full $(STATIC_CHECKS) check-bench-agent test-bench-scrip
 # Harbor version for benchmark-terminal and the adapter tests below, so CI tests the
 # adapter against the same Harbor API the scheduled benchmark runs.
 TB_HARBOR_VERSION := 0.6.4
+# Harbor only sets a floor on litellm (>=1.83.14), so uv installed the newest release. On
+# 2026-10-21 that was litellm 1.107.0, a compromised PyPI upload that ran a credential
+# stealer at every Python start (BerriAI/litellm#47826). Pin the last release published
+# before it, and bump it on purpose (with Harbor), never by letting uv pick the newest.
+TB_LITELLM_VERSION := 1.106.2
 
 # pytest is not a repo dependency; uv (installed in CI's static-check job) supplies it.
 test-bench-scripts: ## Test the Terminal-Bench result checker and agent adapter with offline fixtures
 	@uv run --no-project --with pytest python -m pytest -q scripts/check_tbench_results_test.py
 	@# Harbor requires Python >=3.12 and CI's system python is older; uv fetches a managed 3.12 if needed.
-	@uv run --no-project --python 3.12 --with 'harbor==$(TB_HARBOR_VERSION)' --with pytest python -m pytest -q benchmarks/terminal_bench/mux_agent_test.py
+	@uv run --no-project --python 3.12 --with 'harbor==$(TB_HARBOR_VERSION)' --with 'litellm==$(TB_LITELLM_VERSION)' --with pytest python -m pytest -q benchmarks/terminal_bench/mux_agent_test.py
 
 # CRAP scores (scripts/crap/). uv reads the Crapper and grammar pins from the
 # adapter's inline script header, so no virtualenv is committed or reused.
@@ -960,8 +965,8 @@ benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE
 	echo "Using timeout: $$TB_TIMEOUT seconds"; \
 	echo "Running Terminal-Bench with dataset $$TB_DATASET (concurrency: $$TB_CONCURRENCY)"; \
 	export MUX_TIMEOUT_MS=$$((TB_TIMEOUT * 1000)); \
-	uvx --from "$$HARBOR_PACKAGE" --with "$$HARBOR_DAYTONA_PACKAGE" python -c 'import importlib.metadata as m; print("Resolved Harbor package:", m.version("harbor")); print("Resolved Daytona package:", m.version("daytona"))'; \
-	uvx --from "$$HARBOR_PACKAGE" --with "$$HARBOR_DAYTONA_PACKAGE" harbor run \
+	uvx --from "$$HARBOR_PACKAGE" --with "$$HARBOR_DAYTONA_PACKAGE" --with "litellm==$(TB_LITELLM_VERSION)" python -c 'import importlib.metadata as m; print("Resolved Harbor package:", m.version("harbor")); print("Resolved Daytona package:", m.version("daytona"))'; \
+	uvx --from "$$HARBOR_PACKAGE" --with "$$HARBOR_DAYTONA_PACKAGE" --with "litellm==$(TB_LITELLM_VERSION)" harbor run \
 		--dataset "$$TB_DATASET" \
 		--agent-import-path benchmarks.terminal_bench.mux_agent:MuxAgent \
 		--agent-kwarg timeout=$$TB_TIMEOUT \
