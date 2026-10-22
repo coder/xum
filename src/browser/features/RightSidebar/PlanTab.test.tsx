@@ -1,12 +1,14 @@
+import "../../../../tests/ui/dom";
 import * as RealMarkdownCore from "../Messages/MarkdownCore";
 import * as RealMarkdownRenderer from "../Messages/MarkdownRenderer";
 import * as RealClipboard from "@/browser/utils/clipboard";
+import * as RealOpenInEditor from "@/browser/utils/openInEditor";
 import { APIContext, APIProvider } from "@/browser/contexts/API";
 import type { ReactElement, ReactNode } from "react";
 import { PlanTab } from "./PlanTab";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { GlobalWindow } from "happy-dom";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { installDom } from "../../../../tests/ui/dom";
 import type { APIClient } from "@/browser/contexts/API";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
@@ -24,10 +26,13 @@ const realModules: Array<[string, Record<string, unknown>]> = [
   ["@/browser/features/Messages/MarkdownCore", { ...RealMarkdownCore }],
   ["@/browser/features/Messages/MarkdownRenderer", { ...RealMarkdownRenderer }],
   ["@/browser/utils/clipboard", { ...RealClipboard }],
+  ["@/browser/utils/openInEditor", { ...RealOpenInEditor }],
 ];
 
 /** What the mocked clipboard received. */
 let clipboardWrites: string[] = [];
+/** The mocked openInEditor's pending launches, each settled through its resolver. */
+let editorLaunches: Array<(result: { success: boolean }) => void> = [];
 
 async function installModuleMocks() {
   await mock.module("@/browser/features/Messages/MarkdownCore", () => ({
@@ -48,6 +53,14 @@ async function installModuleMocks() {
       clipboardWrites.push(text);
       return Promise.resolve();
     },
+  }));
+
+  await mock.module("@/browser/utils/openInEditor", () => ({
+    ...RealOpenInEditor,
+    openInEditor: () =>
+      new Promise<{ success: boolean }>((resolve) => {
+        editorLaunches.push(resolve);
+      }),
   }));
 }
 
@@ -85,25 +98,24 @@ function planResult(content: string, path = "/tmp/plan.md"): GetPlanContentResul
 }
 
 describe("PlanTab", () => {
-  let originalWindow: typeof globalThis.window;
-  let originalDocument: typeof globalThis.document;
+  let cleanupDom: (() => void) | null = null;
 
   beforeEach(async () => {
     await installModuleMocks();
-    originalWindow = globalThis.window;
-    originalDocument = globalThis.document;
-    globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
-    globalThis.document = globalThis.window.document;
+    // The shared DOM installer, as in the sibling suites: React's event delegation needs the
+    // window's element classes as globals, not only `window` and `document`.
+    cleanupDom = installDom();
     mockApi = null;
     clipboardWrites = [];
+    editorLaunches = [];
   });
 
   afterEach(async () => {
     cleanup();
     await restoreModuleMocks();
     mock.restore();
-    globalThis.window = originalWindow;
-    globalThis.document = originalDocument;
+    cleanupDom?.();
+    cleanupDom = null;
   });
 
   test("shows the plan and its path once read", async () => {
@@ -260,6 +272,29 @@ describe("PlanTab", () => {
     panel.appendChild(field);
     fireEvent.keyDown(field, { key: "y" });
     expect(clipboardWrites).toEqual(["# Plan"]);
+  });
+
+  test("the Edit shortcut launches one editor per press, none while a launch is pending", async () => {
+    mockApi = { workspace: { getPlanContent: mock(() => Promise.resolve(planResult("# Plan"))) } };
+    const view = renderWithApi(<PlanTab workspaceId="workspace-1" />);
+    await waitFor(() => {
+      expect(view.getByTestId("plan-markdown-core").textContent).toContain("# Plan");
+    });
+
+    const panel = view.getByTestId("plan-tab");
+    fireEvent.keyDown(panel, { key: "e" });
+    expect(editorLaunches).toHaveLength(1);
+    // A held key auto-repeats, and a second press lands while the launch is pending.
+    fireEvent.keyDown(panel, { key: "e", repeat: true });
+    fireEvent.keyDown(panel, { key: "e" });
+    expect(editorLaunches).toHaveLength(1);
+
+    await act(async () => {
+      editorLaunches[0]?.({ success: true });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    fireEvent.keyDown(panel, { key: "e" });
+    expect(editorLaunches).toHaveLength(2);
   });
 
   test("takes focus when opened by its shortcut, once", async () => {

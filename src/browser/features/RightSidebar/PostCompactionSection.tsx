@@ -130,7 +130,7 @@ export const PostCompactionSection: React.FC<PostCompactionSectionProps> = (prop
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        openPlanTab(props.workspaceId);
+                        openPlanTab(props.workspaceId, { focus: true });
                       }}
                       className={`text-subtle hover:text-foreground flex items-center gap-2 text-left text-xs transition-colors ${isPlanExcluded ? "line-through" : ""}`}
                       type="button"
