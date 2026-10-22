@@ -1820,10 +1820,6 @@ export const router = (authToken?: string) => {
         .input(schemas.daytona.testConnection.input)
         .output(schemas.daytona.testConnection.output)
         .handler(async ({ context }) => context.daytonaService.testConnection()),
-      listSandboxes: t
-        .input(schemas.daytona.listSandboxes.input)
-        .output(schemas.daytona.listSandboxes.output)
-        .handler(async ({ context }) => context.daytonaService.listSandboxes()),
       listSnapshots: t
         .input(schemas.daytona.listSnapshots.input)
         .output(schemas.daytona.listSnapshots.output)

@@ -1198,7 +1198,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
         type: "ssh",
         host: "daytona://",
         srcBaseDir: "~/src",
-        daytona: { sandboxId: "xum-multi", shared: false },
+        daytona: { sandboxId: "xum-multi" },
       },
     ],
   ])(

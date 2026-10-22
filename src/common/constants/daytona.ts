@@ -22,6 +22,10 @@ export function isXumDaytonaHost(host: string): boolean {
   return hostname.endsWith(`.${XUM_DAYTONA_HOST_SUFFIX}`);
 }
 
+/** Why a model-driven archive refuses the workspace that created a Daytona sandbox. */
+export const DAYTONA_ARCHIVE_NEEDS_USER =
+  "Archiving this workspace permanently deletes the Daytona sandbox it created (unarchive cannot recreate it), so it needs the user's confirmation. Ask the user to archive this workspace manually.";
+
 export const XUM_DAYTONA_SSH_BLOCK_START = "# --- START XUM DAYTONA SSH ---";
 export const XUM_DAYTONA_SSH_BLOCK_END = "# --- END XUM DAYTONA SSH ---";
 

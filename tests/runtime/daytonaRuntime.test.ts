@@ -132,14 +132,16 @@ describeDaytona("Daytona runtime (real control plane)", () => {
     expect(fork.success).toBe(true);
     const forkConfig = fork.forkedRuntimeConfig;
     if (forkConfig?.type !== "ssh") throw new Error("fork lost its ssh config");
-    expect(forkConfig.daytona?.shared).toBe(true);
+    expect(forkConfig.daytona?.forked).toBe(true);
 
-    // Archive with "stop" stops a dedicated sandbox (this one is shared after the fork, so use
-    // the pre-fork config to exercise the stop path).
-    const archiveHook = createDaytonaArchiveHook({
-      daytonaService: service,
-      getArchiveBehavior: () => "stop",
-    });
+    // Removing the fork deletes only its checkout: the sandbox stays for its owner.
+    const forkRuntime = makeRuntime(forkConfig, "feature-fork");
+    const deleted = await forkRuntime.deleteWorkspace(projectPath, "feature-fork", false);
+    expect(deleted.success).toBe(true);
+    expect((await service.getSandboxState(sandboxId ?? "")).state).toBe("started");
+
+    // Archiving the workspace that created the sandbox deletes it.
+    const archiveHook = createDaytonaArchiveHook({ daytonaService: service });
     const archived = await archiveHook({
       workspaceId: "daytona-test-feature",
       workspaceMetadata: {
@@ -151,12 +153,6 @@ describeDaytona("Daytona runtime (real control plane)", () => {
       },
     });
     expect(archived.success).toBe(true);
-    expect((await service.getSandboxState(sandboxId ?? "")).state).toBe("stopped");
-
-    // Delete starts the stopped sandbox for the dirty check; the shared sandbox survives.
-    const forkRuntime = makeRuntime(forkConfig, "feature-fork");
-    const deleted = await forkRuntime.deleteWorkspace(projectPath, "feature-fork", false);
-    expect(deleted.success).toBe(true);
-    expect((await service.getSandboxState(sandboxId ?? "")).state).toBe("started");
+    expect((await service.getSandboxState(sandboxId ?? "")).state).toBe("missing");
   }, 900_000);
 });

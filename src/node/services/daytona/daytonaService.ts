@@ -1,14 +1,11 @@
 import * as path from "path";
 import type {
-  DaytonaListSandboxesResult,
   DaytonaListSnapshotsResult,
   DaytonaPublicConfig,
   DaytonaSandboxState,
-  DaytonaSandboxSummary,
   DaytonaTestConnectionResult,
 } from "@/common/orpc/schemas/daytona";
 import { toXumDaytonaHost } from "@/common/constants/daytona";
-import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   DaytonaConfigError,
@@ -20,15 +17,9 @@ import { loadOrCreateInstallationId } from "@/node/config/installationIdentity";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { retireSshConnections } from "@/node/runtime/transports";
 import { rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
-import {
-  getDaytonaSandboxId,
-  isDedicatedDaytonaSandbox,
-  type RuntimeConfig,
-} from "@/common/types/runtime";
 import { log } from "@/node/services/log";
 import { sleepWithAbort } from "@/node/utils/abort";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
-import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import {
   DaytonaApiError,
   DaytonaClient,
@@ -40,33 +31,9 @@ import {
   type DaytonaSnapshot,
   type DaytonaSshAccess,
 } from "./daytonaClient";
-import type { DaytonaWorkspaceRef } from "./daytonaReconciler";
-
-/** A workspace whose runtime is on a given sandbox. */
-export interface DaytonaWorkspaceOnSandbox {
-  workspaceId: string;
-  runtimeConfig: RuntimeConfig;
-}
-
-/** The ref with the sandbox string it stores, or none when it stores no sandbox. */
-function onSandboxRef(
-  ref: DaytonaWorkspaceRef
-): Array<DaytonaWorkspaceOnSandbox & { stored: string }> {
-  const stored = getDaytonaSandboxId(ref.runtimeConfig);
-  return stored && ref.runtimeConfig
-    ? [{ stored, workspaceId: ref.workspaceId, runtimeConfig: ref.runtimeConfig }]
-    : [];
-}
-
-/** What another workspace stores as its sandbox, and whether it attached it. */
-interface StoredSandboxRef {
-  stored: string;
-  attached: boolean;
-  archived: boolean;
-}
 
 /**
- * Sandboxes (and the snapshots that create them) Xum never offers, creates or attaches:
+ * Sandboxes (and the snapshots that create them) Xum never offers or creates:
  * - "windows" (Daytona's sandboxClass): Xum provisions and runs workspaces over ssh with POSIX
  *   shell commands, which cmd.exe and PowerShell do not run.
  * - "gpu" (a positive `gpu` count; Daytona's sandboxClass has no GPU value): Daytona deletes a
@@ -219,18 +186,8 @@ export interface DaytonaServiceOptions {
   fetch?: typeof fetch;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
-  /**
-   * Every workspace Xum knows, archived ones included: a sandbox Xum created is deleted only
-   * with the last workspace that references it. Without it no sandbox counts as unreferenced.
-   */
-  listWorkspaces?: () => DaytonaWorkspaceRef[];
   /** Defaults to retiring the pooled OpenSSH and ssh2 connections of the sandbox's alias. */
   retireSshConnections?: (sandboxId: string) => Promise<void>;
-  /**
-   * The archive behavior in Settings, for a removal that ends the last use of a sandbox an
-   * archived owner left alone (see the archive hook). Without it such a removal keeps it as is.
-   */
-  getArchiveBehavior?: () => CoderWorkspaceArchiveBehavior;
 }
 
 export interface DaytonaStartAndWaitOptions {
@@ -270,19 +227,6 @@ function toResultError(error: unknown): {
     return { ok: false, kind: error.kind, error: error.message };
   }
   return { ok: false, kind: "server", error: getErrorMessage(error) };
-}
-
-function toSummary(sandbox: DaytonaSandbox): DaytonaSandboxSummary {
-  return {
-    id: sandbox.id,
-    name: sandbox.name ?? sandbox.id,
-    state: mapDaytonaSandboxState(sandbox.state),
-    ...(sandbox.cpu !== undefined ? { cpu: sandbox.cpu } : {}),
-    ...(sandbox.memory !== undefined ? { memoryGiB: sandbox.memory } : {}),
-    ...(sandbox.disk !== undefined ? { diskGiB: sandbox.disk } : {}),
-    ...(sandbox.snapshot ? { snapshot: sandbox.snapshot } : {}),
-    ...(sandbox.target ? { target: sandbox.target } : {}),
-  };
 }
 
 function toSshGateway(config: DaytonaGatewayConfig) {
@@ -344,32 +288,12 @@ export class DaytonaService {
    * When this process last proved a sandbox carries this install's label (never one that does
    * not). A turn reuses a proof within DAYTONA_READY_CACHE_MS, so a label someone else removed
    * is seen within that window and a healthy sandbox pays one label read per window. Dropped
-   * with a delete or a handoff, and with the account.
+   * with a delete, and with the account.
    */
   private readonly provenOwned = new Map<string, number>();
   private readonly ownershipRequests = new Map<string, Promise<"owned" | "notOwned" | "missing">>();
-  /**
-   * Why a workspace's setup of the sandbox Xum created for it failed, for its later turns. Per
-   * workspace, not per sandbox: a sandbox the failed setup could not delete may be attached by
-   * another workspace, whose own setup decides whether it works.
-   */
+  /** Why a workspace's setup of the sandbox Xum created for it failed, for its later turns. */
   private readonly setupFailures = new Map<string, string>();
-  private readonly listWorkspaces?: () => DaytonaWorkspaceRef[];
-  readonly getArchiveBehavior: () => CoderWorkspaceArchiveBehavior;
-  /**
-   * Serializes "is this its last workspace" decisions. One key for every sandbox: workspaces
-   * may name one sandbox by its name or by its id, so a per-string key would not serialize them.
-   */
-  private readonly removalLocks = new MutexMap<string>();
-  /**
-   * Workspaces whose removal passed its checks and deleted its checkout, but that the
-   * workspace list may still show until the removal is persisted, by that removal's
-   * pendingRemoval marker. A removal that then fails (deregistration rejects) releases its
-   * marker, and a retry claims a new one: either way the record no longer applies, so the
-   * still registered workspace counts as a reference again.
-   */
-  private readonly removedWorkspaces = new Map<string, string>();
-
   constructor(options: DaytonaServiceOptions) {
     this.credentialsStore = options.credentialsStore;
     this.rootDir = options.rootDir;
@@ -378,8 +302,6 @@ export class DaytonaService {
     this.fetchImpl = options.fetch;
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? sleepWithAbort;
-    this.listWorkspaces = options.listWorkspaces;
-    this.getArchiveBehavior = options.getArchiveBehavior ?? (() => "keep");
     this.retireSshConnections =
       options.retireSshConnections ??
       ((sandboxId) => retireSshConnections({ host: toXumDaytonaHost(sandboxId) }));
@@ -478,167 +400,6 @@ export class DaytonaService {
       log.debug("No Daytona client to revoke SSH tokens with", { error: getErrorMessage(error) });
       return undefined;
     }
-  }
-
-  /**
-   * Whether a workspace other than `workspaceId` (archived ones included) references the
-   * sandbox. Daytona takes a sandbox's name or its id, and both get stored: Xum keeps the name
-   * of a sandbox it created, the attach picker the id. So when another workspace stores a
-   * different string, the sandbox is looked up and matched by both. Fails closed, as
-   * referenced, when the workspace list, the caller's id or the lookup is unavailable: a kept
-   * sandbox only costs storage (the reconciler stops it), a deleted one loses the other
-   * workspace's work. A sandbox that is already gone has no references left to protect.
-   */
-  async isSandboxReferencedElsewhere(
-    sandboxId: string,
-    workspaceId: string | undefined
-  ): Promise<boolean> {
-    return (await this.sandboxReferencesElsewhere(sandboxId, workspaceId)) !== "none";
-  }
-
-  /**
-   * Who else references the sandbox, matched as in isSandboxReferencedElsewhere: "none",
-   * "attached" (only workspaces that attached it, through which Xum never deletes it), or
-   * "other" (a workspace that may delete it, or a failed lookup).
-   */
-  async sandboxReferencesElsewhere(
-    sandboxId: string,
-    workspaceId: string | undefined
-  ): Promise<"none" | "attached" | "other"> {
-    if (!this.listWorkspaces || !workspaceId) return "other";
-    const others = this.refsStoredElsewhere(this.listWorkspaces(), workspaceId);
-    if (others.length === 0) return "none";
-    const matched = await this.refsMatchingSandbox(sandboxId, others);
-    if (!matched) return "other";
-    if (matched.length === 0) return "none";
-    return matched.every((ref) => ref.attached) ? "attached" : "other";
-  }
-
-  /**
-   * For archive: whether another workspace still works in the sandbox ("active"), only
-   * archived ones reference it ("archived", or "archivedOwner" when one of them is a workspace
-   * whose sandbox Xum created, whose archive left the sandbox alone), or none does. Matched and
-   * failing closed (as "active") like sandboxReferencesElsewhere; removal still counts
-   * archived workspaces.
-   */
-  async sandboxUseElsewhere(
-    sandboxId: string,
-    workspaceId: string | undefined
-  ): Promise<"none" | "archived" | "archivedOwner" | "active"> {
-    if (!this.listWorkspaces || !workspaceId) return "active";
-    const others = this.refsStoredElsewhere(this.listWorkspaces(), workspaceId);
-    if (others.length === 0) return "none";
-    const matched = await this.refsMatchingSandbox(sandboxId, others);
-    if (!matched) return "active";
-    if (matched.length === 0) return "none";
-    if (!matched.every((ref) => ref.archived)) return "active";
-    return matched.some((ref) => !ref.attached) ? "archivedOwner" : "archived";
-  }
-
-  /**
-   * The other workspaces on the sandbox (archived ones and borrowed checkouts included), for
-   * checks that must cover every job in it. Matched as in sandboxReferencesElsewhere; undefined
-   * when the workspace list, the caller's id or the lookup is unavailable.
-   */
-  async otherWorkspacesOnSandbox(
-    sandboxId: string,
-    workspaceId: string | undefined
-  ): Promise<DaytonaWorkspaceOnSandbox[] | undefined> {
-    if (!this.listWorkspaces || !workspaceId) return undefined;
-    const others = this.listWorkspaces().flatMap((ref) =>
-      ref.workspaceId === workspaceId || this.isRemovalInFlight(ref) ? [] : onSandboxRef(ref)
-    );
-    if (others.length === 0) return [];
-    const matched = await this.refsMatchingSandbox(sandboxId, others);
-    return matched?.map((ref) => ({
-      workspaceId: ref.workspaceId,
-      runtimeConfig: ref.runtimeConfig,
-    }));
-  }
-
-  /** The refs that store this sandbox by its name or its id; undefined when the lookup fails. */
-  private async refsMatchingSandbox<T extends { stored: string }>(
-    sandboxId: string,
-    refs: T[]
-  ): Promise<T[] | undefined> {
-    const aliases = refs.every((ref) => ref.stored === sandboxId)
-      ? new Set([sandboxId])
-      : await this.sandboxAliases(sandboxId);
-    return aliases && refs.filter((ref) => ref.stored === sandboxId || aliases.has(ref.stored));
-  }
-
-  /**
-   * Whether a workspace other than `workspaceId` stores exactly this string as its sandbox:
-   * Xum's ssh access (token, include block) is per stored string. True (keep the access) when
-   * the workspace list or the caller's id is unavailable.
-   */
-  isAliasStoredElsewhere(alias: string, workspaceId: string | undefined): boolean {
-    if (!this.listWorkspaces || !workspaceId) return true;
-    return this.refsStoredElsewhere(this.listWorkspaces(), workspaceId).some(
-      (ref) => ref.stored === alias
-    );
-  }
-
-  /**
-   * What the other workspaces (removals in flight and borrowed checkouts excluded) store as
-   * their sandbox.
-   */
-  private refsStoredElsewhere(
-    refs: DaytonaWorkspaceRef[],
-    workspaceId: string
-  ): StoredSandboxRef[] {
-    return refs.flatMap((ref) => {
-      const stored = getDaytonaSandboxId(ref.runtimeConfig);
-      const counts =
-        ref.workspaceId !== workspaceId &&
-        !this.isRemovalInFlight(ref) &&
-        ref.borrowsCheckout !== true;
-      return counts && stored
-        ? [
-            {
-              stored,
-              attached: !isDedicatedDaytonaSandbox(ref.runtimeConfig),
-              archived: ref.archived === true,
-            },
-          ]
-        : [];
-    });
-  }
-
-  private isRemovalInFlight(ref: DaytonaWorkspaceRef): boolean {
-    return (
-      ref.pendingRemovalId !== undefined &&
-      this.removedWorkspaces.get(ref.workspaceId) === ref.pendingRemovalId
-    );
-  }
-
-  /** The sandbox's id and name (empty when it is gone); undefined when the lookup fails. */
-  private async sandboxAliases(sandboxId: string): Promise<Set<string> | undefined> {
-    try {
-      const { sandbox } = await this.getSandboxState(sandboxId);
-      return new Set([sandbox?.id, sandbox?.name].filter((alias): alias is string => !!alias));
-    } catch (error) {
-      log.warn("Could not look up a Daytona sandbox to match its references", {
-        sandboxId,
-        error: getErrorMessage(error),
-      });
-      return undefined;
-    }
-  }
-
-  /** Run `fn` after every earlier removal decision has settled. */
-  withSandboxRemovalLock<T>(fn: () => Promise<T>): Promise<T> {
-    return this.removalLocks.withLock("daytona-sandbox-removal", fn);
-  }
-
-  /**
-   * The workspace no longer references its sandbox while its current removal is in flight,
-   * even though the workspace list still shows it. A listed workspace without a removal
-   * marker is not recorded: it keeps counting, which can only keep a sandbox.
-   */
-  recordWorkspaceRemoval(workspaceId: string): void {
-    const ref = this.listWorkspaces?.().find((entry) => entry.workspaceId === workspaceId);
-    if (ref?.pendingRemovalId) this.removedWorkspaces.set(workspaceId, ref.pendingRemovalId);
   }
 
   recordSetupFailure(workspaceId: string, reason: string): void {
@@ -847,26 +608,6 @@ export class DaytonaService {
     }
   }
 
-  async listSandboxes(): Promise<DaytonaListSandboxesResult> {
-    try {
-      const { client } = await this.getClient();
-      const sandboxes = await client.listSandboxes();
-      return {
-        ok: true,
-        sandboxes: sandboxes
-          // Error states (destroyed and destroying included) cannot be started or attached.
-          .filter(
-            (sandbox) =>
-              mapDaytonaSandboxState(sandbox.state) !== "error" &&
-              !unsupportedDaytonaSandboxKind(sandbox)
-          )
-          .map(toSummary),
-      };
-    } catch (error) {
-      return toResultError(error);
-    }
-  }
-
   async listSnapshots(): Promise<DaytonaListSnapshotsResult> {
     try {
       const { client } = await this.getClient();
@@ -997,19 +738,6 @@ export class DaytonaService {
     await client.resizeSandbox(sandboxId, request);
   }
 
-  /**
-   * Hand a sandbox Xum created to the user: drop this install's label, which is what makes the
-   * reconciler stop it once no workspace references it.
-   */
-  async disownSandbox(sandboxId: string): Promise<void> {
-    const { client } = await this.getClient();
-    this.provenOwned.delete(sandboxId);
-    const labels = (await client.getSandbox(sandboxId)).labels ?? {};
-    if (!(DAYTONA_LABEL_INSTANCE in labels)) return;
-    const kept = Object.entries(labels).filter(([key]) => key !== DAYTONA_LABEL_INSTANCE);
-    await client.replaceLabels(sandboxId, Object.fromEntries(kept));
-  }
-
   async stopSandbox(sandboxId: string): Promise<void> {
     const { client } = await this.getClient();
     this.readyAt.delete(sandboxId);
@@ -1061,8 +789,8 @@ export class DaytonaService {
    * sandbox that is already gone counts as deleted. `account` deletes it in the account it was
    * created in, even after the settings changed to another one.
    *
-   * A workspace's `shared: false` is not proof: a create of unknown outcome may have left it
-   * naming a sandbox someone else holds. So only a sandbox with this install's label is
+   * A workspace's config is not proof: a create of unknown outcome may have left it naming a
+   * sandbox someone else holds. So only a sandbox with this install's label is
    * deleted; "notOwned" leaves it, and its access, to the caller.
    */
   async deleteSandbox(sandboxId: string): Promise<"deleted" | "notOwned"> {

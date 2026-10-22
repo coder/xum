@@ -282,15 +282,19 @@ export function getDaytonaSandboxId(config: RuntimeConfig | undefined): string |
 }
 
 /**
- * A Daytona sandbox Xum created (for this workspace or the one it was forked from), not an
- * attached existing one. Only these may be stopped or deleted, and only by the last workspace
- * that references them.
+ * Whether the workspace created its Daytona sandbox, so archiving or removing it deletes the
+ * sandbox. A fork (a sub-agent's worktree) and a shared-checkout task only use the sandbox of
+ * the workspace they came from, with its runtime config copied.
  */
-export function isDedicatedDaytonaSandbox(config: RuntimeConfig | undefined): boolean {
+export function ownsDaytonaSandbox(workspace: {
+  runtimeConfig?: RuntimeConfig;
+  taskIsolation?: "fork" | "none";
+}): boolean {
+  const config = workspace.runtimeConfig;
   return (
+    workspace.taskIsolation !== "none" &&
     isSSHRuntime(config) &&
-    config.daytona != null &&
-    config.daytona.shared !== true &&
+    config.daytona?.forked !== true &&
     getDaytonaSandboxId(config) !== undefined
   );
 }

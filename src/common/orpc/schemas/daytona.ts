@@ -2,11 +2,7 @@ import { z } from "zod";
 
 // Daytona sandbox config - attached to the SSH runtime when Daytona is the SSH backend.
 export const DaytonaSandboxConfigSchema = z.object({
-  /**
-   * Daytona sandbox id.
-   * - Omitted at creation: Xum creates a sandbox and fills this in.
-   * - Given at creation: Xum attaches to that existing sandbox (and marks it shared).
-   */
+  /** Set by Xum when it creates the sandbox (finalizeConfig picks its name). */
   sandboxId: z.string().optional().meta({ description: "Daytona sandbox id" }),
   snapshot: z
     .string()
@@ -27,15 +23,8 @@ export const DaytonaSandboxConfigSchema = z.object({
     .meta({ description: "Disk in GiB (size preset)" }),
   target: z.string().optional().meta({ description: "Daytona target (region)" }),
   /**
-   * True for an existing sandbox the user attached: Xum never stops or deletes it. A sandbox
-   * Xum created is deleted with the last workspace (archived ones included) that references it.
-   */
-  shared: z.boolean().optional().meta({
-    description: "True if the sandbox is a pre-existing one the workspace attached to",
-  }),
-  /**
    * True for a fork that reuses its source's sandbox: setup connects to it instead of creating
-   * one. The sandbox stays Xum's, so the last referencing workspace still deletes it.
+   * one, and archiving or removing the fork never stops or deletes it.
    */
   forked: z.boolean().optional().meta({
     description: "True if the workspace reuses the sandbox of the workspace it was forked from",
@@ -94,26 +83,6 @@ export const DaytonaSandboxStateSchema = z.enum([
 
 export type DaytonaSandboxState = z.infer<typeof DaytonaSandboxStateSchema>;
 
-export const DaytonaSandboxSummarySchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  state: DaytonaSandboxStateSchema,
-  cpu: z.number().optional(),
-  memoryGiB: z.number().optional(),
-  diskGiB: z.number().optional(),
-  snapshot: z.string().optional(),
-  target: z.string().optional(),
-});
-
-export type DaytonaSandboxSummary = z.infer<typeof DaytonaSandboxSummarySchema>;
-
-export const DaytonaListSandboxesResultSchema = z.discriminatedUnion("ok", [
-  z.object({ ok: z.literal(true), sandboxes: z.array(DaytonaSandboxSummarySchema) }),
-  DaytonaFailureSchema,
-]);
-
-export type DaytonaListSandboxesResult = z.infer<typeof DaytonaListSandboxesResultSchema>;
-
 export const DaytonaListSnapshotsResultSchema = z.discriminatedUnion("ok", [
   z.object({ ok: z.literal(true), snapshots: z.array(z.object({ name: z.string() })) }),
   DaytonaFailureSchema,
@@ -139,10 +108,6 @@ export const daytona = {
   testConnection: {
     input: z.void(),
     output: DaytonaTestConnectionResultSchema,
-  },
-  listSandboxes: {
-    input: z.void(),
-    output: DaytonaListSandboxesResultSchema,
   },
   listSnapshots: {
     input: z.void(),

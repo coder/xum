@@ -216,7 +216,7 @@ describe("createRuntime - Daytona", () => {
         type: "ssh",
         host: "placeholder",
         srcBaseDir: "~/src",
-        daytona: { sandboxId: "sb-1", shared: false },
+        daytona: { sandboxId: "sb-1" },
       };
 
       const runtime = createRuntime(config, { daytonaService: rig.service });

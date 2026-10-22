@@ -9,7 +9,7 @@ Xum can run workspaces in [Daytona](https://www.daytona.io/docs) sandboxes. Each
 
 - A Daytona account and an API key from the Daytona dashboard
 - `ssh` installed on the machine running Xum
-- A Linux snapshot (or Daytona's default) with git and your toolchain. Xum runs Linux shell commands over SSH, so it does not offer Windows snapshots or Windows sandboxes, and refuses one before it creates or attaches a sandbox.
+- A Linux snapshot (or Daytona's default) with git and your toolchain. Xum runs Linux shell commands over SSH, so it does not offer Windows snapshots, and refuses one before it creates a sandbox.
 
 ## Set up access
 
@@ -41,39 +41,35 @@ Small is the default. Xum offers only these sizes, which keeps costs predictable
 ## Create a workspace
 
 1. In the new-workspace controls, choose **Daytona** as the runtime.
-2. Select **New**, then pick a snapshot and a size.
+2. Pick a snapshot and a size.
 3. Xum creates the sandbox, waits until it starts, clones the project, and runs the [init hook](/hooks/init).
 
 Xum labels each sandbox it creates with `xum.instance`, `xum.workspaceId`, and `xum.project`. If Daytona rejects the size for a snapshot, Xum creates the sandbox at the snapshot's size and then resizes it.
 
-## Use an existing sandbox
-
-Select **Existing** and pick a sandbox from your organization. Xum treats an attached sandbox as yours: it never stops it or deletes it. It does start the sandbox when a workspace needs it. Several Xum workspaces can share one sandbox; each gets its own directory.
+Xum uses only sandboxes it creates: a workspace cannot use an existing sandbox.
 
 ## Lifecycle
 
-| Xum event                           | Daytona action                                                                                |
-| ----------------------------------- | --------------------------------------------------------------------------------------------- |
-| A turn starts                       | Start the sandbox if it is stopped or archived (waits up to 3 minutes)                        |
-| An agent is streaming or a job runs | Report activity every minute, so Daytona does not stop the sandbox                            |
-| Idle                                | Daytona stops the sandbox after 30 minutes and archives it after 1 day stopped                |
-| Sub-agent with a forked workspace   | A new worktree in the same sandbox, not a second sandbox                                      |
-| Archive                             | Follows **Settings > General > Remote box on archive** (default: stop)                        |
-| Delete                              | Check for uncommitted or unpushed work, then delete the sandbox (attached sandboxes are kept) |
-| Opening a workspace                 | Background git and PR status checks do not start the sandbox; they wait until it runs         |
-| Sandbox deleted outside Xum         | The workspace reports that the sandbox no longer exists; Xum does not recreate it             |
+| Xum event                           | Daytona action                                                                        |
+| ----------------------------------- | ------------------------------------------------------------------------------------- |
+| A turn starts                       | Start the sandbox if it is stopped or archived (waits up to 3 minutes)                |
+| An agent is streaming or a job runs | Report activity every minute, so Daytona does not stop the sandbox                    |
+| Idle                                | Daytona stops the sandbox after 30 minutes and archives it after 1 day stopped        |
+| Sub-agent with a forked workspace   | A new worktree in the same sandbox, not a second sandbox                              |
+| Archive                             | Delete the sandbox at once, without a check for uncommitted work                      |
+| Delete                              | Check for uncommitted or unpushed work, then delete the sandbox                       |
+| Opening a workspace                 | Background git and PR status checks do not start the sandbox; they wait until it runs |
+| Sandbox no longer exists            | The workspace reports it; Xum does not recreate it                                    |
 
-A sandbox Xum created can serve several workspaces when you fork one. Xum deletes it only with the last of them, archived ones included; deleting any other one removes its worktree and keeps the sandbox. Archive does not stop or delete a sandbox that another workspace still uses; once the last workspace using it is archived or removed, Xum applies the archive setting in force at that moment (with archived workspaces still on it, a delete setting stops the sandbox instead). When you delete the last workspaces on a sandbox at the same time, Xum deletes the sandbox once, after the last of them passes its check for uncommitted work. If you attach another workspace to a sandbox Xum created and delete the workspaces that Xum created it for first, the sandbox becomes yours like any attached one: Xum keeps it, says so when it removes the last of those workspaces, and never deletes it later. Before any delete, Xum checks that the sandbox still carries this install's `xum.instance` label; a sandbox without it (for example one that took the name while Xum's create failed, or one whose label was removed) is kept, and Xum says so.
+Each sandbox belongs to the workspace that created it. Archiving or deleting that workspace deletes the sandbox, even while forks of it (sub-agent worktrees) still use it; **Settings > General > Remote box on archive** does not apply to Daytona. Unarchiving a workspace whose sandbox was deleted does not bring the sandbox back, so push or copy any work you need before you archive. An agent cannot archive the workspace that created a sandbox: it asks you to do it. Archiving or deleting a fork removes only its worktree and never stops or deletes the sandbox. Before any delete, Xum checks that the sandbox still carries this install's `xum.instance` label; a sandbox without it (for example one that took the name while Xum's create failed, or one whose label was removed) is kept, and Xum says so.
 
 If the sandbox is still being destroyed (for example after a failed setup), delete waits up to a minute for Daytona to finish. A forced delete removes the workspace even when Daytona refuses to delete the sandbox; it then shows a warning that names the sandbox, which you delete in the Daytona dashboard.
 
-With **Remote box on archive** set to delete, Xum first checks the workspace for uncommitted or unpushed work and for untracked files. If it finds some, or cannot run the check, it stops the sandbox instead and shows a warning. Files git ignores (for example `node_modules`, build output or `.env`) do not count, so copy any you need before you archive with this setting.
-
-Once a minute, Xum also stops running sandboxes that carry this install's label but that no workspace uses. It never deletes them.
+Xum does not stop or delete sandboxes that no workspace uses (for example one whose delete failed); Daytona stops them after 30 minutes idle. Delete them in the Daytona dashboard.
 
 ## SSH setup
 
-Xum writes the SSH settings for its sandboxes to `~/.xum/ssh/daytona.conf` and adds a managed block to the top of `~/.ssh/config` that includes it for hosts named `<sandbox-id>.xum--daytona`. The gateway's access token is the SSH user name; Xum keeps it in memory and refreshes it before it expires. It revokes the token when it replaces it, when you change the Daytona settings, and when it deletes or releases the sandbox. At startup, Xum takes over the tokens that an earlier run left in `daytona.conf`, so it can filter and revoke them too. Before each SSH command it reads the file again, in case that read failed at startup. When the gateway refuses a token (for example one revoked outside Xum), Xum gets a new one and runs the command again once. Xum replaces any token it finds in SSH errors and logs with `<daytona-token>`; output of commands that you or an agent run in a terminal is not filtered.
+Xum writes the SSH settings for its sandboxes to `~/.xum/ssh/daytona.conf` and adds a managed block to the top of `~/.ssh/config` that includes it for hosts named `<sandbox-id>.xum--daytona`. The gateway's access token is the SSH user name; Xum keeps it in memory and refreshes it before it expires. It revokes the token when it replaces it, when you change the Daytona settings, and when it deletes the sandbox. At startup, Xum takes over the tokens that an earlier run left in `daytona.conf`, so it can filter and revoke them too. Before each SSH command it reads the file again, in case that read failed at startup. When the gateway refuses a token (for example one revoked outside Xum), Xum gets a new one and runs the command again once. Xum replaces any token it finds in SSH errors and logs with `<daytona-token>`; output of commands that you or an agent run in a terminal is not filtered.
 
 Xum pins the gateway's host keys in `~/.xum/ssh/daytona_known_hosts` and refuses a gateway whose key does not match, with OpenSSH and with the built-in SSH2 transport alike. This holds for `xum server` too, which otherwise skips host key checks for SSH hosts.
 

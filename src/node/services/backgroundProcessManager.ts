@@ -3526,22 +3526,15 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * including recycled-PID EPERM via /proc) reports Ok(true); a garbled or failed probe
    * reports Err so the caller fails closed. Marker matching is substring-based because SSH
    * login banners can prefix stdout.
-   *
-   * `liveProcessesOnly` reports only running-status records with a live PID, skipping
-   * markerless meta-less records and running records without a PID. A keepalive (the Daytona
-   * reconciler) needs positive evidence of a job: a leftover claimed record dir would
-   * otherwise keep its sandbox running forever, while an archive still fails closed on one.
    */
   async hasUnsettledRemoteSpawnRecords(
     runtime: Runtime,
-    workspaceId: string,
-    options: { liveProcessesOnly?: boolean } = {}
+    workspaceId: string
   ): Promise<Result<boolean>> {
     assert(workspaceId.length > 0, "hasUnsettledRemoteSpawnRecords requires workspaceId");
     try {
       const tempDir = await runtime.tempDir();
       const root = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
-      const unprovenRecord = options.liveProcessesOnly ? "continue" : "unsettled=1; break";
       // One POSIX-shell pass over the per-process record dirs (see recordRootHoldsOrphan for the
       // host-local equivalent of these rules):
       // - exit marker present → settled; missing meta.json (or one without a "status" field,
@@ -3573,10 +3566,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         `  case "$p" in */./|*/../) continue ;; esac`,
         `  [ -d "$p" ] || continue`,
         `  [ -e "$p/${BG_EXIT_CODE_FILENAME}" ] && continue`,
-        `  if ! grep -q '"status"' "$p/${BG_META_FILENAME}" 2>/dev/null; then ${unprovenRecord}; fi`,
+        `  if ! grep -q '"status"' "$p/${BG_META_FILENAME}" 2>/dev/null; then unsettled=1; break; fi`,
         `  grep -q '"status"[[:space:]]*:[[:space:]]*"running"' "$p/${BG_META_FILENAME}" 2>/dev/null || continue`,
         `  pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' "$p/${BG_META_FILENAME}" 2>/dev/null | head -n 1)`,
-        `  if [ -z "$pid" ] || [ "$pid" -le 1 ]; then ${unprovenRecord}; fi`,
+        `  if [ -z "$pid" ] || [ "$pid" -le 1 ]; then unsettled=1; break; fi`,
         `  if kill -0 "$pid" 2>/dev/null || [ -e "/proc/$pid" ]; then unsettled=1; break; fi`,
         `done`,
         `if [ "$unsettled" = 1 ]; then echo __MUX_BG_REMOTE_UNSETTLED__; else echo __MUX_BG_REMOTE_CLEAR__; fi`,

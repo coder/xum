@@ -7,6 +7,7 @@ import { XUM_DAYTONA_SSH_BLOCK_START } from "@/common/constants/daytona";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { log } from "@/node/services/log";
 import { DaytonaApiError } from "./daytonaClient";
+import { createDaytonaTestRig } from "./daytona.testHarness";
 import {
   DAYTONA_BUSY_MESSAGE,
   DAYTONA_LABEL_INSTANCE,
@@ -571,5 +572,32 @@ describe("DaytonaService", () => {
     });
     expect(labels[DAYTONA_LABEL_INSTANCE]).toBe(again[DAYTONA_LABEL_INSTANCE]);
     expect(labels[DAYTONA_LABEL_PROJECT]).toBe("my-project");
+  });
+});
+
+describe("DaytonaService.deleteSandbox", () => {
+  it("deletes only a sandbox with this install's label, keeping any other and its ssh access", async () => {
+    const rig = await createDaytonaTestRig();
+    try {
+      rig.plane.addSandbox({
+        id: "sb-foreign",
+        labels: { [DAYTONA_LABEL_INSTANCE]: "another-install" },
+      });
+      rig.plane.addSandbox({ id: "sb-unlabeled", labels: {} });
+      rig.plane.addSandbox({ id: "sb-own" });
+      await rig.service.ensureSshAccess("sb-foreign");
+
+      expect(await rig.service.deleteSandbox("sb-foreign")).toBe("notOwned");
+      expect(await rig.service.deleteSandbox("sb-unlabeled")).toBe("notOwned");
+      expect(rig.plane.find("sb-foreign")).toBeDefined();
+      expect(rig.plane.find("sb-unlabeled")).toBeDefined();
+      expect(rig.plane.calls.filter((call) => call.startsWith("DELETE /sandbox/"))).toEqual([]);
+      expect(rig.writer.tokens.has("sb-foreign")).toBe(true);
+
+      expect(await rig.service.deleteSandbox("sb-own")).toBe("deleted");
+      expect(rig.plane.find("sb-own")).toBeUndefined();
+    } finally {
+      await rig.cleanup();
+    }
   });
 });

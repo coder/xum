@@ -10,11 +10,7 @@ import {
   localShellTransport,
   type DaytonaTestRig,
 } from "@/node/services/daytona/daytona.testHarness";
-import { DaytonaReconciler } from "@/node/services/daytona/daytonaReconciler";
-import {
-  DAYTONA_LABEL_INSTANCE,
-  DAYTONA_READY_CACHE_MS,
-} from "@/node/services/daytona/daytonaService";
+import { DAYTONA_READY_CACHE_MS } from "@/node/services/daytona/daytonaService";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import { DaytonaSSHRuntime } from "./DaytonaSSHRuntime";
 import type { InitLogger, RuntimeStatusEvent, WorkspaceInitParams } from "./Runtime";
@@ -40,14 +36,6 @@ afterEach(async () => {
   execSpy.mockRestore();
   await rig.cleanup();
 });
-
-/**
- * Give every listed workspace a pendingRemoval marker, as each removal claims one: these
- * tests remove workspaces one after another without deregistering them.
- */
-function claimRemovals(testRig = rig): void {
-  for (const ref of testRig.workspaces) ref.pendingRemovalId ??= `rm-${ref.workspaceId}`;
-}
 
 function makeRuntime(
   daytona: DaytonaSandboxConfig,
@@ -225,7 +213,7 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
     };
     const phases: string[] = [];
 
-    const result = await makeRuntime({ sandboxId: "xum-theirs", shared: false }, rig, {
+    const result = await makeRuntime({ sandboxId: "xum-theirs" }, rig, {
       transport,
       projectPath: "/home/me/project",
       workspaceName: "feature",
@@ -242,14 +230,9 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
     expect(spawned).toBe(0);
   });
 
-  it("refuses a sandbox without this install's label even when an attached workspace made it ready", async () => {
-    // After a restart: the dedicated workspace's create lost the name to another install's
-    // sandbox, which a workspace attached on purpose and just used.
+  it("refuses a sandbox without this install's label even while it is cached as ready", async () => {
     rig.plane.addSandbox({ id: "xum-theirs", labels: { "xum.instance": "another-install" } });
-    expect(await makeRuntime({ sandboxId: "xum-theirs", shared: true }).ensureReady()).toEqual({
-      ready: true,
-    });
-    expect(rig.service.isSandboxReady("xum-theirs")).toBe(true);
+    rig.service.markSandboxReady("xum-theirs");
     let spawned = 0;
     const local = localShellTransport(rig.rootDir);
     const transport: SSHTransport = {
@@ -260,7 +243,7 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
       },
     };
 
-    const result = await makeRuntime({ sandboxId: "xum-theirs", shared: false }, rig, {
+    const result = await makeRuntime({ sandboxId: "xum-theirs" }, rig, {
       transport,
       projectPath: "/home/me/project",
       workspaceName: "feature",
@@ -273,7 +256,7 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
 
   it("sees a label removed after a turn once the ready cache window has passed", async () => {
     const sandbox = rig.plane.addSandbox({ id: "sb-handed-back" });
-    const turn = () => makeRuntime({ sandboxId: "sb-handed-back", shared: false }).ensureReady();
+    const turn = () => makeRuntime({ sandboxId: "sb-handed-back" }).ensureReady();
     expect(await turn()).toEqual({ ready: true });
 
     // The user (or another backend) hands the sandbox back by dropping the label.
@@ -293,7 +276,7 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
     for (let check = 0; check < 2; check++) {
       rig.service.invalidateSandboxReady("sb-own");
       const before = lookups();
-      expect(await makeRuntime({ sandboxId: "sb-own", shared: false }).ensureReady()).toEqual({
+      expect(await makeRuntime({ sandboxId: "sb-own" }).ensureReady()).toEqual({
         ready: true,
       });
       perCheck.push(lookups() - before);
@@ -400,20 +383,23 @@ describe("DaytonaSSHRuntime.finalizeConfig and validateBeforePersist", () => {
     const sandboxId = result.data.daytona?.sandboxId ?? "";
     expect(sandboxId).toMatch(/^xum-feature-x-[0-9a-f]{6}$/);
     expect(result.data.host).toBe(`${sandboxId}.xum--daytona`);
-    expect(result.data.daytona).toMatchObject({ shared: false, ...SMALL });
+    expect(result.data.daytona).toMatchObject({ ...SMALL });
     expect(await runtime.validateBeforePersist("Feature_X", result.data)).toEqual({
       success: true,
       data: undefined,
     });
   });
 
-  it("attaches to a given sandbox as shared", async () => {
+  it("creates a new sandbox even when the creation request names an existing one", async () => {
     rig.plane.addSandbox({ id: "sb-mine" });
     const runtime = makeRuntime({});
-    const result = await runtime.finalizeConfig("b", sshDaytonaConfig({ sandboxId: "sb-mine" }));
+    const result = await runtime.finalizeConfig(
+      "b",
+      sshDaytonaConfig({ sandboxId: "sb-mine", forked: true })
+    );
     if (!result.success || result.data.type !== "ssh") throw new Error("expected ssh config");
-    expect(result.data.daytona).toMatchObject({ sandboxId: "sb-mine", shared: true });
-    expect((await runtime.validateBeforePersist("b", result.data)).success).toBe(true);
+    expect(result.data.daytona?.sandboxId).toMatch(/^xum-b-[0-9a-f]{6}$/);
+    expect(result.data.daytona?.forked).toBeUndefined();
   });
 
   it("rejects missing credentials, non-preset sizes and taken names", async () => {
@@ -428,11 +414,11 @@ describe("DaytonaSSHRuntime.finalizeConfig and validateBeforePersist", () => {
     const runtime = makeRuntime({});
     const odd = await runtime.finalizeConfig("b", sshDaytonaConfig({ cpu: 3 }));
     expect(odd.success).toBe(false);
-    const handEdited = sshDaytonaConfig({ sandboxId: "xum-b-1", shared: false, cpu: 64 });
+    const handEdited = sshDaytonaConfig({ sandboxId: "xum-b-1", cpu: 64 });
     expect((await runtime.validateBeforePersist("b", handEdited)).success).toBe(false);
 
     rig.plane.addSandbox({ id: "sb-9", name: "xum-b-taken" });
-    const taken = sshDaytonaConfig({ sandboxId: "xum-b-taken", shared: false, ...SMALL });
+    const taken = sshDaytonaConfig({ sandboxId: "xum-b-taken", ...SMALL });
     expect((await runtime.validateBeforePersist("b", taken)).success).toBe(false);
   });
 });
@@ -440,10 +426,7 @@ describe("DaytonaSSHRuntime.finalizeConfig and validateBeforePersist", () => {
 describe("DaytonaSSHRuntime Windows and GPU sandboxes", () => {
   // Xum provisions over ssh with POSIX commands; a Windows sandbox runs cmd.exe or PowerShell.
   // Daytona deletes a GPU sandbox when it stops, and Xum lets workspaces auto-stop.
-  it("refuses to attach a Windows or GPU sandbox or create from such a snapshot before persisting", async () => {
-    rig.plane.addSandbox({ id: "sb-win", sandboxClass: "windows" });
-    rig.plane.addSandbox({ id: "sb-gpu", sandboxClass: "linux-vm", gpu: 1 });
-    rig.plane.addSandbox({ id: "sb-linux", sandboxClass: "linux-vm", gpu: 0 });
+  it("refuses to create from a Windows or GPU snapshot before persisting", async () => {
     rig.plane.snapshots.push(
       { name: "windows-small", sandboxClass: "windows" },
       { name: "daytona-gpu", sandboxClass: "linux-vm", gpu: 1 },
@@ -456,16 +439,11 @@ describe("DaytonaSSHRuntime Windows and GPU sandboxes", () => {
       return runtime.validateBeforePersist("b", finalized.data);
     };
 
-    const attached = await validate({ sandboxId: "sb-win" });
-    expect(attached.success ? "" : attached.error).toContain("Windows");
     const created = await validate({ snapshot: "windows-small" });
     expect(created.success ? "" : created.error).toContain("Windows");
-    const attachedGpu = await validate({ sandboxId: "sb-gpu" });
-    expect(attachedGpu.success ? "" : attachedGpu.error).toContain("GPU");
     const createdGpu = await validate({ snapshot: "daytona-gpu" });
     expect(createdGpu.success ? "" : createdGpu.error).toContain("GPU");
 
-    expect((await validate({ sandboxId: "sb-linux" })).success).toBe(true);
     expect((await validate({ snapshot: "daytona-small" })).success).toBe(true);
     expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
   });
@@ -502,28 +480,7 @@ describe("DaytonaSSHRuntime Windows and GPU sandboxes", () => {
     expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
   });
 
-  it("neither offers nor attaches a sandbox in an error state", async () => {
-    rig.plane.addSandbox({ id: "sb-broken", state: "build_failed" });
-    rig.plane.addSandbox({ id: "sb-ok" });
-    const runtime = makeRuntime({});
-    const finalized = await runtime.finalizeConfig(
-      "b",
-      sshDaytonaConfig({ sandboxId: "sb-broken" })
-    );
-    if (!finalized.success) throw new Error(finalized.error);
-
-    // startAndWait never brings such a sandbox up: setup would fail on every retry.
-    const refused = await runtime.validateBeforePersist("b", finalized.data);
-    expect(refused.success ? "" : refused.error).toContain("build_failed");
-    const listed = await rig.service.listSandboxes();
-    expect(listed.ok && listed.sandboxes.map((s) => s.id)).toEqual(["sb-ok"]);
-  });
-
-  it("offers neither Windows nor GPU snapshots and sandboxes", async () => {
-    rig.plane.addSandbox({ id: "sb-win", sandboxClass: "windows" });
-    rig.plane.addSandbox({ id: "sb-gpu", sandboxClass: "linux-vm", gpu: 1 });
-    rig.plane.addSandbox({ id: "sb-linux", sandboxClass: "linux-vm" });
-    rig.plane.addSandbox({ id: "sb-older" });
+  it("offers neither Windows nor GPU snapshots", async () => {
     rig.plane.snapshots.push(
       { name: "windows-small", sandboxClass: "windows" },
       { name: "daytona-gpu", sandboxClass: "linux-vm", gpu: 1 },
@@ -532,21 +489,17 @@ describe("DaytonaSSHRuntime Windows and GPU sandboxes", () => {
     );
 
     const snapshots = await rig.service.listSnapshots();
-    const sandboxes = await rig.service.listSandboxes();
 
     expect(snapshots.ok && snapshots.snapshots.map((s) => s.name)).toEqual([
       "daytona-small",
       "older",
     ]);
-    expect(sandboxes.ok && sandboxes.sandboxes.map((s) => s.id)).toEqual(["sb-linux", "sb-older"]);
   });
 });
 
 describe("DaytonaSSHRuntime.postCreateSetup", () => {
   it("creates the sandbox with preset resources, labels and lifecycle intervals", async () => {
-    await makeRuntime({ sandboxId: "xum-new", shared: false, ...SMALL }).postCreateSetup(
-      initParams()
-    );
+    await makeRuntime({ sandboxId: "xum-new", ...SMALL }).postCreateSetup(initParams());
 
     expect(rig.plane.createBodies).toHaveLength(1);
     expect(rig.plane.createBodies[0]).toMatchObject({
@@ -569,7 +522,6 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
 
     await makeRuntime({
       sandboxId: "xum-fixed",
-      shared: false,
       snapshot: "fixed-snap",
       ...medium,
     }).postCreateSetup(initParams());
@@ -592,7 +544,6 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
 
     await makeRuntime({
       sandboxId: "xum-unknown-disk",
-      shared: false,
       snapshot: "fixed-snap",
       cpu: 4,
       memoryGiB: 8,
@@ -615,7 +566,6 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
 
     await makeRuntime({
       sandboxId: "xum-unknown-compute",
-      shared: false,
       snapshot: "fixed-snap",
       cpu: 4,
       memoryGiB: 8,
@@ -634,7 +584,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     rig.writer.writeError = new Error("No space left on device");
     const params = initParams();
 
-    const failure = await makeRuntime({ sandboxId: "xum-doomed", shared: false, ...SMALL })
+    const failure = await makeRuntime({ sandboxId: "xum-doomed", ...SMALL })
       .postCreateSetup(params)
       .then(
         () => undefined,
@@ -650,7 +600,6 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     // A later turn learns why, not that the sandbox was "deleted outside Xum".
     const ready = await makeRuntime({
       sandboxId: "xum-doomed",
-      shared: false,
       ...SMALL,
     }).ensureReady();
     expect(ready.ready).toBe(false);
@@ -673,7 +622,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
       ] as const) {
         rig.writer.writeError = new Error("No space left on device");
         rig.plane.failingRoutes.add(`DELETE /sandbox/${sandboxId}`);
-        const daytona = { sandboxId, shared: false, ...SMALL };
+        const daytona = { sandboxId, ...SMALL };
 
         // eslint-disable-next-line @typescript-eslint/await-thenable
         await expect(makeRuntime(daytona).postCreateSetup(initParams())).rejects.toThrow(
@@ -684,10 +633,6 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
         // The persisted workspace still names the sandbox; removing it deletes the sandbox.
         rig.plane.failingRoutes.clear();
         if (!force) rig.writer.writeError = undefined;
-        rig.workspaces.splice(0, rig.workspaces.length, {
-          workspaceId: "ws-1",
-          runtimeConfig: sshDaytonaConfig(daytona),
-        });
         const removal = await makeRuntime(daytona).deleteWorkspace(
           "/home/me/project",
           "feature",
@@ -701,42 +646,23 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     }
   });
 
-  it("reports a failed setup only to its own workspace, not to one that attached the sandbox", async () => {
+  it("forgets a failed setup once its workspace is removed", async () => {
     const sshDelete = spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
       success: true,
       deletedPath: "/path",
     });
     try {
-      const dedicated = { sandboxId: "xum-left", shared: false, ...SMALL };
+      const daytona = { sandboxId: "xum-left", ...SMALL };
       rig.writer.writeError = new Error("No space left on device");
-      rig.plane.failingRoutes.add("DELETE /sandbox/xum-left");
       // eslint-disable-next-line @typescript-eslint/await-thenable
-      await expect(makeRuntime(dedicated).postCreateSetup(initParams())).rejects.toThrow(
+      await expect(makeRuntime(daytona).postCreateSetup(initParams())).rejects.toThrow(
         "setup failed"
       );
-      expect(rig.plane.find("xum-left")).toBeDefined();
-      rig.plane.failingRoutes.clear();
       rig.writer.writeError = undefined;
+      expect(rig.service.getSetupFailure("ws-1")).toContain("No space left on device");
+      expect(rig.service.getSetupFailure("ws-2")).toBeUndefined();
 
-      // The surviving sandbox is picked in the Existing picker for a new workspace.
-      const attached = { sandboxId: "xum-left", shared: true };
-      const attach = () => makeRuntime(attached, rig, { workspaceId: "ws-2" });
-      await attach().postCreateSetup(initParams());
-      expect(await attach().ensureReady()).toEqual({ ready: true });
-
-      const failed = await makeRuntime(dedicated).ensureReady();
-      expect(failed.ready).toBe(false);
-      if (!failed.ready) expect(failed.error).toContain("No space left on device");
-
-      // Removing the failed workspace forgets its failure.
-      rig.workspaces.splice(
-        0,
-        rig.workspaces.length,
-        { workspaceId: "ws-1", runtimeConfig: sshDaytonaConfig(dedicated) },
-        { workspaceId: "ws-2", runtimeConfig: sshDaytonaConfig(attached) }
-      );
-      claimRemovals();
-      const removal = await makeRuntime(dedicated).deleteWorkspace(
+      const removal = await makeRuntime(daytona).deleteWorkspace(
         "/home/me/project",
         "feature",
         true
@@ -758,9 +684,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
       })
     );
 
-    await makeRuntime({ sandboxId: "xum-kept", shared: false, ...SMALL }).postCreateSetup(
-      initParams()
-    );
+    await makeRuntime({ sandboxId: "xum-kept", ...SMALL }).postCreateSetup(initParams());
 
     expect(String(refusal)).toContain("Daytona is busy");
     expect(rig.plane.find("xum-kept")?.state).toBe("started");
@@ -776,7 +700,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
       labels: { "xum.instance": "another-install", "xum.workspaceId": "ws-other" },
     });
 
-    const failure = await makeRuntime({ sandboxId: "xum-raced", shared: false, ...SMALL })
+    const failure = await makeRuntime({ sandboxId: "xum-raced", ...SMALL })
       .postCreateSetup(initParams())
       .then(
         () => undefined,
@@ -790,7 +714,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
 
   it("after a create of unknown outcome, deletes the sandbox only when it has its labels", async () => {
     const setUp = (sandboxId: string) =>
-      makeRuntime({ sandboxId, shared: false, ...SMALL })
+      makeRuntime({ sandboxId, ...SMALL })
         .postCreateSetup(initParams())
         .then(
           () => undefined,
@@ -827,7 +751,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
         name: "xum-theirs",
         labels: { "xum.instance": "another-install", "xum.workspaceId": "ws-1" },
       });
-      const daytona = { sandboxId: "xum-theirs", shared: false, ...SMALL };
+      const daytona = { sandboxId: "xum-theirs", ...SMALL };
       await makeRuntime(daytona)
         .postCreateSetup(initParams())
         .catch(() => undefined);
@@ -872,26 +796,6 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     sshDeleteSpy.mockRestore();
   });
 
-  it("keeps a sandbox another workspace attached by its id while the owner stores its name", async () => {
-    // Xum created it under a name; the attach picker stores the real id of the same sandbox.
-    rig.plane.addSandbox({ id: "sb-7", name: "xum-owner-abc123" });
-    const owner = { sandboxId: "xum-owner-abc123", shared: false, ...SMALL };
-    rig.workspaces.push(
-      { workspaceId: "ws-1", runtimeConfig: sshDaytonaConfig(owner) },
-      {
-        workspaceId: "ws-attached",
-        runtimeConfig: sshDaytonaConfig({ sandboxId: "sb-7", shared: true }),
-      }
-    );
-
-    for (const force of [false, true]) {
-      const result = await makeRuntime(owner).deleteWorkspace("/home/me/project", "feature", force);
-      expect(result.success).toBe(true);
-      expect(rig.plane.find("sb-7")).toBeDefined();
-    }
-    expect(rig.plane.calls.filter((call) => /^DELETE \/sandbox\/[^/]+$/.test(call))).toEqual([]);
-  });
-
   it("refuses a settings change between its checks and the sandbox delete", async () => {
     rig.plane.addSandbox({ id: "sb-clean" });
     const newAccount = rig.addAccount("new-key");
@@ -903,7 +807,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       return { success: true, deletedPath: "/path" };
     });
 
-    const result = await makeRuntime({ sandboxId: "sb-clean", shared: false }).deleteWorkspace(
+    const result = await makeRuntime({ sandboxId: "sb-clean" }).deleteWorkspace(
       "/home/me/project",
       "feature",
       false
@@ -932,7 +836,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     );
     try {
       const saved = rig.service.setConfig({ apiKey: "new-key" });
-      const deleted = makeRuntime({ sandboxId: "xum-same", shared: false }).deleteWorkspace(
+      const deleted = makeRuntime({ sandboxId: "xum-same" }).deleteWorkspace(
         "/home/me/project",
         "feature",
         false
@@ -949,35 +853,27 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(newAccount.find("xum-same")).toBeUndefined();
   });
 
-  it("still hands off a started sandbox when a forced removal cannot delete the checkout", async () => {
-    const labels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.getInstanceId() };
-    rig.plane.addSandbox({ id: "sb-1", name: "xum-owner", labels });
-    const owner = { sandboxId: "xum-owner", shared: false, ...SMALL };
-    rig.workspaces.push(
-      { workspaceId: "ws-o", runtimeConfig: sshDaytonaConfig(owner) },
-      { workspaceId: "ws-t", runtimeConfig: sshDaytonaConfig({ sandboxId: "sb-1", shared: true }) }
-    );
-    claimRemovals();
-    await rig.service.ensureSshAccess("xum-owner");
+  it("keeps the sandbox when a fork's forced removal cannot delete its checkout", async () => {
+    rig.plane.addSandbox({ id: "sb-1" });
+    await rig.service.ensureSshAccess("sb-1");
     sshDeleteSpy.mockResolvedValue({ success: false, error: "ssh: host unreachable" });
 
-    const forced = await makeRuntime(owner, rig, { workspaceId: "ws-o" }).deleteWorkspace(
-      "/home/me/project",
-      "ws-o",
-      true
-    );
+    const forced = await makeRuntime({ sandboxId: "sb-1", forked: true }, rig, {
+      workspaceId: "ws-fork",
+    }).deleteWorkspace("/home/me/project", "ws-fork", true);
 
     expect(forced.success).toBe(true);
     expect(forced.success ? forced.notice : forced.error).toContain("ssh: host unreachable");
-    expect(rig.plane.find("sb-1")?.labels).toEqual({});
-    expect(rig.writer.removed).toContain("xum-owner");
+    expect(rig.plane.find("sb-1")?.state).toBe("started");
+    // The workspace that created the sandbox still uses Xum's access to it.
+    expect(rig.writer.removed).not.toContain("sb-1");
   });
 
   it("starts a stopped sandbox to run the dirty check and keeps a dirty workspace", async () => {
     rig.plane.addSandbox({ id: "sb-dirty", state: "stopped" });
     sshDeleteSpy.mockResolvedValue({ success: false, error: "uncommitted changes" });
 
-    const result = await makeRuntime({ sandboxId: "sb-dirty", shared: false }).deleteWorkspace(
+    const result = await makeRuntime({ sandboxId: "sb-dirty" }).deleteWorkspace(
       "/home/me/project",
       "feature",
       false
@@ -992,7 +888,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
   it("deletes an owned sandbox after a clean check and drops its ssh access", async () => {
     rig.plane.addSandbox({ id: "sb-clean", state: "stopped" });
 
-    const result = await makeRuntime({ sandboxId: "sb-clean", shared: false }).deleteWorkspace(
+    const result = await makeRuntime({ sandboxId: "sb-clean" }).deleteWorkspace(
       "/home/me/project",
       "feature",
       false
@@ -1005,14 +901,14 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(rig.plane.revokedTokens).toHaveLength(1);
   });
 
-  it("keeps the sandbox for a fork's source, deletes it with the last workspace", async () => {
+  it("keeps the sandbox when a fork is removed, deletes it with the workspace that created it", async () => {
     rig.plane.addSandbox({ id: "sb-parent" });
     const forkSpy = spyOn(SSHRuntime.prototype, "forkWorkspace").mockResolvedValue({
       success: true,
       workspacePath: "/fork",
     });
     try {
-      const sourceDaytona = { sandboxId: "sb-parent", shared: false, ...SMALL };
+      const sourceDaytona = { sandboxId: "sb-parent", ...SMALL };
       const fork = await makeRuntime(sourceDaytona).forkWorkspace({
         projectPath: "/home/me/project",
         sourceWorkspaceName: "feature",
@@ -1023,10 +919,6 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
         fork.forkedRuntimeConfig?.type === "ssh" ? fork.forkedRuntimeConfig.daytona : undefined;
       if (!forkDaytona) throw new Error("expected a Daytona fork config");
       expect(fork.sourceRuntimeConfig).toBeUndefined();
-      rig.workspaces.push(
-        { workspaceId: "ws-1", runtimeConfig: sshDaytonaConfig(sourceDaytona) },
-        { workspaceId: "ws-fork", runtimeConfig: sshDaytonaConfig(forkDaytona) }
-      );
 
       // The fork's setup (a fresh runtime from its config) connects; it creates nothing.
       await makeRuntime(forkDaytona, rig, { workspaceId: "ws-fork" }).postCreateSetup(initParams());
@@ -1037,7 +929,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
         (await deleteFork.deleteWorkspace("/home/me/project", "feature-fork", false)).success
       ).toBe(true);
       expect(rig.plane.find("sb-parent")).toBeDefined();
-      rig.workspaces.splice(1, 1);
+      expect(rig.writer.removed).not.toContain("sb-parent");
 
       const deleteSource = makeRuntime(sourceDaytona);
       expect(
@@ -1058,7 +950,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       return Promise.resolve({ success: true, workspacePath: "/fork" });
     });
     const forkFrom = (sandboxId: string) =>
-      makeRuntime({ sandboxId, shared: false, ...SMALL }).forkWorkspace({
+      makeRuntime({ sandboxId, ...SMALL }).forkWorkspace({
         projectPath: "/home/me/project",
         sourceWorkspaceName: "feature",
         newWorkspaceName: "feature-fork",
@@ -1077,14 +969,14 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     }
   });
 
-  it("deletes the sandbox with a fork that outlives its source", async () => {
+  it("deletes the sandbox with its source while a fork remains, then removes the fork", async () => {
     rig.plane.addSandbox({ id: "sb-parent" });
     const forkSpy = spyOn(SSHRuntime.prototype, "forkWorkspace").mockResolvedValue({
       success: true,
       workspacePath: "/fork",
     });
     try {
-      const sourceDaytona = { sandboxId: "sb-parent", shared: false, ...SMALL };
+      const sourceDaytona = { sandboxId: "sb-parent", ...SMALL };
       const fork = await makeRuntime(sourceDaytona).forkWorkspace({
         projectPath: "/home/me/project",
         sourceWorkspaceName: "feature",
@@ -1094,71 +986,23 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       const forkDaytona =
         fork.forkedRuntimeConfig?.type === "ssh" ? fork.forkedRuntimeConfig.daytona : undefined;
       if (!forkDaytona) throw new Error("expected a Daytona fork config");
-      rig.workspaces.push(
-        { workspaceId: "ws-1", runtimeConfig: sshDaytonaConfig(sourceDaytona) },
-        { workspaceId: "ws-fork", runtimeConfig: sshDaytonaConfig(forkDaytona) }
-      );
 
       const deleteSource = makeRuntime(sourceDaytona);
       expect(
         (await deleteSource.deleteWorkspace("/home/me/project", "feature", false)).success
       ).toBe(true);
-      expect(rig.plane.find("sb-parent")).toBeDefined();
-      rig.workspaces.splice(0, 1);
+      expect(rig.plane.find("sb-parent")).toBeUndefined();
+      const sshDeletes = sshDeleteSpy.mock.calls.length;
 
       const deleteFork = makeRuntime(forkDaytona, rig, { workspaceId: "ws-fork" });
       expect(
         (await deleteFork.deleteWorkspace("/home/me/project", "feature-fork", false)).success
       ).toBe(true);
-      expect(rig.plane.find("sb-parent")).toBeUndefined();
+      // Nothing is left to check on a sandbox that is gone.
+      expect(sshDeleteSpy.mock.calls.length).toBe(sshDeletes);
     } finally {
       forkSpy.mockRestore();
     }
-  });
-
-  describe("two workspaces on one sandbox removed at the same time", () => {
-    // Neither removal is persisted yet, so the workspace list shows both throughout.
-    function removeBoth() {
-      rig.plane.addSandbox({ id: "sb-pair" });
-      const source = { sandboxId: "sb-pair", shared: false, ...SMALL };
-      const fork = { ...source, forked: true };
-      rig.workspaces.push(
-        { workspaceId: "ws-1", runtimeConfig: sshDaytonaConfig(source), pendingRemovalId: "rm-1" },
-        { workspaceId: "ws-fork", runtimeConfig: sshDaytonaConfig(fork), pendingRemovalId: "rm-2" }
-      );
-      return Promise.all([
-        makeRuntime(source).deleteWorkspace("/home/me/project", "feature", false),
-        makeRuntime(fork, rig, { workspaceId: "ws-fork" }).deleteWorkspace(
-          "/home/me/project",
-          "feature-fork",
-          false
-        ),
-      ]);
-    }
-
-    it("deletes the sandbox exactly once", async () => {
-      const results = await removeBoth();
-
-      expect(results.map((result) => result.success)).toEqual([true, true]);
-      expect(rig.plane.countCalls("DELETE /sandbox/sb-pair")).toBe(1);
-      expect(rig.writer.removed).toContain("sb-pair");
-    });
-
-    it("keeps the sandbox when the other removal is refused for uncommitted work", async () => {
-      sshDeleteSpy.mockImplementation((_projectPath, workspaceName) =>
-        Promise.resolve(
-          workspaceName === "feature-fork"
-            ? { success: false, error: "uncommitted changes" }
-            : { success: true, deletedPath: "/path" }
-        )
-      );
-
-      const results = await removeBoth();
-
-      expect(results.map((result) => result.success)).toEqual([true, false]);
-      expect(rig.plane.countCalls("DELETE /sandbox/sb-pair")).toBe(0);
-      expect(rig.plane.find("sb-pair")).toBeDefined();
-    });
   });
 
   it("waits for a sandbox Daytona is already deleting instead of refusing the delete", async () => {
@@ -1170,7 +1014,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     ] as const) {
       rig.plane.addSandbox({ id: sandboxId, state, pendingPolls: 2 });
 
-      const result = await makeRuntime({ sandboxId, shared: false }).deleteWorkspace(
+      const result = await makeRuntime({ sandboxId }).deleteWorkspace(
         "/home/me/project",
         "feature",
         false
@@ -1185,7 +1029,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     rig.plane.addSandbox({ id: "sb-stuck" });
     rig.plane.failingRoutes.add("DELETE /sandbox/sb-stuck");
 
-    const result = await makeRuntime({ sandboxId: "sb-stuck", shared: false }).deleteWorkspace(
+    const result = await makeRuntime({ sandboxId: "sb-stuck" }).deleteWorkspace(
       "/home/me/project",
       "feature",
       true
@@ -1194,267 +1038,46 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(result).toMatchObject({ success: false, leftoverPaths: ['Daytona sandbox "sb-stuck"'] });
   });
 
-  it("never deletes a sandbox Xum created through a workspace that attached it, and says so", async () => {
-    const labels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.getInstanceId() };
-    const owner = (sandboxId: string) => ({ sandboxId, shared: false, ...SMALL });
-    const attached = (sandboxId: string) => ({ sandboxId, shared: true });
-    const remove = (workspaceId: string, daytona: DaytonaSandboxConfig) =>
-      makeRuntime(daytona, rig, { workspaceId }).deleteWorkspace(
-        "/home/me/project",
-        workspaceId,
-        false
-      );
-    const deletes = () =>
-      rig.plane.calls.filter((call) => /^DELETE \/sandbox\/[^/]+$/.test(call)).length;
-    const notice = (result: Awaited<ReturnType<typeof remove>>) =>
-      result.success ? result.notice : result.error;
-    // Each sandbox: the owner stores its name, another workspace attached it by its id.
-    rig.plane.addSandbox({ id: "sb-1", name: "xum-owner-first", labels });
-    rig.plane.addSandbox({ id: "sb-2", name: "xum-attached-first", labels });
-    rig.workspaces.push(
-      { workspaceId: "ws-o1", runtimeConfig: sshDaytonaConfig(owner("xum-owner-first")) },
-      { workspaceId: "ws-t1", runtimeConfig: sshDaytonaConfig(attached("sb-1")) },
-      { workspaceId: "ws-o2", runtimeConfig: sshDaytonaConfig(owner("xum-attached-first")) },
-      { workspaceId: "ws-t2", runtimeConfig: sshDaytonaConfig(attached("sb-2")) }
-    );
-    claimRemovals();
+  it("never starts a stopped sandbox for the checks a forced removal skips", async () => {
+    rig.plane.addSandbox({ id: "sb-users", state: "stopped" });
+    const started = () =>
+      rig.plane.calls.filter((call) => call === "POST /sandbox/sb-users/start").length;
 
-    // The owner goes first: its removal says the sandbox now outlives Xum's workspaces, and the
-    // attached workspace's removal only releases it.
-    const ownerFirst = await remove("ws-o1", owner("xum-owner-first"));
-    expect(ownerFirst.success).toBe(true);
-    expect(notice(ownerFirst)).toContain('"xum-owner-first"');
-    const attachedLast = await remove("ws-t1", attached("sb-1"));
-    expect(attachedLast).toEqual({ success: true, deletedPath: expect.any(String) as string });
-    expect(rig.plane.find("sb-1")).toBeDefined();
-    expect(deletes()).toBe(0);
-    // Handed to the user: no longer labeled as this install's, so no sweep stops it as an orphan.
-    expect(rig.plane.find("sb-1")?.labels).toEqual({});
-    await new DaytonaReconciler({
-      daytonaService: rig.service,
-      listWorkspaces: () => [],
-      isWorkspaceActive: () => Promise.resolve(false),
-    }).sweep();
-    expect(rig.plane.find("sb-1")?.state).toBe("started");
-
-    // The attached workspace goes first: the owner's removal deletes it, with nothing to say.
-    const attachedFirst = await remove("ws-t2", attached("sb-2"));
-    expect(attachedFirst).toEqual({ success: true, deletedPath: expect.any(String) as string });
-    expect(rig.plane.find("sb-2")).toBeDefined();
-    const ownerLast = await remove("ws-o2", owner("xum-attached-first"));
-    expect(ownerLast).toEqual({ success: true, deletedPath: expect.any(String) as string });
-    expect(rig.plane.find("sb-2")).toBeUndefined();
-    expect(deletes()).toBe(1);
-  });
-
-  it("keeps the owner's workspace when its sandbox cannot be handed off", async () => {
-    const labels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.getInstanceId() };
-    rig.plane.addSandbox({ id: "sb-1", name: "xum-owner", labels });
-    const owner = { sandboxId: "xum-owner", shared: false, ...SMALL };
-    rig.workspaces.push(
-      { workspaceId: "ws-o", runtimeConfig: sshDaytonaConfig(owner) },
-      { workspaceId: "ws-t", runtimeConfig: sshDaytonaConfig({ sandboxId: "sb-1", shared: true }) }
-    );
-    claimRemovals();
-    const remove = () =>
-      makeRuntime(owner, rig, { workspaceId: "ws-o" }).deleteWorkspace(
-        "/home/me/project",
-        "ws-o",
-        false
-      );
-
-    rig.plane.failingRoutes.add("PUT /sandbox/xum-owner/labels");
-    const refused = await remove();
-    expect(refused.success ? "" : refused.error).toContain("Xum-owned");
-    expect(rig.plane.find("sb-1")?.labels).toEqual(labels);
-
-    rig.plane.failingRoutes.clear();
-    expect((await remove()).success).toBe(true);
-    expect(rig.plane.find("sb-1")?.labels).toEqual({});
-  });
-
-  it("warns a forced removal that could not hand off its sandbox, and releases its access", async () => {
-    const labels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.getInstanceId() };
-    rig.plane.addSandbox({ id: "sb-1", name: "xum-owner", labels, state: "stopped" });
-    const owner = { sandboxId: "xum-owner", shared: false, ...SMALL };
-    rig.workspaces.push(
-      { workspaceId: "ws-o", runtimeConfig: sshDaytonaConfig(owner) },
-      { workspaceId: "ws-t", runtimeConfig: sshDaytonaConfig({ sandboxId: "sb-1", shared: true }) }
-    );
-    claimRemovals();
-    rig.plane.failingRoutes.add("PUT /sandbox/xum-owner/labels");
-
-    const forced = await makeRuntime(owner, rig, { workspaceId: "ws-o" }).deleteWorkspace(
-      "/home/me/project",
-      "ws-o",
-      true
-    );
-
-    // A forced removal goes on, so the warning is the user's only cue to drop the label.
-    expect(forced.success ? forced.notice : forced.error).toContain(DAYTONA_LABEL_INSTANCE);
-    expect(forced.success).toBe(true);
-    expect(rig.writer.removed).toContain("xum-owner");
-  });
-
-  it("counts a workspace whose removal failed after its checkout step as a reference again", async () => {
-    rig.plane.addSandbox({ id: "sb-kept", state: "stopped" });
-    const owner = { sandboxId: "sb-kept", shared: false, ...SMALL };
-    const fork = { ...owner, forked: true };
-    // Each removal claims its workspace's pendingRemoval marker before any destructive step.
-    const forkRef = {
-      workspaceId: "ws-fork",
-      runtimeConfig: sshDaytonaConfig(fork),
-      pendingRemovalId: "rm-1" as string | undefined,
-    };
-    rig.workspaces.push(
-      { workspaceId: "ws-owner", runtimeConfig: sshDaytonaConfig(owner), pendingRemovalId: "rm-o" },
-      forkRef
-    );
-
-    // Forced on a stopped sandbox: the fork's checkout stays on it, unchecked.
-    const forced = await makeRuntime(fork, rig, { workspaceId: "ws-fork" }).deleteWorkspace(
+    const fork = await makeRuntime({ sandboxId: "sb-users", forked: true }).deleteWorkspace(
       "/home/me/project",
       "feature-fork",
       true
     );
-    expect(forced.success).toBe(true);
-    // Deregistration then fails: the fork stays registered and its marker is released, or a
-    // retry claims a new one.
-    for (const pendingRemovalId of [undefined, "rm-2"]) {
-      forkRef.pendingRemovalId = pendingRemovalId;
-      const removal = await makeRuntime(owner, rig, { workspaceId: "ws-owner" }).deleteWorkspace(
-        "/home/me/project",
-        "feature",
-        false
-      );
-      expect(removal.success).toBe(true);
-      expect(rig.plane.find("sb-kept")).toBeDefined();
-    }
-    expect(rig.plane.countCalls("DELETE /sandbox/sb-kept")).toBe(0);
-  });
+    expect(fork.success).toBe(true);
+    expect(rig.plane.find("sb-users")?.state).toBe("stopped");
+    expect(rig.writer.removed).not.toContain("sb-users");
 
-  it("never starts a stopped sandbox for the checks a forced removal skips", async () => {
-    rig.plane.addSandbox({ id: "sb-users", state: "stopped" });
-    rig.workspaces.push({
-      workspaceId: "ws-1",
-      runtimeConfig: sshDaytonaConfig({ sandboxId: "sb-users", shared: true }),
-    });
-
-    const result = await makeRuntime({ sandboxId: "sb-users", shared: true }).deleteWorkspace(
+    const owner = await makeRuntime({ sandboxId: "sb-users" }).deleteWorkspace(
       "/home/me/project",
       "feature",
       true
     );
-
-    expect(result.success).toBe(true);
-    expect(rig.plane.find("sb-users")?.state).toBe("stopped");
-    expect(rig.plane.calls.filter((call) => call.startsWith("POST /sandbox/sb-users/"))).toEqual(
-      []
-    );
-    expect(rig.writer.removed).toContain("sb-users");
+    expect(owner.success).toBe(true);
+    expect(rig.plane.find("sb-users")).toBeUndefined();
+    expect(started()).toBe(0);
+    expect(sshDeleteSpy).not.toHaveBeenCalled();
   });
 
   it("says where a forced removal left the checkout of a sandbox that was not running", async () => {
     rig.plane.addSandbox({ id: "sb-users", state: "archived" });
-    const attached = { sandboxId: "sb-users", shared: true };
-    const forced = await makeRuntime(attached).deleteWorkspace("/home/me/project", "feature", true);
+    const fork = { sandboxId: "sb-users", forked: true };
+    const forced = await makeRuntime(fork).deleteWorkspace("/home/me/project", "feature", true);
     if (!forced.success) throw new Error(forced.error);
     expect(forced.notice).toContain(forced.deletedPath);
     expect(forced.notice).toContain('"sb-users"');
 
     // Gone: no checkout was left anywhere.
-    const gone = await makeRuntime({ sandboxId: "sb-gone", shared: true }).deleteWorkspace(
+    const gone = await makeRuntime({ sandboxId: "sb-gone", forked: true }).deleteWorkspace(
       "/home/me/project",
       "feature",
       true
     );
     expect(gone).toEqual({ success: true, deletedPath: expect.any(String) as string });
-  });
-
-  it("drops the removed workspace's ssh access to a sandbox another workspace keeps", async () => {
-    const labels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.getInstanceId() };
-    rig.plane.addSandbox({ id: "sb-7", name: "xum-owner-abc123", labels });
-    const owner = { sandboxId: "xum-owner-abc123", shared: false, ...SMALL };
-    const attached = { sandboxId: "sb-7", shared: true };
-    rig.workspaces.push(
-      { workspaceId: "ws-owner", runtimeConfig: sshDaytonaConfig(owner) },
-      { workspaceId: "ws-fork", runtimeConfig: sshDaytonaConfig({ ...owner, forked: true }) },
-      { workspaceId: "ws-attached", runtimeConfig: sshDaytonaConfig(attached) }
-    );
-    claimRemovals();
-    // Tokens and include blocks are per stored string: the name and the id.
-    await rig.service.ensureSshAccess("xum-owner-abc123");
-    await rig.service.ensureSshAccess("sb-7");
-    const remove = (workspaceId: string, daytona: DaytonaSandboxConfig) =>
-      makeRuntime(daytona, rig, { workspaceId }).deleteWorkspace(
-        "/home/me/project",
-        workspaceId,
-        false
-      );
-
-    // The fork still uses the name: its access stays.
-    expect((await remove("ws-owner", owner)).success).toBe(true);
-    expect(rig.writer.removed).toEqual([]);
-    // The fork was the last one to use the name.
-    expect((await remove("ws-fork", { ...owner, forked: true })).success).toBe(true);
-    expect(rig.writer.removed).toEqual(["xum-owner-abc123"]);
-    expect(rig.writer.tokens.has("sb-7")).toBe(true);
-    expect(rig.plane.find("sb-7")).toBeDefined();
-  });
-
-  it("applies the archive setting when removing the last attached workspace leaves only an archived owner", async () => {
-    const sshDelete = spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
-      success: true,
-      deletedPath: "/path",
-    });
-    try {
-      const sandbox = rig.plane.addSandbox({ id: "xum-owner" });
-      // The owner was archived while the attached workspace worked there: it left the sandbox alone.
-      rig.workspaces.splice(0, rig.workspaces.length, {
-        workspaceId: "ws-owner",
-        runtimeConfig: sshDaytonaConfig({ sandboxId: "xum-owner", shared: false }),
-        archived: true,
-      });
-      const attached = { sandboxId: "xum-owner", shared: true };
-      for (const [behavior, expected] of [
-        ["stop", "stopped"],
-        ["delete", "stopped"],
-        ["keep", "started"],
-      ] as const) {
-        sandbox.state = "started";
-        rig.archiveBehavior = behavior;
-        const removal = await makeRuntime(attached, rig, {
-          workspaceId: "ws-attached",
-        }).deleteWorkspace("/home/me/project", "feature", false);
-        expect(removal.success).toBe(true);
-        expect(sandbox.state).toBe(expected);
-        if (behavior === "delete" && removal.success) {
-          expect(removal.notice).toContain("stopped, not deleted");
-        }
-      }
-      // The archived owner's checkout is still on it: never deleted.
-      expect(rig.plane.find("xum-owner")).toBe(sandbox);
-    } finally {
-      sshDelete.mockRestore();
-    }
-  });
-
-  it("never deletes an attached sandbox, even with its last workspace", async () => {
-    rig.plane.addSandbox({ id: "sb-users" });
-    rig.workspaces.push({
-      workspaceId: "ws-1",
-      runtimeConfig: sshDaytonaConfig({ sandboxId: "sb-users", shared: true }),
-    });
-
-    for (const force of [false, true]) {
-      const runtime = makeRuntime({ sandboxId: "sb-users", shared: true });
-      expect((await runtime.deleteWorkspace("/home/me/project", "feature", force)).success).toBe(
-        true
-      );
-    }
-    expect(rig.plane.find("sb-users")).toBeDefined();
-    // Only Xum's own access goes: the token is revoked and the include block removed.
-    expect(rig.writer.removed).toContain("sb-users");
   });
 });
 
@@ -1463,7 +1086,7 @@ describe("DaytonaSSHRuntime delete checks on the unresolved ~ workspace path", (
     execSpy.mockRestore();
     const home = path.join(rig.rootDir, "sandbox-home");
     rig.plane.addSandbox({ id: "sb-dirty" });
-    const runtime = makeRuntime({ sandboxId: "sb-dirty", shared: false }, rig, {
+    const runtime = makeRuntime({ sandboxId: "sb-dirty" }, rig, {
       transport: localShellTransport(home),
     });
     // Deferred access never resolves `~` at creation, so this is the path deletion sees.
@@ -1795,7 +1418,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
     expect(rig.plane.revokedTokens).toEqual([]);
   });
 
-  it("reports a sandbox deleted outside Xum instead of the refused token", async () => {
+  it("reports a sandbox that no longer exists instead of the refused token", async () => {
     rig.plane.addSandbox({ id: "sb-gone" });
     await rig.service.ensureSshAccess("sb-gone");
     rig.plane.sandboxes.delete("sb-gone");

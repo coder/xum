@@ -66,15 +66,7 @@ import {
   listDaytonaWorkspaceRefs,
 } from "@/node/services/daytona/daytonaReconciler";
 import { createDaytonaArchiveHook } from "@/node/services/daytona/daytonaLifecycleHooks";
-import {
-  DEFAULT_CODER_ARCHIVE_BEHAVIOR,
-  type CoderWorkspaceArchiveBehavior,
-} from "@/common/config/coderArchiveBehavior";
-import { createRuntime, setGlobalDaytonaService } from "@/node/runtime/runtimeFactory";
-import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
-import { DaytonaSSHRuntime } from "@/node/runtime/DaytonaSSHRuntime";
-import { Err } from "@/common/types/result";
-import { stripTrailingSlashes } from "@/node/utils/pathUtils";
+import { setGlobalDaytonaService } from "@/node/runtime/runtimeFactory";
 import { PerfReportService } from "@/node/services/perf/perfReportService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
@@ -355,8 +347,6 @@ export class ServiceContainer {
     this.daytonaService = new DaytonaService({
       credentialsStore: new DaytonaCredentialsStore(this.config.rootDir),
       rootDir: this.config.rootDir,
-      listWorkspaces: () => listDaytonaWorkspaceRefs(this.config.loadConfigOrDefault()),
-      getArchiveBehavior: () => this.archiveBehavior(),
     });
     this.perfCaptures = new PerfCaptureService({
       dir: getXumPerfCapturesDir(this.config.rootDir),
@@ -452,30 +442,7 @@ export class ServiceContainer {
   private wireDaytona(lifecycleHooks: WorkspaceLifecycleHooks): DaytonaReconciler {
     setGlobalDaytonaService(this.daytonaService);
     lifecycleHooks.registerBeforeArchive(
-      createDaytonaArchiveHook({
-        daytonaService: this.daytonaService,
-        getArchiveBehavior: () => this.archiveBehavior(),
-        // Spawn records sit under the runtime's temp dir by workspace id: no checkout needed.
-        hasUnsettledRemoteBackgroundJobs: (workspace) =>
-          this.backgroundProcessManager.hasUnsettledRemoteSpawnRecords(
-            createRuntime(workspace.runtimeConfig, { workspaceId: workspace.workspaceId }),
-            workspace.workspaceId
-          ),
-        checkSandboxDeletable: (workspaceMetadata) => {
-          const runtime = createRuntimeForWorkspace(workspaceMetadata);
-          if (!(runtime instanceof DaytonaSSHRuntime)) {
-            return Promise.resolve(Err("the workspace is not on a Daytona sandbox"));
-          }
-          const trusted = this.config
-            .loadConfigOrDefault()
-            .projects.get(stripTrailingSlashes(workspaceMetadata.projectPath))?.trusted;
-          return runtime.checkSandboxDeletable(
-            workspaceMetadata.projectPath,
-            workspaceMetadata.name,
-            trusted
-          );
-        },
-      })
+      createDaytonaArchiveHook({ daytonaService: this.daytonaService })
     );
     return new DaytonaReconciler({
       daytonaService: this.daytonaService,
@@ -483,14 +450,6 @@ export class ServiceContainer {
       isWorkspaceActive: async (workspaceId) =>
         this.aiService.isStreaming(workspaceId) ||
         (await this.backgroundProcessManager.hasLiveBackgroundProcesses(workspaceId)),
-      // Detached jobs that outlived an unclean exit are in no in-memory list.
-      // Keepalive needs a job proven to run: a leftover record dir must not keep a sandbox up.
-      hasUnsettledRemoteJobs: (ref) =>
-        this.backgroundProcessManager.hasUnsettledRemoteSpawnRecords(
-          createRuntime(ref.runtimeConfig, { workspaceId: ref.workspaceId }),
-          ref.workspaceId,
-          { liveProcessesOnly: true }
-        ),
     });
   }
 
@@ -916,14 +875,6 @@ export class ServiceContainer {
     await this.timelineService.flush();
     await this.analyticsService.dispose();
     await this.telemetryService.shutdown();
-  }
-
-  /** Settings' archive behavior for Daytona sandboxes (shared with Coder workspaces). */
-  private archiveBehavior(): CoderWorkspaceArchiveBehavior {
-    return (
-      this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
-      DEFAULT_CODER_ARCHIVE_BEHAVIOR
-    );
   }
 
   /** Starts or stops the perf flight recorder to match the persisted experiment state. */

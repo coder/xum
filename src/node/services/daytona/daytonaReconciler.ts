@@ -1,7 +1,5 @@
-import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { Workspace } from "@/common/types/project";
 import { getDaytonaSandboxId, type RuntimeConfig } from "@/common/types/runtime";
-import { Err, type Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import type { DaytonaSandbox } from "./daytonaClient";
@@ -10,22 +8,10 @@ import { mapDaytonaSandboxState, type DaytonaService } from "./daytonaService";
 export const DAYTONA_RECONCILE_INTERVAL_MS = 60_000;
 /** Each control-plane call gets this long; a hung call is logged and the sweep moves on. */
 export const DAYTONA_RECONCILE_CALL_TIMEOUT_MS = 20_000;
-/** Consecutive failed job probes of one workspace after which keepalive stops waiting on it. */
-export const DAYTONA_JOB_PROBE_FAILURE_LIMIT = 3;
 
 export interface DaytonaWorkspaceRef {
   workspaceId: string;
   runtimeConfig: RuntimeConfig | undefined;
-  /** The marker of a removal in flight (WorkspaceConfigSchema.pendingRemoval). */
-  pendingRemovalId?: string;
-  /** Archived now: archive applies its sandbox policy once only archived workspaces use it. */
-  archived?: boolean;
-  /**
-   * `taskIsolation: "none"` (a side chat, a shared-checkout sub-agent): it copies another
-   * workspace's runtime config and works in that one's checkout, so it never owns or holds a
-   * sandbox. Its activity still keeps the sandbox alive.
-   */
-  borrowsCheckout?: boolean;
 }
 
 export interface DaytonaReconcilerOptions {
@@ -34,61 +20,32 @@ export interface DaytonaReconcilerOptions {
     | "checkAvailability"
     | "listInstanceSandboxes"
     | "refreshActivity"
-    | "stopSandbox"
     | "hasExpiringSshToken"
     | "ensureSshAccess"
     | "getSandboxState"
     | "withAccountLease"
   >;
-  /** Every workspace Xum knows, archived ones included (they still own their sandbox). */
   listWorkspaces: () => DaytonaWorkspaceRef[];
   /**
    * Streaming, or running a background job that has not exited: Daytona counts only SSH and
    * API traffic. May check a job over ssh, so it is only asked about a started sandbox.
    */
   isWorkspaceActive: (workspaceId: string) => boolean | Promise<boolean>;
-  /**
-   * Whether detached jobs that survived an unclean Xum exit still run (durable spawn records
-   * on the sandbox). Asked over ssh, so only about a started sandbox; an error counts as yes.
-   */
-  hasUnsettledRemoteJobs?: (ref: DaytonaSandboxRef) => Promise<Result<boolean>>;
   intervalMs?: number;
   callTimeoutMs?: number;
 }
 
-/**
- * Every workspace in the config, archived ones included: an archived workspace still owns its
- * (stopped) sandbox and unarchiving must find it, so the orphan sweep must not touch it.
- */
 export function listDaytonaWorkspaceRefs(config: {
   projects: ReadonlyMap<
     string,
-    {
-      workspaces: ReadonlyArray<
-        Pick<
-          Workspace,
-          | "id"
-          | "runtimeConfig"
-          | "pendingRemoval"
-          | "archivedAt"
-          | "unarchivedAt"
-          | "taskIsolation"
-        >
-      >;
-    }
+    { workspaces: ReadonlyArray<Pick<Workspace, "id" | "runtimeConfig">> }
   >;
 }): DaytonaWorkspaceRef[] {
   const refs: DaytonaWorkspaceRef[] = [];
   for (const project of config.projects.values()) {
     for (const workspace of project.workspaces) {
       if (!workspace.id) continue;
-      refs.push({
-        workspaceId: workspace.id,
-        runtimeConfig: workspace.runtimeConfig,
-        pendingRemovalId: workspace.pendingRemoval?.removalId,
-        archived: isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt),
-        borrowsCheckout: workspace.taskIsolation === "none",
-      });
+      refs.push({ workspaceId: workspace.id, runtimeConfig: workspace.runtimeConfig });
     }
   }
   return refs;
@@ -120,22 +77,12 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, what: string): P
  * One sweep a minute, safe to repeat, that keeps Daytona sandboxes in line with Xum:
  * - keepalive: refresh activity for sandboxes whose workspace is streaming or running a
  *   background job, so Daytona's 30-minute auto-stop does not cut off long agent work;
- * - token refresh: replace an active workspace's ssh token before it expires;
- * - orphans: STOP (never delete) started sandboxes labeled with this install's `xum.instance`
- *   that no workspace references. Deleting would lose work without a dirty check, and a
- *   stopped sandbox costs only storage.
+ * - token refresh: replace an active workspace's ssh token before it expires.
+ * Sandboxes no workspace uses are left to Daytona's auto-stop.
  * The first sweep runs one interval after start: startup never waits on the control plane.
  */
 export class DaytonaReconciler {
   private readonly options: DaytonaReconcilerOptions;
-  /**
-   * Workspaces whose remote spawn records read clear. Crash survivors only predate this
-   * process (later jobs are tracked in memory), and each probe is ssh traffic that Daytona
-   * counts as activity, so a clear workspace is never probed again.
-   */
-  private readonly remoteJobsClear = new Set<string>();
-  /** Consecutive failed job probes per workspace; a success resets it. */
-  private readonly probeFailures = new Map<string, number>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private sweeping: Promise<void> | undefined;
 
@@ -163,7 +110,7 @@ export class DaytonaReconciler {
     this.timer = undefined;
   }
 
-  /** One account for the whole sweep: it stops sandboxes from what it listed. */
+  /** One account for the whole sweep: it refreshes sandboxes from what it listed. */
   sweep(): Promise<void> {
     return this.options.daytonaService.withAccountLease(() => this.sweepOnce());
   }
@@ -178,8 +125,8 @@ export class DaytonaReconciler {
     try {
       sandboxes = await this.call(service.listInstanceSandboxes(), "listing Daytona sandboxes");
     } catch (error) {
-      // Without the list Xum cannot map stored names to ids or see states: keepalive and
-      // orphans wait for the next sweep instead of guessing.
+      // Without the list Xum cannot map stored names to ids or see states: keepalive waits
+      // for the next sweep instead of guessing.
       log.warn("Daytona reconcile: could not list sandboxes", { error: getErrorMessage(error) });
       return;
     }
@@ -187,9 +134,6 @@ export class DaytonaReconciler {
     for (const ref of refs) {
       await this.keepAlive(ref, sandboxes);
     }
-    // A creation persists its workspace before it creates the sandbox, so references read
-    // after the list cover every sandbox in it; the first read may predate a creation.
-    await this.stopOrphans(sandboxes, this.collectReferences());
   }
 
   private collectReferences(): DaytonaSandboxRef[] {
@@ -211,15 +155,13 @@ export class DaytonaReconciler {
     ref: DaytonaSandboxRef,
     sandboxes: DaytonaSandbox[]
   ): Promise<DaytonaSandbox | undefined> {
-    // Xum stores a name for sandboxes it created; last-activity only takes the real id. An
-    // attached sandbox carries no label of this install, so the list does not show it.
+    // Xum stores a name for sandboxes it created; last-activity only takes the real id.
     const sandbox =
       sandboxes.find((sb) => sb.id === ref.sandboxId || sb.name === ref.sandboxId) ??
       (await this.lookUpSandbox(ref.sandboxId));
     // A stopped sandbox has nothing to keep alive, and checking its jobs over ssh would start it.
     if (!sandbox || !isStarted(sandbox)) return undefined;
-    if (await this.isWorkspaceActive(ref.workspaceId)) return sandbox;
-    return (await this.hasUnsettledRemoteJobs(ref)) ? sandbox : undefined;
+    return (await this.isWorkspaceActive(ref.workspaceId)) ? sandbox : undefined;
   }
 
   private async isWorkspaceActive(workspaceId: string): Promise<boolean> {
@@ -235,48 +177,6 @@ export class DaytonaReconciler {
       });
       return false;
     }
-  }
-
-  /**
-   * Fails closed (keeps the sandbox alive) when the probe fails or times out, but only for
-   * DAYTONA_JOB_PROBE_FAILURE_LIMIT sweeps in a row: a probe that never succeeds would keep the
-   * sandbox running forever, so the workspace then counts as clear.
-   */
-  private async hasUnsettledRemoteJobs(ref: DaytonaSandboxRef): Promise<boolean> {
-    const probe = this.options.hasUnsettledRemoteJobs;
-    if (!probe || this.remoteJobsClear.has(ref.workspaceId)) return false;
-    let result: Result<boolean>;
-    try {
-      result = await this.call(probe(ref), "checking jobs that survived a restart");
-    } catch (error) {
-      result = Err(getErrorMessage(error));
-    }
-    if (!result.success) {
-      log.warn("Daytona reconcile: could not check jobs that survived a restart", {
-        workspaceId: ref.workspaceId,
-        error: result.error,
-      });
-      return !this.giveUpAfterProbeFailure(ref.workspaceId);
-    }
-    this.probeFailures.delete(ref.workspaceId);
-    if (!result.data) this.remoteJobsClear.add(ref.workspaceId);
-    return result.data;
-  }
-
-  /** Whether this failure reached the limit: the workspace then counts as clear. */
-  private giveUpAfterProbeFailure(workspaceId: string): boolean {
-    const failures = (this.probeFailures.get(workspaceId) ?? 0) + 1;
-    if (failures < DAYTONA_JOB_PROBE_FAILURE_LIMIT) {
-      this.probeFailures.set(workspaceId, failures);
-      return false;
-    }
-    this.probeFailures.delete(workspaceId);
-    this.remoteJobsClear.add(workspaceId);
-    log.warn("Daytona reconcile: job probe keeps failing; no longer keeping the sandbox alive", {
-      workspaceId,
-      failures,
-    });
-    return true;
   }
 
   /** `storedId` is what the workspace config holds (tokens use it), `realId` the sandbox id. */
@@ -314,30 +214,6 @@ export class DaytonaReconciler {
         error: getErrorMessage(error),
       });
       return undefined;
-    }
-  }
-
-  private async stopOrphans(
-    sandboxes: DaytonaSandbox[],
-    refs: Array<{ sandboxId: string }>
-  ): Promise<void> {
-    const referenced = new Set(refs.map((ref) => ref.sandboxId));
-    for (const sandbox of sandboxes) {
-      if (referenced.has(sandbox.id) || (sandbox.name && referenced.has(sandbox.name))) continue;
-      // Only settled, running boxes: a starting one may belong to a creation in flight.
-      if (mapDaytonaSandboxState(sandbox.state) !== "started") continue;
-      log.info("Daytona reconcile: stopping an unreferenced sandbox", { sandboxId: sandbox.id });
-      try {
-        await this.call(
-          this.options.daytonaService.stopSandbox(sandbox.id),
-          "stopping an orphaned sandbox"
-        );
-      } catch (error) {
-        log.warn("Daytona reconcile: could not stop an orphaned sandbox", {
-          sandboxId: sandbox.id,
-          error: getErrorMessage(error),
-        });
-      }
     }
   }
 

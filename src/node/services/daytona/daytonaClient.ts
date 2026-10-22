@@ -507,18 +507,6 @@ export class DaytonaClient {
     });
   }
 
-  /** Replaces every label: Daytona has no call that removes a single one. */
-  async replaceLabels(
-    id: string,
-    labels: Record<string, string>,
-    signal?: AbortSignal
-  ): Promise<void> {
-    await this.request("PUT", `/sandbox/${encodeURIComponent(id)}/labels`, {
-      body: { labels },
-      signal,
-    });
-  }
-
   /** Daytona counts only SSH and API traffic as activity; this keeps a busy box from stopping. */
   async refreshActivity(id: string, signal?: AbortSignal): Promise<void> {
     await this.request("POST", `/sandbox/${encodeURIComponent(id)}/last-activity`, { signal });

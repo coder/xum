@@ -109,6 +109,7 @@ import {
   stripClientPluginSendHookFields,
 } from "@/common/utils/messages/pluginSendHookFields";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { DAYTONA_ARCHIVE_NEEDS_USER } from "@/common/constants/daytona";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
   createRuntime,
@@ -358,8 +359,7 @@ import {
   hasSrcBaseDir,
   getSrcBaseDir,
   isSSHRuntime,
-  isDedicatedDaytonaSandbox,
-  getDaytonaSandboxId,
+  ownsDaytonaSandbox,
   isDockerRuntime,
   isDevcontainerRuntime,
 } from "@/common/types/runtime";
@@ -1097,8 +1097,8 @@ const DAYTONA_RUNTIME_STATUS: Record<DaytonaSandboxState, WorkspaceRuntimeStatus
 };
 
 /**
- * Sandbox states of the requested Daytona workspaces, probed in parallel. Forks and attachments
- * share a sandbox, so each sandbox is read once and its status given to all of its workspaces:
+ * Sandbox states of the requested Daytona workspaces, probed in parallel. Forks share their
+ * source's sandbox, so each sandbox is read once and its status given to all of its workspaces:
  * a large fork tree must not send a burst of identical control-plane requests.
  */
 async function probeDaytonaRuntimeStatuses(
@@ -1165,25 +1165,6 @@ const ARCHIVE_OWN_ACTIVITY_POLICY = {
   backgroundProcesses: "allow",
 } as const;
 
-/**
- * An isolation: "none" task borrows another workspace's checkout, so its removal leaves the
- * runtime alone. Except the last workspace on a Daytona sandbox: its owner was removed while
- * this task borrowed the checkout, so that removal skipped the sandbox, and nothing else would
- * ever delete it. This removal then runs the runtime deletion the owner's would have run (on
- * the persisted path, the owner's checkout), deleting or releasing the sandbox.
- */
-function borrowsLiveCheckout(config: ProjectsConfig, workspaceId: string): boolean {
-  const entry = findWorkspaceEntry(config, workspaceId);
-  if (entry?.workspace.taskIsolation !== "none") return false;
-  const sandboxId = getDaytonaSandboxId(entry.workspace.runtimeConfig);
-  if (sandboxId === undefined) return true;
-  return Array.from(config.projects.values()).some((project) =>
-    project.workspaces.some(
-      (ws) => ws.id !== workspaceId && getDaytonaSandboxId(ws.runtimeConfig) === sandboxId
-    )
-  );
-}
-
 function isHomeRelativePath(remotePath: string | null | undefined): remotePath is string {
   return remotePath === "~" || remotePath?.startsWith("~/") === true;
 }
@@ -1208,12 +1189,8 @@ function toBulkArchiveWarnings(
   return (warnings ?? []).map((warning) => ({ workspaceId, warning }));
 }
 
-/**
- * A remote box Xum created for this workspace (not an existing one it connected to): a Coder
- * workspace, or a Daytona sandbox, which reuses the Coder archive behavior (keep, stop, delete).
- */
+/** A Coder workspace Xum created for this workspace (not an existing one it connected to). */
 function isDedicatedCoderRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
-  if (isDedicatedDaytonaSandbox(runtimeConfig)) return true;
   return (
     runtimeConfig != null &&
     isSSHRuntime(runtimeConfig) &&
@@ -1224,8 +1201,21 @@ function isDedicatedCoderRuntime(runtimeConfig: RuntimeConfig | undefined): bool
 }
 
 /**
+ * What archiving does to the remote box Xum created for this workspace: a dedicated Coder
+ * workspace follows the Coder archive setting, and the Daytona sandbox a workspace created is
+ * always deleted.
+ */
+function remoteBoxArchiveBehavior(
+  metadata: WorkspaceMetadata | undefined,
+  coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior
+): CoderWorkspaceArchiveBehavior {
+  if (metadata != null && ownsDaytonaSandbox(metadata)) return "delete";
+  return isDedicatedCoderRuntime(metadata?.runtimeConfig) ? coderWorkspaceArchiveBehavior : "keep";
+}
+
+/**
  * Whether archiving takes the structural mutation gate (#4476): it deletes the managed checkout,
- * or stops or deletes a dedicated Coder workspace (#4871).
+ * or stops or deletes a dedicated remote box (#4871).
  */
 function archiveTakesMutationGate(
   metadata: WorkspaceMetadata,
@@ -1234,7 +1224,7 @@ function archiveTakesMutationGate(
 ): boolean {
   return (
     archiveDeletesManagedWorktree(metadata, worktreeArchiveBehavior) ||
-    (isDedicatedCoderRuntime(metadata.runtimeConfig) && coderWorkspaceArchiveBehavior !== "keep")
+    remoteBoxArchiveBehavior(metadata, coderWorkspaceArchiveBehavior) !== "keep"
   );
 }
 // #4476: removal stops this backend's own stream, terminals, MCP servers, init hook and background
@@ -8326,8 +8316,8 @@ export class WorkspaceService
         // parent's working tree, so skip runtime deletion and only remove config/session state.
         // Runtime deletion is keyed on the task's unique name today (a safe no-op), but guard
         // explicitly so this stays correct if runtime deletion ever resolves the persisted path.
-        // borrowsLiveCheckout makes one exception, for a Daytona sandbox with no owner left.
-        const taskSharesParentCheckout = borrowsLiveCheckout(configSnapshot, workspaceId);
+        const taskSharesParentCheckout =
+          findWorkspaceEntry(configSnapshot, workspaceId)?.workspace.taskIsolation === "none";
 
         // Inverse direction: this workspace's checkout may be shared by live isolation: "none"
         // descendants (their persisted path points at it). Deleting it would yank the cwd out
@@ -13184,16 +13174,16 @@ export class WorkspaceService
         options?.coderWorkspaceArchiveBehaviorOverride ??
         this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
         DEFAULT_CODER_ARCHIVE_BEHAVIOR;
-      const isDedicatedCoderWorkspace = isDedicatedCoderRuntime(
-        beforeArchiveMetadata?.runtimeConfig
+      const remoteBoxBehavior = remoteBoxArchiveBehavior(
+        beforeArchiveMetadata,
+        coderWorkspaceArchiveBehavior
       );
-      if (options?.forbidCoderWorkspaceDeletion === true) {
-        if (isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior === "delete") {
-          const boxLabel = dedicatedRemoteBoxLabel(beforeArchiveMetadata);
-          return Err(
-            `${boxLabel} archive behavior is set to "Delete", which would permanently delete the dedicated remote ${boxLabel} without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the ${boxLabel} archive behavior.`
-          );
-        }
+      if (options?.forbidCoderWorkspaceDeletion === true && remoteBoxBehavior === "delete") {
+        return Err(
+          beforeArchiveMetadata != null && ownsDaytonaSandbox(beforeArchiveMetadata)
+            ? DAYTONA_ARCHIVE_NEEDS_USER
+            : 'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior.'
+        );
       }
 
       const canSnapshotManagedWorktree =
@@ -13212,10 +13202,9 @@ export class WorkspaceService
       // the managed worktree — or stop a dedicated remote Coder workspace the user may still
       // be connected to through such an app — a model-driven archive must not pull the
       // environment out from under a user's live shell or editor. Mirrors the lifecycle
-      // caller's early refusal against the same pinned behavior reads. ("delete" for a
-      // dedicated Coder workspace is refused outright above, so non-"keep" here means stop.)
-      const stopsDedicatedCoderWorkspace =
-        isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior !== "keep";
+      // caller's early refusal against the same pinned behavior reads. ("delete" is refused
+      // outright above for model-driven archives, so non-"keep" here means stop.)
+      const stopsDedicatedCoderWorkspace = remoteBoxBehavior !== "keep";
       if (
         options?.refuseLiveUserActivity === true &&
         (needsSnapshotCapture || stopsDedicatedCoderWorkspace) &&

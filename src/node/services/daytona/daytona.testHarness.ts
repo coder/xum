@@ -2,11 +2,9 @@ import { spawn } from "child_process";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
 import type { DaytonaSshConfigWriter, DaytonaSshGateway } from "@/node/runtime/daytonaSshConfig";
 import type { SSHTransport } from "@/node/runtime/transports";
-import type { DaytonaWorkspaceRef } from "./daytonaReconciler";
 import { DAYTONA_LABEL_INSTANCE, DaytonaService } from "./daytonaService";
 
 /**
@@ -367,10 +365,6 @@ export interface DaytonaTestRig {
   writer: FakeDaytonaSshConfigWriter;
   service: DaytonaService;
   clock: { now: number };
-  /** The workspaces the service sees (it deletes a sandbox only with its last one). */
-  workspaces: DaytonaWorkspaceRef[];
-  /** The archive behavior in Settings the service reports; "keep" unless a test sets it. */
-  archiveBehavior: CoderWorkspaceArchiveBehavior;
   cleanup: () => Promise<void>;
 }
 
@@ -390,7 +384,6 @@ export async function createDaytonaTestRig(
     return accounts.get(auth?.replace(/^Bearer /, "") ?? "") ?? plane;
   };
   const writer = new FakeDaytonaSshConfigWriter();
-  const workspaces: DaytonaWorkspaceRef[] = [];
   const env: NodeJS.ProcessEnv =
     options.apiKey === null ? {} : { DAYTONA_API_KEY: options.apiKey ?? "test-key" };
   const service = new DaytonaService({
@@ -404,14 +397,12 @@ export async function createDaytonaTestRig(
       clock.now += ms;
       return Promise.resolve();
     },
-    listWorkspaces: () => workspaces,
-    getArchiveBehavior: () => rig.archiveBehavior,
   });
   // Sandboxes a test adds count as ones Xum created, as most tests need; a foreign one sets
   // its own labels.
   const ownLabels = { [DAYTONA_LABEL_INSTANCE]: await service.getInstanceId() };
   plane.defaultLabels = ownLabels;
-  const rig: DaytonaTestRig = {
+  return {
     rootDir,
     plane,
     addAccount: (apiKey) => {
@@ -423,11 +414,8 @@ export async function createDaytonaTestRig(
     writer,
     service,
     clock,
-    workspaces,
-    archiveBehavior: "keep",
     cleanup: () => fs.rm(rootDir, { recursive: true, force: true }),
   };
-  return rig;
 }
 
 /** Runs each "remote" command in a local bash whose HOME is `home`: the sandbox end of ssh. */

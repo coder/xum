@@ -1,12 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { createDaytonaTestRig, type DaytonaTestRig } from "./daytona.testHarness";
-import { Err, Ok } from "@/common/types/result";
-import {
-  DaytonaReconciler,
-  listDaytonaWorkspaceRefs,
-  type DaytonaReconcilerOptions,
-} from "./daytonaReconciler";
+import { DaytonaReconciler, listDaytonaWorkspaceRefs } from "./daytonaReconciler";
 import { DAYTONA_LABEL_INSTANCE } from "./daytonaService";
 
 let rig: DaytonaTestRig;
@@ -34,10 +29,9 @@ function daytonaConfig(sandboxId: string): RuntimeConfig {
 let activityChecks: string[];
 
 function makeReconciler(
-  workspaces: Array<{ id: string; runtimeConfig: RuntimeConfig; archivedAt?: string }>,
+  workspaces: Array<{ id: string; runtimeConfig: RuntimeConfig }>,
   activeIds: string[],
-  callTimeoutMs?: number,
-  hasUnsettledRemoteJobs?: DaytonaReconcilerOptions["hasUnsettledRemoteJobs"]
+  callTimeoutMs?: number
 ): DaytonaReconciler {
   const config = { projects: new Map([["/home/me/project", { workspaces }]]) };
   activityChecks = [];
@@ -49,7 +43,6 @@ function makeReconciler(
       return Promise.resolve(activeIds.includes(workspaceId));
     },
     callTimeoutMs,
-    hasUnsettledRemoteJobs,
   });
 }
 
@@ -71,57 +64,21 @@ describe("DaytonaReconciler.sweep", () => {
     expect(rig.plane.countCalls("POST /sandbox/sb-2/last-activity")).toBe(0);
   });
 
-  it("stops only unreferenced running sandboxes of this install, archived workspaces included", async () => {
-    rig.plane.addSandbox({ id: "sb-orphan", labels: instanceLabels });
-    rig.plane.addSandbox({ id: "sb-archived-ws", labels: instanceLabels });
-    rig.plane.addSandbox({ id: "sb-creating", state: "creating", labels: instanceLabels });
-    rig.plane.addSandbox({ id: "sb-other-install", labels: { [DAYTONA_LABEL_INSTANCE]: "x" } });
-
-    await makeReconciler(
-      [
-        {
-          id: "ws-archived",
-          runtimeConfig: daytonaConfig("sb-archived-ws"),
-          archivedAt: "2026-01-01T00:00:00Z",
-        },
-      ],
-      []
-    ).sweep();
-
-    expect(rig.plane.find("sb-orphan")?.state).toBe("stopped");
-    expect(rig.plane.find("sb-archived-ws")?.state).toBe("started");
-    expect(rig.plane.find("sb-creating")?.state).toBe("creating");
-    expect(rig.plane.find("sb-other-install")?.state).toBe("started");
-    // Never deletes: an orphan may still hold unpushed work.
-    expect(rig.plane.calls.some((call) => call.startsWith("DELETE /sandbox/"))).toBe(false);
-  });
-
-  it("keeps the sandbox of a workspace created while the sandboxes were listed", async () => {
-    const workspaces: Array<{ id: string; runtimeConfig: RuntimeConfig }> = [];
-    // A creation persists its workspace, then creates and starts its sandbox, during the list.
-    rig.plane.onRequest.set("GET /sandbox", () => {
-      workspaces.push({ id: "ws-new", runtimeConfig: daytonaConfig("xum-new") });
-      rig.plane.addSandbox({ id: "sb-new", name: "xum-new", labels: instanceLabels });
-      return Promise.resolve();
-    });
-
-    await makeReconciler(workspaces, []).sweep();
-
-    expect(rig.plane.find("xum-new")?.state).toBe("started");
-  });
-
   it("moves on past a hung control-plane call", async () => {
     rig.plane.addSandbox({ id: "sb-hung", labels: instanceLabels });
-    rig.plane.addSandbox({ id: "sb-orphan", labels: instanceLabels });
+    rig.plane.addSandbox({ id: "sb-next", labels: instanceLabels });
     rig.plane.hangingRoutes.add("POST /sandbox/sb-hung/last-activity");
 
     await makeReconciler(
-      [{ id: "ws", runtimeConfig: daytonaConfig("sb-hung") }],
-      ["ws"],
+      [
+        { id: "ws-hung", runtimeConfig: daytonaConfig("sb-hung") },
+        { id: "ws-next", runtimeConfig: daytonaConfig("sb-next") },
+      ],
+      ["ws-hung", "ws-next"],
       20
     ).sweep();
 
-    expect(rig.plane.find("sb-orphan")?.state).toBe("stopped");
+    expect(rig.plane.countCalls("POST /sandbox/sb-next/last-activity")).toBe(1);
   });
 
   it("refreshes an active workspace's ssh token before it expires", async () => {
@@ -138,100 +95,23 @@ describe("DaytonaReconciler.sweep", () => {
 
   it("keeps only started sandboxes alive and skips them all when the list fails", async () => {
     rig.plane.addSandbox({ id: "sb-stopped", state: "stopped", labels: instanceLabels });
-    // Attached by the user: no label of this install, so only a lookup finds it.
-    rig.plane.addSandbox({ id: "sb-attached" });
+    rig.plane.addSandbox({ id: "sb-started", labels: instanceLabels });
     const workspaces = [
       { id: "ws-stopped", runtimeConfig: daytonaConfig("sb-stopped") },
-      { id: "ws-attached", runtimeConfig: daytonaConfig("sb-attached") },
+      { id: "ws-started", runtimeConfig: daytonaConfig("sb-started") },
     ];
-    const active = ["ws-stopped", "ws-attached"];
+    const active = ["ws-stopped", "ws-started"];
 
     await makeReconciler(workspaces, active).sweep();
     expect(rig.plane.countCalls("POST /sandbox/sb-stopped/last-activity")).toBe(0);
     // Checking a stopped sandbox's jobs over ssh would start it.
-    expect(activityChecks).toEqual(["ws-attached"]);
-    expect(rig.plane.countCalls("POST /sandbox/sb-attached/last-activity")).toBe(1);
+    expect(activityChecks).toEqual(["ws-started"]);
+    expect(rig.plane.countCalls("POST /sandbox/sb-started/last-activity")).toBe(1);
 
     rig.plane.failingRoutes.add("GET /sandbox");
     rig.plane.calls.length = 0;
     await makeReconciler(workspaces, active).sweep();
     expect(rig.plane.calls.filter((call) => call.endsWith("/last-activity"))).toEqual([]);
     expect(activityChecks).toEqual([]);
-  });
-
-  it("asks about an attached sandbox's jobs only once its state shows it started", async () => {
-    // Attached by the user (no label of this install) and stopped: an ssh job probe would
-    // start it.
-    rig.plane.addSandbox({ id: "sb-attached-off", state: "stopped" });
-
-    await makeReconciler(
-      [{ id: "ws-attached-off", runtimeConfig: daytonaConfig("sb-attached-off") }],
-      ["ws-attached-off"]
-    ).sweep();
-
-    expect(activityChecks).toEqual([]);
-    expect(rig.plane.countCalls("POST /sandbox/sb-attached-off/last-activity")).toBe(0);
-  });
-
-  it("stops keeping a sandbox alive once its job probe keeps failing, a success resetting the count", async () => {
-    rig.plane.addSandbox({ id: "sb-1", name: "xum-stuck", labels: instanceLabels });
-    rig.plane.addSandbox({ id: "sb-2", name: "xum-flaky", labels: instanceLabels });
-    // Per sweep: the stuck probe always fails; the flaky one succeeds once between failures.
-    const flaky = [
-      Err("ssh failed"),
-      Err("ssh failed"),
-      Ok(true),
-      Err("ssh failed"),
-      Err("ssh failed"),
-    ];
-    const probed: string[] = [];
-    const reconciler = makeReconciler(
-      [
-        { id: "ws-stuck", runtimeConfig: daytonaConfig("xum-stuck") },
-        { id: "ws-flaky", runtimeConfig: daytonaConfig("xum-flaky") },
-      ],
-      [],
-      undefined,
-      (ref) => {
-        probed.push(ref.workspaceId);
-        return Promise.resolve(
-          ref.workspaceId === "ws-stuck" ? Err("ssh failed") : (flaky.shift() ?? Ok(false))
-        );
-      }
-    );
-
-    for (let sweep = 0; sweep < 5; sweep++) await reconciler.sweep();
-
-    // Two failures still keep it alive (fail closed); the third gives up on the workspace.
-    expect(rig.plane.countCalls("POST /sandbox/sb-1/last-activity")).toBe(2);
-    expect(probed.filter((id) => id === "ws-stuck")).toHaveLength(3);
-    expect(rig.plane.countCalls("POST /sandbox/sb-2/last-activity")).toBe(5);
-  });
-
-  it("keeps a sandbox alive under jobs that survived a Xum crash, probing a clear one once", async () => {
-    rig.plane.addSandbox({ id: "sb-1", name: "xum-survivor", labels: instanceLabels });
-    rig.plane.addSandbox({ id: "sb-2", name: "xum-quiet", labels: instanceLabels });
-    const probed: string[] = [];
-    const reconciler = makeReconciler(
-      [
-        { id: "ws-survivor", runtimeConfig: daytonaConfig("xum-survivor") },
-        { id: "ws-quiet", runtimeConfig: daytonaConfig("xum-quiet") },
-      ],
-      // Neither streams nor holds a job in this process's memory.
-      [],
-      undefined,
-      (ref) => {
-        probed.push(ref.workspaceId);
-        return Promise.resolve(Ok(ref.workspaceId === "ws-survivor"));
-      }
-    );
-
-    await reconciler.sweep();
-    await reconciler.sweep();
-
-    expect(rig.plane.countCalls("POST /sandbox/sb-1/last-activity")).toBe(2);
-    expect(rig.plane.countCalls("POST /sandbox/sb-2/last-activity")).toBe(0);
-    // A probe is itself ssh traffic that Daytona counts: a clear workspace is not probed again.
-    expect(probed).toEqual(["ws-survivor", "ws-quiet", "ws-survivor"]);
   });
 });
