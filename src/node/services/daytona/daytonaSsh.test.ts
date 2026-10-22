@@ -349,6 +349,38 @@ describe("DaytonaSsh", () => {
     expect(plane.calls.filter((call) => call === "POST /sandbox/sb-1/ssh-access")).toHaveLength(1);
   });
 
+  it("removes the old account's aliases from the include file when the settings change", async () => {
+    const includeFile = new Map<string, string>();
+    const store = (input: { sandboxId: string; token: string }) => {
+      includeFile.set(input.sandboxId, input.token);
+      return Promise.resolve();
+    };
+    const changing = new DaytonaService({
+      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
+      rootDir,
+      fetch: plane.fetch,
+      now: () => clock,
+      sshConfigWriter: {
+        writeSandbox: store,
+        ensureManagedBlock: () => Promise.resolve(),
+        restoreGatewayPins: () => Promise.resolve(false),
+        updateToken: store,
+        removeSandbox: (sandboxId) => {
+          includeFile.delete(sandboxId);
+          return Promise.resolve();
+        },
+        readTokens: () => Promise.resolve([]),
+        repointGateway: () => Promise.resolve(),
+      },
+    });
+    await changing.ssh.ensureSshAccess("sb-1");
+    expect(includeFile.has("sb-1")).toBe(true);
+
+    // A failed revoke would otherwise leave a working old-account token behind the alias.
+    await changing.account.setConfig({ target: "eu" });
+    expect(includeFile.has("sb-1")).toBe(false);
+  });
+
   it("revokes the tokens an earlier process left in the include file once it replaces them", async () => {
     // The include file, shared by every Xum process (a restart is a new service).
     const includeFile = new Map([["sb-1", "earlier-process-token"]]);

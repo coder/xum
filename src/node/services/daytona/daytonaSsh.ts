@@ -130,15 +130,26 @@ export class DaytonaSsh {
   }
 
   /**
-   * Tokens and gateway data belong to the old account or deployment: revoke the tokens with the
-   * old credentials (which may not work for the new ones) and drop the caches. Connections
-   * already open may reach the old account until they end.
+   * Tokens and gateway data belong to the old account or deployment: drop their aliases from
+   * the include file (a revoke can fail, and the alias would still reach the old account),
+   * revoke the tokens with the old credentials (which may not work for the new ones) and drop
+   * the caches. Connections already open may reach the old account until they end.
    */
   async forgetAccount(previousClient: DaytonaClient | undefined): Promise<void> {
     const tokens = [...this.tokens];
     this.tokens.clear();
     this.sshConfigured.clear();
     this.gatewayCache = undefined;
+    for (const [sandboxId] of tokens) {
+      try {
+        await this.sshConfigWriter.removeSandbox(sandboxId);
+      } catch (error) {
+        log.warn("Failed to remove an old-account Daytona alias from the include file", {
+          sandboxId,
+          error: getErrorMessage(error),
+        });
+      }
+    }
     if (previousClient) {
       await Promise.all(
         tokens.map(([sandboxId, access]) =>
