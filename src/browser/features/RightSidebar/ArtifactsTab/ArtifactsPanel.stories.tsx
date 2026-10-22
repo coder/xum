@@ -48,7 +48,11 @@ const meta: Meta<typeof ArtifactsPanel> = {
   decorators: [
     (Story, context) => (
       <WindowApiStub browserMode={context.parameters.browserMode === true}>
-        <Story />
+        {/* The workspace shell a wide-window fullscreen panel pins over (pinOverWorkspace). It
+            fills the canvas here: no left sidebar in these stories. */}
+        <div data-workspace-shell="">
+          <Story />
+        </div>
       </WindowApiStub>
     ),
   ],
@@ -928,7 +932,10 @@ export const BridgeEscapeExitsFullscreen: Story = {
     await waitFor(() => expect(bridgeMessages).toContain("ready"));
     await userEvent.click(canvas.getByRole("button", { name: "Fullscreen" }));
     await waitFor(() =>
-      expect(canvasElement.ownerDocument.querySelector('[role="dialog"]')).not.toBeNull()
+      // A modal dialog in a narrow window, a region in a wide one: only fullscreen labels it.
+      expect(
+        canvasElement.ownerDocument.querySelector('[data-testid="artifacts-panel"][aria-label]')
+      ).not.toBeNull()
     );
     // Fullscreen keeps the same frame: entering it must not reload the artifact.
     await expect(canvas.getByTestId("artifact-frame")).toBe(frame);
@@ -938,7 +945,9 @@ export const BridgeEscapeExitsFullscreen: Story = {
     await waitFor(() => expect(bridgeMessages).toContain("sent-escape"), { timeout: 10000 });
     // The host must leave fullscreen.
     await waitFor(() =>
-      expect(canvasElement.ownerDocument.querySelector('[role="dialog"]')).toBeNull()
+      expect(
+        canvasElement.ownerDocument.querySelector('[data-testid="artifacts-panel"][aria-label]')
+      ).toBeNull()
     );
   },
 };
@@ -963,7 +972,8 @@ export const FullscreenKeepsFocusWhenViewerSwaps: Story = {
     const canvas = within(canvasElement);
     await canvas.findByRole("button", { name: /^runs:/ });
     await userEvent.click(canvas.getByRole("button", { name: "Fullscreen" }));
-    const dialog = await canvas.findByRole("dialog", { name: "Artifact tree.json" });
+    // A modal dialog in a narrow window, a region in a wide one: both carry the label.
+    const dialog = await canvas.findByLabelText("Artifact tree.json");
     const toggle = within(dialog).getByRole("button", { name: /^runs:/ });
     toggle.focus();
     await expect(toggle).toHaveFocus();
@@ -972,7 +982,7 @@ export const FullscreenKeepsFocusWhenViewerSwaps: Story = {
     await waitFor(() => expect(toggle.isConnected).toBe(false));
     await waitFor(() => expect(dialog).toHaveFocus());
     await userEvent.keyboard("{Escape}");
-    await waitFor(() => expect(canvas.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(canvas.queryByLabelText("Artifact tree.json")).toBeNull());
   },
 };
 

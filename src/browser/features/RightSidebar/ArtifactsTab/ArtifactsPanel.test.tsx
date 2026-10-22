@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { installDom } from "../../../../../tests/ui/dom";
+import { installDom, stubNarrowViewport } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
@@ -26,6 +26,7 @@ import {
   ARTIFACTS_SELECTION_KEY,
   ARTIFACTS_SELECTION_MAX_WORKSPACES,
 } from "@/common/constants/storage";
+import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
 import { openArtifact } from "./openArtifact";
@@ -230,6 +231,9 @@ describe("ArtifactsPanel", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
+    // Most tests cover the narrow-window fullscreen, a modal dialog over the whole window. The
+    // wide-window tests stub a wide viewport and wrap the panel in a workspace shell.
+    stubNarrowViewport(true);
     window.localStorage.clear();
     // Desktop mode (the preload bridge isDesktopMode checks).
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -540,6 +544,48 @@ describe("ArtifactsPanel", () => {
     await waitFor(() => expect(document.activeElement).toBe(panel));
     outside.remove();
   });
+
+  // A wide window pins fullscreen over the workspace shell only, like immersive review: the left
+  // sidebar beside the shell stays visible and usable, so the panel is a region, not a modal.
+  for (const leftSidebarCollapsed of [false, true]) {
+    test(`wide: fullscreen covers the workspace shell and the left sidebar stays usable (collapsed: ${leftSidebarCollapsed})`, async () => {
+      stubNarrowViewport(false);
+      window.localStorage.setItem(LEFT_SIDEBAR_COLLAPSED_KEY, JSON.stringify(leftSidebarCollapsed));
+      fake = createFakeArtifactsApi(
+        {
+          available: true,
+          dir: "/scratch/artifacts",
+          entries: [entry("a.txt", 1, "text")],
+          truncated: false,
+        },
+        { "a.txt": textFile("a.txt", "text", "alpha") }
+      );
+      const leftSidebar = document.body.appendChild(document.createElement("button"));
+      const shell = document.body.appendChild(document.createElement("div"));
+      shell.setAttribute("data-workspace-shell", "");
+      const chat = shell.appendChild(document.createElement("button"));
+      const view = render(<ArtifactsPanel workspaceId="ws-artifacts" />, {
+        wrapper: ApiWrapper,
+        container: shell.appendChild(document.createElement("div")),
+      });
+      const panel = view.getByTestId("artifacts-panel");
+      expect(await view.findByText("alpha")).toBeTruthy();
+
+      fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+      const region = await view.findByRole("region", { name: "Artifact a.txt" });
+      expect(region.getAttribute("aria-modal")).toBeNull();
+      expect([leftSidebar.inert, chat.inert]).toEqual([false, true]);
+      // The collapsed sidebar's toggle bar sits over the toolbar's start: a spacer keeps it clear.
+      expect(region.querySelector(".left-sidebar-toggle-host") != null).toBe(leftSidebarCollapsed);
+
+      fireEvent.keyDown(region, { key: "Escape" });
+      await waitFor(() => expect(view.queryByRole("region")).toBeNull());
+      expect(chat.inert).toBe(false);
+      await waitFor(() => expect(document.activeElement).toBe(panel));
+      leftSidebar.remove();
+      shell.remove();
+    });
+  }
 
   test("autoFocus takes focus from the chat input so J/K and Shift+F work at once", async () => {
     fake = createFakeArtifactsApi(

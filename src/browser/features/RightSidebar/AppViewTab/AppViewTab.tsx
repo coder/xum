@@ -18,13 +18,14 @@ import {
 } from "../ArtifactsTab/mcpAppViewsStore";
 import { Notice } from "../ArtifactsTab/SourceText";
 import { withEntrypointScope } from "./mcpAppEntrypoints";
-import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
+import { useNarrowViewport } from "@/browser/hooks/useNarrowViewport";
+import { pinnedViewClass, pinnedViewRole, pinView } from "@/browser/utils/ui/pinnedView";
+import { cn } from "@/common/lib/utils";
 import {
   KEYBINDS,
   MODAL_DIALOG_OVERLAY_ATTRIBUTE,
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
-import { refocusFallenFocus } from "@/browser/utils/ui/refocusFallenFocus";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 
 /**
@@ -163,30 +164,33 @@ export function AppViewTabPanel(props: {
   );
 }
 
-/** Marks a maximized app tab panel (a modal dialog that belongs to the right sidebar). */
+/** Marks a maximized app tab panel (a view of the right sidebar pinned over the app). */
 const MAXIMIZED_APP_PANEL_ATTRIBUTE = "data-maximized-app-panel";
 
 /**
- * The maximized app tab panel inside `container`, when it is the only open modal. The panel is a
- * modal dialog (aria-modal), so isDialogOpen() is true while it is up. The sidebar still owns it as
- * its tab, so Cmd/Ctrl+W closes it (#6181). Any other open modal returns null: it keeps the keys.
+ * The maximized app tab panel inside `container`, unless another modal is open. In a narrow window
+ * the panel is a modal dialog (aria-modal), so isDialogOpen() is true while it is up; in a wide one
+ * it is a region. Either way the sidebar still owns it as its tab, so Cmd/Ctrl+W closes it
+ * (#6181). Any other open modal returns null: it keeps the keys.
  */
 export function findOwnMaximizedAppPanel(container: Element | null): HTMLElement | null {
   if (container == null) return null;
   if (document.querySelector(`[${MODAL_DIALOG_OVERLAY_ATTRIBUTE}][data-state="open"]`)) return null;
-  const modals = document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]');
-  if (modals.length !== 1) return null;
-  const modal = modals[0];
-  return modal.hasAttribute(MAXIMIZED_APP_PANEL_ATTRIBUTE) && container.contains(modal)
-    ? modal
-    : null;
+  const panel = container.querySelector<HTMLElement>(`[${MAXIMIZED_APP_PANEL_ATTRIBUTE}]`);
+  if (panel == null) return null;
+  const otherModal = document.querySelector(
+    `[role="dialog"][aria-modal="true"]:not([${MAXIMIZED_APP_PANEL_ATTRIBUTE}])`
+  );
+  return otherModal == null ? panel : null;
 }
 
 /**
- * The app tab's box, pinned over the window while maximized (#6165). Pinned in place, not moved
- * into a portal: a portal remounts the frame, which reloads the view and loses its state (the
- * same reason as Artifacts fullscreen). Everything outside goes inert meanwhile, Escape on the
- * panel restores it, and closing the tab restores it too.
+ * The app tab's box, pinned while maximized (#6165): over the workspace shell in a wide window,
+ * like Artifacts fullscreen and immersive review, so the left sidebar stays usable; over the
+ * window in a narrow one. Pinned in place, not moved into a portal: a portal remounts the frame,
+ * which reloads the view and loses its state (the same reason as Artifacts fullscreen). The
+ * covered content goes inert meanwhile, Escape on the panel restores it, and closing the tab
+ * restores it too.
  */
 function MaximizablePanel(props: {
   workspaceId: string;
@@ -197,7 +201,8 @@ function MaximizablePanel(props: {
   const maximized = useMcpAppViewMaximized(workspaceId, toolCallId);
   const setMaximized = (next: boolean) => setMcpAppViewMaximized(workspaceId, toolCallId, next);
   const panelRef = useRef<HTMLDivElement>(null);
-  usePinnedOverWindow(panelRef, maximized, () => setMaximized(false));
+  const narrow = useNarrowViewport();
+  usePinnedView(panelRef, maximized, narrow, () => setMaximized(false));
   // A closed tab must not come back maximized.
   useEffect(
     () => () => setMcpAppViewMaximized(workspaceId, toolCallId, false),
@@ -209,10 +214,9 @@ function MaximizablePanel(props: {
       data-testid="app-view-tab-panel"
       tabIndex={-1}
       aria-label={maximized ? "Maximized app view" : undefined}
-      // While maximized the rest of the window is inert: announce it as a modal dialog, like
-      // the Artifacts fullscreen panel.
-      role={maximized ? "dialog" : undefined}
-      aria-modal={maximized ? true : undefined}
+      // Like the Artifacts fullscreen panel: a modal dialog over the window (narrow) or a region
+      // over the workspace shell beside the usable left sidebar (wide).
+      {...(maximized ? pinnedViewRole(narrow) : {})}
       {...(maximized ? { [MAXIMIZED_APP_PANEL_ATTRIBUTE]: "" } : {})}
       // The Artifacts fullscreen shortcut toggles it while focus is in the panel (outside the
       // view's frame, which keeps its own keys); Escape restores it.
@@ -228,13 +232,12 @@ function MaximizablePanel(props: {
           setMaximized(false);
         }
       }}
-      // z-[1500] matches the shared Dialog layer (and Artifacts fullscreen), so portaled menus
-      // and tooltips stay above it.
-      className={
-        maximized
-          ? "bg-background ios-standalone:top-px fixed inset-0 z-[1500] flex flex-col outline-none"
-          : "flex h-full min-h-0 flex-col outline-none"
-      }
+      // The same layers as Artifacts fullscreen (pinnedViewClass): portaled menus and tooltips
+      // stay above them.
+      className={cn(
+        "flex flex-col outline-none",
+        maximized ? pinnedViewClass(narrow) : "h-full min-h-0"
+      )}
     >
       {props.children(maximized, setMaximized)}
     </div>
@@ -242,13 +245,15 @@ function MaximizablePanel(props: {
 }
 
 /**
- * While `active`, the rest of the window is inert, focus that falls out with a removed node
- * returns to the panel, and the panel leaves the window when it has no box any more (a hidden
- * sidebar would otherwise leave the app inert behind nothing). Focus returns to the panel after.
+ * While `active`, the panel is pinned over the window (`narrow`) or the workspace shell: the
+ * covered content is inert, focus that falls out with a removed node returns to the panel, and the
+ * panel is unpinned when it has no box any more (a hidden sidebar would otherwise leave the app
+ * inert behind nothing). Focus returns to the panel after.
  */
-function usePinnedOverWindow(
+function usePinnedView(
   panelRef: RefObject<HTMLDivElement | null>,
   active: boolean,
+  narrow: boolean,
   onLostBox: () => void
 ) {
   const lostBox = useRef(onLostBox);
@@ -258,9 +263,8 @@ function usePinnedOverWindow(
   useEffect(() => {
     const panel = panelRef.current;
     if (!active || panel == null) return;
-    const restore = makeOthersInert(panel);
+    const unpin = pinView(panel, narrow);
     panel.focus();
-    const stopRefocus = refocusFallenFocus(panel);
     const sizeObserver =
       typeof ResizeObserver === "function"
         ? new ResizeObserver(() => {
@@ -270,11 +274,10 @@ function usePinnedOverWindow(
     sizeObserver?.observe(panel);
     return () => {
       sizeObserver?.disconnect();
-      stopRefocus();
-      restore();
+      unpin();
       if (panel.isConnected) panel.focus();
     };
-  }, [panelRef, active]);
+  }, [panelRef, active, narrow]);
 }
 
 /**

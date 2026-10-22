@@ -4,7 +4,7 @@ import "../../../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { installDom } from "../../../../../tests/ui/dom";
+import { installDom, stubNarrowViewport } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
@@ -113,6 +113,9 @@ describe("ArtifactViewer renderers", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
+    // Fullscreen as a modal dialog over the whole window; the panel renders without a workspace
+    // shell here (ArtifactsPanel.test.tsx covers the wide-window shell case).
+    stubNarrowViewport(true);
     window.localStorage.clear();
     readInputs = [];
     // Desktop app by default (the preload bridge is what isDesktopMode checks). Browser-mode

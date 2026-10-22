@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { PinnedViewToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { Maximize2, Minimize2, X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
@@ -178,6 +179,8 @@ function McpAppViewHeader(props: {
 }) {
   return (
     <div className="border-border-light flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-[11px]">
+      {/* Maximized in a wide window, the panel can sit under the left sidebar's toggle bar. */}
+      {props.maximized === true && <PinnedViewToggleBarSpacer />}
       <span className="text-muted min-w-0 flex-1 truncate">
         App view from{" "}
         <TooltipIfPresent tooltip={props.serverName}>

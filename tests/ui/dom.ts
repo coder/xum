@@ -1,5 +1,6 @@
 import { GlobalWindow } from "happy-dom";
 import * as React from "react";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 import { captureDomGlobals } from "./domGlobals";
 
 /**
@@ -234,3 +235,26 @@ require("react-dnd");
 // bootstrap like react-dnd, so a UI suite renders a tool row's real card in its first commit.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 require("@/browser/features/Tools/Shared/toolCardsLoader");
+
+/**
+ * Makes useNarrowViewport() read `narrow` in the DOM installDom() made: only the narrow-viewport
+ * query changes its answer, so other media queries (the color scheme) keep theirs. The next
+ * installDom() starts wide again.
+ */
+export function stubNarrowViewport(narrow: boolean): void {
+  const original = window.matchMedia.bind(window);
+  window.matchMedia = ((query: string) => {
+    if (query !== `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`) return original(query);
+    // A plain list: the viewport never changes during the test.
+    return {
+      matches: narrow,
+      media: query,
+      onchange: null,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      dispatchEvent: () => false,
+    } as unknown as MediaQueryList;
+  }) as typeof window.matchMedia;
+}
