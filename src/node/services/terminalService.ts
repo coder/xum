@@ -41,6 +41,11 @@ import { NO_OSC_IDLE_FALLBACK_MS } from "@/constants/terminalActivity";
 import { getErrorMessage } from "@/common/utils/errors";
 import { shellQuote } from "@/common/utils/shell";
 
+/** One shell command string for terminals that take ssh as a string, not an argv. */
+function toShellCommand(argv: string[]): string {
+  return argv.map(shellQuote).join(" ");
+}
+
 function quoteForNativeTerminalCommandArg(value: string): string {
   if (process.platform === "win32") {
     // cmd.exe expands %VAR% even in double quotes, so escape literal % as %%.
@@ -1044,7 +1049,7 @@ export class TerminalService {
       if (isSSH && sshArgs) {
         // Ghostty: Use --command flag to run SSH
         // Build the full SSH command as a single string
-        const sshCommand = ["ssh", ...sshArgs].join(" ");
+        const sshCommand = toShellCommand(["ssh", ...sshArgs]);
         args = ["-n", "-a", "Ghostty", "--args", `--command=${sshCommand}`];
       } else if (command) {
         // Ghostty: Run command in workspace directory
@@ -1069,16 +1074,7 @@ export class TerminalService {
       let args: string[];
       if (isSSH && sshArgs) {
         // Terminal.app: Use osascript with proper AppleScript structure
-        // Properly escape single quotes in args before wrapping in quotes
-        const sshCommand = `ssh ${sshArgs
-          .map((arg) => {
-            if (arg.includes(" ") || arg.includes("'")) {
-              // Escape single quotes by ending quote, adding escaped quote, starting quote again
-              return `'${arg.replace(/'/g, "'\\''")}'`;
-            }
-            return arg;
-          })
-          .join(" ")}`;
+        const sshCommand = toShellCommand(["ssh", ...sshArgs]);
         // Escape double quotes for AppleScript string
         const escapedCommand = sshCommand.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
         const script = `tell application "Terminal"\nactivate\ndo script "${escapedCommand}"\nend tell`;
@@ -1155,7 +1151,7 @@ export class TerminalService {
         { cmd: "wezterm", args: ["start", "--", "ssh", ...sshArgs] },
         { cmd: "gnome-terminal", args: ["--", "ssh", ...sshArgs] },
         { cmd: "konsole", args: ["-e", "ssh", ...sshArgs] },
-        { cmd: "xfce4-terminal", args: ["-e", `ssh ${sshArgs.join(" ")}`] },
+        { cmd: "xfce4-terminal", args: ["-e", toShellCommand(["ssh", ...sshArgs])] },
         { cmd: "xterm", args: ["-e", "ssh", ...sshArgs] },
       ];
     } else if (command) {
