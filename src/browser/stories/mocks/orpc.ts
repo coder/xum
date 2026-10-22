@@ -67,7 +67,6 @@ import type {
   AgentPluginHooks,
   AgentPluginPendingSignOuts,
 } from "@/common/orpc/schemas/agentPlugins";
-import type { SkillsCliRun, SkillsCliStatus } from "@/common/orpc/schemas/skillsCli";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { ChatStats } from "@/common/types/chatStats";
 import {
@@ -169,10 +168,6 @@ export interface MockORPCClientOptions {
     marketplace?: AgentPluginMarketplaceListing;
     /** Returned by agentPlugins.preview for a marketplace entry, by entry name. */
     previewsByEntry?: Record<string, AgentPluginInstallPreview>;
-    /** Returned by agentPlugins.skillsCliStatus; omit for "Node.js not found". */
-    skillsCliStatus?: SkillsCliStatus;
-    /** Returned by agentPlugins.installWithSkillsCli; omit to make the run fail. */
-    skillsCliRun?: SkillsCliRun;
     /** Returned by agentPlugins.previewUpdate for the named plugin; omit to make it fail. */
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
@@ -1457,19 +1452,19 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
               error: "No preview configured in this story",
             });
       },
-      skillsCliStatus: () =>
-        Promise.resolve(
-          agentPluginsMock?.skillsCliStatus ?? {
-            available: false as const,
-            reason: "Xum found no Node.js on PATH.",
-            nodeVersion: null,
-            package: "skills@1.7.4",
-          }
-        ),
-      installWithSkillsCli: () =>
-        agentPluginsMock?.skillsCliRun
-          ? Promise.resolve({ success: true as const, data: agentPluginsMock.skillsCliRun })
-          : Promise.resolve({ success: false as const, error: "No skills CLI run in this story" }),
+      // Like the backend's command, from the typed source (the backend normalizes it first).
+      skillsCliCommand: (input: { source: string; skills: string[] }) =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            command: [
+              "npx --yes skills@1.7.4 add",
+              input.source,
+              ...input.skills.map((skill) => `--skill ${skill}`),
+              "--global --agent codex --copy",
+            ].join(" "),
+          },
+        }),
       install: (input: { source: AgentPluginInstallPreview["source"]; expectedSha: string }) =>
         Promise.resolve({
           success: true,
