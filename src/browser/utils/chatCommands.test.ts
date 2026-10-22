@@ -1681,10 +1681,23 @@ describe("compact and plan command results", () => {
     expect(window.dispatchEvent).toHaveBeenCalledWith(
       expect.objectContaining({
         type: CUSTOM_EVENTS.OPEN_PLAN_TAB,
-        detail: { workspaceId: "test-ws" },
+        detail: { workspaceId: "test-ws", focus: false },
       })
     );
     expect(getPlanContent).not.toHaveBeenCalled();
+  });
+
+  test("plan open needs no client: the tab shows the reconnecting state itself", async () => {
+    ensureWindowDispatchEvent();
+    const result = await processSlashCommand({ type: "plan-open" }, createEnv({ api: null }));
+    expect(result).toEqual({
+      kind: "complete",
+      actions: [{ type: "clear-input" }],
+      inputDisposition: "consume",
+    });
+    expect(window.dispatchEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: CUSTOM_EVENTS.OPEN_PLAN_TAB })
+    );
   });
 });
 

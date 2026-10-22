@@ -1863,11 +1863,15 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.OPEN_PLAN_TAB>).detail;
       if (detail?.workspaceId !== workspaceId) return;
       setCollapsed(false);
-      setLayout((prev) => selectOrAddTab(prev, "plan"));
+      const next = selectOrAddTab(getBaseLayout(), "plan");
+      setLayout(() => next);
+      // The Plan file row goes away with the Stats tab it sits in, so the panel claims focus
+      // (as after the shortcut); focus stays in the chat input after "/plan open".
+      if (detail.focus) setPlanFocusTabsetId(next.focusedTabsetId);
     };
     window.addEventListener(CUSTOM_EVENTS.OPEN_PLAN_TAB, handleOpenPlanTab);
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_PLAN_TAB, handleOpenPlanTab);
-  }, [setCollapsed, setLayout, workspaceId]);
+  }, [getBaseLayout, setCollapsed, setLayout, workspaceId]);
 
   const [tabToFocus, setTabToFocus] = React.useState<TabType | null>(null);
   const sidebarContainerRef = React.useRef<HTMLDivElement>(null);

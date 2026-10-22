@@ -98,8 +98,12 @@ function PlanTabBody(props: PlanTabProps) {
     }
   };
 
+  // One editor launch at a time: a second press (or click) while one is in flight would open
+  // another editor window, or another placeholder window in a browser.
+  const editorLaunchRef = useRef(false);
   const handleOpenInEditor = async () => {
-    if (path === null) return;
+    if (path === null || editorLaunchRef.current) return;
+    editorLaunchRef.current = true;
     try {
       const result = await openInEditor({
         api,
@@ -115,6 +119,8 @@ function PlanTabBody(props: PlanTabProps) {
       // Editor discovery for a remote or devcontainer workspace rejects when the connection
       // drops mid-call; the user still needs to hear why nothing opened.
       showFeedbackToast({ type: "error", message: getErrorMessage(error) });
+    } finally {
+      editorLaunchRef.current = false;
     }
   };
 
@@ -133,7 +139,8 @@ function PlanTabBody(props: PlanTabProps) {
 
   // Single-key shortcuts while focus is inside the tab, never from a text field.
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (isEditableElement(event.target)) return;
+    // A held key auto-repeats; that is not another request.
+    if (event.repeat || isEditableElement(event.target)) return;
     if (matchesKeybind(event, KEYBINDS.PLAN_TAB_EDIT)) {
       if (path === null) return;
       event.preventDefault();
