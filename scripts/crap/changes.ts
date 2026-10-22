@@ -47,12 +47,40 @@ export function parseNameStatus(output: string): ChangedFile[] {
   return files.filter((file) => [file.basePath, file.headPath].some((p) => p && SCORED.test(p)));
 }
 
+/** One `git diff -U0` hunk: [baseStart, baseCount, headStart, headCount]. */
+export type Hunk = [number, number, number, number];
+
+const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
+
+/**
+ * Hunks per head path, both sides, so a gate can map a head line back to its
+ * base line (dry/dryer_report.py). Paths follow parseChangedLines in policy.ts.
+ */
+export function parseHunks(diff: string): Map<string, Hunk[]> {
+  const hunks = new Map<string, Hunk[]>();
+  let current: Hunk[] | null = null;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+++ ")) {
+      const target = line.slice(4).replace(/\t$/, "");
+      current = target === "/dev/null" ? null : [];
+      if (current) hunks.set(target.replace(/^b\//, ""), current);
+      continue;
+    }
+    const match = HUNK.exec(line);
+    if (!match || !current) continue;
+    const count = (value: string | undefined) => (value === undefined ? 1 : Number(value));
+    current.push([Number(match[1]), count(match[2]), Number(match[3]), count(match[4])]);
+  }
+  return hunks;
+}
+
 export interface Changes {
   root: string;
   /** The resolved base commit SHA. */
   base: string;
   files: ChangedFile[];
   changed: ChangedLines;
+  hunks: Map<string, Hunk[]>;
 }
 
 export function changesSince(cwd: string, baseRef: string): Changes {
@@ -82,11 +110,9 @@ export function changesSince(cwd: string, baseRef: string): Changes {
   const pathspec = files.flatMap((file) =>
     [file.basePath, file.headPath].filter((p) => p !== null)
   );
-  const changed =
-    pathspec.length === 0
-      ? new Map()
-      : parseChangedLines(git(root, [...diffArgs, "-U0", "--", ...new Set(pathspec)]));
-  return { root, base, files, changed };
+  const diff =
+    pathspec.length === 0 ? "" : git(root, [...diffArgs, "-U0", "--", ...new Set(pathspec)]);
+  return { root, base, files, changed: parseChangedLines(diff), hunks: parseHunks(diff) };
 }
 
 /**

@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from dryer_report import Form, keyed, new_pairs  # noqa: E402
+from dryer_report import Form, base_line, keyed, new_pairs  # noqa: E402
 
 SHAPE = frozenset("abcdefghij")  # 10 fingerprints
 NEAR = frozenset("abcdefghi") | {"z"}  # 9 shared of 11: score 0.818, below 0.82
@@ -22,8 +22,13 @@ def form(path, name, start, fingerprints):
     return Form(path, name, start, start + 5, fingerprints)
 
 
-def run(head, base, changed_paths, spans):
-    return new_pairs(keyed(head), keyed(base), set(changed_paths), spans, 0.82)
+def run(head, base, changed_paths, spans, hunks=None):
+    by_path = {}
+    for f in base:
+        by_path.setdefault(f.path, []).append(f)
+    # Without hunks, a changed file's lines all map to the same base lines.
+    hunks = hunks if hunks is not None else {path: [] for path in changed_paths}
+    return new_pairs(keyed(head), by_path, set(changed_paths), spans, hunks, 0.82)
 
 
 def names(pairs):
@@ -51,7 +56,9 @@ def test_an_edit_that_makes_a_new_match_is_reported():
     # At the base, `fee` had another shape. The edit turned it into a copy.
     fee = form("src/b.ts", "fee", 1, SHAPE)
     cents = form("src/a.ts", "cents", 1, SHAPE)
-    pairs = run([fee, cents], [form("src/b.ts", "fee", 1, OTHER)], ["src/b.ts"], {"src/b.ts": [[3, 3]]})
+    pairs = run(
+        [fee, cents], [form("src/b.ts", "fee", 1, OTHER)], ["src/b.ts"], {"src/b.ts": [[3, 3]]}, {"src/b.ts": [[3, 1, 3, 1]]}
+    )
     assert names(pairs) == [("cents", "fee")]
 
 
@@ -104,3 +111,21 @@ def test_the_script_names_functions_after_crapper(tmp_path):
     report = json.loads(out)
     assert report["changedFunctions"] == 1
     assert [(p["left"]["name"], p["right"]["name"]) for p in report["pairs"]] == [("fee", "cents")]
+
+
+def test_base_line_follows_additions_and_deletions():
+    # Lines 5-6 added after base line 4; base lines 10-11 deleted after head line 11.
+    hunks = [[4, 0, 5, 2], [10, 2, 11, 0]]
+    assert [base_line(n, hunks) for n in (4, 5, 6, 7, 11, 12)] == [4, None, None, 5, 9, 12]
+
+
+def test_a_new_copy_with_the_name_of_an_old_match_is_reported():
+    # Base: render (1-6) and cents (20-25) already match. The diff inserts a
+    # second render, an exact copy, above the first. A name cannot tell the two
+    # renders apart; git's hunk can: the new one is all added lines.
+    copy = form("src/a.ts", "@1", 1, SHAPE)
+    old = form("src/a.ts", "@8", 8, SHAPE)
+    cents = form("src/a.ts", "@27", 27, SHAPE)
+    base = [form("src/a.ts", "@1", 1, SHAPE), form("src/a.ts", "@20", 20, SHAPE)]
+    pairs = run([copy, old, cents], base, ["src/a.ts"], {"src/a.ts": [[1, 7]]}, {"src/a.ts": [[0, 0, 1, 7]]})
+    assert names(pairs) == [("@1", "@27"), ("@1", "@8")]

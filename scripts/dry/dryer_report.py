@@ -19,7 +19,8 @@ Usage (through uv, which reads the pins above; dry/check.ts calls it):
         --changes FILE [--threshold N] [--min-lines N] [--min-nodes N]
 
 `--changes` is a JSON file: {"files": [{"basePath", "headPath"}...],
-"spans": {headPath: [[start, end]...]}} (scripts/crap/changes.ts). The base
+"spans": {headPath: [[start, end]...]}, "hunks": {headPath: [[baseStart,
+baseCount, headStart, headCount]...]}} (scripts/crap/changes.ts). The base
 content of every changed file sits at its base path under `--base-root`.
 
 Upstream `dryer` compares every function with every other one, which takes
@@ -78,12 +79,11 @@ def crapper_functions(root: Path, relative: str) -> list:
     return functions_in_file(language, source, relative, str(root))
 
 
-def forms_in(root: Path, relative: str, shown: str, min_lines: int, min_nodes: int, named: bool) -> list[Form]:
+def forms_in(root: Path, relative: str, shown: str, min_lines: int, min_nodes: int) -> list[Form]:
     """The comparable forms of one file. `shown` is the head path of a renamed file.
 
-    Naming parses the file a second time, so only changed files are named here
-    (their keys pair head and base forms). Other forms get a line key, and
-    name_reported() names the few that a pair reports.
+    Forms get a line name here. Naming parses the file a second time with
+    Crapper, so name_reported() names only the few forms that a pair reports.
     """
 
     language = language_of(relative)
@@ -91,9 +91,8 @@ def forms_in(root: Path, relative: str, shown: str, min_lines: int, min_nodes: i
         return []
     source = (root / relative).read_text(encoding="utf-8", errors="replace")
     entries, _warning = entries_in_source(language, source, relative, shown)
-    functions = crapper_functions(root, relative) if named else []
     return [
-        Form(shown, holder_name(functions, e.start_line) if named else f"@{e.start_line}", e.start_line, e.end_line, e.fingerprints)
+        Form(shown, f"@{e.start_line}", e.start_line, e.end_line, e.fingerprints)
         for e in entries
         if e.end_line - e.start_line + 1 >= min_lines and e.nodes >= min_nodes
     ]
@@ -109,7 +108,7 @@ def name_reported(root: Path, pairs: list[dict]) -> None:
 
 
 def keyed(forms: list[Form]) -> dict[str, Form]:
-    """path::name, with an ordinal for the 2nd and later in line order (as policy.ts keyRows)."""
+    """path::name, with an ordinal for a 2nd form on one line (dryer can nest them)."""
 
     result: dict[str, Form] = {}
     seen: dict[str, int] = {}
@@ -133,22 +132,61 @@ def similar(a: frozenset, b: frozenset, threshold: float) -> float | None:
     return score if score >= threshold else None
 
 
+def base_line(line: int, hunks: list[list[int]]) -> int | None:
+    """The base line of a head line, or None when the diff added it.
+
+    `hunks` are the file's `git diff -U0` hunks (scripts/crap/changes.ts). A
+    side with count 0 sits after its start line, so it begins one line later.
+    """
+
+    offset = 0
+    for base_start, base_count, head_start, head_count in sorted(hunks, key=lambda h: h[2]):
+        head_from = head_start if head_count else head_start + 1
+        if line < head_from:
+            break
+        if line < head_from + head_count:
+            return None
+        base_from = base_start if base_count else base_start + 1
+        offset = (base_from + base_count) - (head_from + head_count)
+    return line + offset
+
+
+def counterpart(form: Form, base_forms: list[Form], hunks: list[list[int]]) -> Form | None:
+    """The base form that holds most of `form`'s lines, by git's own alignment.
+
+    Matching by name cannot tell a new copy from the function it copies when
+    both have one name. Git's hunks can: a function made only of added lines
+    has no base form, so every pair with it is new.
+    """
+
+    mapped = [b for line in range(form.start_line, form.end_line + 1) if (b := base_line(line, hunks)) is not None]
+    best, most = None, 0
+    for candidate in base_forms:
+        count = sum(1 for b in mapped if candidate.start_line <= b <= candidate.end_line)
+        if count > most:
+            best, most = candidate, count
+    return best
+
+
 def new_pairs(
     head: dict[str, Form],
-    base: dict[str, Form],
+    base_by_path: dict[str, list[Form]],
     changed_paths: set[str],
     spans: dict[str, list[list[float]]],
+    hunks: dict[str, list[list[int]]],
     threshold: float,
 ) -> list[dict]:
     """Pairs with a changed function on one side that the diff made.
 
-    `head` holds every production form. `base` holds the base forms of the
-    changed files only: an unchanged file is the same at the base, so its head
-    form stands in for its base form.
+    `head` holds every production form. `base_by_path` holds the base forms
+    of the changed files only, under their head path: an unchanged file is the
+    same at the base, so its head form stands in for its base form.
     """
 
-    def at_base(key: str, form: Form) -> Form | None:
-        return base.get(key) if form.path in changed_paths else form
+    def at_base(form: Form) -> Form | None:
+        if form.path not in changed_paths:
+            return form
+        return counterpart(form, base_by_path.get(form.path, []), hunks.get(form.path, []))
 
     pairs: dict[tuple[str, str], dict] = {}
     items = list(head.items())
@@ -161,7 +199,7 @@ def new_pairs(
             score = similar(left.fingerprints, right.fingerprints, threshold)
             if score is None:
                 continue
-            left_base, right_base = at_base(key, left), at_base(other, right)
+            left_base, right_base = at_base(left), at_base(right)
             if left_base and right_base and similar(left_base.fingerprints, right_base.fingerprints, threshold):
                 continue  # the same two functions matched before the diff
             pair = tuple(sorted((key, other)))
@@ -192,16 +230,19 @@ def main(argv: list[str]) -> int:
     for relative in tracked_src_files(args.root):
         # A deleted-but-tracked file is gone from the working tree.
         if is_production(relative) and (args.root / relative).is_file():
-            named = relative in changed_paths
-            head_forms += forms_in(args.root, relative, relative, args.min_lines, args.min_nodes, named)
+            head_forms += forms_in(args.root, relative, relative, args.min_lines, args.min_nodes)
     base_forms: list[Form] = []
     for f in files:
         # A file renamed from a test into production has no base forms.
         if f["basePath"] and f["headPath"] and is_production(f["basePath"]):
-            base_forms += forms_in(args.base_root, f["basePath"], f["headPath"], args.min_lines, args.min_nodes, True)
+            base_forms += forms_in(args.base_root, f["basePath"], f["headPath"], args.min_lines, args.min_nodes)
 
     head = keyed(head_forms)
-    pairs = new_pairs(head, keyed(base_forms), changed_paths, spans, args.threshold)
+    base_by_path: dict[str, list[Form]] = {}
+    for form in base_forms:
+        base_by_path.setdefault(form.path, []).append(form)
+    hunks = changes.get("hunks", {})
+    pairs = new_pairs(head, base_by_path, changed_paths, spans, hunks, args.threshold)
     name_reported(args.root, pairs)
     report = {
         "compared": len(head),

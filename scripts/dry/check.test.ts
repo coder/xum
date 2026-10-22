@@ -85,3 +85,26 @@ test("a test file copy is not a finding", () => {
 
   expect(check().status).toBe(0);
 });
+
+test("a new copy that shares a name with an old match is a finding", () => {
+  // Base: B.render already matches cents. The diff adds A.render, a copy, above
+  // it. Both are "render", so only git's hunks tell the new one from the old one.
+  const method = (cls: string) =>
+    `export class ${cls} {\n  render(n: number): string {\n    if (n === 0) return "0";\n    if (n < 100) return "1-99";\n    if (n < 1000) return "100-999";\n    return "1000+";\n  }\n}\n`;
+  write("src/r.ts", `${method("B")}\n${bucket("cents")}`);
+  git("add", ".");
+  git("commit", "-q", "-m", "old pair");
+  write("src/r.ts", `${method("A")}\n${method("B")}\n${bucket("cents")}`);
+
+  const { status, report } = check();
+
+  expect(status).toBe(1);
+  type Side = { path: string; name: string; startLine: number };
+  const pairs = (report.pairs as Array<{ left: Side; right: Side }>)
+    .filter((p) => p.left.path === "src/r.ts" && p.left.startLine === 2)
+    .filter((p) => p.right.path === "src/r.ts")
+    .map((p) => p.right.name);
+  // The copy matches both B.render and cents; the cents pair is the one a
+  // name-based base lookup hid (it read B.render's base match as A's).
+  expect(pairs.sort()).toEqual(["cents", "render"]);
+});

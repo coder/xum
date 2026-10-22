@@ -58,13 +58,20 @@ export function formatReport(report: DryReport): string {
 }
 
 export function runCheck(cwd: string, baseRef: string): DryReport {
-  const { root, base, files, changed } = changesSince(cwd, baseRef);
+  const { root, base, files, changed, hunks } = changesSince(cwd, baseRef);
   const empty = { base, compared: 0, changedFunctions: 0, pairs: [] };
   if (files.every((file) => file.headPath === null)) return empty;
   const { tree } = writeBaseTree(root, base, files);
   try {
     const changes = join(tree, ".dry-changes.json");
-    writeFileSync(changes, JSON.stringify({ files, spans: Object.fromEntries(changed) }));
+    writeFileSync(
+      changes,
+      JSON.stringify({
+        files,
+        spans: Object.fromEntries(changed),
+        hunks: Object.fromEntries(hunks),
+      })
+    );
     const out = execFileSync(
       "uv",
       [
