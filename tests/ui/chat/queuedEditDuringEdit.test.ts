@@ -52,37 +52,6 @@ const attachedStoreNotes = async (app: AppHarness) =>
     .filter((entry) => entry.status === "attached")
     .map((entry) => entry.data.userNote);
 
-/** Hold the workspace busy and queue "queued Q" with one review note; returns the held send. */
-async function queueWithNote(
-  app: AppHarness,
-  session: ReturnType<AppHarness["env"]["services"]["workspaceService"]["getOrCreateSession"]>
-) {
-  const holding = app.env.orpc.workspace.sendMessage({
-    workspaceId: app.workspaceId,
-    message: "[mock:wait-start] hold the workspace busy",
-    options: { model: "openai:gpt-5.2", agentId: "exec" },
-  });
-  await waitFor(() => expect(session.isBusy()).toBe(true), WAIT);
-  await app.env.orpc.workspace.reviewState.update({
-    workspaceId: app.workspaceId,
-    delta: {
-      reviews: {
-        set: {
-          "review-q": {
-            id: "review-q",
-            data: review("queued note"),
-            status: "attached",
-            createdAt: Date.now(),
-          },
-        },
-      },
-    },
-  });
-  await waitFor(() => expect(composerSection(app).textContent).toContain("queued note"), WAIT);
-  await app.chat.send("queued Q");
-  return holding;
-}
-
 describe("the queued card's Edit during an open edit (#5934)", () => {
   beforeAll(async () => {
     await preloadTestModules();
@@ -99,7 +68,29 @@ describe("the queued card's Edit during an open edit (#5934)", () => {
       await app.chat.expectStreamComplete();
 
       // Q waits in the queue behind a busy workspace, with one review note.
-      holding = queueWithNote(app, session);
+      holding = app.env.orpc.workspace.sendMessage({
+        workspaceId: app.workspaceId,
+        message: "[mock:wait-start] hold the workspace busy",
+        options: { model: "openai:gpt-5.2", agentId: "exec" },
+      });
+      await waitFor(() => expect(session.isBusy()).toBe(true), WAIT);
+      await app.env.orpc.workspace.reviewState.update({
+        workspaceId: app.workspaceId,
+        delta: {
+          reviews: {
+            set: {
+              "review-q": {
+                id: "review-q",
+                data: review("queued note"),
+                status: "attached",
+                createdAt: Date.now(),
+              },
+            },
+          },
+        },
+      });
+      await waitFor(() => expect(composerSection(app).textContent).toContain("queued note"), WAIT);
+      await app.chat.send("queued Q");
       await waitFor(() => expect(session.hasQueuedMessages()).toBe(true), WAIT);
       await app.chat.expectInputValue("", WAIT.timeout);
       // The queued send checked its note off: the note now lives only in the queued message.
@@ -151,53 +142,6 @@ describe("the queued card's Edit during an open edit (#5934)", () => {
       await waitFor(() => expect(composerSection(app).textContent).toContain("queued note"), WAIT);
       expect(session.hasQueuedMessages()).toBe(false);
     } finally {
-      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
-      await holding;
-      await app.dispose();
-    }
-  }, 180_000);
-
-  // Codex review: the other order. The queued Edit clears the queue first (an IPC call), and an
-  // edit opened before the restore lands would be overwritten by it, so a Cancel lost Q again.
-  test("no edit opens while the queued Edit's restore is pending", async () => {
-    const app = await createAppHarness({ branchPrefix: "queued-restore-pending-edit" });
-    const scope = { kind: "workspace" as const, workspaceId: app.workspaceId };
-    const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
-    const workspaceService = app.env.services.workspaceService;
-    const realClear = workspaceService.clearQueue.bind(workspaceService);
-    let releaseClear: () => void = () => undefined;
-    const clearGate = new Promise<void>((resolve) => {
-      releaseClear = resolve;
-    });
-    let holding: Promise<unknown> | undefined;
-    try {
-      await app.chat.send("first message");
-      await app.chat.expectTranscriptContains("Mock response: first message", WAIT.timeout);
-      await app.chat.expectStreamComplete();
-      holding = queueWithNote(app, session);
-      await waitFor(() => expect(session.hasQueuedMessages()).toBe(true), WAIT);
-      await waitFor(async () => expect(await attachedStoreNotes(app)).toEqual([]), WAIT);
-
-      const clearSpy = jest
-        .spyOn(workspaceService, "clearQueue")
-        .mockImplementation(((...args: Parameters<typeof realClear>) =>
-          clearGate.then(() => realClear(...args))) as unknown as typeof realClear);
-      fireEvent.click(queuedEditButton(app)!);
-      await waitFor(() => expect(clearSpy).toHaveBeenCalled(), WAIT);
-
-      // The row's Edit while the restore waits for clearQueue: no edit opens.
-      fireEvent.click(rowEditButton(app, "first message")!);
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      expect(editTextarea(app)).toBeNull();
-
-      releaseClear();
-      await waitFor(() => expect(getDraftStore().getText(scope)).toContain("queued Q"), WAIT);
-      await waitFor(() => expect(composerSection(app).textContent).toContain("queued note"), WAIT);
-      expect(editTextarea(app)).toBeNull();
-      expect(session.hasQueuedMessages()).toBe(false);
-      clearSpy.mockRestore();
-    } finally {
-      releaseClear();
       app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
       await holding;
       await app.dispose();

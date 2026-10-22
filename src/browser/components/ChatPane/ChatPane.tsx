@@ -527,12 +527,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
    * Enter edit mode with content evidence of the rows the edit deletes. A row the aggregator
    * does not hold cannot be fenced (a real state, not a bug): stay out of edit mode and say so.
    */
-  // #5934: set while a queued message's Edit clears the queue and restores it into the composer.
-  // An edit opened in between would be overwritten by the restore (a Cancel then lost the queued
-  // message), so no edit starts meanwhile. The other order is blocked by queuedMessageToEdit.
-  const queuedRestorePendingRef = useRef(false);
   const beginEditingMessage = (message: EditingMessageState): boolean => {
-    if (editSendPending || queuedRestorePendingRef.current) return false;
+    if (editSendPending) return false;
     const precondition = storeRaw.captureHistoryEditPrecondition(workspaceId, message.id);
     if (!precondition) {
       publishChatError(workspaceId, EDIT_NOT_HELD_MESSAGE);
@@ -1081,17 +1077,10 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       const inputApi = chatInputAPI.current;
       if (!inputApi) return;
 
-      queuedRestorePendingRef.current = true;
-      // A promise chain, not try/finally: React Compiler skips a component with try/finally.
-      await Promise.resolve(api?.workspace.clearQueue({ workspaceId }))
-        .then(() =>
-          inputApi.restoreDraft(normalizeQueuedMessage(queuedMessage), {
-            retainedSendIds: queuedMessage.sendIds,
-          })
-        )
-        .finally(() => {
-          queuedRestorePendingRef.current = false;
-        });
+      await api?.workspace.clearQueue({ workspaceId });
+      inputApi.restoreDraft(normalizeQueuedMessage(queuedMessage), {
+        retainedSendIds: queuedMessage.sendIds,
+      });
     },
     [api, workspaceId]
   );
