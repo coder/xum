@@ -141,18 +141,57 @@ export async function runFile(cwd: string, file: string, scratchDir: string): Pr
   return { wallMs, exitCode, preload };
 }
 
-/** Runs `jobs` tasks at a time, in order of `tasks`. */
-export async function runPool<T>(tasks: Array<() => Promise<T>>, jobs: number): Promise<T[]> {
+export interface PoolTask<T> {
+  /** Tasks with the same key never run at the same time: the rounds of one test file. */
+  key: string;
+  run: () => Promise<T>;
+}
+
+/**
+ * Runs `jobs` tasks at a time. Each free slot takes the first task in order whose key is not
+ * running. After a task throws, the pool starts no new task, waits for the running ones (their
+ * `bun test` children write into the scratch dir that main removes), then rethrows.
+ */
+export async function runPool<T>(tasks: Array<PoolTask<T>>, jobs: number): Promise<T[]> {
   assert(Number.isInteger(jobs) && jobs >= 1, `invalid --jobs ${jobs}`);
   const results: T[] = new Array<T>(tasks.length);
-  let next = 0;
-  const worker = async () => {
-    while (next < tasks.length) {
-      const index = next++;
-      results[index] = await tasks[index]();
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(jobs, tasks.length) }, worker));
+  const pending = tasks.map((_, index) => index);
+  const busy = new Set<string>();
+  let running = 0;
+  const errors: unknown[] = [];
+  await new Promise<void>((resolve) => {
+    const launch = () => {
+      while (errors.length === 0 && running < jobs) {
+        const at = pending.findIndex((index) => !busy.has(tasks[index].key));
+        if (at < 0) break;
+        const [index] = pending.splice(at, 1);
+        const task = tasks[index];
+        busy.add(task.key);
+        running++;
+        // Not fire-and-forget: `running` counts the task until its finally, and the pool
+        // resolves only at 0. The rejection handler keeps the chain from rejecting.
+        void task
+          .run()
+          .then(
+            (result) => {
+              results[index] = result;
+            },
+            (error: unknown) => {
+              errors.push(error);
+            }
+          )
+          .finally(() => {
+            busy.delete(task.key);
+            running--;
+            launch();
+          });
+      }
+      if (running === 0) resolve();
+    };
+    launch();
+  });
+  if (errors.length > 0) throw errors[0];
+  assert(pending.length === 0, `${pending.length} loop test tasks never ran`);
   return results;
 }
 
@@ -194,19 +233,28 @@ export function heavySkips(runs: number, changedFiles: readonly string[]): strin
     .map(([test]) => test);
 }
 
-/** Files that differ between the merge base of `baseSha` and HEAD, plus working-tree edits. */
-function changedFiles(root: string, baseSha: string): string[] {
-  const committed = git(root, ["diff", "--name-only", `${baseSha}...HEAD`]).split("\n");
-  const edited = git(root, ["status", "--porcelain"])
+/**
+ * Files that differ between the merge base of `baseSha` and HEAD, plus working-tree edits.
+ * --no-renames lists a renamed file under its old and its new path.
+ */
+export function changedFiles(root: string, baseSha: string): string[] {
+  const committed = git(root, ["diff", "--name-only", "--no-renames", `${baseSha}...HEAD`]).split(
+    "\n"
+  );
+  const edited = git(root, ["status", "--porcelain", "--no-renames"])
     .split("\n")
     .map((line) => line.slice(3));
   return [...committed, ...edited].filter(Boolean);
 }
 
-/** A detached worktree of `sha` in `dir`, with the caller's node_modules and src/version.ts. */
-function addWorktree(root: string, dir: string, sha: string): void {
-  git(root, ["worktree", "add", "--detach", dir, sha]);
-  fs.symlinkSync(path.join(root, "node_modules"), path.join(dir, "node_modules"), "dir");
+/** Gives the worktree in `dir` the caller's node_modules and src/version.ts. */
+function prepareWorktree(root: string, dir: string): void {
+  // Windows needs a junction: directory symlinks need Developer Mode or elevation there.
+  fs.symlinkSync(
+    path.join(root, "node_modules"),
+    path.join(dir, "node_modules"),
+    process.platform === "win32" ? "junction" : "dir"
+  );
   // src/version.ts is generated and git-ignored; without it some loop tests fail at import.
   const versionFile = path.join(root, "src", "version.ts");
   if (fs.existsSync(versionFile)) fs.copyFileSync(versionFile, path.join(dir, "src", "version.ts"));
@@ -221,7 +269,7 @@ interface Side {
 
 /**
  * Runs `files` for `runs` rounds, `jobs` processes at a time, and returns one record per side.
- * Round-major order, as the spike ran: the rounds of one file do not run side by side. In a
+ * Round-major order, as the spike ran, and the pool never runs two rounds of one file at once. In a
  * compare each task runs one file on base, then on head (the order flips each round), so host
  * load drift hits both sides of a round alike.
  */
@@ -239,13 +287,16 @@ async function measure(
   let results: Array<Map<Side["label"], LoopTestRun>>;
   try {
     const tasks = Array.from({ length: runs }, (_, round) =>
-      files.map((file) => async () => {
-        const order = round % 2 === 0 ? sides : [...sides].reverse();
-        const byLabel = new Map<Side["label"], LoopTestRun>();
-        for (const side of order)
-          byLabel.set(side.label, await runFile(side.root, file, scratchDir));
-        return byLabel;
-      })
+      files.map((file) => ({
+        key: file,
+        run: async () => {
+          const order = round % 2 === 0 ? sides : [...sides].reverse();
+          const byLabel = new Map<Side["label"], LoopTestRun>();
+          for (const side of order)
+            byLabel.set(side.label, await runFile(side.root, file, scratchDir));
+          return byLabel;
+        },
+      }))
     ).flat();
     results = await runPool(tasks, jobs);
   } finally {
@@ -359,8 +410,10 @@ async function main(): Promise<number> {
     let files = loopTestFiles(root, values.filter);
     if (values.base !== undefined) {
       const baseSha = git(root, ["rev-parse", "--verify", `${values.base}^{commit}`]);
-      addWorktree(root, baseDir, baseSha);
+      git(root, ["worktree", "add", "--detach", baseDir, baseSha]);
+      // Set before the next step can throw, so cleanup removes the registration too.
       worktreeAdded = true;
+      prepareWorktree(root, baseDir);
       sides.unshift({ label: "base", root: baseDir, commit: baseSha, dirty: false });
       const baseFiles = new Set(loopTestFiles(baseDir, values.filter));
       newFiles = files.filter((file) => !baseFiles.has(file));
@@ -369,7 +422,11 @@ async function main(): Promise<number> {
       );
       files = files.filter((file) => baseFiles.has(file) && !skipped.includes(file));
     }
-    assert(files.length > 0, `no loop test files match --filter ${values.filter}`);
+    // A compare of only new test files is valid: it lists them and cannot trip.
+    assert(
+      files.length > 0 || newFiles.length > 0,
+      `no loop test files match --filter ${values.filter}`
+    );
     console.error(
       `loop tests · ${files.length} files · ${runs} ${sides.length > 1 ? "paired " : ""}rounds · ${jobs} jobs`
     );
