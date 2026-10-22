@@ -115,8 +115,6 @@ const CLOCK_PATCH_FREE_TESTS = [
 // moves the file onto the HostClock service, and the rule fails an entry that is too high.
 const RAW_CLOCK_ALLOW = {
   "src/node/services/backgroundProcessManager.ts": 25,
-  "src/node/services/contextManagement/strategies/continuous.ts": 1,
-  "src/node/services/contextManagement/strategies/tokenBudget.ts": 1,
   "src/node/services/tools/bash.ts": 3,
   "src/node/services/tools/bash_background_list.ts": 1,
   "src/node/services/tools/code_execution.ts": 3,
@@ -129,7 +127,6 @@ const RAW_CLOCK_ALLOW = {
   "src/node/services/tools/withHooks.ts": 6,
   "src/node/services/tools/workflow_resume.ts": 1,
   "src/node/services/tools/workflow_run.ts": 1,
-  "src/node/services/turnRequestBuilder.ts": 29,
 };
 // The rule strips "node:" and resolves relative specifiers to "@/..." forms.
 const HOST_MODULES = [

@@ -9,6 +9,8 @@ import { CompactionPendingState } from "./compactionPendingState";
 import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
 import { Effect, type Scope } from "effect";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
+import { hostClockFor } from "./di/hostClockLive";
+import type { HostClock } from "@/node/utils/hostClock";
 import {
   DesktopInputCoordinator,
   settleArchivedSharedDesktopTask,
@@ -3254,7 +3256,10 @@ export class WorkspaceService
     // construction builds its own from the stores above, like the other defaults.
     private readonly autoModelRouter: Pick<AutoModelRouter, "classify"> = new AutoModelRouter({
       providersConfigStore,
-    })
+    }),
+    // The turn path stamps the user message, its recency and the stream end on the sessions'
+    // clock. WorkspaceLive passes the HostClock service; by default the clock of the runner.
+    private readonly hostClock: HostClock = hostClockFor(effectRunner)
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
@@ -5405,7 +5410,7 @@ export class WorkspaceService
       // can lose the race against the frontend's lastRead (set via Date.now()
       // after the IPC round-trip). Using a fresh timestamp here ensures the
       // completion recency is strictly after any earlier lastRead write.
-      await this.updateRecencyTimestamp(workspaceId, Date.now());
+      await this.updateRecencyTimestamp(workspaceId, this.hostClock.nowMs());
     }
 
     await this.stopStreamingStatus(workspaceId, generation);
@@ -5824,6 +5829,7 @@ export class WorkspaceService
     return new AgentSession({
       contextManagement: this.contextManagement,
       effectRunner: this.effectRunner,
+      hostClock: this.hostClock,
       appFiberScope: this.appFiberScope,
       workspaceId,
       config: this.config,
@@ -16530,7 +16536,7 @@ export class WorkspaceService
     // sampling later — at enqueue or dispatch — would misclassify a message
     // the user authored before a goal became visible as an intervention
     // against it, pausing the fresh goal.
-    const authoredAtMs = Date.now();
+    const authoredAtMs = this.hostClock.nowMs();
     // Deliberate picker intent pins agent-task AI fields; only a person's own send may carry
     // it. Strip it here so it never reaches the queue, AgentSession, or persisted options.
     const { aiSelectionIntent, ...optionsWithoutAiSelectionIntent } = options;
@@ -16802,7 +16808,7 @@ export class WorkspaceService
         muxMeta?.type === "compaction-request" && muxMeta?.source === "idle-compaction";
       // Use current time for recency - this matches the timestamp used on the message
       // in agentSession.sendMessage(). Keeps ExtensionMetadata in sync with chat.jsonl.
-      const messageTimestamp = Date.now();
+      const messageTimestamp = this.hostClock.nowMs();
       if (!isIdleCompaction) {
         void this.updateRecencyTimestamp(workspaceId, messageTimestamp);
       }

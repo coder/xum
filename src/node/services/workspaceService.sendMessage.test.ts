@@ -10,7 +10,7 @@ import {
   createStartedTurnHandle,
   createStreamLifecycleMocks,
 } from "./agentSession.testHarness";
-import { makeTestEffectRunner } from "./di/testEffectRunner";
+import { makeTestEffectRunner, TEST_CLOCK_START_MS } from "./di/testEffectRunner";
 import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
 import { askUserQuestionManager } from "./askUserQuestionManager";
 import { EventEmitter } from "events";
@@ -185,6 +185,43 @@ describe("WorkspaceService sendMessage status clearing", () => {
       .projects.get("/tmp/test/project")
       ?.workspaces.find((workspace) => workspace.id === "test-workspace")?.aiSettingsByAgent;
     expect(remembered?.plan).toBeUndefined();
+  });
+
+  test("stamps the turn's recency and authoring time on the runner's clock", async () => {
+    // Recency must match the user message timestamp that AgentSession stamps on the same
+    // HostClock. Both come from one makeTestEffectRunner(), so neither reads real time.
+    const clock = makeTestEffectRunner();
+    const service = createWorkspaceServiceForTest({
+      config: harness.config,
+      historyService: harness.historyService,
+      aiService: harness.aiService,
+      initStateManager: harness.initStateManager,
+      extensionMetadata: harness.extensionMetadata,
+      backgroundProcessManager: harness.backgroundProcessManager,
+      effectRunner: clock.runner,
+      hostClock: clock.hostClock,
+    });
+    service.registerSession("test-workspace", fakeSession as unknown as AgentSession);
+    const updateRecency = harness.extensionMetadata.updateRecency as unknown as ReturnType<
+      typeof mock
+    >;
+    try {
+      await clock.adjust(7_000);
+      const result = await service.sendMessage("test-workspace", "hello", {
+        model: "openai:gpt-4o",
+        agentId: "exec",
+      });
+
+      expect(result.success).toBe(true);
+      expect(updateRecency).toHaveBeenCalledWith("test-workspace", TEST_CLOCK_START_MS + 7_000);
+      expect(fakeSession.queueMessage).toHaveBeenCalledWith(
+        "hello",
+        expect.anything(),
+        expect.objectContaining({ authoredAtMs: TEST_CLOCK_START_MS + 7_000 })
+      );
+    } finally {
+      await clock.dispose();
+    }
   });
 
   test("leaves budgeted-goal pricing rejections to AgentSession instead of rejecting early", async () => {

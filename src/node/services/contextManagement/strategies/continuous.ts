@@ -131,7 +131,7 @@ export class ContinuousStrategy {
         ...(pending?.readFiles ?? []),
         ...extractReadFilePaths(head),
       ]),
-      reportsCompletedBeforeMs: Date.now(),
+      reportsCompletedBeforeMs: this.host.hostClock.nowMs(),
     });
   }
 

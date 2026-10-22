@@ -486,7 +486,8 @@ export const WorkspaceLive = Layer.effect(
       yield* DesktopInputCoordinatorTag,
       yield* EffectRunnerTag,
       yield* AppFiberScopeTag,
-      yield* AutoModelRouterTag
+      yield* AutoModelRouterTag,
+      yield* HostClockTag
     );
   })
 );

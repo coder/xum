@@ -2003,6 +2003,7 @@ export class AgentSession {
     const session = this;
     const contextHost: SessionContextHost = {
       workspaceId: this.workspaceId,
+      hostClock: this.hostClock,
       sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
       emitter: this.emitter,
       coordinator: this.coordinator,
