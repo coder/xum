@@ -675,15 +675,21 @@ const localPlugin = {
           if (typeof entry === "string") whole.add(entry);
           else named.set(entry.module, new Set(entry.names));
         }
+        // One form per module: "node:" stripped, "@shared/" (an alias of "@/" in tsconfig.json)
+        // and relative paths as "@/...", and no file extension on a repo module.
         const canonical = (specifier) => {
           if (specifier.startsWith("node:")) return specifier.slice("node:".length);
-          if (!specifier.startsWith(".")) return specifier;
-          const abs = path.resolve(path.dirname(context.filename), specifier);
-          const fromSrc = path
-            .relative(path.join(context.cwd, "src"), abs)
-            .split(path.sep)
-            .join("/");
-          return "@/" + fromSrc.replace(/\.[cm]?[jt]sx?$/, "");
+          let module = specifier;
+          if (module.startsWith("@shared/")) module = "@/" + module.slice("@shared/".length);
+          if (module.startsWith(".")) {
+            const abs = path.resolve(path.dirname(context.filename), module);
+            const fromSrc = path
+              .relative(path.join(context.cwd, "src"), abs)
+              .split(path.sep)
+              .join("/");
+            module = "@/" + fromSrc;
+          }
+          return module.startsWith("@/") ? module.replace(/\.[cm]?[jt]sx?$/, "") : module;
         };
         const seen = new Set();
         // names: the value names taken from the module; null means the whole module.
@@ -710,6 +716,8 @@ const localPlugin = {
           },
           ExportNamedDeclaration(node) {
             if (node.source == null || node.exportKind === "type") return;
+            // `export {} from "fs"` still loads the module: check it whole.
+            if (node.specifiers.length === 0) return check(node, node.source, null);
             const values = node.specifiers.filter((s) => s.exportKind !== "type");
             if (values.length === 0) return;
             check(
