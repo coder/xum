@@ -150,11 +150,22 @@ async function countOtherRefCommits(
   base: string,
   head: string
 ): Promise<number> {
-  const stash =
+  const hasStash =
     (await git(runtime, repo, "for-each-ref '--format=%(refname)' refs/stash")).trim() ===
-    "refs/stash"
-      ? "refs/stash "
-      : "";
+    "refs/stash";
+  // refs/stash names only the newest entry. Older entries live only in its reflog, and removal
+  // deletes them with the repository (#5163). rev-list is plumbing: it runs no pager, hooks or
+  // signature checks. Each line must be a commit ID: anything else fails the check, so removal
+  // refuses instead of counting less than it deletes.
+  const stashEntries = hasStash
+    ? (await git(runtime, repo, "rev-list --walk-reflogs refs/stash"))
+        .split("\n")
+        .filter((line) => line !== "")
+    : [];
+  for (const sha of stashEntries) {
+    assert(/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(sha), `stash reflog line is not a commit ID: ${sha}`);
+  }
+  const stash = hasStash ? `refs/stash ${stashEntries.join(" ")} ` : "";
   // A copy starts with the source's branches (and, for `cp` copies, its stash). Commits the source
   // had are preserved there, and two records prove which those are: the snapshot creation writes
   // (#5105) and the origin/* refs of copies with an origin URL. A copy with neither (made before

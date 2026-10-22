@@ -111,7 +111,9 @@ describe("findUnpreservedSubagentWork", () => {
 
   async function addStash() {
     await fsPromises.writeFile(path.join(repo, "README.md"), `stashed ${Math.random()}\n`);
-    execSync("git stash -q", { cwd: repo });
+    // Staged, so each entry's index commit differs too: two entries made in the same second with
+    // an unchanged index share one index commit.
+    execSync("git add README.md && git stash -q", { cwd: repo });
   }
 
   function commitOnSideBranch() {
