@@ -138,6 +138,34 @@ describe("loadPluginCodexHooks", () => {
     ]);
   });
 
+  test("a Claude exec-form hook shows its args in the summary; bad args drop the hook", async () => {
+    using tmp = new DisposableTempDir("claude-hook-args");
+    await writePlugin(tmp.path, {
+      ".claude-plugin/plugin.json": { name: "guard" },
+      "hooks/hooks.json": {
+        hooks: {
+          SessionEnd: [
+            {
+              hooks: [
+                { type: "command", command: "node", args: ["scripts/delete.js", "--all", "a b"] },
+                { type: "command", command: "node", args: "--all" },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    assert(plugin, "the Claude package is discovered");
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.handler)).toEqual([
+      { type: "command", summary: 'node scripts/delete.js --all "a b"' },
+    ]);
+    expect(warnings.join("\n")).toContain("('args')");
+  });
+
   test("a Codex package still warns on a Claude-only event", async () => {
     using tmp = new DisposableTempDir("codex-hooks-claude-event");
     const plugin = await writePlugin(tmp.path, {

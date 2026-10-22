@@ -338,7 +338,9 @@ function parseMatcherGroup(
   if (matcher === null) return;
   for (const [handlerIndex, raw] of group.hooks.entries()) {
     if (out.length > MAX_PLUGIN_HOOKS) return;
-    const handler = parseHandler(raw, `${source}: '${event}'`, warnings);
+    const handler = parseHandler(raw, `${source}: '${event}'`, warnings, {
+      claude: where.status === "claude-plugin",
+    });
     if (handler === undefined) continue;
     let hash: string;
     try {
@@ -406,7 +408,8 @@ function isU64(value: unknown): boolean {
 function parseHandler(
   raw: unknown,
   where: string,
-  warnings: HookWarnings
+  warnings: HookWarnings,
+  dialect: { claude: boolean }
 ): PluginHookHandler | undefined {
   if (!isPlainObject(raw)) {
     warnings.push(`${where}: a hook handler must be an object; ignoring it`);
@@ -452,7 +455,12 @@ function parseHandler(
         invalid = "command";
         break;
       }
-      return { type: "command", summary: raw.command };
+      {
+        const summary = commandSummary(raw.command, dialect.claude ? raw.args : undefined);
+        if (summary !== undefined) return { type: "command", summary };
+        invalid = "args";
+        break;
+      }
     case "prompt":
     case "agent":
       return { type: raw.type, summary: `${raw.type} handler` };
@@ -467,6 +475,20 @@ function parseHandler(
     `${where}: a '${String(raw.type)}' handler has missing or invalid fields ('${invalid}'${tool}); ignoring it`
   );
   return undefined;
+}
+
+/**
+ * A command hook's summary. Claude's exec form adds `args`, the argument vector, so the
+ * disclosure shows it too: each argument is quoted when it is empty or has a space or quote.
+ * Undefined when `args` is not a list of strings.
+ */
+function commandSummary(command: string, args: unknown): string | undefined {
+  if (args === undefined) return command;
+  if (!Array.isArray(args) || !args.every((arg) => typeof arg === "string")) return undefined;
+  const argv: string[] = [command, ...args];
+  return argv
+    .map((arg) => (arg === "" || /[\s"'\\]/.test(arg) ? JSON.stringify(arg) : arg))
+    .join(" ");
 }
 
 /**
