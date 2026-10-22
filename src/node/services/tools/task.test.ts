@@ -81,28 +81,32 @@ describe("task tool", () => {
     expect(tool.description).toContain(guidance);
   });
 
-  it("adds the desktop delegation hint only when the desktop agent is listed", () => {
+  it("adds the desktop delegation hint only when the built-in desktop agent is listed", () => {
     using tempDir = new TestTempDir("test-task-tool-desktop-hint");
-    const agent = (id: string): AgentDefinitionDescriptor => ({
+    const agent = (
+      id: string,
+      scope: AgentDefinitionDescriptor["scope"] = "built-in"
+    ): AgentDefinitionDescriptor => ({
       id,
-      scope: "built-in",
+      scope,
       name: id,
       description: `${id} agent`,
       uiSelectable: false,
       subagentRunnable: true,
     });
-    const paragraphCount = (ids: string[]) => {
+    const paragraphCount = (agents: AgentDefinitionDescriptor[]) => {
       const { description } = createTaskTool({
         ...createTestToolConfig(tempDir.path),
-        availableSubagents: ids.map(agent),
+        availableSubagents: agents,
       });
       if (typeof description !== "string") throw new Error("expected a static description");
       return description.split("\n\n").length;
     };
-    const base = paragraphCount(["explore"]);
+    const base = paragraphCount([agent("explore")]);
 
-    expect(paragraphCount(["explore", "exec"])).toBe(base);
-    expect(paragraphCount(["explore", "desktop"])).toBe(base + 1);
+    expect(paragraphCount([agent("explore"), agent("exec")])).toBe(base);
+    expect(paragraphCount([agent("explore"), agent("desktop")])).toBe(base + 1);
+    expect(paragraphCount([agent("explore"), agent("desktop", "project")])).toBe(base);
   });
 
   // The advertised inputSchema is the raw (strict) Zod schema. A `.strict()` schema that omits

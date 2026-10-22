@@ -2,7 +2,14 @@ import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
 import { createHash, hash } from "node:crypto";
 import { LRUCache } from "lru-cache";
-import { getAvailableTools, getToolSchemas } from "@/common/utils/tools/toolDefinitions";
+import { asSchema } from "ai";
+import type { z } from "zod";
+import {
+  getAvailableTools,
+  TOOL_DEFINITIONS,
+  type ToolName,
+} from "@/common/utils/tools/toolDefinitions";
+import { compactToolInputSchema } from "@/node/services/toolSchemaCompactionMiddleware";
 import type { CountTokensBatchInput, EncodingName } from "./tokenizer.worker";
 import { models, type ModelName } from "ai-tokenizer";
 import { run } from "./workerPool";
@@ -374,15 +381,24 @@ export async function getToolDefinitionTokens(
       return 0;
     }
 
-    const toolSchemas = getToolSchemas();
-    const toolSchema = toolSchemas[toolName];
-    if (!toolSchema) {
+    if (!Object.hasOwn(TOOL_DEFINITIONS, toolName)) {
       return TOOL_DEFINITION_FALLBACK_TOKENS[toolName] ?? 40;
     }
+    const definition: { description: string; schema: z.ZodType } =
+      TOOL_DEFINITIONS[toolName as ToolName];
 
+    // Count the schema the request sends: the AI SDK's conversion, compacted for this model's wire.
+    const inputSchema = compactToolInputSchema(
+      { name: toolName, inputSchema: await asSchema(definition.schema).jsonSchema },
+      { anthropicWire: normalizeToCanonical(modelString).startsWith("anthropic:") }
+    );
     const tokenizerModel = metadataModelOverride ?? modelString;
-    return countTokens(tokenizerModel, JSON.stringify(toolSchema));
-  } catch {
+    return countTokens(
+      tokenizerModel,
+      JSON.stringify({ name: toolName, description: definition.description, inputSchema })
+    );
+  } catch (error) {
+    log.debug(`Falling back to estimated definition tokens for tool '${toolName}':`, error);
     return TOOL_DEFINITION_FALLBACK_TOKENS[toolName] ?? 40;
   }
 }

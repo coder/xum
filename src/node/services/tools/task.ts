@@ -89,7 +89,8 @@ function supportsSharedIsolation(config: ToolConfiguration): boolean {
 }
 
 // The built-in desktop agent is listed only where a desktop session exists, so this hint rides
-// with it instead of sitting in every exec prompt.
+// with it instead of sitting in every exec prompt. A project or global desktop.md replaces that
+// agent (see turnContextAssembler) and may not drive a GUI.
 const DESKTOP_DELEGATION_HINT =
   "Delegate repeated screenshot, act and verify loops on a desktop GUI (clicking through application UIs, filling desktop app forms, visually verifying GUI state) to `desktop` instead of automating them inline. This does not apply to the `computer` tool: it controls the user's real computer, which sub-agents cannot use, so use it directly.";
 
@@ -113,7 +114,9 @@ function buildTaskDescription(config: ToolConfiguration): string {
     return `- ${agent.id}${desc}`;
   });
 
-  const desktopHint = subagents.some((agent) => agent.id === "desktop")
+  const desktopHint = subagents.some(
+    (agent) => agent.id === "desktop" && agent.scope === "built-in"
+  )
     ? `\n\n${DESKTOP_DELEGATION_HINT}`
     : "";
   return `${baseDescription}\n\nAvailable sub-agents (use \`agentId\` parameter):\n${subagentLines.join("\n")}${desktopHint}`;
