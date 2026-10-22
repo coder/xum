@@ -55,7 +55,7 @@ from tree_sitter_language_pack import get_parser
 
 # Reuse the CRAP gate's production-file rule and LCOV reader.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "crap"))
-from crapper_report import is_production, load_coverage  # noqa: E402
+from crapper_report import inlined_const_users, is_production, load_coverage, suspect_windows  # noqa: E402
 from markers import Comments  # noqa: E402
 
 MARKER = "mutation-equivalent"
@@ -109,6 +109,24 @@ def resolve(importer: str, specifier: str, files: set[str]) -> str | None:
     return None
 
 
+def only_types(statement) -> bool:
+    """Whether every named specifier is `type X`: `import { type A } from "m"`.
+
+    Bun drops such an import (checked on Bun 1.4.3: "m" does not load), so
+    the test is no importer. One value specifier, a default or a namespace
+    import keeps it.
+    """
+
+    clause = next((c for c in statement.named_children if c.type in ("import_clause", "export_clause")), None)
+    if clause is None:
+        return False
+    named = clause if clause.type == "export_clause" else next((c for c in clause.named_children if c.type == "named_imports"), None)
+    if named is None or (clause.type == "import_clause" and len(clause.named_children) > 1):
+        return False  # a default or namespace import loads the module (an export clause holds only specifiers)
+    specifiers = [c for c in named.named_children if c.type in ("import_specifier", "export_specifier")]
+    return bool(specifiers) and all(c.child_count > 0 and c.children[0].type == "type" for c in specifiers)
+
+
 def runtime_specifiers(source: bytes, tsx: bool) -> list[str]:
     """The specifiers that a test loads at run time.
 
@@ -126,7 +144,7 @@ def runtime_specifiers(source: bytes, tsx: bool) -> list[str]:
         stack.extend(node.children)
         target = None
         if node.type in ("import_statement", "export_statement"):
-            erased = node.child_count > 1 and node.children[1].type == "type"
+            erased = (node.child_count > 1 and node.children[1].type == "type") or only_types(node)
             target = None if erased else node.child_by_field_name("source")
         elif node.type == "call_expression":
             function = node.child_by_field_name("function")
@@ -209,25 +227,43 @@ def uncovered(site: Site, coverage: dict[str, list[dict[int, int]]] | None) -> b
     return not any(report.get(site.anchor_line, 0) > 0 for report in reports)
 
 
+def false_zero_windows(source: str, path: str, reports: list[dict[int, int]]) -> list[tuple[int, int]]:
+    """Line spans where a report's zeros may be Bun's inlined-const bug.
+
+    The CRAP gate's detector (crapper_report.py, "Bun bug: an inlined
+    `const`"): a report may have run any line in such a window, so a zero
+    there does not prove that a site never ran.
+    """
+
+    users = inlined_const_users(source, path) if reports else set()
+    return [window for report in reports for window in suspect_windows(report, users)] if users else []
+
+
 def triage(
     sites: list[Site],
     plan: dict[str, list[str]],
     coverage: dict[str, list[dict[int, int]]] | None,
     blind: set[str],
+    false_zero: dict[str, list[tuple[int, int]]] | None = None,
 ) -> tuple[list[dict], list[Site]]:
     """Rows for the sites that do not run, and the sites that do.
 
     `blind` holds the tests that run without coverage (`no-coverage:` in
     scripts/test-unit-ci.sh): their hits are in no LCOV report, so a site
-    that one of them covers can look uncovered. Such a site runs.
+    that one of them covers can look uncovered. Such a site runs. So does a
+    site in a `false_zero` window (false_zero_windows).
     """
+
+    def maybe_ran(site: Site) -> bool:
+        windows = (false_zero or {}).get(site.path, [])
+        return any(first <= site.anchor_line <= last for first, last in windows)
 
     rows: list[dict] = []
     to_run: list[Site] = []
     for site in sites:
         if not plan.get(site.path):
             rows.append(row(site, "no-test"))
-        elif uncovered(site, coverage) and not blind.intersection(plan[site.path]):
+        elif uncovered(site, coverage) and not blind.intersection(plan[site.path]) and not maybe_ran(site):
             rows.append(row(site, "uncovered"))
         else:
             to_run.append(site)
@@ -473,7 +509,11 @@ def main(argv: list[str]) -> int:
         if cut:
             capped.append(source)
 
-    rows, to_run = triage(sites, plan, coverage, blind)
+    false_zero = {
+        source: false_zero_windows((root / source).read_bytes().decode("utf-8"), source, coverage.get(source, []))
+        for source in sources
+    } if coverage is not None else None
+    rows, to_run = triage(sites, plan, coverage, blind, false_zero)
     deadline = started + args.max_seconds
     # Cap first, so no baseline runs for a test that only the cut mutants use.
     budget = to_run[: args.max_mutants]
