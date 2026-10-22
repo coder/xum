@@ -86,6 +86,7 @@ import * as agentResolution from "./agentResolution";
 import * as turnContextAssembler from "./turnContextAssembler";
 import { resolveCompactionInputBudgetTokens } from "./turnRequestBuilder";
 import * as messagePipeline from "./messagePipeline";
+import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
@@ -6391,7 +6392,7 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
       expect(result.success).toBe(true);
       return startStreamCalls.at(-1)!;
     };
-    return { workspaceId, mcp, send, service, config };
+    return { workspaceId, mcp, send, service, config, historyService };
   }
 
   const hotTail = (text: string) => `\n\n<hot_memories>${text}</hot_memories>`;
@@ -6540,6 +6541,72 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
     // The step-0 rebuild returns its record too, for StreamManager to apply.
     const rebuilt = await unfolded.rebuildFirstStepForThinkingLevel!("off", {});
     expect(rebuilt.volatileSystemTail).toEqual({ text: hotTail("B"), placement: "row" });
+  });
+
+  // The fold runs before the placeholder append (#5286). A change written while that append's
+  // file I/O runs must still reach the messages, as when the fold ran after the append.
+  it("folds a thinking change written while the assistant placeholder is appended", async () => {
+    using xumHome = new DisposableTempDir("ai-service-fold-during-append");
+    const { send, historyService } = await setup(xumHome);
+    const history = [
+      createMuxMessage("u1", "user", "first"),
+      createMuxMessage("a1", "assistant", "answer", {
+        volatileSystemTail: { text: hotTail("A"), placement: "system" },
+      }),
+      createMuxMessage("u2", "user", "second"),
+      createMuxMessage(
+        "r0",
+        "assistant",
+        "",
+        { volatileSystemTail: { text: hotTail("B"), placement: "row" } },
+        [{ type: "reasoning", text: "thinking", signature: "sig-r0" }]
+      ),
+      createMuxMessage("u3", "user", "third"),
+    ];
+    const override: ActiveTurnThinkingOverride = {};
+    spyOn(historyService, "appendToHistory").mockImplementation((_workspaceId, message) => {
+      if (message.role === "assistant") override.pending = "off";
+      message.metadata = { ...(message.metadata ?? {}), historySequence: 7 };
+      return Promise.resolve({ success: true, data: undefined });
+    });
+    const call = await send(history, "B", {
+      modelString: KNOWN_MODELS.HAIKU.id,
+      activeTurnThinkingOverride: override,
+    });
+    expect(override).toEqual({ applied: "off" });
+    expect(call.thinkingLevel).toBe("off");
+    // At "off" the reasoning-only row is dropped, so the request appends row B again.
+    expect(call.messages.at(-1)?.role).toBe("system");
+  });
+
+  it("a turn stopped before start folds no pending thinking change", async () => {
+    using xumHome = new DisposableTempDir("ai-service-fold-after-stop");
+    const { service, workspaceId } = await setup(xumHome);
+    const controller = new AbortController();
+    const options = {
+      messages: [createMuxMessage("u1", "user", "first")],
+      workspaceId,
+      modelString: KNOWN_MODELS.HAIKU.id,
+      thinkingLevel: "high" as const,
+      abortSignal: controller.signal,
+    };
+    const candidate = await service.prepareStreamMessage(options);
+    if (!candidate.success) throw new Error(JSON.stringify(candidate.error));
+    await using request = candidate.data;
+    controller.abort();
+    const override: ActiveTurnThinkingOverride = { pending: "off" };
+    const assemblies = spyOn(turnContextAssembler, "assemblePromptPayload");
+    try {
+      expect(
+        (await request.start({ ...options, activeTurnThinkingOverride: override })).success
+      ).toBe(true);
+      // Only the admission re-assembly ran: the stopped turn neither rebuilt nor consumed the
+      // pending level.
+      expect(assemblies).toHaveBeenCalledTimes(1);
+      expect(override).toEqual({ pending: "off" });
+    } finally {
+      assemblies.mockRestore();
+    }
   });
 
   it("sends as before when middleware edited a volatile section", async () => {
