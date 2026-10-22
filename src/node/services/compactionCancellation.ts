@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { promises as fs, rmSync } from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
 import { COMPACTION_CANCELLATION_FILE } from "@/constants/continuousCompaction";
@@ -8,7 +7,7 @@ import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { HistoryService } from "./historyService";
 import { publishCompactionFile } from "./continuousCompactionJournal";
-import { nodeSessionFiles } from "./sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "./sessionFiles/sessionFiles";
 import { hasAmbiguousResetKeys } from "./historyScanner";
 import type { MuxMessage } from "@/common/types/message";
 import { log } from "./log";
@@ -179,6 +178,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
   constructor(
     private readonly history: HistoryService,
     private readonly workspaceId: string,
+    private readonly files: SessionFiles,
     // Prepare expensive history evidence outside both locks; the returned verifier only
     // revalidates it under the lock. A caller-provided nonce alone grants no authority.
     private readonly prepareVerification?: (
@@ -195,7 +195,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
   async read(): Promise<CompactionCancellationRecord | null> {
     let contents: string;
     try {
-      const handle = await fs.open(this.path, "r");
+      const handle = await this.files.promises.open(this.path, "r");
       try {
         // Bound allocation even if the file grows; short reads do not imply EOF.
         const buffer = Buffer.alloc(SESSION_HISTORY_MAX_LINE_BYTES + 1);
@@ -343,7 +343,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
             contents,
             isCurrent,
             // Host files until this storage takes the history's SessionFiles.
-            nodeSessionFiles,
+            this.files,
             () => {
               frontier.nonce = committed.nonce;
               // Install inherited retention before cleanup can admit a newer read.
@@ -398,7 +398,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
           this.path,
           contents,
           isCurrent,
-          nodeSessionFiles,
+          this.files,
           () => onCommitted(committed),
           checkLock
         ))
@@ -430,7 +430,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
         : undefined;
       await checkLock();
       if (!isCurrent()) return "superseded";
-      rmSync(this.path, { force: true });
+      this.files.rmSync(this.path, { force: true });
       onCommitted(null, retiredPredecessor);
       return "applied";
     });
@@ -476,7 +476,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
         this.path,
         contents,
         isCurrent,
-        nodeSessionFiles,
+        this.files,
         () => onCommitted(record),
         checkLock
       ))
@@ -541,7 +541,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
           this.path,
           serialized.contents,
           isCurrent,
-          nodeSessionFiles,
+          this.files,
           onCommitted,
           checkLock
         ))
@@ -549,7 +549,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
         throw new Error("Cancellation repair was superseded");
       return serialized.record;
     }
-    rmSync(this.path, { force: true });
+    this.files.rmSync(this.path, { force: true });
     onCommitted();
     return null;
   }

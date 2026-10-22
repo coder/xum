@@ -149,8 +149,6 @@ const FROZEN_ALLOW_PAIRS = [
   "src/node/services/tools/xum_agents_path.ts fs/promises",
   "src/node/services/tools/xum_agents_read.ts fs/promises",
   "src/node/services/tools/xum_agents_write.ts fs/promises",
-  // Phase 2 (session files): the 15 pairs of the history layer.
-  "src/node/services/compactionCancellation.ts fs",
 ];
 
 function allowMap(): Record<string, string[]> {

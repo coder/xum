@@ -4268,15 +4268,20 @@ export class HistoryService {
 
   /** Shared history-lock authority for Stop, replacement acceptance, and recovery. */
   getCompactionCancellationStorage(workspaceId: string): FileCompactionCancellationStorage {
-    return new FileCompactionCancellationStorage(this, workspaceId, async (witness, signal) => {
-      const evidence = await this.prepareCompactionReplacementWitness(
-        workspaceId,
-        witness.nonce,
-        signal
-      );
-      if (!evidence.success) throw new Error(evidence.error);
-      return async () => (await evidence.data()) !== null;
-    });
+    return new FileCompactionCancellationStorage(
+      this,
+      workspaceId,
+      this.files,
+      async (witness, signal) => {
+        const evidence = await this.prepareCompactionReplacementWitness(
+          workspaceId,
+          witness.nonce,
+          signal
+        );
+        if (!evidence.success) throw new Error(evidence.error);
+        return async () => (await evidence.data()) !== null;
+      }
+    );
   }
 
   private async captureCompactionReplacementUnderHistoryLock(
