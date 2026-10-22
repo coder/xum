@@ -85,7 +85,7 @@ FROM node:22-slim
 # OCI image metadata — allows registries (GHCR, Docker Hub) to link the image
 # back to the source repository and display version/description.
 ARG VERSION=dev
-LABEL org.opencontainers.image.source="https://github.com/coder/mux"
+LABEL org.opencontainers.image.source="https://github.com/coder/xum"
 LABEL org.opencontainers.image.version="${VERSION}"
 LABEL org.opencontainers.image.description="Xum server — parallel AI agent workflows"
 LABEL org.opencontainers.image.licenses="AGPL-3.0"

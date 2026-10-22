@@ -1046,7 +1046,7 @@ jobs:
       - uses: ./.github/actions/build-vscode-extension
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          path: vscode/mux-*.vsix
+          path: vscode/xum-*.vsix
           retention-days: 30
           if-no-files-found: error
           archive: false

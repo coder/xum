@@ -84,6 +84,11 @@ jobs:
 
       - uses: ./.github/actions/build-vscode-extension
 
+      # Same xum-* canonical + mux-* alias contract as the desktop artifacts, so
+      # old download links and docs that point at mux-*.vsix keep working.
+      - name: Create legacy mux artifact aliases
+        run: ./scripts/create-legacy-mux-artifact-aliases.sh vscode
+
       - name: Wait for GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -106,6 +111,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "$RELEASE_TAG" \
+            vscode/xum-*.vsix \
             vscode/mux-*.vsix \
             --clobber
 
