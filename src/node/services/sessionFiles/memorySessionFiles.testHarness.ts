@@ -60,7 +60,7 @@ function fixSuperblock(core: MemCore, fs: MemFs): void {
     fs.lstatSync(target, { throwIfNoEntry: false })?.isDirectory() === true;
 
   // Fix 1.
-  const unlink = core.unlink;
+  const unlink = core.unlink.bind(core);
   core.unlink = (filename) => {
     if (process.platform === "linux" && isDirectory(filename))
       throw systemError("EISDIR", "illegal operation on a directory", "unlink", filename);
@@ -68,7 +68,7 @@ function fixSuperblock(core: MemCore, fs: MemFs): void {
   };
 
   // Fix 2, and the ctime part of fix 3.
-  const rename = core.rename;
+  const rename = core.rename.bind(core);
   core.rename = (oldPath, newPath) => {
     if (isDirectory(oldPath) && isDirectory(newPath) && fs.readdirSync(newPath).length > 0)
       throw systemError("ENOTEMPTY", "directory not empty", "rename", `${oldPath}' -> '${newPath}`);
