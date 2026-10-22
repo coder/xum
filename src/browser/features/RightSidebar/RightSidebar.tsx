@@ -591,6 +591,9 @@ interface RightSidebarTabsetNodeProps {
   /** The Artifacts panel should take focus once it renders (opened via shortcut). */
   autoFocusArtifacts: boolean;
   onArtifactsAutoFocusConsumed: () => void;
+  /** The Plan panel should take focus once it renders (opened via shortcut). */
+  autoFocusPlan: boolean;
+  onPlanAutoFocusConsumed: () => void;
   // RightSidebar / GoalTab UI requests user-facing transitions only;
   // `budget_limited` is internal-only.
   onGoalSetStatus: (
@@ -840,6 +843,10 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
     artifacts: {
       autoFocus: props.autoFocusArtifacts,
       onAutoFocusConsumed: props.onArtifactsAutoFocusConsumed,
+    },
+    plan: {
+      autoFocus: props.autoFocusPlan,
+      onAutoFocusConsumed: props.onPlanAutoFocusConsumed,
     },
     goal: {
       snapshot: props.goal,
@@ -1390,6 +1397,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // panel claims focus once it renders, like terminals do with autoFocusTerminalSession. The
   // value is the pane whose copy claims it (Artifacts, like Review, can be open in two panes).
   const [artifactsFocusTabsetId, setArtifactsFocusTabsetId] = React.useState<string | null>(null);
+  const [planFocusTabsetId, setPlanFocusTabsetId] = React.useState<string | null>(null);
   const llmDebugLogsEnabled = useLlmDebugLogsEnabled(api);
   const desktopAvailable = useDesktopAvailable(api, desktopExperimentEnabled, workspaceId);
 
@@ -1735,6 +1743,23 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_GOAL_TAB, handleOpenGoalTab);
   }, [setCollapsed, setLayout, workspaceId]);
 
+  // "/plan open" and the Stats tab's "Plan file" row: open (and un-collapse) the Plan tab. While
+  // the narrow layout hides the sidebar, WorkspaceMenuBar shows the tab full-screen as well.
+  React.useEffect(() => {
+    const handleOpenPlanTab = (event: Event) => {
+      const detail = (event as CustomEventType<typeof CUSTOM_EVENTS.OPEN_PLAN_TAB>).detail;
+      if (detail?.workspaceId !== workspaceId) return;
+      setCollapsed(false);
+      const next = selectOrAddTab(getBaseLayout(), "plan");
+      setLayout(() => next);
+      // The Plan file row goes away with the Stats tab it sits in, so the panel claims focus
+      // (as after the shortcut); focus stays in the chat input after "/plan open".
+      if (detail.focus) setPlanFocusTabsetId(next.focusedTabsetId);
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_PLAN_TAB, handleOpenPlanTab);
+    return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_PLAN_TAB, handleOpenPlanTab);
+  }, [getBaseLayout, setCollapsed, setLayout, workspaceId]);
+
   const [tabToFocus, setTabToFocus] = React.useState<TabType | null>(null);
   const sidebarContainerRef = React.useRef<HTMLDivElement>(null);
 
@@ -1819,6 +1844,33 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       setArtifactsFocusTabsetId(next.focusedTabsetId);
     },
   });
+
+  // Global shortcut: open (and un-collapse) the Plan tab, with the Artifacts shortcut's guards.
+  // While the narrow layout hides the sidebar, WorkspaceMenuBar shows the tab full-screen
+  // instead; this handler then stays out, so one keystroke never acts twice.
+  React.useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const container = sidebarContainerRef.current;
+      if (
+        !matchesKeybind(e, KEYBINDS.OPEN_PLAN_TAB) ||
+        (container != null && isRightSidebarResponsivelyHidden(container)) ||
+        isDialogOpen() ||
+        // Remote desktops, browsers and terminals own their keystrokes.
+        isTerminalFocused(e.target) ||
+        isDesktopViewportFocused(e.target) ||
+        isBrowserViewportFocused(e.target)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      setCollapsed(false);
+      const next = selectOrAddTab(getBaseLayout(), "plan");
+      setLayout(() => next);
+      setPlanFocusTabsetId(next.focusedTabsetId);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [getBaseLayout, setCollapsed, setLayout]);
 
   // Auto-surface the Workflows tab when a run starts: the tab is the primary
   // run-detail surface (the chat card stays collapsed while it exists), but a
@@ -2312,6 +2364,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const focusPickedTool = (tabsetId: string, tool: TabType) => {
     if (tool === "review") setReviewFocusRequest((prev) => nextReviewFocusRequest(prev, tabsetId));
     else if (tool === "artifacts") setArtifactsFocusTabsetId(tabsetId);
+    else if (tool === "plan") setPlanFocusTabsetId(tabsetId);
     else setTabToFocus(tool);
   };
 
@@ -2387,6 +2440,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     costs: true,
     review: canReviewDiffs,
     instructions: true,
+    plan: true,
     goal: true,
     workflows: true,
     timeline: true,
@@ -2721,6 +2775,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         goalCompleteInputRequest={goalCompleteInputRequest}
         autoFocusArtifacts={artifactsFocusTabsetId === node.id}
         onArtifactsAutoFocusConsumed={() => setArtifactsFocusTabsetId(null)}
+        autoFocusPlan={planFocusTabsetId === node.id}
+        onPlanAutoFocusConsumed={() => setPlanFocusTabsetId(null)}
         onGoalSetStatus={handleGoalSetStatus}
         onGoalUpdateObjective={handleGoalUpdateObjective}
         onGoalUpdateBudget={handleGoalUpdateBudget}

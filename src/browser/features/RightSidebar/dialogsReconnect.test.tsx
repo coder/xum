@@ -14,7 +14,7 @@ import {
 } from "@/browser/contexts/connection.testHarness";
 import { SubagentTranscriptDialog } from "@/browser/features/Tools/SubagentTranscriptDialog";
 import type { TestApiOverrides } from "@/browser/testUtils";
-import { PlanFileDialog } from "./PlanFileDialog";
+import { PlanTab } from "./PlanTab";
 
 /*
  * A dialog that shows loaded content keeps it across a dropped connection: the new client
@@ -105,9 +105,9 @@ describe.each([...GAP_MODES])("dialogs across a dropped connection (%s)", (mode)
     cleanupDom = null;
   });
 
-  test("the plan dialog keeps the shown plan until the new client's read lands", async () => {
+  test("the plan tab keeps the shown plan until the new client's read lands", async () => {
     answerPlan = () => Promise.resolve(planResult("Plan A"));
-    const view = render(<PlanFileDialog open onOpenChange={noop} workspaceId="ws-1" />, {
+    const view = render(<PlanTab workspaceId="ws-1" />, {
       wrapper: Wrapper,
     });
     await view.findByText("Plan A");
@@ -124,7 +124,7 @@ describe.each([...GAP_MODES])("dialogs across a dropped connection (%s)", (mode)
     expect(view.queryByText("Loading plan…")).toBeNull();
     await drop();
     expect(view.queryByText("Plan A")).not.toBeNull();
-    expect(view.queryByTestId("plan-file-dialog-error")).toBeNull();
+    expect(view.queryByTestId("plan-tab-error")).toBeNull();
 
     const next = deferred<unknown>();
     answerPlan = () => next.promise;
@@ -210,9 +210,9 @@ describe.each([...GAP_MODES])("dialogs opened while reconnecting (%s)", (mode) =
     cleanupDom = null;
   });
 
-  test("the plan dialog shows its loading state once a client reads the plan", async () => {
+  test("the plan tab shows its loading state once a client reads the plan", async () => {
     answerPlan = () => Promise.resolve(planResult("unused"));
-    const view = render(<PlanFileDialog open onOpenChange={noop} workspaceId="ws-1" />, {
+    const view = render(<PlanTab workspaceId="ws-1" />, {
       wrapper: Wrapper,
     });
     await flush();
@@ -221,7 +221,7 @@ describe.each([...GAP_MODES])("dialogs opened while reconnecting (%s)", (mode) =
     answerPlan = () => next.promise;
     await reconnect();
     expect(view.queryByText("Loading plan…")).not.toBeNull();
-    expect(view.queryByTestId("plan-file-dialog-error")).toBeNull();
+    expect(view.queryByTestId("plan-tab-error")).toBeNull();
 
     next.resolve(planResult("Plan A"));
     await view.findByText("Plan A");
@@ -261,14 +261,14 @@ describe("dialogs opened on other data", () => {
 
   test("another workspace clears the shown plan while its own plan loads", async () => {
     answerPlan = () => Promise.resolve(planResult("Plan A"));
-    const view = render(<PlanFileDialog open onOpenChange={noop} workspaceId="ws-1" />, {
+    const view = render(<PlanTab workspaceId="ws-1" />, {
       wrapper: Wrapper,
     });
     await view.findByText("Plan A");
 
     const pending = deferred<unknown>();
     answerPlan = () => pending.promise;
-    view.rerender(<PlanFileDialog open onOpenChange={noop} workspaceId="ws-2" />);
+    view.rerender(<PlanTab workspaceId="ws-2" />);
     await waitFor(() => expect(view.queryByText("Loading plan…")).not.toBeNull());
     expect(view.queryByText("Plan A")).toBeNull();
   });

@@ -5,6 +5,7 @@ import type { APIClient } from "@/browser/contexts/API";
 import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
 import { showFeedbackToast as showCommandFeedbackToast } from "@/browser/utils/feedbackToast";
+import { NO_RUNNABLE_PLAN_MESSAGE, runLatestPlanAction } from "@/browser/utils/latestPlanAction";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { PinnedMoveDirection } from "@/browser/utils/ui/pinnedReorder";
 import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
@@ -416,9 +417,6 @@ let sessionTapesSaveRunning = false;
 const SESSION_TAPES_PATH_TOAST_MS = 15_000;
 
 const NO_BACKGROUND_PROCESSES_MESSAGE = "No background processes are running in this workspace.";
-
-const NO_RUNNABLE_PLAN_MESSAGE =
-  "No plan to implement: the latest plan's Implement / Continue in Auto is missing or disabled.";
 
 // Module-level: palette sources are rebuilt on every render, so a closure flag would reset.
 let reportSlownessRunning = false;
@@ -1594,14 +1592,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["plan", "implement", "continue in auto", "propose_plan"],
         shortcutHint: formatKeybind(KEYBINDS.RUN_LATEST_PLAN_ACTION),
         run: () => {
-          // The latest plan card runs its enabled primary action and marks the request handled
-          // (#4963); listeners run synchronously inside dispatchEvent.
-          const request = createCustomEvent(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, {
-            workspaceId: id,
-            handled: false,
-          });
-          window.dispatchEvent(request);
-          if (!request.detail.handled) {
+          if (!runLatestPlanAction(id)) {
             showCommandFeedbackToast({ type: "error", message: NO_RUNNABLE_PLAN_MESSAGE });
           }
         },

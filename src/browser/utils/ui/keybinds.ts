@@ -609,6 +609,9 @@ export const KEYBINDS = {
   /** Open (or focus) the Artifacts tab in the right sidebar, or collapse the sidebar when it shows it */
   OPEN_ARTIFACTS_TAB: { key: "K", ctrl: true, shift: true },
 
+  /** Open (or focus) the Plan tab in the right sidebar */
+  OPEN_PLAN_TAB: { key: "p", code: "KeyP", ctrl: true, alt: true, shift: true },
+
   // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,
   // like the Review panel's single-key hunk navigation.
   /** Toggle fullscreen for the selected artifact */
@@ -822,6 +825,13 @@ export const KEYBINDS = {
 
   /** Copy the active file's full contents to the clipboard in immersive review */
   REVIEW_COPY_FILE: { key: "y" },
+
+  // Plan tab shortcuts: only handled while focus is inside the Plan tab, like the Artifacts
+  // panel's single-key shortcuts.
+  /** Open the plan file in the external editor (Plan tab) */
+  PLAN_TAB_EDIT: { key: "e" },
+  /** Copy the plan to the clipboard (Plan tab) */
+  PLAN_TAB_COPY: { key: "y" },
 
   /** Toggle plan annotation mode in propose_plan */
   TOGGLE_PLAN_ANNOTATE: { key: "a", shift: true },

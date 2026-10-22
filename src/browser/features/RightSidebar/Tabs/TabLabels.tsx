@@ -259,6 +259,15 @@ export const WorkflowsTabLabel: React.FC<WorkflowsTabLabelProps> = ({ workspaceI
   );
 };
 
+export function PlanTabLabel() {
+  return (
+    <span className="inline-flex items-center gap-1">
+      <TAB_ICONS.plan className="h-3 w-3 shrink-0" />
+      Plan
+    </span>
+  );
+}
+
 export function OutputTabLabel() {
   return (
     <span className="inline-flex items-center gap-1">

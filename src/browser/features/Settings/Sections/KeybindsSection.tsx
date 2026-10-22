@@ -68,6 +68,9 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   OPEN_TIMELINE_DIALOG: "Open Timeline tab (small viewports)",
   OPEN_STATS_DIALOG: "Open Stats tab (small viewports)",
   OPEN_ARTIFACTS_TAB: "Toggle Artifacts tab",
+  OPEN_PLAN_TAB: "Open Plan tab",
+  PLAN_TAB_EDIT: "Open the plan file in the editor (Plan tab)",
+  PLAN_TAB_COPY: "Copy the plan (Plan tab)",
   TOGGLE_ARTIFACT_FULLSCREEN: "Toggle artifact fullscreen (Artifacts tab)",
   NEXT_ARTIFACT: "Next artifact (Artifacts tab)",
   PREV_ARTIFACT: "Previous artifact (Artifacts tab)",
@@ -260,6 +263,10 @@ const KEYBIND_GROUPS: Array<{
       "OPEN_TIMELINE_DIALOG",
       "OPEN_STATS_DIALOG",
     ],
+  },
+  {
+    label: "Plan tab",
+    keys: ["OPEN_PLAN_TAB", "PLAN_TAB_EDIT", "PLAN_TAB_COPY"],
   },
   {
     label: "Artifacts",

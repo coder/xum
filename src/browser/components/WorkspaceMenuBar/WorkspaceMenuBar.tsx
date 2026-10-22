@@ -443,6 +443,36 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     return () => window.removeEventListener("keydown", handler);
   }, [artifactsExperimentEnabled, isTimelineSidebarHidden, openSidebarTab]);
 
+  // The Plan tab while the sidebar is hidden: its shortcut (RightSidebar owns the wide-layout
+  // handler) and "/plan open" (OPEN_PLAN_TAB; RightSidebar already selected the tab, so only a
+  // hidden sidebar needs showing).
+  useEffect(() => {
+    const open = () => openSidebarTab("plan", activeElement());
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (
+        !matchesKeybind(e, KEYBINDS.OPEN_PLAN_TAB) ||
+        isDialogOpen() ||
+        !isTimelineSidebarHidden() ||
+        isTerminalFocused(e.target) ||
+        isDesktopViewportFocused(e.target)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      open();
+    };
+    const onOpenPlanTab = (event: Event) => {
+      const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
+      if (detail?.workspaceId === workspaceId && isTimelineSidebarHidden()) open();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_PLAN_TAB, onOpenPlanTab);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_PLAN_TAB, onOpenPlanTab);
+    };
+  }, [isTimelineSidebarHidden, openSidebarTab, workspaceId]);
+
   // openArtifact() (chat cards, file cards, Review, palette) and "Open in tab" on an MCP Apps
   // tool card: while the sidebar is hidden, they show their tab full-screen (RightSidebar
   // handles the same events on wider layouts).

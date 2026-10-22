@@ -78,7 +78,7 @@ import { buildCompactionMessageText } from "@/common/utils/compaction/compaction
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { isValidProvider } from "@/common/constants/providers";
-import { openInEditor } from "@/browser/utils/openInEditor";
+import { openPlanTab } from "@/browser/utils/openPlanTab";
 import {
   appendStagedAttachmentNotice,
   getStagedAttachments,
@@ -1025,8 +1025,9 @@ export async function processSlashCommand(
         return handlePlanShowCommand({ ...env, api: client, workspaceId: env.workspaceId });
       case "plan-open":
         if (!env.workspaceId) throw new Error("Workspace ID required");
-        if (!client) return notConnected();
-        return handlePlanOpenCommand({ ...env, api: client, workspaceId: env.workspaceId });
+        // No client needed: the tab shows the reconnecting state itself. (A side chat never
+        // gets here: the side-chat gate above refuses workspace-only commands.)
+        return handlePlanOpenCommand(env.workspaceId);
       case "goal-show":
       case "goal-set":
       case "goal-budget":
@@ -2020,54 +2021,12 @@ function handlePlanShowCommand(env: WorkspaceCommandEnv): CommandResult {
   });
 }
 
-function handlePlanOpenCommand(env: WorkspaceCommandEnv): CommandResult {
-  return phase([{ type: "clear-input" }], async () => {
-    try {
-      const planResult = await env.api.workspace.getPlanContent({ workspaceId: env.workspaceId });
-      if (!planResult.success) {
-        return complete("consume", [
-          showToast({
-            id: Date.now().toString(),
-            type: "error",
-            message: "No plan found for this workspace",
-          }),
-        ]);
-      }
-      const workspaceInfo = await env.api.workspace.getInfo({ workspaceId: env.workspaceId });
-      const openResult = await openInEditor({
-        api: env.api,
-        workspaceId: env.workspaceId,
-        targetPath: planResult.data.path,
-        runtimeConfig: workspaceInfo?.runtimeConfig,
-        isFile: true,
-      });
-      if (!openResult.success) {
-        return complete("consume", [
-          showToast({
-            id: Date.now().toString(),
-            type: "error",
-            message: openResult.error ?? "Failed to open editor",
-          }),
-        ]);
-      }
-      trackCommandUsed("plan");
-      return complete("consume", [
-        showToast({
-          id: Date.now().toString(),
-          type: "success",
-          message: "Opened plan in editor",
-        }),
-      ]);
-    } catch (error) {
-      return complete("restore", [
-        showToast({
-          id: Date.now().toString(),
-          type: "error",
-          message: error instanceof Error ? error.message : "Failed to open plan",
-        }),
-      ]);
-    }
-  });
+function handlePlanOpenCommand(workspaceId: string): CommandResult {
+  // The Plan tab shows the plan, or that there is none yet (or that the backend is away);
+  // opening it in an editor is one of the tab's actions.
+  openPlanTab(workspaceId);
+  trackCommandUsed("plan");
+  return complete("consume", [{ type: "clear-input" }]);
 }
 
 // ============================================================================

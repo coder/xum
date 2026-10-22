@@ -595,6 +595,16 @@ export function getRightSidebarLayoutKey(workspaceId: string): string {
 }
 
 /**
+ * Scroll offset of the right sidebar's Plan tab per workspace. The tab unmounts when the user
+ * leaves the workspace or switches tabs, so the offset is saved then and restored once the plan
+ * renders again, like the mobile left sidebar's list position.
+ * Format: "plan-tab:scroll-top:{workspaceId}"
+ */
+export function getPlanTabScrollTopKey(workspaceId: string): string {
+  return `plan-tab:scroll-top:${workspaceId}`;
+}
+
+/**
  * Artifacts tab selection for the most recently used workspaces, as one global map
  * `{ [workspaceId]: { scope, path, version } }` (artifactSelection.ts). Per-workspace keys would
  * multiply by every workspace ever opened; the map is bounded instead.
@@ -874,6 +884,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getReviewSearchStateKey, "workspace-scoped", true, REVIEW_SEARCH_STATE_MAX_CHARS),
   workspaceKey(getReviewImmersiveKey, "workspace-scoped", true, 16),
   workspaceKey(getWorkspaceLastReadKey, "workspace-scoped", true, 32),
+  workspaceKey(getPlanTabScrollTopKey, "workspace-scoped", true, 16),
   // Not a cache: a status_set result compacted out of history cannot be re-derived after reload
   // (see StreamingMessageAggregator.loadPersistedAgentStatus), so it must never be evicted.
   // ~28 skeleton + the STATUS_STATE_*_MAX_CHARS field caps.

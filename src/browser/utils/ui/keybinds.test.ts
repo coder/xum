@@ -446,6 +446,7 @@ describe("global keybind collisions", () => {
     "OPEN_TIMELINE_DIALOG",
     "OPEN_STATS_DIALOG",
     "OPEN_ARTIFACTS_TAB",
+    "OPEN_PLAN_TAB",
     "SIDEBAR_TAB_1",
     "SIDEBAR_TAB_2",
     "SIDEBAR_TAB_3",
