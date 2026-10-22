@@ -168,6 +168,35 @@ describe("findUnpreservedSubagentWork", () => {
     expect(otherRefCount(await check())).toBe(2);
   });
 
+  // #5163: only refs/stash (the newest entry) was counted. Older entries live in the stash reflog,
+  // and removal deletes them with the repository.
+  test("a Docker copy counts every stash entry, not only the newest (#5163)", async () => {
+    makeStandaloneCopy();
+    await addStash();
+    await addStash();
+    expect(git(repo, "stash list").split("\n")).toHaveLength(2);
+    // Two commits per entry: the stash commit and its index commit.
+    expect(otherRefCount(await check({ dockerCopy: true }))).toBe(4);
+    // Popping the newest entry leaves the older one as refs/stash: it still counts.
+    execSync("git stash drop -q", { cwd: repo });
+    expect(otherRefCount(await check({ dockerCopy: true }))).toBe(2);
+  });
+
+  test("the creation snapshot records the source's older stash entries too (#5163)", async () => {
+    // A cp -R -P copy inherits the source's whole stash reflog.
+    await addStash();
+    await addStash();
+    const copy = path.join(rootDir, "copy");
+    execSync(`cp -R -P ${repo} ${copy}`);
+    repo = copy;
+    execSync(buildSourceRefSnapshotCommand(), { cwd: repo });
+    execSync("git checkout -q -b task", { cwd: repo });
+    expect(await check()).toEqual({ success: true, data: { kind: "none" } });
+    // A stash the child adds still counts.
+    await addStash();
+    expect(otherRefCount(await check())).toBe(2);
+  });
+
   test("a linked worktree keeps the base..HEAD scope: its repository survives removal", async () => {
     const worktree = path.join(rootDir, "worktree");
     execSync(`git worktree add -q -b task ${worktree}`, { cwd: repo });
