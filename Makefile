@@ -98,7 +98,7 @@ include fmt.mk
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
-.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
+.PHONY: benchmark-terminal bench bench-compare test-loop-baseline first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -892,6 +892,10 @@ bench: node_modules/.installed src/version.ts ## Run *.bench.ts microbenchmarks 
 
 bench-compare: node_modules/.installed src/version.ts ## Compare *.bench.ts results, base vs working tree (BENCH=<filter>, BASE=<ref>, ROUNDS=10, RUNTIME=node|bun)
 	@bun scripts/perf/benchCompare.ts --bench '$(BENCH)' --runtime $(or $(RUNTIME),node) --rounds $(or $(ROUNDS),10) $(if $(BASE),--base '$(BASE)')
+
+# Agent loop refactor tripwire data. Gates call the script directly: make reports any failure as 2.
+test-loop-baseline: node_modules/.installed src/version.ts ## Time the loop test files (RUNS=10, FILTER=<substring>, JOBS=6)
+	@bun scripts/perf/loopTestBaseline.ts --runs $(or $(RUNS),10) --jobs $(or $(JOBS),6) $(if $(FILTER),--filter '$(FILTER)')
 
 first-load-js: ## Report first-load JS bytes of dist/ (run make build-renderer first)
 	@bun scripts/perf/firstLoadJs.ts dist
