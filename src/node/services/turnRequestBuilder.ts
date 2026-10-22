@@ -229,7 +229,7 @@ import {
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
-import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { isWorkspaceProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import { getAnthropicCacheTtl, supportsAnthropicCache } from "@/common/utils/ai/cacheStrategy";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
@@ -2182,6 +2182,8 @@ export class TurnRequestBuilder {
         taskSettings,
         requestPayloadMessages: providerRequestMessages,
         agentDefinitionCache,
+        // #6426: from this turn's loaded config (no extra read).
+        projectPluginsTrusted: isWorkspaceProjectTrustedIn(cfg.projects, metadata),
       });
     recordStartupPhaseTiming("buildPlanInstructionsMs", buildPlanInstructionsStartedAt);
 

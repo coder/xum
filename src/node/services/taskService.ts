@@ -111,6 +111,7 @@ import {
   TASK_FAMILY_MESSAGE_MAX_CHARS,
 } from "@/constants/taskMessages";
 import { log } from "@/node/services/log";
+import { isProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import {
@@ -5512,6 +5513,8 @@ export class TaskService implements AgentTaskIntegration {
     if (agentIdCandidates.length === 0) {
       return false;
     }
+    // #6426: one cached config load per call (not per candidate or per read).
+    const projectPluginsTrusted = isProjectTrusted(this.config, entry.projectPath);
 
     const workspacePath = coerceNonEmptyString(entry.workspace.path);
     const workspaceName = coerceNonEmptyString(entry.workspace.name) ?? entry.workspace.id;
@@ -5561,7 +5564,8 @@ export class TaskService implements AgentTaskIntegration {
           const agentDefinition = await readAgentDefinition(
             discovery.runtime,
             discovery.workspacePath,
-            agentId
+            agentId,
+            { projectPluginsTrusted }
           );
           const chain = await resolveAgentInheritanceChain({
             runtime: discovery.runtime,
@@ -5569,6 +5573,7 @@ export class TaskService implements AgentTaskIntegration {
             agentId: agentDefinition.id,
             agentDefinition,
             workspaceId: entry.workspace.id ?? workspaceName,
+            projectPluginsTrusted,
           });
 
           if (agentDefinition.scope === "project") {
@@ -6717,6 +6722,8 @@ export class TaskService implements AgentTaskIntegration {
       return Err(`Task.createMany: parent workspace not found (${parentMetaResult.error})`);
     }
     const parentMeta = parentMetaResult.data;
+    // #6426: once per reservation, from the loaded config.
+    const projectPluginsTrusted = isWorkspaceProjectTrustedIn(cfg.projects, parentMeta);
     const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
     if (
       parentEntry != null &&
@@ -6813,7 +6820,9 @@ export class TaskService implements AgentTaskIntegration {
 
     const getRunnableHint = async (): Promise<string> => {
       try {
-        const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath);
+        const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
+          projectPluginsTrusted,
+        });
         const runnableIds = (
           await Promise.all(
             allAgents.map(async (agent) => {
@@ -6822,7 +6831,10 @@ export class TaskService implements AgentTaskIntegration {
                   runtime,
                   parentWorkspacePath,
                   agent.id,
-                  { skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope) }
+                  {
+                    skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
+                    projectPluginsTrusted,
+                  }
                 );
                 if (
                   !isAgentRunnableAsChild(frontmatter, {
@@ -6857,7 +6869,7 @@ export class TaskService implements AgentTaskIntegration {
     let frontmatterJson: string;
     try {
       const definitionRead = await this.readCancellable(
-        resolveAgentDefinition(runtime, parentWorkspacePath, agentId),
+        resolveAgentDefinition(runtime, parentWorkspacePath, agentId, { projectPluginsTrusted }),
         signal
       );
       if (definitionRead.kind !== "ok") return Err(progress.interruptedError());
@@ -6907,6 +6919,7 @@ export class TaskService implements AgentTaskIntegration {
             runtime,
             workspacePath: parentWorkspacePath,
             workspaceId: parentWorkspaceId,
+            projectPluginsTrusted,
           },
         }),
         signal
@@ -7051,7 +7064,9 @@ export class TaskService implements AgentTaskIntegration {
       let definitionNow: { source?: string; frontmatter: unknown };
       try {
         const definitionNowRead = await this.readCancellable(
-          resolveAgentDefinition(plan.runtime, plan.parentWorkspacePath, plan.agentId),
+          resolveAgentDefinition(plan.runtime, plan.parentWorkspacePath, plan.agentId, {
+            projectPluginsTrusted: isWorkspaceProjectTrustedIn(cfg.projects, parentMetaNow.data),
+          }),
           signal
         );
         if (definitionNowRead.kind !== "ok") return interrupted();
@@ -8655,6 +8670,8 @@ export class TaskService implements AgentTaskIntegration {
 
     // Enforce nesting depth.
     const cfg = this.config.loadConfigOrDefault();
+    // #6426: once per create, from the loaded config.
+    const projectPluginsTrusted = isWorkspaceProjectTrustedIn(cfg.projects, parentMeta);
     const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
     const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
     const legacyParentRow = this.legacyParentRowOf(cfg, parentWorkspaceId);
@@ -8779,7 +8796,9 @@ export class TaskService implements AgentTaskIntegration {
     // with base: exec) still count as runnable.
     const getRunnableHint = async (): Promise<string> => {
       try {
-        const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath);
+        const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
+          projectPluginsTrusted,
+        });
 
         const runnableIds = (
           await Promise.all(
@@ -8791,6 +8810,7 @@ export class TaskService implements AgentTaskIntegration {
                   agent.id,
                   {
                     skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
+                    projectPluginsTrusted,
                   }
                 );
                 if (
@@ -8824,7 +8844,9 @@ export class TaskService implements AgentTaskIntegration {
 
     let skipInitHook = false;
     try {
-      const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId);
+      const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId, {
+        projectPluginsTrusted,
+      });
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
         const hint = await getRunnableHint();
         return Err(`Task.create: agentId is not runnable as a sub-agent (${agentId}). ${hint}`);
@@ -8875,6 +8897,7 @@ export class TaskService implements AgentTaskIntegration {
           runtime,
           workspacePath: parentWorkspacePath,
           workspaceId: parentWorkspaceId,
+          projectPluginsTrusted,
         },
       }));
     } catch (error) {
@@ -9847,7 +9870,8 @@ export class TaskService implements AgentTaskIntegration {
    * falls back to resolving without layers. Never mutates.
    */
   private async prepareReawakenAi(taskId: string): Promise<PreparedReawakenAi | undefined> {
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    const cfg = this.config.loadConfigOrDefault();
+    const entry = findWorkspaceEntry(cfg, taskId);
     if (entry == null) return undefined;
     const workspace = entry.workspace;
     if (
@@ -9866,13 +9890,20 @@ export class TaskService implements AgentTaskIntegration {
     const contextKey = buildReawakenContextKey(entry);
     let context: ReturnType<typeof buildWorkspaceAgentContext>;
     try {
-      context = buildWorkspaceAgentContext({
-        runtimeConfig: workspace.runtimeConfig,
-        projectPath: entry.projectPath,
-        workspaceName,
-        persistedWorkspacePath: workspace.path,
-        subProjectPath: workspace.subProjectPath,
-      });
+      context = buildWorkspaceAgentContext(
+        {
+          runtimeConfig: workspace.runtimeConfig,
+          projectPath: entry.projectPath,
+          workspaceName,
+          persistedWorkspacePath: workspace.path,
+          subProjectPath: workspace.subProjectPath,
+        },
+        // #6426: from the snapshot loaded above (no second config read).
+        isWorkspaceProjectTrustedIn(cfg.projects, {
+          kind: workspace.kind,
+          projectPath: entry.projectPath,
+        })
+      );
     } catch (error) {
       log.debug("prepareReawakenAi: definition context unavailable", {
         taskId,
@@ -9886,6 +9917,7 @@ export class TaskService implements AgentTaskIntegration {
         runtime: context.runtime,
         workspacePath: context.workspacePath,
         workspaceId: taskId,
+        projectPluginsTrusted: context.projectPluginsTrusted,
       },
       { abortSignal: AbortSignal.timeout(REAWAKEN_DEFINITION_READ_TIMEOUT_MS) }
     );
@@ -17249,7 +17281,13 @@ export class TaskService implements AgentTaskIntegration {
           const frontmatter = await resolveAgentFrontmatter(
             parentRuntime,
             parentWorkspacePath,
-            agentId
+            agentId,
+            {
+              projectPluginsTrusted: isWorkspaceProjectTrustedIn(config.projects, {
+                kind: parentEntry.workspace.kind,
+                projectPath: parentEntry.projectPath,
+              }),
+            }
           );
           skipInitHook = frontmatter.subagent?.skip_init_hook === true;
         } catch (error: unknown) {

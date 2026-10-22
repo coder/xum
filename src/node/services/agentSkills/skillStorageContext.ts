@@ -8,12 +8,12 @@ import type { XumToolScope } from "@/common/types/toolScope";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { projectPluginsAllowed } from "@/node/utils/projectTrust";
 
 import {
   buildProjectSkillRoots,
   getDefaultAgentSkillsRoots,
   getLegacyMuxGlobalSkillsRoot,
-  projectPluginsAllowed,
   type AgentSkillsRoots,
 } from "./agentSkillsService";
 

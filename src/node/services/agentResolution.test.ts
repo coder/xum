@@ -978,8 +978,11 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
       const again = await runTurn({ projectPath, cfg, cache });
       const repeatRuntime = again.agent.agentDiscoveryRuntime as CountingRuntime;
       const readsAfterTurn = new Map(repeatRuntime.definitionReads);
+      // The cache keys reads by trust (#6426), so repeat the turn's trust value.
+      const projectPluginsTrusted = again.agent.projectPluginsTrusted;
       const repeatedBody = await resolveAgentBody(repeatRuntime, projectPath, "reviewer", {
         cache,
+        projectPluginsTrusted,
       });
       await resolveAgentInheritanceChain({
         runtime: repeatRuntime,
@@ -988,6 +991,7 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
         agentDefinition: again.agent.agentDefinition,
         workspaceId: again.metadata.id,
         cache,
+        projectPluginsTrusted,
       });
       expect(repeatedBody).toBe(again.context.agentSystemPromptSections[0]);
       expect(repeatRuntime.definitionReads).toEqual(readsAfterTurn);

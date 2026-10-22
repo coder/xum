@@ -11,6 +11,7 @@
  * - Tool policy composition (agent → caller)
  */
 
+import { isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { SendMessageError } from "@/common/types/errors";
 import type { SendMessageOptions } from "@/common/orpc/types";
@@ -118,6 +119,8 @@ export interface AgentResolutionResult {
    * policy applies at all.
    */
   switchableAgents: SwitchableAgent[] | undefined;
+  /** #6426: whether this workspace may load project plugin agents (later reads reuse it). */
+  projectPluginsTrusted: boolean;
 }
 
 /** An agent the root mode picker offers (see AgentResolutionResult.switchableAgents). */
@@ -269,6 +272,8 @@ export async function resolveAgentForStream(
   } = opts;
 
   const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
+  // #6426: project plugin agents load only in a trusted project. From the loaded config: no read.
+  const projectPluginsTrusted = isWorkspaceProjectTrustedIn(cfg.projects, metadata);
 
   // --- Agent ID resolution ---
   // Precedence:
@@ -342,7 +347,7 @@ export async function resolveAgentForStream(
           discovery.runtime,
           discovery.workspacePath,
           candidateAgentId,
-          { cache }
+          { cache, projectPluginsTrusted }
         );
         if (definition.scope === "project") {
           agentDefinition = definition;
@@ -385,6 +390,7 @@ export async function resolveAgentForStream(
     });
     agentDefinition = await readAgentDefinition(agentDiscoveryRuntime, agentDiscoveryPath, "exec", {
       cache,
+      projectPluginsTrusted,
     });
   }
 
@@ -431,6 +437,7 @@ export async function resolveAgentForStream(
         {
           skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
           cache,
+          projectPluginsTrusted,
         }
       );
 
@@ -483,7 +490,7 @@ export async function resolveAgentForStream(
           agentDiscoveryRuntime,
           agentDiscoveryPath,
           "exec",
-          { cache }
+          { cache, projectPluginsTrusted }
         );
         effectiveAgentId = agentDefinition.id;
       }
@@ -516,6 +523,7 @@ export async function resolveAgentForStream(
     agentDefinition,
     workspaceId,
     cache,
+    projectPluginsTrusted,
   });
 
   // Strict chain pin: inheritance resolution reloads every base independently, so a
@@ -593,16 +601,16 @@ export async function resolveAgentForStream(
           agentDefinition.id,
           {
             cache,
+            projectPluginsTrusted,
             skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
           }
         ).catch(() => undefined)
       )?.ui
     ).selectable;
   if (activeSelectable && effectiveToolPolicy !== undefined) {
-    const descriptors = await discoverAgentDefinitions(
-      agentDiscoveryRuntime,
-      agentDiscoveryPath
-    ).catch(() => []);
+    const descriptors = await discoverAgentDefinitions(agentDiscoveryRuntime, agentDiscoveryPath, {
+      projectPluginsTrusted,
+    }).catch(() => []);
     // Parallel, like sub-agent discovery: on SSH runtimes each read is a round trip.
     const policies = await Promise.all(
       descriptors.map(async (descriptor): Promise<SwitchableAgent | undefined> => {
@@ -610,6 +618,7 @@ export async function resolveAgentForStream(
         try {
           const readOptions = {
             cache,
+            projectPluginsTrusted,
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
           };
           const frontmatter = await resolveAgentFrontmatter(
@@ -642,6 +651,7 @@ export async function resolveAgentForStream(
             agentDefinition: definition,
             workspaceId,
             cache,
+            projectPluginsTrusted,
           });
           const toolPolicy = composeForUnion(
             resolveToolPolicyForAgent({
@@ -690,5 +700,6 @@ export async function resolveAgentForStream(
     shouldDisableTaskToolsForDepth,
     effectiveToolPolicy,
     switchableAgents,
+    projectPluginsTrusted,
   });
 }

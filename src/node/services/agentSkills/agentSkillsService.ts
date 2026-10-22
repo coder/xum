@@ -53,8 +53,7 @@ import {
   parseSkillLookupName,
 } from "@/common/utils/agentSkills/skillLookupName";
 import { log } from "@/node/services/log";
-import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
-import { isProjectTrusted } from "@/node/utils/projectTrust";
+import { isProjectTrusted, projectPluginsAllowed } from "@/node/utils/projectTrust";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { ensureRuntimePathWithinWorkspace } from "@/node/services/tools/runtimeSkillPathUtils";
 import {
@@ -186,15 +185,6 @@ export function buildProjectSkillRoots(
     runtime.normalizePath(".agents/skills", directory),
     ...(options?.includeClaudeSkills ? [runtime.normalizePath(".claude/skills", directory)] : []),
   ]);
-}
-
-/**
- * #6426: a project's own Agent Plugins are one trust unit. Their skills load only in a trusted
- * project, as their MCP servers, hooks and slash commands do (computeAgentPluginContainers),
- * and never under the project-automation kill switch. Missing trust means untrusted.
- */
-export function projectPluginsAllowed(projectPluginsTrusted: boolean | undefined): boolean {
-  return projectPluginsTrusted === true && !projectAutomationDisabled();
 }
 
 export function getDefaultAgentSkillsRoots(

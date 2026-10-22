@@ -208,6 +208,7 @@ export async function buildWorkspaceComposition(
 
   const agentDescriptors = await discoverAgentDefinitions(args.runtime, args.workspacePath, {
     dedupeById: false,
+    projectPluginsTrusted: args.projectTrusted,
   });
   const agents = markShadowed(
     agentDescriptors.map((agent) => ({

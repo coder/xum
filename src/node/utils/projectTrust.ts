@@ -1,6 +1,8 @@
 import type { Config } from "@/node/config";
+import type { ProjectsConfig } from "@/common/types/project";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 
 /**
  * Workspace-scoped trust. Scratch workspaces are app-owned (created trusted
@@ -26,10 +28,39 @@ export function isProjectTrusted(config: Config, projectPath?: string | null): b
   if (!projectPath) {
     return false;
   }
+  return isProjectTrustedIn(config.loadConfigOrDefault().projects, projectPath);
+}
 
-  const projects = config.loadConfigOrDefault().projects;
+/**
+ * isWorkspaceProjectTrusted on a config the caller already loaded: no config read or stat
+ * (#6426, for per-agent lookups in a turn).
+ */
+export function isWorkspaceProjectTrustedIn(
+  projects: ProjectsConfig["projects"],
+  metadata: Pick<WorkspaceMetadata, "kind" | "projectPath">
+): boolean {
+  return metadata.kind === "scratch" || isProjectTrustedIn(projects, metadata.projectPath);
+}
+
+/** isProjectTrusted on a config the caller already loaded. */
+export function isProjectTrustedIn(
+  projects: ProjectsConfig["projects"],
+  projectPath?: string | null
+): boolean {
+  if (!projectPath) {
+    return false;
+  }
   const normalizedProjectPath = stripTrailingSlashes(projectPath);
   const project = projects.get(normalizedProjectPath);
   const trustOwnerPath = project?.parentProjectPath ?? normalizedProjectPath;
   return projects.get(trustOwnerPath)?.trusted ?? false;
+}
+
+/**
+ * #6426: a project's own Agent Plugins are one trust unit. Their skills and agents load only in a
+ * trusted project, as their MCP servers, hooks and slash commands do (computeAgentPluginContainers),
+ * and never under the project-automation kill switch. Missing trust means untrusted.
+ */
+export function projectPluginsAllowed(projectPluginsTrusted: boolean | undefined): boolean {
+  return projectPluginsTrusted === true && !projectAutomationDisabled();
 }

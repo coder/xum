@@ -12,6 +12,7 @@ import { RuntimeError } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
+  AgentDefinitionRequestCache,
   discoverAgentDefinitions,
   listAgentDefinitions,
   type AgentDefinitionsContext,
@@ -981,6 +982,43 @@ base: a
       expect(shared[0]?.name).toBe("Shared (project)");
       expect(shared[0]?.pluginName).toBeUndefined();
     });
+
+    // #6426: project plugin agents load only in a trusted project, in the listing and in a
+    // read by id (an agentId, a base). Plain project agents do not change.
+    test.each([false, true])(
+      "project plugin agents are listed and read only in a trusted project (trusted: %s)",
+      async (projectPluginsTrusted) => {
+        using project = new DisposableTempDir("agent-defs-plugin-trust");
+        await writeAgent(path.join(project.path, ".xum", "agents"), "plain-project", "Plain");
+        await writePluginWithAgent(
+          path.join(project.path, ".xum", "plugins"),
+          "repo-plugin",
+          "repo-agent",
+          "Repo (plugin)"
+        );
+        const runtime = new LocalRuntime(project.path);
+
+        const ids = (
+          await discoverAgentDefinitions(runtime, project.path, { projectPluginsTrusted })
+        ).map((agent) => agent.id);
+        expect(ids).toContain("plain-project");
+        expect(ids.includes("repo-agent")).toBe(projectPluginsTrusted);
+
+        // One request cache serves both trust values without mixing them.
+        const cache = new AgentDefinitionRequestCache();
+        const read = (trusted: boolean) =>
+          readAgentDefinition(runtime, project.path, AgentIdSchema.parse("repo-agent"), {
+            cache,
+            projectPluginsTrusted: trusted,
+          }).then((pkg) => pkg.frontmatter.name);
+        if (projectPluginsTrusted) expect(await read(true)).toBe("Repo (plugin)");
+        else {
+          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types `rejects` as void
+          await expect(read(false)).rejects.toThrow("Agent definition not found");
+          expect(await read(true)).toBe("Repo (plugin)");
+        }
+      }
+    );
 
     test("dedupeById: false returns shadowed plugin agents in precedence order", async () => {
       using project = new DisposableTempDir("agent-defs-plugin-project");
