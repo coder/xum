@@ -27,11 +27,14 @@ import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
+  FLUSH_RESERVE_TOKENS,
+  WARNING_RESERVE_TOKENS,
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
   type StepBudgetEvaluation,
   getContextBudgetHardCeiling,
+  getContextBudgetFinalPoint,
   getContextBudgetHandoffPoint,
 } from "@/common/utils/compaction/contextBudget";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
@@ -51,6 +54,7 @@ import {
 } from "../../contextWindowRollover";
 import { resolveAgentForStream, type AgentResolutionResult } from "../../agentResolution";
 import type { SettledStepBudget, SettledStepOutcome } from "../../streamManager";
+import type { OnTurnStartStage, TurnStartStage } from "../../turnRequestBuilder";
 import type { RequestAssemblySnapshot } from "../../events/eventSpine";
 import { createUnknownSendMessageError } from "../../utils/sendMessageError";
 import { log } from "../../log";
@@ -59,6 +63,68 @@ import type { SessionContextHost } from "../sessionContextHost";
 import type { ContinuationEntry, PreparationReceipt } from "../types";
 
 /** Budget policy and window claims; the host retains queue and publication authority. */
+/** A stage is claimed once per window by its warning row in that window's history. */
+function isStageClaimed(messages: readonly MuxMessage[], key: "handoff" | "final"): boolean {
+  return messages.some((row) => {
+    const notice = row.metadata?.muxMetadata;
+    return notice?.type === "context-budget-warning" && notice[key] === true;
+  });
+}
+
+/**
+ * The stage a turn start opens on E (#5286): unclaimed in this window and E at its point. Same
+ * precedence as settlement: the handoff comes first, and a claimed final prompt closes both.
+ */
+export function dueTurnStartStage(
+  budget: Pick<Parameters<OnTurnStartStage>[0], "estimate" | "limit" | "messages">,
+  threshold: number
+): "handoff" | "final" | undefined {
+  const claimed = (key: "handoff" | "final") => isStageClaimed(budget.messages, key);
+  if (threshold >= 1 || claimed("final")) return undefined;
+  if (
+    !claimed("handoff") &&
+    budget.estimate >= getContextBudgetHandoffPoint(budget.limit, threshold)
+  )
+    return "handoff";
+  return budget.estimate >= getContextBudgetFinalPoint(budget.limit) ? "final" : undefined;
+}
+
+type StagePermissions = Pick<
+  Parameters<typeof createContextBudgetWarning>[0],
+  "sessionHistoryAvailable" | "newContextAvailable"
+>;
+
+/** The final prompt asks for new_context, so it is only offered when that tool is. */
+function isStageOffered(
+  stage: "handoff" | "final",
+  permissions: StagePermissions | undefined
+): permissions is StagePermissions {
+  return permissions != null && (stage === "handoff" || permissions.newContextAvailable === true);
+}
+
+/** The stage's warning row, reporting E, and the reserve E′ must leave below the ceiling. */
+function createTurnStartStageRow(
+  stage: "handoff" | "final",
+  budget: Pick<Parameters<OnTurnStartStage>[0], "estimate" | "limit">,
+  threshold: number,
+  permissions: StagePermissions
+): { row: MuxMessage; reserve: number } {
+  const stageFields =
+    stage === "handoff"
+      ? { handoffTokens: getContextBudgetHandoffPoint(budget.limit, threshold), handoff: true }
+      : { final: true };
+  return {
+    row: createContextBudgetWarning({
+      contextTokens: budget.estimate,
+      maxTokens: budget.limit,
+      budgetTokens: getContextBudgetHardCeiling(budget.limit),
+      ...stageFields,
+      ...permissions,
+    }),
+    reserve: stage === "handoff" ? WARNING_RESERVE_TOKENS : FLUSH_RESERVE_TOKENS,
+  };
+}
+
 export class TokenBudgetStrategy {
   // Slider edits cannot expand the budget of a reset that has already been queued.
   private pendingRollover?: ContextWindowRollover & { budgetTokens: number };
@@ -66,6 +132,11 @@ export class TokenBudgetStrategy {
   /** One final prompt per window; derived from history on restart. */
   private contextBudgetFinalClaimed = false;
   private contextBudgetGeneration = 0;
+  /**
+   * The stream whose turn start found a stage due but published none (no room, or no
+   * permissions). Its settlement stops for no stage: the queued Continue would decline it again.
+   */
+  private stageDeclinedStream?: StreamContextSnapshot;
 
   constructor(
     private readonly deps: ContextManagementDependencies,
@@ -102,6 +173,7 @@ export class TokenBudgetStrategy {
     this.pendingRollover = undefined;
     this.contextBudgetHandoffClaimed = false;
     this.contextBudgetFinalClaimed = false;
+    this.stageDeclinedStream = undefined;
     this.host.continuations.withdraw(
       [CONTEXT_CONTINUE_DEDUPE_KEY, CONTEXT_WARNING_DEDUPE_KEY],
       "withdrawn-cut"
@@ -430,46 +502,64 @@ export class TokenBudgetStrategy {
       });
       this.pendingRollover = undefined;
     }
-    if (userMessage.metadata?.muxMetadata?.type === "context-budget-warning") {
-      return Ok({ prefix: [] });
-    }
-    // Advisory capabilities come from the dispatching agent, policy and experiments, so the first
-    // send after a restart (where no step has settled yet, and a text-only reply never settles
-    // one) still publishes its single advisory instead of staying silent until the ceiling.
-    if (knownLimit && this.isActive(options)) {
-      const receipt = this.capturePreparation();
-      const permissions = await this.resolveContextBudgetAdvisoryPermissions(options);
-      // Pending intent only owns the queued Continue. Recompute after awaits: a slider or policy
-      // edit may upgrade, downgrade, or omit the row, and nothing is claimed until publication.
-      // The final prompt asks for new_context, so it is only offered when that tool is.
-      const advisory = evaluateBudget(
-        !this.contextBudgetFinalClaimed && permissions?.newContextAvailable === true
-      );
-      if (
-        permissions &&
-        this.validatePreparation(receipt) &&
-        this.isActive(options) &&
-        (advisory.decision === "handoff" || advisory.decision === "final")
-      ) {
-        return Ok({
-          prefix: [
-            createContextBudgetWarning({
-              contextTokens: advisory.projected,
-              maxTokens: recordedLimit,
-              budgetTokens: getContextBudgetHardCeiling(recordedLimit),
-              ...(advisory.decision === "handoff"
-                ? {
-                    handoffTokens: getContextBudgetHandoffPoint(recordedLimit, threshold),
-                    handoff: true,
-                  }
-                : { final: true }),
-              ...permissions,
-            }),
-          ],
-        });
-      }
-    }
+    // Stage prompts are decided on the built request, at turn start (prepareTurnStartStage).
     return Ok({ prefix: [] });
+  }
+
+  /**
+   * Turn-start stage decision (#5286). A stage prompt is decided and published by the send that
+   * delivers it, in TurnRequestBuilder.start(), from E, the full estimate the turn-start check
+   * counted on the built request. It opens when it is unclaimed in this window (warning rows in
+   * the turn's own messages) and E reaches its point. The builder then counts the request with
+   * the row (E′) and publishes the row only if `fits(E′)`. Due and fit never read saved provider
+   * usage or in-memory claims, so a restart, an edit or a resume decides the same way.
+   */
+  async prepareTurnStartStage(
+    budget: Parameters<OnTurnStartStage>[0],
+    options: SendMessageOptions,
+    publish: (row: MuxMessage) => Promise<boolean>
+  ): Promise<TurnStartStage | undefined> {
+    const threshold = this.resolveThreshold(budget.model);
+    const stage = dueTurnStartStage(budget, threshold);
+    if (stage == null) return undefined;
+    // Declined until published: this stream's settlement then stops for no stage (no churn).
+    const stream = this.host.state.stream;
+    this.stageDeclinedStream = stream;
+    // Advisory capabilities come from the dispatching agent, policy and experiments. Recompute
+    // after the await: a slider or policy edit may omit the row, and nothing is claimed until
+    // publication. The final prompt asks for new_context, so it is only offered with that tool.
+    const receipt = this.capturePreparation();
+    const permissions = await this.resolveContextBudgetAdvisoryPermissions(options);
+    if (!isStageOffered(stage, permissions) || !this.validatePreparation(receipt)) return;
+    if (!this.isActive(options)) return;
+    const { row, reserve } = createTurnStartStageRow(stage, budget, threshold, permissions);
+    const ceiling = getContextBudgetHardCeiling(budget.limit);
+    return {
+      row,
+      fits: (estimate) => estimate + reserve < ceiling,
+      publish: () => this.publishTurnStartStage(row, stream, publish),
+    };
+  }
+
+  private async publishTurnStartStage(
+    row: MuxMessage,
+    stream: StreamContextSnapshot | undefined,
+    publish: (row: MuxMessage) => Promise<boolean>
+  ): Promise<boolean> {
+    const published = await publish(row);
+    if (published && this.stageDeclinedStream === stream) this.stageDeclinedStream = undefined;
+    return published;
+  }
+
+  /** Settlement stops for no stage: none is due, or this turn's start already declined it. */
+  private settlesWithoutStage(
+    decision: StepBudgetEvaluation,
+    context: StreamContextSnapshot | undefined
+  ): boolean {
+    if (decision.decision === "continue") return true;
+    // The declined turn's request only grew since its start, so its Continue would decline again.
+    const stage = decision.decision === "handoff" || decision.decision === "final";
+    return stage && context === this.stageDeclinedStream;
   }
 
   async onContextBudgetStepSettled(step: SettledStepBudget): Promise<SettledStepOutcome> {
@@ -525,7 +615,8 @@ export class TokenBudgetStrategy {
     // A model request is honored like a budget rollover (continuation queued after every sibling
     // settled) so the model never re-executes side effects; the persisted tool result doubles as
     // the durable receipt that prepareRolloverRequest recovers after a restart.
-    if (decision.decision === "continue" && !modelRequested) return { decision: "continue" };
+    if (this.settlesWithoutStage(decision, context) && !modelRequested)
+      return { decision: "continue" };
     // The handoff request and the final prompt are prefix rows: the queued continuation's send
     // re-evaluates the budget, publishes the row, and claims it (prepareContextBudgetSend).
     const prompt =

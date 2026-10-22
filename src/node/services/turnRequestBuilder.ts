@@ -386,6 +386,8 @@ export interface StreamMessageOptions {
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
   onStepSettled?: OnStepSettled;
+  /** Token Budget stage decision on the built request (#5286); see prepareTurnStartStage. */
+  onTurnStartStage?: OnTurnStartStage;
   /**
    * Whether a token-budget rollover could actually be sealed for this request (mode active and
    * automatic rollover threshold below 100%). Gates the new_context tool so a request that
@@ -587,6 +589,8 @@ interface FoldedStreamState<TMessages, TTail> {
   messages: TMessages;
   volatileSystemTail: TTail;
   systemMessageTokens: number;
+  /** The full estimate of `messages`, the stage decision's E (#5286). */
+  contextBudgetEstimate?: number;
 }
 
 /**
@@ -612,6 +616,7 @@ async function foldPendingThinkingOverrides<TMessages, TTail>(
       messages: TMessages;
       volatileSystemTail: TTail;
       systemMessageTokens: number;
+      contextBudgetEstimate?: number;
     }>;
     currentEffectiveLevelRef: { current: ThinkingLevel };
   },
@@ -638,6 +643,7 @@ async function foldPendingThinkingOverrides<TMessages, TTail>(
         messages: rebuilt.messages,
         volatileSystemTail: rebuilt.volatileSystemTail,
         systemMessageTokens: rebuilt.systemMessageTokens,
+        contextBudgetEstimate: rebuilt.contextBudgetEstimate,
       };
     } catch (error) {
       if (error instanceof ContextBudgetExceededError) return { exceeded: error.details };
@@ -651,6 +657,89 @@ async function foldPendingThinkingOverrides<TMessages, TTail>(
     // against the level just applied.
   }
   return state;
+}
+
+/** Called once per primary start() with E, the full estimate of the built request (#5286). */
+export type OnTurnStartStage = (budget: {
+  estimate: number;
+  limit: number;
+  model: string;
+  /** The turn's history rows: their warning rows are this window's stage claims. */
+  messages: readonly MuxMessage[];
+}) => Promise<TurnStartStage | undefined>;
+/** A due, unclaimed stage. `publish` resolves false when the send lost its admission first. */
+export interface TurnStartStage {
+  row: MuxMessage;
+  /** Whether E′, the count of the request with `row` appended, leaves the stage its reserve. */
+  fits: (estimate: number) => boolean;
+  publish: () => Promise<boolean>;
+}
+
+/** What a primary start dispatches: the built request, or the counted candidate with a stage. */
+interface TurnStartPayload<TMessages, TTail> {
+  messages: TMessages;
+  volatileSystemTail: TTail;
+  systemMessageTokens: number;
+  requestHistorySequence: number;
+}
+
+/**
+ * Turn-start Token Budget stage (#5286). Decided on E, the count of the built request. The request
+ * is counted again with the warning row (E′) and the row is published only if E′ leaves the stage
+ * its reserve, so every published prompt is dispatched: the payload sent is the payload counted.
+ * The candidate carries the row in `messages`, so the fallback's and step 0's rebuilds carry it.
+ */
+async function applyTurnStartStage<TMessages, TTail>(input: {
+  onTurnStartStage: OnTurnStartStage | undefined;
+  estimate: number | undefined;
+  limit: number | undefined;
+  model: string;
+  messages: MuxMessage[];
+  rebuild: () => Promise<{
+    messages: TMessages;
+    volatileSystemTail: TTail;
+    systemMessageTokens: number;
+    contextBudgetEstimate?: number;
+  }>;
+  abortSignal: AbortSignal;
+  current: TurnStartPayload<TMessages, TTail>;
+}): Promise<TurnStartPayload<TMessages, TTail>> {
+  const { onTurnStartStage, estimate, limit, messages, current } = input;
+  if (onTurnStartStage == null || estimate == null || limit == null) return current;
+  const stage = await onTurnStartStage({ estimate, limit, model: input.model, messages });
+  if (!stage) return current;
+  messages.push(stage.row);
+  const candidate = await countAndPublishStage(stage, input.rebuild, input.abortSignal);
+  if (!candidate) {
+    messages.pop();
+    return current;
+  }
+  return {
+    messages: candidate.messages,
+    volatileSystemTail: candidate.volatileSystemTail,
+    systemMessageTokens: candidate.systemMessageTokens,
+    requestHistorySequence: stage.row.metadata?.historySequence ?? current.requestHistorySequence,
+  };
+}
+
+/** Counts E′ with the row and publishes it only when it fits and the turn was not stopped. */
+async function countAndPublishStage<TCandidate extends { contextBudgetEstimate?: number }>(
+  stage: TurnStartStage,
+  rebuild: () => Promise<TCandidate>,
+  abortSignal: AbortSignal
+): Promise<TCandidate | undefined> {
+  let candidate: TCandidate;
+  try {
+    candidate = await rebuild();
+  } catch (error) {
+    // A candidate over the ceiling only means the stage does not fit.
+    if (error instanceof ContextBudgetExceededError) return undefined;
+    throw error;
+  }
+  const fits =
+    candidate.contextBudgetEstimate != null && stage.fits(candidate.contextBudgetEstimate);
+  if (!fits || abortSignal.aborted) return undefined;
+  return (await stage.publish()) ? candidate : undefined;
 }
 
 /**
@@ -1374,6 +1463,7 @@ export class TurnRequestBuilder {
       hasQueuedMessages,
       getQueuedInputStopCause,
       onStepSettled,
+      onTurnStartStage,
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
       openaiTruncationModeOverride,
@@ -3424,6 +3514,7 @@ export class TurnRequestBuilder {
           const rebuiltPayload = await assemblePayloadForThinkingLevel(level);
           return {
             messages: rebuiltPayload.messages,
+            contextBudgetEstimate: rebuiltPayload.contextBudgetEstimate,
             systemMessageTokens: sent.tokens,
             volatileSystemTail: rowVolatileSystemTail(
               rebuiltPayload,
@@ -3611,11 +3702,37 @@ export class TurnRequestBuilder {
         messages: finalMessages,
         volatileSystemTail: primaryRequest.volatileSystemTail,
         systemMessageTokens,
+        contextBudgetEstimate: primaryRequest.contextBudgetEstimate,
       });
       if ("exceeded" in streamState) {
         runLanguageModelCleanup(modelResult.data.model);
         return { type: "finished", result: Err(streamState.exceeded) };
       }
+      // Token Budget stage (#5286), decided on E, the count the turn-start check (or the fold)
+      // just took; see applyTurnStartStage.
+      const foldedLevel = streamState.thinkingLevel;
+      const staged = await applyTurnStartStage({
+        onTurnStartStage,
+        estimate: streamState.contextBudgetEstimate,
+        limit: primaryRequest.contextBudgetLimit,
+        model: modelString,
+        messages,
+        rebuild: () => primaryRequest.rebuildMessagesForThinkingLevel(foldedLevel),
+        abortSignal: combinedAbortSignal,
+        current: {
+          messages: streamState.messages,
+          volatileSystemTail: streamState.volatileSystemTail,
+          systemMessageTokens: streamState.systemMessageTokens,
+          requestHistorySequence,
+        },
+      });
+      ({ requestHistorySequence } = staged);
+      streamState = {
+        ...streamState,
+        messages: staged.messages,
+        volatileSystemTail: staged.volatileSystemTail,
+        systemMessageTokens: staged.systemMessageTokens,
+      };
       ({ systemMessageTokens } = streamState);
       if (combinedAbortSignal.aborted)
         return {

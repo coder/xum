@@ -6904,6 +6904,34 @@ export class AgentSession {
     }
   }
 
+  /**
+   * Publishes a turn-start stage warning (#5286) after the turn's user row, under the send's
+   * admission like the user row itself, unless the start was superseded or stopped first.
+   */
+  private async publishTurnStartStage(
+    row: MuxMessage,
+    admissionCapture: CompactionReplacementCapture | undefined,
+    isStreamStartAborted: () => boolean,
+    stopFence: () => boolean
+  ): Promise<boolean> {
+    if (!admissionCapture) return false;
+    const accepted = await this.historyService
+      .acceptCompactionReplacement(
+        this.workspaceId,
+        admissionCapture,
+        { kind: "append", messages: [row], preserveCancellation: true },
+        {
+          isCurrent: () => !isStreamStartAborted() && stopFence(),
+          onCommitted: () => undefined,
+        }
+      )
+      .catch((error: unknown) => Err(getErrorMessage(error)));
+    if (!accepted.success || accepted.data.kind !== "accepted") return false;
+    this.emitChatEvent({ ...row, type: "message" });
+    this.contextController.onSendAccepted(row, []);
+    return true;
+  }
+
   private async appendContextRolloverRows(
     rows: MuxMessage[],
     publish: () => Promise<Result<void>> = async () => {
@@ -9159,6 +9187,11 @@ export class AgentSession {
           kind: "starting",
           stream: { options },
         }),
+        // The stage warning follows the user row (#5286). It is published under this send's
+        // admission, like the user row itself, unless the start was superseded or stopped.
+        onTurnStartStage: this.contextController.turnStartStage(options, (row) =>
+          this.publishTurnStartStage(row, admissionCapture, isStreamStartAborted, stopFence)
+        ),
         openaiTruncationModeOverride,
         ...this.compactionRetryInputBudget(),
         compactionContextRetryAvailable: this.hasCompactionContextRetry(),

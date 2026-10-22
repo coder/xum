@@ -86,7 +86,13 @@ import * as agentResolution from "./agentResolution";
 import * as turnContextAssembler from "./turnContextAssembler";
 import { resolveCompactionInputBudgetTokens } from "./turnRequestBuilder";
 import * as messagePipeline from "./messagePipeline";
+import type { OnTurnStartStage } from "./turnRequestBuilder";
+import { TokenBudgetStrategy } from "./contextManagement/strategies/tokenBudget";
+import type { ContextManagementDependencies } from "./contextManagement/contextManagementService";
+import type { SessionContextHost } from "./contextManagement/sessionContextHost";
+import type { CompactionHandler } from "./compactionHandler";
 import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
+import * as budgetCountingModule from "./contextBudgetCounting";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { compactToolInputSchema } from "@/node/services/toolSchemaCompactionMiddleware";
@@ -1327,6 +1333,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     resolveAndCreateModelSpy: ResolveAndCreateModelSpy;
     streamManager: StreamManager;
     providerService: ProviderService;
+    historyService: HistoryService;
   }
 
   function initialMetadataFromStartStreamCall(
@@ -1437,6 +1444,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       resolveAndCreateModelSpy,
       streamManager,
       providerService,
+      historyService,
     };
   }
 
@@ -2570,6 +2578,201 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       unregister();
       removeLive?.();
     }
+  });
+
+  // #5286: TurnRequestBuilder.start() decides a Token Budget stage from E, the count of the built
+  // request, counts the request with the warning row appended (E′), and dispatches that payload
+  // only when the stage fits. The real stage policy decides due, claims and fit.
+  describe("turn-start Token Budget stages (#5286)", () => {
+    // Puts the handoff point (100 tokens of the 1M window) below these small requests.
+    const DUE_SLIDER = 0.0001;
+    const USER_TEXT = "continue the deployment";
+    const sendOptions = { model: KNOWN_MODELS.SONNET.id, agentId: "exec" };
+
+    async function runStageTurn(
+      xumHomePath: string,
+      options: {
+        slider?: number;
+        /** false: send without a stage callback (the baseline without Token Budget stages). */
+        stageCallback?: boolean;
+        /** Runs after the candidate count, before the stage is published. */
+        afterCandidate?: () => void;
+        abortController?: AbortController;
+        activeTurnThinkingOverride?: ActiveTurnThinkingOverride;
+      } = {}
+    ) {
+      const metadata = createLocalWorkspaceMetadata("turn-start-stage", xumHomePath);
+      const harness = createHarness(xumHomePath, metadata, {
+        experimentsService: await experimentsServiceWith(xumHomePath, [
+          EXPERIMENT_IDS.TOKEN_BUDGET,
+          EXPERIMENT_IDS.MEMORY,
+        ]),
+      });
+      // Real history and real provider messages: the dispatched payload is what a provider gets.
+      spyOn(harness.historyService, "appendToHistory").mockRestore();
+      spyOn(messagePipeline, "prepareMessagesForProvider").mockRestore();
+      const user = createMuxMessage("user-1", "user", USER_TEXT);
+      expect((await harness.historyService.appendToHistory(metadata.id, user)).success).toBe(true);
+      const read = await harness.historyService.getHistoryFromLatestBoundary(metadata.id);
+      if (!read.success) throw new Error(read.error);
+      // A fresh policy holds no in-memory claims, as after a restart.
+      const strategy = new TokenBudgetStrategy(
+        {
+          aiService: harness.service,
+          config: harness.config,
+        } as unknown as ContextManagementDependencies,
+        { workspaceId: metadata.id, state: {} } as unknown as SessionContextHost,
+        () => options.slider ?? DUE_SLIDER,
+        {} as unknown as CompactionHandler,
+        () => true
+      );
+      const estimates: number[] = [];
+      const measured: number[] = [];
+      let offered: MuxMessage | undefined;
+      let publishCalls = 0;
+      const onTurnStartStage: OnTurnStartStage = async (budget) => {
+        estimates.push(budget.estimate);
+        const stage = await strategy.prepareTurnStartStage(budget, sendOptions, async (row) => {
+          publishCalls += 1;
+          return (await harness.historyService.appendToHistory(metadata.id, row)).success;
+        });
+        if (!stage) return undefined;
+        offered = stage.row;
+        return {
+          ...stage,
+          fits: (estimate) => {
+            measured.push(estimate);
+            options.afterCandidate?.();
+            return stage.fits(estimate);
+          },
+        };
+      };
+      // Call-through spies: how many assemblies and full counts the turn ran.
+      const assemblies = spyOn(turnContextAssembler, "assemblePromptPayload");
+      const counts = spyOn(budgetCountingModule, "measureAssembledRequestBudgetForModel");
+      const result = await harness.service.streamMessage({
+        messages: read.data,
+        workspaceId: metadata.id,
+        modelString: KNOWN_MODELS.SONNET.id,
+        thinkingLevel: "off",
+        ...(options.stageCallback === false ? {} : { onTurnStartStage }),
+        ...(options.abortController ? { abortSignal: options.abortController.signal } : {}),
+        ...(options.activeTurnThinkingOverride
+          ? { activeTurnThinkingOverride: options.activeTurnThinkingOverride }
+          : {}),
+      });
+      const assemblyCalls = assemblies.mock.calls.length;
+      const countOptions = counts.mock.calls.map(([, countOption]) => countOption);
+      assemblies.mockRestore();
+      counts.mockRestore();
+      expect(result.success).toBe(true);
+      const history = await harness.historyService.getHistoryFromLatestBoundary(metadata.id);
+      if (!history.success) throw new Error(history.error);
+      return {
+        assemblyCalls,
+        countOptions,
+        sent: harness.startStreamCalls.at(0),
+        estimates,
+        measured,
+        offered,
+        publishCalls: () => publishCalls,
+        history: history.data,
+      };
+    }
+
+    const isWarning = (row: MuxMessage) =>
+      row.metadata?.muxMetadata?.type === "context-budget-warning";
+    // The dispatched conversation as the model reads it (consecutive user rows are merged).
+    const conversationText = (sent: TurnExecutionOptions) =>
+      sent.messages
+        .filter((message) => message.role !== "system")
+        .flatMap((message) =>
+          typeof message.content === "string"
+            ? [message.content]
+            : message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
+        )
+        .join("\n");
+    const warningTextOf = (row: MuxMessage) =>
+      row.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("");
+    // A fresh count of dispatched messages, with the options of the turn-start check.
+    const countRequest = async (
+      turn: Awaited<ReturnType<typeof runStageTurn>>,
+      messages: TurnExecutionOptions["messages"]
+    ) =>
+      (await budgetCountingModule.estimateAssembledRequestTokensForModel(
+        { system: turn.sent!.system, messages, tools: turn.sent!.tools },
+        turn.countOptions[0]
+      ))!.estimate;
+
+    it("publishes the warning after the user row and dispatches the payload it counted", async () => {
+      using xumHome = new DisposableTempDir("ai-turn-start-stage-opens");
+      const turn = await runStageTurn(xumHome.path);
+      const row = turn.offered!;
+      expect(row.metadata?.muxMetadata).toMatchObject({ handoff: true });
+      const sent = turn.sent!;
+      // The dispatched conversation ends with the user text, then the warning text, once.
+      const conversation = conversationText(sent);
+      expect(conversation.endsWith(warningTextOf(row))).toBe(true);
+      expect(conversation.split(warningTextOf(row))).toHaveLength(2);
+      expect(conversation.indexOf(USER_TEXT)).toBeLessThan(
+        conversation.indexOf(warningTextOf(row))
+      );
+      // History holds [user, warning, assistant], and the assistant answers the warning.
+      expect(turn.history.map((message) => message.id)).toEqual(["user-1", row.id, sent.messageId]);
+      expect(turn.history[2].metadata?.requestHistorySequence).toBe(
+        turn.history[1].metadata?.historySequence
+      );
+      // E′ is a fresh count of exactly the dispatched payload, and the row reports E.
+      expect(turn.measured).toEqual([await countRequest(turn, sent.messages)]);
+      expect(turn.measured[0]).toBeGreaterThan(turn.estimates[0]);
+      expect(row.metadata?.muxMetadata).toMatchObject({ contextTokens: turn.estimates[0] });
+    });
+
+    it("a stage that is not due adds no assembly and no count", async () => {
+      using xumHome = new DisposableTempDir("ai-turn-start-stage-not-due");
+      const baseline = await runStageTurn(path.join(xumHome.path, "baseline"), {
+        stageCallback: false,
+      });
+      // A 50% slider puts the handoff point far above this request.
+      const notDue = await runStageTurn(path.join(xumHome.path, "not-due"), { slider: 0.5 });
+      // Non-vacuous: the stage decision ran and declined.
+      expect(notDue.estimates).toHaveLength(1);
+      expect(notDue.offered).toBeUndefined();
+      expect(baseline.countOptions.length).toBeGreaterThan(0);
+      expect({ assemblies: notDue.assemblyCalls, counts: notDue.countOptions.length }).toEqual({
+        assemblies: baseline.assemblyCalls,
+        counts: baseline.countOptions.length,
+      });
+      expect(notDue.sent!.messages).toEqual(baseline.sent!.messages);
+    });
+
+    it("a Stop after the candidate count writes no warning", async () => {
+      using xumHome = new DisposableTempDir("ai-turn-start-stage-stop-before-publish");
+      const abortController = new AbortController();
+      const turn = await runStageTurn(xumHome.path, {
+        abortController,
+        afterCandidate: () => abortController.abort(),
+      });
+      // Non-vacuous: the candidate was counted and would have fit.
+      expect(turn.offered).toBeDefined();
+      expect(turn.measured).toHaveLength(1);
+      expect(turn.publishCalls()).toBe(0);
+      expect(turn.sent).toBeUndefined();
+      expect(turn.history.filter(isWarning)).toHaveLength(0);
+    });
+
+    it("a pre-stream thinking fold runs before the stage, which is counted at the folded level", async () => {
+      using xumHome = new DisposableTempDir("ai-turn-start-stage-thinking-fold");
+      const override: ActiveTurnThinkingOverride = { pending: "high" };
+      const turn = await runStageTurn(xumHome.path, { activeTurnThinkingOverride: override });
+      expect(override.applied).toBe("high");
+      const sent = turn.sent!;
+      expect(sent.thinkingLevel).toBe("high");
+      expect(conversationText(sent).endsWith(warningTextOf(turn.offered!))).toBe(true);
+      // No count after the stage's own: the dispatched payload is the counted candidate.
+      expect(turn.measured).toEqual([await countRequest(turn, sent.messages)]);
+      expect(turn.countOptions.length).toBe(3);
+    });
   });
 
   it("emits startup breadcrumbs as runtime-status events before stream start", async () => {
