@@ -9,14 +9,15 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as prettier from "prettier";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
+import { SessionFilesMemory } from "./memorySessionFiles.testHarness";
 import { runGoldenScript, STEPS, type GoldenSnapshot } from "./goldenScript.testHarness";
 
 const FIXTURE = path.join(import.meta.dir, "__fixtures__", "historyFiles.golden.json");
 
 test("today's code writes the golden session folder", async () => {
-  const { historyService, config, cleanup } = await createTestHistoryService();
+  const { historyService, config, files, cleanup } = await createTestHistoryService();
   try {
-    const snapshots = await runGoldenScript(historyService, config, STEPS);
+    const snapshots = await runGoldenScript(historyService, config, STEPS, files);
     if (process.env.UPDATE_GOLDEN === "1") {
       // Format like `make fmt` does, so fmt-check accepts the recorded fixture as is.
       const options = await prettier.resolveConfig(FIXTURE);
@@ -31,6 +32,35 @@ test("today's code writes the golden session folder", async () => {
     const fixture = JSON.parse(await fs.readFile(FIXTURE, "utf8")) as GoldenSnapshot[];
     // toEqual reports the first differing step, listing entry or file content.
     expect(snapshots).toEqual(fixture);
+  } finally {
+    await cleanup();
+  }
+});
+
+/** Every file under root on the host disk, relative to root. */
+async function listHostFiles(root: string): Promise<string[]> {
+  const entries = await fs
+    .readdir(root, { recursive: true, withFileTypes: true })
+    .catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+  return entries
+    .filter((entry) => !entry.isDirectory())
+    .map((entry) => path.relative(root, path.join(entry.parentPath, entry.name)))
+    .sort();
+}
+
+// A history write that skips SessionFiles lands in the real temp folder instead of the volume.
+test("the memory layer writes the golden bytes and nothing on disk", async () => {
+  const { historyService, config, files, tempDir, cleanup } = await createTestHistoryService({
+    files: SessionFilesMemory,
+  });
+  try {
+    const snapshots = await runGoldenScript(historyService, config, STEPS, files);
+    const fixture = JSON.parse(await fs.readFile(FIXTURE, "utf8")) as GoldenSnapshot[];
+    expect(snapshots).toEqual(fixture);
+    expect(await listHostFiles(path.join(tempDir, "sessions"))).toEqual([]);
   } finally {
     await cleanup();
   }

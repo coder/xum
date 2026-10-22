@@ -12,7 +12,6 @@
  * RANDOM_FIELDS differ between runs.
  */
 import assert from "node:assert/strict";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ContinuousCompactionJournal } from "@/common/orpc/schemas/continuousCompaction";
 import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
@@ -22,6 +21,7 @@ import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCom
 import type { Config } from "@/node/config";
 import { CompactionPendingState } from "@/node/services/compactionPendingState";
 import type { HistoryService } from "@/node/services/historyService";
+import type { SessionFiles } from "./sessionFiles";
 
 export const GOLDEN_WORKSPACE_ID = "golden-history-files";
 
@@ -306,23 +306,27 @@ export function normalizeSessionFile(name: string, text: string): string {
   return JSON.stringify(parsed);
 }
 
-async function listRecursive(root: string, relative = ""): Promise<string[]> {
-  const entries = await fs.readdir(path.join(root, relative), { withFileTypes: true });
+async function listRecursive(files: SessionFiles, root: string, relative = ""): Promise<string[]> {
+  const entries = await files.promises.readdir(path.join(root, relative), { withFileTypes: true });
   const names: string[] = [];
   for (const entry of entries) {
     const name = path.posix.join(relative, entry.name);
-    if (entry.isDirectory()) names.push(`${name}/`, ...(await listRecursive(root, name)));
+    if (entry.isDirectory()) names.push(`${name}/`, ...(await listRecursive(files, root, name)));
     else names.push(name);
   }
   return names;
 }
 
-async function snapshotFolder(step: string, sessionDir: string): Promise<GoldenSnapshot> {
-  const listing = (await listRecursive(sessionDir)).sort();
+async function snapshotFolder(
+  sessionFiles: SessionFiles,
+  step: string,
+  sessionDir: string
+): Promise<GoldenSnapshot> {
+  const listing = (await listRecursive(sessionFiles, sessionDir)).sort();
   const files: Record<string, string> = {};
   for (const name of listing) {
     if (name.endsWith("/")) continue;
-    const bytes = await fs.readFile(path.join(sessionDir, name));
+    const bytes = await sessionFiles.promises.readFile(path.join(sessionDir, name));
     const text = bytes.toString("utf8");
     // The fixture stores text, so it must decode back to the same bytes.
     assert(Buffer.from(text, "utf8").equals(bytes), `${name} is not valid UTF-8`);
@@ -331,17 +335,21 @@ async function snapshotFolder(step: string, sessionDir: string): Promise<GoldenS
   return { step, listing, files };
 }
 
-/** Run the steps in order on a fresh HistoryService and snapshot the session folder after each. */
+/**
+ * Run the steps in order on a fresh HistoryService and snapshot the session folder after each.
+ * The snapshots read through `files`, the SessionFiles that historyService writes to.
+ */
 export async function runGoldenScript(
   historyService: HistoryService,
   config: Config,
-  steps: readonly GoldenStep[]
+  steps: readonly GoldenStep[],
+  files: SessionFiles
 ): Promise<GoldenSnapshot[]> {
   const context = goldenStepContext(historyService, config);
   const snapshots: GoldenSnapshot[] = [];
   for (const step of steps) {
     await step.run(context);
-    snapshots.push(await snapshotFolder(step.name, context.sessionDir));
+    snapshots.push(await snapshotFolder(files, step.name, context.sessionDir));
   }
   return snapshots;
 }
