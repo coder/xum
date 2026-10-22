@@ -9,8 +9,6 @@ import { createWorkspaceServiceForTest } from "@/node/services/workspaceService.
 import { subscribeWorkspaceChat } from "@/node/orpc/routerSubscriptions";
 import { markSessionTapeReplayEgressBlocked } from "@/common/utils/sessionTapes/sessionTapeReplay";
 import type { ORPCContext } from "@/node/orpc/context";
-import { CUSTOM_EVENTS } from "@/common/constants/events";
-import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
 import { getInterruptionContext } from "@/common/utils/messages/retryEligibility";
 import type { TurnCoordinator, OperationId } from "@/node/services/turnCoordinator";
 import { Ok } from "@/common/types/result";
@@ -1018,12 +1016,10 @@ describe("WorkspaceStore", () => {
   it.each([false, true])(
     "suppresses recorded side effects when the renderer replays a session tape (%p)",
     async (replaying) => {
-      // A replayed tape's events never ran here: no gateway dialog, no git/review refresh.
+      // A replayed tape's events never ran here: no git/review refresh.
       const workspaceId = `tape-side-effects-${String(replaying)}`;
       const api = global.window.api as { isSessionTapeReplay?: boolean };
       api.isSessionTapeReplay = replaying;
-      const dispatchEvent = global.window.dispatchEvent as Mock<(event: Event) => boolean>;
-      dispatchEvent.mockClear();
       try {
         const send = openChat(workspaceId);
         createAndAddWorkspace(store, workspaceId);
@@ -1042,17 +1038,13 @@ describe("WorkspaceStore", () => {
           {
             type: "stream-error",
             messageId,
-            error: MUX_GATEWAY_SESSION_EXPIRED_MESSAGE,
+            error: "Unauthorized",
             errorType: "authentication",
           }
         );
         expect(
           await waitUntil(() => store.getWorkspaceState(workspaceId).messages.length > 0)
         ).toBe(true);
-        const gatewayDialogs = dispatchEvent.mock.calls.filter(
-          ([event]) => event.type === CUSTOM_EVENTS.MUX_GATEWAY_SESSION_EXPIRED
-        );
-        expect(gatewayDialogs.length).toBe(replaying ? 0 : 1);
         expect(store.getFileModifyingToolMs(workspaceId) === undefined).toBe(replaying);
       } finally {
         delete api.isSessionTapeReplay;

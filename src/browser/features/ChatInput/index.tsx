@@ -687,10 +687,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Track transcription provider prerequisites from Settings → Providers.
   const [openAIKeySet, setOpenAIKeySet] = useState(false);
   const [openAIProviderEnabled, setOpenAIProviderEnabled] = useState(true);
-  const [muxGatewayCouponSet, setMuxGatewayCouponSet] = useState(false);
-  const [muxGatewayEnabled, setMuxGatewayEnabled] = useState(true);
-  const isTranscriptionAvailable =
-    (openAIProviderEnabled && openAIKeySet) || (muxGatewayEnabled && muxGatewayCouponSet);
+  const isTranscriptionAvailable = openAIProviderEnabled && openAIKeySet;
 
   // Voice input - appends transcribed text to input
   const voiceInput = useVoiceInput({
@@ -710,7 +707,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   });
 
   const voiceInputUnavailableMessage =
-    "Voice input requires a Xum Gateway login or an OpenAI API key. Configure in Settings → Providers.";
+    "Voice input requires an OpenAI API key. Configure in Settings → Providers.";
 
   // Start creation tutorial when entering creation mode
   useEffect(() => {
@@ -1576,8 +1573,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           if (!signal.aborted) {
             setOpenAIKeySet(config?.openai?.apiKeySet ?? false);
             setOpenAIProviderEnabled(config?.openai?.isEnabled ?? true);
-            setMuxGatewayCouponSet(config?.["mux-gateway"]?.couponCodeSet ?? false);
-            setMuxGatewayEnabled(config?.["mux-gateway"]?.isEnabled ?? true);
           }
         },
         () => {
