@@ -134,6 +134,61 @@ async function readJson(file: string): Promise<unknown> {
   return JSON.parse(await fs.readFile(file, "utf8"));
 }
 
+/** A snapshot with one long animation frame that ran `scripts`: [sourceURL, invoker, type]. */
+function loafSnapshot(scripts: Array<[string, string, string]>): FlightRecorderSnapshot {
+  const toScript = ([sourceURL, invoker, invokerType]: [string, string, string]) => ({
+    sourceURL,
+    sourceFunctionName: "f",
+    sourceCharPosition: 0,
+    invoker,
+    invokerType,
+    durationMs: 60,
+    forcedStyleAndLayoutDurationMs: 0,
+  });
+  const frame = { rendererId: "r1", startMs: 1000, durationMs: 120, blockingDurationMs: 70 };
+  return snapshot({
+    renderer: {
+      loaf: [
+        { ...frame, renderStartMs: 0, styleAndLayoutStartMs: 0, scripts: scripts.map(toScript) },
+      ],
+      events: [],
+      droppedLoaf: 0,
+      droppedEvents: 0,
+    },
+  });
+}
+
+/** Reports a profile naming `urls` and `recorded`; returns the copied URLs and LoAF scripts. */
+async function reportUrls(
+  urls: string[],
+  recorded: FlightRecorderSnapshot,
+  overrides: Partial<PerfReportServiceOptions> = {}
+) {
+  await writeProfile(
+    "c-urls",
+    JSON.stringify({ nodes: urls.map((url) => ({ callFrame: { url } })) })
+  );
+  captures.unshift(captureMetadata("c-urls", 2000));
+  const report = await createService({
+    recorder: {
+      getSnapshot: () => recorded,
+      getStatus: () => ({ enabled: true, state: "collecting" }),
+    },
+    ...overrides,
+  }).createReport();
+  const copy = (await readJson(path.join(report.dir, "captures/c-urls.cpuprofile"))) as {
+    nodes: Array<{ callFrame: { url: string } }>;
+  };
+  const written = (await readJson(
+    path.join(report.dir, "snapshot.json")
+  )) as FlightRecorderSnapshot;
+  return {
+    dir: report.dir,
+    urls: copy.nodes.map((node) => node.callFrame.url),
+    scripts: written.renderer.loaf[0]?.scripts.map((script) => [script.sourceURL, script.invoker]),
+  };
+}
+
 describe("PerfReportService", () => {
   test("publishes a private bundle with the snapshot, trace, environment and captures", async () => {
     captures = [captureMetadata("c-new", 3000), captureMetadata("c-skip", 2000, false)];
@@ -420,6 +475,25 @@ describe("PerfReportService", () => {
     // The prefix is copied unchanged: the url value's opening quote sits at MiB - 2.
     expect(copyText.indexOf('"url":"') + '"url":'.length).toBe(MiB - 2);
     expect(copyText).not.toContain(SECRET_QUERY);
+  });
+
+  test("leaves script paths outside the home folder as they are", async () => {
+    // Only paths below the home folder can name the user's folders; rewriting others would
+    // cost attribution for nothing.
+    const outside = ["file:///opt/xum/dist/a.js", "/opt/xum/node_modules/zod/b.js", "node:fs"];
+    const label = `click at ${outside[0]}:1:2`;
+    const out = await reportUrls(
+      outside,
+      loafSnapshot([
+        [outside[0], outside[0], "classic-script"],
+        [outside[1], label, "event-listener"],
+      ])
+    );
+    expect(out.urls).toEqual(outside);
+    expect(out.scripts).toEqual([
+      [outside[0], outside[0]],
+      [outside[1], label],
+    ]);
   });
 
   test("skips a profile whose size no longer matches its metadata", async () => {
