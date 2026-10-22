@@ -10,8 +10,9 @@
  */
 import { expect, unique } from "e2e";
 import { z } from "zod";
-import { disableTutorials, WORKSPACE_TITLE } from "../bugbash/repros/helpers";
+import { disableTutorials } from "../bugbash/repros/helpers";
 import { test } from "./fixtures";
+import { openPlayground } from "./helpers";
 
 const TURN_OFF = /^Turn off PreToolUse hook MCP tool guard \/ check_command/;
 const TRUST = /^Trust PreToolUse hook MCP tool guard \/ check_command/;
@@ -29,9 +30,11 @@ test(
 
     await disableTutorials(app);
     await app.open();
-    await agent.act(
-      `open the '${WORKSPACE_TITLE}' workspace, then open the file 'plugin-sources.md' in its Artifacts tab`
-    );
+    // exact steps: Haiku 5.5 tapped the Outputs row as it re-rendered, then found no Artifacts
+    // tab (PR lane, run 39670599114; 1 of 5 local runs). The row of RightSidebarOverview.tsx.
+    await openPlayground(screen);
+    await screen.getByRole("region", "Outputs").getByRole("button", "plugin-sources.md").tap();
+    await expect(screen.getByTestId("artifacts-panel")).toBeVisible({ timeout: 15_000 });
     // The clipboard is blocked in the sandbox, so the agent reads the path and types it later.
     const { path } = await agent.extract(
       "the local path listed for the hook-guard plugin in 'plugin-sources.md'",
