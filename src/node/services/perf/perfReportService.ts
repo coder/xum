@@ -171,14 +171,13 @@ function findAppRoot(dir: string): string | null {
   return null;
 }
 
-/**
- * A script path or file URL below home, naming none of the user's folders (project, branch;
- * #7125): `<xum>/<path in the app>`, `~/<dir>/node_modules/<package>/...` or `~/<dir>/<name>`.
- * The analyzer needs these parts to find source maps and to tell app code from dependencies.
- */
+/** A script path below home without the user's folder names (#7125). The analyzer needs the
+ * app path and package names: `<xum>/...`, `~/<dir>/node_modules/...` or `~/<dir>/<name>`. */
 function placeholderPath(value: string, scrub: PathScrub): string {
   const scheme = value.startsWith("file://") ? "file://" : "";
-  const rest = scheme === "" ? value.replaceAll("\\", "/") : value.slice(scheme.length);
+  // Keeps a UNC home's host (`file://server/...`); URL parsing already dropped `localhost`.
+  const rest =
+    scheme === "" ? value.replaceAll("\\", "/") : value.slice(5).replace(/^\/\/(?=\/)/, "");
   const below = (prefixes: readonly string[]) => {
     const lower = rest.toLowerCase();
     const prefix = prefixes.find((p) => lower.startsWith(p) && rest[p.length] === "/");
@@ -374,10 +373,9 @@ developer if you choose to.
 
 It contains no chat content, prompts, tool payloads, session tapes or
 environment variables. Script URLs keep only scheme, host and path (other URLs
-only their scheme). Script paths below your home folder name none of your
-folders: Xum's own files are written as "<xum>/...", dependencies as
-"~/<dir>/node_modules/...", and other files as "~/<dir>/<file name>". In other
-text, your home folder is written as "~".
+only their scheme). Script paths below your home folder name no folders: Xum's
+files read "<xum>/...", dependencies "~/<dir>/node_modules/...", other files
+"~/<dir>/<name>". Other text writes your home folder as "~".
 
 Files
 -----
@@ -501,7 +499,6 @@ export class PerfReportService {
 
   private async writeBundle(dir: string): Promise<Omit<PerfReportResult, "dir" | "revealed">> {
     const snapshot = sanitizeSnapshot(this.options.recorder.getSnapshot(), this.scrub);
-    const { spellings } = this.scrub;
     const status = this.options.recorder.getStatus();
     const hooks = this.desktopHooks;
     // Re-parsed here so a metadata object can never carry fields beyond the schema.
@@ -514,13 +511,11 @@ export class PerfReportService {
       .slice(PERF_REPORT_MAX_CAPTURES)
       .map((metadata) => ({ metadata, reason: "count-cap" }));
 
+    const trace = buildPerfTrace({ snapshot, captures: candidates });
     const fixedFiles = new Map<string, string>([
       ["snapshot.json", JSON.stringify(snapshot, null, 2)],
       // skippedReason ("failed: <error>") can quote a path; copyCapture scrubs its copy too.
-      [
-        "trace.json",
-        scrubHome(JSON.stringify(buildPerfTrace({ snapshot, captures: candidates })), spellings),
-      ],
+      ["trace.json", scrubHome(JSON.stringify(trace), this.scrub.spellings)],
       ["environment.json", JSON.stringify(this.environment(status, hooks !== null), null, 2)],
       ["README.txt", README],
     ]);

@@ -138,25 +138,19 @@ async function readJson(file: string): Promise<unknown> {
 
 /** A snapshot with one long animation frame that ran `scripts`: [sourceURL, invoker, type]. */
 function loafSnapshot(scripts: Array<[string, string, string]>): FlightRecorderSnapshot {
-  const toScript = ([sourceURL, invoker, invokerType]: [string, string, string]) => ({
+  const base = { sourceFunctionName: "f", sourceCharPosition: 0, durationMs: 60 };
+  const toScript = ([sourceURL, invoker, invokerType]: string[]) => ({
+    ...base,
+    forcedStyleAndLayoutDurationMs: 0,
     sourceURL,
-    sourceFunctionName: "f",
-    sourceCharPosition: 0,
     invoker,
     invokerType,
-    durationMs: 60,
-    forcedStyleAndLayoutDurationMs: 0,
   });
-  const frame = { rendererId: "r1", startMs: 1000, durationMs: 120, blockingDurationMs: 70 };
+  const frame = { rendererId: "r1", startMs: 1000, durationMs: 120, renderStartMs: 0 };
+  const loaf = { ...frame, blockingDurationMs: 70, styleAndLayoutStartMs: 0 };
+  const renderer = { events: [], droppedLoaf: 0, droppedEvents: 0 };
   return snapshot({
-    renderer: {
-      loaf: [
-        { ...frame, renderStartMs: 0, styleAndLayoutStartMs: 0, scripts: scripts.map(toScript) },
-      ],
-      events: [],
-      droppedLoaf: 0,
-      droppedEvents: 0,
-    },
+    renderer: { ...renderer, loaf: [{ ...loaf, scripts: scripts.map(toScript) }] },
   });
 }
 
@@ -520,7 +514,6 @@ describe("PerfReportService", () => {
       loafSnapshot([[cases[0][0], `click at ${cases[2][0]}:1:2`, "event-listener"]]),
       { appRoot }
     );
-
     expect(out.urls).toEqual(cases.map(([, expected]) => expected));
     expect(out.scripts).toEqual([[cases[0][1], `click at ${cases[2][1]}:1:2`]]);
     for (const file of await listFiles(out.dir)) {

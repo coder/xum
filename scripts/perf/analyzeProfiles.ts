@@ -90,8 +90,8 @@ Options:
   --map-dir <dir>      Directory with source maps named <script basename>.map, for example a local
                        build of the same commit (repeatable). Local scripts are also mapped through
                        their sourceMappingURL comment or a sibling .map file.
-  --app-root <dir>     Checkout or install that a report bundle's <xum>/... script paths name, for
-                       example a local build of the same commit.
+  --app-root <dir>     Checkout or install for a report bundle's <xum>/... script paths. Diff mode:
+                       the baseline uses it only without --baseline-map-dir.
   --help               Show this help.
 
 Exit status: 0 on success, 1 when no valid profile was read on a required side, 2 on usage errors.`;
@@ -227,14 +227,10 @@ function isNetworkPath(path: string): boolean {
   return /^[\\/]{2}/.test(path);
 }
 
-/** --app-root: the checkout or install that a bundle's `<xum>/...` script paths name. */
-let appRoot: string | undefined;
-
 /** Local file path of a script URL; undefined for remote, network or unparseable locations. */
-function scriptPath(url: string): string | undefined {
+function scriptPath(url: string, appRoot?: string): string | undefined {
   let path: string | undefined;
-  // A newer bundle writes Xum's own files as `<xum>/<path in the app>` (#7125). A malformed
-  // escape throws; the resolver reports it as a warning.
+  // A report bundle writes Xum's files as `<xum>/...` (#7125). A bad escape throws: a warning.
   const app = /^(?:file:\/\/)?<xum>\//.exec(url);
   if (app !== null) {
     const parts = url.slice(app[0].length).split("/").map(decodeURIComponent);
@@ -309,9 +305,9 @@ function fileMapSource(mapPath: string, fromMapDir = false): MapSource {
 }
 
 /** Map candidates in lookup order: sourceMappingURL comment, sibling .map, then --map-dir entries. */
-function mapSources(url: string, mapDirs: string[]): MapSource[] {
+function mapSources(url: string, mapDirs: string[], appRoot?: string): MapSource[] {
   const sources: MapSource[] = [];
-  const script = scriptPath(url);
+  const script = scriptPath(url, appRoot);
   if (script !== undefined && existsSync(script) && statSync(script).isFile()) {
     const scriptDir = dirname(script);
     const text = readFileSync(script, "utf8");
@@ -378,7 +374,8 @@ function createResolver(
   warnings: string[],
   flag = "--map-dir",
   /** Advice for a map name found in several directories; depends on the mode and the flag. */
-  duplicateAdvice = "keep only the directory of the profiled build"
+  duplicateAdvice = "keep only the directory of the profiled build",
+  appRoot?: string
 ): { resolve: SourceResolver; finish: () => void } {
   const cwd = process.cwd();
   const lookedUp = new Set<string>();
@@ -392,7 +389,7 @@ function createResolver(
     const name = scriptBasename(url);
     let candidates: MapSource[] = [];
     try {
-      candidates = mapSources(url, mapDirs);
+      candidates = mapSources(url, mapDirs, appRoot);
     } catch (error) {
       warnings.push(
         `${name ?? url}: cannot read script for its source map: ${errorMessage(error)}`
@@ -525,7 +522,6 @@ function main(): number {
         throw new UsageError(`${flag} is not a directory: ${dir}`);
     }
   }
-  appRoot = values["app-root"];
   const options: ReportOptions = {
     top: parsePositiveNumber(values.top, "--top", 25, true),
     sort,
@@ -560,7 +556,8 @@ function main(): number {
     "--map-dir",
     baselinePaths.length > 0 && !baselineMapDirs
       ? "pass the baseline's maps with --baseline-map-dir"
-      : "keep only the directory of the profiled build"
+      : "keep only the directory of the profiled build",
+    values["app-root"]
   );
   const identify = createFrameIdentifier(resolver.resolve);
   const baselineResolver = baselineMapDirs
