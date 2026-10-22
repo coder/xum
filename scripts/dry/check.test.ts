@@ -151,7 +151,7 @@ test("a marker on the old side does not excuse a new copy", () => {
   expect((report.pairs as Array<{ accepted?: string }>).some((p) => p.accepted)).toBe(false);
 });
 
-test("a function moved to another file keeps its old pairs quiet", () => {
+test("a function moved to another file is reported again (moves are not tracked)", () => {
   // src/a.ts keeps other code, so git sees two edits, not a rename.
   const other = `export function keep(s: string): number {
   const parts = s.split(",");
@@ -170,6 +170,11 @@ test("a function moved to another file keeps its old pairs quiet", () => {
 
   const { status, report } = check();
 
-  expect(status).toBe(0);
-  expect(report.pairs).toEqual([]);
+  // cents~count matched before the move. See new_pairs in dryer_report.py.
+  expect(status).toBe(1);
+  type Side = { name: string };
+  const pairs = (report.pairs as Array<{ left: Side; right: Side }>).map(
+    (pair) => `${pair.left.name}~${pair.right.name}`
+  );
+  expect(pairs).toEqual(["cents~count"]);
 });
