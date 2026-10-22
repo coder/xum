@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { changesSince, git, SCORED, writeBaseTree, type ChangedFile } from "./changes";
 import { applyDebt, evaluate, type DebtUse, type Finding, type FunctionRow } from "./policy";
+import { uvRunArgs } from "./uv";
 
 const ADAPTER = join(import.meta.dir, "crapper_report.py");
 
@@ -29,7 +30,7 @@ function score(
 ): FunctionRow[] {
   // The adapter scores all of src/ when given no files, so never call it empty.
   if (files.length === 0) return [];
-  const args = ["run", "--quiet", "--script", ADAPTER, "--root", root];
+  const args = [...uvRunArgs("crap", ADAPTER), "--root", root];
   for (const report of lcov) args.push("--lcov", report);
   for (const [from, to] of renames) args.push("--rename", from, to);
   const out = execFileSync("uv", [...args, ...files], {
