@@ -407,18 +407,22 @@ export async function skillsCliSkillNames(
 ): Promise<{ names: string[]; warnings: string[] }> {
   const rootReal = await fsPromises.realpath(stagedDir);
   const names: string[] = [];
+  // One folder can be listed twice (`skills/SKILL.md` is a root child and the `skills`
+  // container), so each canonical folder counts once before the shared-name check below.
+  const seen = new Set<string>();
+  const add = async (dir: string): Promise<boolean> => {
+    const name = await readSkillsCliName(rootReal, dir);
+    if (name === undefined) return false;
+    const real = await fsPromises.realpath(dir);
+    if (!seen.has(real)) names.push(name);
+    seen.add(real);
+    return true;
+  };
   for (const root of roots) {
     const rootDir = path.join(rootReal, root.root);
     // A root that holds SKILL.md is one skill (the repository root, or a container path).
-    const own = await readSkillsCliName(rootReal, rootDir);
-    if (own !== undefined) {
-      names.push(own);
-      continue;
-    }
-    for (const skill of root.skills) {
-      const name = await readSkillsCliName(rootReal, path.join(rootDir, skill));
-      if (name !== undefined) names.push(name);
-    }
+    if (await add(rootDir)) continue;
+    for (const skill of root.skills) await add(path.join(rootDir, skill));
   }
   const valid = names.filter((name) => SkillNameSchema.safeParse(name).success);
   const shared = new Set(valid.filter((name, index) => valid.indexOf(name) !== index));
