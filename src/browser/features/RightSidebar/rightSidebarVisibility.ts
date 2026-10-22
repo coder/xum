@@ -79,6 +79,19 @@ export function focusRightSidebarToggle(root: ParentNode | null | undefined): vo
 }
 
 /**
+ * Toggles the right sidebar for a hotkey (TOGGLE_RIGHT_SIDEBAR, and OPEN_ARTIFACTS_TAB while the
+ * Artifacts tab shows). A collapse unmounts the focused control, and focus then fell to <body>
+ * (bug bash RS3), so focus moves to the header toggle. Returns whether the sidebar toggled.
+ */
+export function toggleRightSidebarFromKey(workspaceId: string, shell: Element | null): boolean {
+  const sidebar = shell?.querySelector(".mobile-hide-right-sidebar");
+  const focusWasInSidebar = sidebar?.contains(document.activeElement) === true;
+  if (!toggleRightSidebarCollapsed(workspaceId, shell)) return false;
+  if (focusWasInSidebar) focusRightSidebarToggle(shell);
+  return true;
+}
+
+/**
  * The command palette's "Right Sidebar: Toggle". The palette closes before its command runs, and
  * its input took focus with it, so a toggle moves focus to the header toggle.
  */

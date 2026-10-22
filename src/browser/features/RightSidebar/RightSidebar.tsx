@@ -105,7 +105,6 @@ import {
   findTopRightTabsetId,
   getDefaultRightSidebarLayoutState,
   getFocusedActiveTab,
-  isTabSelected,
   moveTabToTabset,
   openToolFromNewTab,
   parseRightSidebarLayoutState,
@@ -167,11 +166,8 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
-import {
-  focusRightSidebarToggle,
-  isRightSidebarResponsivelyHidden,
-  toggleRightSidebarCollapsed,
-} from "./rightSidebarVisibility";
+import { isRightSidebarResponsivelyHidden } from "./rightSidebarVisibility";
+import { useArtifactsTabKey } from "./useArtifactsTabKey";
 import { usePaletteTabFocus } from "./usePaletteTabFocus";
 import { SideChatPanel } from "./SideChatPanel";
 import { NewTabLauncher } from "./NewTabLauncher";
@@ -1808,47 +1804,19 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     };
   }, [artifactsExperimentEnabled, mcpAppsExperimentEnabled, setCollapsed, setLayout, workspaceId]);
 
-  // Global shortcut: open (and un-collapse) the Artifacts tab, or, when the expanded sidebar
-  // already shows it, collapse the whole sidebar like TOGGLE_RIGHT_SIDEBAR (user request: the key
-  // toggles the tab). Works from the chat input too, because Ctrl+Shift+K inserts nothing there.
-  // While the narrow layout hides the sidebar, WorkspaceMenuBar shows the tab in the full-screen
-  // sidebar instead; this handler then stays out, so one keystroke never acts twice.
-  React.useEffect(() => {
-    if (!artifactsExperimentEnabled) return;
-    const handler = (e: KeyboardEvent) => {
-      const container = sidebarContainerRef.current;
-      if (
-        !matchesKeybind(e, KEYBINDS.OPEN_ARTIFACTS_TAB) ||
-        (container != null && isRightSidebarResponsivelyHidden(container)) ||
-        isDialogOpen() ||
-        // Remote desktops and terminals own their keystrokes.
-        isTerminalFocused(e.target) ||
-        isDesktopViewportFocused(e.target)
-      ) {
-        return;
-      }
-      e.preventDefault();
-      // A held key would open and collapse the sidebar on every repeat.
-      if (e.repeat) return;
-      if (!collapsed && isTabSelected(getBaseLayout().root, "artifacts")) {
-        // The same collapse as TOGGLE_RIGHT_SIDEBAR's key (WorkspaceShell): it refuses where a
-        // collapse would not show (immersive review, the failed-load frame), and the collapse
-        // unmounts the focused control, so focus moves to the header toggle.
-        const shell = container?.closest("[data-workspace-shell]") ?? null;
-        const focusWasInSidebar = container?.contains(document.activeElement) === true;
-        if (toggleRightSidebarCollapsed(workspaceId, shell)) {
-          if (focusWasInSidebar) focusRightSidebarToggle(shell);
-          return;
-        }
-      }
+  useArtifactsTabKey({
+    workspaceId,
+    enabled: artifactsExperimentEnabled,
+    collapsed,
+    sidebarContainerRef,
+    getLayout: getBaseLayout,
+    openArtifactsTab: () => {
       setCollapsed(false);
       const next = selectOrAddTab(getBaseLayout(), "artifacts");
       setLayout(() => next);
       setArtifactsFocusTabsetId(next.focusedTabsetId);
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [artifactsExperimentEnabled, collapsed, getBaseLayout, setCollapsed, setLayout, workspaceId]);
+    },
+  });
 
   // Auto-surface the Workflows tab when a run starts: the tab is the primary
   // run-detail surface (the chat card stays collapsed while it exists), but a

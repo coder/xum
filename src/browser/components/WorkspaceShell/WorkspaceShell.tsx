@@ -27,9 +27,8 @@ import {
 } from "@/browser/utils/ui/keybinds";
 
 import {
-  focusRightSidebarToggle,
   isWorkspaceRightSidebarHidden,
-  toggleRightSidebarCollapsed,
+  toggleRightSidebarFromKey,
 } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
@@ -362,18 +361,6 @@ function isRightSidebarToggleBlocked(e: KeyboardEvent): boolean {
     isCommandPaletteTarget(e.target) ||
     (e.target instanceof Element && e.target.closest("[data-radix-popper-content-wrapper]") != null)
   );
-}
-
-/**
- * Toggles the right sidebar for its hotkey. A collapse unmounts the focused control, and focus then
- * fell to <body> (bug bash RS3), so focus moves to the header toggle.
- */
-function toggleRightSidebarFromKey(workspaceId: string, shell: HTMLElement | null): void {
-  const sidebar = shell?.querySelector(".mobile-hide-right-sidebar");
-  const focusWasInSidebar = sidebar?.contains(document.activeElement) === true;
-  if (toggleRightSidebarCollapsed(workspaceId, shell) && focusWasInSidebar) {
-    focusRightSidebarToggle(shell);
-  }
 }
 
 /**
