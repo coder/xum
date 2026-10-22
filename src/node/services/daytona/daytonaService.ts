@@ -42,7 +42,6 @@ import {
 } from "./daytonaClient";
 import type { DaytonaWorkspaceRef } from "./daytonaReconciler";
 
-/** What another workspace stores as its sandbox, and whether it attached it. */
 /** A workspace whose runtime is on a given sandbox. */
 export interface DaytonaWorkspaceOnSandbox {
   workspaceId: string;
@@ -59,6 +58,7 @@ function onSandboxRef(
     : [];
 }
 
+/** What another workspace stores as its sandbox, and whether it attached it. */
 interface StoredSandboxRef {
   stored: string;
   attached: boolean;
