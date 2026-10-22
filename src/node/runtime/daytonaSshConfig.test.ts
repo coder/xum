@@ -14,6 +14,7 @@ import {
   hasInheritedRemoteForward,
   renderDaytonaKnownHosts,
 } from "./daytonaSshConfig";
+import { resolveSSHConfig } from "./sshConfigParser";
 import { appendOpenSSHHostKeyPolicyArgs } from "./sshConnectionPool";
 
 const GATEWAY = {
@@ -281,6 +282,47 @@ describe("DaytonaSshConfigWriter", () => {
         gateway: { ...gateway, host: "fe80::1%eth0" },
       })
     ).rejects.toThrow(/Refusing to write an invalid Daytona gateway host/);
+  });
+
+  // Self-hosted deployments may name the gateway absolutely. Kept as written: ssh uses the
+  // HostKeyAlias as is, both to look up the pinned key and (ssh2) to match known_hosts lines.
+  it("writes an absolute gateway name with its trailing dot, pinned under that name", async () => {
+    const gateway = { ...GATEWAY, host: "gateway.example.com.", port: 2222 };
+    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway });
+
+    const knownHosts = await fs.readFile(writer.paths.knownHostsPath, "utf8");
+    expect(knownHosts).toBe(
+      [
+        "gateway.example.com. ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGatewayKey",
+        "[gateway.example.com.]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGatewayKey",
+        "",
+      ].join("\n")
+    );
+    const parsed = await resolveSSHConfig(toXumDaytonaHost("sb-1"), writer.paths.includePath);
+    expect(parsed.hostName).toBe("gateway.example.com.");
+    expect(parsed.hostKeyAlias).toBe("gateway.example.com.");
+    if (hasOpenSsh) {
+      const resolved = spawnSync("ssh", ["-G", "-F", sshConfigPath, "sb-1.xum--daytona"], {
+        encoding: "utf8",
+      }).stdout.split("\n");
+      expect(resolved).toContain("hostname gateway.example.com.");
+      expect(resolved).toContain("hostkeyalias gateway.example.com.");
+      // What ssh does with that alias: find the pinned key in Xum's known_hosts.
+      const lookup = spawnSync("ssh-keygen", [
+        "-F",
+        "gateway.example.com.",
+        "-f",
+        writer.paths.knownHostsPath,
+      ]);
+      expect(lookup.status).toBe(0);
+    }
+
+    for (const host of ["gateway.example.com..", "gateway..example.com", ".example.com", "."]) {
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
+      await expect(
+        writer.writeSandbox({ sandboxId: "sb-2", token: "t", gateway: { ...gateway, host } })
+      ).rejects.toThrow(/Refusing to write an invalid Daytona gateway host/);
+    }
   });
 
   it("port-qualifies known_hosts entries for a gateway off port 22", () => {

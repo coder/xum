@@ -72,7 +72,9 @@ export class DaytonaSshConfigError extends Error {
 // value would let it inject arbitrary ssh directives (ProxyCommand runs local commands).
 const SANDBOX_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const TOKEN_PATTERN = /^[A-Za-z0-9._~+/=-]+$/;
-const HOSTNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/;
+// Dot-separated labels (no empty one), optionally absolute: one trailing dot.
+const HOSTNAME_LABEL = "[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?";
+const HOSTNAME_PATTERN = new RegExp(`^${HOSTNAME_LABEL}(?:\\.${HOSTNAME_LABEL})*\\.?$`);
 const HOST_KEY_PATTERN = /^([A-Za-z0-9@.-]+)\s+([A-Za-z0-9+/]+={0,3})(?:\s.*)?$/;
 
 function assertValid(value: string, pattern: RegExp, what: string): void {
@@ -84,7 +86,9 @@ function assertValid(value: string, pattern: RegExp, what: string): void {
 /**
  * A DNS name or an IP literal: self-hosted deployments may advertise an IPv6 gateway, which
  * OpenSSH takes in HostName and HostKeyAlias. A zone id (`%eth0`) is refused: ssh config
- * would expand its `%` as a token.
+ * would expand its `%` as a token. An absolute name keeps its trailing dot: HostName,
+ * HostKeyAlias and the pinned known_hosts lines all carry the same string, which OpenSSH and
+ * the ssh2 pin check use as written.
  */
 function isGatewayHost(host: string): boolean {
   return HOSTNAME_PATTERN.test(host) || (net.isIPv6(host) && !host.includes("%"));
