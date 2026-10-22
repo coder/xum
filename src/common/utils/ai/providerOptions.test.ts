@@ -4220,6 +4220,46 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
     expect(sent.body.additionalModelRequestFields).toEqual(expected);
   });
 
+  // Cross-region inference profiles keep the `bedrock:` origin, and Bedrock ids
+  // carry a -vN[:M] suffix that the capability matchers do not expect. A missed
+  // match must not send `disabled` to a model that rejects it (a 400).
+  test.each([
+    [
+      "bedrock:us.anthropic.claude-sonnet-5-5",
+      "high",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "high" } },
+    ],
+    [
+      "bedrock:global.anthropic.claude-opus-4-6-v1",
+      "xhigh",
+      { thinking: { type: "adaptive" }, output_config: { effort: "max" } },
+    ],
+    ["bedrock:us.anthropic.claude-sonnet-5-5-v1:0", "off", { output_config: { effort: "low" } }],
+    [
+      "bedrock:anthropic.claude-sonnet-4-5-20250929-v1:0",
+      "medium",
+      { thinking: { type: "enabled", budget_tokens: 10000 } },
+    ],
+    [
+      "bedrock:eu.anthropic.claude-haiku-5-5-v1:0",
+      "off",
+      { thinking: { type: "disabled" }, output_config: { effort: "low" } },
+    ],
+  ] as const)(
+    "Bedrock profile id %s at %s sends the matching fields",
+    async (model, level, expected) => {
+      const sent = await sentBedrockBody(
+        model.slice("bedrock:".length),
+        bedrockOptions(model, level)
+      );
+      expect(sent.body.additionalModelRequestFields).toEqual(expected);
+    }
+  );
+
+  test("non-Claude Bedrock models get no Claude thinking fields", () => {
+    expect(bedrockOptions("bedrock:amazon.nova-pro-v1:0", "high")).toEqual({});
+  });
+
   test("raises the output limit by the thinking budget", async () => {
     const sent = await sentBedrockBody(
       "anthropic.claude-sonnet-4-5",

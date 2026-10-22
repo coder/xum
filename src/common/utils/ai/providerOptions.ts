@@ -330,6 +330,17 @@ function adaptiveModelOffThinking(capabilityModel: string): AnthropicThinkingSha
 }
 
 /**
+ * The canonical `anthropic:claude-*` id of a Claude model on Bedrock, or null for
+ * other models. Cross-region inference profiles (`us.`, `global.` ...) keep the
+ * `bedrock:` origin, and Bedrock ids end in -vN[:M]; both defeat the anchored
+ * capability matchers (a missed "rejects disabled" match would send a 400).
+ */
+function bedrockClaudeCapabilityModel(capabilityModel: string): string | null {
+  const match = /(?:^|[.:])(claude-[a-z0-9-]+?)(?:-v\d+(?::\d+)?)?$/i.exec(capabilityModel);
+  return match ? `anthropic:${match[1].toLowerCase()}` : null;
+}
+
+/**
  * Bedrock Converse fields for one thinking shape. Thinking goes through the SDK's
  * typed `reasoningConfig`: for a budget the SDK also raises maxTokens by the
  * budget (a budget at or above max_tokens is a 400), which raw fields would skip.
@@ -1143,9 +1154,15 @@ export function buildProviderOptions(
 
   // Claude on Bedrock gets the same per-model thinking shape as the direct route
   // (#5839); without it the level picker did nothing there.
-  if (formatProvider === "bedrock" && origin === "anthropic") {
+  const bedrockClaudeModel =
+    formatProvider === "bedrock" ? bedrockClaudeCapabilityModel(capabilityModel) : null;
+  if (bedrockClaudeModel != null) {
     const options = buildBedrockClaudeOptions(
-      resolveAnthropicThinkingShape(capabilityModel, capModelName, effectiveThinking)
+      resolveAnthropicThinkingShape(
+        bedrockClaudeModel,
+        bedrockClaudeModel.slice("anthropic:".length),
+        effectiveThinking
+      )
     );
     log.debug("buildProviderOptions: Returning Bedrock options", options);
     return options;
