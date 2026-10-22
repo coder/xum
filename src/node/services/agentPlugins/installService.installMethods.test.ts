@@ -163,6 +163,16 @@ describe("AgentPluginInstallService install methods", () => {
     );
   });
 
+  test("one skill folder found twice counts once for the Skills CLI choice", async () => {
+    // skills/SKILL.md is both a root child folder and the skills container itself.
+    await fsPromises.rm(path.join(remoteDir, "skills"), { recursive: true });
+    await write({ "skills/SKILL.md": skillMd("skills") });
+    await commit("one skill at skills/SKILL.md");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.skillsCliSkills).toEqual(["skills"]);
+    expect(preview.warnings.join("\n")).not.toContain("more than one skill folder");
+  });
+
   test("install refuses a method that does not fit its clone", async () => {
     const preview = await service.preview({ input: remoteDir });
     await expect(

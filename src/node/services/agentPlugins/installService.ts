@@ -3552,9 +3552,15 @@ export class AgentPluginInstallService {
     let entryDir: string;
     try {
       entryDir = await ensurePluginPathContained(stagedDir, folder);
-    } catch {
-      // A missing or escaping folder fails its own preview with the reason.
-      return row;
+    } catch (error) {
+      // A missing or escaping folder would fail the entry's preview, so the listing does not
+      // offer it. The reason names the folder, not the staging path.
+      const why = hasErrorCode(error, "ENOENT") ? "it does not exist" : getErrorMessage(error);
+      return {
+        ...row,
+        installable: false,
+        reason: `Xum cannot install the entry's folder '${resolved.subpath ?? "."}': ${why}`,
+      };
     }
     let manifest: Record<string, unknown>;
     try {

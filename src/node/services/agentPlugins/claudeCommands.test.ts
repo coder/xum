@@ -30,3 +30,14 @@ describe("claudeCommandSkillMarkdown", () => {
     expect(raw).toMatchObject({ "argument-hint": "[pr]", "allowed-tools": ["Read", "Grep"] });
   });
 });
+
+test("a command that YAML aliases blow up past the size cap does not load", () => {
+  // 20 KB in the file; each alias repeats the value when Xum rewrites the frontmatter.
+  const value = "x".repeat(20_000);
+  const aliases = Array.from({ length: 60 }, (_, index) => `k${index}: *big`).join("\n");
+  const content = `---\nbig: &big "${value}"\n${aliases}\n---\nReview it.\n`;
+  expect(content.length).toBeLessThan(25_000);
+  expect(() => claudeCommandSkillMarkdown("review", content)).toThrow(
+    "once its frontmatter is rewritten as a skill"
+  );
+});
