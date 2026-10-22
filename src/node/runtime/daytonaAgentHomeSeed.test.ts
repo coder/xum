@@ -106,7 +106,10 @@ describe("agent-home seeding", () => {
       expect((await fs.lstat(written)).isFile()).toBe(true);
       expect(await fs.readFile(written, "utf-8")).toBe("export A=1\n");
       expect((await fs.stat(written)).mode & 0o777).toBe(0o755);
-      expect(await fs.readdir(path.join(remoteHome, ".mux"))).toEqual(["tool_env", "tool_pre"]);
+      expect((await fs.readdir(path.join(remoteHome, ".mux"))).sort()).toEqual([
+        "tool_env",
+        "tool_pre",
+      ]);
     });
 
     it("refuses a symlinked directory on the way, writing nothing through it", async () => {
