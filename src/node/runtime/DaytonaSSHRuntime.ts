@@ -42,7 +42,11 @@ import { isSSHRuntime } from "@/common/types/runtime";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
-import { DaytonaApiError, type DaytonaSandbox } from "@/node/services/daytona/daytonaClient";
+import {
+  DaytonaApiError,
+  isDaytonaNotFound,
+  type DaytonaSandbox,
+} from "@/node/services/daytona/daytonaClient";
 import {
   DAYTONA_LABEL_INSTANCE,
   DAYTONA_LABEL_WORKSPACE_ID,
@@ -1505,7 +1509,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       await this.daytonaService.ensureSandboxReady(sandboxId, { signal: abortSignal });
       return "ready";
     } catch (error) {
-      if (error instanceof DaytonaApiError && error.kind === "not_found") return "missing";
+      if (isDaytonaNotFound(error)) return "missing";
       // A sandbox on its way out (a failed setup deleting it) has no work left to check.
       if (await this.isBeingDestroyed(sandboxId)) return "missing";
       return {
