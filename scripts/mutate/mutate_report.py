@@ -36,7 +36,6 @@ touches the real checkout and "@/" imports reach the mutated file.
 import argparse
 import json
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -51,6 +50,7 @@ from queue import Queue
 from crapper.discover import language_of
 from crapper.languages import functions_in_file
 from mutator.sites import apply_site, discover_raw
+from tree_sitter_language_pack import get_parser
 
 # Reuse the CRAP gate's production-file rule and LCOV reader.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "crap"))
@@ -60,9 +60,9 @@ MAX_TEST_FILES = 10
 TIMEOUT_FACTOR = 10  # mutator's default: a mutant gets 10x the baseline,
 MIN_TIMEOUT = 2.0  # and at least 2 seconds.
 BASELINE_TIMEOUT = 120.0  # a test file that hangs unmutated is dropped
+DEADLINE = "the run's deadline came first"
 
 EXTENSIONS = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
-SPECIFIER = re.compile(r"""(?:\bfrom|\bimport|\brequire)\s*\(?\s*["']([^"'\n]+)["']""")
 
 
 @dataclass(frozen=True)
@@ -100,13 +100,43 @@ def resolve(importer: str, specifier: str, files: set[str]) -> str | None:
     return None
 
 
+def runtime_specifiers(source: bytes, tsx: bool) -> list[str]:
+    """The specifiers that a test loads at run time.
+
+    A parse, not a regex over the text: an import in a comment or a string
+    fixture loads nothing, and `import type` / `export type` are erased. Only
+    a test that loads the module can kill its mutants, and a phantom importer
+    takes one of the capped test slots.
+    """
+
+    tree = get_parser("tsx" if tsx else "typescript").parse(source)
+    found: list[str] = []
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        stack.extend(node.children)
+        target = None
+        if node.type in ("import_statement", "export_statement"):
+            erased = node.child_count > 1 and node.children[1].type == "type"
+            target = None if erased else node.child_by_field_name("source")
+        elif node.type == "call_expression":
+            function = node.child_by_field_name("function")
+            arguments = node.child_by_field_name("arguments")
+            loads = function is not None and (function.type == "import" or function.text == b"require")
+            first = arguments.named_children[0] if loads and arguments is not None and arguments.named_children else None
+            target = first if first is not None and first.type == "string" else None
+        if target is not None:
+            found.append(target.text.decode("utf-8", errors="replace")[1:-1])
+    return found
+
+
 def import_graph(root: Path, tests: list[str], files: set[str]) -> dict[str, set[str]]:
     """Source file -> the test files that import it directly."""
 
     importers: dict[str, set[str]] = {}
     for test in tests:
-        text = (root / test).read_text(encoding="utf-8", errors="replace")
-        for specifier in SPECIFIER.findall(text):
+        source = (root / test).read_bytes()
+        for specifier in runtime_specifiers(source, test.endswith((".tsx", ".jsx"))):
             target = resolve(test, specifier, files)
             if target is not None:
                 importers.setdefault(target, set()).add(test)
@@ -170,6 +200,31 @@ def uncovered(site: Site, coverage: dict[str, list[dict[int, int]]] | None) -> b
     return not any(report.get(site.anchor_line, 0) > 0 for report in reports)
 
 
+def triage(
+    sites: list[Site],
+    plan: dict[str, list[str]],
+    coverage: dict[str, list[dict[int, int]]] | None,
+    blind: set[str],
+) -> tuple[list[dict], list[Site]]:
+    """Rows for the sites that do not run, and the sites that do.
+
+    `blind` holds the tests that run without coverage (`no-coverage:` in
+    scripts/test-unit-ci.sh): their hits are in no LCOV report, so a site
+    that one of them covers can look uncovered. Such a site runs.
+    """
+
+    rows: list[dict] = []
+    to_run: list[Site] = []
+    for site in sites:
+        if not plan.get(site.path):
+            rows.append(row(site, "no-test"))
+        elif uncovered(site, coverage) and not blind.intersection(plan[site.path]):
+            rows.append(row(site, "uncovered"))
+        else:
+            to_run.append(site)
+    return rows, to_run
+
+
 # ---------------------------------------------------------------- workers
 
 
@@ -184,7 +239,8 @@ def make_worker(root: Path, tracked: list[str], into: Path) -> Path:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
     if (root / "node_modules").is_dir():
-        (into / "node_modules").symlink_to(root / "node_modules")
+        # A directory link on Windows too (it needs symlink rights: Developer Mode).
+        (into / "node_modules").symlink_to(root / "node_modules", target_is_directory=True)
     # src/version.ts is generated (gitignored), and many modules import it.
     version = root / "src" / "version.ts"
     if version.is_file():
@@ -209,7 +265,10 @@ def run_test(worker: Path, test: str, timeout: float) -> tuple[bool, float, bool
     try:
         code = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:  # Windows has no process groups: kill bun itself
+            proc.kill()
         proc.wait()
         return False, time.monotonic() - started, True
     return code == 0, time.monotonic() - started, False
@@ -281,12 +340,57 @@ def run_all(
         return list(pool.map(one, sites))
 
 
+def baselines(
+    tests: list[str], free: Queue, worker_count: int, deadline: float, runner=run_test
+) -> tuple[dict[str, float], list[dict]]:
+    """Run each test file alone, unmutated: (mutant timeouts, dropped tests).
+
+    A baseline gets at most the time left before the run's deadline, so the
+    run ends with a report before the CI step's own timeout kills it.
+    """
+
+    def one(test: str) -> tuple[bool, float, bool] | str:
+        # One process per worker copy at a time, as for mutants.
+        worker = free.get()
+        try:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return DEADLINE
+            passed, seconds, timed_out = runner(worker, test, min(BASELINE_TIMEOUT, left))
+            return DEADLINE if timed_out and left < BASELINE_TIMEOUT else (passed, seconds, timed_out)
+        except Exception as error:  # noqa: BLE001 - one test, not the run
+            return f"could not run: {error}"
+        finally:
+            free.put(worker)
+
+    timeouts: dict[str, float] = {}
+    dropped: list[dict] = []
+    if worker_count == 0:
+        return timeouts, dropped
+    with ThreadPoolExecutor(worker_count) as pool:
+        results = list(pool.map(one, tests))
+    for test, result in zip(tests, results):
+        if isinstance(result, str):
+            dropped.append({"path": test, "reason": result})
+        elif result[0]:
+            timeouts[test] = max(MIN_TIMEOUT, result[1] * TIMEOUT_FACTOR)
+        else:
+            dropped.append({"path": test, "reason": "fails without a mutant"})
+    return timeouts, dropped
+
+
 # ---------------------------------------------------------------- main
 
 
 def tracked_files(root: Path) -> list[str]:
     out = subprocess.run(["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True).stdout
     return [p for p in out.decode("utf-8").split("\0") if p]
+
+
+def read_list(path: Path) -> list[str]:
+    """Repo-relative paths, one per line, as scripts/test-unit-ci.sh lists them."""
+
+    return [line.strip().removeprefix("./") for line in path.read_text().splitlines() if line.strip()]
 
 
 def positive(value: str) -> int:
@@ -304,6 +408,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--changes", required=True, type=Path)
     parser.add_argument("--lane", required=True, type=Path)
     parser.add_argument("--lcov", action="append", default=[], type=Path)
+    # The lane tests that write no LCOV (scripts/test-unit-ci.sh --list-no-coverage).
+    parser.add_argument("--no-coverage-tests", type=Path)
     parser.add_argument("--workers", type=positive, default=max(1, min(4, (os.cpu_count() or 2) // 2)))
     parser.add_argument("--max-mutants", type=int, default=300)
     parser.add_argument("--max-seconds", type=float, default=15 * 60)
@@ -318,9 +424,10 @@ def main(argv: list[str]) -> int:
         f["headPath"] for f in changes["files"] if f["headPath"] and is_production(f["headPath"]) and (root / f["headPath"]).is_file()
     )
     sites = [site for source in sources for site in sites_in(root, source, changes["spans"].get(source, []))]
-    lane = [line.strip().removeprefix("./") for line in args.lane.read_text().splitlines() if line.strip()]
+    lane = read_list(args.lane)
     graph = import_graph(root, [t for t in lane if (root / t).is_file()], files)
     coverage = load_coverage(args.lcov, root, sorted(files)) if args.lcov else None
+    blind = set(read_list(args.no_coverage_tests)) if args.no_coverage_tests else set()
 
     plan: dict[str, list[str]] = {}
     capped: list[str] = []
@@ -329,52 +436,22 @@ def main(argv: list[str]) -> int:
         if cut:
             capped.append(source)
 
-    rows: list[dict] = []
-    to_run: list[Site] = []
-    for site in sites:
-        if not plan.get(site.path):
-            rows.append(row(site, "no-test"))
-        elif uncovered(site, coverage):
-            rows.append(row(site, "uncovered"))
-        else:
-            to_run.append(site)
+    rows, to_run = triage(sites, plan, coverage, blind)
+    deadline = started + args.max_seconds
+    # Cap first, so no baseline runs for a test that only the cut mutants use.
+    budget = to_run[: args.max_mutants]
+    rows += [row(site, "not-run") for site in to_run[args.max_mutants :]]
 
-    dropped: list[dict] = []
     with tempfile.TemporaryDirectory(prefix="mutate-") as scratch:
-        needed = sorted({t for site in to_run for t in plan[site.path]})
-        workers = [make_worker(root, tracked, Path(scratch) / f"w{i}") for i in range(min(args.workers, max(1, len(to_run))))] if to_run else []
-        # Baselines: each test file must pass alone, unmutated.
-        timeouts: dict[str, float] = {}
+        needed = sorted({t for site in budget for t in plan[site.path]})
+        workers = [make_worker(root, tracked, Path(scratch) / f"w{i}") for i in range(min(args.workers, len(budget)))]
         free: Queue = Queue()
         for worker in workers:
             free.put(worker)
-
-        def baseline(test: str) -> tuple[bool, float, bool] | str:
-            # One process per worker copy at a time, as for mutants.
-            worker = free.get()
-            try:
-                return run_test(worker, test, BASELINE_TIMEOUT)
-            except Exception as error:  # noqa: BLE001 - one test, not the run
-                return f"could not run: {error}"
-            finally:
-                free.put(worker)
-
-        if workers:
-            with ThreadPoolExecutor(len(workers)) as pool:
-                results = list(pool.map(baseline, needed))
-            for test, result in zip(needed, results):
-                if isinstance(result, str):
-                    dropped.append({"path": test, "reason": result})
-                elif result[0]:
-                    timeouts[test] = max(MIN_TIMEOUT, result[1] * TIMEOUT_FACTOR)
-                else:
-                    dropped.append({"path": test, "reason": "fails without a mutant"})
+        timeouts, dropped = baselines(needed, free, len(workers), deadline)
         for source in plan:
             plan[source] = [t for t in plan[source] if t in timeouts]
-
-        budget = to_run[: args.max_mutants]
-        rows += [row(site, "not-run") for site in to_run[args.max_mutants :]]
-        rows += run_all(root, budget, plan, free, len(workers), timeouts, started + args.max_seconds)
+        rows += run_all(root, budget, plan, free, len(workers), timeouts, deadline)
 
     rows.sort(key=lambda r: (r["path"], r["line"], r["original"], r["mutant"]))
     report = {

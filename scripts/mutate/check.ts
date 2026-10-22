@@ -142,8 +142,17 @@ export function runCheck(cwd: string, baseRef: string, options: CheckOptions): M
         maxBuffer: 64 * 1024 * 1024,
       })
     );
+    // Tests that run without coverage: LCOV cannot show what they cover.
+    const blind = join(scratch, "no-coverage.txt");
+    writeFileSync(
+      blind,
+      execFileSync("bash", ["scripts/test-unit-ci.sh", "--list-no-coverage"], {
+        cwd: root,
+        encoding: "utf8",
+      })
+    );
     const args = ["run", "--quiet", "--script", ADAPTER, "--root", root];
-    args.push("--changes", changes, "--lane", lane);
+    args.push("--changes", changes, "--lane", lane, "--no-coverage-tests", blind);
     for (const report of options.coverage) args.push("--lcov", report);
     if (options.workers) args.push("--workers", options.workers);
     if (options.maxMutants) args.push("--max-mutants", options.maxMutants);
