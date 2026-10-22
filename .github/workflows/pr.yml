@@ -144,46 +144,63 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
       - run: ./scripts/generate-version.sh
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.local/bin/shfmt
-          key: ${{ runner.os }}-shfmt-latest
-      - name: Install shfmt
+      # Release binaries pinned by checksum. A version bump needs new checksums for every asset
+      # below. Never copy them from the release page: download each asset yourself, run
+      # `sha256sum` on it, and check that the result equals the digest GitHub computed at upload
+      # (`gh api repos/<owner>/<repo>/releases/tags/<tag> --jq '.assets[] | .name + " " +
+      # .digest'`). hadolint v2.12.0 predates those digests: compare with its .sha256 assets.
+      - name: Install shfmt and hadolint
+        env:
+          SHFMT_VERSION: v3.14.1
+          SHFMT_SHA256_X86_64: 76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf
+          SHFMT_SHA256_AARCH64: 5f2db09dae91fca848f7adbdd014632e921a383863a2ad7e0450ad3aba0c6489
+          HADOLINT_VERSION: v2.12.0
+          HADOLINT_SHA256_X86_64: 56de6d5e5ec427e17b74fa48d51271c7fc0d61244bf5c90e828aab8362d55010
+          HADOLINT_SHA256_AARCH64: 5798551bf19f33951881f15eb238f90aef023f11e7ec7e9f4c37961cb87c5df6
         run: |
           set -euo pipefail
-          if [[ ! -f "$HOME/.local/bin/shfmt" ]] || ! "$HOME/.local/bin/shfmt" --version >/dev/null 2>&1; then
-            # webinstall.dev can be flaky; retry and force HTTP/1.1 to avoid HTTP/2 stream errors.
-            curl --retry 5 --retry-all-errors --retry-delay 2 -LsSf --http1.1 https://webinstall.dev/shfmt | bash
-          fi
-
-          if ! "$HOME/.local/bin/shfmt" --version >/dev/null 2>&1; then
-            echo "Error: shfmt install failed"
-            exit 1
-          fi
-
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          case "$(uname -m)" in
+            x86_64)
+              shfmt_arch=amd64 shfmt_sha256="$SHFMT_SHA256_X86_64"
+              hadolint_arch=x86_64 hadolint_sha256="$HADOLINT_SHA256_X86_64"
+              ;;
+            aarch64 | arm64)
+              shfmt_arch=arm64 shfmt_sha256="$SHFMT_SHA256_AARCH64"
+              hadolint_arch=arm64 hadolint_sha256="$HADOLINT_SHA256_AARCH64"
+              ;;
+            *)
+              echo "::error::no pinned shfmt or hadolint for $(uname -m); add its assets and checksums"
+              exit 1
+              ;;
+          esac
+          bin="$HOME/.local/bin"
+          mkdir -p "$bin"
+          curl -fsSL --retry 5 --retry-all-errors -o "$bin/shfmt" \
+            "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_${shfmt_arch}"
+          curl -fsSL --retry 5 --retry-all-errors -o "$bin/hadolint" \
+            "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-Linux-${hadolint_arch}"
+          echo "${shfmt_sha256}  $bin/shfmt" | sha256sum -c -
+          echo "${hadolint_sha256}  $bin/hadolint" | sha256sum -c -
+          chmod +x "$bin/shfmt" "$bin/hadolint"
+          "$bin/shfmt" --version
+          "$bin/hadolint" --version
+          echo "$bin" >> "$GITHUB_PATH"
       - name: Install shellcheck
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y shellcheck
-      - name: Install hadolint
-        run: |
-          set -euo pipefail
-          HADOLINT_VERSION="v2.12.0"
-          curl --retry 5 --retry-all-errors --retry-delay 2 -LsSf \
-            "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-Linux-x86_64" \
-            -o "$HOME/.local/bin/hadolint"
-          chmod +x "$HOME/.local/bin/hadolint"
-          hadolint --version
       - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - run: |
-          set -euo pipefail
-          curl --retry 5 --retry-all-errors --retry-delay 2 -LsSf https://astral.sh/uv/install.sh | sh
-      - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # uv runs the Python tools of pyproject.toml. setup-uv checks its download against the
+      # checksums it ships, which cover the uv releases before its own: keep `version` at one of
+      # them (setup-uv v10.2.0 knows uv up to 0.12.17).
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.17"
+          enable-cache: false
       # ESLint's result cache hashes the Node version, and setup-xum takes the runner's Node 22.x,
       # so a runner with a newer Node misses every entry (#7191). Key the cache by Node version so
       # each version restores a cache it can use.
@@ -480,6 +497,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         with:
+          version: "0.12.17"
           enable-cache: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         continue-on-error: true
@@ -571,6 +589,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         with:
+          version: "0.12.17"
           enable-cache: false
       # ci.ts writes verdict=violations only for a finished report with
       # unaccepted duplicates in block mode. A crash or a timeout leaves none.
@@ -643,6 +662,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         with:
+          version: "0.12.17"
           enable-cache: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         continue-on-error: true
@@ -876,7 +896,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
-      - run: ./scripts/generate-npm-shrinkwrap.sh
+      - run: bun scripts/generate-npm-shrinkwrap.ts
       - run: make build
       - run: make check-startup-imports-runtime
       - name: Pack npm package
