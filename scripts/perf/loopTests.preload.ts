@@ -3,8 +3,8 @@
  *
  * Usage: LOOP_TESTS_OUT=<file.json> bun test --preload ./scripts/perf/loopTests.preload.ts <test>
  *
- * It replaces the fs and fs/promises functions, setTimeout and Bun.sleep with the timing wrappers
- * of loopTestTiming.ts. In Bun 1.4.3 a new value on require("fs/promises") also reaches
+ * It replaces the fs and fs/promises functions, the FileHandle methods, setTimeout and Bun.sleep
+ * with the timing wrappers of loopTestTiming.ts. In Bun 1.4.3 a new value on require("fs/promises") also reaches
  * `import { readFile } from "fs/promises"` in test and product code, so no product file changes.
  * After all tests it writes { fsMs, timerMs, usesTempDir } to $LOOP_TESTS_OUT. The runner times the
  * whole process itself, so a crash at import still counts.
@@ -20,6 +20,7 @@ import {
   isTempDirCall,
   isTimedFsName,
   timed,
+  timedDelay,
   timedTimeout,
   unionMs,
 } from "./loopTestTiming";
@@ -57,6 +58,34 @@ function flagTempDir(name: string, fn: Fn): Fn {
   return flagged;
 }
 
+// FileHandle methods: history code reads and writes through handles that open() returns.
+const FILE_HANDLE_METHODS = [
+  "appendFile",
+  "chmod",
+  "chown",
+  "close",
+  "datasync",
+  "read",
+  "readFile",
+  "readv",
+  "stat",
+  "sync",
+  "truncate",
+  "utimes",
+  "write",
+  "writeFile",
+  "writev",
+];
+const open = fsPromises.open as (file: string, flags: string) => Promise<object>;
+const handle = await open(import.meta.path, "r");
+const fileHandle = Object.getPrototypeOf(handle) as Record<string, unknown>;
+await (handle as { close(): Promise<void> }).close();
+for (const name of FILE_HANDLE_METHODS) {
+  const method = fileHandle[name];
+  assert(typeof method === "function", `FileHandle.${name} is not a function`);
+  fileHandle[name] = timed(method as Fn, recordFs, now);
+}
+
 for (const mod of [fsModule, fsPromises]) {
   for (const [name, value] of Object.entries(mod)) {
     if (!isTimedFsName(name, value)) continue;
@@ -64,7 +93,7 @@ for (const mod of [fsModule, fsPromises]) {
   }
 }
 globalThis.setTimeout = timedTimeout(globalThis.setTimeout, recordTimer, now);
-Bun.sleep = timed(Bun.sleep, recordTimer, now);
+Bun.sleep = timedDelay(Bun.sleep, recordTimer, now);
 
 afterAll(() => {
   const result = {
