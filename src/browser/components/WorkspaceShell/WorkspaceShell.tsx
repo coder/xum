@@ -18,15 +18,14 @@ import { guardSidebarKeys, holdSidebarInput, type HeldSidebarInput } from "./def
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import {
   isBrowserViewportFocused,
-  isCommandPaletteTarget,
   isDesktopViewportFocused,
-  isDialogOpen,
   isTerminalFocused,
   KEYBINDS,
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
 
 import {
+  isRightSidebarToggleBlocked,
   isWorkspaceRightSidebarHidden,
   toggleRightSidebarFromKey,
 } from "@/browser/features/RightSidebar/rightSidebarVisibility";
@@ -345,21 +344,6 @@ function isRightSidebarToggleChord(e: KeyboardEvent): boolean {
     !isTerminalFocused(e.target) &&
     !isBrowserViewportFocused(e.target) &&
     !isDesktopViewportFocused(e.target)
-  );
-}
-
-/**
- * True when an overlay blocks the right sidebar toggle: a modal dialog, the command palette (not a
- * modal dialog, bug bash RS1), or a focused popover or menu (Radix portals them out of the sidebar,
- * so a collapse would unmount the control with focus and leave focus on <body>). A held key also
- * blocks it, or it would flip the sidebar on every repeat.
- */
-function isRightSidebarToggleBlocked(e: KeyboardEvent): boolean {
-  return (
-    e.repeat ||
-    isDialogOpen() ||
-    isCommandPaletteTarget(e.target) ||
-    (e.target instanceof Element && e.target.closest("[data-radix-popper-content-wrapper]") != null)
   );
 }
 

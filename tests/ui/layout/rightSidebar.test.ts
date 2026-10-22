@@ -659,6 +659,21 @@ describeIntegration("RightSidebar (UI)", () => {
       fireEvent.keyDown(window, { ...chord, repeat: true });
       expect(collapsed()).toBe(false);
 
+      // Nor does a press in an overlay that blocks Ctrl+Shift+B (stand-ins, as in the Ctrl+Shift+B
+      // overlay test, but letting the key bubble to the window listener).
+      for (const attribute of ["cmdk-root", "data-radix-popper-content-wrapper"]) {
+        const root = document.createElement("div");
+        root.setAttribute(attribute, "");
+        const control = root.appendChild(document.createElement("button"));
+        document.body.append(root);
+        try {
+          fireEvent.keyDown(control, chord);
+          expect({ attribute, collapsed: collapsed() }).toEqual({ attribute, collapsed: false });
+        } finally {
+          root.remove();
+        }
+      }
+
       // Artifacts shows: the key collapses the whole sidebar, like Ctrl+Shift+B.
       fireEvent.keyDown(window, chord);
       await waitFor(() => expect(collapsed()).toBe(true));

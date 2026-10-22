@@ -1,6 +1,7 @@
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getReviewImmersiveKey, getRightSidebarCollapsedKey } from "@/common/constants/storage";
 import { NARROW_VIEWPORT_MAX_WIDTH_PX, RIGHT_SIDEBAR_DEFAULT_COLLAPSED } from "@/constants/layout";
+import { isCommandPaletteTarget, isDialogOpen } from "@/browser/utils/ui/keybinds";
 
 /**
  * True when the right sidebar container is hidden by the responsive (narrow) layout. Immersive
@@ -76,6 +77,21 @@ export function toggleRightSidebarCollapsed(workspaceId: string, shell: Element 
  */
 export function focusRightSidebarToggle(root: ParentNode | null | undefined): void {
   root?.querySelector<HTMLElement>('[data-testid="right-sidebar-toggle-bar"] button')?.focus();
+}
+
+/**
+ * True when an overlay blocks the right sidebar toggle: a modal dialog, the command palette (not a
+ * modal dialog, bug bash RS1), or a focused popover or menu (Radix portals them out of the sidebar,
+ * so a collapse would unmount the control with focus and leave focus on <body>). A held key also
+ * blocks it, or it would flip the sidebar on every repeat.
+ */
+export function isRightSidebarToggleBlocked(e: KeyboardEvent): boolean {
+  return (
+    e.repeat ||
+    isDialogOpen() ||
+    isCommandPaletteTarget(e.target) ||
+    (e.target instanceof Element && e.target.closest("[data-radix-popper-content-wrapper]") != null)
+  );
 }
 
 /**

@@ -9,6 +9,7 @@ import {
 import { isTabSelected, type RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import {
   isRightSidebarResponsivelyHidden,
+  isRightSidebarToggleBlocked,
   toggleRightSidebarFromKey,
 } from "./rightSidebarVisibility";
 
@@ -39,19 +40,23 @@ function isSidebarArtifactsKey(e: KeyboardEvent, container: HTMLElement | null):
 }
 
 /**
- * Collapses the sidebar when it is expanded on the Artifacts tab, and returns whether it did. The
- * collapse refuses where it would not show (immersive review, the failed-load frame): the key then
- * opens the tab as before.
+ * While the expanded sidebar shows the Artifacts tab, the key acts as TOGGLE_RIGHT_SIDEBAR does,
+ * with the same blocks: a modal dialog, the command palette or a focused popover keeps the sidebar
+ * open, and so do immersive review and the failed-load frame (toggleRightSidebarFromKey refuses
+ * there). Returns whether the key was handled this way.
  */
-function collapseOnArtifactsTab(
+function handleAsSidebarToggle(
+  e: KeyboardEvent,
   workspaceId: string,
   collapsed: boolean,
   layout: RightSidebarLayoutState,
   container: HTMLElement | null
 ): boolean {
   if (collapsed || !isTabSelected(layout.root, "artifacts")) return false;
-  const shell = container?.closest("[data-workspace-shell]") ?? null;
-  return toggleRightSidebarFromKey(workspaceId, shell);
+  if (!isRightSidebarToggleBlocked(e)) {
+    toggleRightSidebarFromKey(workspaceId, container?.closest("[data-workspace-shell]") ?? null);
+  }
+  return true;
 }
 
 /**
@@ -70,7 +75,7 @@ export function useArtifactsTabKey(options: ArtifactsTabKeyOptions): void {
       e.preventDefault();
       // A held key would open and collapse the sidebar on every repeat.
       if (e.repeat) return;
-      if (!collapseOnArtifactsTab(workspaceId, collapsed, getLayout(), container)) {
+      if (!handleAsSidebarToggle(e, workspaceId, collapsed, getLayout(), container)) {
         openArtifactsTab();
       }
     };
