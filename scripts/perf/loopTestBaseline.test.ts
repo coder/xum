@@ -69,6 +69,25 @@ describe("patchesGlobalTime", () => {
 });
 
 describe("runFile", () => {
+  test("the preload reads no clock through a test's performance.now spy", async () => {
+    // session_history.budget.test.ts counts its own clock reads; a wrapper read would change them.
+    write(
+      "spy.test.ts",
+      [
+        'import { expect, spyOn, test } from "bun:test";',
+        'import * as fs from "node:fs";',
+        'test("spy", () => {',
+        "  let reads = 0;",
+        '  const spy = spyOn(performance, "now").mockImplementation(() => ++reads);',
+        '  fs.existsSync("/");',
+        "  spy.mockRestore();",
+        "  expect(reads).toBe(0);",
+        "});",
+      ].join("\n")
+    );
+    expect((await runFile(root, "spy.test.ts", root)).exitCode).toBe(0);
+  });
+
   test("measures a passing file, and counts a crash at import as a failed run", async () => {
     write(
       "ok.test.ts",
