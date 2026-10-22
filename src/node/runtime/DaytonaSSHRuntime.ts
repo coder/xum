@@ -83,6 +83,7 @@ export type DaytonaRuntimeService = Pick<
   | "startAndWait"
   | "deleteSandbox"
   | "ensureSandboxReady"
+  | "ensureSshAccess"
   | "isSandboxReady"
   | "markSandboxReady"
   | "invalidateSandboxReady"
@@ -423,7 +424,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         (await this.refuseUnownedSandbox(sandboxId, emitStatus, options?.signal));
       if (refusal) return refusal;
       if (this.daytonaService.isSandboxReady(sandboxId)) {
-        return this.ensureReadyFromCache(options, emitStatus);
+        return this.ensureReadyFromCache(sandboxId, options, emitStatus);
       }
       return this.ensureReadyUncached(sandboxId, options, emitStatus);
     });
@@ -456,12 +457,17 @@ export class DaytonaSSHRuntime extends SSHRuntime {
 
   /** The cache covers the sandbox, not this workspace's checkout: a fork shares the sandbox. */
   private async ensureReadyFromCache(
+    sandboxId: string,
     options: EnsureReadyOptions | undefined,
     emitStatus: StatusEmitter
   ): Promise<EnsureReadyResult> {
     // Set before the probe: ensureReady is an explicit action, so a sandbox that stopped
     // within the cache is started again (recoverForRetry) instead of failing until it expires.
     this.restartsStoppedSandbox = true;
+    const accessFailure = options?.externalSshClient
+      ? await this.restoreExternalSshAccess(sandboxId, emitStatus, options.signal)
+      : undefined;
+    if (accessFailure) return accessFailure;
     const repoFailure = await this.checkRepo(options, emitStatus);
     if (repoFailure) return repoFailure;
     return { ready: true };
@@ -653,6 +659,25 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       return result.error ? { ...result, error: redactDaytonaTokens(result.error) } : result;
     } catch (error) {
       throw redactDaytonaError(error);
+    }
+  }
+
+  /**
+   * The ready cache proves Xum's own ssh (`-F daytona.conf`) works, not the user's ssh config
+   * an external client reads: another tool may have removed the managed block since. Only
+   * external clients ask for this, so cached checks on the exec path never touch that file.
+   */
+  private async restoreExternalSshAccess(
+    sandboxId: string,
+    emitStatus: StatusEmitter,
+    signal: AbortSignal | undefined
+  ): Promise<EnsureReadyResult | undefined> {
+    try {
+      await this.daytonaService.ensureSshAccess(sandboxId);
+      return undefined;
+    } catch (error) {
+      emitStatus("error");
+      return this.ensureReadyFailure(sandboxId, error, signal);
     }
   }
 

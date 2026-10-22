@@ -306,7 +306,11 @@ export class FakeDaytonaSshConfigWriter implements Pick<
     return Promise.resolve();
   }
 
+  /** False once a test removes the `~/.ssh/config` block, as a dotfiles tool might. */
+  managedBlockPresent = false;
+
   ensureManagedBlock(): Promise<void> {
+    this.managedBlockPresent = true;
     return Promise.resolve();
   }
 

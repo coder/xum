@@ -178,7 +178,7 @@ export async function ensureDaytonaSandboxReady(
   if (!isSSHRuntime(metadata.runtimeConfig) || !metadata.runtimeConfig.daytona) {
     return Ok(undefined);
   }
-  const ready = await createRuntimeForWorkspace(metadata).ensureReady();
+  const ready = await createRuntimeForWorkspace(metadata).ensureReady({ externalSshClient: true });
   return ready.ready ? Ok(undefined) : Err(ready.error);
 }
 

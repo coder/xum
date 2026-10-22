@@ -113,6 +113,22 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
     expect(rig.plane.countCalls("GET /sandbox/sb-ready")).toBeGreaterThan(getsAfterFirst);
   });
 
+  it("puts back the ~/.ssh/config block for an external ssh client within the ready cache", async () => {
+    rig.plane.addSandbox({ id: "sb-ready" });
+    expect(await makeRuntime({ sandboxId: "sb-ready" }).ensureReady()).toEqual({ ready: true });
+    rig.writer.managedBlockPresent = false;
+
+    // Xum's own commands read only daytona.conf: a cached check leaves the block alone.
+    expect(await makeRuntime({ sandboxId: "sb-ready" }).ensureReady()).toEqual({ ready: true });
+    expect(rig.writer.managedBlockPresent).toBe(false);
+
+    const forEditor = await makeRuntime({ sandboxId: "sb-ready" }).ensureReady({
+      externalSshClient: true,
+    });
+    expect(forEditor).toEqual({ ready: true });
+    expect(rig.writer.managedBlockPresent).toBe(true);
+  });
+
   it("checks each workspace's checkout while their shared sandbox is cached as ready", async () => {
     execSpy.mockRestore();
     rig.plane.addSandbox({ id: "sb-shared" });

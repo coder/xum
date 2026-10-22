@@ -4,7 +4,7 @@ import path from "node:path";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { shellQuote } from "@/common/utils/shell";
 import type { TerminalService } from "@/node/services/terminalService";
-import type { Runtime } from "@/node/runtime/Runtime";
+import type { EnsureReadyOptions, Runtime } from "@/node/runtime/Runtime";
 import * as daytonaSshConfig from "@/node/runtime/daytonaSshConfig";
 import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
 import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
@@ -234,7 +234,7 @@ describe("WorkspaceService.recordExternalEditorOpen for a Daytona workspace", ()
   /** The editor use leases held on the workspace while each readiness check ran. */
   let leasesDuringReadiness: number[];
   let readiness: { ready: true } | { ready: false; error: string };
-  const ensureReady = mock(() => {
+  const ensureReady = mock((_options?: EnsureReadyOptions) => {
     leasesDuringReadiness.push(workspaceUseLeasesFor(harness.config).heldCount("dt", "editor"));
     return Promise.resolve(
       readiness.ready ? readiness : { ...readiness, errorType: "runtime_not_ready" as const }
@@ -295,6 +295,8 @@ describe("WorkspaceService.recordExternalEditorOpen for a Daytona workspace", ()
       data: undefined,
     });
     expect(leasesDuringReadiness).toEqual([1]);
+    // The editor reads the user's ssh config, which the ready cache does not cover.
+    expect(ensureReady).toHaveBeenCalledWith({ externalSshClient: true });
   });
 
   test("refuses the open and releases the use when the sandbox cannot come up", async () => {
