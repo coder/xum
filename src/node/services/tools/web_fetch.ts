@@ -1,4 +1,5 @@
 import { tool } from "ai";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { Window } from "happy-dom";
 import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
@@ -84,8 +85,12 @@ function assertSupportedWebFetchProtocol(url: URL): void {
   }
 }
 
-function getRemainingWebFetchTimeoutSecs(deadlineMs: number, maxTimeoutSecs?: number): number {
-  const remainingMs = deadlineMs - Date.now();
+function getRemainingWebFetchTimeoutSecs(
+  clock: HostClock,
+  deadlineMs: number,
+  maxTimeoutSecs?: number
+): number {
+  const remainingMs = deadlineMs - clock.nowMs();
   if (remainingMs <= 0) {
     throw new WebFetchValidationError(WEB_FETCH_TIMEOUT_ERROR);
   }
@@ -205,6 +210,7 @@ async function resolveHostnameInRuntime(
   abortSignal?: AbortSignal
 ): Promise<string[]> {
   const resolveTimeoutSecs = getRemainingWebFetchTimeoutSecs(
+    config.clock ?? nodeClock,
     deadlineMs,
     WEB_FETCH_RESOLVE_TIMEOUT_SECS
   );
@@ -512,7 +518,7 @@ async function fetchTargetFromValidatedAddresses(
 ): Promise<runtimeHelpers.ExecResult> {
   let result: runtimeHelpers.ExecResult | undefined;
   for (const address of target.addresses.slice(0, WEB_FETCH_MAX_ADDRESS_ATTEMPTS)) {
-    const curlTimeoutSecs = getRemainingWebFetchTimeoutSecs(deadlineMs);
+    const curlTimeoutSecs = getRemainingWebFetchTimeoutSecs(config.clock ?? nodeClock, deadlineMs);
     const connectTo = target.pinned ? buildConnectToPin(target.url, address) : null;
     const raw = await runtimeHelpers.execBuffered(
       config.runtime,
@@ -542,7 +548,7 @@ async function executeWebFetchRequest(
   rawUrl: string,
   abortSignal?: AbortSignal
 ): Promise<{ result: runtimeHelpers.ExecResult; finalUrl: string }> {
-  const deadlineMs = Date.now() + WEB_FETCH_TIMEOUT_SECS * 1000;
+  const deadlineMs = (config.clock ?? nodeClock).nowMs() + WEB_FETCH_TIMEOUT_SECS * 1000;
   let target = await assertWebFetchTargetAllowed(config, rawUrl, deadlineMs, abortSignal);
   // A curl that cannot be classified refuses here, before any HTTP request.
   const reportsProxyUsed = await probeCurlReportsProxyUsed(config);

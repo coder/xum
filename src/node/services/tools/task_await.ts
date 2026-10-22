@@ -1,4 +1,5 @@
 import assert from "@/common/utils/assert";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { tool } from "ai";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -81,14 +82,15 @@ function parseTimestampMs(value: string | undefined): number | undefined {
 }
 
 function getAgentTaskElapsedMs(
-  timestamps: AgentTaskTimestamps | null | undefined
+  timestamps: AgentTaskTimestamps | null | undefined,
+  clock: HostClock
 ): number | undefined {
   const createdAtMs = parseTimestampMs(timestamps?.createdAt);
   if (createdAtMs == null) {
     return undefined;
   }
 
-  const endAtMs = parseTimestampMs(timestamps?.reportedAt) ?? Date.now();
+  const endAtMs = parseTimestampMs(timestamps?.reportedAt) ?? clock.nowMs();
   return Math.max(0, endAtMs - createdAtMs);
 }
 
@@ -142,14 +144,14 @@ function isPageableReport<T extends { status: string; taskId: string }>(
   return "reportMarkdown" in result && typeof result.reportMarkdown === "string";
 }
 
-function getWorkflowRunElapsedMs(run: WorkflowRunRecord): number | undefined {
+function getWorkflowRunElapsedMs(run: WorkflowRunRecord, clock: HostClock): number | undefined {
   const createdAtMs = parseTimestampMs(run.createdAt);
   if (createdAtMs == null) {
     return undefined;
   }
   const updatedAtMs = parseTimestampMs(run.updatedAt);
-  const endAtMs = isTerminalWorkflowRunStatus(run.status) ? updatedAtMs : Date.now();
-  return Math.max(0, (endAtMs ?? Date.now()) - createdAtMs);
+  const endAtMs = isTerminalWorkflowRunStatus(run.status) ? updatedAtMs : clock.nowMs();
+  return Math.max(0, (endAtMs ?? clock.nowMs()) - createdAtMs);
 }
 
 function getWorkflowRunReport(run: WorkflowRunRecord): {
@@ -190,13 +192,13 @@ function buildWorkflowFailureState(run: WorkflowRunRecord) {
   };
 }
 
-function buildWorkflowAwaitResult(run: WorkflowRunRecord) {
+function buildWorkflowAwaitResult(run: WorkflowRunRecord, clock: HostClock) {
   // Deliberately omit the full run record (script source, event log, step snapshots):
   // it is huge and model-facing only. In-progress events may never materialize in the final
   // result, so the model only needs the status plus the final report/error.
   const base = {
     taskId: run.id,
-    ...withElapsedMs(getWorkflowRunElapsedMs(run)),
+    ...withElapsedMs(getWorkflowRunElapsedMs(run, clock)),
   };
   const workflowProgress = buildWorkflowProgressSummary(run);
   const workflowProgressField = workflowProgress == null ? {} : { workflowProgress };
@@ -255,16 +257,20 @@ function buildWorkflowAwaitResult(run: WorkflowRunRecord) {
   }
 }
 
-async function waitForDelayOrAbort(delayMs: number, signal: AbortSignal): Promise<void> {
+async function waitForDelayOrAbort(
+  clock: HostClock,
+  delayMs: number,
+  signal: AbortSignal
+): Promise<void> {
   if (signal.aborted) {
     return;
   }
   await new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, delayMs);
+    const cancelTimer = clock.setTimer(resolve, delayMs);
     signal.addEventListener(
       "abort",
       () => {
-        clearTimeout(timer);
+        cancelTimer();
         resolve();
       },
       { once: true }
@@ -273,6 +279,7 @@ async function waitForDelayOrAbort(delayMs: number, signal: AbortSignal): Promis
 }
 
 export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
+  const clock = config.clock ?? nodeClock;
   return tool({
     description: TOOL_DEFINITIONS.task_await.description,
     inputSchema: TOOL_DEFINITIONS.task_await.schema,
@@ -399,7 +406,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       // Agent task records currently store creation/report timestamps, but not a separate
       // running-start timestamp, so this elapsed value intentionally includes queued time.
       const getAgentTaskElapsedField = (taskId: string) =>
-        withElapsedMs(getAgentTaskElapsedMs(taskService.getAgentTaskTimestamps?.(taskId)));
+        withElapsedMs(getAgentTaskElapsedMs(taskService.getAgentTaskTimestamps?.(taskId), clock));
 
       const descendantAgentTaskIds =
         typeof bulkFilter === "function"
@@ -462,25 +469,26 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         }
         if (timeoutMs === 0 || isTerminalWorkflowRunStatus(run.status)) {
           await markWorkflowTerminalAttentionConsumed(run);
-          return buildWorkflowAwaitResult(run);
+          return buildWorkflowAwaitResult(run, clock);
         }
 
-        const deadline = Date.now() + (timeoutMs ?? DEFAULT_TASK_AWAIT_TIMEOUT_MS);
+        const deadline = clock.nowMs() + (timeoutMs ?? DEFAULT_TASK_AWAIT_TIMEOUT_MS);
         while (!isTerminalWorkflowRunStatus(run.status)) {
           if (abortSignal?.aborted) {
             return { status: "error" as const, taskId: runId, error: "Interrupted" };
           }
-          if (taskSignal.aborted || Date.now() >= deadline) {
-            return buildWorkflowAwaitResult(run);
+          if (taskSignal.aborted || clock.nowMs() >= deadline) {
+            return buildWorkflowAwaitResult(run, clock);
           }
 
-          const remainingMs = Math.max(1, deadline - Date.now());
+          const remainingMs = Math.max(1, deadline - clock.nowMs());
           await waitForDelayOrAbort(
+            clock,
             Math.min(WORKFLOW_AWAIT_POLL_INTERVAL_MS, remainingMs),
             taskSignal
           );
           if (taskSignal.aborted) {
-            return buildWorkflowAwaitResult(run);
+            return buildWorkflowAwaitResult(run, clock);
           }
 
           const nextRun = await getWorkflowRun(runId);
@@ -491,7 +499,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         }
 
         await markWorkflowTerminalAttentionConsumed(run);
-        return buildWorkflowAwaitResult(run);
+        return buildWorkflowAwaitResult(run, clock);
       };
 
       // task_await resolves once `min_completed` tasks have completed (default 1 = return on the

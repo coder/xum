@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import type { ExecResult } from "@/node/utils/runtime/helpers";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import { createWebFetchTool } from "./web_fetch";
@@ -13,9 +14,10 @@ const toolCallOptions: ToolExecutionOptions<unknown> = {
   context: undefined,
 };
 
-function createTestWebFetchTool() {
+function createTestWebFetchTool(clock?: HostClock) {
   const tempDir = new TestTempDir("test-web-fetch");
   const config = createTestToolConfig(tempDir.path);
+  config.clock = clock;
   const tool = createWebFetchTool(config);
 
   return {
@@ -80,12 +82,9 @@ function getCurlMaxTime(command: string): number {
 }
 
 afterEach(() => {
-  // Restore all spies (including the Date.now spy in the shared-timeout-budget
-  // test) so they never leak across test files: a frozen Date.now leaks
-  // process-wide and breaks downstream suites in the same `bun test` run, e.g.
-  // WorkflowService's crash-recovery retry test, whose retry delay never
-  // reaches 0 when time stands still. Do not remove this without restoring
-  // each global spy individually.
+  // Restore all spies so they never leak across test files: a global spy leaks
+  // process-wide and breaks downstream suites in the same `bun test` run. Do not
+  // remove this without restoring each global spy individually.
   mock.restore();
 });
 
@@ -426,10 +425,9 @@ describe("web_fetch tool", () => {
   });
 
   it("shares one overall timeout budget across redirect validation and fetch hops", async () => {
-    using testEnv = createTestWebFetchTool();
-
     let now = 1_000;
-    spyOn(Date, "now").mockImplementation(() => now);
+    // The tool reads the config's clock, so the test moves time without patching Date.now.
+    using testEnv = createTestWebFetchTool({ ...nodeClock, nowMs: () => now });
 
     const execSpy = mockRuntimeExec((_runtime, command, options) => {
       if (isRuntimeResolveCommand(command) && command.includes("public.example")) {

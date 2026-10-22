@@ -111,22 +111,14 @@ const CLOCK_PATCH_FREE_TESTS = [
   "src/node/services/backgroundProcessManager.test.ts",
   "src/node/services/retryManager.test.ts",
   "src/node/services/streamManager.toolEvents.test.ts",
+  "src/node/services/tools/skills_catalog_read.test.ts",
+  "src/node/services/tools/task_await.test.ts",
+  "src/node/services/tools/web_fetch.test.ts",
 ];
 // File -> the exact number of raw clock reads it still has. Phase 3 lowers each entry as it
 // moves the file onto the HostClock service, and the rule fails an entry that is too high.
 const RAW_CLOCK_ALLOW = {
-  "src/node/services/tools/bash.ts": 3,
-  "src/node/services/tools/bash_background_list.ts": 1,
-  "src/node/services/tools/code_execution.ts": 3,
-  "src/node/services/tools/intuition.ts": 1,
-  "src/node/services/tools/skills_catalog_read.ts": 1,
-  "src/node/services/tools/task.ts": 1,
-  "src/node/services/tools/task_await.ts": 7,
-  "src/node/services/tools/toolUtils.ts": 1,
-  "src/node/services/tools/web_fetch.ts": 2,
-  "src/node/services/tools/withHooks.ts": 6,
-  "src/node/services/tools/workflow_resume.ts": 1,
-  "src/node/services/tools/workflow_run.ts": 1,
+  "src/node/services/tools/bash.ts": 1,
 };
 // The rule strips "node:" and resolves relative specifiers to "@/..." forms.
 const HOST_MODULES = [

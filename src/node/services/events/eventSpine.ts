@@ -27,6 +27,7 @@ import assert from "node:assert";
 import { EventEmitter } from "node:events";
 import type { Tool } from "ai";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { HostClock } from "@/node/utils/hostClock";
 import { log } from "@/node/services/log";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -73,6 +74,8 @@ export interface ToolExecutionHost {
   workspaceId: string;
   /** Additional environment variables to pass to hooks. */
   env?: Record<string, string>;
+  /** The session's HostClock (hook durations). Absent: nodeClock. */
+  clock?: HostClock;
 }
 
 /** Outcome of ToolExecuteContext.parseInput: on success, the value the tool runs with. */

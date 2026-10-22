@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { nodeClock } from "@/node/utils/hostClock";
 
 import { tool, type Tool } from "ai";
 import type { z } from "zod";
@@ -306,7 +307,7 @@ function emitTaskCreatedEvent(params: {
       workspaceId: params.workspaceId,
       toolCallId: params.toolCallId,
       taskId: params.taskId,
-      timestamp: Date.now(),
+      timestamp: (params.config.clock ?? nodeClock).nowMs(),
     } satisfies TaskCreatedEvent,
     "task"
   );

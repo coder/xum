@@ -2823,6 +2823,7 @@ export class TurnRequestBuilder {
     // Hoisted so refusal fallback can rebuild tools without changing their context.
     const toolsForModelConfig: ToolConfiguration = {
       cwd: workspacePath,
+      clock: this.hostClock,
       hookTurn,
       runtime,
       projects: getProjects(metadata),
@@ -3186,6 +3187,7 @@ export class TurnRequestBuilder {
             sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             kernelFileLoader,
           },
+          clock: this.hostClock,
         });
         if (options.recordTimings) {
           recordStartupPhaseTiming("applyToolPolicyAndExperimentsMs", applyPolicyStartedAt);
