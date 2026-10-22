@@ -2,6 +2,7 @@ import React, { useContext, useEffect, useRef, useState } from "react";
 import {
   PinnedViewToolbarSpacerContext,
   usePinnedViewCoversWindow,
+  usePinnedViewEscape,
 } from "@/browser/hooks/usePinnedViewCoversWindow";
 import { pinnedViewClass, pinnedViewRole, pinView } from "@/browser/utils/ui/pinnedView";
 import {
@@ -702,6 +703,8 @@ export function ArtifactsPanel(props: {
   // so then it covers the window, everything else goes inert, and it is a modal dialog.
   const coversWindow = usePinnedViewCoversWindow();
   const ToolbarSpacer = useContext(PinnedViewToolbarSpacerContext);
+  // Escape from the usable left sidebar ends a workspace-scoped fullscreen too.
+  usePinnedViewEscape(showFullscreen, coversWindow, () => setFullscreenMode(false));
   useEffect(() => {
     const panel = panelRef.current;
     if (!showFullscreen || panel == null) return;

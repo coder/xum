@@ -28,10 +28,10 @@ import {
 } from "@/common/constants/storage";
 import { PinnedViewToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import {
+  NoToolbarSpacer,
   PinnedViewToolbarSpacerContext,
   RightSidebarOverlayContext,
 } from "@/browser/hooks/usePinnedViewCoversWindow";
-import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
 import { openArtifact } from "./openArtifact";
@@ -555,7 +555,6 @@ describe("ArtifactsPanel", () => {
   for (const leftSidebarCollapsed of [false, true]) {
     test(`wide: fullscreen covers the workspace shell and the left sidebar stays usable (collapsed: ${leftSidebarCollapsed})`, async () => {
       stubNarrowViewport(false);
-      window.localStorage.setItem(LEFT_SIDEBAR_COLLAPSED_KEY, JSON.stringify(leftSidebarCollapsed));
       fake = createFakeArtifactsApi(
         {
           available: true,
@@ -569,9 +568,12 @@ describe("ArtifactsPanel", () => {
       const shell = document.body.appendChild(document.createElement("div"));
       shell.setAttribute("data-workspace-shell", "");
       const chat = shell.appendChild(document.createElement("button"));
-      // RightSidebar provides the toolbar spacer (the webview bundles the panel without it).
+      // RightSidebar provides the toolbar spacer while the left sidebar is collapsed (the webview
+      // bundles the panel without it).
       const view = render(
-        <PinnedViewToolbarSpacerContext.Provider value={PinnedViewToggleBarSpacer}>
+        <PinnedViewToolbarSpacerContext.Provider
+          value={leftSidebarCollapsed ? PinnedViewToggleBarSpacer : NoToolbarSpacer}
+        >
           <ArtifactsPanel workspaceId="ws-artifacts" />
         </PinnedViewToolbarSpacerContext.Provider>,
         { wrapper: ApiWrapper, container: shell.appendChild(document.createElement("div")) }
@@ -590,6 +592,15 @@ describe("ArtifactsPanel", () => {
       await waitFor(() => expect(view.queryByRole("region")).toBeNull());
       expect(chat.inert).toBe(false);
       await waitFor(() => expect(document.activeElement).toBe(panel));
+
+      // Escape from a control in the usable left sidebar ends fullscreen too, and is consumed, so
+      // it cannot also reach Escape-to-interrupt (a window listener) behind the panel.
+      fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+      await view.findByRole("region", { name: "Artifact a.txt" });
+      leftSidebar.focus();
+      expect(fireEvent.keyDown(leftSidebar, { key: "Escape" })).toBe(false);
+      await waitFor(() => expect(view.queryByRole("region")).toBeNull());
+      expect(chat.inert).toBe(false);
       leftSidebar.remove();
       shell.remove();
     });

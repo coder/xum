@@ -1,4 +1,5 @@
 import { createContext, useContext, type ComponentType } from "react";
+import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 import { useNarrowViewport } from "@/browser/hooks/useNarrowViewport";
 
 /**
@@ -17,8 +18,11 @@ export const RightSidebarOverlayContext = createContext(false);
  */
 export const PinnedViewToolbarSpacerContext = createContext<ComponentType>(NoToolbarSpacer);
 
-/** Outside RightSidebar (the webview, tests): no app shell, so no toggle bar to keep clear. */
-function NoToolbarSpacer() {
+/**
+ * No toggle bar to keep clear: outside RightSidebar (the webview, tests), or while the left
+ * sidebar is expanded (its toggle bar then sits over the sidebar, not over the pinned view).
+ */
+export function NoToolbarSpacer() {
   return null;
 }
 
@@ -32,4 +36,20 @@ export function usePinnedViewCoversWindow(): boolean {
   const narrow = useNarrowViewport();
   const inOverlay = useContext(RightSidebarOverlayContext);
   return narrow || inOverlay;
+}
+
+/**
+ * Escape layer of a workspace-scoped pinned view: above the narrow-screen drawer (0) and the
+ * full-screen right sidebar (1), though neither can be open with it.
+ */
+const PINNED_VIEW_ESCAPE_LAYER = 2;
+
+/**
+ * Escape from the usable left sidebar beside a workspace-scoped pinned view ends it, like
+ * Escape from inside the panel. Without this, Escape from a sidebar control reached
+ * Escape-to-interrupt and stopped the chat stream behind the panel (useAIViewKeybinds yields to
+ * open useEscapeToDismiss overlays). A window-scoped view needs none: everything else is inert.
+ */
+export function usePinnedViewEscape(active: boolean, coversWindow: boolean, onExit: () => void) {
+  useEscapeToDismiss(active && !coversWindow, onExit, PINNED_VIEW_ESCAPE_LAYER);
 }

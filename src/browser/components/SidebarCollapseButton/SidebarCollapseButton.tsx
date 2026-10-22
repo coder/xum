@@ -1,12 +1,15 @@
+import type { ReactNode } from "react";
 import { PanelLeft, PanelRight, SquarePen } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import { usePinnedViewCoversWindow } from "@/browser/hooks/usePinnedViewCoversWindow";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  NoToolbarSpacer,
+  PinnedViewToolbarSpacerContext,
+  usePinnedViewCoversWindow,
+} from "@/browser/hooks/usePinnedViewCoversWindow";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import { cn } from "@/common/lib/utils";
 
 // Shared by the bar and its spacers, so a spacer is exactly as wide as the bar in every layout:
@@ -140,17 +143,32 @@ export function LeftSidebarToggleBarSpacer(props: { showNewChat: boolean }) {
 
 /**
  * The spacer for the toolbar of a pinned view (Artifacts fullscreen, a maximized App View tab;
- * render it only while pinned). In a wide window the view covers the workspace shell, and while
- * the left sidebar is collapsed the toggle bar sits over the view's top-left corner, as over the
- * workspace header. Renders nothing otherwise: a view that covers the window covers the bar.
+ * render it only while pinned). RightSidebar provides it while the left sidebar is collapsed (from
+ * App's resolved state, not the persisted key, whose default App picks at mount): in a wide window
+ * the view covers the workspace shell and the toggle bar sits over its top-left corner, as over
+ * the workspace header. Renders nothing when the view covers the window: it covers the bar.
  */
 export function PinnedViewToggleBarSpacer() {
   const coversWindow = usePinnedViewCoversWindow();
-  // App owns this key. Its default (collapsed in a narrow window) never applies here: the spacer
-  // shows only in a wide window.
-  const [collapsed] = usePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, false, { listener: true });
   // Collapsed inside a workspace, so the bar offers New chat too (App's toggleBarShowsNewChat).
-  return collapsed && !coversWindow ? <LeftSidebarToggleBarSpacer showNewChat /> : null;
+  return coversWindow ? null : <LeftSidebarToggleBarSpacer showNewChat />;
+}
+
+/**
+ * Gives the pinned views inside (the right sidebar's Artifacts fullscreen and App View maximize)
+ * the toggle bar spacer while the left sidebar is collapsed, and none while it is expanded.
+ */
+export function PinnedViewToolbarSpacerProvider(props: {
+  leftSidebarCollapsed: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <PinnedViewToolbarSpacerContext.Provider
+      value={props.leftSidebarCollapsed ? PinnedViewToggleBarSpacer : NoToolbarSpacer}
+    >
+      {props.children}
+    </PinnedViewToolbarSpacerContext.Provider>
+  );
 }
 
 // Shared by the right toggle bar and its title bar hole. `right-sidebar-toggle` (globals.css)

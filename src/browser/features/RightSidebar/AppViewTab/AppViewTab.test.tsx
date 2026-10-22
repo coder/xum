@@ -391,6 +391,14 @@ describe("AppViewTabPanel", () => {
       expect(panel().className).not.toContain("fixed");
       expect(view.getByTestId("outside").inert).toBe(false);
 
+      // Wide: Escape from the usable left sidebar restores the panel too, and is consumed.
+      if (!narrow) {
+        fireEvent.click(view.getByRole("button", { name: "Maximize view" }));
+        expect(panel().className).toContain("fixed");
+        expect(fireEvent.keyDown(view.getByTestId("left-sidebar"), { key: "Escape" })).toBe(false);
+        expect(panel().className).not.toContain("fixed");
+      }
+
       // The keyboard path: the Artifacts fullscreen shortcut toggles it, Escape restores it.
       fireEvent.keyDown(panel(), { key: "F", shiftKey: true });
       expect(panel().className).toContain("fixed");

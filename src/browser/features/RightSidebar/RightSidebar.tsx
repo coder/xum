@@ -14,11 +14,7 @@ import { trimRecordToChars } from "@/browser/utils/boundedPersistedValue";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { PinnedViewToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
-import {
-  PinnedViewToolbarSpacerContext,
-  RightSidebarOverlayContext,
-} from "@/browser/hooks/usePinnedViewCoversWindow";
+import { RightSidebarOverlayContext } from "@/browser/hooks/usePinnedViewCoversWindow";
 import {
   DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
   isDesktopMode,
@@ -454,6 +450,7 @@ interface RightSidebarProps {
    */
   fullscreen?: boolean;
   onCloseFullscreen?: () => void;
+
   /** Sidebar shortcuts while the narrow layout hides the sidebar: show it full-screen. */
   onRequestFullscreen?: () => void;
   /**
@@ -2753,125 +2750,123 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     // Pinned views inside (Artifacts fullscreen, App View maximize) cover the whole window while
     // this sidebar is its full-window overlay: usePinnedViewCoversWindow.
     <RightSidebarOverlayContext.Provider value={fullscreen}>
-      <PinnedViewToolbarSpacerContext.Provider value={PinnedViewToggleBarSpacer}>
-        <DndContext sensors={sensors} onDragStart={handleDragStart} onDragEnd={handleDragEnd}>
-          <ReviewAssistedStatsReporter
-            workspaceId={workspaceId}
-            workspacePath={workspacePath}
-            projectPath={projectPath}
-            isCreating={Boolean(isCreating)}
-            onUnreadAssistedChange={setUnreadAssisted}
-          />
-          <SidebarContainer
-            collapsed={collapsed}
-            isResizing={isResizing}
-            isDesktop={isDesktopMode()}
-            immersiveHidden={immersiveHidden}
-            fullscreen={fullscreen}
-            containerRef={sidebarContainerRef}
-            customWidth={width} // Unified width from AIView (applies to all tabs)
-            role="complementary"
-            aria-label="Workspace insights"
-            header={
-              fullscreen && (
-                // Shown only by the full-screen CSS (globals.css); also the probe for "layout widened".
-                <div
-                  ref={fullscreenHeaderRef}
-                  className={cn(
-                    // It covers the window's top edge, so on Windows/Linux and macOS desktop it must
-                    // keep clear of the native window controls and stay a drag region, like the
-                    // workspace header.
-                    "right-sidebar-fullscreen-header border-border-light titlebar-safe-left titlebar-safe-left-gutter-4 titlebar-safe-right titlebar-safe-right-gutter-2 shrink-0 items-center justify-between gap-2 border-b py-1",
-                    isDesktopMode() && cn(DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS, "titlebar-drag")
-                  )}
-                >
-                  <span className="text-foreground min-w-0 truncate text-sm font-medium">
-                    {workspaceDisplayTitle}
-                  </span>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className={cn(
-                      "text-muted hover:text-foreground h-8 w-8 shrink-0",
-                      isDesktopMode() && "titlebar-no-drag"
-                    )}
-                    aria-label="Close sidebar"
-                    onClick={onCloseFullscreen}
-                  >
-                    <X className="h-4 w-4" />
-                  </Button>
-                </div>
-              )
-            }
-            renderPanel={() => (
-              <>
-                {/* Resize handle (left edge); full-screen mode has nothing to resize. */}
-                {onStartResize && !fullscreen && (
-                  <div
-                    data-sidebar-resize-handle=""
-                    className={cn(
-                      // touch-none: a touch drag on the handle resizes instead of panning the page.
-                      "group/resize z-10 flex w-0.5 flex-shrink-0 cursor-col-resize touch-none justify-center",
-                      // A 2px line is too thin to grab with a finger, and iPads report a coarse
-                      // pointer even with a trackpad: coarse pointers get a wider strip with a grip.
-                      // The sidebar's divider line moves to the strip's right edge (the panel drops
-                      // its own), so the tab strip's bottom border still meets it.
-                      "[@media(pointer:coarse)]:border-border-light [@media(pointer:coarse)]:w-3 [@media(pointer:coarse)]:border-r"
-                    )}
-                    onPointerDown={onStartResize}
-                  >
-                    <span
-                      aria-hidden="true"
-                      className={cn(
-                        "w-full transition-[background] duration-150",
-                        "[@media(pointer:coarse)]:my-auto [@media(pointer:coarse)]:h-10 [@media(pointer:coarse)]:w-1 [@media(pointer:coarse)]:rounded-full",
-                        isResizing
-                          ? "bg-accent"
-                          : "bg-border-light group-hover/resize:bg-accent [@media(pointer:coarse)]:bg-border-darker"
-                      )}
-                    />
-                  </div>
+      <DndContext sensors={sensors} onDragStart={handleDragStart} onDragEnd={handleDragEnd}>
+        <ReviewAssistedStatsReporter
+          workspaceId={workspaceId}
+          workspacePath={workspacePath}
+          projectPath={projectPath}
+          isCreating={Boolean(isCreating)}
+          onUnreadAssistedChange={setUnreadAssisted}
+        />
+        <SidebarContainer
+          collapsed={collapsed}
+          isResizing={isResizing}
+          isDesktop={isDesktopMode()}
+          immersiveHidden={immersiveHidden}
+          fullscreen={fullscreen}
+          containerRef={sidebarContainerRef}
+          customWidth={width} // Unified width from AIView (applies to all tabs)
+          role="complementary"
+          aria-label="Workspace insights"
+          header={
+            fullscreen && (
+              // Shown only by the full-screen CSS (globals.css); also the probe for "layout widened".
+              <div
+                ref={fullscreenHeaderRef}
+                className={cn(
+                  // It covers the window's top edge, so on Windows/Linux and macOS desktop it must
+                  // keep clear of the native window controls and stay a drag region, like the
+                  // workspace header.
+                  "right-sidebar-fullscreen-header border-border-light titlebar-safe-left titlebar-safe-left-gutter-4 titlebar-safe-right titlebar-safe-right-gutter-2 shrink-0 items-center justify-between gap-2 border-b py-1",
+                  isDesktopMode() && cn(DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS, "titlebar-drag")
                 )}
-
-                <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-                  {renderLayoutNode(layout.root)}
-                </div>
-              </>
-            )}
-            renderCard={() => (
-              <RightSidebarOverview
-                workspaceId={workspaceId}
-                onOpenTab={handleOpenTabFromOverview}
-                onOpenTerminals={
-                  overviewTerminalTab != null
-                    ? () => handleOpenTabFromOverview(overviewTerminalTab)
-                    : undefined
-                }
-                onNewSideChat={canStartSideChat ? () => handleStartSideChat() : undefined}
-                creatingSideChat={creatingSideChat}
-                artifactsEnabled={artifactsExperimentEnabled}
-                mcpAppsEnabled={mcpAppsExperimentEnabled}
-                unreadAssisted={unreadAssisted}
-              />
-            )}
-          />
-
-          {/* Drag overlay - shows tab being dragged at cursor position */}
-          <DragOverlay>
-            {activeDragData ? (
-              <div className="border-border bg-background/95 cursor-grabbing rounded-md border px-3 py-1 text-xs font-medium shadow">
-                {getTabName(activeDragData.tab)}
+              >
+                <span className="text-foreground min-w-0 truncate text-sm font-medium">
+                  {workspaceDisplayTitle}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className={cn(
+                    "text-muted hover:text-foreground h-8 w-8 shrink-0",
+                    isDesktopMode() && "titlebar-no-drag"
+                  )}
+                  aria-label="Close sidebar"
+                  onClick={onCloseFullscreen}
+                >
+                  <X className="h-4 w-4" />
+                </Button>
               </div>
-            ) : null}
-          </DragOverlay>
+            )
+          }
+          renderPanel={() => (
+            <>
+              {/* Resize handle (left edge); full-screen mode has nothing to resize. */}
+              {onStartResize && !fullscreen && (
+                <div
+                  data-sidebar-resize-handle=""
+                  className={cn(
+                    // touch-none: a touch drag on the handle resizes instead of panning the page.
+                    "group/resize z-10 flex w-0.5 flex-shrink-0 cursor-col-resize touch-none justify-center",
+                    // A 2px line is too thin to grab with a finger, and iPads report a coarse
+                    // pointer even with a trackpad: coarse pointers get a wider strip with a grip.
+                    // The sidebar's divider line moves to the strip's right edge (the panel drops
+                    // its own), so the tab strip's bottom border still meets it.
+                    "[@media(pointer:coarse)]:border-border-light [@media(pointer:coarse)]:w-3 [@media(pointer:coarse)]:border-r"
+                  )}
+                  onPointerDown={onStartResize}
+                >
+                  <span
+                    aria-hidden="true"
+                    className={cn(
+                      "w-full transition-[background] duration-150",
+                      "[@media(pointer:coarse)]:my-auto [@media(pointer:coarse)]:h-10 [@media(pointer:coarse)]:w-1 [@media(pointer:coarse)]:rounded-full",
+                      isResizing
+                        ? "bg-accent"
+                        : "bg-border-light group-hover/resize:bg-accent [@media(pointer:coarse)]:bg-border-darker"
+                    )}
+                  />
+                </div>
+              )}
 
-          <PopoverError
-            error={terminalCreateError.error}
-            prefix="Failed to open terminal:"
-            onDismiss={terminalCreateError.clearError}
-          />
-        </DndContext>
-      </PinnedViewToolbarSpacerContext.Provider>
+              <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+                {renderLayoutNode(layout.root)}
+              </div>
+            </>
+          )}
+          renderCard={() => (
+            <RightSidebarOverview
+              workspaceId={workspaceId}
+              onOpenTab={handleOpenTabFromOverview}
+              onOpenTerminals={
+                overviewTerminalTab != null
+                  ? () => handleOpenTabFromOverview(overviewTerminalTab)
+                  : undefined
+              }
+              onNewSideChat={canStartSideChat ? () => handleStartSideChat() : undefined}
+              creatingSideChat={creatingSideChat}
+              artifactsEnabled={artifactsExperimentEnabled}
+              mcpAppsEnabled={mcpAppsExperimentEnabled}
+              unreadAssisted={unreadAssisted}
+            />
+          )}
+        />
+
+        {/* Drag overlay - shows tab being dragged at cursor position */}
+        <DragOverlay>
+          {activeDragData ? (
+            <div className="border-border bg-background/95 cursor-grabbing rounded-md border px-3 py-1 text-xs font-medium shadow">
+              {getTabName(activeDragData.tab)}
+            </div>
+          ) : null}
+        </DragOverlay>
+
+        <PopoverError
+          error={terminalCreateError.error}
+          prefix="Failed to open terminal:"
+          onDismiss={terminalCreateError.clearError}
+        />
+      </DndContext>
     </RightSidebarOverlayContext.Provider>
   );
 };

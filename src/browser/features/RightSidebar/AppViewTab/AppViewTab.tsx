@@ -18,7 +18,10 @@ import {
 } from "../ArtifactsTab/mcpAppViewsStore";
 import { Notice } from "../ArtifactsTab/SourceText";
 import { withEntrypointScope } from "./mcpAppEntrypoints";
-import { usePinnedViewCoversWindow } from "@/browser/hooks/usePinnedViewCoversWindow";
+import {
+  usePinnedViewCoversWindow,
+  usePinnedViewEscape,
+} from "@/browser/hooks/usePinnedViewCoversWindow";
 import { pinnedViewClass, pinnedViewRole, pinView } from "@/browser/utils/ui/pinnedView";
 import { cn } from "@/common/lib/utils";
 import {
@@ -203,6 +206,8 @@ function MaximizablePanel(props: {
   const panelRef = useRef<HTMLDivElement>(null);
   const coversWindow = usePinnedViewCoversWindow();
   usePinnedView(panelRef, maximized, coversWindow, () => setMaximized(false));
+  // Escape from the usable left sidebar restores a workspace-scoped maximize too.
+  usePinnedViewEscape(maximized, coversWindow, () => setMaximized(false));
   // A closed tab must not come back maximized.
   useEffect(
     () => () => setMcpAppViewMaximized(workspaceId, toolCallId, false),
