@@ -88,7 +88,10 @@ const SortableTab: React.FC<{
   const sortableOnKeyDown = listeners?.onKeyDown;
 
   return (
-    <div className="relative shrink-0" style={style}>
+    // Capped at the row's width, so a tab never shows cut off at the row's end when the row is
+    // narrower than the tab (a 300 px sidebar under the window-controls inset, #7103): its label
+    // truncates and its X stays in view.
+    <div className="relative max-w-full shrink-0" style={style}>
       <Tooltip>
         <TooltipTrigger asChild>
           <div
