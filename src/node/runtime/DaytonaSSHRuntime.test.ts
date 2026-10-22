@@ -1601,6 +1601,19 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
     expect(String(error)).toContain(`${DAYTONA_TOKEN_PLACEHOLDER}@127.0.0.1: Permission denied`);
   });
 
+  it("revokes the token another backend wrote as a sandbox's first alias once it replaces it", async () => {
+    rig.plane.addSandbox({ id: "sb-theirs-first" });
+    await rig.service.loadPersistedTokens();
+    // After this backend's startup load, another one sets the sandbox up first.
+    rig.writer.tokens.set("sb-theirs-first", "other-backend-first-token");
+
+    await rig.service.ensureSshAccess("sb-theirs-first");
+
+    expect(rig.writer.tokens.get("sb-theirs-first")).not.toBe("other-backend-first-token");
+    expect(rig.writer.fullWrites).toEqual(["sb-theirs-first"]);
+    expect(rig.plane.revokedTokens).toEqual(["other-backend-first-token"]);
+  });
+
   it("follows the include file another backend sharing the root edits", async () => {
     rig.plane.addSandbox({ id: "sb-both" });
     await rig.service.ensureSshAccess("sb-both");

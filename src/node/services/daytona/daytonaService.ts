@@ -457,7 +457,12 @@ export class DaytonaService {
     const unchanged =
       generation === this.sshTokenGeneration(sandboxId) &&
       releases === this.accessReleases.get(sandboxId);
-    if (!unchanged || !this.sshConfigured.has(sandboxId)) return;
+    if (!unchanged) return;
+    if (this.sshConfigured.has(sandboxId)) this.followIncludeFile(sandboxId, fileToken);
+    else this.holdFirstSeenToken(sandboxId, fileToken);
+  }
+
+  private followIncludeFile(sandboxId: string, fileToken: string | undefined): void {
     const cached = this.tokens.get(sandboxId);
     if (fileToken === undefined) {
       this.sshConfigured.delete(sandboxId);
@@ -470,6 +475,17 @@ export class DaytonaService {
     if (cached && cached.token !== fileToken) {
       this.cacheNewToken(sandboxId, { token: fileToken, expiresAt: cached.expiresAt });
     }
+  }
+
+  /**
+   * Another backend set the sandbox up first: held as due at once, the mint about to run
+   * replaces and revokes it (that backend's next command is refused and mints its own). Only
+   * for the sandbox this process is about to use: holding another backend's tokens for others
+   * would revoke them, live, on a settings change here.
+   */
+  private holdFirstSeenToken(sandboxId: string, fileToken: string | undefined): void {
+    if (fileToken === undefined || this.tokens.has(sandboxId)) return;
+    this.cacheNewToken(sandboxId, { token: fileToken, expiresAt: new Date(0).toISOString() });
   }
 
   getPublicConfig(): Promise<DaytonaPublicConfig> {
