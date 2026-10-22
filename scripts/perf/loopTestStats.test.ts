@@ -50,6 +50,7 @@ describe("trips", () => {
     bun: "1.4.3",
     loadavg: [1],
     rounds: 3,
+    jobs: 6,
     files: files.map(([file, wallMs, failedRuns]) => ({
       file,
       wallMs,
@@ -102,6 +103,7 @@ describe("recheck", () => {
     bun: "1.4.3",
     loadavg: [1],
     rounds: wallMs.length,
+    jobs: 1,
     files: [
       {
         file: "a",

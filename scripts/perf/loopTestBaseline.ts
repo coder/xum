@@ -7,11 +7,12 @@
  *        bun scripts/perf/loopTestBaseline.ts [--runs 10] [--jobs 6] [--filter <substring>]
  *          [--base <ref>]
  *
- * It writes artifacts/loop-tests/<sha>[-dirty].json and .md (git-ignored: never commit a record,
- * it goes stale). With --base it also measures <ref> in a temporary worktree, pairs the rounds of
- * each file, and writes compare-<base>-<head>.json and .md with the trips of loopTestStats.ts.
- * Stage 2 reruns each tripped file alone, paired, RECHECK_RUNS rounds: only a trip that repeats
- * there counts. The report lists every stage 1 trip with its stage 2 result.
+ * It writes artifacts/loop-tests/<sha>[-dirty][-<filter>][-r<runs>].json and .md (recordName).
+ * They are git-ignored: never commit a record, it goes stale. With --base it also measures <ref>
+ * in a temporary worktree, pairs the rounds of each file, and writes compare-<base>-<name>.json
+ * and .md with the trips of loopTestStats.ts. Stage 2 reruns each tripped file alone, paired,
+ * RECHECK_RUNS rounds: only a trip that repeats there counts. The report lists every stage 1
+ * trip with its stage 2 result.
  * The numbers are tripwire data for the refactor, not targets: a trip pauses the PR for review.
  * Exit codes: 0 no trip (or a record), 1 a repeated trip, 2 bad input or a runner error (stage 2
  * included). The last line is
@@ -114,7 +115,9 @@ export function patchesGlobalTime(root: string, file: string): boolean {
     const transpiler = absolute.endsWith(".tsx") ? transpilers.tsx : transpilers.ts;
     return transpiler.scanImports(source).some(({ path: specifier }) => {
       const target = resolveImport(root, absolute, specifier);
-      return target !== null && TEST_HELPER.test(target) && visit(target);
+      // Match on "/" separators, also on Windows.
+      const helper = target !== null && TEST_HELPER.test(target.split(path.sep).join("/"));
+      return helper && visit(target);
     });
   };
   return visit(path.join(root, file));
@@ -195,6 +198,20 @@ export async function runPool<T>(tasks: Array<PoolTask<T>>, jobs: number): Promi
   return results;
 }
 
+export const DEFAULT_RUNS = 10;
+
+/**
+ * The artifact name: <sha>[-dirty], plus the filter and the rounds when they differ from a full
+ * run, so a filtered or short smoke run never overwrites the full baseline of a commit.
+ */
+export function recordName(sha: string, dirty: boolean, filter: string | undefined, runs: number) {
+  const parts = [sha.slice(0, 10)];
+  if (dirty) parts.push("dirty");
+  if (filter !== undefined) parts.push(filter.replace(/[^\w.-]+/g, "_"));
+  if (runs !== DEFAULT_RUNS) parts.push(`r${runs}`);
+  return parts.join("-");
+}
+
 const pct = (share: number | null) => (share === null ? "-" : share.toFixed(2));
 
 export function renderRecord(record: LoopTestRecord): string {
@@ -205,7 +222,7 @@ export function renderRecord(record: LoopTestRecord): string {
       `${pct(f.fsShare)} | ${pct(f.timerShare)} |`
   );
   return [
-    `Loop tests: ${record.files.length} files, ${record.rounds} rounds, ${record.commit.slice(0, 10)}` +
+    `Loop tests: ${record.files.length} files, ${record.rounds} rounds, ${record.jobs} jobs, ${record.commit.slice(0, 10)}` +
       `${record.dirty ? " (dirty)" : ""}, bun ${record.bun}, load ${record.loadavg.map((l) => l.toFixed(1)).join(" ")}`,
     "",
     "| file | median | failed | temp dir | patches time | fs share | timer share |",
@@ -310,6 +327,7 @@ async function measure(
       bun: Bun.version,
       loadavg,
       rounds: runs,
+      jobs,
       files: files.map((file, i) => {
         const fileRuns = Array.from({ length: runs }, (_, round) => {
           const run = results[round * files.length + i].get(side.label);
@@ -374,7 +392,7 @@ function renderCompare(compare: LoopTestCompare): string {
 async function main(): Promise<number> {
   const { values } = parseArgs({
     options: {
-      runs: { type: "string", default: "10" },
+      runs: { type: "string", default: String(DEFAULT_RUNS) },
       jobs: { type: "string", default: "6" },
       filter: { type: "string" },
       base: { type: "string" },
@@ -433,7 +451,7 @@ async function main(): Promise<number> {
     const records = await measure(sides, files, runs, jobs, scratchDir);
     const outDir = path.join(root, "artifacts", "loop-tests");
     fs.mkdirSync(outDir, { recursive: true });
-    const headName = `${state.gitSha.slice(0, 10)}${state.dirty ? "-dirty" : ""}`;
+    const headName = recordName(state.gitSha, state.dirty, values.filter, runs);
     const head = records[records.length - 1];
     if (records.length === 1) {
       const markdown = renderRecord(head);

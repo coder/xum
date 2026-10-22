@@ -47,6 +47,8 @@ export interface LoopTestRecord {
   /** The 1-minute load average, sampled once a minute during the run. */
   loadavg: number[];
   rounds: number;
+  /** `bun test` processes at a time: concurrency changes wall times and shares. */
+  jobs: number;
   files: LoopTestFileRecord[];
 }
 

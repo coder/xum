@@ -3,8 +3,9 @@
  *
  * Usage: LOOP_TESTS_OUT=<file.json> bun test --preload ./scripts/perf/loopTests.preload.ts <test>
  *
- * It replaces the fs and fs/promises functions, the FileHandle methods, setTimeout and Bun.sleep
- * with the timing wrappers of loopTestTiming.ts. In Bun 1.4.3 a new value on require("fs/promises") also reaches
+ * It replaces the fs and fs/promises functions, the FileHandle methods, setTimeout (global and
+ * timers/promises) and Bun.sleep with the timing wrappers of loopTestTiming.ts. In Bun 1.4.3 a
+ * new value on require("fs/promises") also reaches
  * `import { readFile } from "fs/promises"` in test and product code, so no product file changes.
  * After all tests it writes { fsMs, timerMs, usesTempDir } to $LOOP_TESTS_OUT. The runner times the
  * whole process itself, so a crash at import still counts.
@@ -58,7 +59,8 @@ function flagTempDir(name: string, fn: Fn): Fn {
   return flagged;
 }
 
-// FileHandle methods: history code reads and writes through handles that open() returns.
+// FileHandle methods: history code reads and writes through handles that open() returns. In
+// Bun 1.4.3 they live on the prototype, close included, and Symbol.asyncDispose calls this.close().
 const FILE_HANDLE_METHODS = [
   "appendFile",
   "chmod",
@@ -93,6 +95,9 @@ for (const mod of [fsModule, fsPromises]) {
   }
 }
 globalThis.setTimeout = timedTimeout(globalThis.setTimeout, recordTimer, now);
+// `import { setTimeout } from "timers/promises"` reads this export too.
+const timersPromises = require("timers/promises") as Record<string, unknown>;
+timersPromises.setTimeout = timedDelay(timersPromises.setTimeout as Fn, recordTimer, now);
 Bun.sleep = timedDelay(Bun.sleep, recordTimer, now);
 
 afterAll(() => {
