@@ -1872,19 +1872,54 @@ describe("Claude Code plugin discovery", () => {
     expect(messages).not.toContain("'$schema'");
   });
 
-  test("agents spread over two folders fall back to agents/ with a warning", async () => {
+  test("agents spread over two folders, or an empty list, load no agents (never agents/)", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");
-    const pluginDir = path.join(container, "spread");
-    await writeTree(pluginDir, {
+    const agent = "---\nname: c\ndescription: C\n---\n";
+    await writeTree(path.join(container, "spread"), {
       ...claudeManifest({ name: "spread", agents: ["./one/a.md", "./two/b.md"] }),
-      "agents/c.md": "---\nname: c\ndescription: C\n---\n",
+      "one/a.md": agent,
+      "two/b.md": agent,
+      "agents/c.md": agent,
+    });
+    // A Claude `agents` value replaces the default scan, so an empty list declares none.
+    await writeTree(path.join(container, "none"), {
+      ...claudeManifest({ name: "none", agents: [] }),
+      "agents/c.md": agent,
     });
 
     const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
 
-    expect(result.plugins[0].agentsDir).toBe(path.join(result.plugins[0].rootPath, "agents"));
-    expect(result.diagnostics.map((d) => d.message).join("\n")).toContain("'agents'");
+    expect(result.plugins.map((plugin) => [plugin.name, plugin.agentsDir])).toEqual([
+      ["none", undefined],
+      ["spread", undefined],
+    ]);
+    expect(result.diagnostics.map((d) => d.message).join("\n")).toContain(
+      "'agents' must list .md files in one folder below the plugin root; loading no agents"
+    );
+  });
+
+  test("a Claude name with capitals or underscores loads in the Agent Plugins grammar", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    for (const [dirName, name] of [
+      ["snake", "my_plugin"],
+      ["camel", "MyPlugin"],
+      // No safe mapping: "--" stays invalid, so the validator refuses the plugin.
+      ["double", "my__plugin"],
+    ]) {
+      await writeTree(path.join(container, dirName), claudeManifest({ name }));
+    }
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins.map((plugin) => [plugin.dirName, plugin.name])).toEqual([
+      ["camel", "myplugin"],
+      ["snake", "my-plugin"],
+    ]);
+    const messages = result.diagnostics.map((d) => `${d.severity}: ${d.message}`).join("\n");
+    expect(messages).toContain("Plugin name 'my_plugin' is not an Agent Plugins name");
+    expect(messages).toContain("error: Invalid plugin manifest");
   });
 
   test("a Claude package gets agents/ but no hooks.js and no workflows/", async () => {
