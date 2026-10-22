@@ -2068,14 +2068,15 @@ export class ProjectService {
         affectedPaths.push(candidatePath);
       }
     }
-    // #6426: snapshots of remote project plugins exist only for trusted projects.
-    await clearRemoteProjectPluginSnapshots();
     this.mcpServerManager?.applyProjectTrust(
       affectedPaths.map((candidatePath) => ({
         projectPath: candidatePath,
         trusted: isProjectTrusted(this.config, candidatePath),
       }))
     );
+    // #6426: snapshots of remote project plugins exist only for trusted projects. After the trust
+    // change is published; synchronous and never throws.
+    clearRemoteProjectPluginSnapshots();
   }
 
   async setDisplayName(projectPath: string, displayName: string | null | undefined): Promise<void> {

@@ -29,8 +29,11 @@ import { execBuffered } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
 import { discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
 
-/** Deep enough for `<plugin>/skills/<name>/SKILL.md` and nested `contributes` paths. */
-const MAX_LISTING_DEPTH = 6;
+/**
+ * Deep enough for `<plugin>/skills/<name>/SKILL.md` and `contributes` paths of up to 7 segments.
+ * Deeper files are left out (the entry cap bounds the cost, not the depth).
+ */
+const MAX_LISTING_DEPTH = 10;
 /** Entries per call; a bigger listing loads no remote plugins (fail closed). */
 export const MAX_REMOTE_PLUGIN_ENTRIES = 4000;
 const MAX_LISTING_OUTPUT_BYTES = 16 * 1024 * 1024;
@@ -79,6 +82,8 @@ export function buildRemotePluginListingScript(checkoutRoot: string, containers:
     `  [ -z "$(${tree} -name "*$nl*" | head -n 1)" ] || exit 4`,
     `  ${tree} -type d | head -n ${limit} | sed "s|^|D\${tab}0\${tab}\${tab}|"`,
     `  ${tree} -type l | head -n ${limit} | while IFS= read -r e; do t=$(readlink -f "$e" 2>/dev/null) || t=; printf 'L\\t0\\t%s\\t%s\\n' "$t" "$e"; done`,
+    // Count first, so wc and cat never run over a tree the host will refuse anyway.
+    `  [ $(${files} | head -n ${limit} | wc -l) -lt ${limit} ] || exit 5`,
     String.raw`  ${files} -exec wc -c {} + | sed -n "s|^ *\([0-9][0-9]*\) \(/.*\)\$|F${"$"}{tab}\1${"$"}{tab}${"$"}{tab}\2|p"`,
     `  printf 'B\\t0\\t\\t%s\\n' "$1"`,
     `  ${files} -exec cat {} + | base64`,
@@ -88,6 +93,8 @@ export function buildRemotePluginListingScript(checkoutRoot: string, containers:
     `  case "$c" in "$rootarg"/*) lex="$root/\${c#"$rootarg"/}" ;; *) continue ;; esac`,
     `  real=$(readlink -f "$c" 2>/dev/null) || continue`,
     `  [ -d "$real" ] || continue`,
+    // A container that resolves outside the checkout is never walked, so none of its bytes leave.
+    `  case "$real" in "$root"/*) ;; *) continue ;; esac`,
     `  printf 'K\\t0\\t%s\\t%s\\n' "$real" "$lex"`,
     `  walk "$real" ${MAX_LISTING_DEPTH}`,
     // A plugin folder may be a symlink to a directory elsewhere in the checkout.
@@ -337,20 +344,42 @@ const liveMirrors = new Set<string>();
 let exitHookInstalled = false;
 const MIRROR_PREFIX = "xum-remote-plugins-";
 
+/** Best effort: never throws (a trust change must not fail on cleanup). */
 function removeMirror(mirrorRoot: string): void {
   liveMirrors.delete(mirrorRoot);
-  fs.rmSync(mirrorRoot, { recursive: true, force: true });
+  try {
+    fs.rmSync(mirrorRoot, { recursive: true, force: true });
+  } catch (error) {
+    log.debug(`Remote project plugins: mirror cleanup failed: ${getErrorMessage(error)}`);
+  }
 }
 
-/** Best effort: mirrors a crashed process left behind (older than 1 h). Never throws. */
+/** A mirror's name holds its owner's pid, so a second Xum process never removes a live one. */
+const OWNER_PID = /^xum-remote-plugins-(\d+)-/;
+
+function isLivePid(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: the process exists but belongs to another user.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Best effort: mirrors that a crashed process left behind (owner pid gone, older than 1 h).
+ * Never throws.
+ */
 async function sweepStaleMirrors(): Promise<void> {
   try {
     const cutoff = Date.now() - 60 * 60 * 1000;
     for (const name of await fsPromises.readdir(os.tmpdir())) {
-      if (!name.startsWith(MIRROR_PREFIX)) continue;
+      const owner = OWNER_PID.exec(name);
+      if (owner === null || isLivePid(Number(owner[1]))) continue;
       const dir = path.join(os.tmpdir(), name);
       const stat = await fsPromises.lstat(dir).catch(() => null);
-      if (stat?.isDirectory() === true && stat.mtimeMs < cutoff && !liveMirrors.has(dir)) {
+      if (stat?.isDirectory() === true && stat.mtimeMs < cutoff) {
         await fsPromises.rm(dir, { recursive: true, force: true }).catch(() => undefined);
       }
     }
@@ -362,20 +391,15 @@ async function sweepStaleMirrors(): Promise<void> {
 async function createMirrorDir(): Promise<string> {
   if (!exitHookInstalled) {
     exitHookInstalled = true;
+    // Exit cleanup is best effort; a later start sweeps leftovers.
     process.once("exit", () => {
-      for (const mirrorRoot of [...liveMirrors]) {
-        try {
-          removeMirror(mirrorRoot);
-        } catch {
-          // Exit cleanup is best effort; the next start sweeps leftovers.
-        }
-      }
+      for (const mirrorRoot of [...liveMirrors]) removeMirror(mirrorRoot);
     });
     await sweepStaleMirrors();
   }
   // mkdtemp creates the directory with mode 0700.
   const mirrorRoot = await fsPromises.realpath(
-    await fsPromises.mkdtemp(path.join(os.tmpdir(), MIRROR_PREFIX))
+    await fsPromises.mkdtemp(path.join(os.tmpdir(), `${MIRROR_PREFIX}${process.pid}-`))
   );
   liveMirrors.add(mirrorRoot);
   return mirrorRoot;
@@ -418,10 +442,15 @@ export async function discoverRemoteProjectAgentPlugins(
 
 /** A failed snapshot is not retried for this long, so a down host costs no exec per turn. */
 const FAILURE_RETRY_MS = 60_000;
-const snapshots = new Map<
-  string,
-  { promise: Promise<RemoteProjectPluginSnapshot | null>; failedAt?: number }
->();
+interface SnapshotEntry {
+  promise: Promise<RemoteProjectPluginSnapshot | null>;
+  failedAt?: number;
+  /** Set once the read lands, so a clear can remove the mirror without waiting. */
+  snapshot?: RemoteProjectPluginSnapshot;
+  /** A trust change dropped this entry while its read was in flight. */
+  cleared?: boolean;
+}
+const snapshots = new Map<string, SnapshotEntry>();
 
 /**
  * The cached snapshot of a TRUSTED remote checkout (the caller checks trust). One listing exec
@@ -442,9 +471,14 @@ export function getRemoteProjectPluginSnapshot(
   if (cached !== undefined && (cached.failedAt ?? Infinity) > Date.now() - FAILURE_RETRY_MS) {
     return cached.promise;
   }
-  const entry: { promise: Promise<RemoteProjectPluginSnapshot | null>; failedAt?: number } = {
+  const entry: SnapshotEntry = {
     promise: createSnapshot({ runtime, checkoutRoot, containers }).then((snapshot) => {
       if (snapshot === null) entry.failedAt = Date.now();
+      else if (entry.cleared === true) {
+        // Read under the old trust: drop it.
+        removeMirror(snapshot.mirrorRoot);
+        return null;
+      } else entry.snapshot = snapshot;
       return snapshot;
     }),
   };
@@ -452,12 +486,15 @@ export function getRemoteProjectPluginSnapshot(
   return entry.promise;
 }
 
-/** Drops every snapshot and its mirror (project trust changed). */
-export async function clearRemoteProjectPluginSnapshots(): Promise<void> {
-  const entries = [...snapshots.values()];
-  snapshots.clear();
-  for (const entry of entries) {
-    const snapshot = await entry.promise;
-    if (snapshot !== null) removeMirror(snapshot.mirrorRoot);
+/**
+ * Drops every snapshot and its mirror (project trust changed). Synchronous and never throws, so
+ * it cannot delay or block the trust change; an in-flight read removes its own mirror and
+ * resolves to null.
+ */
+export function clearRemoteProjectPluginSnapshots(): void {
+  for (const entry of snapshots.values()) {
+    entry.cleared = true;
+    if (entry.snapshot !== undefined) removeMirror(entry.snapshot.mirrorRoot);
   }
+  snapshots.clear();
 }

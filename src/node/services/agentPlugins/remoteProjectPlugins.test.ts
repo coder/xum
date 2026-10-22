@@ -11,9 +11,12 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   clearRemoteProjectPluginSnapshots,
   discoverRemoteProjectAgentPlugins,
+  buildRemotePluginListingScript,
   getRemoteProjectPluginSnapshot,
+  MAX_REMOTE_PLUGIN_ENTRIES,
   parseRemotePluginListing,
 } from "./remoteProjectPlugins";
+import { execBuffered } from "@/node/utils/runtime/helpers";
 
 // The listing script runs through Runtime.exec, so a LocalRuntime on a temp checkout runs the
 // exact command an SSH or Docker runtime would run.
@@ -135,6 +138,44 @@ describe("discoverRemoteProjectAgentPlugins", () => {
   });
 });
 
+describe("buildRemotePluginListingScript", () => {
+  test("never walks a container that resolves outside the checkout", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-escape-container");
+    using outside = new DisposableTempDir("remote-plugins-outside");
+    const root = await fs.realpath(checkout.path);
+    await writePlugin(await fs.realpath(outside.path), "secret", manifest("secret"));
+    await fs.mkdir(path.join(root, ".xum"), { recursive: true });
+    const container = path.join(root, ".xum", "plugins");
+    await fs.symlink(await fs.realpath(outside.path), container);
+    const result = await execBuffered(
+      new LocalRuntime(root),
+      buildRemotePluginListingScript(root, [container]),
+      { cwd: root, timeout: 30 }
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("secret");
+  });
+
+  test("exits before reading the files of a tree with too many entries", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-many");
+    const root = await fs.realpath(checkout.path);
+    const container = path.join(root, ".xum", "plugins");
+    const dir = path.join(container, "big");
+    await fs.mkdir(dir, { recursive: true });
+    await Promise.all(
+      Array.from({ length: MAX_REMOTE_PLUGIN_ENTRIES + 1 }, (_, i) =>
+        fs.writeFile(path.join(dir, `f${i}`), "x")
+      )
+    );
+    const result = await execBuffered(
+      new LocalRuntime(root),
+      buildRemotePluginListingScript(root, [container]),
+      { cwd: root, timeout: 30 }
+    );
+    expect(result.exitCode).toBe(5);
+  }, 60_000);
+});
+
 describe("parseRemotePluginListing", () => {
   test("fails closed on a cut-off, malformed or escaping listing", () => {
     const ok = "K\t0\t/r/.xum/plugins\t/r/.xum/plugins\nROOT\t0\t/r\t\nEND\n";
@@ -198,11 +239,25 @@ describe("getRemoteProjectPluginSnapshot", () => {
     expect(first?.plugins.map((plugin) => plugin.name)).toEqual(["cached"]);
     const mirror = first?.mirrorRoot ?? "";
 
-    await clearRemoteProjectPluginSnapshots();
+    clearRemoteProjectPluginSnapshots();
     expect(await fs.stat(mirror).catch(() => null)).toBeNull();
     await getRemoteProjectPluginSnapshot(runtime, root, [container]);
     expect(runtime.execs).toBe(2);
-    await clearRemoteProjectPluginSnapshots();
+    clearRemoteProjectPluginSnapshots();
+  });
+
+  test("a trust change during a read drops that read's snapshot", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-inflight");
+    const root = await fs.realpath(checkout.path);
+    const container = path.join(root, ".xum", "plugins");
+    await writePlugin(container, "late", manifest("late"));
+    const runtime = new CountingRemoteRuntime(root, `test:${root}`);
+    const inFlight = getRemoteProjectPluginSnapshot(runtime, root, [container]);
+    clearRemoteProjectPluginSnapshots();
+    expect(await inFlight).toBeNull();
+    expect(await getRemoteProjectPluginSnapshot(runtime, root, [container])).not.toBeNull();
+    expect(runtime.execs).toBe(2);
+    clearRemoteProjectPluginSnapshots();
   });
 
   test("a failed read is not retried at once and leaves no mirror", async () => {
@@ -216,7 +271,7 @@ describe("getRemoteProjectPluginSnapshot", () => {
     expect(await getRemoteProjectPluginSnapshot(runtime, checkout.path, [container])).toBeNull();
     expect(await getRemoteProjectPluginSnapshot(runtime, checkout.path, [container])).toBeNull();
     expect(runtime.execs).toBe(1);
-    await clearRemoteProjectPluginSnapshots();
+    clearRemoteProjectPluginSnapshots();
   });
 
   test("two Docker containers or two SSH users with the same checkout path get different host keys", () => {
@@ -232,5 +287,11 @@ describe("getRemoteProjectPluginSnapshot", () => {
     };
     expect(sshKeyOf("alice@build.example")).not.toBe(sshKeyOf("bob@build.example"));
     expect(sshKeyOf("alice@build.example")).toBe(sshKeyOf("alice@build.example"));
+    // An unset port comes from the SSH config, so it is not the same endpoint as port 22.
+    const withPort = (port?: number) => {
+      const config = { host: "build", port, srcBaseDir: "/src" };
+      return new SSHRuntime(config, createSSHTransport(config, false)).getAgentHostKey();
+    };
+    expect(withPort(undefined)).not.toBe(withPort(22));
   });
 });

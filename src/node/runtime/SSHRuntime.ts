@@ -1105,7 +1105,8 @@ export class SSHRuntime extends RemoteRuntime {
   override getAgentHostKey(): string {
     // `host` carries the SSH user when the config has one (`user@host`), so two users on the
     // same host and path get different keys. An SSH config alias is part of `host` as well.
-    return JSON.stringify(["ssh", this.config.host, this.config.port ?? 22]);
+    // An unset port is not 22: the SSH config can give the alias another port.
+    return JSON.stringify(["ssh", this.config.host, this.config.port ?? "ssh-config"]);
   }
 
   protected getBasePath(): string {
