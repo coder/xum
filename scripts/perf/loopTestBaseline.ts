@@ -7,8 +7,9 @@
  *        bun scripts/perf/loopTestBaseline.ts [--runs 10] [--jobs 6] [--filter <substring>]
  *
  * It writes artifacts/loop-tests/<sha>[-dirty][-<filter>][-r<runs>].json and .md (recordName).
- * They are git-ignored: never commit a record, it goes stale. The numbers are tripwire data for the refactor, not targets. The script exits 0
- * after it writes the record, 2 on bad input or a runner error, and prints "loop-tests: ..." last.
+ * They are git-ignored: never commit a record, it goes stale. The numbers are tripwire data for
+ * the refactor, not targets. The script exits 0 after it writes the record, 2 on bad input or a
+ * runner error, and prints "loop-tests: ..." last.
  */
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
