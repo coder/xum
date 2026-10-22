@@ -1227,7 +1227,7 @@ describe("ServiceContainer", () => {
     let tokensRequested!: () => void;
     const requested = new Promise<void>((resolve) => (tokensRequested = resolve));
     let releaseTokens!: () => void;
-    spyOn(services.daytonaService, "loadPersistedTokens").mockImplementation(() => {
+    spyOn(services.daytonaService.ssh, "loadPersistedTokens").mockImplementation(() => {
       tokensRequested();
       return new Promise<void>((resolve) => (releaseTokens = resolve));
     });

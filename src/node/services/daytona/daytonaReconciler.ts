@@ -3,7 +3,9 @@ import { getDaytonaSandboxId, type RuntimeConfig } from "@/common/types/runtime"
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import type { DaytonaSandbox } from "./daytonaClient";
-import { mapDaytonaSandboxState, type DaytonaService } from "./daytonaService";
+import type { DaytonaAccount } from "./daytonaAccount";
+import { mapDaytonaSandboxState, type DaytonaSandboxes } from "./daytonaSandboxes";
+import type { DaytonaSsh } from "./daytonaSsh";
 
 export const DAYTONA_RECONCILE_INTERVAL_MS = 60_000;
 /** Each control-plane call gets this long; a hung call is logged and the sweep moves on. */
@@ -15,16 +17,14 @@ export interface DaytonaWorkspaceRef {
 }
 
 export interface DaytonaReconcilerOptions {
-  daytonaService: Pick<
-    DaytonaService,
-    | "checkAvailability"
-    | "listInstanceSandboxes"
-    | "refreshActivity"
-    | "hasExpiringSshToken"
-    | "ensureSshAccess"
-    | "getSandboxState"
-    | "withAccountLease"
-  >;
+  daytonaService: {
+    account: Pick<DaytonaAccount, "checkAvailability" | "withAccountLease">;
+    sandboxes: Pick<
+      DaytonaSandboxes,
+      "listInstanceSandboxes" | "refreshActivity" | "getSandboxState"
+    >;
+    ssh: Pick<DaytonaSsh, "hasExpiringSshToken" | "ensureSshAccess">;
+  };
   listWorkspaces: () => DaytonaWorkspaceRef[];
   /**
    * Streaming, or running a background job that has not exited: Daytona counts only SSH and
@@ -112,18 +112,21 @@ export class DaytonaReconciler {
 
   /** One account for the whole sweep: it refreshes sandboxes from what it listed. */
   sweep(): Promise<void> {
-    return this.options.daytonaService.withAccountLease(() => this.sweepOnce());
+    return this.options.daytonaService.account.withAccountLease(() => this.sweepOnce());
   }
 
   private async sweepOnce(): Promise<void> {
     const service = this.options.daytonaService;
     // No credentials: no Daytona workspaces can be reached, and nothing to reconcile.
-    if (!(await service.checkAvailability()).available) return;
+    if (!(await service.account.checkAvailability()).available) return;
 
     const refs = this.collectReferences();
     let sandboxes: DaytonaSandbox[];
     try {
-      sandboxes = await this.call(service.listInstanceSandboxes(), "listing Daytona sandboxes");
+      sandboxes = await this.call(
+        service.sandboxes.listInstanceSandboxes(),
+        "listing Daytona sandboxes"
+      );
     } catch (error) {
       // Without the list Xum cannot map stored names to ids or see states: keepalive waits
       // for the next sweep instead of guessing.
@@ -183,16 +186,16 @@ export class DaytonaReconciler {
   private async refreshActivityAndToken(storedId: string, realId: string): Promise<void> {
     const service = this.options.daytonaService;
     try {
-      await this.call(service.refreshActivity(realId), "refreshing activity");
+      await this.call(service.sandboxes.refreshActivity(realId), "refreshing activity");
     } catch (error) {
       log.warn("Daytona reconcile: activity refresh failed", {
         sandboxId: storedId,
         error: getErrorMessage(error),
       });
     }
-    if (!service.hasExpiringSshToken(storedId)) return;
+    if (!service.ssh.hasExpiringSshToken(storedId)) return;
     try {
-      await this.call(service.ensureSshAccess(storedId), "refreshing the ssh token");
+      await this.call(service.ssh.ensureSshAccess(storedId), "refreshing the ssh token");
     } catch (error) {
       log.warn("Daytona reconcile: ssh token refresh failed", {
         sandboxId: storedId,
@@ -204,7 +207,7 @@ export class DaytonaReconciler {
   private async lookUpSandbox(sandboxId: string): Promise<DaytonaSandbox | undefined> {
     try {
       const { sandbox } = await this.call(
-        this.options.daytonaService.getSandboxState(sandboxId),
+        this.options.daytonaService.sandboxes.getSandboxState(sandboxId),
         "looking up a sandbox"
       );
       return sandbox;

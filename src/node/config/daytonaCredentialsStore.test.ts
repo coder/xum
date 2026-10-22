@@ -121,20 +121,22 @@ describe("DaytonaCredentialsStore", () => {
     const rig = await createDaytonaTestRig({ apiKey: "env-key" });
     try {
       const saved = rig.addAccount(KEY);
-      await rig.service.setConfig({ apiKey: KEY });
+      await rig.service.account.setConfig({ apiKey: KEY });
       const file = path.join(rig.rootDir, "daytona.json");
       await fs.chmod(file, 0o000);
       try {
         // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
         await expect(
-          rig.service.withAccountLease(() => rig.service.listInstanceSandboxes())
+          rig.service.account.withAccountLease(() => rig.service.sandboxes.listInstanceSandboxes())
         ).rejects.toThrow(/Could not read the Daytona settings/);
-        expect((await rig.service.listSnapshots()).ok).toBe(false);
+        expect((await rig.service.account.listSnapshots()).ok).toBe(false);
       } finally {
         await fs.chmod(file, 0o600);
       }
       expect(rig.plane.calls).toEqual([]);
-      await rig.service.withAccountLease(() => rig.service.listInstanceSandboxes());
+      await rig.service.account.withAccountLease(() =>
+        rig.service.sandboxes.listInstanceSandboxes()
+      );
       expect(saved.calls.length).toBeGreaterThan(0);
       expect(rig.plane.calls).toEqual([]);
     } finally {

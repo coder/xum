@@ -1129,7 +1129,7 @@ async function probeDaytonaRuntimeStatus(sandboxId: string): Promise<WorkspaceRu
   const service = getGlobalDaytonaService();
   if (!service) return "unknown";
   try {
-    const { state } = await service.getSandboxState(sandboxId);
+    const { state } = await service.sandboxes.getSandboxState(sandboxId);
     return DAYTONA_RUNTIME_STATUS[state];
   } catch (error) {
     log.debug("Failed to read Daytona sandbox state for runtime status", {

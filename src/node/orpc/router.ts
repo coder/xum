@@ -1809,21 +1809,21 @@ export const router = (authToken?: string) => {
       getConfig: t
         .input(schemas.daytona.getConfig.input)
         .output(schemas.daytona.getConfig.output)
-        .handler(async ({ context }) => context.daytonaService.getPublicConfig()),
+        .handler(async ({ context }) => context.daytonaService.account.getPublicConfig()),
       setConfig: t
         .input(schemas.daytona.setConfig.input)
         .output(schemas.daytona.setConfig.output)
         .handler(async ({ context, input }) =>
-          context.daytonaService.setConfig(input).catch(rethrowDaytonaConfigError)
+          context.daytonaService.account.setConfig(input).catch(rethrowDaytonaConfigError)
         ),
       testConnection: t
         .input(schemas.daytona.testConnection.input)
         .output(schemas.daytona.testConnection.output)
-        .handler(async ({ context }) => context.daytonaService.testConnection()),
+        .handler(async ({ context }) => context.daytonaService.account.testConnection()),
       listSnapshots: t
         .input(schemas.daytona.listSnapshots.input)
         .output(schemas.daytona.listSnapshots.output)
-        .handler(async ({ context }) => context.daytonaService.listSnapshots()),
+        .handler(async ({ context }) => context.daytonaService.account.listSnapshots()),
     },
     artifacts: {
       list: t

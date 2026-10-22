@@ -47,14 +47,19 @@ import {
   isDaytonaNotFound,
   type DaytonaSandbox,
 } from "@/node/services/daytona/daytonaClient";
+import type {
+  DaytonaAccount,
+  UnsupportedDaytonaSandboxKind,
+} from "@/node/services/daytona/daytonaAccount";
+import type { DaytonaReadiness } from "@/node/services/daytona/daytonaReadiness";
 import {
   DAYTONA_LABEL_INSTANCE,
   DAYTONA_LABEL_WORKSPACE_ID,
   DAYTONA_START_TIMEOUT_MS,
   notOwnedSandboxNotice,
-  type UnsupportedDaytonaSandboxKind,
-  type DaytonaService,
-} from "@/node/services/daytona/daytonaService";
+  type DaytonaSandboxes,
+} from "@/node/services/daytona/daytonaSandboxes";
+import type { DaytonaSsh } from "@/node/services/daytona/daytonaSsh";
 import { log } from "@/node/services/log";
 import {
   redactChildStderr,
@@ -63,38 +68,44 @@ import {
   redactDaytonaTokens,
 } from "./daytonaTokenRedaction";
 
-/** The DaytonaService surface this runtime uses (tests pass an in-memory fake). */
-export type DaytonaRuntimeService = Pick<
-  DaytonaService,
-  | "checkAvailability"
-  | "getSandboxState"
-  | "withAccountLease"
-  | "buildLabels"
-  | "getDefaultTarget"
-  | "createSandbox"
-  | "resizeSandbox"
-  | "stopAndWait"
-  | "startAndWait"
-  | "deleteSandbox"
-  | "ensureSandboxReady"
-  | "ensureSshAccess"
-  | "isSandboxReady"
-  | "markSandboxReady"
-  | "invalidateSandboxReady"
-  | "replaceRejectedSshToken"
-  | "sshTokenGeneration"
-  | "gatewayGeneration"
-  | "refreshGatewayAfterSshFailure"
-  | "loadPersistedTokens"
-  | "findSnapshot"
-  | "getGatewayConfig"
-  | "sandboxOwnership"
-  | "waitUntilDestroyed"
-  | "releaseSshAccess"
-  | "recordSetupFailure"
-  | "getSetupFailure"
-  | "clearSetupFailure"
->;
+/** The DaytonaService parts this runtime uses (tests pass an in-memory fake). */
+export interface DaytonaRuntimeService {
+  account: Pick<
+    DaytonaAccount,
+    "checkAvailability" | "withAccountLease" | "getDefaultTarget" | "findSnapshot"
+  >;
+  readiness: Pick<
+    DaytonaReadiness,
+    "isSandboxReady" | "markSandboxReady" | "invalidateSandboxReady"
+  >;
+  ssh: Pick<
+    DaytonaSsh,
+    | "ensureSshAccess"
+    | "replaceRejectedSshToken"
+    | "sshTokenGeneration"
+    | "gatewayGeneration"
+    | "refreshGatewayAfterSshFailure"
+    | "loadPersistedTokens"
+    | "getGatewayConfig"
+    | "releaseSshAccess"
+  >;
+  sandboxes: Pick<
+    DaytonaSandboxes,
+    | "getSandboxState"
+    | "buildLabels"
+    | "createSandbox"
+    | "resizeSandbox"
+    | "stopAndWait"
+    | "startAndWait"
+    | "deleteSandbox"
+    | "ensureSandboxReady"
+    | "sandboxOwnership"
+    | "waitUntilDestroyed"
+    | "recordSetupFailure"
+    | "getSetupFailure"
+    | "clearSetupFailure"
+  >;
+}
 
 export interface DaytonaSSHRuntimeConfig extends SSHRuntimeConfig {
   daytona: DaytonaSandboxConfig;
@@ -312,7 +323,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   /** Undefined when the state cannot be read: callers treat that as not running. */
   private async readSandboxState(sandboxId: string): Promise<string | undefined> {
     try {
-      return (await this.daytonaService.getSandboxState(sandboxId)).state;
+      return (await this.daytonaService.sandboxes.getSandboxState(sandboxId)).state;
     } catch (error) {
       log.warn("Could not read Daytona sandbox state; treating it as not running", {
         sandboxId,
@@ -329,7 +340,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * silently recreated.
    */
   override ensureReady(options?: EnsureReadyOptions): Promise<EnsureReadyResult> {
-    return this.daytonaService.withAccountLease(async () => {
+    return this.daytonaService.account.withAccountLease(async () => {
       const sandboxId = this.daytonaConfig.sandboxId;
       if (!sandboxId) {
         return {
@@ -344,7 +355,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         this.setupFailureResult() ??
         (await this.refuseUnownedSandbox(sandboxId, emitStatus, options?.signal));
       if (refusal) return refusal;
-      if (this.daytonaService.isSandboxReady(sandboxId)) {
+      if (this.daytonaService.readiness.isSandboxReady(sandboxId)) {
         return this.ensureReadyFromCache(sandboxId, options, emitStatus);
       }
       return this.ensureReadyUncached(sandboxId, options, emitStatus);
@@ -365,12 +376,13 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   }
 
   private recordSetupFailure(reason: string): void {
-    if (this.workspaceId) this.daytonaService.recordSetupFailure(this.workspaceId, reason);
+    if (this.workspaceId)
+      this.daytonaService.sandboxes.recordSetupFailure(this.workspaceId, reason);
   }
 
   private setupFailureResult(): EnsureReadyResult | undefined {
     if (!this.workspaceId) return undefined;
-    const setupFailure = this.daytonaService.getSetupFailure(this.workspaceId);
+    const setupFailure = this.daytonaService.sandboxes.getSetupFailure(this.workspaceId);
     if (!setupFailure) return undefined;
     return {
       ready: false,
@@ -432,7 +444,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       onExit: (exitCode, stderr) => {
         // The ready cache must not hide a sandbox that stopped: the next ensureReady checks.
         if (sandboxId && this.isTransportFailureExit(exitCode, stderr)) {
-          this.daytonaService.invalidateSandboxReady(sandboxId);
+          this.daytonaService.readiness.invalidateSandboxReady(sandboxId);
         }
         onExit?.(exitCode, stderr);
       },
@@ -444,10 +456,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     if (!sandboxId) return { tokenGeneration: 0, gatewayGeneration: 0 };
     // ssh may send a token an earlier process left in the include file: the redactor must
     // know it before ssh can quote it. Not every command runs after ensureReady.
-    await this.daytonaService.loadPersistedTokens();
+    await this.daytonaService.ssh.loadPersistedTokens();
     return {
-      tokenGeneration: this.daytonaService.sshTokenGeneration(sandboxId),
-      gatewayGeneration: this.daytonaService.gatewayGeneration(),
+      tokenGeneration: this.daytonaService.ssh.sshTokenGeneration(sandboxId),
+      gatewayGeneration: this.daytonaService.ssh.gatewayGeneration(),
     };
   }
 
@@ -462,13 +474,13 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     attempt: SshAttempt,
     abortSignal: AbortSignal | undefined
   ): Promise<boolean> {
-    return this.daytonaService.withAccountLease(async () => {
+    return this.daytonaService.account.withAccountLease(async () => {
       const sandboxId = this.daytonaConfig.sandboxId;
       if (!sandboxId || !isRuntimeTransportError(error) || abortSignal?.aborted) return false;
       const tokenRejected = isTokenRejected(error);
       // A UI or background runtime never starts the sandbox, so only a refused token is worth a look.
       if (!tokenRejected && !this.restartsStoppedSandbox) return false;
-      this.daytonaService.invalidateSandboxReady(sandboxId);
+      this.daytonaService.readiness.invalidateSandboxReady(sandboxId);
       const state = await this.readStateAfterFailure(sandboxId);
       return this.recoverInState(sandboxId, state, { error, tokenRejected, attempt }, abortSignal);
     });
@@ -503,7 +515,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       sandboxId,
     });
     try {
-      await this.daytonaService.replaceRejectedSshToken(sandboxId, tokenGeneration);
+      await this.daytonaService.ssh.replaceRejectedSshToken(sandboxId, tokenGeneration);
     } catch (replaceError) {
       log.warn("Could not replace the refused Daytona ssh token", {
         sandboxId,
@@ -518,7 +530,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   private async followMovedGateway(sandboxId: string, gatewayGeneration: number): Promise<boolean> {
     let moved: boolean;
     try {
-      moved = await this.daytonaService.refreshGatewayAfterSshFailure(sandboxId, gatewayGeneration);
+      moved = await this.daytonaService.ssh.refreshGatewayAfterSshFailure(
+        sandboxId,
+        gatewayGeneration
+      );
     } catch (refreshError) {
       log.warn("Could not refetch the Daytona gateway after an ssh failure", {
         sandboxId,
@@ -554,7 +569,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   /** Undefined when the state cannot be read (then nothing is retried). */
   private async readStateAfterFailure(sandboxId: string): Promise<DaytonaSandboxState | undefined> {
     try {
-      return (await this.daytonaService.getSandboxState(sandboxId)).state;
+      return (await this.daytonaService.sandboxes.getSandboxState(sandboxId)).state;
     } catch (stateError) {
       log.warn("Could not read Daytona sandbox state after an ssh failure", {
         sandboxId,
@@ -599,7 +614,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     signal: AbortSignal | undefined
   ): Promise<EnsureReadyResult | undefined> {
     try {
-      await this.daytonaService.ensureSshAccess(sandboxId);
+      await this.daytonaService.ssh.ensureSshAccess(sandboxId);
       return undefined;
     } catch (error) {
       emitStatus("error");
@@ -614,7 +629,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     signal: AbortSignal | undefined
   ): Promise<EnsureReadyResult | undefined> {
     try {
-      await this.daytonaService.ensureSandboxReady(sandboxId, {
+      await this.daytonaService.sandboxes.ensureSandboxReady(sandboxId, {
         onStarting: () => emitStatus("starting", "Starting sandbox..."),
         signal,
       });
@@ -636,9 +651,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     emitStatus: StatusEmitter,
     signal: AbortSignal | undefined
   ): Promise<EnsureReadyResult | undefined> {
-    let ownership: Awaited<ReturnType<DaytonaRuntimeService["sandboxOwnership"]>>;
+    let ownership: Awaited<ReturnType<DaytonaSandboxes["sandboxOwnership"]>>;
     try {
-      ownership = await this.daytonaService.sandboxOwnership(sandboxId, {
+      ownership = await this.daytonaService.sandboxes.sandboxOwnership(sandboxId, {
         reuseProof: true,
         signal,
       });
@@ -662,7 +677,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   ): Promise<EnsureReadyResult> {
     const repoFailure = await this.checkRepo(options, emitStatus);
     if (repoFailure) return repoFailure;
-    this.daytonaService.markSandboxReady(sandboxId);
+    this.daytonaService.readiness.markSandboxReady(sandboxId);
     emitStatus("ready");
     return { ready: true };
   }
@@ -714,7 +729,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     if (!isSSHRuntime(config) || !config.daytona) {
       return Ok(config);
     }
-    const availability = await this.daytonaService.checkAvailability();
+    const availability = await this.daytonaService.account.checkAvailability();
     if (!availability.available) {
       return Err(availability.reason);
     }
@@ -751,7 +766,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     if (!isSSHRuntime(config) || !config.daytona) {
       return Ok(undefined);
     }
-    const availability = await this.daytonaService.checkAvailability();
+    const availability = await this.daytonaService.account.checkAvailability();
     if (!availability.available) {
       return Err(availability.reason);
     }
@@ -784,7 +799,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   private async checkDefaultSnapshotClass(): Promise<Result<void, string>> {
     let snapshot: string | undefined;
     try {
-      snapshot = (await this.daytonaService.getGatewayConfig()).defaultSnapshot;
+      snapshot = (await this.daytonaService.ssh.getGatewayConfig()).defaultSnapshot;
     } catch (error) {
       return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
     }
@@ -794,7 +809,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   private async checkNameFree(sandboxId: string): Promise<Result<void, string>> {
     let state: DaytonaSandboxState;
     try {
-      state = (await this.daytonaService.getSandboxState(sandboxId)).state;
+      state = (await this.daytonaService.sandboxes.getSandboxState(sandboxId)).state;
     } catch (error) {
       return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
     }
@@ -808,9 +823,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     snapshot: string,
     options?: { missingOk: boolean }
   ): Promise<Result<void, string>> {
-    let found: Awaited<ReturnType<DaytonaRuntimeService["findSnapshot"]>>;
+    let found: Awaited<ReturnType<DaytonaAccount["findSnapshot"]>>;
     try {
-      found = await this.daytonaService.findSnapshot(snapshot);
+      found = await this.daytonaService.account.findSnapshot(snapshot);
     } catch (error) {
       return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
     }
@@ -840,7 +855,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * sent, the sandbox this call created is deleted again so it cannot linger and bill.
    */
   postCreateSetup(params: WorkspaceInitParams): Promise<void> {
-    return this.daytonaService.withAccountLease(() => this.provisionSandbox(params));
+    return this.daytonaService.account.withAccountLease(() => this.provisionSandbox(params));
   }
 
   private async provisionSandbox(params: WorkspaceInitParams): Promise<void> {
@@ -878,7 +893,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   private async connect(sandboxId: string, params: WorkspaceInitParams): Promise<void> {
     const { initLogger, abortSignal } = params;
     initLogger.logStep("Waiting for the sandbox to start and configuring SSH...");
-    await this.daytonaService.ensureSandboxReady(sandboxId, {
+    await this.daytonaService.sandboxes.ensureSandboxReady(sandboxId, {
       onStarting: () => initLogger.logStep("Starting sandbox..."),
       signal: abortSignal,
     });
@@ -895,7 +910,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         return;
       }
       initLogger.logStep(`Deleting the sandbox "${sandboxId}" this setup created...`);
-      if ((await this.daytonaService.deleteSandbox(sandboxId)) === "notOwned") {
+      if ((await this.daytonaService.sandboxes.deleteSandbox(sandboxId)) === "notOwned") {
         log.warn("Not deleting a Daytona sandbox without this install's label", { sandboxId });
         initLogger.logStderr(notOwnedSandboxNotice(sandboxId));
       }
@@ -917,7 +932,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   /** After a create of unknown outcome: the sandbox has this install's and workspace's labels. */
   private async carriesLabels(sandboxId: string, create: CreateAttempt): Promise<boolean> {
     const { labels } = create;
-    const { sandbox } = await this.daytonaService.getSandboxState(sandboxId);
+    const { sandbox } = await this.daytonaService.sandboxes.getSandboxState(sandboxId);
     if (!sandbox || !labels) return false;
     return [DAYTONA_LABEL_INSTANCE, DAYTONA_LABEL_WORKSPACE_ID].every(
       (key) => labels[key] !== undefined && sandbox.labels?.[key] === labels[key]
@@ -926,12 +941,12 @@ export class DaytonaSSHRuntime extends SSHRuntime {
 
   /** One create request; `create.outcome` tells postCreateSetup what a failure may delete. */
   private async requestCreate(
-    request: Parameters<DaytonaRuntimeService["createSandbox"]>[0],
+    request: Parameters<DaytonaSandboxes["createSandbox"]>[0],
     create: CreateAttempt
   ): Promise<void> {
     create.outcome = "unknown";
     create.labels = request.labels;
-    await this.daytonaService.createSandbox(request);
+    await this.daytonaService.sandboxes.createSandbox(request);
     create.outcome = "created";
   }
 
@@ -949,7 +964,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     const base = {
       name: sandboxId,
       ...(this.daytonaConfig.snapshot ? { snapshot: this.daytonaConfig.snapshot } : {}),
-      labels: await this.daytonaService.buildLabels({
+      labels: await this.daytonaService.sandboxes.buildLabels({
         workspaceId: this.workspaceId ?? sandboxId,
         projectPath: params.projectPath,
       }),
@@ -976,7 +991,8 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   }
 
   private async resolveTarget(): Promise<{ target?: string }> {
-    const target = this.daytonaConfig.target ?? (await this.daytonaService.getDefaultTarget());
+    const target =
+      this.daytonaConfig.target ?? (await this.daytonaService.account.getDefaultTarget());
     return target ? { target } : {};
   }
 
@@ -986,7 +1002,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    */
   private async resizeToPreset(sandboxId: string, preset: DaytonaSizePreset): Promise<void> {
     const deadline = () => Date.now() + DAYTONA_START_TIMEOUT_MS;
-    const sandbox = await this.daytonaService.startAndWait(sandboxId, deadline());
+    const sandbox = await this.daytonaService.sandboxes.startAndWait(sandboxId, deadline());
     const disk = growsDisk(sandbox, preset);
     const request = {
       cpu: preset.cpu,
@@ -994,12 +1010,12 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       ...(disk ? { disk: preset.diskGiB } : {}),
     };
     if (disk || shrinksCompute(sandbox, preset)) {
-      await this.daytonaService.stopAndWait(sandboxId, deadline());
-      await this.daytonaService.resizeSandbox(sandboxId, request);
+      await this.daytonaService.sandboxes.stopAndWait(sandboxId, deadline());
+      await this.daytonaService.sandboxes.resizeSandbox(sandboxId, request);
     } else if (changesCompute(sandbox, preset)) {
-      await this.daytonaService.resizeSandbox(sandboxId, request);
+      await this.daytonaService.sandboxes.resizeSandbox(sandboxId, request);
     }
-    await this.daytonaService.startAndWait(sandboxId, deadline());
+    await this.daytonaService.sandboxes.startAndWait(sandboxId, deadline());
   }
 
   /**
@@ -1038,7 +1054,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     trusted?: boolean,
     options?: { keepBranch?: boolean }
   ): Promise<DeleteResult> {
-    return this.daytonaService.withAccountLease(async () => {
+    return this.daytonaService.account.withAccountLease(async () => {
       const sshDelete = () =>
         super.deleteWorkspace(projectPath, workspaceName, force, abortSignal, trusted, options);
       const result = await this.deleteWorkspaceAndSandbox(
@@ -1048,7 +1064,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         sshDelete
       );
       if (result.success && this.workspaceId) {
-        this.daytonaService.clearSetupFailure(this.workspaceId);
+        this.daytonaService.sandboxes.clearSetupFailure(this.workspaceId);
       }
       return result;
     });
@@ -1093,9 +1109,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     deletedPath: string,
     force: boolean
   ): Promise<DeleteResult | undefined> {
-    let ownership: Awaited<ReturnType<DaytonaRuntimeService["sandboxOwnership"]>>;
+    let ownership: Awaited<ReturnType<DaytonaSandboxes["sandboxOwnership"]>>;
     try {
-      ownership = await this.daytonaService.sandboxOwnership(sandboxId);
+      ownership = await this.daytonaService.sandboxes.sandboxOwnership(sandboxId);
     } catch (error) {
       const message = getErrorMessage(error);
       log.error("Could not read a Daytona sandbox's labels before removal", {
@@ -1148,7 +1164,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     errorPrefix?: string
   ): Promise<DeleteResult> {
     try {
-      if ((await this.daytonaService.deleteSandbox(sandboxId)) === "deleted") {
+      if ((await this.daytonaService.sandboxes.deleteSandbox(sandboxId)) === "deleted") {
         return { success: true, deletedPath };
       }
       await this.releaseAccess(sandboxId);
@@ -1169,7 +1185,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
 
   private async releaseAccess(sandboxId: string): Promise<void> {
     try {
-      await this.daytonaService.releaseSshAccess(sandboxId);
+      await this.daytonaService.ssh.releaseSshAccess(sandboxId);
     } catch (error) {
       // The token expires within the hour; the workspace is gone either way.
       log.warn("Failed to release Daytona ssh access after deleting a workspace", {
@@ -1204,7 +1220,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     abortSignal: AbortSignal | undefined
   ): Promise<"ready" | "missing" | { error: string }> {
     try {
-      await this.daytonaService.ensureSandboxReady(sandboxId, { signal: abortSignal });
+      await this.daytonaService.sandboxes.ensureSandboxReady(sandboxId, { signal: abortSignal });
       return "ready";
     } catch (error) {
       if (isDaytonaNotFound(error)) return "missing";
@@ -1220,7 +1236,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
 
   private async isBeingDestroyed(sandboxId: string): Promise<boolean> {
     try {
-      return await this.daytonaService.waitUntilDestroyed(sandboxId);
+      return await this.daytonaService.sandboxes.waitUntilDestroyed(sandboxId);
     } catch (error) {
       log.warn("Could not read Daytona sandbox state before a delete", {
         sandboxId,

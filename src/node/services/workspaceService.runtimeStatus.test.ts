@@ -246,7 +246,7 @@ describe("WorkspaceService.getRuntimeStatuses for Daytona workspaces", () => {
     await fs.mkdir(projectPath);
     getSandboxState.mockClear();
     globalService = spyOn(runtimeFactory, "getGlobalDaytonaService").mockReturnValue({
-      getSandboxState,
+      sandboxes: { getSandboxState },
     } as unknown as DaytonaRuntimeService);
   });
 

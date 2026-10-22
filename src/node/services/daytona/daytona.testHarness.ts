@@ -5,7 +5,8 @@ import * as path from "path";
 import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
 import type { DaytonaSshConfigWriter, DaytonaSshGateway } from "@/node/runtime/daytonaSshConfig";
 import type { SSHTransport } from "@/node/runtime/transports";
-import { DAYTONA_LABEL_INSTANCE, DaytonaService } from "./daytonaService";
+import { DAYTONA_LABEL_INSTANCE } from "./daytonaSandboxes";
+import { DaytonaService } from "./daytonaService";
 
 /**
  * In-memory Daytona control plane for unit tests: enough of the REST API (by id or name, as
@@ -400,7 +401,7 @@ export async function createDaytonaTestRig(
   });
   // Sandboxes a test adds count as ones Xum created, as most tests need; a foreign one sets
   // its own labels.
-  const ownLabels = { [DAYTONA_LABEL_INSTANCE]: await service.getInstanceId() };
+  const ownLabels = { [DAYTONA_LABEL_INSTANCE]: await service.sandboxes.getInstanceId() };
   plane.defaultLabels = ownLabels;
   return {
     rootDir,
@@ -435,4 +436,68 @@ export function localShellTransport(home: string): SSHTransport {
     createPtySession: () => Promise.reject(new Error("no PTY in this test")),
     openReverseForward: () => Promise.reject(new Error("no forwards in this test")),
   };
+}
+
+/** In-memory control plane: one sandbox whose `state` follows a script of observations. */
+export class ScriptedSandboxControlPlane {
+  states: string[] = [];
+  exists = true;
+  errorReason?: string;
+  /** A proxy that echoes the request URI and its Authorization header in a failed revoke. */
+  revokeEchoesRequest = false;
+  readonly calls: string[] = [];
+  private tokenCounter = 0;
+  readonly revoked: string[] = [];
+  gatewayHost = "ssh.test";
+  gatewayHostKeys = ["ssh-ed25519 AAAA"];
+
+  constructor(private readonly now: () => number) {}
+
+  readonly fetch = ((input: string | URL | Request, init?: RequestInit) =>
+    Promise.resolve(this.handle(input, init))) as typeof fetch;
+
+  private handle(input: string | URL | Request, init?: RequestInit): Response {
+    const url = new URL(input instanceof Request ? input.url : input.toString());
+    const method = init?.method ?? "GET";
+    const route = `${method} ${url.pathname.replace(/^\/api/, "")}`;
+    this.calls.push(route);
+    const json = (status: number, body?: unknown) =>
+      new Response(body === undefined ? "" : JSON.stringify(body), { status });
+
+    if (route === "GET /config") {
+      return json(200, {
+        sshGatewayHost: this.gatewayHost,
+        sshGatewayHostKeys: this.gatewayHostKeys,
+      });
+    }
+    if (route === "GET /sandbox") {
+      if (init?.headers && (init.headers as Record<string, string>).Authorization !== "Bearer k") {
+        return json(401, { statusCode: 401, message: "Invalid credentials" });
+      }
+      return json(200, { items: [], nextCursor: null });
+    }
+    if (!this.exists) return json(404, { statusCode: 404, message: "Sandbox not found" });
+    if (route === "GET /sandbox/sb-1") {
+      const state = this.states.length > 1 ? this.states.shift() : this.states[0];
+      return json(200, { id: "sb-1", name: "sb-1", state, errorReason: this.errorReason });
+    }
+    if (route === "POST /sandbox/sb-1/start") return json(200, {});
+    if (route === "POST /sandbox/sb-1/ssh-access") {
+      this.tokenCounter += 1;
+      const minutes = Number(url.searchParams.get("expiresInMinutes"));
+      return json(200, {
+        token: `tok${this.tokenCounter}`,
+        expiresAt: new Date(this.now() + minutes * 60_000).toISOString(),
+      });
+    }
+    if (route === "DELETE /sandbox/sb-1/ssh-access") {
+      if (this.revokeEchoesRequest) {
+        const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
+        return json(500, { message: `Revoke failed for ${url.toString()} (${auth})` });
+      }
+      this.revoked.push(url.searchParams.get("token") ?? "");
+      return json(200, {});
+    }
+    return json(500, { message: `unexpected ${route}` });
+  }
 }

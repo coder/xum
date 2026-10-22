@@ -32,7 +32,7 @@ function archive(workspaceMetadata: WorkspaceMetadata, reportWarning?: (warning:
 describe("createDaytonaArchiveHook", () => {
   it("deletes the sandbox of the workspace that created it, and Xum's ssh access to it", async () => {
     rig.plane.addSandbox({ id: "sb-own" });
-    await rig.service.ensureSandboxReady("sb-own");
+    await rig.service.sandboxes.ensureSandboxReady("sb-own");
     expect(rig.writer.tokens.has("sb-own")).toBe(true);
 
     expect((await archive(metadata({ sandboxId: "sb-own" }))).success).toBe(true);

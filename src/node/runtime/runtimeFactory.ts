@@ -448,7 +448,7 @@ async function checkDaytonaAvailability(): Promise<RuntimeAvailabilityStatus> {
     return { available: false, reason: "Daytona is not initialized" };
   }
   try {
-    return await daytonaService.checkAvailability();
+    return await daytonaService.account.checkAvailability();
   } catch (error) {
     // Availability must never fail the whole runtime list.
     return { available: false, reason: `Daytona settings unreadable: ${getErrorMessage(error)}` };

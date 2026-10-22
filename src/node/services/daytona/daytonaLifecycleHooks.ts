@@ -2,7 +2,8 @@ import { Err, Ok, type Result } from "@/common/types/result";
 import { getDaytonaSandboxId, ownsDaytonaSandbox } from "@/common/types/runtime";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { BeforeArchiveHook } from "@/node/services/workspaceLifecycleHooks";
-import { notOwnedSandboxNotice, type DaytonaService } from "./daytonaService";
+import type { DaytonaAccount } from "./daytonaAccount";
+import { notOwnedSandboxNotice, type DaytonaSandboxes } from "./daytonaSandboxes";
 
 /**
  * Archiving the workspace that created a Daytona sandbox deletes the sandbox, whatever the
@@ -10,19 +11,22 @@ import { notOwnedSandboxNotice, type DaytonaService } from "./daytonaService";
  * for a Coder workspace deleted on archive. No unarchive hook: the deleted sandbox is gone.
  */
 export interface DaytonaArchiveHookOptions {
-  daytonaService: Pick<DaytonaService, "deleteSandbox" | "withAccountLease">;
+  daytonaService: {
+    account: Pick<DaytonaAccount, "withAccountLease">;
+    sandboxes: Pick<DaytonaSandboxes, "deleteSandbox">;
+  };
 }
 
 export function createDaytonaArchiveHook(options: DaytonaArchiveHookOptions): BeforeArchiveHook {
   return (args) =>
-    options.daytonaService.withAccountLease(async (): Promise<Result<void>> => {
+    options.daytonaService.account.withAccountLease(async (): Promise<Result<void>> => {
       const sandboxId = ownsDaytonaSandbox(args.workspaceMetadata)
         ? getDaytonaSandboxId(args.workspaceMetadata.runtimeConfig)
         : undefined;
       if (!sandboxId) return Ok(undefined);
       try {
         // Not Xum's after all (see deleteSandbox): it is kept.
-        if ((await options.daytonaService.deleteSandbox(sandboxId)) === "notOwned") {
+        if ((await options.daytonaService.sandboxes.deleteSandbox(sandboxId)) === "notOwned") {
           args.reportWarning?.(notOwnedSandboxNotice(sandboxId));
         }
         return Ok(undefined);

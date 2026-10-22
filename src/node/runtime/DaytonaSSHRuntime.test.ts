@@ -10,7 +10,7 @@ import {
   localShellTransport,
   type DaytonaTestRig,
 } from "@/node/services/daytona/daytona.testHarness";
-import { DAYTONA_READY_CACHE_MS } from "@/node/services/daytona/daytonaService";
+import { DAYTONA_READY_CACHE_MS } from "@/node/services/daytona/daytonaReadiness";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import { DaytonaSSHRuntime } from "./DaytonaSSHRuntime";
 import type { InitLogger, RuntimeStatusEvent, WorkspaceInitParams } from "./Runtime";
@@ -232,7 +232,7 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
 
   it("refuses a sandbox without this install's label even while it is cached as ready", async () => {
     rig.plane.addSandbox({ id: "xum-theirs", labels: { "xum.instance": "another-install" } });
-    rig.service.markSandboxReady("xum-theirs");
+    rig.service.readiness.markSandboxReady("xum-theirs");
     let spawned = 0;
     const local = localShellTransport(rig.rootDir);
     const transport: SSHTransport = {
@@ -274,7 +274,7 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
     const lookups = () => rig.plane.countCalls("GET /sandbox/sb-own");
     const perCheck: number[] = [];
     for (let check = 0; check < 2; check++) {
-      rig.service.invalidateSandboxReady("sb-own");
+      rig.service.readiness.invalidateSandboxReady("sb-own");
       const before = lookups();
       expect(await makeRuntime({ sandboxId: "sb-own" }).ensureReady()).toEqual({
         ready: true,
@@ -338,7 +338,7 @@ describe("DaytonaSSHRuntime integrated terminals", () => {
 
   it("keep the token out of what the terminal prints", async () => {
     rig.plane.addSandbox({ id: "sb-term-tok" });
-    await rig.service.ensureSshAccess("sb-term-tok");
+    await rig.service.ssh.ensureSshAccess("sb-term-tok");
     const token = rig.writer.tokens.get("sb-term-tok");
     if (!token) throw new Error("expected a minted token");
     let emit: (data: string) => void = () => undefined;
@@ -488,7 +488,7 @@ describe("DaytonaSSHRuntime Windows and GPU sandboxes", () => {
       { name: "older" }
     );
 
-    const snapshots = await rig.service.listSnapshots();
+    const snapshots = await rig.service.account.listSnapshots();
 
     expect(snapshots.ok && snapshots.snapshots.map((s) => s.name)).toEqual([
       "daytona-small",
@@ -659,8 +659,8 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
         "setup failed"
       );
       rig.writer.writeError = undefined;
-      expect(rig.service.getSetupFailure("ws-1")).toContain("No space left on device");
-      expect(rig.service.getSetupFailure("ws-2")).toBeUndefined();
+      expect(rig.service.sandboxes.getSetupFailure("ws-1")).toContain("No space left on device");
+      expect(rig.service.sandboxes.getSetupFailure("ws-2")).toBeUndefined();
 
       const removal = await makeRuntime(daytona).deleteWorkspace(
         "/home/me/project",
@@ -668,7 +668,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
         true
       );
       expect(removal.success).toBe(true);
-      expect(rig.service.getSetupFailure("ws-1")).toBeUndefined();
+      expect(rig.service.sandboxes.getSetupFailure("ws-1")).toBeUndefined();
     } finally {
       sshDelete.mockRestore();
     }
@@ -679,7 +679,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     // The user saves another account's key while the create request is in flight.
     let refusal: unknown;
     rig.plane.onRequest.set("POST /sandbox", () =>
-      rig.service.setConfig({ apiKey: "new-key" }).catch((error: unknown) => {
+      rig.service.account.setConfig({ apiKey: "new-key" }).catch((error: unknown) => {
         refusal = error;
       })
     );
@@ -689,7 +689,9 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     expect(String(refusal)).toContain("Daytona is busy");
     expect(rig.plane.find("xum-kept")?.state).toBe("started");
     expect(newAccount.calls).toEqual([]);
-    expect((await rig.service.setConfig({ apiKey: "new-key" })).apiKeySource).toBe("settings");
+    expect((await rig.service.account.setConfig({ apiKey: "new-key" })).apiKeySource).toBe(
+      "settings"
+    );
   });
 
   it("never deletes a sandbox that took its name before the create request", async () => {
@@ -801,7 +803,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     const newAccount = rig.addAccount("new-key");
     let refusal: unknown;
     sshDeleteSpy.mockImplementation(async () => {
-      await rig.service.setConfig({ apiKey: "new-key" }).catch((error: unknown) => {
+      await rig.service.account.setConfig({ apiKey: "new-key" }).catch((error: unknown) => {
         refusal = error;
       });
       return { success: true, deletedPath: "/path" };
@@ -817,7 +819,9 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(String(refusal)).toContain("Daytona is busy");
     expect(rig.plane.find("sb-clean")).toBeUndefined();
     expect(newAccount.calls).toEqual([]);
-    expect((await rig.service.setConfig({ apiKey: "new-key" })).apiKeySource).toBe("settings");
+    expect((await rig.service.account.setConfig({ apiKey: "new-key" })).apiKeySource).toBe(
+      "settings"
+    );
   });
 
   it("starts a delete after a settings change being saved, in the new account only", async () => {
@@ -835,7 +839,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       }
     );
     try {
-      const saved = rig.service.setConfig({ apiKey: "new-key" });
+      const saved = rig.service.account.setConfig({ apiKey: "new-key" });
       const deleted = makeRuntime({ sandboxId: "xum-same" }).deleteWorkspace(
         "/home/me/project",
         "feature",
@@ -855,7 +859,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
 
   it("keeps the sandbox when a fork's forced removal cannot delete its checkout", async () => {
     rig.plane.addSandbox({ id: "sb-1" });
-    await rig.service.ensureSshAccess("sb-1");
+    await rig.service.ssh.ensureSshAccess("sb-1");
     sshDeleteSpy.mockResolvedValue({ success: false, error: "ssh: host unreachable" });
 
     const forced = await makeRuntime({ sandboxId: "sb-1", forked: true }, rig, {
@@ -1116,7 +1120,7 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
   it("keeps the token (the ssh user name) out of command stderr and thrown errors", async () => {
     execSpy.mockRestore();
     rig.plane.addSandbox({ id: "sb-tok" });
-    await rig.service.ensureSshAccess("sb-tok");
+    await rig.service.ssh.ensureSshAccess("sb-tok");
     const token = rig.writer.tokens.get("sb-tok");
     if (!token) throw new Error("expected a minted token");
     let refuseConnections = false;
@@ -1156,7 +1160,7 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
     const stale = "earlier-process-token-7f3a";
     rig.plane.addSandbox({ id: "sb-old" });
     rig.writer.tokens.set("sb-old", stale);
-    await rig.service.loadPersistedTokens();
+    await rig.service.ssh.loadPersistedTokens();
     const runtime = makeRuntime({ sandboxId: "sb-old" }, rig, {
       transport: {
         ...localShellTransport(rig.rootDir),
@@ -1178,7 +1182,7 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
 
   it("keeps the token out of an error that gets no retry", async () => {
     rig.plane.addSandbox({ id: "sb-tok" });
-    await rig.service.ensureSshAccess("sb-tok");
+    await rig.service.ssh.ensureSshAccess("sb-tok");
     const token = rig.writer.tokens.get("sb-tok");
     if (!token) throw new Error("expected a minted token");
     let spawns = 0;
@@ -1213,7 +1217,7 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
     );
     // Startup goes on without them.
     let startupLoad: unknown;
-    await rig.service.loadPersistedTokens().catch((error: unknown) => (startupLoad = error));
+    await rig.service.ssh.loadPersistedTokens().catch((error: unknown) => (startupLoad = error));
     expect(startupLoad).toBeInstanceOf(Error);
 
     let readsWhenSpawned: number | undefined;
@@ -1420,7 +1424,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
 
   it("reports a sandbox that no longer exists instead of the refused token", async () => {
     rig.plane.addSandbox({ id: "sb-gone" });
-    await rig.service.ensureSshAccess("sb-gone");
+    await rig.service.ssh.ensureSshAccess("sb-gone");
     rig.plane.sandboxes.delete("sb-gone");
     const runtime = makeRuntime({ sandboxId: "sb-gone" }, rig, {
       transport: refusingTransportWhile("sb-gone", () => true),
@@ -1435,7 +1439,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
 
   it("never replaces a token that a concurrent command already replaced", async () => {
     rig.plane.addSandbox({ id: "sb-race" });
-    await rig.service.ensureSshAccess("sb-race");
+    await rig.service.ssh.ensureSshAccess("sb-race");
     const first = rig.writer.tokens.get("sb-race");
     if (!first) throw new Error("expected a minted token");
     const local = localShellTransport(rig.rootDir);
@@ -1478,7 +1482,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
 
   it("replaces a token the gateway refused and retries the command once", async () => {
     rig.plane.addSandbox({ id: "sb-rev" });
-    await rig.service.ensureSshAccess("sb-rev");
+    await rig.service.ssh.ensureSshAccess("sb-rev");
     const refused = rig.writer.tokens.get("sb-rev");
     if (!refused) throw new Error("expected a minted token");
     const local = localShellTransport(rig.rootDir);

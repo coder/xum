@@ -6,84 +6,14 @@ import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
 import { XUM_DAYTONA_SSH_BLOCK_START } from "@/common/constants/daytona";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { log } from "@/node/services/log";
-import { DaytonaApiError } from "./daytonaClient";
-import { createDaytonaTestRig } from "./daytona.testHarness";
-import {
-  DAYTONA_BUSY_MESSAGE,
-  DAYTONA_LABEL_INSTANCE,
-  DAYTONA_LABEL_PROJECT,
-  DaytonaService,
-  mapDaytonaSandboxState,
-} from "./daytonaService";
+import { ScriptedSandboxControlPlane } from "./daytona.testHarness";
+import { DAYTONA_BUSY_MESSAGE } from "./daytonaAccount";
+import { DaytonaService } from "./daytonaService";
 
-/** In-memory control plane: one sandbox whose `state` follows a script of observations. */
-class FakeControlPlane {
-  states: string[] = [];
-  exists = true;
-  errorReason?: string;
-  /** A proxy that echoes the request URI and its Authorization header in a failed revoke. */
-  revokeEchoesRequest = false;
-  readonly calls: string[] = [];
-  private tokenCounter = 0;
-  readonly revoked: string[] = [];
-  gatewayHost = "ssh.test";
-  gatewayHostKeys = ["ssh-ed25519 AAAA"];
-
-  constructor(private readonly now: () => number) {}
-
-  readonly fetch = ((input: string | URL | Request, init?: RequestInit) =>
-    Promise.resolve(this.handle(input, init))) as typeof fetch;
-
-  private handle(input: string | URL | Request, init?: RequestInit): Response {
-    const url = new URL(input instanceof Request ? input.url : input.toString());
-    const method = init?.method ?? "GET";
-    const route = `${method} ${url.pathname.replace(/^\/api/, "")}`;
-    this.calls.push(route);
-    const json = (status: number, body?: unknown) =>
-      new Response(body === undefined ? "" : JSON.stringify(body), { status });
-
-    if (route === "GET /config") {
-      return json(200, {
-        sshGatewayHost: this.gatewayHost,
-        sshGatewayHostKeys: this.gatewayHostKeys,
-      });
-    }
-    if (route === "GET /sandbox") {
-      if (init?.headers && (init.headers as Record<string, string>).Authorization !== "Bearer k") {
-        return json(401, { statusCode: 401, message: "Invalid credentials" });
-      }
-      return json(200, { items: [], nextCursor: null });
-    }
-    if (!this.exists) return json(404, { statusCode: 404, message: "Sandbox not found" });
-    if (route === "GET /sandbox/sb-1") {
-      const state = this.states.length > 1 ? this.states.shift() : this.states[0];
-      return json(200, { id: "sb-1", name: "sb-1", state, errorReason: this.errorReason });
-    }
-    if (route === "POST /sandbox/sb-1/start") return json(200, {});
-    if (route === "POST /sandbox/sb-1/ssh-access") {
-      this.tokenCounter += 1;
-      const minutes = Number(url.searchParams.get("expiresInMinutes"));
-      return json(200, {
-        token: `tok${this.tokenCounter}`,
-        expiresAt: new Date(this.now() + minutes * 60_000).toISOString(),
-      });
-    }
-    if (route === "DELETE /sandbox/sb-1/ssh-access") {
-      if (this.revokeEchoesRequest) {
-        const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
-        return json(500, { message: `Revoke failed for ${url.toString()} (${auth})` });
-      }
-      this.revoked.push(url.searchParams.get("token") ?? "");
-      return json(200, {});
-    }
-    return json(500, { message: `unexpected ${route}` });
-  }
-}
-
-describe("DaytonaService", () => {
+describe("DaytonaSsh", () => {
   let rootDir: string;
   let clock: number;
-  let plane: FakeControlPlane;
+  let plane: ScriptedSandboxControlPlane;
   let service: DaytonaService;
   const sleeps: number[] = [];
 
@@ -104,7 +34,7 @@ describe("DaytonaService", () => {
   beforeEach(async () => {
     rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-daytona-service-"));
     clock = Date.parse("2026-01-01T00:00:00Z");
-    plane = new FakeControlPlane(() => clock);
+    plane = new ScriptedSandboxControlPlane(() => clock);
     sleeps.length = 0;
     service = makeService();
   });
@@ -113,68 +43,15 @@ describe("DaytonaService", () => {
     await fs.rm(rootDir, { recursive: true, force: true });
   });
 
-  it("collapses Daytona states to the ones Xum acts on", () => {
-    const expected: Record<string, string> = {
-      creating: "starting",
-      resuming: "starting",
-      stopping: "starting",
-      archiving: "starting",
-      started: "started",
-      stopped: "stopped",
-      paused: "stopped",
-      archived: "archived",
-      build_failed: "error",
-      destroyed: "error",
-      some_future_state: "error",
-    };
-    for (const [raw, state] of Object.entries(expected)) {
-      expect(`${raw} -> ${mapDaytonaSandboxState(raw)}`).toBe(`${raw} -> ${state}`);
-    }
-  });
-
-  it("starts a stopped sandbox once and waits until it reports started", async () => {
-    plane.states = ["stopped", "stopped", "starting", "started"];
-    let startingEvents = 0;
-    const sandbox = await service.startAndWait("sb-1", clock + 60_000, {
-      onStarting: () => startingEvents++,
-    });
-    expect(sandbox.state).toBe("started");
-    expect(startingEvents).toBe(1);
-    expect(plane.calls.filter((call) => call === "POST /sandbox/sb-1/start")).toHaveLength(1);
-  });
-
-  it("gives up at the deadline with a timeout error", async () => {
-    plane.states = ["starting"];
-    const deadline = clock + 7_000;
-    const error = await service.startAndWait("sb-1", deadline).catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(DaytonaApiError);
-    expect((error as DaytonaApiError).kind).toBe("timeout");
-    expect(clock).toBe(deadline);
-  });
-
-  it("fails fast on a missing sandbox or an error state instead of polling", async () => {
-    plane.exists = false;
-    const missing = await service.startAndWait("sb-1", clock + 60_000).catch((e: unknown) => e);
-    expect((missing as DaytonaApiError).kind).toBe("not_found");
-    expect(await service.getSandboxState("sb-1")).toEqual({ state: "missing" });
-
-    plane.exists = true;
-    plane.states = ["build_failed"];
-    plane.errorReason = "Dockerfile step 3 failed";
-    const failed = await service.startAndWait("sb-1", clock + 60_000).catch((e: unknown) => e);
-    expect((failed as Error).message).toContain("Dockerfile step 3 failed");
-    expect(sleeps).toEqual([]);
-  });
-
   it("reuses an SSH token until it nears expiry, then swaps it before revoking the old one", async () => {
-    const first = await service.getSshToken("sb-1");
+    const first = await service.ssh.getSshToken("sb-1");
     clock += 30 * 60_000;
-    expect(await service.getSshToken("sb-1")).toEqual(first);
+    expect(await service.ssh.getSshToken("sb-1")).toEqual(first);
 
     // 50 minutes in, less than 15 minutes remain.
     clock += 20 * 60_000;
     const order: string[] = [];
-    const second = await service.getSshToken("sb-1", {
+    const second = await service.ssh.getSshToken("sb-1", {
       onNewToken: (access) => {
         order.push(`installed ${access.token}, revoked so far: ${plane.revoked.join(",")}`);
         return Promise.resolve();
@@ -186,25 +63,28 @@ describe("DaytonaService", () => {
   });
 
   it("shares one mint between concurrent token requests", async () => {
-    const [a, b] = await Promise.all([service.getSshToken("sb-1"), service.getSshToken("sb-1")]);
+    const [a, b] = await Promise.all([
+      service.ssh.getSshToken("sb-1"),
+      service.ssh.getSshToken("sb-1"),
+    ]);
     expect(a).toEqual(b);
     expect(plane.calls.filter((call) => call === "POST /sandbox/sb-1/ssh-access")).toHaveLength(1);
   });
 
   it("revokes the SSH tokens it holds when the settings change", async () => {
-    const held = await service.getSshToken("sb-1");
-    await service.setConfig({ target: "eu" });
+    const held = await service.ssh.getSshToken("sb-1");
+    await service.account.setConfig({ target: "eu" });
     expect(plane.revoked).toEqual([held.token]);
     // The next request mints a fresh token instead of reusing the revoked one.
-    expect((await service.getSshToken("sb-1")).token).not.toBe(held.token);
+    expect((await service.ssh.getSshToken("sb-1")).token).not.toBe(held.token);
   });
 
   it("logs a failed revoke without the token or the API key the response echoes", async () => {
-    const held = await service.getSshToken("sb-1");
+    const held = await service.ssh.getSshToken("sb-1");
     plane.revokeEchoesRequest = true;
     const warn = spyOn(log, "warn");
     try {
-      await service.setConfig({ target: "eu" });
+      await service.account.setConfig({ target: "eu" });
       const logged = JSON.stringify(warn.mock.calls);
       expect(logged).toContain("Failed to revoke a Daytona SSH token");
       expect(logged).not.toContain(held.token);
@@ -262,9 +142,9 @@ describe("DaytonaService", () => {
   it("refuses a settings change while a token is minted, and takes it afterwards", async () => {
     const held = serviceWithHeldMint();
 
-    const access = held.service.ensureSshAccess("sb-1");
+    const access = held.service.ssh.ensureSshAccess("sb-1");
     await held.started;
-    const refusal = await held.service.setConfig({ target: "eu" }).then(
+    const refusal = await held.service.account.setConfig({ target: "eu" }).then(
       () => undefined,
       (error: unknown) => error
     );
@@ -273,7 +153,7 @@ describe("DaytonaService", () => {
     await access;
 
     expect(held.written).toEqual(["tok1"]);
-    expect((await held.service.setConfig({ target: "eu" })).target).toBe("eu");
+    expect((await held.service.account.setConfig({ target: "eu" })).target).toBe("eu");
     // The change revokes the old settings' token.
     expect(plane.revoked).toEqual(["tok1"]);
   });
@@ -324,7 +204,7 @@ describe("DaytonaService", () => {
       retireSshConnections: (sandboxId) => {
         retired.push(sandboxId);
         order.push(`retire ${sandboxId}`);
-        staleAtRetire.push(recording.tokenNeedsRefresh(sandboxId));
+        staleAtRetire.push(recording.ssh.tokenNeedsRefresh(sandboxId));
         return Promise.resolve();
       },
     });
@@ -350,9 +230,9 @@ describe("DaytonaService", () => {
     }) as typeof fetch;
     const { service: racing, writes } = serviceRecordingWrites(fetchHoldingFirstConfig);
 
-    const access = racing.ensureSshAccess("sb-1");
+    const access = racing.ssh.ensureSshAccess("sb-1");
     await fetched;
-    const refusal = await racing.setConfig({ target: "eu" }).then(
+    const refusal = await racing.account.setConfig({ target: "eu" }).then(
       () => undefined,
       (error: unknown) => error
     );
@@ -367,15 +247,15 @@ describe("DaytonaService", () => {
     const { service: watching, writes, retired } = serviceRecordingWrites();
     const configFetches = () => plane.calls.filter((call) => call === "GET /config").length;
 
-    await watching.ensureSshAccess("sb-1");
+    await watching.ssh.ensureSshAccess("sb-1");
     clock += 4 * 60_000;
-    await watching.ensureSshAccess("sb-1");
+    await watching.ssh.ensureSshAccess("sb-1");
     expect(configFetches()).toBe(1);
 
     // Rotated (and listed in another order) while Xum runs.
     plane.gatewayHostKeys = ["ssh-rsa CCCC", "ssh-ed25519 BBBB"];
     clock += 2 * 60_000;
-    await watching.ensureSshAccess("sb-1");
+    await watching.ssh.ensureSshAccess("sb-1");
     expect(writes).toEqual([
       "tok1@ssh.test ssh-ed25519 AAAA",
       "tok2@ssh.test ssh-rsa CCCC,ssh-ed25519 BBBB",
@@ -387,7 +267,7 @@ describe("DaytonaService", () => {
     // A refetch that finds the same gateway, keys reordered, rewrites nothing.
     plane.gatewayHostKeys = ["ssh-ed25519 BBBB", "ssh-rsa CCCC"];
     clock += 6 * 60_000;
-    await watching.ensureSshAccess("sb-1");
+    await watching.ssh.ensureSshAccess("sb-1");
     expect(configFetches()).toBe(3);
     expect(writes).toHaveLength(2);
     expect(retired).toEqual(["sb-1"]);
@@ -404,11 +284,11 @@ describe("DaytonaService", () => {
       });
     }) as typeof fetch;
     const { service: watching, retired } = serviceRecordingWrites(fetchImpl);
-    await watching.ensureSshAccess("sb-1");
+    await watching.ssh.ensureSshAccess("sb-1");
 
     clock += 6 * 60_000;
     holdConfig = true;
-    const lookups = Promise.all([watching.getGatewayConfig(), watching.getGatewayConfig()]);
+    const lookups = Promise.all([watching.ssh.getGatewayConfig(), watching.ssh.getGatewayConfig()]);
     while (held.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
     await new Promise((resolve) => setTimeout(resolve, 20));
     // During a rollout the last request answers first with the new gateway; earlier ones late.
@@ -424,17 +304,17 @@ describe("DaytonaService", () => {
       ["ssh-ed25519 NEW"],
       ["ssh-ed25519 NEW"],
     ]);
-    expect((await watching.getGatewayConfig()).sshGatewayHostKeys).toEqual(["ssh-ed25519 NEW"]);
+    expect((await watching.ssh.getGatewayConfig()).sshGatewayHostKeys).toEqual(["ssh-ed25519 NEW"]);
     expect(retired).toEqual(["sb-1"]);
   });
 
   it("installs a moved gateway before retiring the connections to the old one", async () => {
     const { service: watching, order, staleAtRetire } = serviceRecordingWrites();
-    await watching.ensureSshAccess("sb-1");
+    await watching.ssh.ensureSshAccess("sb-1");
 
     plane.gatewayHostKeys = ["ssh-ed25519 BBBB"];
     clock += 6 * 60_000;
-    await watching.getGatewayConfig();
+    await watching.ssh.getGatewayConfig();
 
     // A connection opened while the old ones are retired reads the new files, and the next
     // access sets the sandbox up again: nothing reaches the old gateway afterwards.
@@ -444,9 +324,9 @@ describe("DaytonaService", () => {
 
   it("retires a released sandbox's ssh connections once its include block is gone", async () => {
     const { service: releasing, order } = serviceRecordingWrites();
-    await releasing.ensureSshAccess("sb-1");
+    await releasing.ssh.ensureSshAccess("sb-1");
 
-    await releasing.releaseSshAccess("sb-1");
+    await releasing.ssh.releaseSshAccess("sb-1");
 
     // Pooled sessions and reverse forwards stay authenticated after the token is revoked; a
     // retirement before the block is gone could reconnect from it.
@@ -456,16 +336,16 @@ describe("DaytonaService", () => {
   it("revokes a token minted across a release, keeping the access released", async () => {
     const held = serviceWithHeldMint();
 
-    const access = held.service.ensureSshAccess("sb-1").catch((error: unknown) => error);
+    const access = held.service.ssh.ensureSshAccess("sb-1").catch((error: unknown) => error);
     await held.started;
-    await held.service.releaseSshAccess("sb-1");
+    await held.service.ssh.releaseSshAccess("sb-1");
     held.releaseMint();
 
     // The caller asked for access the release took away: it fails instead of minting again.
     expect(String(await access)).toContain("released");
     expect(plane.revoked).toEqual(["tok1"]);
     expect(held.includeFile.has("sb-1")).toBe(false);
-    expect(held.service.hasExpiringSshToken("sb-1")).toBe(false);
+    expect(held.service.ssh.hasExpiringSshToken("sb-1")).toBe(false);
     expect(plane.calls.filter((call) => call === "POST /sandbox/sb-1/ssh-access")).toHaveLength(1);
   });
 
@@ -495,18 +375,18 @@ describe("DaytonaService", () => {
         now: () => clock,
         sshConfigWriter: writer,
       });
-      await started.loadPersistedTokens();
+      await started.ssh.loadPersistedTokens();
       return started;
     };
 
     // The file has no expiry, so the first ssh access replaces the loaded token.
-    await (await startProcess()).ensureSshAccess("sb-1");
+    await (await startProcess()).ssh.ensureSshAccess("sb-1");
     const minted = includeFile.get("sb-1");
     expect(minted).not.toBe("earlier-process-token");
     expect(plane.revoked).toEqual(["earlier-process-token"]);
 
     // After another restart, a settings change revokes what it loaded.
-    await (await startProcess()).setConfig({ target: "eu" });
+    await (await startProcess()).account.setConfig({ target: "eu" });
     expect(plane.revoked).toEqual(["earlier-process-token", minted ?? ""]);
   });
 
@@ -519,85 +399,16 @@ describe("DaytonaService", () => {
       now: () => clock,
       sshConfigWriter: new DaytonaSshConfigWriter({ xumHome: rootDir, sshConfigPath }),
     });
-    await service.ensureSshAccess("sb-1");
+    await service.ssh.ensureSshAccess("sb-1");
     expect(await fs.readFile(sshConfigPath, "utf8")).toContain(XUM_DAYTONA_SSH_BLOCK_START);
     // A dotfiles tool replaces the file: the include file and the cached token stay.
     await fs.writeFile(sshConfigPath, "Host work\n  User me\n", "utf8");
 
-    await service.ensureSshAccess("sb-1");
+    await service.ssh.ensureSshAccess("sb-1");
 
     const restored = await fs.readFile(sshConfigPath, "utf8");
     expect(restored.startsWith(XUM_DAYTONA_SSH_BLOCK_START)).toBe(true);
     expect(restored).toContain("Host work\n  User me\n");
     expect(plane.calls.filter((call) => call === "POST /sandbox/sb-1/ssh-access")).toHaveLength(1);
-  });
-
-  it("reports test-connection failures as typed results", async () => {
-    expect(await service.testConnection()).toEqual({ ok: true });
-
-    const wrongKey = makeService({ DAYTONA_API_KEY: "wrong" });
-    expect(await wrongKey.testConnection()).toMatchObject({ ok: false, kind: "unauthorized" });
-
-    const unconfigured = makeService({});
-    expect(await unconfigured.testConnection()).toMatchObject({
-      ok: false,
-      kind: "not_configured",
-    });
-    expect(await unconfigured.checkAvailability()).toMatchObject({ available: false });
-  });
-
-  it("never sends the key to a non-loopback http DAYTONA_API_URL", async () => {
-    const insecure = makeService({ DAYTONA_API_KEY: "k", DAYTONA_API_URL: "http://byoc.test/api" });
-
-    expect(await insecure.testConnection()).toMatchObject({
-      ok: false,
-      kind: "not_configured",
-      error: expect.stringContaining("DAYTONA_API_URL") as unknown,
-    });
-    expect(await insecure.checkAvailability()).toMatchObject({
-      available: false,
-      reason: expect.stringContaining("https") as unknown,
-    });
-    expect(plane.calls).toEqual([]);
-  });
-
-  it("labels sandboxes with an instance id that is stable across service instances", async () => {
-    const labels = await service.buildLabels({
-      workspaceId: "ws-1",
-      projectPath: "/home/me/secret-dir/my-project",
-    });
-    const again = await makeService().buildLabels({
-      workspaceId: "ws-2",
-      projectPath: "/x/other",
-    });
-    expect(labels[DAYTONA_LABEL_INSTANCE]).toBe(again[DAYTONA_LABEL_INSTANCE]);
-    expect(labels[DAYTONA_LABEL_PROJECT]).toBe("my-project");
-  });
-});
-
-describe("DaytonaService.deleteSandbox", () => {
-  it("deletes only a sandbox with this install's label, keeping any other and its ssh access", async () => {
-    const rig = await createDaytonaTestRig();
-    try {
-      rig.plane.addSandbox({
-        id: "sb-foreign",
-        labels: { [DAYTONA_LABEL_INSTANCE]: "another-install" },
-      });
-      rig.plane.addSandbox({ id: "sb-unlabeled", labels: {} });
-      rig.plane.addSandbox({ id: "sb-own" });
-      await rig.service.ensureSshAccess("sb-foreign");
-
-      expect(await rig.service.deleteSandbox("sb-foreign")).toBe("notOwned");
-      expect(await rig.service.deleteSandbox("sb-unlabeled")).toBe("notOwned");
-      expect(rig.plane.find("sb-foreign")).toBeDefined();
-      expect(rig.plane.find("sb-unlabeled")).toBeDefined();
-      expect(rig.plane.calls.filter((call) => call.startsWith("DELETE /sandbox/"))).toEqual([]);
-      expect(rig.writer.tokens.has("sb-foreign")).toBe(true);
-
-      expect(await rig.service.deleteSandbox("sb-own")).toBe("deleted");
-      expect(rig.plane.find("sb-own")).toBeUndefined();
-    } finally {
-      await rig.cleanup();
-    }
   });
 });

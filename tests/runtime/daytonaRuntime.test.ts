@@ -73,7 +73,7 @@ describeDaytona("Daytona runtime (real control plane)", () => {
   }, 60_000);
 
   afterAll(async () => {
-    if (sandboxId) await service.deleteSandbox(sandboxId);
+    if (sandboxId) await service.sandboxes.deleteSandbox(sandboxId);
     process.env.HOME = originalHome;
     await fs.rm(tempRoot, { recursive: true, force: true });
   }, 120_000);
@@ -138,7 +138,7 @@ describeDaytona("Daytona runtime (real control plane)", () => {
     const forkRuntime = makeRuntime(forkConfig, "feature-fork");
     const deleted = await forkRuntime.deleteWorkspace(projectPath, "feature-fork", false);
     expect(deleted.success).toBe(true);
-    expect((await service.getSandboxState(sandboxId ?? "")).state).toBe("started");
+    expect((await service.sandboxes.getSandboxState(sandboxId ?? "")).state).toBe("started");
 
     // Archiving the workspace that created the sandbox deletes it.
     const archiveHook = createDaytonaArchiveHook({ daytonaService: service });
@@ -153,6 +153,6 @@ describeDaytona("Daytona runtime (real control plane)", () => {
       },
     });
     expect(archived.success).toBe(true);
-    expect((await service.getSandboxState(sandboxId ?? "")).state).toBe("missing");
+    expect((await service.sandboxes.getSandboxState(sandboxId ?? "")).state).toBe("missing");
   }, 900_000);
 });

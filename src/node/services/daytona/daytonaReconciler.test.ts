@@ -2,14 +2,14 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { createDaytonaTestRig, type DaytonaTestRig } from "./daytona.testHarness";
 import { DaytonaReconciler, listDaytonaWorkspaceRefs } from "./daytonaReconciler";
-import { DAYTONA_LABEL_INSTANCE } from "./daytonaService";
+import { DAYTONA_LABEL_INSTANCE } from "./daytonaSandboxes";
 
 let rig: DaytonaTestRig;
 let instanceLabels: Record<string, string>;
 
 beforeEach(async () => {
   rig = await createDaytonaTestRig();
-  instanceLabels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.getInstanceId() };
+  instanceLabels = { [DAYTONA_LABEL_INSTANCE]: await rig.service.sandboxes.getInstanceId() };
 });
 
 afterEach(async () => {
@@ -83,7 +83,7 @@ describe("DaytonaReconciler.sweep", () => {
 
   it("refreshes an active workspace's ssh token before it expires", async () => {
     rig.plane.addSandbox({ id: "sb-1", labels: instanceLabels });
-    await rig.service.ensureSshAccess("sb-1");
+    await rig.service.ssh.ensureSshAccess("sb-1");
     const firstToken = rig.writer.tokens.get("sb-1");
     rig.clock.now += 50 * 60_000;
 

@@ -499,7 +499,7 @@ export class ServiceContainer {
     // them.
     {
       name: "daytonaService.loadPersistedTokens",
-      run: () => this.daytonaService.loadPersistedTokens(),
+      run: () => this.daytonaService.ssh.loadPersistedTokens(),
       bestEffort: true,
     },
     // Bash commands that outlived a restart still hold the proxy URL and key: bind the saved
