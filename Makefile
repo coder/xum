@@ -929,8 +929,8 @@ bench-compare: node_modules/.installed src/version.ts ## Compare *.bench.ts resu
 	@bun scripts/perf/benchCompare.ts --bench '$(BENCH)' --runtime $(or $(RUNTIME),node) --rounds $(or $(ROUNDS),10) $(if $(BASE),--base '$(BASE)')
 
 # Agent loop refactor tripwire data. Gates call the script directly: make reports any failure as 2.
-test-loop-baseline: node_modules/.installed src/version.ts ## Time the loop test files (RUNS=10, FILTER=<substring>, JOBS=6)
-	@bun scripts/perf/loopTestBaseline.ts --runs $(or $(RUNS),10) --jobs $(or $(JOBS),6) $(if $(FILTER),--filter '$(FILTER)')
+test-loop-baseline: node_modules/.installed src/version.ts ## Time the loop test files (RUNS=10, FILTER=<substring>, JOBS=6, BASE=<ref> compares)
+	@bun scripts/perf/loopTestBaseline.ts --runs $(or $(RUNS),10) --jobs $(or $(JOBS),6) $(if $(FILTER),--filter '$(FILTER)') $(if $(BASE),--base '$(BASE)')
 
 first-load-js: ## Report first-load JS bytes of dist/ (run make build-renderer first)
 	@bun scripts/perf/firstLoadJs.ts dist

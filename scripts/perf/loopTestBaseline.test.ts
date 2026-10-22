@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loopTestFiles, patchesGlobalTime, recordName, runFile, runPool } from "./loopTestBaseline";
+import {
+  changedFiles,
+  heavySkips,
+  loopTestFiles,
+  patchesGlobalTime,
+  recordName,
+  runFile,
+  runPool,
+} from "./loopTestBaseline";
 import { summarizeFile } from "./loopTestStats";
 
 let root: string;
@@ -101,6 +109,59 @@ describe("runFile", () => {
     expect(crash.exitCode).not.toBe(0);
     expect(summarizeFile("f", [ok, crash], false).failedRuns).toBe(1);
   });
+});
+
+describe("heavySkips", () => {
+  const heavy = "src/node/services/backgroundProcessManager.test.ts";
+
+  test("a short compare skips backgroundProcessManager.test.ts unless its code changed", () => {
+    expect(heavySkips(3, ["src/node/services/historyService.ts"])).toEqual([heavy]);
+    expect(heavySkips(3, ["src/node/services/backgroundProcessManager.ts"])).toEqual([]);
+    expect(heavySkips(3, [heavy])).toEqual([]);
+  });
+
+  test("a full compare never skips it", () => {
+    expect(heavySkips(5, [])).toEqual([]);
+  });
+});
+
+describe("changedFiles", () => {
+  const sh = (...args: string[]) => {
+    const result = Bun.spawnSync(["git", ...args], { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(result.exitCode).toBe(0);
+    return result.stdout.toString().trim();
+  };
+
+  test("lists a renamed file under its old and its new path", () => {
+    sh("init", "-q");
+    sh("config", "user.email", "t@example.com");
+    sh("config", "user.name", "t");
+    write("a.ts", "export const a = 1;\n".repeat(20));
+    write("b.ts", "export const b = 1;\n".repeat(20));
+    sh("add", ".");
+    sh("commit", "-qm", "base");
+    const base = sh("rev-parse", "HEAD");
+    sh("mv", "a.ts", "a2.ts");
+    sh("commit", "-qm", "rename a");
+    sh("mv", "b.ts", "b2.ts");
+    expect(changedFiles(root, base).sort()).toEqual(["a.ts", "a2.ts", "b.ts", "b2.ts"]);
+  });
+});
+
+test("an unknown --base exits 2 with a last loop-tests line", () => {
+  const result = Bun.spawnSync(
+    [
+      "bun",
+      "scripts/perf/loopTestBaseline.ts",
+      "--base",
+      "no-such-ref-for-loop-tests",
+      "--runs",
+      "3",
+    ],
+    { cwd: path.join(import.meta.dir, "..", ".."), stdout: "pipe", stderr: "pipe" }
+  );
+  expect(result.exitCode).toBe(2);
+  expect(result.stdout.toString().trim().split("\n").at(-1)).toBe("loop-tests: error");
 });
 
 describe("runPool", () => {

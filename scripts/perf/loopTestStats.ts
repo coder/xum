@@ -7,6 +7,7 @@
  * named the fields medianMs and realWaitShare; this record keeps wallMs[] and timerShare instead.
  */
 import assert from "node:assert/strict";
+import { type BenchComparison, compareBenchRounds } from "./benchStats";
 
 /** What scripts/perf/loopTests.preload.ts writes for one process. */
 export interface PreloadOutput {
@@ -82,4 +83,79 @@ export function summarizeFile(
     fsShare: share((preload) => preload.fsMs),
     timerShare: share((preload) => preload.timerMs),
   };
+}
+
+/**
+ * The trip margins. They are fixed in the phase 1 plan before work starts: no worker changes them
+ * to clear a trip. A paired same-code (A/A) spike of 5 rounds gave a highest lower bound of +2.7%,
+ * and tools/bash_output.test.ts failed 1 of 2 runs with no change, so one more failed run is noise.
+ */
+export const SLOWER_LOW_BOUND_PCT = 10;
+export const SLOWER_MIN_DELTA_MS = 250;
+export const MORE_FAILED_RUNS = 2;
+
+export interface Trip {
+  file: string;
+  slower: boolean;
+  failsMore: boolean;
+  comparison: BenchComparison;
+}
+
+/** Paired rounds of the stage 2 rerun of one stage 1 trip. */
+export const RECHECK_RUNS = 5;
+
+/** One stage 1 trip and its stage 2 rerun. */
+export interface TripCheck {
+  /** Stage 1: the trip in the run of the whole set. */
+  first: Trip;
+  /** Stage 2: the file alone, RECHECK_RUNS paired rounds, one process at a time. */
+  rerun: { base: LoopTestRecord; head: LoopTestRecord };
+  /** The stage 2 trip, of either kind; null when stage 2 cleared the file. */
+  again: Trip | null;
+}
+
+export interface LoopTestCompare {
+  base: LoopTestRecord;
+  head: LoopTestRecord;
+  /** Files left out of this run (backgroundProcessManager.test.ts at RUNS below 5). */
+  skipped: string[];
+  /** Every stage 1 trip with its stage 2 result. */
+  checks: TripCheck[];
+  /** The trips that count: the stage 2 trips of the files that tripped in both stages. */
+  trips: Trip[];
+  /** Head test files with no base: listed, never a trip. */
+  newFiles: string[];
+}
+
+/**
+ * A head file trips when its paired 95% lower bound is above +SLOWER_LOW_BOUND_PCT and its median
+ * grew by more than SLOWER_MIN_DELTA_MS, or when it failed MORE_FAILED_RUNS more runs than base.
+ * A trip pauses the PR for review; it never fails the PR by itself.
+ */
+export function trips(base: LoopTestRecord, head: LoopTestRecord): Trip[] {
+  return head.files.flatMap((h) => {
+    const b = base.files.find((f) => f.file === h.file);
+    if (b === undefined) return [];
+    const comparison = compareBenchRounds(b.wallMs, h.wallMs);
+    const slower =
+      comparison.ciLowPct > SLOWER_LOW_BOUND_PCT &&
+      comparison.headMedian - comparison.baseMedian > SLOWER_MIN_DELTA_MS;
+    const failsMore = h.failedRuns >= b.failedRuns + MORE_FAILED_RUNS;
+    return slower || failsMore ? [{ file: h.file, slower, failsMore, comparison }] : [];
+  });
+}
+
+/**
+ * Stage 2. Under the load of the whole set, a same-code compare tripped on files that did not trip
+ * alone (bash_output.test.ts failed 1/3 on base and 3/3 on head). So a stage 1 trip counts only
+ * when the rerun of its file alone trips again, of either kind, with the same margins.
+ */
+export function recheck(first: Trip, rerun: TripCheck["rerun"]): TripCheck {
+  for (const side of [rerun.base, rerun.head]) {
+    assert(
+      side.files.length === 1 && side.files[0].file === first.file,
+      `stage 2 of ${first.file} measured ${side.files.map((f) => f.file).join(", ")}`
+    );
+  }
+  return { first, rerun, again: trips(rerun.base, rerun.head)[0] ?? null };
 }
