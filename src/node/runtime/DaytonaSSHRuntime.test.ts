@@ -1553,6 +1553,34 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
     expect(String(error)).toContain(`${DAYTONA_TOKEN_PLACEHOLDER}@127.0.0.1: Permission denied`);
   });
 
+  it("keeps the token out of an error that gets no retry", async () => {
+    rig.plane.addSandbox({ id: "sb-tok" });
+    await rig.service.ensureSshAccess("sb-tok");
+    const token = rig.writer.tokens.get("sb-tok");
+    if (!token) throw new Error("expected a minted token");
+    let spawns = 0;
+    // A UI runtime never restarts the sandbox, so a dropped connection is not retried.
+    const runtime = makeRuntime({ sandboxId: "sb-tok" }, rig, {
+      transport: {
+        ...localShellTransport(rig.rootDir),
+        spawnRemoteProcess: () => {
+          spawns++;
+          return Promise.reject(
+            new RuntimeError(`Connection closed by user ${token} 127.0.0.1 port 22`, "network")
+          );
+        },
+      },
+    });
+
+    const error = await runtime.exec("true", { cwd: "/tmp", timeout: 10 }).then(
+      () => new Error("exec unexpectedly succeeded"),
+      (rejection: unknown) => rejection
+    );
+    expect(spawns).toBe(1);
+    expect(String(error)).not.toContain(token);
+    expect(String(error)).toContain(DAYTONA_TOKEN_PLACEHOLDER);
+  });
+
   it("runs no ssh command before the include file's tokens are loaded, retrying a failed load", async () => {
     const stale = "earlier-process-token-unloaded-9c1d";
     rig.plane.addSandbox({ id: "sb-old" });
