@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { createElement, type ComponentProps, type ReactNode } from "react";
-import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { APIProvider } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { DaytonaPublicConfig } from "@/common/orpc/schemas/daytona";
+import { DaytonaSandboxForm } from "@/browser/features/Runtime/DaytonaControls";
 import { useDaytonaResources } from "./useDaytonaResources";
 
 describe("useDaytonaResources", () => {
@@ -56,5 +57,55 @@ describe("useDaytonaResources", () => {
 
     await waitFor(() => expect(result.current.snapshots).toEqual(["base"]));
     expect(result.current.config?.apiKeySet).toBe(true);
+  });
+  // Kept, the old account's config would keep the form ready with its snapshots and sandboxes.
+  test("drops what the previous load found when a reload cannot read the config", async () => {
+    let failing = false;
+    const client = createTestApiClient({
+      daytona: {
+        getConfig: (): Promise<DaytonaPublicConfig> =>
+          failing
+            ? Promise.reject(new Error("backend unreachable"))
+            : Promise.resolve({
+                apiKeySet: true,
+                apiKeySource: "settings",
+                apiUrl: "https://app.daytona.io/api",
+                target: null,
+              }),
+        listSnapshots: () => Promise.resolve({ ok: true as const, snapshots: [{ name: "base" }] }),
+        listSandboxes: () =>
+          Promise.resolve({
+            ok: true as const,
+            sandboxes: [{ id: "sb-old", name: "old", state: "started", labels: {} }],
+          }),
+      },
+    });
+    const wrapper = (props: { children: ReactNode }) =>
+      createElement(APIProvider, { client } as ComponentProps<typeof APIProvider>, props.children);
+    const { result } = renderHook(() => useDaytonaResources({ loadSandboxes: true }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.sandboxes).toHaveLength(1));
+    expect(result.current.snapshots).toEqual(["base"]);
+
+    failing = true;
+    act(() => {
+      window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.DAYTONA_CONFIG_CHANGED));
+    });
+
+    await waitFor(() => expect(result.current.configError).toBe("backend unreachable"));
+    expect(result.current.config).toBeNull();
+    expect(result.current.snapshots).toEqual([]);
+    expect(result.current.sandboxes).toEqual([]);
+    const form = render(
+      createElement(DaytonaSandboxForm, {
+        config: {},
+        onConfigChange: () => undefined,
+        resources: result.current,
+        allowExisting: true,
+      })
+    );
+    expect(form.getByRole("alert").textContent).toContain("backend unreachable");
+    expect(form.queryByText("base")).toBeNull();
   });
 });

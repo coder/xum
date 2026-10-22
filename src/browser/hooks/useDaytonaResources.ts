@@ -55,18 +55,40 @@ export function useDaytonaConfigVersion(): number {
   return version;
 }
 
+/** What a load depends on: another API connection or saved access starts from empty. */
+interface DaytonaLoadKey {
+  api: unknown;
+  configVersion: number;
+  loadSandboxes: boolean;
+}
+
+interface LoadedDaytonaResources extends DaytonaLoadKey {
+  resources: DaytonaResources;
+}
+
+/** `loaded`'s resources if they came from the load `key` names, else empty ones. */
+function resourcesFor(loaded: LoadedDaytonaResources | null, key: DaytonaLoadKey) {
+  return loaded?.api === key.api &&
+    loaded.configVersion === key.configVersion &&
+    loaded.loadSandboxes === key.loadSandboxes
+    ? loaded.resources
+    : EMPTY_DAYTONA_RESOURCES;
+}
+
 export function useDaytonaResources(options: UseDaytonaResourcesOptions): DaytonaResources {
   const { api } = useAPI();
   const configVersion = useDaytonaConfigVersion();
   // One state object so consumers get a stable identity until something actually loads.
-  const [resources, setResources] = useState<DaytonaResources>(EMPTY_DAYTONA_RESOURCES);
+  const [loaded, setLoaded] = useState<LoadedDaytonaResources | null>(null);
   const { loadSandboxes } = options;
 
   useEffect(() => {
     if (!api) return;
     let active = true;
     const update = (patch: Partial<DaytonaResources>) => {
-      if (active) setResources((prev) => ({ ...prev, ...patch }));
+      if (!active) return;
+      const key = { api, configVersion, loadSandboxes };
+      setLoaded((prev) => ({ ...key, resources: { ...resourcesFor(prev, key), ...patch } }));
     };
 
     const load = async () => {
@@ -116,5 +138,7 @@ export function useDaytonaResources(options: UseDaytonaResourcesOptions): Dayton
     };
   }, [api, loadSandboxes, configVersion]);
 
-  return resources;
+  // A reload never shows what the previous load found: a failed or keyless reload would
+  // otherwise leave the form ready with the old account's config, snapshots and sandboxes.
+  return resourcesFor(loaded, { api, configVersion, loadSandboxes });
 }
