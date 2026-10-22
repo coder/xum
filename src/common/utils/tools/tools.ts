@@ -947,7 +947,6 @@ export function getForcedXaiSearchToolNames(
   return toolNames.length > 0 ? toolNames : undefined;
 }
 
-/** The getAvailableTools options that match what this workspace's config can run. */
 function toolAllowlistOptions(
   config: ToolConfiguration
 ): NonNullable<Parameters<typeof getAvailableTools>[1]> {

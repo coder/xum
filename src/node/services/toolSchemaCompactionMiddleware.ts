@@ -21,7 +21,6 @@ function isNullSchema(schema: unknown): boolean {
   return isPlainObject(schema) && schema.type === "null" && Object.keys(schema).length === 1;
 }
 
-/** The schema with `null` dropped from its type list, unless null is its only type. */
 function withoutNullType(schema: Record<string, unknown>): Record<string, unknown> {
   if (!Array.isArray(schema.type)) return schema;
   const types: unknown[] = schema.type.filter((type) => type !== "null");
@@ -29,7 +28,6 @@ function withoutNullType(schema: Record<string, unknown>): Record<string, unknow
   return { ...schema, type: types.length === 1 ? types[0] : types };
 }
 
-/** The schema with its `null` anyOf branch dropped, unless null is its only branch. */
 function withoutNullBranch(schema: Record<string, unknown>): Record<string, unknown> {
   if (!Array.isArray(schema.anyOf)) return schema;
   const { anyOf, ...rest } = schema;
