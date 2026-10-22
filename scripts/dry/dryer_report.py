@@ -178,6 +178,16 @@ def base_line(line: int, hunks: list[list[int]]) -> int | None:
     return line + offset
 
 
+def replaced_line(line: int, hunks: list[list[int]]) -> int | None:
+    """The base line at the same position in the replacement hunk that holds
+    `line`, or None when no hunk replaced it (an added or unchanged line)."""
+
+    for base_start, base_count, head_start, head_count in hunks:
+        if base_count and head_count and head_start <= line < head_start + head_count:
+            return base_start + min(line - head_start, base_count - 1)
+    return None
+
+
 def counterpart(form: Form, base_forms: list[Form], hunks: list[list[int]]) -> Form | None:
     """The base form that holds most of `form`'s lines, by git's own alignment.
 
@@ -186,7 +196,12 @@ def counterpart(form: Form, base_forms: list[Form], hunks: list[list[int]]) -> F
     has no base form, so every pair with it is new.
     """
 
-    mapped = [b for line in range(form.start_line, form.end_line + 1) if (b := base_line(line, hunks)) is not None]
+    lines = range(form.start_line, form.end_line + 1)
+    mapped = [b for line in lines if (b := base_line(line, hunks)) is not None]
+    if not mapped:
+        # Every line changed. Lines that a hunk replaced (both sides non-empty)
+        # map by position, so a function rewritten line for line keeps its base.
+        mapped = [b for line in lines if (b := replaced_line(line, hunks)) is not None]
     best, most = None, 0
     for candidate in base_forms:
         count = sum(1 for b in mapped if candidate.start_line <= b <= candidate.end_line)

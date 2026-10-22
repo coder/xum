@@ -219,3 +219,21 @@ def test_a_marker_is_a_whole_token_and_a_jsx_comment_counts():
         ");",  # 6
     ]
     assert marker_reason(jsx, 4, "a.tsx") == "the label is never empty"
+
+
+def test_a_function_rewritten_line_for_line_keeps_its_old_pairs_quiet():
+    # Base: cents (lines 1-6) already matched count. The diff replaces all six
+    # lines of cents (new names and literals, same shape): one replacement hunk.
+    cents = form("src/a.ts", "@1", 1, SHAPE)
+    count = form("src/c.ts", "@1", 1, SHAPE)
+    base = [form("src/a.ts", "@1", 1, SHAPE)]
+    pairs = run([cents, count], base, ["src/a.ts"], {"src/a.ts": [[1, 6]]}, {"src/a.ts": [[1, 6, 1, 6]]})
+    assert pairs == []
+
+
+def test_a_new_function_added_after_a_rewrite_is_still_new():
+    # The positional fallback covers only replaced lines: a pure addition has no base.
+    copy = form("src/a.ts", "@10", 10, SHAPE)
+    count = form("src/c.ts", "@1", 1, SHAPE)
+    pairs = run([copy, count], [form("src/a.ts", "@1", 1, OTHER)], ["src/a.ts"], {"src/a.ts": [[10, 15]]}, {"src/a.ts": [[9, 0, 10, 6]]})
+    assert names(pairs) == [("@1", "@10")]
