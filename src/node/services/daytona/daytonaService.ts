@@ -21,7 +21,11 @@ import { loadOrCreateInstallationId } from "@/node/config/installationIdentity";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { retireSshConnections } from "@/node/runtime/transports";
 import { rememberDaytonaToken } from "@/node/runtime/daytonaTokenRedaction";
-import { getDaytonaSandboxId, isDedicatedDaytonaSandbox } from "@/common/types/runtime";
+import {
+  getDaytonaSandboxId,
+  isDedicatedDaytonaSandbox,
+  type RuntimeConfig,
+} from "@/common/types/runtime";
 import { log } from "@/node/services/log";
 import { raceAbort, sleepWithAbort } from "@/node/utils/abort";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -39,6 +43,22 @@ import {
 import type { DaytonaWorkspaceRef } from "./daytonaReconciler";
 
 /** What another workspace stores as its sandbox, and whether it attached it. */
+/** A workspace whose runtime is on a given sandbox. */
+export interface DaytonaWorkspaceOnSandbox {
+  workspaceId: string;
+  runtimeConfig: RuntimeConfig;
+}
+
+/** The ref with the sandbox string it stores, or none when it stores no sandbox. */
+function onSandboxRef(
+  ref: DaytonaWorkspaceRef
+): Array<DaytonaWorkspaceOnSandbox & { stored: string }> {
+  const stored = getDaytonaSandboxId(ref.runtimeConfig);
+  return stored && ref.runtimeConfig
+    ? [{ stored, workspaceId: ref.workspaceId, runtimeConfig: ref.runtimeConfig }]
+    : [];
+}
+
 interface StoredSandboxRef {
   stored: string;
   attached: boolean;
@@ -666,11 +686,32 @@ export class DaytonaService {
     return matched.some((ref) => !ref.attached) ? "archivedOwner" : "archived";
   }
 
-  /** The refs that store this sandbox by its name or its id; undefined when the lookup fails. */
-  private async refsMatchingSandbox(
+  /**
+   * The other workspaces on the sandbox (archived ones and borrowed checkouts included), for
+   * checks that must cover every job in it. Matched as in sandboxReferencesElsewhere; undefined
+   * when the workspace list, the caller's id or the lookup is unavailable.
+   */
+  async otherWorkspacesOnSandbox(
     sandboxId: string,
-    refs: StoredSandboxRef[]
-  ): Promise<StoredSandboxRef[] | undefined> {
+    workspaceId: string | undefined
+  ): Promise<DaytonaWorkspaceOnSandbox[] | undefined> {
+    if (!this.listWorkspaces || !workspaceId) return undefined;
+    const others = this.listWorkspaces().flatMap((ref) =>
+      ref.workspaceId === workspaceId || this.isRemovalInFlight(ref) ? [] : onSandboxRef(ref)
+    );
+    if (others.length === 0) return [];
+    const matched = await this.refsMatchingSandbox(sandboxId, others);
+    return matched?.map((ref) => ({
+      workspaceId: ref.workspaceId,
+      runtimeConfig: ref.runtimeConfig,
+    }));
+  }
+
+  /** The refs that store this sandbox by its name or its id; undefined when the lookup fails. */
+  private async refsMatchingSandbox<T extends { stored: string }>(
+    sandboxId: string,
+    refs: T[]
+  ): Promise<T[] | undefined> {
     const aliases = refs.every((ref) => ref.stored === sandboxId)
       ? new Set([sandboxId])
       : await this.sandboxAliases(sandboxId);
@@ -699,10 +740,10 @@ export class DaytonaService {
   ): StoredSandboxRef[] {
     return refs.flatMap((ref) => {
       const stored = getDaytonaSandboxId(ref.runtimeConfig);
-      const removed =
-        ref.pendingRemovalId !== undefined &&
-        this.removedWorkspaces.get(ref.workspaceId) === ref.pendingRemovalId;
-      const counts = ref.workspaceId !== workspaceId && !removed && ref.borrowsCheckout !== true;
+      const counts =
+        ref.workspaceId !== workspaceId &&
+        !this.isRemovalInFlight(ref) &&
+        ref.borrowsCheckout !== true;
       return counts && stored
         ? [
             {
@@ -713,6 +754,13 @@ export class DaytonaService {
           ]
         : [];
     });
+  }
+
+  private isRemovalInFlight(ref: DaytonaWorkspaceRef): boolean {
+    return (
+      ref.pendingRemovalId !== undefined &&
+      this.removedWorkspaces.get(ref.workspaceId) === ref.pendingRemovalId
+    );
   }
 
   /** The sandbox's id and name (empty when it is gone); undefined when the lookup fails. */

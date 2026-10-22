@@ -333,6 +333,45 @@ describe("createDaytonaArchiveHook", () => {
     expect(rig.plane.find("sb-idle")).toBeUndefined();
   });
 
+  it("keeps a shared sandbox on a model-driven archive while another workspace's job may run", async () => {
+    rig.plane.addSandbox({ id: "sb-shared" });
+    rig.workspaces.push({
+      workspaceId: "owner",
+      runtimeConfig: metadata({ sandboxId: "sb-shared", shared: false }).runtimeConfig,
+      archived: true,
+    });
+    const probed: string[] = [];
+    let ownerJobRuns = true;
+    const modelArchive = (behavior: CoderWorkspaceArchiveBehavior) =>
+      createDaytonaArchiveHook({
+        daytonaService: rig.service,
+        getArchiveBehavior: () => behavior,
+        checkSandboxDeletable: cleanCheck,
+        hasUnsettledRemoteBackgroundJobs: (ref) => {
+          probed.push(ref.workspaceId);
+          return Promise.resolve(Ok(ref.workspaceId === "owner" && ownerJobRuns));
+        },
+      })({
+        workspaceId: "ws",
+        workspaceMetadata: metadata({ sandboxId: "sb-shared", forked: true, shared: false }),
+        refuseStopUnderUnverifiedRemoteJobs: true,
+      });
+
+    // The archived owner's job survived a backend exit: neither policy stops the sandbox.
+    for (const behavior of ["stop", "delete"] as const) {
+      const result = await modelArchive(behavior);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("background process");
+      expect(rig.plane.find("sb-shared")?.state).toBe("started");
+    }
+    expect(probed).toContain("owner");
+
+    // Every workspace on it is clear: the policy applies as before.
+    ownerJobRuns = false;
+    expect((await modelArchive("stop")).success).toBe(true);
+    expect(rig.plane.find("sb-shared")?.state).toBe("stopped");
+  });
+
   it("keeps a dirty sandbox on archive delete: starts it for the check, then stops it and warns", async () => {
     rig.plane.addSandbox({ id: "sb-dirty", state: "stopped" });
     const sshCheck = spyOn(

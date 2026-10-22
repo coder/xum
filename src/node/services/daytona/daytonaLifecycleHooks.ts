@@ -5,7 +5,11 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import type { BeforeArchiveHook } from "@/node/services/workspaceLifecycleHooks";
-import { notOwnedSandboxNotice, type DaytonaService } from "./daytonaService";
+import {
+  notOwnedSandboxNotice,
+  type DaytonaService,
+  type DaytonaWorkspaceOnSandbox,
+} from "./daytonaService";
 
 const DAYTONA_STOP_TIMEOUT_MS = 60_000;
 
@@ -24,15 +28,19 @@ export interface DaytonaArchiveHookOptions {
     | "deleteSandbox"
     | "sandboxOwnership"
     | "sandboxUseElsewhere"
+    | "otherWorkspacesOnSandbox"
     | "isAliasStoredElsewhere"
     | "releaseSshAccess"
     | "waitForSandboxReadiness"
     | "withAccountLease"
   >;
   getArchiveBehavior: () => CoderWorkspaceArchiveBehavior;
-  /** As for Coder: model-driven archives must not stop a box under a surviving detached job. */
+  /**
+   * As for Coder: model-driven archives must not stop a box under a surviving detached job.
+   * Asked for every workspace on the sandbox, since a stop ends their jobs too.
+   */
   hasUnsettledRemoteBackgroundJobs?: (
-    workspaceMetadata: WorkspaceMetadata
+    workspace: DaytonaWorkspaceOnSandbox
   ) => Promise<Result<boolean>>;
   /**
    * The dirty and unpushed checks deleteWorkspace runs (starting a stopped sandbox for them).
@@ -235,21 +243,32 @@ async function refuseUnderRemoteJobs(
   if (args.refuseStopUnderUnverifiedRemoteJobs !== true) return undefined;
   const state = knownState ?? (await options.daytonaService.getSandboxState(sandboxId)).state;
   if (!isRunning(state)) return undefined;
-  return probeRemoteJobs(options, args.workspaceMetadata, sandboxId);
+  const { id, runtimeConfig } = args.workspaceMetadata;
+  // An archived workspace on the sandbox may have a job that outlived a backend exit too.
+  const others = await options.daytonaService.otherWorkspacesOnSandbox(sandboxId, id);
+  if (!others) {
+    return `Cannot list the other workspaces on Daytona sandbox "${sandboxId}" to verify that none of them still runs a background process; stopping it could terminate a surviving job. ${MANUAL_ARCHIVE}`;
+  }
+  for (const workspace of [{ workspaceId: id, runtimeConfig }, ...others]) {
+    const refusal = await probeRemoteJobs(options, workspace, sandboxId);
+    if (refusal) return refusal;
+  }
+  return undefined;
 }
+
+const MANUAL_ARCHIVE = "Ask the user to archive this workspace manually.";
 
 async function probeRemoteJobs(
   options: DaytonaArchiveHookOptions,
-  workspaceMetadata: WorkspaceMetadata,
+  workspace: DaytonaWorkspaceOnSandbox,
   sandboxId: string
 ): Promise<string | undefined> {
-  const manual = "Ask the user to archive this workspace manually.";
   if (options.hasUnsettledRemoteBackgroundJobs == null) {
-    return `Cannot verify that no background process is still running in Daytona sandbox "${sandboxId}"; stopping it could terminate a surviving job. ${manual}`;
+    return `Cannot verify that no background process is still running in Daytona sandbox "${sandboxId}"; stopping it could terminate a surviving job. ${MANUAL_ARCHIVE}`;
   }
-  const probe = await options.hasUnsettledRemoteBackgroundJobs(workspaceMetadata);
+  const probe = await options.hasUnsettledRemoteBackgroundJobs(workspace);
   if (!probe.success) {
-    return `Cannot verify that no background process is still running in Daytona sandbox "${sandboxId}" (${probe.error}); stopping it could terminate a surviving job. ${manual}`;
+    return `Cannot verify that no background process is still running in Daytona sandbox "${sandboxId}" (${probe.error}); stopping it could terminate a surviving job. ${MANUAL_ARCHIVE}`;
   }
   if (probe.data) {
     return `A background process from a previous session may still be running in Daytona sandbox "${sandboxId}"; stopping it would terminate that job. Terminate the process (or wait for it to finish) or ask the user to archive this workspace manually.`;

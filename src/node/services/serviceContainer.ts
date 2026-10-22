@@ -455,10 +455,11 @@ export class ServiceContainer {
       createDaytonaArchiveHook({
         daytonaService: this.daytonaService,
         getArchiveBehavior: () => this.archiveBehavior(),
-        hasUnsettledRemoteBackgroundJobs: (workspaceMetadata) =>
+        // Spawn records sit under the runtime's temp dir by workspace id: no checkout needed.
+        hasUnsettledRemoteBackgroundJobs: (workspace) =>
           this.backgroundProcessManager.hasUnsettledRemoteSpawnRecords(
-            createRuntimeForWorkspace(workspaceMetadata),
-            workspaceMetadata.id
+            createRuntime(workspace.runtimeConfig, { workspaceId: workspace.workspaceId }),
+            workspace.workspaceId
           ),
         checkSandboxDeletable: (workspaceMetadata) => {
           const runtime = createRuntimeForWorkspace(workspaceMetadata);
