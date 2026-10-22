@@ -200,6 +200,18 @@ function buildCredentialArgs(): string[] {
 }
 
 /**
+ * #6426: how often this process created or deleted each container name. Module level, because a
+ * runtime object is made per call. It is part of getAgentHostKey, so a container that Xum created
+ * again under the same name never reuses the cached plugin snapshot of the old one, and no docker
+ * process runs to tell them apart.
+ */
+const containerGenerations = new Map<string, number>();
+
+function bumpContainerGeneration(containerName: string): void {
+  containerGenerations.set(containerName, (containerGenerations.get(containerName) ?? 0) + 1);
+}
+
+/**
  * Run docker run with streaming output (for image pull progress).
  * Streams stdout/stderr to initLogger for visibility during image pulls.
  */
@@ -210,6 +222,7 @@ async function streamDockerRun(
   options?: { abortSignal?: AbortSignal; shareCredentials?: boolean; timeoutMs?: number }
 ): Promise<DockerCommandResult> {
   const { abortSignal, shareCredentials, timeoutMs = 600000 } = options ?? {};
+  bumpContainerGeneration(containerName);
   const cli = await resolveContainerCli();
 
   return new Promise((resolve) => {
@@ -345,6 +358,17 @@ export class DockerRuntime extends RemoteRuntime {
   // ===== RemoteRuntime abstract method implementations =====
 
   protected readonly commandPrefix = "Docker";
+
+  override getAgentHostKey(): string | undefined {
+    // Without a name the container is not known yet.
+    return this.containerName !== undefined
+      ? JSON.stringify([
+          "docker",
+          this.containerName,
+          containerGenerations.get(this.containerName) ?? 0,
+        ])
+      : undefined;
+  }
 
   protected getBasePath(): string {
     return CONTAINER_SRC_DIR;
@@ -964,6 +988,7 @@ export class DockerRuntime extends RemoteRuntime {
 
     const containerName = getContainerName(projectPath, workspaceName);
     const deletedPath = CONTAINER_SRC_DIR;
+    bumpContainerGeneration(containerName);
 
     try {
       // Check if container exists

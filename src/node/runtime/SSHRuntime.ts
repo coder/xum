@@ -48,6 +48,7 @@ import {
   type SSHRuntimeConfig,
   getControlPath,
   appendOpenSSHHostKeyPolicyArgs,
+  makeAgentHostKey,
   sshConnectionPool,
 } from "./sshConnectionPool";
 import { buildSourceRefSnapshotCommand, getOriginUrlForBundle } from "./gitBundleSync";
@@ -1101,6 +1102,10 @@ export class SSHRuntime extends RemoteRuntime {
   // ===== RemoteRuntime abstract method implementations =====
 
   protected readonly commandPrefix: string = "SSH";
+
+  override getAgentHostKey(): string {
+    return makeAgentHostKey(this.config);
+  }
 
   protected getBasePath(): string {
     return this.config.srcBaseDir;
