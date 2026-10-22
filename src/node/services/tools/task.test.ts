@@ -91,7 +91,7 @@ describe("task tool", () => {
       uiSelectable: false,
       subagentRunnable: true,
     });
-    const paragraphs = (ids: string[]) => {
+    const paragraphCount = (ids: string[]) => {
       const { description } = createTaskTool({
         ...createTestToolConfig(tempDir.path),
         availableSubagents: ids.map(agent),
@@ -99,10 +99,10 @@ describe("task tool", () => {
       if (typeof description !== "string") throw new Error("expected a static description");
       return description.split("\n\n").length;
     };
-    const base = paragraphs(["explore"]);
+    const base = paragraphCount(["explore"]);
 
-    expect(paragraphs(["explore", "exec"])).toBe(base);
-    expect(paragraphs(["explore", "desktop"])).toBe(base + 1);
+    expect(paragraphCount(["explore", "exec"])).toBe(base);
+    expect(paragraphCount(["explore", "desktop"])).toBe(base + 1);
   });
 
   // The advertised inputSchema is the raw (strict) Zod schema. A `.strict()` schema that omits

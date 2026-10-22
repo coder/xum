@@ -964,10 +964,9 @@ function toolAllowlistOptions(
       config.experiments?.artifacts === true && config.xumEnv?.XUM_SCRATCH_DIR != null,
     enableToolSearch: Boolean(config.toolSearchRuntime),
     enableMcpPromptGet: Boolean(config.mcpPromptRuntime),
-    // The Review pane belongs to the user-facing parent workspace, so sub-agents
-    // (enableAgentReport is set iff the workspace has a parentWorkspaceId) do not get it,
-    // which keeps the toolset in sync with the system prompt. Scratch chats have no
-    // repository to review.
+    // Sub-agents (enableAgentReport is set iff the workspace has a parentWorkspaceId) do not get
+    // the parent's Review pane, which keeps the toolset in sync with the system prompt, and
+    // scratch chats have no repository to review.
     enableReviewPane: !config.enableAgentReport && !config.scratchWorkspace,
     // Scratch sub-agents share the chat's folder and never produce patches.
     enableGitPatches: !config.scratchWorkspace,

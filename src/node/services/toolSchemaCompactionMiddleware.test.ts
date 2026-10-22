@@ -53,7 +53,7 @@ const compactForAnthropic = (name: string, inputSchema: JSONSchema7) =>
   compactToolInputSchema({ name, inputSchema }, { anthropicWire: true });
 
 describe("tool schema compaction", () => {
-  it("drops $schema, safe-integer bounds and zod's uuid regex off the Anthropic wire too", async () => {
+  it("drops $schema, safe-integer bounds and zod's uuid regex on the OpenAI wire too", async () => {
     const sent = await sentSchemas("openai.responses", "gpt-6", {
       sample: tool({
         inputSchema: z.object({
@@ -94,6 +94,7 @@ describe("tool schema compaction", () => {
     expect(nullPaths(anthropic.task_await)).toEqual([]);
     expect(nullPaths(gateway.task_await)).toEqual([]);
     expect(nullPaths(openai.task_await)).not.toEqual([]);
+    expect(anthropic.task_await.properties?.timeout_secs).toMatchObject({ type: "number" });
     // An MCP tool's null may mean "clear the field".
     expect(nullPaths(anthropic.linear_update_issue)).toEqual(["$.properties.assigneeId"]);
   });

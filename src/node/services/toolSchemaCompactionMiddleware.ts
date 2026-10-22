@@ -1,9 +1,9 @@
 import type {
   JSONSchema7,
+  LanguageModelV4,
   LanguageModelV4FunctionTool,
   LanguageModelV4Middleware,
 } from "@ai-sdk/provider";
-import type { LanguageModel } from "ai";
 import { z } from "zod";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { mapToolSubschemas, requiredPropertyNames } from "@/common/utils/tools/schemaSanitizer";
@@ -44,20 +44,21 @@ function withoutNullBranch(schema: Record<string, unknown>): Record<string, unkn
     : { ...rest, anyOf: branches };
 }
 
-/** The object schema with `null` dropped from every optional property. */
 function withoutOptionalNulls(schema: Record<string, unknown>): Record<string, unknown> {
   if (!isPlainObject(schema.properties)) return schema;
   const required = requiredPropertyNames(schema);
-  const properties = Object.entries(schema.properties).map(([name, property]) => [
-    name,
-    !required.has(name) && isPlainObject(property)
-      ? withoutNullBranch(withoutNullType(property))
-      : property,
-  ]);
+  const properties = Object.entries(schema.properties).map(
+    ([name, property]): [string, unknown] => [
+      name,
+      !required.has(name) && isPlainObject(property)
+        ? withoutNullBranch(withoutNullType(property))
+        : property,
+    ]
+  );
   return { ...schema, properties: Object.fromEntries(properties) };
 }
 
-function withoutZodDefaults(schema: Record<string, unknown>): Record<string, unknown> {
+function withoutZodAddedKeywords(schema: Record<string, unknown>): Record<string, unknown> {
   const out = { ...schema };
   // zod puts these bounds on every `.int()`.
   if (out.maximum === Number.MAX_SAFE_INTEGER) delete out.maximum;
@@ -68,11 +69,9 @@ function withoutZodDefaults(schema: Record<string, unknown>): Record<string, unk
 }
 
 /**
- * A tool's input schema as the model should read it. The AI SDK validates tool input against the
- * tool's own schema (zod for built-ins), never this JSON, so keywords that tell the model nothing
- * go. On the Anthropic wire, built-in tools also lose `null` from optional fields: those are
- * `.nullish()` only so that OpenAI strict mode, which requires every field, can skip one (see
- * toolDefinitions.ts). Anthropic lets the model omit them, and handlers read null and absent alike.
+ * A tool's input schema as the model should read it. The AI SDK validates input against the tool's
+ * own schema (zod for built-ins), never this JSON. On the Anthropic wire, optional built-in fields
+ * also lose `null`, which only OpenAI strict mode needs (see toolDefinitions.ts).
  */
 export function compactToolInputSchema(
   tool: Pick<LanguageModelV4FunctionTool, "name" | "inputSchema" | "strict">,
@@ -82,19 +81,14 @@ export function compactToolInputSchema(
     options.anthropicWire && tool.strict !== true && NULL_STRIPPED_TOOL_NAMES.has(tool.name);
   const { $schema: _schemaUri, ...schema } = tool.inputSchema;
   return mapToolSubschemas(schema, (node) => {
-    const compacted = withoutZodDefaults(node);
+    const compacted = withoutZodAddedKeywords(node);
     return stripOptionalNulls ? withoutOptionalNulls(compacted) : compacted;
   }) as JSONSchema7;
 }
 
-/**
- * Whether a resolved SDK model speaks the Anthropic Messages wire. Check the resolved model, not
- * the requested prefix: createAnthropic names its models "anthropic.messages" on every route
- * (direct, Coder, custom anthropic-messages providers), and the gateway forwards anthropic/*
- * models to Anthropic.
- */
-export function isAnthropicMessagesModel(model: LanguageModel): boolean {
-  if (typeof model === "string") return false;
+// createAnthropic names its models "anthropic.messages" on every route (direct, Coder, custom
+// anthropic-messages providers), and the gateway forwards anthropic/* models to Anthropic.
+function sendsAnthropicMessages(model: Pick<LanguageModelV4, "provider" | "modelId">): boolean {
   return (
     model.provider === "anthropic.messages" ||
     (model.provider === "gateway" && model.modelId.startsWith("anthropic/"))
@@ -106,7 +100,7 @@ export function createToolSchemaCompactionMiddleware(): LanguageModelV4Middlewar
     specificationVersion: "v4",
     transformParams: ({ params, model }) => {
       if (params.tools == null) return Promise.resolve(params);
-      const anthropicWire = isAnthropicMessagesModel(model);
+      const anthropicWire = sendsAnthropicMessages(model);
       return Promise.resolve({
         ...params,
         tools: params.tools.map((tool) =>

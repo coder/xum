@@ -143,7 +143,6 @@ import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/me
 import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
 import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
 import { countAnthropicInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
-import { isAnthropicMessagesModel } from "@/node/services/toolSchemaCompactionMiddleware";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
 import { stripAnthropicReasoning } from "@/browser/utils/messages/modelMessageTransform";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
@@ -773,6 +772,16 @@ function isOpenAIResponsesModel(model: LanguageModel): boolean {
   return (
     model.provider === "openai.responses" ||
     (model.provider === "gateway" && model.modelId.startsWith("openai/"))
+  );
+}
+
+// Same idea for the Anthropic Messages wire, whose converter replays thinking
+// from the `anthropic` providerOptions namespace on every route.
+function isAnthropicMessagesModel(model: LanguageModel): boolean {
+  if (typeof model === "string") return false;
+  return (
+    model.provider === "anthropic.messages" ||
+    (model.provider === "gateway" && model.modelId.startsWith("anthropic/"))
   );
 }
 

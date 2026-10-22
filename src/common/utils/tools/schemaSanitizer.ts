@@ -180,10 +180,10 @@ export function mapToolSubschemas(
   if (Array.isArray(node)) return node.map((item) => mapToolSubschemas(item, rewrite));
   if (!isPlainObject(node)) return node;
   const out = Object.fromEntries(
-    Object.entries(node).map(([key, value]) => {
+    Object.entries(node).map(([key, value]): [string, unknown] => {
       if (TOOL_SUBSCHEMA_KEY.test(key)) return [key, mapToolSubschemas(value, rewrite)];
       if (!TOOL_SCHEMA_MAP_KEY.test(key) || !isPlainObject(value)) return [key, value];
-      const schemas = Object.entries(value).map(([name, schema]) => [
+      const schemas = Object.entries(value).map(([name, schema]): [string, unknown] => [
         name,
         mapToolSubschemas(schema, rewrite),
       ]);
