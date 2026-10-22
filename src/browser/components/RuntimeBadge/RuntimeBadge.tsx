@@ -71,7 +71,7 @@ function TooltipRow({
 type RuntimeType = keyof typeof RUNTIME_BADGE_UI;
 
 /** SSH runtimes split by their managed backend (Coder, Daytona) or plain host. */
-function getSshRuntimeInfo(runtimeConfig: Extract<RuntimeConfig, { type: "ssh" }>): {
+export function getSshRuntimeInfo(runtimeConfig: Extract<RuntimeConfig, { type: "ssh" }>): {
   type: RuntimeType;
   label: string;
 } {

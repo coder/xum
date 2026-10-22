@@ -291,23 +291,20 @@ export function getDevcontainerStatusChip(status: RuntimeStatus | null): Runtime
   }
 }
 
+const DAYTONA_STATUS_CHIPS: Record<RuntimeStatus, RuntimeStatusChip | null> = {
+  running: { label: "Sandbox Running", className: RUNNING_CHIP_CLASS },
+  starting: { label: "Sandbox Starting", className: "bg-warning/10 text-warning" },
+  stopped: { label: "Sandbox Stopped", className: STOPPED_CHIP_CLASS },
+  archived: { label: "Sandbox Archived", className: STOPPED_CHIP_CLASS },
+  error: { label: "Sandbox Error", className: "bg-destructive/10 text-destructive" },
+  unknown: null,
+  unsupported: null,
+};
+
 /**
  * Titlebar chip for a Daytona sandbox status, or null while unknown. Daytona auto-stops idle
  * sandboxes, so stopped and archived are normal states (the next turn starts the sandbox).
  */
 export function getDaytonaStatusChip(status: RuntimeStatus | null): RuntimeStatusChip | null {
-  switch (status) {
-    case "running":
-      return { label: "Sandbox Running", className: RUNNING_CHIP_CLASS };
-    case "starting":
-      return { label: "Sandbox Starting", className: "bg-warning/10 text-warning" };
-    case "stopped":
-      return { label: "Sandbox Stopped", className: STOPPED_CHIP_CLASS };
-    case "archived":
-      return { label: "Sandbox Archived", className: STOPPED_CHIP_CLASS };
-    case "error":
-      return { label: "Sandbox Error", className: "bg-destructive/10 text-destructive" };
-    default:
-      return null;
-  }
+  return status ? DAYTONA_STATUS_CHIPS[status] : null;
 }

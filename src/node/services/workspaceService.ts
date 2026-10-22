@@ -358,6 +358,7 @@ import type {
 import {
   hasSrcBaseDir,
   getSrcBaseDir,
+  getDaytonaSandboxId,
   isSSHRuntime,
   ownsDaytonaSandbox,
   isDockerRuntime,
@@ -1171,10 +1172,7 @@ function isHomeRelativePath(remotePath: string | null | undefined): remotePath i
 
 /** What archive refusals call the dedicated remote box, so Daytona users are not told "Coder". */
 function dedicatedRemoteBoxLabel(metadata: WorkspaceMetadata | undefined): string {
-  const runtimeConfig = metadata?.runtimeConfig;
-  return isSSHRuntime(runtimeConfig) && runtimeConfig.daytona != null
-    ? "Daytona sandbox"
-    : "Coder workspace";
+  return getDaytonaSandboxId(metadata?.runtimeConfig) ? "Daytona sandbox" : "Coder workspace";
 }
 
 /** The archive success value; warnings are outcomes that did not fail it (a sandbox kept). */
