@@ -1,10 +1,12 @@
 /**
- * Web Worker for syntax highlighting (Shiki)
- * Moves expensive highlighting work off the main thread
+ * Web Worker for syntax highlighting
+ * Moves highlighting work off the main thread. @pierre/highlights handles every language it
+ * has a lexer for; Shiki (created on first use) handles the rest.
  */
 
 import * as Comlink from "comlink";
 import { createHighlighter, type Highlighter } from "shiki";
+import { canHighlight, highlightToShikiHtml } from "../utils/highlighting/highlightsEngine";
 import {
   mapToShikiLang,
   SHIKI_COLOR_REPLACEMENTS,
@@ -47,11 +49,15 @@ const api = {
    * count toward the per-input time budget (#6292).
    */
   async prepare(language: string): Promise<void> {
-    await getHighlighterFor(mapToShikiLang(language));
+    const shikiLang = mapToShikiLang(language);
+    // Highlights needs no engine start or grammar load, so a known language is ready at once.
+    if (canHighlight(shikiLang)) return;
+    await getHighlighterFor(shikiLang);
   },
 
   async highlight(code: string, language: string, theme: "dark" | "light"): Promise<string> {
     const shikiLang = mapToShikiLang(language);
+    if (canHighlight(shikiLang)) return highlightToShikiHtml(code, shikiLang, theme);
     const hl = await getHighlighterFor(shikiLang);
 
     const shikiTheme = theme === "light" ? SHIKI_LIGHT_THEME : SHIKI_DARK_THEME;

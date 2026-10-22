@@ -11,7 +11,10 @@
  */
 import YAML from "yaml";
 
-import { AgentSkillParseError } from "@/node/services/agentSkills/parseSkillMarkdown";
+import {
+  AgentSkillParseError,
+  quoteBracketedArgumentHint,
+} from "@/node/services/agentSkills/parseSkillMarkdown";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { SKILL_FILENAME } from "@/node/services/tools/skillFileUtils";
 import { normalizeNewlines, stripUtf8Bom } from "@/node/utils/markdownFrontmatter";
@@ -51,18 +54,6 @@ function firstLineDescription(name: string, body: string): string {
     .map((text) => text.trim())
     .find((text) => text.length > 0);
   return (line ?? `Command /${name}`).slice(0, MAX_DESCRIPTION_LENGTH);
-}
-
-/**
- * The Claude Code docs write `argument-hint: [issue-number]` and `[filename] [format]` unquoted.
- * YAML reads the first as a list and refuses the second, so the command would not load, while
- * Claude Code shows the hint as typed. Quote a bracketed top-level hint so it stays that text.
- */
-function quoteBracketedArgumentHint(yaml: string): string {
-  return yaml.replace(
-    /^argument-hint:[ \t]*(\[.*?)[ \t]*$/m,
-    (_line, hint: string) => `argument-hint: ${JSON.stringify(hint)}`
-  );
 }
 
 /**

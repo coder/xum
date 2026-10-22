@@ -19,6 +19,7 @@ import { resolveAgentDiscoveryContext } from "@/node/services/agentDefinitions/a
 import { resolveSkillStorageContext, type SkillStorageContext } from "./skillStorageContext";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
+import { PlatformPaths } from "@/node/utils/paths.main";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { normalizeForDescendantComparison } from "@/common/utils/subProjects";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -248,9 +249,14 @@ export function getProjectSkillRoots(roots: AgentSkillsRoots): string[] {
  * maps a `~/.mux` path to the Xum home.
  */
 export function getLegacyMuxGlobalSkillsRoot(runtime: Runtime, workspacePath: string): string {
-  return resolveGlobalRuntime(runtime, workspacePath) instanceof RemoteRuntime
-    ? `~/${LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR}`
-    : path.join(os.homedir(), LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR);
+  if (resolveGlobalRuntime(runtime, workspacePath) instanceof RemoteRuntime) {
+    return `~/${LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR}`;
+  }
+  // The same home that universalRoot's `~/` expands to (HOME/USERPROFILE when called), not
+  // os.homedir(), which Bun does not update when HOME changes. So a test or sandbox that points
+  // HOME at a temp folder does not read the host's ~/.mux/skills (#7167).
+  const home = PlatformPaths.expandHome("~");
+  return path.join(home === "~" ? os.homedir() : home, LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR);
 }
 
 /** True when ~/.mux/skills is the Xum home's own skills dir (the home is ~/.mux, or links to it). */

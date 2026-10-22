@@ -316,8 +316,9 @@ describe("highlightDiffChunk", () => {
 
       expect(result.lines).toHaveLength(1);
       expect(result.lines[0].html).toContain("<span");
-      // Shiki HTML-encodes special chars: && becomes &#x26;&#x26;
-      expect(result.lines[0].html).toContain("&#x26;&#x26;");
+      // Special chars are HTML-encoded (Shiki writes &#x26;, Highlights output &amp;): no raw &&.
+      expect(result.lines[0].html).not.toContain("&&");
+      expect(result.lines[0].html).toMatch(/(&amp;|&#x26;){2}/);
     });
 
     it("should handle complex nested structures", async () => {

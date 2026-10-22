@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
-import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
 import { Button } from "@/browser/components/Button/Button";
 import { ModelSelector } from "@/browser/components/ModelSelector/ModelSelector";
@@ -52,6 +51,7 @@ import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { FALLBACK_AGENTS, deriveTasksSectionAgentGroups } from "./TasksSection.agents";
 import { AgentResourceLimitsSettings } from "./AgentResourceLimitsSettings";
+import { TaskLimitInput } from "./TaskLimitInput";
 
 const INHERIT = "__inherit__";
 /** Shown while an autosave waits for the connection. */
@@ -669,14 +669,14 @@ export function TasksSection() {
     };
   }, [api, loaded, loadFailed]);
 
-  const setMaxParallelAgentTasks = (rawValue: string) => {
-    const parsed = Number(rawValue);
-    setTaskSettings((prev) => normalizeTaskSettings({ ...prev, maxParallelAgentTasks: parsed }));
+  // TaskLimitInput decides when a typed value is ready (#6384); this clamps and saves it.
+  const setMaxParallelAgentTasks = (value: number) => {
+    setTaskSettings((prev) => normalizeTaskSettings({ ...prev, maxParallelAgentTasks: value }));
   };
 
-  const setMaxTaskNestingDepth = (rawValue: string) => {
-    const parsed = Number(rawValue);
-    setTaskSettings((prev) => normalizeTaskSettings({ ...prev, maxTaskNestingDepth: parsed }));
+  // TaskLimitInput decides when a typed value is ready (#6384); this clamps and saves it.
+  const setMaxTaskNestingDepth = (value: number) => {
+    setTaskSettings((prev) => normalizeTaskSettings({ ...prev, maxTaskNestingDepth: value }));
   };
 
   const setProposePlanImplementReplacesChatHistory = (value: boolean) => {
@@ -1174,15 +1174,12 @@ export function TasksSection() {
                 {TASK_SETTINGS_LIMITS.maxParallelAgentTasks.max}
               </div>
             </div>
-            <Input
-              type="number"
+            <TaskLimitInput
+              label="Max Parallel Agent Tasks"
               value={taskSettings.maxParallelAgentTasks}
               min={TASK_SETTINGS_LIMITS.maxParallelAgentTasks.min}
               max={TASK_SETTINGS_LIMITS.maxParallelAgentTasks.max}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                setMaxParallelAgentTasks(e.target.value)
-              }
-              className="border-border-medium bg-background-secondary h-9 w-28"
+              onCommit={setMaxParallelAgentTasks}
             />
           </div>
 
@@ -1195,15 +1192,12 @@ export function TasksSection() {
                 {TASK_SETTINGS_LIMITS.maxTaskNestingDepth.max}
               </div>
             </div>
-            <Input
-              type="number"
+            <TaskLimitInput
+              label="Max Task Nesting Depth"
               value={taskSettings.maxTaskNestingDepth}
               min={TASK_SETTINGS_LIMITS.maxTaskNestingDepth.min}
               max={TASK_SETTINGS_LIMITS.maxTaskNestingDepth.max}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                setMaxTaskNestingDepth(e.target.value)
-              }
-              className="border-border-medium bg-background-secondary h-9 w-28"
+              onCommit={setMaxTaskNestingDepth}
             />
           </div>
 

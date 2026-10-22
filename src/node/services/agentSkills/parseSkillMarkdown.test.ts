@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import { SkillNameSchema } from "@/common/orpc/schemas";
-import { AgentSkillParseError, parseSkillMarkdown } from "./parseSkillMarkdown";
+import {
+  AgentSkillParseError,
+  parseSkillMarkdown,
+  quoteBracketedArgumentHint,
+} from "./parseSkillMarkdown";
 
 describe("parseSkillMarkdown", () => {
   test("parses valid YAML frontmatter and body", () => {
@@ -111,6 +115,53 @@ Body
     expect(result.frontmatter["user-invocable"]).toBe(false);
     expect(result.frontmatter["argument-hint"]).toBe("[issue-number]");
     expect(result.frontmatter.when_to_use).toBe("Use when triaging issues");
+  });
+
+  // The Claude Code docs write the hint unquoted, which YAML reads as a flow sequence ("[x]")
+  // or as invalid YAML ("[a] [b]"); either way the skill failed to load (#7123 item 5).
+  const parseHintedSkill = (frontmatter: string) => {
+    const content = `---\n${frontmatter}\n---\nBody\n`;
+    return parseSkillMarkdown({
+      content,
+      byteSize: Buffer.byteLength(content, "utf-8"),
+      directoryName: SkillNameSchema.parse("hinted-skill"),
+    }).frontmatter;
+  };
+
+  test.each([
+    ["argument-hint: [issue-number]", "[issue-number]"],
+    ["argument-hint: [filename] [format]", "[filename] [format]"],
+    // JSON quoting keeps inner quotes and backslashes as typed.
+    ['argument-hint: [say "hi"] [C:\\dir]', '[say "hi"] [C:\\dir]'],
+    // A value that is already quoted is not quoted again.
+    ['argument-hint: "[pr]"', "[pr]"],
+    ["argument-hint: '[a] [b]'", "[a] [b]"],
+    // A trailing YAML comment stays a comment, as it does for a quoted hint.
+    ["argument-hint: [issue-number] # issue ID", "[issue-number]"],
+    ["argument-hint : [issue-number]", "[issue-number]"],
+  ])("keeps %s as typed", (line, hint) => {
+    const frontmatter = parseHintedSkill(
+      `name: hinted-skill\ndescription: Takes arguments\n${line}`
+    );
+    expect(frontmatter["argument-hint"]).toBe(hint);
+  });
+
+  // A 1 MB SKILL.md can come from a cloned repo. An earlier quadratic pattern took ~16 s on this
+  // input; the linear one takes under 1 ms, so the bound leaves room for a slow CI host.
+  test("quotes a hint line with a long run of spaces in linear time", () => {
+    const hint = `[${" ".repeat(100_000)}x`;
+    const startedAt = performance.now();
+    const quoted = quoteBracketedArgumentHint(`name: hinted-skill\nargument-hint: ${hint}`);
+    expect(performance.now() - startedAt).toBeLessThan(500);
+    expect(quoted).toBe(`name: hinted-skill\nargument-hint: ${JSON.stringify(hint)}`);
+  });
+
+  test("keeps a bracketed argument-hint in an indented root mapping, not in block text", () => {
+    const frontmatter = parseHintedSkill(
+      "  name: hinted-skill\n  description: |\n    argument-hint: [x]\n  argument-hint: [pr]"
+    );
+    expect(frontmatter["argument-hint"]).toBe("[pr]");
+    expect(frontmatter.description).toBe("argument-hint: [x]\n");
   });
 
   test("parses kebab-case when-to-use spelling in frontmatter", () => {
