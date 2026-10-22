@@ -70,6 +70,88 @@ const BACKEND_ONLY_COMMON_RESTRICTION = backendOnlyCommonRestriction(
 );
 // Every no-restricted-imports block for browser or common files replaces the options of the
 // earlier blocks that match the same file, so each one starts from these lists.
+// local/no-host-imports (agent loop refactor, phase 1). .oxlintrc.json repeats these lists.
+// The loop core, its context code and its tools. Not tests or test helpers.
+const AGENT_LOOP_FILES = [
+  "src/node/services/agentSession.ts",
+  "src/node/services/aiService.ts",
+  "src/node/services/aiServiceEventGuards.ts",
+  "src/node/services/messagePipeline.ts",
+  "src/node/services/retryManager.ts",
+  "src/node/services/streamManager.ts",
+  "src/node/services/turn*.ts",
+  "src/node/services/contextManagement/**/*.ts",
+  "src/node/services/tools/**/*.ts",
+];
+const AGENT_LOOP_IGNORES = [
+  "**/*.test.ts",
+  "**/*.testHarness.ts",
+  "**/*.bench.ts",
+  "src/node/services/tools/testHelpers.ts",
+];
+// The rule strips "node:" and resolves relative specifiers to "@/..." forms.
+const HOST_MODULES = [
+  "fs",
+  "fs/promises",
+  "os",
+  "net",
+  "child_process",
+  "electron",
+  "@/node/utils/writeFileAtomic",
+  { module: "@/node/utils/fs", names: ["ensurePrivateDir", "ensurePrivateDirSync"] },
+  // Concrete runtimes. The Runtime interface (runtime/Runtime.ts) stays allowed.
+  ...[
+    "CoderSSHRuntime",
+    "DevcontainerRuntime",
+    "DockerRuntime",
+    "LocalBaseRuntime",
+    "LocalRuntime",
+    "RemoteRuntime",
+    "SSHRuntime",
+    "WorktreeRuntime",
+    "multiProjectRuntime",
+    "runtimeFactory",
+  ].map((name) => `@/node/runtime/${name}`),
+  // The two builders make concrete runtimes. Its path helpers and types stay allowed.
+  {
+    module: "@/node/runtime/runtimeHelpers",
+    names: ["createRuntimeForWorkspace", "createRuntimeContextForWorkspace"],
+  },
+];
+// File -> the host modules it still imports. Phase plans list the pairs they add or remove.
+const HOST_IMPORT_ALLOW = {
+  "src/node/services/agentSession.ts": ["@/node/runtime/runtimeHelpers", "fs/promises"],
+  "src/node/services/aiService.ts": [
+    "@/node/runtime/multiProjectRuntime",
+    "@/node/runtime/runtimeFactory",
+    "@/node/runtime/runtimeHelpers",
+    "@/node/utils/fs",
+    "fs/promises",
+  ],
+  "src/node/services/contextManagement/strategies/tokenBudget.ts": [
+    "@/node/runtime/runtimeHelpers",
+  ],
+  "src/node/services/tools/agent_skill_delete.ts": ["fs/promises"],
+  "src/node/services/tools/agent_skill_list.ts": ["fs/promises", "os"],
+  "src/node/services/tools/agent_skill_read_file.ts": ["@/node/runtime/RemoteRuntime"],
+  "src/node/services/tools/agent_skill_write.ts": ["fs/promises"],
+  "src/node/services/tools/bash.ts": ["@/node/runtime/LocalBaseRuntime", "fs"],
+  "src/node/services/tools/notify.ts": ["electron"],
+  "src/node/services/tools/review_pane.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
+  "src/node/services/tools/shared/configReadWrite.ts": [
+    "@/node/utils/writeFileAtomic",
+    "fs/promises",
+  ],
+  "src/node/services/tools/skillFileHint.ts": ["@/node/runtime/RemoteRuntime"],
+  "src/node/services/tools/skillFileUtils.ts": ["fs/promises"],
+  "src/node/services/tools/skillsCatalogFetch.ts": ["fs/promises", "os"],
+  "src/node/services/tools/todo.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
+  "src/node/services/tools/web_fetch.ts": ["net"],
+  "src/node/services/tools/xum_agents_path.ts": ["fs/promises"],
+  "src/node/services/tools/xum_agents_read.ts": ["fs/promises"],
+  "src/node/services/tools/xum_agents_write.ts": ["fs/promises"],
+};
+
 const SHARED_RESTRICTED_PATHS = [AI_TOKENIZER_ENCODING_RESTRICTION];
 const SHARED_RESTRICTED_PATTERNS = [SHIKI_RESTRICTION, ORPC_SCHEMAS_BARREL_RESTRICTION];
 const BROWSER_COMMON_RESTRICTED_PATTERNS = [
@@ -396,6 +478,16 @@ export default defineConfig([
     ],
     rules: {
       "local/no-direct-web-storage": "error",
+    },
+  },
+  {
+    // Agent-loop files get host access from Effect services, not by an import (agent loop
+    // refactor, phase 1). The allow map is today's debt: later phases only remove entries, and
+    // scripts/noHostImports.test.ts freezes it.
+    files: AGENT_LOOP_FILES,
+    ignores: AGENT_LOOP_IGNORES,
+    rules: {
+      "local/no-host-imports": ["error", { modules: HOST_MODULES, allow: HOST_IMPORT_ALLOW }],
     },
   },
   {
