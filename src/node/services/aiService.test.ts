@@ -4714,7 +4714,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   it.each([
     { model: "openai:gpt-5.6", wireFormat: "responses", route: "openai" },
     { model: "openai:gpt-5.6", wireFormat: "chatCompletions", route: "openai" },
-    { model: "mux-gateway:openai/gpt-5.6", wireFormat: "responses", route: "mux-gateway" },
+    { model: "openrouter:openai/gpt-5.6", wireFormat: "responses", route: "openrouter" },
   ] as const)(
     "pins intuition wire and route independently of live config: %j",
     async (testCase) => {
@@ -4735,12 +4735,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const providersStore = new ProvidersConfigStore(harness.config.rootDir);
       providersStore.saveProvidersConfig({
         openai: { apiKey: "sk-test-key", wireFormat: testCase.wireFormat },
-        "mux-gateway": { couponCode: "test-coupon" },
+        openrouter: { apiKey: "or-test-key" },
       });
       await harness.config.editConfig((cfg) => ({
         ...cfg,
         routePriority: ["direct"],
-        muxGatewayEnabled: true,
       }));
       await enableIntuitionForHarness(harness, testCase.model);
       await startTestStream(harness, workspaceId);

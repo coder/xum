@@ -135,7 +135,6 @@ import {
 import type { AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { isDeferLoadingTool } from "@/common/utils/tools/toolCatalog";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
-import { MUX_GATEWAY_AI_BASE_URL } from "@/common/constants/muxGatewayOAuth";
 import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/appAttribution";
 import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import {
@@ -145,11 +144,6 @@ import {
   resolveTypeSafeCredentials,
   type ProviderRequirementError,
 } from "@/node/utils/providerRequirements";
-import {
-  normalizeGatewayStreamUsage,
-  normalizeGatewayGenerateResult,
-} from "@/node/utils/gatewayStreamNormalization";
-import { wrapFetchWithGatewayFilePartNormalization } from "@/node/utils/gatewayFilePartNormalization";
 import { EnvHttpProxyAgent, type Dispatcher } from "undici";
 import packageJson from "../../../package.json";
 
@@ -1105,37 +1099,6 @@ export function wrapFetchWithAnthropicCacheControl(
 }
 
 /**
- * Wrap fetch so any mux-gateway 401 response clears local credentials (best-effort).
- *
- * This ensures the UI immediately reflects that the user has been logged out
- * when the gateway session expires.
- */
-function wrapFetchWithMuxGatewayAutoLogout(
-  baseFetch: typeof fetch,
-  providerService: ProviderService
-): typeof fetch {
-  const wrappedFetch = async (
-    input: Parameters<typeof fetch>[0],
-    init?: Parameters<typeof fetch>[1]
-  ): Promise<Response> => {
-    const response = await baseFetch(input, init);
-
-    if (response.status === 401) {
-      try {
-        await providerService.setConfig("mux-gateway", ["couponCode"], "");
-        await providerService.setConfig("mux-gateway", ["voucher"], "");
-      } catch {
-        // Ignore failures clearing local credentials
-      }
-    }
-
-    return response;
-  };
-
-  return Object.assign(wrappedFetch, baseFetch) as typeof fetch;
-}
-
-/**
  * Custom adapters pass an explicit empty apiKey so the official SDKs cannot
  * fall back to OPENAI_API_KEY/ANTHROPIC_API_KEY env credentials, but the SDKs
  * then emit an empty auth header ("Authorization: Bearer" / "x-api-key: ").
@@ -1179,15 +1142,6 @@ function shortHash(value: string): string {
 /** `?sha256:<hash>` for a non-empty query string, else "". */
 function hashedQuery(search: string): string {
   return search.length > 0 ? `?sha256:${shortHash(search)}` : "";
-}
-
-/**
- * The prompt-cache route of a mux-gateway account. Signing in as another account keeps the
- * base URL but reaches another cache, so the account joins the baseline key, as a short
- * hash: the credential never reaches keys, logs or events.
- */
-export function muxGatewayPromptCacheRoute(couponCode: string): string {
-  return `mux-gateway:${shortHash(couponCode)}`;
 }
 
 /**
@@ -1876,8 +1830,7 @@ export class ProviderModelFactory {
 
   private isProviderAvailableForRouting(
     provider: ProviderName,
-    providersConfig: ProvidersConfig,
-    config: ReturnType<Config["loadConfigOrDefault"]>
+    providersConfig: ProvidersConfig
   ): boolean {
     const providerConfig = providersConfig[provider] ?? {};
     const credentials = resolveProviderCredentials(provider, providerConfig);
@@ -1892,14 +1845,9 @@ export class ProviderModelFactory {
       return false;
     }
 
-    // Route resolution must honor the shared provider-level enabled=false switch
-    // before considering legacy gateway-specific config gates.
+    // Route resolution must honor the shared provider-level enabled=false switch.
     if (isProviderDisabledInConfig(providerConfig as { enabled?: unknown })) {
       return false;
-    }
-
-    if (provider === "mux-gateway") {
-      return config.muxGatewayEnabled !== false;
     }
 
     return true;
@@ -2887,125 +2835,6 @@ export class ProviderModelFactory {
           return yield* createGoogleVertexModelEffect(providerConfig, modelId);
         }
 
-        // Handle Xum Gateway provider
-        if (providerName === "mux-gateway") {
-          // Resolve couponCode from config (single source of truth)
-          const creds = resolveProviderCredentials("mux-gateway", providerConfig);
-          if (!creds.isConfigured || !creds.couponCode) {
-            return Err({ type: "api_key_not_found", provider: providerName });
-          }
-          const { couponCode } = creds;
-
-          const { createGateway } = yield* Effect.promise(async () =>
-            PROVIDER_REGISTRY["mux-gateway"]()
-          );
-          // For Anthropic models via gateway, normalize cache_control on the final payload.
-          // Use getProviderFetch to preserve any user-configured custom fetch (e.g., proxies)
-          // The gateway server still expects spec-v3 string-encoded file parts;
-          // rewrite the v4 `{ type: "data" | "url" }` objects the 4.x SDK emits
-          // so image attachments are not rejected as "invalid request".
-          const baseFetch = getProviderFetch(providerConfig);
-          const isAnthropicModel = modelId.startsWith("anthropic/");
-          const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
-          // For Anthropic models via gateway, wrap for cache_control normalization;
-          // skip injection when beta features are off. It sits inside the file-part
-          // normalization, so its prefix observer sees the body the gateway receives
-          // (normalization does not touch cache markers, so the order is otherwise neutral).
-          const gatewayRoute = { route: muxGatewayPromptCacheRoute(couponCode), modelString };
-          const fetchWithCacheControl = isAnthropicModel
-            ? wrapFetchWithAnthropicCacheControl(baseFetch, effectiveAnthropicCacheTtl, {
-                injectCacheControl: !disableBeta,
-                observeFinalBody: self.promptCacheObserver(opts, gatewayRoute),
-                // The same per-account route as the monitor, so the audit keys alike.
-                routeIdentity: gatewayRoute,
-              })
-            : baseFetch;
-          const fetchWithAutoLogout = wrapFetchWithMuxGatewayAutoLogout(
-            wrapFetchWithGatewayFilePartNormalization(fetchWithCacheControl),
-            self.providerService
-          );
-          const providerFetch = fetchWithAutoLogout;
-          // Use configured baseURL or fall back to default gateway URL
-          const gatewayBaseURL = providerConfig.baseURL ?? MUX_GATEWAY_AI_BASE_URL;
-
-          // 1M context beta header is injected per-request via buildRequestHeaders() →
-          // streamText({ headers }), not at provider creation time.
-          const gateway = createGateway({
-            apiKey: couponCode,
-            baseURL: gatewayBaseURL,
-            fetch: providerFetch,
-          });
-          const model = gateway(modelId);
-
-          // Normalize usage format from the gateway server.
-          // The gateway SDK declares specificationVersion "v3", so the AI SDK core
-          // expects nested v3 usage: { inputTokens: { total, ... }, outputTokens: { total, ... } }.
-          // However the gateway server may return flat v2-style usage
-          // (e.g. { inputTokens: 123, outputTokens: 456 }), causing
-          // asLanguageModelUsage to produce undefined → 0 for all token counts.
-          // These wrappers detect flat usage and convert to v3 nested format.
-          // Google forwards candidatesTokenCount as flat outputTokens, which excludes
-          // thoughts; other providers report output inclusive of reasoning.
-          const usageOptions = { outputExcludesReasoning: modelId.startsWith("google/") };
-          const originalDoStream = model.doStream.bind(model);
-          model.doStream = async (options) => {
-            const result = await originalDoStream(options);
-            return {
-              ...result,
-              // Type assertion safe: the transform only modifies the shape of usage/finishReason
-              // fields within existing chunks, it doesn't change the stream part types.
-              stream: result.stream.pipeThrough(
-                normalizeGatewayStreamUsage(usageOptions)
-              ) as typeof result.stream,
-            };
-          };
-
-          const originalDoGenerate = model.doGenerate.bind(model);
-          model.doGenerate = async (options) => {
-            const result = await originalDoGenerate(options);
-            return normalizeGatewayGenerateResult(result, usageOptions);
-          };
-
-          const configuredOpenAIStore = muxProviderOptions?.openai?.store;
-          if (modelId.startsWith("openai/") && typeof configuredOpenAIStore === "boolean") {
-            // Inject configured OpenAI store as a request-level default for
-            // gateway-routed OpenAI models when callers omit providerOptions.
-            const injectStoreFlag = (
-              options: Parameters<typeof model.doStream>[0]
-            ): Parameters<typeof model.doStream>[0] => {
-              const openaiOpts =
-                (options.providerOptions?.openai as Record<string, unknown> | undefined) ?? {};
-              return {
-                ...options,
-                providerOptions: {
-                  ...options.providerOptions,
-                  openai: {
-                    store: configuredOpenAIStore,
-                    ...openaiOpts,
-                  },
-                },
-              };
-            };
-
-            const originalDoStream = model.doStream.bind(model);
-            const originalDoGenerate = model.doGenerate.bind(model);
-            model.doStream = (options) => originalDoStream(injectStoreFlag(options));
-            model.doGenerate = (options) => originalDoGenerate(injectStoreFlag(options));
-          }
-
-          // Gateway-routed frontier Grok must get the same store=false default as direct xAI.
-          // Route form is mux-gateway:xai/<model>; capability lookup uses canonical xai:id.
-          if (modelId.startsWith("xai/")) {
-            const gatewayGrokModel = `xai:${modelId.slice("xai/".length)}`;
-            const capabilityModel = resolveModelForMetadata(gatewayGrokModel, providersConfig);
-            if (isGrokFrontierModel(capabilityModel)) {
-              injectGrokStoreDefault(model, muxProviderOptions?.xai?.store);
-            }
-          }
-
-          return Ok(model);
-        }
-
         // GitHub Copilot chooses a stock OpenAI chat model or a custom Responses model per route.
         if (providerName === "github-copilot") {
           const creds = resolveProviderCredentials(
@@ -3820,12 +3649,10 @@ export class ProviderModelFactory {
         providersConfigForShadowCheck
       );
       if (rawCoderGatewayModelId != null) {
-        const appConfig = self.config.loadConfigOrDefault();
         const { isGatewayModelAccessible } = createGatewayRouting(providersConfigForShadowCheck);
         const coderProviderRoutable = self.isProviderAvailableForRouting(
           "coder",
-          providersConfigForShadowCheck,
-          appConfig
+          providersConfigForShadowCheck
         );
         const coderModelAccessible = isGatewayModelAccessible("coder", rawCoderGatewayModelId);
         if (coderProviderRoutable && coderModelAccessible) {
@@ -4036,11 +3863,7 @@ export class ProviderModelFactory {
           return false;
         }
 
-        return this.isProviderAvailableForRouting(
-          provider as ProviderName,
-          providersConfig,
-          config
-        );
+        return this.isProviderAvailableForRouting(provider as ProviderName, providersConfig);
       },
       isGatewayModelAccessible,
       resolveGatewayModelId
@@ -4139,11 +3962,7 @@ export class ProviderModelFactory {
                 return false;
               }
 
-              return this.isProviderAvailableForRouting(
-                provider as ProviderName,
-                providersConfig,
-                config
-              );
+              return this.isProviderAvailableForRouting(provider as ProviderName, providersConfig);
             },
             isGatewayModelAccessible,
             resolveGatewayModelId
@@ -4154,7 +3973,7 @@ export class ProviderModelFactory {
     // gateway selections from being silently rewritten after canonicalization.
     if (
       explicitGateway != null &&
-      this.isProviderAvailableForRouting(explicitGateway, providersConfig, config)
+      this.isProviderAvailableForRouting(explicitGateway, providersConfig)
     ) {
       const explicitGatewayDefinition = PROVIDER_DEFINITIONS[explicitGateway];
       if (explicitGatewayDefinition.kind === "gateway") {

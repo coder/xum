@@ -1,8 +1,7 @@
 /**
  * Coder deployment OAuth service.
  *
- * Internals are Effect-native (see codexOauthService.ts / muxGatewayOauthService.ts
- * for the shape): fallible pipelines are `Effect.gen` programs whose error
+ * Internals are Effect-native (see codexOauthService.ts for the shape): fallible pipelines are `Effect.gen` programs whose error
  * channel carries a single reason-carrying tagged error, and the public
  * Promise methods are thin `Effect.runPromise` facades folding back into the
  * wire `Result<_, string>` shape, so pre-Effect callers keep working
@@ -552,7 +551,7 @@ export class CoderOauthService {
 
   /**
    * Wire-shaped Effect surface for handlerGen router handlers. Uninterruptible
-   * (mirrors startDesktopFlowEffect in muxGatewayOauthService.ts): a client
+   * (mirrors startDesktopFlowEffect in codexOauthService.ts): a client
    * abort between the loopback-server acquisition and `desktopFlows.register`
    * would leak the server with nothing left to close it — user-initiated
    * Cancel flows through the pre-registration checkpoints and the flow
