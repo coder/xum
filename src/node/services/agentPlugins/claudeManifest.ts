@@ -18,6 +18,7 @@ import {
   isSafeContributesPath,
 } from "./manifest";
 import { MAX_HOOK_POINTER_ENTRIES } from "./openaiExtension";
+import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
 
 /** Claude components that have no `contributes` member. Discovery resolves them itself. */
 export interface ClaudePluginComponents {
@@ -111,17 +112,22 @@ function readPathList(key: string, value: unknown, cap: number, warnings: string
 }
 
 /**
- * Claude `agents` is a list of `.md` files. Xum reads one agents folder, so the list maps only
- * when every file sits in one folder below the plugin root. Otherwise Xum warns and reads the
- * default `agents/`. The plugin root itself is refused: it would load every Markdown file there.
- * The listed file names go to discovery (ClaudePluginComponents.agentFiles), which refuses the
- * folder when it holds an agent file that the list does not name.
+ * Claude `agents` is a list of `.md` files, and it replaces the default `agents/` scan. Xum reads
+ * one agents folder, so the list maps only when every file sits in one folder below the plugin
+ * root. Otherwise Xum warns and loads no agents (an empty agentFiles list): falling back to
+ * `agents/` would load files the manifest did not list. The plugin root itself is refused: it
+ * would load every Markdown file there. The listed file names go to discovery
+ * (ClaudePluginComponents.agentFiles), which refuses the folder when it holds an agent file that
+ * the list does not name.
  */
 function agentsFolder(value: unknown, warnings: string[]): { agents?: string; files?: string[] } {
   if (value === undefined) return {};
   const folders = new Set<string>();
   const files: string[] = [];
-  for (const entry of asList(value)) {
+  const entries = asList(value);
+  // An empty list is valid Claude: it replaces agents/ with nothing.
+  if (entries.length === 0) return { files };
+  for (const entry of entries) {
     const normalized = claudeComponentPath(entry);
     if (!normalized?.endsWith(".md")) {
       folders.clear();
@@ -135,9 +141,9 @@ function agentsFolder(value: unknown, warnings: string[]): { agents?: string; fi
     return { agents: folder, files };
   }
   warnings.push(
-    "'agents' must list .md files in one folder below the plugin root; reading the default agents/ instead"
+    "'agents' must list .md files in one folder below the plugin root; loading no agents"
   );
-  return {};
+  return { files: [] };
 }
 
 /**
@@ -188,11 +194,26 @@ function readMetadata(raw: Record<string, unknown>, warnings: string[]): Record<
     if (raw[key] !== undefined) manifest[key] = raw[key];
   }
   if (raw.author !== undefined) manifest.author = readAuthor(raw.author, warnings);
+  if (typeof raw.name === "string") manifest.name = claudePluginName(raw.name, warnings);
   for (const key of Object.keys(raw)) {
     if (HANDLED_CLAUDE_KEYS.has(key) || SILENT_CLAUDE_KEYS.has(key)) continue;
     warnings.push(`'${key}' is not supported in .claude-plugin/plugin.json; ignoring`);
   }
   return manifest;
+}
+
+/**
+ * Claude Code accepts names such as `my_plugin` or `MyPlugin` (non-kebab names only warn), but the
+ * Agent Plugins grammar is lowercase letters, digits, dots and hyphens. Such a name loads under
+ * its lowercase form with `_` as `-`, with a warning. Any other invalid name stays as it is, so
+ * the validator refuses the plugin with its usual error.
+ */
+function claudePluginName(name: string, warnings: string[]): string {
+  if (isValidAgentPluginName(name)) return name;
+  const mapped = name.toLowerCase().replaceAll("_", "-");
+  if (!isValidAgentPluginName(mapped)) return name;
+  warnings.push(`Plugin name '${name}' is not an Agent Plugins name; Xum loads it as '${mapped}'`);
+  return mapped;
 }
 
 /**
