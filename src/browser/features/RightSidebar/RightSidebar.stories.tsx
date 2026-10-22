@@ -2225,6 +2225,40 @@ export const ToggleStaysPutWhileSliding: Story = {
 };
 
 /**
+ * Closing the only tab collapses the sidebar, and the panel slides out empty: the New tab that
+ * takes the closed tab's place never paints during the slide (user request). A collapse with the
+ * New tab already open slides out with it (ToggleStaysPutWhileSliding).
+ */
+export const ClosingLastTabSlidesOutEmpty: Story = {
+  ...CollapsedOverview,
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const sidebar = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    await userEvent.click(canvas.getByRole("button", { name: "Expand right sidebar" }));
+    // The launcher row's name includes its description.
+    await userEvent.click(await within(sidebar).findByRole("button", { name: /^Stats\b/ }));
+    const close = await within(sidebar).findByRole("button", { name: "Close Stats" });
+    await waitFor(() => {
+      if (sidebar.getAnimations().length > 0) throw new Error("The sidebar is still sliding open");
+    });
+
+    const frames = await sampleToggleFrames(canvasElement, () => userEvent.click(close));
+    await expect(canvas.getByRole("button", { name: "Expand right sidebar" })).toBeVisible();
+    const openWidth = frames[0].sidebarWidth;
+    await expect(openWidth).toBeGreaterThan(200);
+    await expect(frames[frames.length - 1].sidebarWidth).toBe(0);
+    const sliding = frames.filter((frame) => frame.sidebarWidth < openWidth - 1);
+    await expect(sliding.some((frame) => frame.sidebarWidth > 1)).toBe(true);
+    await expect(sliding.some((frame) => frame.panel)).toBe(false);
+  },
+};
+
+/**
  * Dragging the resize handle past the snap point collapses the sidebar, and dragging back
  * reopens it, at once: the width (and the transcript's room for the card) follows the pointer
  * instead of sliding behind it.

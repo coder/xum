@@ -195,11 +195,8 @@ interface SidebarContainerProps {
   header?: React.ReactNode;
   /** The docked panel's content (resize handle and tab layout). */
   renderPanel: () => React.ReactNode;
-  /**
-   * The panel shows only the New tab, so it slides out empty: closing the last tab leaves the New
-   * tab in its place, and the close must not show it (user request).
-   */
-  blankWhileClosing: boolean;
+  /** The panel shows only the New tab (see useSidebarSlidePhase). */
+  onlyNewTab: boolean;
   /** The collapsed sidebar's overview card content. */
   renderCard: () => React.ReactNode;
   role: string;
@@ -260,17 +257,26 @@ function settleAfterWidthTransition(container: HTMLElement | null, settle: () =>
  * from a prop change), so the first frame of a slide already renders both the panel and the
  * card. Settles once the container's width transition ends; where none runs (drag resizes,
  * display:none, reduced or disabled transitions, happy-dom) it settles before the frame paints.
+ *
+ * `blankWhileClosing` marks a collapse that came in the same update that left only the New tab:
+ * closing the last tab does both, and that slide must not show the New tab (user request). A
+ * collapse with the New tab already open still slides out with it.
  */
 function useSidebarSlidePhase(
   collapsed: boolean,
+  onlyNewTab: boolean,
   containerRef: React.RefObject<HTMLDivElement>
-): { phase: SidebarSlidePhase; sliding: boolean } {
+): { phase: SidebarSlidePhase; sliding: boolean; blankWhileClosing: boolean } {
   const [phase, setPhase] = React.useState<SidebarSlidePhase>(collapsed ? "closed" : "open");
   const [phaseCollapsed, setPhaseCollapsed] = React.useState(collapsed);
+  const [prevOnlyNewTab, setPrevOnlyNewTab] = React.useState(onlyNewTab);
+  const [blankWhileClosing, setBlankWhileClosing] = React.useState(false);
   if (phaseCollapsed !== collapsed) {
     setPhaseCollapsed(collapsed);
     setPhase(collapsed ? "closing" : "opening");
+    setBlankWhileClosing(collapsed && onlyNewTab && !prevOnlyNewTab);
   }
+  if (prevOnlyNewTab !== onlyNewTab) setPrevOnlyNewTab(onlyNewTab);
   const sliding = phase === "closing" || phase === "opening";
 
   React.useLayoutEffect(() => {
@@ -279,7 +285,7 @@ function useSidebarSlidePhase(
     return settleAfterWidthTransition(containerRef.current, () => setPhase(settled));
   }, [containerRef, phase, sliding]);
 
-  return { phase, sliding };
+  return { phase, sliding, blankWhileClosing };
 }
 
 /** Marks the element inert while `inert` holds (React 18 has no `inert` prop). */
@@ -378,7 +384,11 @@ const SidebarPanelFrame: React.FC<{
 const SidebarContainer: React.FC<SidebarContainerProps> = ({ containerRef, ...props }) => {
   const width = props.customWidth ? `${props.customWidth}px` : "400px";
   const immersiveHidden = props.immersiveHidden === true;
-  const { phase, sliding } = useSidebarSlidePhase(props.collapsed, containerRef);
+  const { phase, sliding, blankWhileClosing } = useSidebarSlidePhase(
+    props.collapsed,
+    props.onlyNewTab,
+    containerRef
+  );
   const animating = sliding && !props.isResizing;
   // Immersive review covers it.
   useInertWhile(containerRef, immersiveHidden);
@@ -418,7 +428,7 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({ containerRef, ...pr
         phase={phase}
         fullscreen={props.fullscreen === true}
         width={width}
-        blankWhileClosing={props.blankWhileClosing}
+        blankWhileClosing={blankWhileClosing}
         render={props.renderPanel}
       />
     </div>
@@ -2915,7 +2925,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             </div>
           </>
         )}
-        blankWhileClosing={getOnlyTab(layout.root) === NEW_TAB}
+        onlyNewTab={getOnlyTab(layout.root) === NEW_TAB}
         renderCard={() => (
           <RightSidebarOverview
             workspaceId={workspaceId}
