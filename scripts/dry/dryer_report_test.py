@@ -179,3 +179,13 @@ def test_two_old_duplicates_moved_together_stay_quiet():
     hunks = {"src/b.ts": [[0, 0, 1, 16]], "src/a.ts": [[1, 39, 0, 0]]}
     pairs = run(head, base, ["src/a.ts", "src/b.ts"], {"src/b.ts": [[1, 16]]}, hunks)
     assert pairs == []
+
+
+def test_a_third_copy_of_two_moved_duplicates_is_new():
+    # Base: two duplicates in src/a.ts. The diff moves them into src/b.ts and
+    # adds a third copy: each removed form covers one moved form, not two.
+    base = [form("src/a.ts", "@1", 1, SHAPE), form("src/a.ts", "@20", 20, SHAPE), form("src/a.ts", "@40", 40, OTHER)]
+    head = [form("src/b.ts", f"@{n}", n, SHAPE) for n in (1, 10, 20)] + [form("src/a.ts", "@1", 1, OTHER)]
+    hunks = {"src/b.ts": [[0, 0, 1, 26]], "src/a.ts": [[1, 39, 0, 0]]}
+    pairs = run(head, base, ["src/a.ts", "src/b.ts"], {"src/b.ts": [[1, 26]]}, hunks)
+    assert names(pairs) == [("@1", "@20"), ("@10", "@20")]
