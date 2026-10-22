@@ -13,6 +13,7 @@ import {
   discoverRemoteProjectAgentPlugins,
   buildRemotePluginListingScript,
   getRemoteProjectPluginSnapshot,
+  isInsideMirror,
   MAX_REMOTE_PLUGIN_ENTRIES,
   parseRemotePluginListing,
 } from "./remoteProjectPlugins";
@@ -75,6 +76,24 @@ describe("discoverRemoteProjectAgentPlugins", () => {
     expect(plugin?.agentsDir).toBe(path.join(root, "agents"));
     // Code components are out of scope (#7218), so the result has no MCP or hooks fields.
     expect(Object.keys(plugin ?? {})).not.toContain("mcpConfigPath");
+  });
+
+  test("a backslash file name loads no plugins and writes nothing outside the mirror", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-backslash");
+    const root = await fs.realpath(checkout.path);
+    const container = path.join(root, ".xum", "plugins");
+    const plugin = await writePlugin(container, "good", manifest("good"));
+    await writeSkill(path.join(plugin, "skills"), "review");
+    const escapeName = "evil-" + String(process.pid);
+    await fs.writeFile(path.join(plugin, `..\\..\\${escapeName}`), "x");
+    const plugins = await discoverRemoteProjectAgentPlugins({
+      runtime: new LocalRuntime(root),
+      checkoutRoot: root,
+      containers: [container],
+    });
+    // The whole listing is refused, so the valid plugin next to it does not load either.
+    expect(plugins).toEqual([]);
+    expect(await fs.stat(path.join(path.dirname(root), escapeName)).catch(() => null)).toBeNull();
   });
 
   test("refuses symlinks whose realpath leaves the checkout, keeps contained ones", async () => {
@@ -186,6 +205,27 @@ describe("parseRemotePluginListing", () => {
     expect(parseRemotePluginListing("D\t0\t\t/r/a\tb\nROOT\t0\t/r\t\nEND\n")).toBeNull();
     // An F line without its blob.
     expect(parseRemotePluginListing("ROOT\t0\t/r\t\nF\t2\t\t/r/x/plugin.json\nEND\n")).toBeNull();
+  });
+
+  test("refuses the whole listing for a name a Windows host could read as a path", () => {
+    const withDir = (dir: string, target = "") =>
+      parseRemotePluginListing(`D\t0\t\t/r/p/ok\nL\t0\t${target}\t${dir}\nROOT\t0\t/r\t\nEND\n`);
+    expect(withDir("/r/p/link", "/r/p/ok")?.entries).toHaveLength(2);
+    expect(withDir("/r/p/a\\..\\..\\Startup")).toBeNull();
+    expect(withDir("/r/p/../../etc")).toBeNull();
+    expect(withDir("/r/p/C:x")).toBeNull();
+    expect(withDir("/r/p//x")).toBeNull();
+    // A symlink target is checked too.
+    expect(withDir("/r/p/link", "/r/p/a\\..\\x")).toBeNull();
+  });
+
+  test("the mirror containment check follows the host path rules (win32)", () => {
+    const mirror = "C:\\Temp\\xum-remote-plugins-1-ab";
+    expect(isInsideMirror(path.win32, mirror, `${mirror}\\p\\SKILL.md`)).toBe(true);
+    expect(isInsideMirror(path.win32, mirror, `${mirror}\\p\\..\\..\\Startup\\x.cmd`)).toBe(false);
+    expect(isInsideMirror(path.win32, mirror, "D:\\x")).toBe(false);
+    expect(isInsideMirror(path.win32, mirror, mirror)).toBe(false);
+    expect(isInsideMirror(path.win32, mirror, `${mirror}\\..x`)).toBe(true);
   });
 
   test("splits a blob among its files in order, and fails closed when the sizes do not add up", () => {
