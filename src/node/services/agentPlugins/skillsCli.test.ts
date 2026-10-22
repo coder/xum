@@ -1,6 +1,18 @@
 import { describe, expect, test } from "bun:test";
+import { execFile } from "node:child_process";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { promisify } from "node:util";
 
-import { SKILLS_CLI_PACKAGE, skillsCliArgs, skillsCliCommandResult } from "./skillsCli";
+import {
+  SKILLS_CLI_PACKAGE,
+  skillsCliArgs,
+  skillsCliCommand,
+  skillsCliCommandResult,
+} from "./skillsCli";
+
+const execFileAsync = promisify(execFile);
 
 const REPO = "https://github.com/anthropics/skills.git";
 
@@ -62,7 +74,7 @@ test("the command holds only validated arguments; invalid input is the error bra
   ).toEqual({
     success: true,
     data: {
-      command: `npx --yes ${SKILLS_CLI_PACKAGE} add git@github.com:anthropics/skills.git --skill pdf --global --agent codex --copy`,
+      command: `${process.platform === "win32" ? 'cd /d "%USERPROFILE%" &&' : "cd ~ &&"} npx --yes ${SKILLS_CLI_PACKAGE} add git@github.com:anthropics/skills.git --skill pdf --global --agent codex --copy`,
     },
   });
   for (const input of [
@@ -73,3 +85,31 @@ test("the command holds only validated arguments; invalid input is the error bra
     expect(skillsCliCommandResult(input).success).toBe(false);
   }
 });
+
+// npx prefers a matching package in the working folder's node_modules over the registry, so the
+// shown command must leave the folder the user runs it from before npx starts.
+test.skipIf(process.platform === "win32")(
+  "the shown command starts npx in the home folder, not in the current folder",
+  async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "skills-cli-cwd-"));
+    try {
+      const home = path.join(root, "home");
+      const checkout = path.join(root, "checkout");
+      const bin = path.join(root, "bin");
+      await fs.mkdir(home);
+      await fs.mkdir(path.join(checkout, "node_modules", "skills"), { recursive: true });
+      await fs.mkdir(bin);
+      // A stand-in npx that reports the folder it starts in.
+      await fs.writeFile(path.join(bin, "npx"), "#!/bin/sh\npwd -P\n", { mode: 0o755 });
+      const command = skillsCliCommand({ source: REPO, skills: ["pdf"] }, "linux");
+      const { stdout } = await execFileAsync("/bin/sh", ["-c", command], {
+        cwd: checkout,
+        env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home },
+        encoding: "utf8",
+      });
+      expect(stdout.trim()).toBe(await fs.realpath(home));
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+);

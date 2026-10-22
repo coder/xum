@@ -92,10 +92,26 @@ function formatCommand(argv: string[]): string {
 }
 
 /**
- * The command for `input`: validated source and skill names only. Throws a user-facing error for
- * invalid input.
+ * SECURITY: `npx skills@<version>` prefers a matching package in the working folder's
+ * node_modules over the registry, so the copied command run inside an attacker's checkout would
+ * start the attacker's copy. The command therefore changes to the home folder first; `&&` stops
+ * it when that fails. A fixed constant per shell, never built from input.
  */
-export function skillsCliCommand(input: { source: string; skills: string[] }): string {
+const SKILLS_CLI_CWD_PREFIX = {
+  posix: "cd ~ &&",
+  // cmd.exe has no `~`; `/d` also switches the drive.
+  win32: 'cd /d "%USERPROFILE%" &&',
+} as const;
+
+/**
+ * The command for `input`: validated source and skill names only. Throws a user-facing error for
+ * invalid input. `platform` picks the shell syntax of the folder change (the user's terminal runs
+ * on the same machine as the Xum backend).
+ */
+export function skillsCliCommand(
+  input: { source: string; skills: string[] },
+  platform: NodeJS.Platform = process.platform
+): string {
   const args = skillsCliArgs(input.source, input.skills);
   // skillsCliSourceProblem and the skill-name grammar admit only safe characters. Check what Xum
   // shows again: an unsafe argument throws here, it is never quoted.
@@ -103,7 +119,8 @@ export function skillsCliCommand(input: { source: string; skills: string[] }): s
     args.every((arg) => SKILLS_CLI_SAFE_ARG_PATTERN.test(arg)),
     "skillsCliCommand: every argument must be safe to show unquoted in any shell"
   );
-  return formatCommand(["npx", ...args]);
+  const prefix = platform === "win32" ? SKILLS_CLI_CWD_PREFIX.win32 : SKILLS_CLI_CWD_PREFIX.posix;
+  return `${prefix} ${formatCommand(["npx", ...args])}`;
 }
 
 /** The ORPC shape: invalid input becomes the error branch. */

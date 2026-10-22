@@ -1318,7 +1318,7 @@ export const AddPluginSkillsCliCommand: Story = {
     await userEvent.click(canvas.getByRole("checkbox", { name: "frontend-design" }));
     await userEvent.click(canvas.getByRole("checkbox", { name: "skill-creator" }));
     await userEvent.click(canvas.getByRole("button", { name: "Show command (1)" }));
-    await canvas.findByText("Run this command in a terminal:");
+    await canvas.findByText(/Run this command in a terminal\. It starts in your home folder/);
     await canvas.findByText(/--skill pdf --global --agent codex --copy$/);
     await canvas.findByRole("button", { name: /copy/i });
   },
