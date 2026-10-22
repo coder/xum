@@ -96,9 +96,10 @@ export function skillConsentFrontmatter(
  * YAML reads the first as a list and refuses the second, so the skill did not load (#7123 item 5),
  * while Claude Code shows the hint as typed. Quote a bracketed top-level hint so it stays that
  * text. JSON.stringify keeps a hint with quotes or backslashes valid YAML; an already quoted value
- * does not start with `[`, so it is left alone.
+ * does not start with `[`, so it is left alone. Claude command files (claudeCommands.ts) use it
+ * too, before their frontmatter is rewritten into SKILL.md text.
  */
-function quoteBracketedArgumentHint(yaml: string): string {
+export function quoteBracketedArgumentHint(yaml: string): string {
   return yaml.replace(
     /^argument-hint:[ \t]*(\[.*?)[ \t]*$/m,
     (_line, hint: string) => `argument-hint: ${JSON.stringify(hint)}`
