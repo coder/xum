@@ -246,6 +246,7 @@ export interface DaytonaServiceOptions {
     | "removeSandbox"
     | "removeSandboxTokens"
     | "readTokens"
+    | "restoreGatewayPins"
   >;
   fetch?: typeof fetch;
   now?: () => number;
@@ -1045,16 +1046,30 @@ export class DaytonaService {
    * An ssh command to a started sandbox failed with neither a refused token nor a stop: Daytona
    * may have moved its gateway or rotated its host keys within the `/config` cache. True when
    * the gateway changed since `attemptGeneration` (refetching `/config` unless a concurrent
-   * failure already found the move) and the sandbox's ssh setup now points at the new one.
+   * failure already found the move) and the sandbox's ssh setup now points at the new one, or
+   * when the gateway stayed but its pins in known_hosts had to be put back.
    */
   async refreshGatewayAfterSshFailure(
     sandboxId: string,
     attemptGeneration: number
   ): Promise<boolean> {
-    if (this.gatewayMoves === attemptGeneration) await this.getGatewayConfig({ force: true });
-    if (this.gatewayMoves === attemptGeneration) return false;
+    if (this.gatewayMoves === attemptGeneration) {
+      const config = await this.getGatewayConfig({ force: true });
+      if (this.gatewayMoves === attemptGeneration) return this.restoreGatewayPins(config);
+    }
     await this.ensureSshAccess(sandboxId);
     return true;
+  }
+
+  /**
+   * The pins come from the `/config` just fetched, never from a key a server offered. Only here,
+   * after a fresh fetch: a readiness check reads a cached `/config`, and another backend on this
+   * root may already have pinned the gateway's rotated keys.
+   */
+  private async restoreGatewayPins(config: DaytonaGatewayConfig): Promise<boolean> {
+    const restored = await this.sshConfigWriter.restoreGatewayPins(toSshGateway(config));
+    if (restored) log.info("Daytona gateway pins were missing or changed; wrote them again");
+    return restored;
   }
 
   /** The cached `/config` of these settings, fresh or not. */

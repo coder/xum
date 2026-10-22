@@ -1902,6 +1902,33 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
     expect(rig.writer.repoints).toHaveLength(before.repoints);
   });
 
+  it("puts back the gateway's pins after a host key failure when the gateway did not move", async () => {
+    rig.plane.addSandbox({ id: "sb-pins" });
+    const local = localShellTransport(rig.rootDir);
+    let attempts = 0;
+    // OpenSSH (StrictHostKeyChecking yes) refuses the gateway without its pinned key.
+    const transport: SSHTransport = {
+      ...local,
+      spawnRemoteProcess: (command, options) => {
+        attempts++;
+        return JSON.stringify(rig.writer.pins) === JSON.stringify(rig.plane.gateway)
+          ? local.spawnRemoteProcess(command, options)
+          : Promise.reject(new RuntimeError("Host key verification failed.", "network"));
+      },
+    };
+    const turn = makeRuntime({ sandboxId: "sb-pins" }, rig, { transport });
+    expect(await turn.ensureReady()).toEqual({ ready: true });
+    rig.writer.deletePins();
+
+    const stream = await turn.exec("echo ok", { cwd: "/tmp", timeout: 10 });
+
+    expect(await new Response(stream.stdout).text()).toBe("ok\n");
+    expect(attempts).toBe(2);
+    // The keys /config advertises are pinned, never the one a server offers.
+    expect(rig.writer.pins).toEqual(rig.plane.gateway);
+    expect(rig.writer.repoints).toHaveLength(0);
+  });
+
   /** The gateway answers a stopped or deleted sandbox with the same refusal as a bad token. */
   function refusingTransportWhile(sandboxId: string, refuses: () => boolean): SSHTransport {
     const local = localShellTransport(rig.rootDir);

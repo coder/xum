@@ -402,6 +402,7 @@ describe("DaytonaService", () => {
       sshConfigWriter: {
         writeSandbox: store,
         ensureManagedBlock: () => Promise.resolve(),
+        restoreGatewayPins: () => Promise.resolve(false),
         updateToken: store,
         repointGateway: () => Promise.resolve(),
         removeSandbox: (sandboxId: string) => {
@@ -463,6 +464,7 @@ describe("DaytonaService", () => {
       sshConfigWriter: {
         writeSandbox: record,
         ensureManagedBlock: () => Promise.resolve(),
+        restoreGatewayPins: () => Promise.resolve(false),
         updateToken: record,
         removeSandbox: (sandboxId) => {
           includeFile.delete(sandboxId);
@@ -645,6 +647,7 @@ describe("DaytonaService", () => {
     const writer = {
       writeSandbox: store,
       ensureManagedBlock: () => Promise.resolve(),
+      restoreGatewayPins: () => Promise.resolve(false),
       updateToken: store,
       removeSandbox: () => Promise.resolve(),
       removeSandboxTokens: () => Promise.resolve(),
@@ -681,6 +684,7 @@ describe("DaytonaService", () => {
     const writer = {
       writeSandbox: () => Promise.resolve(),
       ensureManagedBlock: () => Promise.resolve(),
+      restoreGatewayPins: () => Promise.resolve(false),
       updateToken: () => Promise.resolve(),
       removeSandbox: () => Promise.resolve(),
       removeSandboxTokens: () => Promise.resolve(),

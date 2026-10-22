@@ -296,6 +296,16 @@ function knownHostsLineHosts(line: string): string[] {
     .map((entry) => /^\[(.+)\]:\d+$/.exec(entry)?.[1] ?? entry);
 }
 
+/** The known_hosts lines that pin `host` (in either form). */
+function linesPinning(content: string, host: string): string[] {
+  return content.split("\n").filter((line) => knownHostsLineHosts(line).includes(host));
+}
+
+function sameLines(lines: string[], expected: string): boolean {
+  const wanted = expected.split("\n").filter((line) => line.length > 0);
+  return lines.length === wanted.length && lines.every((line, index) => line === wanted[index]);
+}
+
 // One lock per include file across writer instances in this process (withIncludeFileLock adds
 // the cross-process one): blocks of different sandboxes share it.
 const includeFileLocks = new MutexMap<string>();
@@ -378,18 +388,46 @@ export class DaytonaSshConfigWriter {
         blocks.set(toXumDaytonaHost(other.sandboxId), this.renderBlock({ ...other, gateway }));
       }
       edit(blocks);
-      const keptHosts = new Set(hostKeyAliasesIn(blocks));
-      keptHosts.delete(gateway.host);
-      const keptLines = (await this.readKnownHosts())
-        .split("\n")
-        .filter((line) => knownHostsLineHosts(line).some((host) => keptHosts.has(host)));
-      await writeFileAtomic(
-        this.paths.knownHostsPath,
-        keptLines.length > 0 ? `${keptLines.join("\n")}\n${gatewayLines}` : gatewayLines,
-        { encoding: "utf-8", mode: 0o600 }
-      );
+      await this.writeKnownHosts(blocks, gateway.host, gatewayLines);
       await this.writeBlocks(blocks);
     });
+  }
+
+  /**
+   * known_hosts was deleted or edited while this backend runs: an unchanged gateway would
+   * otherwise fail every ssh command until a restart. Rewrites the gateway's pins (from
+   * `/config`, never a key a server offers) when its lines differ, keeping the include file
+   * and other gateways' pins. True when it wrote.
+   */
+  async restoreGatewayPins(gateway: DaytonaSshGateway): Promise<boolean> {
+    const gatewayLines = renderDaytonaKnownHosts(gateway);
+    this.assertPathsReadLiterallyBySsh();
+    let wrote = false;
+    await this.withIncludeFileLock(async () => {
+      const current = await this.readKnownHosts();
+      if (sameLines(linesPinning(current, gateway.host), gatewayLines)) return;
+      await this.writeKnownHosts(await this.readBlocks(), gateway.host, gatewayLines);
+      wrote = true;
+    });
+    return wrote;
+  }
+
+  /** The gateway's lines replace every line pinning its host; other gateways' pins stay. */
+  private async writeKnownHosts(
+    blocks: Map<string, string>,
+    gatewayHost: string,
+    gatewayLines: string
+  ): Promise<void> {
+    const keptHosts = new Set(hostKeyAliasesIn(blocks));
+    keptHosts.delete(gatewayHost);
+    const keptLines = (await this.readKnownHosts())
+      .split("\n")
+      .filter((line) => knownHostsLineHosts(line).some((host) => keptHosts.has(host)));
+    await writeFileAtomic(
+      this.paths.knownHostsPath,
+      keptLines.length > 0 ? `${keptLines.join("\n")}\n${gatewayLines}` : gatewayLines,
+      { encoding: "utf-8", mode: 0o600 }
+    );
   }
 
   /** Token refresh: rewrites only the include file, never `~/.ssh/config` or known_hosts. */
