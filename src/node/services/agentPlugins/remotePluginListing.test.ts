@@ -92,7 +92,7 @@ describe("parseRemotePluginListing", () => {
   });
 
   test("malformed, outside-the-root, oversized or cut-off listings are refused", () => {
-    const ok = [`D\t\t${root}/p`];
+    const ok = [`D\t\t${root}/p`, `L\t${root}/a\t${root}/l`, `L\t${root}/a\t${root}/l`];
     expect(parseRemotePluginListing(listing(ok, []))).not.toBeNull();
     for (const bad of [
       [`D\t\t${root}/p/../../etc`],
@@ -100,6 +100,8 @@ describe("parseRemotePluginListing", () => {
       [`K\t/etc\t${root}/p`],
       [`D\t\t${root}/p`, `L\t\t${root}/p`],
       [`X\t\t${root}/p`],
+      // One link listed twice with two targets (retargeted between two walks).
+      [`L\t${root}/a\t${root}/p`, `L\t${root}/b\t${root}/p`],
       Array.from({ length: MAX_REMOTE_PLUGIN_ENTRIES + 1 }, (_, i) => `D\t\t${root}/d${i}`),
     ]) {
       expect(parseRemotePluginListing(listing(bad, []))).toBeNull();

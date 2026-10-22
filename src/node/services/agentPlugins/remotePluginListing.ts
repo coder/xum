@@ -112,12 +112,20 @@ function ensureDir(nodes: Map<string, MemoryNode>, dir: string): boolean {
   return existing === undefined ? addNode(nodes, dir, { kind: "dir" }) : existing.kind === "dir";
 }
 
-/** Adds `remote` and its missing ancestor directories; false when a path has two kinds. */
+/** Same kind and same content: a symlink's target, a file's bytes (both from one tar member). */
+function isSameNode(a: MemoryNode, b: MemoryNode): boolean {
+  if (a.kind === "symlink" && b.kind === "symlink") return a.target === b.target;
+  if (a.kind === "file" && b.kind === "file") return a.bytes === b.bytes;
+  return a.kind === b.kind;
+}
+
+/** Adds `remote` and its missing ancestor directories; false when a path is listed two ways. */
 function addNode(nodes: Map<string, MemoryNode>, remote: string, node: MemoryNode): boolean {
   if (!ensureDir(nodes, path.posix.dirname(remote))) return false;
   const existing = nodes.get(remote);
-  // A tree listed twice (two containers that resolve to one directory) repeats its lines.
-  if (existing !== undefined && existing.kind !== node.kind) return false;
+  // A tree listed twice (two containers that resolve to one directory) repeats its lines. A
+  // repeat that differs (a link retargeted between the two walks) refuses the listing.
+  if (existing !== undefined && !isSameNode(existing, node)) return false;
   nodes.set(remote, node);
   return true;
 }
