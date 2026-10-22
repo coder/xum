@@ -239,9 +239,10 @@ describe("writeGeneratedManifest", () => {
     await writeTree(tmp.path, ["pdf", "skills/a"]);
     await writeGeneratedManifest(tmp.path, { kind: "skills" }, source);
     const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
-    expect(plugin?.skillsDirs).toEqual([
-      { dir: plugin?.rootPath },
-      { dir: path.join(plugin?.rootPath ?? "", "skills") },
+    if (plugin === null) throw new Error("the generated manifest is not a plugin");
+    expect(plugin.skillsDirs).toEqual([
+      { dir: plugin.rootPath },
+      { dir: path.join(plugin.rootPath, "skills") },
     ]);
   });
 
