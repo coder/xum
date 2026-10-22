@@ -192,10 +192,17 @@ describe("resolveEntrySource", () => {
     ]) {
       expect(resolveOnly({ source: "url", url })).toContain("path on this machine");
     }
-    expect(resolveOnly({ source: "url", url: "git@gitlab.com:acme/tool.git" })).toMatchObject({
-      kind: "remote",
-      url: "git@gitlab.com:acme/tool.git",
-    });
+    // A network marketplace names only https sources: ssh and scp forms would sign in with the
+    // user's SSH agent to any host the catalog picks, also a DNS alias of this machine.
+    for (const url of ["git@gitlab.com:acme/tool.git", "ssh://git@github.com/acme/tool.git"]) {
+      expect(resolveOnly({ source: "url", url })).toContain("only https");
+    }
+    expect(
+      resolveOnly(
+        { source: "url", url: "git@gitlab.com:acme/tool.git" },
+        { marketplaceUrl: "/srv/repos/market" }
+      )
+    ).toMatchObject({ kind: "remote", url: "git@gitlab.com:acme/tool.git" });
     expect(
       resolveOnly(
         { source: "url", url: "ssh://localhost/srv/tool.git" },

@@ -317,6 +317,15 @@ function entryGitUrl(raw: unknown, marketplaceUrl: string): string {
       `'${value}' is a path on this machine; a remote marketplace cannot install it.`
     );
   }
+  // SECURITY: an ssh or scp source from a network marketplace makes git sign in with the user's
+  // SSH agent to whatever host the catalog names, also a DNS alias of this machine or of a private
+  // host. Git resolves the name itself, so Xum cannot check the address first (DNS rebinding).
+  // Such a marketplace may name only https sources; a marketplace on this machine may name any.
+  if (!pointsAtThisMachine(marketplaceUrl) && !parsed.url.startsWith("https://")) {
+    throw new Error(
+      `'${value}' is not an https URL; a remote marketplace can name only https git sources.`
+    );
+  }
   return parsed.url;
 }
 
