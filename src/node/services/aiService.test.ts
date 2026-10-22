@@ -481,7 +481,6 @@ function stubCommonStreamMessageDependencies(args: {
         canonicalModelId: args.canonicalModelId ?? modelIdFromModelString(canonicalModelString),
         wireProviderName:
           args.canonicalProviderName ?? providerNameFromModelString(canonicalModelString),
-        routedThroughGateway: false,
         ...(args.routeProvider != null ? { routeProvider: args.routeProvider } : {}),
       },
     });
@@ -3297,19 +3296,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   );
 
-  it.each(["mux-gateway", "coder"] as const)(
-    "keeps native deferred loading through the %s passthrough gateway",
-    async (routeProvider) => {
-      const on = await startToolSearchStream(
-        "anthropic:claude-sonnet-4-5",
-        true,
-        undefined,
-        routeProvider
-      );
-      expect(on.state?.native).toBe(true);
-      expect(on.deferLoadingNames).toEqual(["tracker_list_issues"]);
-    }
-  );
+  it("keeps native deferred loading through the coder passthrough gateway", async () => {
+    const on = await startToolSearchStream("anthropic:claude-sonnet-4-5", true, undefined, "coder");
+    expect(on.state?.native).toBe(true);
+    expect(on.deferLoadingNames).toEqual(["tracker_list_issues"]);
+  });
 
   it("keeps scoped tool-search deferral on models without Anthropic prompt caching", async () => {
     const on = await startToolSearchStream("openai:gpt-5.2", true);
@@ -3529,7 +3520,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   it("shares one overview between selections that reach the same wire model", async () => {
     using xumHome = new DisposableTempDir("ai-tool-search-overview-alias");
     const { fixture, harness, send } = createOverviewHarness(xumHome.path);
-    const wireModel = "mux-gateway:anthropic/claude-sonnet-4-5";
+    const wireModel = "coder:anthropic/claude-sonnet-4-5";
     const resolveToWire = harness.resolveAndCreateModelSpy.getMockImplementation();
     if (resolveToWire === undefined) throw new Error("Expected a resolveAndCreateModel stub");
     // Like routing: the direct selection goes out through the gateway the explicit one names.
@@ -4825,7 +4816,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
               canonicalModelId: "gpt-6-astra",
               wireProviderName: "openai",
               routeProvider: "coder",
-              routedThroughGateway: false,
             },
           });
         }
@@ -4906,7 +4896,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           canonicalModelId: model.slice("coder:".length),
           wireProviderName: testCase.origin,
           routeProvider: "coder",
-          routedThroughGateway: false,
           coderWire: {
             origin: testCase.origin,
             modelId: testCase.modelId,
@@ -4974,7 +4963,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           canonicalModelId: testCase.modelId,
           wireProviderName: "openai",
           routeProvider: "coder",
-          routedThroughGateway: false,
           coderWire: {
             origin: "openai",
             modelId: testCase.modelId,
@@ -5038,7 +5026,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
             canonicalModelId: "gemini-3.8-flash",
             wireProviderName: "openai",
             routeProvider: "coder",
-            routedThroughGateway: false,
             coderWire: { origin: "openai", modelId: "gemini-3.8-flash", providerType: "google" },
           },
         };
@@ -5261,7 +5248,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
             canonicalProviderName: providerNameFromModelString(requested),
             canonicalModelId: modelIdFromModelString(requested),
             wireProviderName: providerNameFromModelString(requested),
-            routedThroughGateway: false,
           },
         });
       });

@@ -141,20 +141,6 @@ describe("ACP slash command support", () => {
     expect(parsed.model).toBe("openrouter:openai/gpt-5");
   });
 
-  it("preserves mux-gateway prefix in /compact -m model", () => {
-    const parsed = parseAcpSlashCommand(
-      "/compact -m mux-gateway:anthropic/claude-sonnet-4-6",
-      mapSkillsByName(skills)
-    );
-
-    expect(parsed?.kind).toBe("compact");
-    if (parsed?.kind !== "compact") {
-      throw new Error("Expected /compact command with mux-gateway prefix to parse");
-    }
-
-    expect(parsed.model).toBe("mux-gateway:anthropic/claude-sonnet-4-6");
-  });
-
   it("rejects invalid model ids in /compact -m", () => {
     const parsed = parseAcpSlashCommand("/compact -m openai::gpt-5", mapSkillsByName(skills));
 

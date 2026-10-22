@@ -14,7 +14,6 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
-import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
 import { OnChatEventSchema } from "@/common/orpc/schemas";
 import type { OnChatEvent } from "@/common/orpc/types";
 import {
@@ -482,9 +481,9 @@ describe("replayed tapes stay data", () => {
 
   test("hostile recorded content is only yielded as data: no network, no process, no file changes", async () => {
     // Recorded remote URLs (an image file part, a markdown image, an MCP origin), tool calls and
-    // events that trigger renderer effects live (gateway-expired error, skill completion, input
-    // restore) must come out of load + replay unchanged and in order, and nothing may act on
-    // them: the read side never contacts an endpoint, spawns a tool or writes workspace state.
+    // events that trigger renderer effects live (skill completion, input restore) must come out
+    // of load + replay unchanged and in order, and nothing may act on them: the read side never
+    // contacts an endpoint, spawns a tool or writes workspace state.
     const workspaceId = "ws-hostile";
     const hostileRows: unknown[] = [
       {
@@ -497,12 +496,6 @@ describe("replayed tapes stay data", () => {
           { type: "file", url: "https://images.example.invalid/photo.png", mediaType: "image/png" },
         ],
         metadata: { historySequence: 1, timestamp: 1 },
-      },
-      {
-        type: "stream-error",
-        messageId: "msg-gateway",
-        error: MUX_GATEWAY_SESSION_EXPIRED_MESSAGE,
-        errorType: "authentication",
       },
     ];
     const events = [

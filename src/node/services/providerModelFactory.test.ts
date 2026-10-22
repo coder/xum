@@ -108,7 +108,6 @@ function expectSuccessfulRouteResult(
   expected: {
     effectiveModelString: string;
     routeProvider: SuccessfulResolvedModel["routeProvider"];
-    routedThroughGateway?: boolean;
   }
 ): void {
   expect(result.success).toBe(true);
@@ -117,9 +116,6 @@ function expectSuccessfulRouteResult(
   }
   expect(result.data.effectiveModelString).toBe(expected.effectiveModelString);
   expect(result.data.routeProvider).toBe(expected.routeProvider);
-  if (expected.routedThroughGateway !== undefined) {
-    expect(result.data.routedThroughGateway).toBe(expected.routedThroughGateway);
-  }
 }
 
 async function withTempConfig(
@@ -504,27 +500,6 @@ describe("ProviderModelFactory.createModel", () => {
         }
       });
     }
-  });
-
-  it("keeps a custom provider shadowing mux-gateway off gateway attribution", async () => {
-    await withTempConfig(async (config, factory) => {
-      // The request goes directly to the custom endpoint, so gateway
-      // attribution and quota handling must not engage.
-      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        "mux-gateway": {
-          providerType: "openai-compatible",
-          baseUrl: "http://localhost:8000/v1",
-          models: ["qwen3-coder"],
-        },
-      });
-
-      const result = await factory.resolveAndCreateModel("mux-gateway:qwen3-coder", "off");
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.data.routedThroughGateway).toBe(false);
-        expect(result.data.routeProvider).toBeUndefined();
-      }
-    });
   });
 
   it("merges backend OpenAI store policy for custom openai-responses providers", async () => {
@@ -2468,7 +2443,7 @@ describe("ProviderModelFactory.resolveGatewayModelString modelKey", () => {
 });
 
 describe("ProviderModelFactory routing", () => {
-  it("honors non-mux gateway routes end-to-end", async () => {
+  it("honors gateway routes end-to-end", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
@@ -2492,7 +2467,6 @@ describe("ProviderModelFactory routing", () => {
       expectSuccessfulRouteResult(result, {
         effectiveModelString: "openrouter:openai/gpt-5",
         routeProvider: "openrouter",
-        routedThroughGateway: false,
       });
     });
   });
@@ -2515,7 +2489,6 @@ describe("ProviderModelFactory routing", () => {
       expectSuccessfulRouteResult(result, {
         effectiveModelString: "openai:gpt-5.5",
         routeProvider: "openai",
-        routedThroughGateway: false,
       });
     });
   });
@@ -2535,7 +2508,6 @@ describe("ProviderModelFactory routing", () => {
       expectSuccessfulRouteResult(result, {
         effectiveModelString: "openrouter:openai/gpt-5",
         routeProvider: "openrouter",
-        routedThroughGateway: false,
       });
     });
   });
@@ -2698,7 +2670,6 @@ describe("ProviderModelFactory routing", () => {
       if (result.success) {
         expect(result.data.effectiveModelString).toBe("coder:google/gemini-2.5-pro");
         expect(result.data.canonicalModelString).toBe("coder:google/gemini-2.5-pro");
-        expect(result.data.routedThroughGateway).toBe(false);
         expect((result.data.model as { modelId?: unknown }).modelId).toBe("google/gemini-2.5-pro");
       }
     });
@@ -2716,7 +2687,7 @@ describe("ProviderModelFactory routing", () => {
         },
       });
 
-      await saveRoutePriority(config, ["mux-gateway", "openrouter", "direct"]);
+      await saveRoutePriority(config, ["github-copilot", "openrouter", "direct"]);
 
       const resolved = factory.resolveGatewayModelString("openai:gpt-5", "openai:gpt-5");
       expect(resolved).toBe("openrouter:openai/gpt-5");
@@ -2755,7 +2726,6 @@ describe("ProviderModelFactory routing", () => {
       expectSuccessfulRouteResult(result, {
         effectiveModelString: "openrouter:openai/gpt-5",
         routeProvider: "openrouter",
-        routedThroughGateway: false,
       });
     });
   });
@@ -2824,7 +2794,6 @@ describe("ProviderModelFactory routing", () => {
         expectSuccessfulRouteResult(result, {
           effectiveModelString: "openai:gpt-6-luna",
           routeProvider: "openai",
-          routedThroughGateway: false,
         });
       });
     } finally {
@@ -2856,7 +2825,6 @@ describe("ProviderModelFactory routing", () => {
       expect(result.data.effectiveModelString).toBe("openai:gpt-5");
       expect(result.data.canonicalModelString).toBe("openai:gpt-5");
       expect(result.data.routeProvider).toBe("openai");
-      expect(result.data.routedThroughGateway).toBe(false);
     });
   });
 });
@@ -3694,13 +3662,7 @@ describe("ProviderModelFactory Coder", () => {
                 expect(new Headers(call.init.headers).get("authorization")).toBe(
                   new Headers(originalCall.init.headers).get("authorization")
                 );
-                if (modelString.startsWith("mux-gateway:")) {
-                  expect((body.providerOptions as MuxProviderOptions)?.openai?.serviceTier).toBe(
-                    expected
-                  );
-                } else {
-                  expect(body.service_tier).toBe(expected);
-                }
+                expect(body.service_tier).toBe(expected);
               }
             }
           }
@@ -5834,8 +5796,8 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
   it("rejects explicit gateway prefixes instead of rewriting them to a direct route", async () => {
     await withEvaluationFixture({ openai: { apiKey: "sk-test" } }, async (_c, factory) => {
       expect(
-        expectRejected(await factory.createEvaluationModel("mux-gateway:openai/gpt-5"))
-      ).toEqual({ reason: "unsupported-route", routeKind: "gateway", providerName: "mux-gateway" });
+        expectRejected(await factory.createEvaluationModel("openrouter:openai/gpt-5"))
+      ).toEqual({ reason: "unsupported-route", routeKind: "gateway", providerName: "openrouter" });
       expect(
         expectRejected(await factory.createEvaluationModel("coder:anthropic/claude-haiku-4-5"))
       ).toMatchObject({ reason: "unsupported-route", providerName: "coder" });

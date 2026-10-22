@@ -37,8 +37,7 @@ const SAFE_KEYS = {
     "historySequence requestHistorySequence timestamp model metadataModel agentId mode thinkingLevel",
     "duration ttftMs usage contextUsage providerMetadata contextProviderMetadata systemMessageTokens",
     "costsIncluded toolModelUsages stepStartPartIndices streamFinalized finishReason stopCause",
-    "volatileSystemTail anthropicThinkingReplay anthropicThinkingReplayFromStep",
-    "routedThroughGateway routeProvider"
+    "volatileSystemTail anthropicThinkingReplay anthropicThinkingReplayFromStep routeProvider"
   ),
 };
 
@@ -67,8 +66,7 @@ function drawableText(message: MuxMessage, metadata: Record<string, unknown>): s
 
 /** The "via …" label ModelDisplay adds when the reply was routed through another provider. */
 function routeLabel(metadata: Record<string, unknown>, provider: string): string | null {
-  const gateway = metadata.routedThroughGateway === true ? "mux-gateway" : null;
-  const route = typeof metadata.routeProvider === "string" ? metadata.routeProvider : gateway;
+  const route = typeof metadata.routeProvider === "string" ? metadata.routeProvider : null;
   if (route == null || route === provider) return null;
   // Own keys only: a damaged row's "constructor" must not resolve to Object.prototype.
   return Object.hasOwn(PROVIDER_DEFINITIONS, route)

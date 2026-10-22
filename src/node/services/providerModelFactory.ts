@@ -859,7 +859,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-/** Anthropic wire form (`defer_loading`) or gateway prompt form (providerOptions). */
+/** Anthropic wire form (`defer_loading`) or AI SDK prompt form (providerOptions). */
 function isWireDeferLoadingTool(tool: Record<string, unknown>): boolean {
   return tool.defer_loading === true || isDeferLoadingTool(tool);
 }
@@ -867,7 +867,7 @@ function isWireDeferLoadingTool(tool: Record<string, unknown>): boolean {
 /**
  * Remove every cache marker the request pipeline may have serialized:
  * `cache_control` on system/message/tool entries and nested content parts,
- * plus gateway-style providerOptions.anthropic.cacheControl. ZDR enforcement
+ * plus prompt-form providerOptions.anthropic.cacheControl. ZDR enforcement
  * happens HERE, at the wire, so no upstream eligibility check is load-bearing
  * for the global anthropic disableBetaFeatures flag.
  */
@@ -1038,7 +1038,7 @@ export function wrapFetchWithAnthropicCacheControl(
       // This caches the entire conversation
       // Handle both formats:
       // - Direct Anthropic provider: json.messages (Anthropic API format)
-      // - Gateway provider: json.prompt (AI SDK internal format)
+      // - AI SDK prompt form: json.prompt
       const messages =
         injectCacheControl && Array.isArray(json.messages)
           ? json.messages
@@ -1049,8 +1049,8 @@ export function wrapFetchWithAnthropicCacheControl(
       if (messages && messages.length >= 1) {
         const lastMsg = messages[messages.length - 1] as Record<string, unknown>;
 
-        // For gateway: add providerOptions.anthropic.cacheControl at message level
-        // (gateway validates schema strictly, doesn't allow raw cache_control on messages)
+        // For the prompt form: add providerOptions.anthropic.cacheControl at message level
+        // (that schema is validated strictly and has no raw cache_control on messages)
         if (Array.isArray(json.prompt)) {
           const providerOpts = (lastMsg.providerOptions ?? {}) as Record<string, unknown>;
           const anthropicOpts = (providerOpts.anthropic ?? {}) as Record<string, unknown>;
@@ -1681,8 +1681,6 @@ export interface ResolveAndCreateModelResult {
    * retagged instance type diverging from the created fallback model.
    */
   coderSelectedInstance?: { name: string; type: string };
-  /** Whether the request is being routed through the Xum gateway. */
-  routedThroughGateway: boolean;
   /** Route provider chosen by backend routing (direct provider or gateway). */
   routeProvider?: ProviderName;
 }
@@ -1771,8 +1769,8 @@ interface CreateModelOptions {
  *   via `resolveProviderCredentials`): they compose no async work, so an
  *   Effect conversion would add fiber overhead without composition benefit.
  * - Per-request fetch wrappers and doStream/doGenerate wrappers (Codex/Coder
- *   OAuth token refresh via `getValidAuth()`, mux-gateway auto-logout,
- *   Copilot billing classification, gateway usage normalization): these are
+ *   OAuth token refresh via `getValidAuth()`, Copilot billing
+ *   classification): these are
  *   AI SDK-owned async callbacks executed on every network request after
  *   model creation, not service pipelines — converting them would embed a
  *   `runPromise` boundary per request with no error-typing win.
@@ -2008,8 +2006,7 @@ export class ProviderModelFactory {
         }
 
         // Backend config is authoritative for Anthropic prompt cache TTL on any
-        // Anthropic-routed model (direct Anthropic, mux-gateway:anthropic/*,
-        // openrouter:anthropic/*). We still allow request-level values when config
+        // Anthropic-routed model (direct Anthropic, openrouter:anthropic/*). We still allow request-level values when config
         // is unset for backward compatibility with older clients.
         const configAnthropicCacheTtl = parseAnthropicCacheTtl(providersConfig.anthropic?.cacheTtl);
         // Coder gateway instances classify by their resolved WIRE type, not the
@@ -2154,10 +2151,7 @@ export class ProviderModelFactory {
         let providerConfig = providersConfig[providerName] ?? {};
 
         // Providers can be disabled in providers.jsonc without deleting credentials.
-        if (
-          providerName !== "mux-gateway" &&
-          isProviderDisabledInConfig(providerConfig as { enabled?: unknown })
-        ) {
+        if (isProviderDisabledInConfig(providerConfig as { enabled?: unknown })) {
           return Err({ type: "provider_disabled", provider: providerName });
         }
 
@@ -2977,7 +2971,7 @@ export class ProviderModelFactory {
             });
           }
 
-          // Model IDs are <providerName>/<modelId> (mux-gateway style) because
+          // Model IDs are <providerName>/<modelId> because
           // the gateway has no cross-provider routing: each configured provider
           // instance is mounted at /<name>/... and only serves its own wire
           // format. The FIRST slash separates the instance name (names cannot
@@ -3055,7 +3049,7 @@ export class ProviderModelFactory {
           if (wire === "anthropic") {
             const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
             const coderRoute = { route: `coder:${gatewayProvider.name}`, modelString };
-            // Same cache_control normalization as direct Anthropic / mux-gateway:
+            // Same cache_control normalization as direct Anthropic:
             // the bridge forwards origin-shaped payloads to the real Anthropic API.
             const providerFetch = wrapFetchWithAnthropicCacheControl(
               coderFetch,
@@ -3114,7 +3108,7 @@ export class ProviderModelFactory {
         // Generic handler for simple providers (standard API key + factory pattern)
         // (mirrored for Google by createEvaluationModelEffect — keep credential
         // merging in sync)
-        // Providers with custom logic (anthropic, openai, xai, ollama, openrouter, bedrock, mux-gateway,
+        // Providers with custom logic (anthropic, openai, xai, ollama, openrouter, bedrock,
         // github-copilot) are handled explicitly above. New providers using the standard pattern need
         // only be added to PROVIDER_DEFINITIONS - no code changes required here.
         const providerDef = PROVIDER_DEFINITIONS[providerName as ProviderName];
@@ -3262,7 +3256,7 @@ export class ProviderModelFactory {
    *
    * A narrow sibling of createModelCoreEffect, NOT a refactor of it: only direct
    * API-key routes of EVALUATION_PROVIDERS are supported; Codex OAuth, every
-   * gateway (Coder, Copilot, Xum Gateway, OpenRouter, Bedrock), custom providers
+   * gateway (Coder, Copilot, OpenRouter, Bedrock), custom providers
    * and providers without an evaluation factory are intentional typed
    * rejections (EvaluationResolveError) so the caller can name the fix instead
    * of silently re-routing a billable call. Each provider branch mirrors ~20
@@ -3709,12 +3703,6 @@ export class ProviderModelFactory {
       const canonicalCustomEntry = providersConfigForShadowCheck[canonicalProviderName];
       const canonicalIsCustomProvider = isCustomProviderConfig(canonicalCustomEntry);
 
-      // Stream result normalization currently only understands Xum gateway responses,
-      // so keep this flag mux-gateway-specific until the downstream normalization path
-      // is generalized too. A custom provider shadowing the mux-gateway id is
-      // direct: gateway attribution/quota handling must not engage for it.
-      const routedThroughGateway =
-        !canonicalIsCustomProvider && effectiveModelString.startsWith("mux-gateway:");
       const [effectiveRouteProvider] = parseModelString(effectiveModelString);
       const routeProvider = Object.hasOwn(PROVIDER_REGISTRY, effectiveRouteProvider)
         ? (effectiveRouteProvider as ProviderName)
@@ -3832,7 +3820,6 @@ export class ProviderModelFactory {
         wireProviderName,
         coderWire,
         coderSelectedInstance,
-        routedThroughGateway,
         // Custom adapters are direct routes: the raw custom id is not a
         // ProviderName, and leaking it as routeProvider makes downstream
         // namespace/format selection treat the request as a transforming
@@ -3895,17 +3882,9 @@ export class ProviderModelFactory {
   resolveGatewayModelString(
     modelString: string,
     modelKeyOrRouteContext?: string | RouteContext,
-    explicitGatewayOrLegacyFlag?: ProviderName | boolean,
+    explicitGateway?: ProviderName,
     providersConfigSnapshot?: ProvidersConfig
   ): string {
-    // Legacy callers may still pass boolean true to mean an explicit mux-gateway request.
-    const explicitGateway: ProviderName | undefined =
-      explicitGatewayOrLegacyFlag === true
-        ? "mux-gateway"
-        : typeof explicitGatewayOrLegacyFlag === "string"
-          ? explicitGatewayOrLegacyFlag
-          : undefined;
-
     // Same single-snapshot rule as resolveModelRoute: callers holding one
     // providers.jsonc read pass it so routing cannot diverge from it.
     const providersConfig =
@@ -3927,10 +3906,6 @@ export class ProviderModelFactory {
     const [originProviderName, originModelId] = parseModelString(canonicalModelString);
 
     if (!originProviderName || !originModelId) {
-      return canonicalModelString;
-    }
-
-    if (originProviderName === "mux-gateway") {
       return canonicalModelString;
     }
 

@@ -101,13 +101,13 @@ describe("readWorkspaceViewTail", () => {
       thinkingLevel: "high",
       metadataModel: "x",
     };
-    Object.assign(stream, { routedThroughGateway: false, stopCause: { kind: "required-tool" } });
+    Object.assign(stream, { stopCause: { kind: "required-tool" } });
     const textPart = (text: string) => [{ type: "text", text, timestamp: 7 }] as never;
     await append([
       msg("u", "user", "hello", send),
       msg("u2", "user", "bare", { muxMetadata: { type: "normal" } }),
       msg("a", "assistant", "", stream, textPart("direct")),
-      msg("g", "assistant", "", { ...stream, routeProvider: "mux-gateway" }, textPart("routed")),
+      msg("g", "assistant", "", { ...stream, routeProvider: "openrouter" }, textPart("routed")),
       msg("bad", "assistant", "damaged", { model: 7, timestamp: "x" }),
       msg("proto", "assistant", "", { ...stream, routeProvider: "constructor" }, textPart("odd")),
       msg("ok", "assistant", "after", { finishReason: undefined }),
@@ -127,7 +127,7 @@ describe("readWorkspaceViewTail", () => {
       ["u", "hello", 1, undefined],
       ["u2", "bare", 1, undefined],
       ["a", "direct", 7, null],
-      ["g", "routed", 7, PROVIDER_DEFINITIONS["mux-gateway"].displayName],
+      ["g", "routed", 7, PROVIDER_DEFINITIONS.openrouter.displayName],
       ["bad", null, null, undefined],
       ["proto", "odd", 7, "constructor"],
       ["ok", "after", 1, null],

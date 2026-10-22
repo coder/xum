@@ -3850,7 +3850,7 @@ describe("WorkspaceStore", () => {
   });
 
   // Loaded session usage is repriced against the current provider config, except for
-  // gateway-billed rows, whose zero costs are real: repricing them would inflate totals.
+  // costs-included rows, whose zero costs are real: repricing them would inflate totals.
   describe("session usage repricing", () => {
     // A flat-priced model: $5/M input and $25/M output tokens.
     const BILLABLE_MODEL = "anthropic:claude-opus-4-5";
@@ -3913,7 +3913,7 @@ describe("WorkspaceStore", () => {
     };
 
     it("reprices recorded costs with the current model pricing", async () => {
-      // One non-zero component is enough to rule out the legacy gateway-billed heuristic.
+      // One non-zero component is enough to rule out the legacy costs-included heuristic.
       const { bucket, lastRequest } = await loadUsage(
         "reprice-stale-costs",
         BILLABLE_MODEL,
@@ -3924,7 +3924,7 @@ describe("WorkspaceStore", () => {
       expectCosts(lastRequest, OPUS_COST_OF_1000_IN_100_OUT);
     });
 
-    it("keeps the zero costs of rows marked as gateway-billed", async () => {
+    it("keeps the zero costs of rows marked as costs-included", async () => {
       const { bucket, lastRequest } = await loadUsage(
         "reprice-costs-included",
         BILLABLE_MODEL,
@@ -3936,7 +3936,7 @@ describe("WorkspaceStore", () => {
       expectCosts(lastRequest, { input: 0, output: 0 });
     });
 
-    it("keeps legacy all-zero costs of a billable model as gateway-billed", async () => {
+    it("keeps legacy all-zero costs of a billable model as costs-included", async () => {
       const { bucket, lastRequest } = await loadUsage(
         "reprice-legacy-zero-costs",
         BILLABLE_MODEL,
@@ -3959,7 +3959,7 @@ describe("WorkspaceStore", () => {
       expectCosts(lastRequest, OPUS_COST_OF_1000_IN_100_OUT);
     });
 
-    it("does not treat all-zero costs of an unpriced model as gateway-billed", async () => {
+    it("does not treat all-zero costs of an unpriced model as costs-included", async () => {
       const { bucket, lastRequest } = await loadUsage(
         "reprice-unpriced-zero-costs",
         CUSTOM_MODEL,
