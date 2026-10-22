@@ -178,5 +178,29 @@ describe("resolveEntrySource", () => {
         { marketplaceUrl: "/srv/repos/market" }
       )
     ).toMatchObject({ kind: "remote", url: "/srv/repos/tool" });
+    // A loopback host is this machine too: git would reach it with the user's own SSH keys.
+    for (const url of [
+      "ssh://localhost/home/me/private.git",
+      "ssh://git@LOCALHOST./srv/private.git",
+      "git@127.0.0.1:/srv/private.git",
+      "ssh://127.1/srv/private.git",
+      "ssh://2130706433/srv/private.git",
+      "ssh://[::1]/srv/private.git",
+      "git@[::ffff:127.0.0.1]:srv/private.git",
+      "https://dev.localhost/acme/tool.git",
+      "ssh://0.0.0.0/srv/private.git",
+    ]) {
+      expect(resolveOnly({ source: "url", url })).toContain("path on this machine");
+    }
+    expect(resolveOnly({ source: "url", url: "git@gitlab.com:acme/tool.git" })).toMatchObject({
+      kind: "remote",
+      url: "git@gitlab.com:acme/tool.git",
+    });
+    expect(
+      resolveOnly(
+        { source: "url", url: "ssh://localhost/srv/tool.git" },
+        { marketplaceUrl: "ssh://localhost/srv/market.git" }
+      )
+    ).toMatchObject({ kind: "remote", url: "ssh://localhost/srv/tool.git" });
   });
 });
