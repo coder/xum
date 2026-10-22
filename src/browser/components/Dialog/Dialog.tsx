@@ -12,22 +12,31 @@ import { isEditableElement, MODAL_DIALOG_OVERLAY_ATTRIBUTE } from "@/browser/uti
  */
 const VisuallyHidden = VisuallyHiddenPrimitive.Root;
 
-/**
- * The root's onOpenChange, for DialogContent's early-Escape fallback (#7141). Unset for an
- * uncontrolled root without onOpenChange: Radix keeps that open state to itself.
- */
+/** Sets the root's open state, for DialogContent's early-Escape fallback (#7141). */
 const DialogOpenChangeContext = React.createContext<((open: boolean) => void) | undefined>(
   undefined
 );
 
-const Dialog = (props: React.ComponentProps<typeof DialogPrimitive.Root>) => (
-  <DialogOpenChangeContext.Provider
-    // Radix declares onOpenChange as a method, so pass a bound call, not the method itself.
-    value={props.onOpenChange == null ? undefined : (open) => props.onOpenChange?.(open)}
-  >
-    <DialogPrimitive.Root {...props} />
-  </DialogOpenChangeContext.Provider>
-);
+/**
+ * Radix's Root, with an uncontrolled root's open state held here instead of inside Radix. The
+ * early-Escape fallback must close every dialog, and Radix keeps that state to itself.
+ */
+const Dialog = (props: React.ComponentProps<typeof DialogPrimitive.Root>) => {
+  const [uncontrolledOpen, setUncontrolledOpen] = React.useState(props.defaultOpen ?? false);
+  const setOpen = (open: boolean) => {
+    if (props.open === undefined) setUncontrolledOpen(open);
+    props.onOpenChange?.(open);
+  };
+  return (
+    <DialogOpenChangeContext.Provider value={setOpen}>
+      <DialogPrimitive.Root
+        {...props}
+        open={props.open ?? uncontrolledOpen}
+        onOpenChange={setOpen}
+      />
+    </DialogOpenChangeContext.Provider>
+  );
+};
 
 const DialogTrigger = DialogPrimitive.Trigger;
 
