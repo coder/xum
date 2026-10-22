@@ -198,6 +198,30 @@ describe("CLI via HTTP", () => {
       }
     });
 
+    test("workspace heartbeat set accepts a nullable integer --interval-ms (#6329)", async () => {
+      const setInterval = (intervalMs: string) =>
+        runCli([
+          "workspace",
+          "heartbeat",
+          "set",
+          "--workspace-id",
+          "nonexistent",
+          "--enabled",
+          "true",
+          "--interval-ms",
+          intervalMs,
+        ]).then(
+          (result: unknown) => ({ result }),
+          (rejection: unknown) => ({ rejection: String(rejection) })
+        );
+      // An integer passes CLI parsing and reaches the server, which reports the unknown
+      // workspace in its result.
+      expect(await setInterval("1800000")).toMatchObject({ result: { success: false } });
+      // A fraction is still not an integer.
+      const fraction = await setInterval("1800000.5");
+      expect("rejection" in fraction && fraction.rejection).toContain("expected integer or null");
+    });
+
     test("workspace get-info with workspace-id option", async () => {
       const result = await runCli(["workspace", "get-info", "--workspace-id", "nonexistent"]);
       expect(result).toBeNull(); // Non-existent workspace returns null
