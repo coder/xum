@@ -117,6 +117,9 @@ const HOST_MODULES = [
     module: "@/node/runtime/runtimeHelpers",
     names: ["createRuntimeForWorkspace", "createRuntimeContextForWorkspace"],
   },
+  // getXumHome() reads XUM_ROOT and stats ~/.xum (paths.ts). Phase 5 gives loop code the
+  // Xum home through HostPaths instead. Its other exports are pure and stay allowed.
+  { module: "@/common/constants/paths", names: ["getXumHome"] },
 ];
 // File -> the host modules it still imports. Phase plans list the pairs they add or remove.
 const HOST_IMPORT_ALLOW = {
