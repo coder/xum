@@ -231,7 +231,51 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
     expect(spawned).toBe(0);
   });
 
-  it("proves a sandbox is this install's once per process", async () => {
+  it("refuses a sandbox without this install's label even when an attached workspace made it ready", async () => {
+    // After a restart: the dedicated workspace's create lost the name to another install's
+    // sandbox, which a workspace attached on purpose and just used.
+    rig.plane.addSandbox({ id: "xum-theirs", labels: { "xum.instance": "another-install" } });
+    expect(await makeRuntime({ sandboxId: "xum-theirs", shared: true }).ensureReady()).toEqual({
+      ready: true,
+    });
+    expect(rig.service.isSandboxReady("xum-theirs")).toBe(true);
+    let spawned = 0;
+    const local = localShellTransport(rig.rootDir);
+    const transport: SSHTransport = {
+      ...local,
+      spawnRemoteProcess: (command, options) => {
+        spawned++;
+        return local.spawnRemoteProcess(command, options);
+      },
+    };
+
+    const result = await makeRuntime({ sandboxId: "xum-theirs", shared: false }, rig, {
+      transport,
+      projectPath: "/home/me/project",
+      workspaceName: "feature",
+    }).ensureReady();
+
+    expect(result.ready).toBe(false);
+    if (!result.ready) expect(result.error).toContain("xum.instance");
+    expect(spawned).toBe(0);
+  });
+
+  it("sees a label removed after a turn once the ready cache window has passed", async () => {
+    const sandbox = rig.plane.addSandbox({ id: "sb-handed-back" });
+    const turn = () => makeRuntime({ sandboxId: "sb-handed-back", shared: false }).ensureReady();
+    expect(await turn()).toEqual({ ready: true });
+
+    // The user (or another backend) hands the sandbox back by dropping the label.
+    sandbox.labels = {};
+    rig.clock.now += DAYTONA_READY_CACHE_MS / 2;
+    expect(await turn()).toEqual({ ready: true });
+    rig.clock.now += DAYTONA_READY_CACHE_MS;
+    const refused = await turn();
+    expect(refused.ready).toBe(false);
+    if (!refused.ready) expect(refused.error).toContain("xum.instance");
+  });
+
+  it("proves a sandbox is this install's once per ready cache window", async () => {
     rig.plane.addSandbox({ id: "sb-own" });
     const lookups = () => rig.plane.countCalls("GET /sandbox/sb-own");
     const perCheck: number[] = [];

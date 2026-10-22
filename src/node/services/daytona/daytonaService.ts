@@ -362,11 +362,12 @@ export class DaytonaService {
   private persistedTokensLoaded = false;
   private readonly readyRequests = new Map<string, SandboxReadyRequest>();
   /**
-   * Sandboxes this process proved carry this install's label (never ones that do not), so a
-   * turn pays one label read per sandbox per process. Dropped with a delete or a handoff, and
-   * with the account.
+   * When this process last proved a sandbox carries this install's label (never one that does
+   * not). A turn reuses a proof within DAYTONA_READY_CACHE_MS, so a label someone else removed
+   * is seen within that window and a healthy sandbox pays one label read per window. Dropped
+   * with a delete or a handoff, and with the account.
    */
-  private readonly provenOwned = new Set<string>();
+  private readonly provenOwned = new Map<string, number>();
   private readonly ownershipRequests = new Map<string, Promise<"owned" | "notOwned" | "missing">>();
   /** Why the setup of a sandbox Xum created (and then deleted) failed, for later turns. */
   private readonly setupFailures = new Map<string, string>();
@@ -1201,7 +1202,8 @@ export class DaytonaService {
   ): Promise<"owned" | "notOwned" | "missing"> {
     // Only a turn or terminal reuses a proof: removals and archives read the label again.
     if (!options.reuseProof) return this.ownershipWith((await this.getClient()).client, sandboxId);
-    if (this.provenOwned.has(sandboxId)) return "owned";
+    const provenAt = this.provenOwned.get(sandboxId);
+    if (provenAt !== undefined && this.now() - provenAt < DAYTONA_READY_CACHE_MS) return "owned";
     // Concurrent checks share one read, so they reach the shared start together.
     const request = this.ownershipRequests.get(sandboxId) ?? this.proveOwnership(sandboxId);
     return raceAbort(request, options.signal);
@@ -1212,9 +1214,9 @@ export class DaytonaService {
     const request = (async () => {
       const ownership = await this.ownershipWith((await this.getClient()).client, sandboxId);
       // A proof from before a settings change belongs to the old account.
-      if (ownership === "owned" && generation === this.credentialsGeneration) {
-        this.provenOwned.add(sandboxId);
-      }
+      if (ownership !== "owned") this.provenOwned.delete(sandboxId);
+      else if (generation === this.credentialsGeneration)
+        this.provenOwned.set(sandboxId, this.now());
       return ownership;
     })().finally(() => this.ownershipRequests.delete(sandboxId));
     this.ownershipRequests.set(sandboxId, request);

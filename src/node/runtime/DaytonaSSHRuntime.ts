@@ -412,20 +412,31 @@ export class DaytonaSSHRuntime extends SSHRuntime {
           errorType: "runtime_not_ready",
         };
       }
-      const setupFailure = this.setupFailureResult(sandboxId);
-      if (setupFailure) return setupFailure;
       const emitStatus = makeStatusEmitter(options?.statusSink);
+      // Before the ready cache too: another workspace (one that attached the sandbox) may have
+      // made it ready.
+      const refusal =
+        this.setupFailureResult(sandboxId) ??
+        (await this.refuseUnownedSandbox(sandboxId, emitStatus, options?.signal));
+      if (refusal) return refusal;
       if (this.daytonaService.isSandboxReady(sandboxId)) {
         return this.ensureReadyFromCache(options, emitStatus);
       }
-
-      emitStatus("checking");
-      const failure = await this.bringSandboxUp(sandboxId, emitStatus, options?.signal);
-      if (failure) return failure;
-      const result = await this.markReadyIfRepoPresent(sandboxId, options, emitStatus);
-      if (result.ready) this.restartsStoppedSandbox = true;
-      return result;
+      return this.ensureReadyUncached(sandboxId, options, emitStatus);
     });
+  }
+
+  private async ensureReadyUncached(
+    sandboxId: string,
+    options: EnsureReadyOptions | undefined,
+    emitStatus: StatusEmitter
+  ): Promise<EnsureReadyResult> {
+    emitStatus("checking");
+    const failure = await this.bringSandboxUp(sandboxId, emitStatus, options?.signal);
+    if (failure) return failure;
+    const result = await this.markReadyIfRepoPresent(sandboxId, options, emitStatus);
+    if (result.ready) this.restartsStoppedSandbox = true;
+    return result;
   }
 
   private setupFailureResult(sandboxId: string): EnsureReadyResult | undefined {
@@ -594,7 +605,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     log.info("Daytona sandbox is not running; starting it and retrying the command once", {
       sandboxId,
     });
-    const failure = await this.bringSandboxUp(sandboxId, () => undefined, abortSignal);
+    // The proof ensureReady took may have expired since; a lapsed one is read again.
+    const failure =
+      (await this.refuseUnownedSandbox(sandboxId, () => undefined, abortSignal)) ??
+      (await this.bringSandboxUp(sandboxId, () => undefined, abortSignal));
     if (failure && !failure.ready) {
       log.warn("Could not restart the Daytona sandbox", { sandboxId, error: failure.error });
       return false;
@@ -645,8 +659,6 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     emitStatus: StatusEmitter,
     signal: AbortSignal | undefined
   ): Promise<EnsureReadyResult | undefined> {
-    const refusal = await this.refuseUnownedSandbox(sandboxId, emitStatus, signal);
-    if (refusal) return refusal;
     try {
       await this.daytonaService.ensureSandboxReady(sandboxId, {
         onStarting: () => emitStatus("starting", "Starting sandbox..."),
