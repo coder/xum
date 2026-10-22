@@ -156,7 +156,6 @@ const SortableTab: React.FC<{
               <TabCloseButton
                 label={item.closeLabel}
                 selected={item.selected}
-                tabbable={isTabStop}
                 onClose={item.onClose}
               />
             )}
@@ -182,13 +181,10 @@ const SortableTab: React.FC<{
 const TabCloseButton: React.FC<{
   label: string;
   selected: boolean;
-  /** Only the tab stop's X is in the Tab order, so Shift+Tab from it leaves the row (#7102). */
-  tabbable: boolean;
   onClose: () => void;
 }> = (props) => (
   <button
     type="button"
-    tabIndex={props.tabbable ? undefined : -1}
     className={cn(
       // Touch grows the X to a 24px target (44px on phones, from the global phone floor). Its
       // fill would then paint a grey square beside every unselected tab label, so touch keeps
@@ -397,46 +393,6 @@ function handleTabStripKeyDown(event: React.KeyboardEvent<HTMLElement>): void {
 }
 
 /**
- * The roving tab stop: the one tab that Tab and Shift+Tab reach. While focus is in the row, it is
- * the focused tab, so Shift+Tab from a tab reached by the arrow keys leaves the row instead of
- * going back to the selected tab. Otherwise it is the selected tab, or the first enabled one.
- */
-function useRovingTabStop(items: RightSidebarTabStripItem[]): {
-  tabStopId: string | undefined;
-  onFocus: (event: React.FocusEvent<HTMLElement>) => void;
-  onBlur: (event: React.FocusEvent<HTMLElement>) => void;
-} {
-  const [focusedTabId, setFocusedTabId] = React.useState<string | null>(null);
-  return {
-    tabStopId: pickTabStopId(items, focusedTabId),
-    // Focus on a control inside a tab (its close button) keeps that tab as the stop.
-    onFocus: (event) => {
-      if (event.target.getAttribute("role") === "tab") setFocusedTabId(event.target.id);
-    },
-    onBlur: (event) => {
-      if (!focusStaysIn(event)) setFocusedTabId(null);
-    },
-  };
-}
-
-function pickTabStopId(
-  items: RightSidebarTabStripItem[],
-  focusedTabId: string | null
-): string | undefined {
-  const enabled = items.filter((item) => !item.disabled);
-  return (
-    enabled.find((item) => item.id === focusedTabId)?.id ??
-    enabled.find((item) => item.selected)?.id ??
-    enabled[0]?.id
-  );
-}
-
-function focusStaysIn(event: React.FocusEvent<HTMLElement>): boolean {
-  const next = event.relatedTarget;
-  return next instanceof Node && event.currentTarget.contains(next);
-}
-
-/**
  * One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges) while the
  * controls after it stay in view. Its wrapper holds the desktop no-drag box over the row's
  * visible part (see the strip's drag regions). `rowRef` is destructured on purpose: React
@@ -450,7 +406,10 @@ const TabScrollRow: React.FC<{
   tabsetId: string;
   isDesktop: boolean;
 }> = ({ rowRef, ...props }) => {
-  const rovingTabStop = useRovingTabStop(props.items);
+  // Tab reaches the selected tab, or the first enabled one when none is selected.
+  const tabStopId =
+    props.items.find((item) => item.selected && !item.disabled)?.id ??
+    props.items.find((item) => !item.disabled)?.id;
   return (
     <div className="relative flex min-w-0">
       {props.isDesktop && (
@@ -463,8 +422,6 @@ const TabScrollRow: React.FC<{
         aria-label={props.ariaLabel}
         className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
         onKeyDown={handleTabStripKeyDown}
-        onFocus={rovingTabStop.onFocus}
-        onBlur={rovingTabStop.onBlur}
       >
         {props.items.map((item, index) => (
           <SortableTab
@@ -472,7 +429,7 @@ const TabScrollRow: React.FC<{
             item={item}
             index={index}
             tabsetId={props.tabsetId}
-            isTabStop={item.id === rovingTabStop.tabStopId}
+            isTabStop={item.id === tabStopId}
           />
         ))}
       </div>

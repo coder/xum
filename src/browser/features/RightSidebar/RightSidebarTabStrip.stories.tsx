@@ -403,16 +403,6 @@ export const ArrowKeys: Story = {
     await expect(second).toHaveFocus();
     // Focus moves; the selection stays until Enter or Space.
     await expect(first).toHaveAttribute("aria-selected", "true");
-    // The tab stop moves with focus, so Shift+Tab leaves the row instead of going back to the
-    // selected tab. Coming back, Tab lands on the selected tab again.
-    await expect(tabStops()).toEqual([second]);
-    await userEvent.tab({ shift: true });
-    await expect(row.contains(document.activeElement)).toBe(false);
-    await expect(tabStops()).toEqual([first]);
-
-    first.focus();
-    await userEvent.keyboard("{ArrowRight}");
-    await expect(second).toHaveFocus();
     await userEvent.keyboard("{End}");
     await expect(last).toHaveFocus();
     await expectFullyInRow(row, last);
