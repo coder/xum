@@ -324,6 +324,8 @@ export interface ToolConfiguration {
   allowLegacyInvalidWorkflowAgentOutputSchema?: boolean;
   /** Enable agent_report tool (only valid for child task workspaces) */
   enableAgentReport?: boolean;
+  /** A scratch chat: no repository, and its sub-agents share its folder. */
+  scratchWorkspace?: boolean;
   /**
    * Enable RLM family messaging tools (task_message_parent / task_message_sibling).
    * Only valid for child task workspaces whose task record was stamped with the rlm
@@ -945,6 +947,37 @@ export function getForcedXaiSearchToolNames(
   return toolNames.length > 0 ? toolNames : undefined;
 }
 
+/** The getAvailableTools options that match what this workspace's config can run. */
+function toolAllowlistOptions(
+  config: ToolConfiguration
+): NonNullable<Parameters<typeof getAvailableTools>[1]> {
+  return {
+    enableAgentReport: config.enableAgentReport,
+    enableFamilyMessaging: config.enableFamilyMessaging,
+    enableAnalyticsQuery: Boolean(config.analyticsService),
+    enableDynamicWorkflows: Boolean(config.workflowService),
+    enableIntuition: Boolean(config.intuitionRuntime),
+    enableSessionHistory: config.experiments?.tokenBudget === true,
+    enableMemory: Boolean(config.memoryService && config.experiments?.memory),
+    enableTimelineEvent: Boolean(config.timelineService),
+    enableArtifacts:
+      config.experiments?.artifacts === true && config.xumEnv?.XUM_SCRATCH_DIR != null,
+    enableToolSearch: Boolean(config.toolSearchRuntime),
+    enableMcpPromptGet: Boolean(config.mcpPromptRuntime),
+    // The Review pane belongs to the user-facing parent workspace. config
+    // .enableAgentReport is the canonical "is sub-agent" signal (set true iff
+    // the workspace has a parentWorkspaceId), so withhold the review_pane_*
+    // tools from sub-agents to keep the toolset in sync with the system prompt.
+    // Scratch chats have no repository, so no Review pane either.
+    enableReviewPane: !config.enableAgentReport && config.scratchWorkspace !== true,
+    // Scratch sub-agents share the chat's folder and never produce patches.
+    enableGitPatches: config.scratchWorkspace !== true,
+    // Xum global tools are always created; tool policy (agent frontmatter)
+    // controls which agents can actually use them.
+    enableMuxGlobalAgentsTools: true,
+  };
+}
+
 export async function getToolsForModel(
   modelString: string,
   config: ToolConfiguration,
@@ -1224,28 +1257,7 @@ export async function getToolsForModel(
   // Filter tools to the canonical allowlist so system prompt + toolset stay in sync.
   // Include MCP tools even if they're not in getAvailableTools().
   const allowlistedToolNames = new Set(
-    getAvailableTools(capabilityModelString, {
-      enableAgentReport: config.enableAgentReport,
-      enableFamilyMessaging: config.enableFamilyMessaging,
-      enableAnalyticsQuery: Boolean(config.analyticsService),
-      enableDynamicWorkflows: Boolean(config.workflowService),
-      enableIntuition: Boolean(config.intuitionRuntime),
-      enableSessionHistory: config.experiments?.tokenBudget === true,
-      enableMemory: Boolean(config.memoryService && config.experiments?.memory),
-      enableTimelineEvent: Boolean(config.timelineService),
-      enableArtifacts:
-        config.experiments?.artifacts === true && config.xumEnv?.XUM_SCRATCH_DIR != null,
-      enableToolSearch: Boolean(config.toolSearchRuntime),
-      enableMcpPromptGet: Boolean(config.mcpPromptRuntime),
-      // The Review pane belongs to the user-facing parent workspace. config
-      // .enableAgentReport is the canonical "is sub-agent" signal (set true iff
-      // the workspace has a parentWorkspaceId), so withhold the review_pane_*
-      // tools from sub-agents to keep the toolset in sync with the system prompt.
-      enableReviewPane: !config.enableAgentReport,
-      // Xum global tools are always created; tool policy (agent frontmatter)
-      // controls which agents can actually use them.
-      enableMuxGlobalAgentsTools: true,
-    })
+    getAvailableTools(capabilityModelString, toolAllowlistOptions(config))
   );
   for (const toolName of Object.keys(mcpTools ?? {})) {
     allowlistedToolNames.add(toolName);

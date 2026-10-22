@@ -2704,6 +2704,7 @@ export class TurnRequestBuilder {
       goalToolContext,
       // Only child workspaces (tasks) can report to a parent.
       enableAgentReport: Boolean(metadata.parentWorkspaceId),
+      scratchWorkspace: metadata.kind === "scratch",
       // Workflow-owned workers are excluded: they hand results to WorkflowRunner through the
       // journal path.
       enableFamilyMessaging:

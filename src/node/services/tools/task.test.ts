@@ -1,4 +1,5 @@
 import { describe, it, expect, mock } from "bun:test";
+import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { TaskCreatedEvent } from "@/common/types/stream";
 
 import { tool } from "ai";
@@ -78,6 +79,32 @@ describe("task tool", () => {
     });
 
     expect(tool.description).toContain(guidance);
+  });
+
+  it("adds the desktop delegation hint only when the desktop agent is listed", () => {
+    using tempDir = new TestTempDir("test-task-tool-desktop-hint");
+    const agent = (id: string): AgentDefinitionDescriptor => ({
+      id,
+      scope: "built-in",
+      name: id,
+      description: `${id} agent`,
+      uiSelectable: false,
+      subagentRunnable: true,
+    });
+    const descriptionFor = (ids: string[]) =>
+      String(
+        createTaskTool({
+          ...createTestToolConfig(tempDir.path),
+          availableSubagents: ids.map(agent),
+        }).description
+      );
+    const base = descriptionFor(["explore"]);
+
+    // Another agent adds only its own list line; desktop adds its line plus a paragraph.
+    expect(descriptionFor(["explore", "exec"]).slice(base.length).split("\n\n")).toHaveLength(1);
+    const desktop = descriptionFor(["explore", "desktop"]);
+    expect(desktop.startsWith(base)).toBe(true);
+    expect(desktop.slice(base.length).split("\n\n")).toHaveLength(2);
   });
 
   // The advertised inputSchema is the raw (strict) Zod schema. A `.strict()` schema that omits

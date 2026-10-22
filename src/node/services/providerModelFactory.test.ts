@@ -6413,6 +6413,38 @@ describe("ProviderModelFactory Ollama tool schemas", () => {
   });
 });
 
+describe("ProviderModelFactory tool schema compaction", () => {
+  unsetEnvForEachTest("ANTHROPIC_BASE_URL");
+
+  it("sends Anthropic built-in tool schemas without $schema or optional nulls", async () => {
+    let sent: Array<{ name: string; input_schema: Record<string, unknown> }> = [];
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ anthropic: { apiKey: "test-key" } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("anthropic:claude-opus-5-5");
+        if (!result.success) throw new Error(result.error.type);
+        const tools = { task_await: tool({ inputSchema: TOOL_DEFINITIONS.task_await.schema }) };
+        // The fake response is not a valid message, so only the request matters.
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+        await expect(
+          generateText({ model: result.data, prompt: "hello", tools, maxRetries: 0 })
+        ).rejects.toThrow();
+        expect(calls).toHaveLength(1);
+        sent = parseSentBody(calls[0]).tools as typeof sent;
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+
+    expect(sent.map((entry) => entry.name)).toEqual(["task_await"]);
+    const schema = sent[0].input_schema;
+    expect(schema).not.toHaveProperty("$schema");
+    expect(JSON.stringify(schema)).not.toContain('"null"');
+  });
+});
+
 describe("ProviderModelFactory prompt-cache prefix observation", () => {
   const recorded: TimelineEventDraft[] = [];
   const recorder = {
