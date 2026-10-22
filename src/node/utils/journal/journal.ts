@@ -19,7 +19,8 @@
 import assert from "node:assert";
 import * as fs from "fs/promises";
 import * as path from "path";
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { log } from "@/node/services/log";
 
 /** Default bound on waiting for the append lock (see JournalOptions). */
@@ -61,6 +62,8 @@ export interface JournalOptions<T> {
    * test).
    */
   testOnlyBeforeAppendWrite?: () => Promise<void>;
+  /** The session locks (phase 4); the default is the Node layer. */
+  locks?: SessionLocks;
 }
 
 export class Journal<T> {
@@ -72,6 +75,7 @@ export class Journal<T> {
   private readonly appendLockTimeoutMs: number;
   private readonly onAppended?: JournalOptions<T>["onAppended"];
   private readonly testOnlyBeforeAppendWrite?: () => Promise<void>;
+  private readonly locks: SessionLocks;
   /** Next sequence to assign; null until the file has been scanned once. */
   private nextSeq: number | null = null;
   /**
@@ -95,6 +99,7 @@ export class Journal<T> {
     assert(this.appendLockTimeoutMs > 0, "Journal appendLockTimeoutMs must be positive");
     this.onAppended = options.onAppended;
     this.testOnlyBeforeAppendWrite = options.testOnlyBeforeAppendWrite;
+    this.locks = options.locks ?? nodeSessionLocks;
   }
 
   /**
@@ -108,7 +113,7 @@ export class Journal<T> {
       // Cross-process serialization: seq derivation and the write must be one
       // exclusive unit, or a concurrent writer in another process (debug CLI
       // vs live backend) could assign the same sequence number.
-      await using lock = await acquireProcessFileLock({
+      await using lock = await this.locks.acquireProcessFileLock({
         lockPath: this.lockPath,
         timeoutMs: this.appendLockTimeoutMs,
         label: "append lock",

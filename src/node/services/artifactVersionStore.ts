@@ -13,7 +13,8 @@ import { assert } from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
-import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 /**
@@ -117,7 +118,8 @@ export interface RecordArtifactVersionParams {
   pin?: ArtifactPin | null;
   nowMs?: number;
   /** Checked under the index lock: an aborted publish writes nothing. */
-  abortSignal?: AbortSignal;
+  abortSignal?: AbortSignal; /** The session locks (phase 4); callers outside the session lock owners keep the Node layer. */
+  locks?: SessionLocks;
 }
 
 export const ARTIFACT_PUBLISH_INTERRUPTED = "Publish was interrupted";
@@ -137,7 +139,11 @@ export async function recordArtifactVersion(
   const artifactId = getArtifactId(params.relPath);
   const dir = artifactDir(params.sessionDir, artifactId);
   return indexLocks.withLock(dir, async () => {
-    await using _fileLock = await acquireIndexFileLock(dir, params.abortSignal);
+    await using _fileLock = await acquireIndexFileLock(
+      dir,
+      params.abortSignal,
+      params.locks ?? nodeSessionLocks
+    );
     const existing = await readArtifactIndex(params.sessionDir, artifactId);
     const index: ArtifactVersionIndex = existing ?? {
       id: artifactId,
@@ -203,12 +209,13 @@ export async function recordArtifactVersion(
  */
 async function acquireIndexFileLock(
   dir: string,
-  abortSignal: AbortSignal | undefined
+  abortSignal: AbortSignal | undefined,
+  locks: SessionLocks
 ): Promise<AsyncDisposable> {
   // Checked first: acquiring creates the artifact dir, and a cancelled publish writes nothing.
   if (abortSignal?.aborted) throw new Error(ARTIFACT_PUBLISH_INTERRUPTED);
   try {
-    const release = await acquireCrossProcessLock({
+    const release = await locks.acquireCrossProcessLock({
       lockPath: path.join(dir, INDEX_LOCK_FILE_NAME),
       acquireTimeoutMs: 30_000,
       staleMs: 60_000,

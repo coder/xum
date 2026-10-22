@@ -34,10 +34,9 @@ import {
   parseProcessIdentity,
   type ProcessIdentity,
 } from "@/node/utils/concurrency/processLiveness";
-import {
-  acquireCrossProcessLock,
-  CrossProcessLockTimeoutError,
-} from "@/node/utils/main/crossProcessLock";
+import { CrossProcessLockTimeoutError } from "@/node/utils/concurrency/lockErrors";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { workflowRunStreamHub } from "@/node/services/workflows/workflowRunStreamHub";
 import { KeyedFifoLock } from "@/node/services/workflows/keyedFifoLock";
 
@@ -114,6 +113,8 @@ export interface WorkflowRunStoreOptions {
   staleLeaseMs?: number;
   /** Test seam: how long a journal/lease mutation waits for its locks before timing out. */
   mutationLockWaitTimeoutMs?: number;
+  /** The session locks (phase 4); every caller today keeps the Node layer. */
+  locks?: SessionLocks;
 }
 
 export interface CreateWorkflowRunInput {
@@ -219,6 +220,7 @@ export class WorkflowRunStore {
   private readonly sessionDir: string;
   private readonly staleLeaseMs: number;
   private readonly mutationLockWaitTimeoutMs: number | undefined;
+  private readonly locks: SessionLocks;
   /** Live draining-owner capabilities by run id; see WorkflowCancellationSettlement. */
   private readonly cancellationSettlements = new Map<string, WorkflowCancellationSettlement>();
 
@@ -231,6 +233,7 @@ export class WorkflowRunStore {
       "WorkflowRunStore: mutationLockWaitTimeoutMs must be positive"
     );
     this.mutationLockWaitTimeoutMs = options.mutationLockWaitTimeoutMs;
+    this.locks = options.locks ?? nodeSessionLocks;
   }
 
   async createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunRecord> {
@@ -1107,6 +1110,7 @@ export class WorkflowRunStore {
     const leaseFile = this.leaseFile(runId);
     // Single attempt, as before: a busy lease lock reads as "another runner is active".
     const attempt = await tryWithWorkflowFileLock(
+      this.locks,
       this.leaseLockFile(runId),
       this.leaseMutationLockStaleMs(),
       async () => {
@@ -1144,10 +1148,11 @@ export class WorkflowRunStore {
     return this.mutationLockWaitTimeoutMs ?? Math.max(30_000, this.leaseMutationLockStaleMs() * 4);
   }
 
-  private workflowLockOptions(): { staleMs: number; acquireTimeoutMs: number } {
+  private workflowLockOptions(): WorkflowLockOptions {
     return {
       staleMs: this.leaseMutationLockStaleMs(),
       acquireTimeoutMs: this.leaseMutationWaitTimeoutMs(),
+      locks: this.locks,
     };
   }
 
@@ -1724,12 +1729,13 @@ const workflowLockQueue = new KeyedFifoLock();
  * acquire itself fail leaves no window between an existence check and the publication.
  */
 async function acquireWorkflowCrossProcessLock(
+  locks: SessionLocks,
   lockPath: string,
   acquireTimeoutMs: number,
   staleMs: number,
   timeoutMessage: string
 ): Promise<() => Promise<void>> {
-  return await acquireCrossProcessLock({
+  return await locks.acquireCrossProcessLock({
     lockPath,
     acquireTimeoutMs,
     staleMs,
@@ -1744,9 +1750,15 @@ async function acquireWorkflowCrossProcessLock(
  * finally removed the lock unconditionally, deleting a successor's. crossProcessLock never takes a
  * lock from a live holder and its release removes only its own record.
  */
+interface WorkflowLockOptions {
+  staleMs: number;
+  acquireTimeoutMs: number;
+  locks: SessionLocks;
+}
+
 async function withWorkflowFileLock<T>(
   lockPath: string,
-  options: { staleMs: number; acquireTimeoutMs: number },
+  options: WorkflowLockOptions,
   operation: () => Promise<T>
 ): Promise<T> {
   // One budget covers the in-process queue and the cross-process acquire. A waiter behind a hung
@@ -1760,6 +1772,7 @@ async function withWorkflowFileLock<T>(
   }
   try {
     const release = await acquireWorkflowCrossProcessLock(
+      options.locks,
       lockPath,
       Math.max(0, deadline - Date.now()),
       options.staleMs,
@@ -1777,6 +1790,7 @@ async function withWorkflowFileLock<T>(
 
 /** One attempt, in-process and cross-process; `{ acquired: false }` while anyone holds the lock. */
 async function tryWithWorkflowFileLock<T>(
+  locks: SessionLocks,
   lockPath: string,
   staleMs: number,
   operation: () => Promise<T>
@@ -1789,6 +1803,7 @@ async function tryWithWorkflowFileLock<T>(
     let release: () => Promise<void>;
     try {
       release = await acquireWorkflowCrossProcessLock(
+        locks,
         lockPath,
         0,
         staleMs,
