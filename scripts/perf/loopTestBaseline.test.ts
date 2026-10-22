@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loopTestFiles, patchesGlobalTime, runFile, runPool } from "./loopTestBaseline";
+import { loopTestFiles, patchesGlobalTime, recordName, runFile, runPool } from "./loopTestBaseline";
 import { summarizeFile } from "./loopTestStats";
 
 let root: string;
@@ -148,4 +148,11 @@ describe("runPool", () => {
     );
     expect(started).toEqual(["slow"]);
   });
+});
+
+test("recordName keeps a filtered or short run off the full record of a commit", () => {
+  const sha = "0123456789abcdef";
+  expect(recordName(sha, false, undefined, 10)).toBe("0123456789");
+  expect(recordName(sha, true, undefined, 10)).toBe("0123456789-dirty");
+  expect(recordName(sha, false, "tools/bash", 2)).toBe("0123456789-tools_bash-r2");
 });
