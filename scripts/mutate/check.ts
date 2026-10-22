@@ -1,7 +1,8 @@
 // make mutate-check: run mutants in the functions changed since BASE and list
-// the ones the unit tests do not kill (scripts/mutate/mutate_report.py). The
-// mutation gate only warns: a surviving mutant can be equivalent (no input
-// tells it apart), and only a reader can tell.
+// the ones the unit tests do not kill (scripts/mutate/mutate_report.py). A
+// surviving mutant can be equivalent (no input tells it apart), and only a
+// reader can tell: a `mutation-equivalent: <reason>` comment accepts it
+// (scripts/crap/markers.py), and its row becomes "equivalent".
 // Exit 0 no survivors, 1 survivors, 2 tool error (no report), 3 a test file
 // failed without a mutant (the report lists it; its mutants did not run).
 //
@@ -19,7 +20,15 @@ import { changesSince } from "../crap/changes";
 
 const ADAPTER = join(import.meta.dir, "mutate_report.py");
 
-export type Outcome = "killed" | "survived" | "uncovered" | "no-test" | "not-run" | "error";
+export type Outcome =
+  | "killed"
+  | "survived"
+  /** A survivor under a `mutation-equivalent: <reason>` marker (scripts/crap/markers.py). */
+  | "equivalent"
+  | "uncovered"
+  | "no-test"
+  | "not-run"
+  | "error";
 
 export interface MutantRow {
   path: string;
@@ -30,7 +39,7 @@ export interface MutantRow {
   /** The replacement; "" deletes the original token. */
   mutant: string;
   outcome: Outcome;
-  /** Why an "error" row has no result (the runner's exception). */
+  /** An "error" row's exception, or an "equivalent" row's marker reason. */
   reason?: string;
 }
 
@@ -50,6 +59,7 @@ export function counts(report: MutateReport): Record<Outcome, number> {
   const result: Record<Outcome, number> = {
     killed: 0,
     survived: 0,
+    equivalent: 0,
     uncovered: 0,
     "no-test": 0,
     "not-run": 0,
@@ -80,7 +90,7 @@ function verdict(report: MutateReport): string {
 export function formatReport(report: MutateReport): string {
   const c = counts(report);
   const lines = [
-    `mutate-check: ${verdict(report)}, ${c.killed} killed, ${c.uncovered} uncovered, ${c["no-test"]} without a test, ${c["not-run"]} not run${c.error > 0 ? `, ${c.error} error(s)` : ""} (base ${report.base.slice(0, 10)}, ${report.seconds}s)`,
+    `mutate-check: ${verdict(report)}, ${c.killed} killed${c.equivalent > 0 ? `, ${c.equivalent} equivalent` : ""}, ${c.uncovered} uncovered, ${c["no-test"]} without a test, ${c["not-run"]} not run${c.error > 0 ? `, ${c.error} error(s)` : ""} (base ${report.base.slice(0, 10)}, ${report.seconds}s)`,
   ];
   const survivors = report.mutants.filter((row) => row.outcome === "survived");
   for (const path of [...new Set(survivors.map((row) => row.path))]) {
@@ -95,6 +105,9 @@ export function formatReport(report: MutateReport): string {
   if (untested.length > 0) lines.push(`  no passing unit test imports: ${untested.join(", ")}`);
   for (const dropped of report.droppedTests) {
     lines.push(`  dropped test ${dropped.path}: ${dropped.reason}`);
+  }
+  for (const row of report.mutants.filter((r) => r.outcome === "equivalent")) {
+    lines.push(`  equivalent :${row.line} ${describe(row)} in ${row.path}: ${row.reason ?? ""}`);
   }
   for (const row of report.mutants.filter((r) => r.outcome === "error")) {
     lines.push(`  error :${row.line} ${describe(row)} in ${row.path}: ${row.reason ?? "unknown"}`);

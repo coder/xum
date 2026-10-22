@@ -118,3 +118,23 @@ test(
   },
   SLOW
 );
+
+test(
+  "a mutation-equivalent marker accepts a survivor",
+  () => {
+    write(
+      "src/age.ts",
+      AGE.replace("export", "// mutation-equivalent: no caller passes 18\nexport").replace(
+        "age >= 18",
+        "age >= 18 /* touched */"
+      )
+    );
+
+    const { status, report } = check();
+
+    expect(status).toBe(0);
+    expect(outcomes(report)).toEqual([">=>>:equivalent"]);
+    expect(report?.mutants[0].reason).toBe("no caller passes 18");
+  },
+  SLOW
+);

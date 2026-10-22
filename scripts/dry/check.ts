@@ -1,7 +1,8 @@
 // make dry-check: report near-duplicate functions that the changes since BASE
-// make (scripts/dry/dryer_report.py). The DRY gate only warns: a duplicate
-// can be on purpose, and only a reader can tell.
-// Exit 0 no findings, 1 findings, 2 tool error.
+// make (scripts/dry/dryer_report.py). A duplicate can be on purpose: a
+// `dry-duplicate-ok: <reason>` comment in the changed function accepts it
+// (scripts/crap/markers.py), and the report lists it with the reason.
+// Exit 0 no findings, 1 findings that no marker accepts, 2 tool error.
 //
 //   bun scripts/dry/check.ts --base <ref> [--json]
 //
@@ -28,6 +29,8 @@ export interface DryPair {
   /** A function that the diff changed. */
   left: DrySpan;
   right: DrySpan;
+  /** The reason of a `dry-duplicate-ok:` marker on a changed side, if any. */
+  accepted?: string;
 }
 
 export interface DryReport {
@@ -41,15 +44,22 @@ function where(span: DrySpan): string {
   return `${span.path}:${span.startLine}-${span.endLine} ${span.name}`;
 }
 
+/** Pairs that no `dry-duplicate-ok:` marker accepts. */
+export function findings(report: DryReport): DryPair[] {
+  return report.pairs.filter((pair) => pair.accepted === undefined);
+}
+
 export function formatReport(report: DryReport): string {
+  const open = findings(report);
+  const accepted = report.pairs.length - open.length;
   const lines = [
-    `dry-check: ${report.pairs.length === 0 ? "PASS" : `${report.pairs.length} warning(s)`} (base ${report.base.slice(0, 10)}, ${report.changedFunctions} changed function(s), ${report.compared} compared)`,
+    `dry-check: ${open.length === 0 ? "PASS" : `${open.length} warning(s)`}${accepted > 0 ? `, ${accepted} accepted` : ""} (base ${report.base.slice(0, 10)}, ${report.changedFunctions} changed function(s), ${report.compared} compared)`,
     ...report.pairs.map(
       (pair) =>
-        `  warning  new-duplicate score ${pair.score.toFixed(2)} ${where(pair.left)}\n           matches ${where(pair.right)}`
+        `  ${pair.accepted === undefined ? "warning " : "accepted"} new-duplicate score ${pair.score.toFixed(2)} ${where(pair.left)}\n           matches ${where(pair.right)}${pair.accepted === undefined ? "" : `\n           dry-duplicate-ok: ${pair.accepted}`}`
     ),
   ];
-  if (report.pairs.length > 0) {
+  if (open.length > 0) {
     lines.push(
       "Repair: extract the shared shape if both must change together; else keep both and say why (see .xum/skills/gauntlet)."
     );
@@ -102,7 +112,7 @@ function main(argv: string[]): number {
   if (!values.base) throw new Error("--base <ref> is required");
   const report = runCheck(process.cwd(), values.base);
   console.log(values.json ? JSON.stringify(report, null, 2) : formatReport(report));
-  return report.pairs.length === 0 ? 0 : 1;
+  return findings(report).length === 0 ? 0 : 1;
 }
 
 if (import.meta.main) {

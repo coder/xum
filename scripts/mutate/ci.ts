@@ -1,16 +1,27 @@
 // Quality / Mutation (.github/workflows/pr.yml): run mutate/check.ts on the
 // PR, then write a step summary and one warning annotation per surviving
-// mutant. The mutation gate only warns, so this script always exits 0.
+// mutant. In warn mode (the default) this script always exits 0. In block
+// mode (MUTATION_MODE=block) it exits 1 when a survivor that no
+// `mutation-equivalent:` marker accepts remains. A tool error, a baseline
+// failure, an "error" row or a mutant that did not run never blocks.
 //
 // Coverage: with every Test / Unit shard report (crap-lcov-unit-*), a site on
 // a line that no unit test ran is "uncovered" and does not run. With a shard
 // missing, every site runs, and the summary says so.
 //
-// Env: BASE_REF, LCOV_DIR, EXPECTED_UNIT (shard count), GITHUB_STEP_SUMMARY.
+// Env: BASE_REF, LCOV_DIR, EXPECTED_UNIT (shard count), MUTATION_MODE,
+// GITHUB_STEP_SUMMARY, GITHUB_OUTPUT.
 import { spawnSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import { cell, escapeData, escapeProperty, lcovFiles } from "../crap/ci";
+import {
+  cell,
+  crapMode as gateMode,
+  escapeData,
+  escapeProperty,
+  lcovFiles,
+  type CrapMode,
+} from "../crap/ci";
 import { counts, describe, type MutantRow, type MutateReport } from "./check";
 
 // Kept under the report step's 18-minute timeout (pr.yml), with room for setup.
@@ -40,15 +51,25 @@ export function unitCoverage(
   };
 }
 
-export function summary(report: MutateReport | null, coverage: boolean, toolError: string): string {
+/** 1 only in block mode with a report that has unaccepted survivors. */
+export function exitCode(mode: CrapMode, report: MutateReport | null): number {
+  return mode === "block" && report !== null && counts(report).survived > 0 ? 1 : 0;
+}
+
+export function summary(
+  report: MutateReport | null,
+  coverage: boolean,
+  toolError: string,
+  mode: CrapMode = "warn"
+): string {
   if (report === null) {
-    return `## Mutation\n\nmutate-check failed, so there is no report. It never blocks.\n\n\`\`\`\n${toolError.trim()}\n\`\`\`\n`;
+    return `## Mutation\n\nmutate-check failed, so there is no report. A tool error never blocks.\n\n\`\`\`\n${toolError.trim()}\n\`\`\`\n`;
   }
   const c = counts(report);
   const lines = [
     "## Mutation",
     "",
-    `${c.survived} survived, ${c.killed} killed, ${c.uncovered} uncovered, ${c["no-test"]} without a passing test, ${c["not-run"]} not run, ${c.error} error(s) (${report.seconds}s). This check only warns.`,
+    `${c.survived} survived, ${c.killed} killed, ${c.uncovered} uncovered, ${c["no-test"]} without a passing test, ${c["not-run"]} not run, ${c.error} error(s), ${c.equivalent} accepted as equivalent (${report.seconds}s). ${mode === "block" ? (c.survived > 0 ? "Block mode: the survivors fail this check until a test or a marker clears them." : "Block mode.") : "This check only warns."}`,
     coverage
       ? "Sites on lines that no unit test ran were skipped (uncovered)."
       : "Unit coverage was incomplete, so every site ran.",
@@ -72,8 +93,9 @@ export function summary(report: MutateReport | null, coverage: boolean, toolErro
   return `${lines.join("\n")}\n`;
 }
 
-function main(): void {
+function main(): number {
   const env = process.env;
+  const mode = gateMode(env.MUTATION_MODE);
   const coverage = unitCoverage(env.LCOV_DIR ?? "coverage-shards", Number(env.EXPECTED_UNIT ?? 0));
   const args = [join(import.meta.dir, "check.ts"), "--base", env.BASE_REF ?? "", "--json"];
   args.push("--max-mutants", String(MAX_MUTANTS), "--max-seconds", String(MAX_SECONDS));
@@ -90,15 +112,21 @@ function main(): void {
   for (const row of report?.mutants ?? []) {
     if (row.outcome === "survived") console.log(annotation(row));
   }
-  const text = summary(report, coverage.complete, toolError);
+  const text = summary(report, coverage.complete, toolError, mode);
   console.log(text);
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, text);
+  const code = exitCode(mode, report);
+  // pr.yml's Verdict step fails the job only on this output, so a timeout or
+  // crash of this step (no output) never blocks.
+  if (code === 1 && env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, "verdict=violations\n");
+  return code;
 }
 
 if (import.meta.main) {
   try {
-    main();
+    process.exitCode = main();
   } catch (error) {
+    // A crash in this script is a tool error: it never blocks, in either mode.
     console.log(
       `::warning title=Mutation::Quality / Mutation failed: ${escapeData(String(error))}`
     );

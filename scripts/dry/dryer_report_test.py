@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "crap"))
 
 from dryer_report import Form, base_line, keyed, new_pairs  # noqa: E402
 
@@ -129,3 +130,22 @@ def test_a_new_copy_with_the_name_of_an_old_match_is_reported():
     base = [form("src/a.ts", "@1", 1, SHAPE), form("src/a.ts", "@20", 20, SHAPE)]
     pairs = run([copy, old, cents], base, ["src/a.ts"], {"src/a.ts": [[1, 7]]}, {"src/a.ts": [[0, 0, 1, 7]]})
     assert names(pairs) == [("@1", "@27"), ("@1", "@8")]
+
+
+def test_a_marker_needs_a_reason_and_sits_in_or_right_above_the_span():
+    from markers import marker_reason
+
+    lines = [
+        "const a = 1;",  # 1
+        "/**",  # 2
+        " * dry-duplicate-ok: v1 and v2 parsers must change apart",  # 3
+        " */",  # 4
+        "export function parse() {",  # 5
+        "  return 1; // dry-duplicate-ok:",  # 6, no reason
+        "}",  # 7
+        "// dry-duplicate-ok: far away",  # 8
+    ]
+    assert marker_reason(lines, 5, 7, "dry-duplicate-ok") == "v1 and v2 parsers must change apart"
+    assert marker_reason(lines, 6, 7, "dry-duplicate-ok") is None  # line 6 has no reason, 5 is code
+    assert marker_reason(lines, 1, 1, "dry-duplicate-ok") is None
+    assert marker_reason(["x; /* mutation-equivalent: never empty */"], 1, 1, "mutation-equivalent") == "never empty"

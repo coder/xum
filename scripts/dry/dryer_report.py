@@ -45,6 +45,9 @@ from crapper.languages import functions_in_file
 # Reuse the CRAP gate's production-file rule, so both gates see the same files.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "crap"))
 from crapper_report import is_production, tracked_src_files  # noqa: E402
+from markers import marker_reason  # noqa: E402
+
+MARKER = "dry-duplicate-ok"
 
 # dryer's defaults (dryer/src/dryer/cli.py).
 THRESHOLD = 0.82
@@ -96,6 +99,27 @@ def forms_in(root: Path, relative: str, shown: str, min_lines: int, min_nodes: i
         for e in entries
         if e.end_line - e.start_line + 1 >= min_lines and e.nodes >= min_nodes
     ]
+
+
+def accept_marked(root: Path, pairs: list[dict], spans: dict[str, list[list[float]]]) -> None:
+    """Sets "accepted" to the reason of a `dry-duplicate-ok:` marker (markers.py).
+
+    Only a changed side counts. Otherwise a marker on an old function would
+    excuse every future copy of it.
+    """
+
+    cache: dict[str, list[str]] = {}
+    for pair in pairs:
+        for side in (pair["left"], pair["right"]):
+            changed = any(side["startLine"] <= end and start <= side["endLine"] for start, end in spans.get(side["path"], []))
+            if not changed:
+                continue
+            if side["path"] not in cache:
+                cache[side["path"]] = (root / side["path"]).read_text(encoding="utf-8", errors="replace").split("\n")
+            reason = marker_reason(cache[side["path"]], side["startLine"], side["endLine"], MARKER)
+            if reason is not None:
+                pair["accepted"] = reason
+                break
 
 
 def name_reported(root: Path, pairs: list[dict]) -> None:
@@ -244,6 +268,7 @@ def main(argv: list[str]) -> int:
     hunks = changes.get("hunks", {})
     pairs = new_pairs(head, base_by_path, changed_paths, spans, hunks, args.threshold)
     name_reported(args.root, pairs)
+    accept_marked(args.root, pairs, spans)
     report = {
         "compared": len(head),
         "changedFunctions": sum(1 for form in head.values() if touched(form, spans)),

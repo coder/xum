@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MutateReport } from "./check";
-import { annotation, summary, unitCoverage } from "./ci";
+import { annotation, exitCode, summary, unitCoverage } from "./ci";
 
 let dir: string;
 
@@ -55,4 +55,17 @@ test("the summary lists survivors only, and escapes table cells", () => {
 
 test("the annotation sits on the mutant's line", () => {
   expect(annotation(report.mutants[0]).startsWith("::warning file=src/a.ts,line=4,")).toBe(true);
+});
+
+test("block mode fails only on a survivor that no marker accepts", () => {
+  const only = (outcome: "survived" | "equivalent" | "error" | "not-run") => ({
+    ...report,
+    mutants: [{ ...report.mutants[0], outcome }],
+  });
+  expect(exitCode("block", only("survived"))).toBe(1);
+  expect(exitCode("block", only("equivalent"))).toBe(0);
+  expect(exitCode("block", only("error"))).toBe(0);
+  expect(exitCode("block", only("not-run"))).toBe(0);
+  expect(exitCode("warn", only("survived"))).toBe(0);
+  expect(exitCode("block", null)).toBe(0);
 });

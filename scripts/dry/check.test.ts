@@ -108,3 +108,31 @@ test("a new copy that shares a name with an old match is a finding", () => {
   // name-based base lookup hid (it read B.render's base match as A's).
   expect(pairs.sort()).toEqual(["cents", "render"]);
 });
+
+test("a dry-duplicate-ok marker in the changed function accepts the pair", () => {
+  const marked = bucket("fee").replace(
+    "export function",
+    "// dry-duplicate-ok: fees and cents must change apart\nexport function"
+  );
+  write("src/b.ts", marked);
+  git("add", "-N", "src/b.ts");
+
+  const { status, report } = check();
+
+  expect(status).toBe(0);
+  const reasons = (report.pairs as Array<{ accepted?: string }>).map((p) => p.accepted);
+  expect(reasons).toEqual(["fees and cents must change apart", "fees and cents must change apart"]);
+});
+
+test("a marker on the old side does not excuse a new copy", () => {
+  const path = join(repo, "src/a.ts");
+  writeFileSync(path, `// dry-duplicate-ok: an old excuse\n${readFileSync(path, "utf8")}`);
+  git("commit", "-qam", "old marker");
+  write("src/b.ts", bucket("fee"));
+  git("add", "-N", "src/b.ts");
+
+  const { status, report } = check();
+
+  expect(status).toBe(1);
+  expect((report.pairs as Array<{ accepted?: string }>).some((p) => p.accepted)).toBe(false);
+});

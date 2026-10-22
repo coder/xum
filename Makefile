@@ -588,8 +588,9 @@ test-crap-scripts: tree-sitter-grammars ## Test the Crapper adapter (hand-counte
 	@bun test ./scripts/crap/check.test.ts ./scripts/crap/agentGate.test.ts
 
 # DRY gate (scripts/dry/): near-duplicate functions that the changes since
-# BASE make. It only warns; see .xum/skills/gauntlet. The script exits 0 no
-# findings, 1 findings, 2 tool error; CI calls it through scripts/dry/ci.ts.
+# BASE make (CI's mode: DRY_MODE; see .xum/skills/gauntlet). The script exits
+# 0 no findings, 1 findings that no marker accepts, 2 tool error; CI calls
+# it through scripts/dry/ci.ts.
 dry-check: ## DRY gate on functions changed since BASE (default: merge-base with origin/main) [DRY_CHECK_ARGS=--json]
 	@bun scripts/dry/check.ts --base "$(or $(BASE),$$(git merge-base origin/main HEAD))" $(DRY_CHECK_ARGS)
 
@@ -600,8 +601,9 @@ test-dry-scripts: tree-sitter-grammars ## Test the dryer adapter and dry-check e
 	@bun test ./scripts/dry/check.test.ts
 
 # Mutation gate (scripts/mutate/): mutants in the functions changed since BASE
-# that the unit tests do not kill. It only warns; see .xum/skills/gauntlet.
-# The script exits 0 no survivors, 1 survivors, 2 tool error, 3 a test failed
+# that the unit tests do not kill (CI's mode: MUTATION_MODE; see
+# .xum/skills/gauntlet). The script exits 0 no survivors, 1 survivors that no
+# marker accepts, 2 tool error, 3 a test failed
 # without a mutant; CI calls it through scripts/mutate/ci.ts.
 mutate-check: ## Mutation gate on functions changed since BASE (default: merge-base with origin/main) [COVERAGE="<lcov>..."] [MUTATE_CHECK_ARGS=--json]
 	@bun scripts/mutate/check.ts --base "$(or $(BASE),$$(git merge-base origin/main HEAD))" \
