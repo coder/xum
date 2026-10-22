@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { CheckCircle2, Loader2, XCircle } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Input } from "@/browser/components/Input/Input";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import { DAYTONA_DEFAULT_API_URL } from "@/common/constants/daytona";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { DaytonaPublicConfig } from "@/common/orpc/schemas/daytona";
@@ -34,15 +34,15 @@ function describeKey(config: DaytonaPublicConfig | null): string {
   return config.apiKeySource === "env" ? "Key set (env)" : "Key set (settings)";
 }
 
-type DaytonaApi = NonNullable<ReturnType<typeof useAPI>["api"]>;
-
 /**
  * The saved public config (never the key itself), loaded each time the connection becomes live:
  * while Xum reconnects the last client may stay (and come back), and its calls fail at once.
+ * `loads` counts the loads that succeeded: an action's error belongs to the load it ran under.
  */
-function useDaytonaPublicConfig(liveApi: DaytonaApi | null) {
+function useDaytonaPublicConfig(liveApi: APIClient | null) {
   const [config, setConfig] = useState<DaytonaPublicConfig | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [loads, setLoads] = useState(0);
   useEffect(() => {
     if (!liveApi) return;
     let active = true;
@@ -52,6 +52,7 @@ function useDaytonaPublicConfig(liveApi: DaytonaApi | null) {
         if (!active) return;
         setConfig(next);
         setLoadError(null);
+        setLoads((previous) => previous + 1);
       })
       .catch((error: unknown) => {
         if (active) setLoadError(`Could not load Daytona settings: ${getErrorMessage(error)}`);
@@ -60,44 +61,65 @@ function useDaytonaPublicConfig(liveApi: DaytonaApi | null) {
       active = false;
     };
   }, [liveApi]);
-  return { config, setConfig, loadError };
+  return { config, setConfig, loadError, loads };
 }
 
-function useDaytonaConnectionTest(api: DaytonaApi | null) {
-  const [test, setTest] = useState<TestState>({ status: "idle" });
+/** A result shown only while no reload superseded the load it ran under. */
+interface ActionResult<T> {
+  loads: number;
+  value: T;
+}
+
+function currentResult<T>(result: ActionResult<T> | null, loads: number, fallback: T): T {
+  return result !== null && result.loads === loads ? result.value : fallback;
+}
+
+const IDLE_TEST: TestState = { status: "idle" };
+
+function useDaytonaConnectionTest(liveApi: APIClient | null, loads: number) {
+  const [result, setResult] = useState<ActionResult<TestState> | null>(null);
   const runTest = async () => {
-    if (!api) return;
-    setTest({ status: "testing" });
+    if (!liveApi) return;
+    const settle = (value: TestState) => setResult({ loads, value });
+    settle({ status: "testing" });
     try {
-      const result = await api.daytona.testConnection();
-      setTest(result.ok ? { status: "ok" } : { status: "error", message: result.error });
+      const outcome = await liveApi.daytona.testConnection();
+      settle(outcome.ok ? { status: "ok" } : { status: "error", message: outcome.error });
     } catch (testError) {
-      setTest({ status: "error", message: getErrorMessage(testError) });
+      settle({ status: "error", message: getErrorMessage(testError) });
     }
   };
-  return { test, runTest, resetTest: () => setTest({ status: "idle" }) };
+  return {
+    test: currentResult(result, loads, IDLE_TEST),
+    runTest,
+    resetTest: () => setResult(null),
+  };
 }
 
-/** The saved config plus the save and test-connection calls. */
+/**
+ * The saved config plus the save and test-connection calls, all on the live client: while Xum
+ * reconnects, useAPI() keeps the last client, whose calls fail at once (ConnectionLostError).
+ * An error such a call left goes with the reload that follows the reconnect.
+ */
 function useDaytonaAccess() {
-  const { api } = useAPI();
-  const { config, setConfig, loadError } = useDaytonaPublicConfig(useLiveAPI());
-  const { test, runTest, resetTest } = useDaytonaConnectionTest(api);
+  const liveApi = useLiveAPI();
+  const { config, setConfig, loadError, loads } = useDaytonaPublicConfig(liveApi);
+  const { test, runTest, resetTest } = useDaytonaConnectionTest(liveApi, loads);
   const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<ActionResult<string> | null>(null);
 
   /** Resolves true when the backend accepted the change. */
   const save = async (input: DaytonaAccessInput): Promise<boolean> => {
-    if (!api) return false;
+    if (!liveApi) return false;
     setSaving(true);
     setSaveError(null);
     resetTest();
     try {
-      setConfig(await api.daytona.setConfig(input));
+      setConfig(await liveApi.daytona.setConfig(input));
       window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.DAYTONA_CONFIG_CHANGED));
       return true;
     } catch (error) {
-      setSaveError(`Could not save Daytona settings: ${getErrorMessage(error)}`);
+      setSaveError({ loads, value: `Could not save Daytona settings: ${getErrorMessage(error)}` });
       return false;
     } finally {
       setSaving(false);
@@ -105,10 +127,11 @@ function useDaytonaAccess() {
   };
 
   return {
-    loaded: api != null && config !== null,
+    loaded: config !== null,
+    live: liveApi !== null,
     config,
     saving,
-    error: saveError ?? loadError,
+    error: currentResult(saveError, loads, null) ?? loadError,
     test,
     save,
     runTest,
@@ -266,6 +289,8 @@ function AccessMessages(props: { test: TestState; error: string | null }) {
 export function DaytonaAccessForm() {
   const access = useDaytonaAccess();
   const drafts = useDaytonaAccessDrafts(access.config);
+  // Offline, edits stay on screen but Save and Test are disabled (as in Secrets): they could
+  // not reach the server.
   const disabled = !access.loaded || access.saving;
   const keySet = access.config?.apiKeySet === true;
 
@@ -302,7 +327,7 @@ export function DaytonaAccessForm() {
         disabled={disabled}
       />
       <AccessActions
-        disabled={disabled}
+        disabled={disabled || !access.live}
         keySet={keySet}
         canRemoveKey={access.config?.apiKeySource === "settings"}
         dirty={drafts.isDirty}
