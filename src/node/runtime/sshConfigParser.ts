@@ -384,9 +384,9 @@ async function globPath(pattern: string): Promise<string[]> {
   const { root } = path.parse(normalized);
   let matches = [root];
   for (const segment of normalized.slice(root.length).split(path.sep).filter(Boolean)) {
-    const matcher = segmentMatcher(segment);
+    const { matcher, literal } = segmentPattern(segment);
     if (!matcher) {
-      matches = matches.map((dir) => path.join(dir, segment));
+      matches = matches.map((dir) => path.join(dir, literal));
       continue;
     }
     const next: string[][] = [];
@@ -419,18 +419,21 @@ const escapeRegExp = (text: string) => text.replace(REGEXP_SPECIAL, "\\$&");
 /**
  * One path segment of a glob(3) pattern as a RegExp: `*`, `?` (one character), bracket
  * expressions (`[ab]`, `[a-z]`, negated by a leading `!` or `^`; an unclosed `[` is literal)
- * and `\` escapes. Undefined when the segment has no wildcard.
+ * and `\` escapes. Without a wildcard there is no matcher, only the unescaped `literal` name
+ * glob(3) opens.
  */
-function segmentMatcher(segment: string): RegExp | undefined {
+function segmentPattern(segment: string): { matcher?: RegExp; literal: string } {
   let source = "";
+  let literal = "";
   let wildcard = false;
   for (let i = 0; i < segment.length; i++) {
     const token = segmentToken(segment, i);
     source += token.source;
     wildcard ||= token.wildcard;
+    if (!token.wildcard) literal += segment[token.end];
     i = token.end;
   }
-  return wildcard ? new RegExp(`^${source}$`, "s") : undefined;
+  return wildcard ? { matcher: new RegExp(`^${source}$`, "s"), literal } : { literal };
 }
 
 const WILDCARD_SOURCES = new Map([
