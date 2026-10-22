@@ -1528,7 +1528,7 @@ describe("agentSkillsService agent plugins", () => {
         expect(resolved.sourceRuntime).toBe(runtime);
         expect(resolved.pluginRoot).toBeUndefined();
       } finally {
-        await clearRemoteProjectPluginSnapshots();
+        clearRemoteProjectPluginSnapshots();
       }
     },
     60_000

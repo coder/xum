@@ -1061,7 +1061,7 @@ base: a
             expect(pkg.source).toBe(path.join(root, ".xum", "plugins", "repo-plugin", "agents"));
           }
         } finally {
-          await clearRemoteProjectPluginSnapshots();
+          clearRemoteProjectPluginSnapshots();
         }
       }
     );

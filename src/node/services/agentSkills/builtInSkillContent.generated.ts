@@ -2395,7 +2395,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "- Xum reads the checkout's plugin folders with one remote command and keeps a copy on the Xum host. Edits to a plugin in a remote checkout show after you restart Xum or change the project's trust.",
       "- Skill paths and tool output name the remote files. Nothing from the copy runs on the Xum host.",
-      "- Files over 1 MiB are left out. A symlink that leaves the checkout is left out. If the read fails or the checkout has more than 4000 plugin entries, no remote project plugins load.",
+      "- Files over 1 MiB, and files more than 10 folders below the plugins folder, are left out. A symlink that leaves the checkout is left out. If the read fails or the checkout has more than 4000 plugin entries, no remote project plugins load.",
       "- The MCP servers, hooks, workflows, and slash commands of remote project plugins do not load.",
       "",
       "As in Claude Code, a skills path (`contributes.skills`) that holds a `SKILL.md` itself is one skill. Its name is the folder name, or the plugin name when the path is the plugin root (`.`). The default `skills/` folder always holds skill folders.",
