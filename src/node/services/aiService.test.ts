@@ -2580,6 +2580,77 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   });
 
+  // The pre-stream thinking fold runs before the placeholder append (#7164). A refused first fold
+  // returns before any row is written. A refused refold (a change written during the append)
+  // deletes the placeholder it follows.
+  it.each([
+    { when: "before the send", duringAppend: false },
+    { when: "during the placeholder append", duringAppend: true },
+  ])("a refused thinking fold for a change written $when leaves no assistant row", async (c) => {
+    using xumHome = new DisposableTempDir("ai-service-refused-fold");
+    const metadata = createLocalWorkspaceMetadata("refused-fold", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, {
+      experimentsService: await experimentsServiceWith(xumHome.path, [
+        EXPERIMENT_IDS.TOKEN_BUDGET,
+        EXPERIMENT_IDS.MEMORY,
+      ]),
+    });
+    const override: ActiveTurnThinkingOverride = c.duringAppend ? {} : { pending: "high" };
+    spyOn(harness.historyService, "appendToHistory").mockRestore();
+    const realAppend = harness.historyService.appendToHistory.bind(harness.historyService);
+    const assistantAppends: string[] = [];
+    spyOn(harness.historyService, "appendToHistory").mockImplementation((id, message) => {
+      const appended = realAppend(id, message);
+      if (message.role === "assistant") {
+        assistantAppends.push(message.id);
+        if (c.duringAppend) override.pending = "high";
+      }
+      return appended;
+    });
+    const user = createMuxMessage("user-1", "user", "continue");
+    expect((await realAppend(metadata.id, user)).success).toBe(true);
+    // Count 1 is the turn-start check, count 2 the fold's rebuild: refuse the rebuild only.
+    const realMeasure = budgetCountingModule.measureAssembledRequestBudgetForModel;
+    let measureCalls = 0;
+    const measure = spyOn(
+      budgetCountingModule,
+      "measureAssembledRequestBudgetForModel"
+    ).mockImplementation(async (payload, options, anchor) => {
+      const measured = await realMeasure(payload, options, anchor);
+      measureCalls += 1;
+      if (measured == null || measureCalls !== 2) return measured;
+      return {
+        ...measured,
+        exceeded: {
+          type: "context_budget_exceeded",
+          model: options.model,
+          estimate: measured.hardCeiling + 1,
+          hardCeiling: measured.hardCeiling,
+        },
+      };
+    });
+    try {
+      const result = await harness.service.streamMessage({
+        messages: [user],
+        workspaceId: metadata.id,
+        modelString: KNOWN_MODELS.SONNET.id,
+        thinkingLevel: "off",
+        activeTurnThinkingOverride: override,
+      });
+      expect(measureCalls).toBe(2);
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error.type).toBe("context_budget_exceeded");
+    } finally {
+      measure.mockRestore();
+    }
+    expect(harness.startStreamCalls).toHaveLength(0);
+    // Non-vacuous for the refold: the placeholder was written, then deleted.
+    expect(assistantAppends).toHaveLength(c.duringAppend ? 1 : 0);
+    const history = await harness.historyService.getHistoryFromLatestBoundary(metadata.id);
+    if (!history.success) throw new Error(history.error);
+    expect(history.data.map((row) => row.id)).toEqual(["user-1"]);
+  });
+
   // #5286: TurnRequestBuilder.start() decides a Token Budget stage from E, the count of the built
   // request, counts the request with the warning row appended (E′), and dispatches that payload
   // only when the stage fits. The real stage policy decides due, claims and fit.

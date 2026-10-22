@@ -3679,9 +3679,9 @@ export class TurnRequestBuilder {
       const computeRebuiltProviderOptions = primaryRequest.computeRebuiltProviderOptions;
       // Fold PREPARING-window pending thinking overrides into the ACTUAL
       // request build, not just the envelope (see foldPendingThinkingOverrides).
-      // The fold runs before the assistant placeholder is appended: its budget-checked rebuild
-      // is the last count of this request, so a refusal leaves no row to delete, and a Token
-      // Budget stage decided after it is never re-counted after publication (#5286). A turn
+      // The fold runs before the assistant placeholder is appended, so a refusal leaves no row
+      // to delete, and a Token Budget stage is decided on the folded request (#5286). Only a
+      // change written during the append counts the request again (the refold below). A turn
       // already stopped skips the rebuild.
       if (combinedAbortSignal.aborted)
         return {
