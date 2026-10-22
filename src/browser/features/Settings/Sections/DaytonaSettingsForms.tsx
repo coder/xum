@@ -2,7 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { CheckCircle2, Loader2, XCircle } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Input } from "@/browser/components/Input/Input";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { DAYTONA_DEFAULT_API_URL } from "@/common/constants/daytona";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { DaytonaPublicConfig } from "@/common/orpc/schemas/daytona";
@@ -36,17 +36,22 @@ function describeKey(config: DaytonaPublicConfig | null): string {
 
 type DaytonaApi = NonNullable<ReturnType<typeof useAPI>["api"]>;
 
-/** The saved public config (never the key itself), loaded once per API connection. */
-function useDaytonaPublicConfig(api: DaytonaApi | null) {
+/**
+ * The saved public config (never the key itself), loaded each time the connection becomes live:
+ * while Xum reconnects the last client may stay (and come back), and its calls fail at once.
+ */
+function useDaytonaPublicConfig(liveApi: DaytonaApi | null) {
   const [config, setConfig] = useState<DaytonaPublicConfig | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   useEffect(() => {
-    if (!api) return;
+    if (!liveApi) return;
     let active = true;
-    api.daytona
+    liveApi.daytona
       .getConfig()
       .then((next) => {
-        if (active) setConfig(next);
+        if (!active) return;
+        setConfig(next);
+        setLoadError(null);
       })
       .catch((error: unknown) => {
         if (active) setLoadError(`Could not load Daytona settings: ${getErrorMessage(error)}`);
@@ -54,7 +59,7 @@ function useDaytonaPublicConfig(api: DaytonaApi | null) {
     return () => {
       active = false;
     };
-  }, [api]);
+  }, [liveApi]);
   return { config, setConfig, loadError };
 }
 
@@ -76,7 +81,7 @@ function useDaytonaConnectionTest(api: DaytonaApi | null) {
 /** The saved config plus the save and test-connection calls. */
 function useDaytonaAccess() {
   const { api } = useAPI();
-  const { config, setConfig, loadError } = useDaytonaPublicConfig(api);
+  const { config, setConfig, loadError } = useDaytonaPublicConfig(useLiveAPI());
   const { test, runTest, resetTest } = useDaytonaConnectionTest(api);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);

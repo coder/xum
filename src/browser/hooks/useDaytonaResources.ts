@@ -4,7 +4,7 @@
  * The runtime config itself is owned by the caller (selectedRuntime.daytona or project defaults).
  */
 import { useEffect, useState } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import type { DaytonaPublicConfig, DaytonaSandboxSummary } from "@/common/orpc/schemas/daytona";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -78,13 +78,17 @@ function resourcesFor(loaded: LoadedDaytonaResources | null, key: DaytonaLoadKey
 
 export function useDaytonaResources(options: UseDaytonaResourcesOptions): DaytonaResources {
   const { api } = useAPI();
+  // Loads run on the live client only. While Xum reconnects `api` can stay the last client,
+  // whose calls fail at once, and the same object may come back: a load keyed on it alone would
+  // keep that failure until something else changed.
+  const liveApi = useLiveAPI();
   const configVersion = useDaytonaConfigVersion();
   // One state object so consumers get a stable identity until something actually loads.
   const [loaded, setLoaded] = useState<LoadedDaytonaResources | null>(null);
   const { loadSandboxes } = options;
 
   useEffect(() => {
-    if (!api) return;
+    if (!liveApi) return;
     let active = true;
     const update = (patch: Partial<DaytonaResources>) => {
       if (!active) return;
@@ -93,12 +97,12 @@ export function useDaytonaResources(options: UseDaytonaResourcesOptions): Dayton
     };
 
     const load = async () => {
-      const config = await api.daytona.getConfig();
+      const config = await liveApi.daytona.getConfig();
       update({ config, configError: null });
       if (!config.apiKeySet) return;
       update({ loadingSnapshots: true, loadingSandboxes: loadSandboxes });
       await Promise.all([
-        api.daytona.listSnapshots().then((result) =>
+        liveApi.daytona.listSnapshots().then((result) =>
           update(
             result.ok
               ? {
@@ -110,7 +114,7 @@ export function useDaytonaResources(options: UseDaytonaResourcesOptions): Dayton
           )
         ),
         loadSandboxes
-          ? api.daytona
+          ? liveApi.daytona
               .listSandboxes()
               .then((result) =>
                 update(
@@ -137,7 +141,7 @@ export function useDaytonaResources(options: UseDaytonaResourcesOptions): Dayton
     return () => {
       active = false;
     };
-  }, [api, loadSandboxes, configVersion]);
+  }, [api, liveApi, loadSandboxes, configVersion]);
 
   // A reload never shows what the previous load found: a failed or keyless reload would
   // otherwise leave the form ready with the old account's config, snapshots and sandboxes.

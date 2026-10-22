@@ -4,6 +4,8 @@ import { cleanup, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider } from "@/browser/contexts/API";
+import { createKeptClientConnection } from "@/browser/contexts/connection.testHarness";
+import { ConnectionLostError } from "@/browser/contexts/connectionLink";
 import { createTestApiClient } from "@/browser/testUtils";
 import type { DaytonaPublicConfig } from "@/common/orpc/schemas/daytona";
 import { DaytonaAccessForm } from "./DaytonaSettingsForms";
@@ -63,6 +65,27 @@ describe("DaytonaAccessForm", () => {
   test("saving only a new key leaves the URL from the environment unsaved", async () => {
     const sent = await saveAfter((fields, user) => user.type(fields.key, "new-key"));
     expect(sent).toEqual({ apiKey: "new-key" });
+  });
+
+  test("loads the saved settings once the connection is live after a reconnect", async () => {
+    let live = false;
+    const client = createTestApiClient({
+      daytona: {
+        getConfig: () =>
+          live ? Promise.resolve(ENV_CONFIG) : Promise.reject(new ConnectionLostError()),
+      },
+    });
+    const connection = createKeptClientConnection(client);
+    const view = render(<DaytonaAccessForm />, { wrapper: connection.Wrapper });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    live = true;
+    connection.setStatus("connected");
+
+    await waitFor(() =>
+      expect((view.getByLabelText("API URL") as HTMLInputElement).value).toBe(ENV_CONFIG.apiUrl)
+    );
+    expect(view.queryByText(/Could not load Daytona settings/)).toBeNull();
   });
 
   test("saves a URL the user edited", async () => {

@@ -4,6 +4,8 @@ import { createElement, type ComponentProps, type ReactNode } from "react";
 import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { APIProvider } from "@/browser/contexts/API";
+import { createKeptClientConnection } from "@/browser/contexts/connection.testHarness";
+import { ConnectionLostError } from "@/browser/contexts/connectionLink";
 import { createTestApiClient } from "@/browser/testUtils";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { DaytonaPublicConfig } from "@/common/orpc/schemas/daytona";
@@ -58,6 +60,41 @@ describe("useDaytonaResources", () => {
     await waitFor(() => expect(result.current.snapshots).toEqual(["base"]));
     expect(result.current.config?.apiKeySet).toBe(true);
   });
+  test("loads once the connection is live again after a load that failed while reconnecting", async () => {
+    let live = false;
+    const whenLive = <T>(value: T): Promise<T> =>
+      live ? Promise.resolve(value) : Promise.reject(new ConnectionLostError());
+    const client = createTestApiClient({
+      daytona: {
+        getConfig: () =>
+          whenLive<DaytonaPublicConfig>({
+            apiKeySet: true,
+            apiKeySource: "settings",
+            apiUrl: "https://app.daytona.io/api",
+            target: null,
+          }),
+        listSnapshots: () => whenLive({ ok: true as const, snapshots: [{ name: "base" }] }),
+        listSandboxes: () => whenLive({ ok: true as const, sandboxes: [] }),
+      },
+    });
+    const connection = createKeptClientConnection(client);
+    const { result } = renderHook(() => useDaytonaResources({ loadSandboxes: true }), {
+      wrapper: connection.Wrapper,
+    });
+    // A reconnect gap is not a Daytona error: the form waits instead of reporting one.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(result.current.configError).toBeNull();
+
+    live = true;
+    connection.setStatus("connected");
+
+    await waitFor(() => expect(result.current.snapshots).toEqual(["base"]));
+    expect(result.current.config?.apiKeySet).toBe(true);
+    expect(result.current.configError).toBeNull();
+  });
+
   // Kept, the old account's config would keep the form ready with its snapshots and sandboxes.
   test("drops what the previous load found when a reload cannot read the config", async () => {
     let failing = false;
