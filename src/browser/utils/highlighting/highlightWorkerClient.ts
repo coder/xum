@@ -282,8 +282,14 @@ async function highlightMainThread(
     );
   }
 
-  const highlighter = await getShikiHighlighter();
   const shikiLang = mapToShikiLang(language);
+  // Same reason as getShikiHighlighter's import("shiki"): keep the engine (and its inlined
+  // ~183 KB Wasm module) out of the main bundle unless the worker is unavailable.
+  const engine = await import("./highlightsEngine");
+  signal?.throwIfAborted();
+  if (engine.canHighlight(shikiLang)) return engine.highlightToShikiHtml(code, shikiLang, theme);
+
+  const highlighter = await getShikiHighlighter();
 
   // Load language on-demand
   const loadedLangs = highlighter.getLoadedLanguages();
