@@ -8,10 +8,10 @@ import type { z } from "zod";
 import { SkillNameSchema } from "@/common/orpc/schemas/agentSkill";
 import type { SkillsCliRunSchema, SkillsCliStatusSchema } from "@/common/orpc/schemas/skillsCli";
 import { getErrorMessage } from "@/common/utils/errors";
-import { shellQuote } from "@/common/utils/shell";
 import {
   isSkillsCliRemoteUrl,
   SKILLS_CLI_NOT_REMOTE_PROBLEM,
+  SKILLS_CLI_SAFE_ARG_PATTERN,
   skillsCliSourceProblem,
 } from "@/common/utils/skillsCliSource";
 import {
@@ -123,11 +123,12 @@ export function skillsCliArgs(source: string, skills: string[]): string[] {
   ];
 }
 
-/** Quote only where a POSIX shell needs it, so the copied command stays readable. */
+/**
+ * The command to show and copy. No quoting: no quoting is right for both POSIX shells and cmd.exe,
+ * so installWithSkillsCli refuses any argument that would need it (SKILLS_CLI_SAFE_ARG_PATTERN).
+ */
 function formatCommand(argv: string[]): string {
-  return argv
-    .map((arg) => (/^[A-Za-z0-9@%_+=:,./-]+$/.test(arg) ? arg : shellQuote(arg)))
-    .join(" ");
+  return argv.join(" ");
 }
 
 function parseNodeVersion(text: string): [number, number, number] | null {
@@ -462,6 +463,12 @@ export async function installWithSkillsCli(
   options?: SkillsCliOptions
 ): Promise<SkillsCliRun> {
   const args = skillsCliArgs(input.source, input.skills);
+  // skillsCliSourceProblem and the skill-name grammar admit only safe characters. Check what Xum
+  // shows and runs again: an unsafe argument throws here, it is never quoted.
+  assert(
+    args.every((arg) => SKILLS_CLI_SAFE_ARG_PATTERN.test(arg)),
+    "installWithSkillsCli: every argument must be safe to show unquoted in any shell"
+  );
   const command = formatCommand(["npx", ...args]);
   const homeDir = options?.homeDir ?? os.homedir();
   await using _lock = await runMutex.acquire();
