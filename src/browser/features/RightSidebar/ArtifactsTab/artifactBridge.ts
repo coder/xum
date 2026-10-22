@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { isMac, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { Keybind } from "@/common/types/keybind";
 import {
   ARTIFACT_ANNOTATION_CONTEXT_CHARS,
@@ -124,8 +124,8 @@ const ArtifactAnnotateMessageSchema = z
 
 /**
  * The right-sidebar chord (KEYBINDS.TOGGLE_RIGHT_SIDEBAR) pressed inside the frame, with the
- * modifiers the host needs to match the keybind exactly (macOS takes only Cmd). See the host side
- * in SandboxedArtifactFrame.tsx.
+ * modifiers the host needs to match the keybind exactly (matchesKeybind). See the host side in
+ * SandboxedArtifactFrame.tsx.
  */
 const ArtifactSidebarKeyMessageSchema = z
   .object({
@@ -470,8 +470,8 @@ const ANNOTATE_KEY_LISTENER =
 
 /**
  * The right-sidebar key the frame forwards, lowercased, from KEYBINDS.TOGGLE_RIGHT_SIDEBAR. The
- * shim checks only a Ctrl or Cmd plus Shift chord of one key, so another keybind shape turns
- * forwarding off (null), like plainSingleKey. The shim tests send the keybind's key.
+ * shim checks only a Ctrl (Cmd on macOS) plus Shift chord of one key, so another keybind shape
+ * turns forwarding off (null), like plainSingleKey. The shim tests send the keybind's key.
  */
 function ctrlShiftKey(keybind: Keybind): string | null {
   const chord =
@@ -479,6 +479,7 @@ function ctrlShiftKey(keybind: Keybind): string | null {
     keybind.code == null &&
     keybind.ctrl === true &&
     keybind.shift === true &&
+    keybind.macCtrlBehavior === "command" &&
     !keybind.alt &&
     !keybind.meta;
   return chord ? keybind.key.toLowerCase() : null;
@@ -486,22 +487,25 @@ function ctrlShiftKey(keybind: Keybind): string | null {
 const SIDEBAR_FRAME_KEY = ctrlShiftKey(KEYBINDS.TOGGLE_RIGHT_SIDEBAR);
 
 /**
- * The right-sidebar chord. The shim sends Ctrl and Cmd as pressed, and the host matches them
- * against the keybind (on macOS only Cmd counts). No editable exclusion: the chord types nothing,
- * and the host's own handler works from the chat input too.
+ * The right-sidebar chord, with this platform's modifier as matchesKeybind reads the keybind: on
+ * macOS only Cmd (Ctrl may be held too), elsewhere only Ctrl. The shim claims nothing else, so the
+ * other form of the chord stays the artifact's. The host matches the keybind again (it decides).
+ * No editable exclusion: the chord types nothing, and the host's own handler works from the chat
+ * input too. Built per frame: isMac() needs the window.
  */
-const SIDEBAR_KEY_LISTENER =
-  SIDEBAR_FRAME_KEY == null
-    ? ""
-    : `
+function sidebarKeyListener(): string {
+  if (SIDEBAR_FRAME_KEY == null) return "";
+  const modifier = isMac() ? "event.metaKey" : "event.ctrlKey && !event.metaKey";
+  return `
   window.addEventListener("keydown", function (event) {
     // A held key would flip the sidebar on every repeat and spend the frame's message budget.
-    if (event.repeat || event.altKey || !event.shiftKey || !(event.ctrlKey || event.metaKey)) return;
+    if (event.repeat || event.altKey || !event.shiftKey || !(${modifier})) return;
     if (typeof event.key !== "string" || event.key.toLowerCase() !== ${JSON.stringify(SIDEBAR_FRAME_KEY)}) return;
     // Claimed like the host claims it: in a browser, Chrome binds the chord to its bookmarks bar.
     event.preventDefault();
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "sidebarKey", ctrlKey: event.ctrlKey, metaKey: event.metaKey }, "*");
   }, true);`;
+}
 
 export function buildArtifactBridgeScript(
   initialTheme: ArtifactTheme,
@@ -651,7 +655,7 @@ export function buildArtifactBridgeScript(
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: key, shiftKey: event.shiftKey }, "*");
   }, true);
   ${ANNOTATE_KEY_LISTENER}
-  ${SIDEBAR_KEY_LISTENER}
+  ${sidebarKeyListener()}
   ${ARTIFACT_IN_PAGE_LINK_SCRIPT}
 })();`;
 }

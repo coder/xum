@@ -94,7 +94,7 @@ function replayFrameSidebarKey(
     bubbles: true,
     cancelable: true,
   });
-  // The shim forwards Ctrl and Cmd alike; on macOS only Cmd is the keybind.
+  // The frame's script can post any modifiers, so the host matches the keybind itself.
   if (!matchesKeybind(event, KEYBINDS.TOGGLE_RIGHT_SIDEBAR)) return;
   frame.dispatchEvent(event);
 }

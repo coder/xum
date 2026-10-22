@@ -1,7 +1,7 @@
-// artifact-frame-sidebar-hotkey (bug bash 2026-10-22): Ctrl+Shift+B (Cmd+Shift+B on macOS,
-// TOGGLE_RIGHT_SIDEBAR) did nothing once focus was inside an HTML artifact's sandboxed frame (any
-// click in its content). The key went to the frame's document, which never reaches the app's
-// window listener, and the frame's key bridge forwarded only Escape, Shift+F and C.
+// artifact-frame-sidebar-hotkey (bug bash 2026-10-22): the TOGGLE_RIGHT_SIDEBAR keybind did nothing
+// once focus was inside an HTML artifact's sandboxed frame (any click in its content). The key went
+// to the frame's document, which never reaches the app's window listener, and the frame's key
+// bridge forwarded only the fullscreen exit keys and the annotate key.
 import { test } from "@e2e-dev/web";
 import type { Browser } from "@e2e-dev/web";
 import { expect } from "e2e";

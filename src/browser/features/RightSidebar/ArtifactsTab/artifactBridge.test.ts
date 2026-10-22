@@ -175,7 +175,7 @@ describe("bridge script keys", () => {
     expect(bridge.posted).toEqual([c, c]);
   });
 
-  test("the right-sidebar chord is posted with Ctrl or Cmd, even from an input, and claimed", () => {
+  test("the right-sidebar chord is posted with Ctrl, even from an input, and claimed", () => {
     // The keybind's own key: a keybind the shim cannot forward fails here, not at startup.
     const key = KEYBINDS.TOGGLE_RIGHT_SIDEBAR.key;
     const bridge = runBridgeScript();
@@ -183,16 +183,38 @@ describe("bridge script keys", () => {
     bridge.keydown(key, div, true);
     bridge.keydown(key, div, true, { ctrlKey: true, altKey: true });
     bridge.keydown(key, div, true, { ctrlKey: true, repeat: true });
+    // Off macOS the keybind takes Ctrl only, so the Meta form stays the artifact's.
+    bridge.keydown(key, div, true, { metaKey: true });
+    bridge.keydown(key, div, true, { ctrlKey: true, metaKey: true });
     expect(bridge.posted).toEqual([]);
     expect(bridge.prevented()).toBe(0);
     bridge.keydown(key, input, true, { ctrlKey: true });
-    bridge.keydown(key.toLowerCase(), div, true, { metaKey: true });
-    expect(bridge.posted).toEqual([
-      { xumArtifact: 1, type: "sidebarKey", ctrlKey: true, metaKey: false },
-      { xumArtifact: 1, type: "sidebarKey", ctrlKey: false, metaKey: true },
-    ]);
+    bridge.keydown(key.toLowerCase(), div, true, { ctrlKey: true });
+    const posted = { xumArtifact: 1, type: "sidebarKey", ctrlKey: true, metaKey: false };
+    expect(bridge.posted).toEqual([posted, posted]);
     // Claimed in the frame, as the host claims it (Chrome binds the chord to its bookmarks bar).
     expect(bridge.prevented()).toBe(2);
+  });
+
+  test("on macOS the right-sidebar chord is Cmd, and Ctrl stays the artifact's", () => {
+    // isMac() reads the Electron preload's platform first.
+    const global = globalThis as { window?: unknown };
+    const saved = global.window;
+    global.window = { api: { platform: "darwin" } };
+    try {
+      const key = KEYBINDS.TOGGLE_RIGHT_SIDEBAR.key;
+      const bridge = runBridgeScript();
+      bridge.keydown(key, div, true, { ctrlKey: true });
+      expect(bridge.posted).toEqual([]);
+      expect(bridge.prevented()).toBe(0);
+      bridge.keydown(key, div, true, { metaKey: true });
+      expect(bridge.posted).toEqual([
+        { xumArtifact: 1, type: "sidebarKey", ctrlKey: false, metaKey: true },
+      ]);
+      expect(bridge.prevented()).toBe(1);
+    } finally {
+      global.window = saved;
+    }
   });
 });
 
