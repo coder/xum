@@ -291,31 +291,30 @@ describe("resolveSSHConfig", () => {
   });
 
   // OpenSSH's glob(3) unescapes every segment, with or without a real wildcard in it.
-  test.skipIf(process.platform === "win32")(
-    "reads an Include's escaped glob characters as the literal file names OpenSSH opens",
-    async () => {
-      await withTempHome(async (homeDir) => {
-        const confDir = path.join(homeDir, ".ssh", "conf.d");
-        await fs.mkdir(confDir);
-        const files = ["foo*", "foo?", "foo[", "foo\\", "fooX", "foo[*"];
-        for (const [i, name] of files.entries()) {
-          await fs.writeFile(path.join(confDir, name), `Host host-${i}\n  User user-${i}\n`);
-        }
-        const configPath = path.join(homeDir, ".ssh", "config");
-        // Four backslashes in the config text name one: the config parser and glob(3) each unescape.
-        const patterns = ["foo\\*", "foo\\?", "foo\\[", "foo\\\\\\\\", "fo\\o\\X", "foo[\\*"];
-        await fs.writeFile(
-          configPath,
-          `${patterns.map((pattern) => `Include ${confDir}/${pattern}`).join("\n")}\nHost *\n  User none\n`
-        );
+  test("reads an Include's escaped glob characters as the literal file names OpenSSH opens", async () => {
+    // Windows file names cannot hold "*" or "?".
+    if (process.platform === "win32") return;
+    await withTempHome(async (homeDir) => {
+      const confDir = path.join(homeDir, ".ssh", "conf.d");
+      await fs.mkdir(confDir);
+      const files = ["foo*", "foo?", "foo[", "foo\\", "fooX", "foo[*"];
+      for (const [i, name] of files.entries()) {
+        await fs.writeFile(path.join(confDir, name), `Host host-${i}\n  User user-${i}\n`);
+      }
+      const configPath = path.join(homeDir, ".ssh", "config");
+      // Four backslashes in the config text name one: the config parser and glob(3) each unescape.
+      const patterns = ["foo\\*", "foo\\?", "foo\\[", "foo\\\\\\\\", "fo\\o\\X", "foo[\\*"];
+      await fs.writeFile(
+        configPath,
+        `${patterns.map((pattern) => `Include ${confDir}/${pattern}`).join("\n")}\nHost *\n  User none\n`
+      );
 
-        for (const i of files.keys()) {
-          expect((await resolveSSHConfig(`host-${i}`)).user).toBe(`user-${i}`);
-          if (hasOpenSsh) expect(opensshOptions(configPath, `host-${i}`)("user")).toBe(`user-${i}`);
-        }
-      });
-    }
-  );
+      for (const i of files.keys()) {
+        expect((await resolveSSHConfig(`host-${i}`)).user).toBe(`user-${i}`);
+        if (hasOpenSsh) expect(opensshOptions(configPath, `host-${i}`)("user")).toBe(`user-${i}`);
+      }
+    });
+  });
 
   test("matches an Include wildcard as glob(3) does: ? is one character, * skips dot files", async () => {
     await withTempHome(async (homeDir) => {
