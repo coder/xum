@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import assert from "@/common/utils/assert";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -104,6 +105,106 @@ describe("loadPluginCodexHooks", () => {
       input: { cmd: "${tool_input.command}" },
     });
     expect(hooks[2]?.handler).toMatchObject({ input: {}, timeoutSeconds: 30 });
+  });
+
+  test("a Claude package lists every hook as never running, on every Claude event", async () => {
+    using tmp = new DisposableTempDir("claude-hooks");
+    await writePlugin(tmp.path, {
+      ".claude-plugin/plugin.json": { name: "guard", hooks: "./config/extra.json" },
+      "hooks/hooks.json": {
+        hooks: {
+          // Runnable in a Codex package: a Claude package never runs it.
+          PreToolUse: [{ matcher: "Bash", hooks: [scan, { type: "command", command: "x.sh" }] }],
+          Notification: [{ hooks: [{ type: "prompt", prompt: "p" }] }],
+          SessionEnd: [{ hooks: [{ type: "command", command: "y.sh" }] }],
+        },
+      },
+      "config/extra.json": { hooks: { PreCompact: [{ hooks: [{ type: "agent" }] }] } },
+    });
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    assert(plugin, "the Claude package is discovered");
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(warnings).toEqual([]);
+    expect(
+      hooks.map(({ event, status, handler, source }) => [event, status, handler.type, source])
+    ).toEqual([
+      ["PreToolUse", "claude-plugin", "mcp_tool", path.join("hooks", "hooks.json")],
+      ["PreToolUse", "claude-plugin", "command", path.join("hooks", "hooks.json")],
+      ["Notification", "claude-plugin", "prompt", path.join("hooks", "hooks.json")],
+      ["SessionEnd", "claude-plugin", "command", path.join("hooks", "hooks.json")],
+      ["PreCompact", "claude-plugin", "agent", path.join("config", "extra.json")],
+    ]);
+  });
+
+  test("a Claude matcherless event ignores its matcher, so the hook stays listed", async () => {
+    using tmp = new DisposableTempDir("claude-hook-matcherless");
+    const hook = { hooks: [{ type: "command", command: "x.sh" }] };
+    await writePlugin(tmp.path, {
+      ".claude-plugin/plugin.json": { name: "guard" },
+      "hooks/hooks.json": {
+        hooks: {
+          // Claude Code silently ignores a matcher on these events, even an invalid one.
+          TaskCompleted: [{ matcher: "[", ...hook }],
+          PostToolBatch: [{ matcher: "[", ...hook }],
+          // A matcher event still refuses an invalid regex.
+          PreToolUse: [{ matcher: "[", ...hook }],
+        },
+      },
+    });
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    assert(plugin, "the Claude package is discovered");
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((h) => [h.event, h.status])).toEqual([
+      ["TaskCompleted", "claude-plugin"],
+      ["PostToolBatch", "claude-plugin"],
+    ]);
+    expect(warnings.join("\n")).toContain("a 'PreToolUse' matcher is not a valid regex");
+  });
+
+  test("a Claude exec-form hook shows its args in the summary; bad args drop the hook", async () => {
+    using tmp = new DisposableTempDir("claude-hook-args");
+    await writePlugin(tmp.path, {
+      ".claude-plugin/plugin.json": { name: "guard" },
+      "hooks/hooks.json": {
+        hooks: {
+          SessionEnd: [
+            {
+              hooks: [
+                { type: "command", command: "node", args: ["scripts/delete.js", "--all", "a b"] },
+                { type: "command", command: "node", args: "--all" },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: tmp.path, scope: "global" });
+    assert(plugin, "the Claude package is discovered");
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.handler)).toEqual([
+      { type: "command", summary: 'node scripts/delete.js --all "a b"' },
+    ]);
+    expect(warnings.join("\n")).toContain("('args')");
+  });
+
+  test("a Codex package still warns on a Claude-only event", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-claude-event");
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": { hooks: { Notification: [{ hooks: [scan] }] } },
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks).toEqual([]);
+    expect(warnings).toEqual([
+      `${path.join("hooks", "hooks.json")}: unknown hook event 'Notification'; ignoring it`,
+    ]);
   });
 
   test("a non-finite timeout drops only that handler", async () => {

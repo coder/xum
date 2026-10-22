@@ -21,7 +21,9 @@ rules live in `scripts/crap/policy.ts` with thresholds in
   command before it runs. `scripts/crap/agent-gate.sh` holds the mode. A bash
   call that exits non-zero gets no report, even when a `git commit` in it
   succeeded before a later command failed. Run `make crap-check` then.
-- CI: the `Quality / CRAP` job summary and its annotations. It is informational.
+- CI: the `Quality / CRAP` job summary and its annotations. When the repo
+  variable `CRAP_MODE` is `block`, its violations fail `Required`. Otherwise it
+  is informational.
 
 Without coverage, scores are CC. With `--coverage <lcov>`, scores are CRAP.
 
@@ -85,6 +87,14 @@ Never do these to lower a score:
 ## Crap-Debt
 
 When a violation cannot be fixed in this change (a hotfix, a generated file),
-add a `Crap-Debt: <reason>` trailer to the commit, or the `crap-debt` label to
-the PR in CI. Every violation becomes a warning, and the report lists each use.
-Name the follow-up in the reason.
+use the escape hatch for where the check runs. Every violation becomes a
+warning, and the report lists each use. Name the follow-up in the reason.
+
+- Local (the commit hook, `make crap-check`): add a `Crap-Debt: <reason>`
+  trailer to the commit.
+- CI (`Quality / CRAP`): add the `crap-debt` label to the PR. CI reads no
+  trailers, and the label does not affect the local hook.
+
+Agents: ask the maintainer first, and add the trailer or label only after an
+explicit approval for that PR. The label skips every CI block, and agent PRs run
+as the maintainer's account, so GitHub cannot show who added it.

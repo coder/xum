@@ -10,12 +10,24 @@ import { e2eCommand, isE2eWorker, onlyAgentTag } from "../hostPause";
 import { modelDrivenSandbox, PROXY_BASE_URL } from "./inContainer";
 
 /** BUGBASH_MODEL (`anthropic:<id>`, set by the launcher) through the proxy. */
-export function proxyModel(env: NodeJS.ProcessEnv = process.env) {
-  const spec = env.BUGBASH_MODEL ?? "";
+export function proxyModel(env: NodeJS.ProcessEnv = process.env, variable = "BUGBASH_MODEL") {
+  const spec = env[variable] ?? "";
   const [provider, id] = spec.split(/:(.*)/s, 2);
   if (provider !== "anthropic" || !id)
-    throw new Error(`BUGBASH_MODEL must be anthropic:<model> in the sandbox, got "${spec}"`);
+    throw new Error(`${variable} must be anthropic:<model> in the sandbox, got "${spec}"`);
   return createAnthropic({ baseURL: PROXY_BASE_URL, apiKey: "bugbash-sandbox-placeholder" })(id);
+}
+
+/**
+ * The story agents' judge (`agents.<name>.judge`): BUGBASH_JUDGE_MODEL through the proxy, or
+ * undefined (e2e then judges with the agent's own model). The cheap PR lane drives with Haiku 5.5,
+ * which missed layout defects on screenshots (it passed 44px checkboxes and a wrapped meta row),
+ * so its asserts go to a stronger model.
+ */
+export function proxyJudgeModel(env: NodeJS.ProcessEnv = process.env) {
+  return (env.BUGBASH_JUDGE_MODEL ?? "") === ""
+    ? undefined
+    : proxyModel(env, "BUGBASH_JUDGE_MODEL");
 }
 
 /**

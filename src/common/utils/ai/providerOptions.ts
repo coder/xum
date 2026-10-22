@@ -19,7 +19,12 @@ import type {
 import type { ProviderName } from "@/common/constants/providers";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
-import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
+import assert from "@/common/utils/assert";
+import type {
+  AnthropicEffortLevel,
+  OpenAIReasoningMode,
+  ThinkingLevel,
+} from "@/common/types/thinking";
 import {
   getAnthropicEffort,
   anthropicBindsThinkingToPrefix,
@@ -225,6 +230,161 @@ const DIRECT_REASONING_BUILDERS: Record<
 interface BedrockProviderOptions {
   [key: string]: JSONValue | undefined;
   additionalModelRequestFields?: Record<string, JSONValue>;
+  reasoningConfig?: {
+    type?: "adaptive";
+    maxReasoningEffort?: AnthropicEffortLevel;
+    display?: "summarized";
+  };
+}
+
+/**
+ * The thinking fields one Claude model takes at one level, independent of the
+ * wire (direct Anthropic or Bedrock). `effort` is set only for models with the
+ * effort parameter; `thinking` is undefined when the request omits it.
+ */
+interface AnthropicThinkingShape {
+  usesAdaptiveThinking: boolean;
+  effort?: AnthropicEffortLevel;
+  thinking?:
+    | { type: "adaptive"; summarized: boolean }
+    | { type: "enabled"; budgetTokens: number }
+    | { type: "disabled" }
+    | { type: "between_tools" };
+}
+
+/**
+ * Per-model Anthropic thinking rules, shared by the direct and Bedrock routes so
+ * they cannot drift (#5839).
+ *
+ * - Opus 4.6+ / Sonnet 4.6 / Sonnet 5+ / Haiku 5+ / Mythos-class: adaptive thinking
+ *   (the model decides when and how much) plus effort. Native-xhigh models (Opus
+ *   4.7+, Sonnet 5+, Haiku 5+, Mythos) get the native "xhigh" effort and need
+ *   `display: "summarized"` to return thinking; Opus 4.6 / Sonnet 4.6 keep
+ *   xhigh -> "max" and must not get `display`. Haiku 5.5 must land here: it
+ *   rejects `budget_tokens` (400).
+ * - Opus 4.5: enabled thinking with a budgetTokens ceiling, plus effort.
+ * - Older Claude: enabled thinking with budgetTokens, no effort.
+ *
+ * "off" on adaptive models: Sonnet 5.5 "off" is `between_tools` only for the
+ * Anthropic payload on an eligible route (the caller resolves that); Mythos-class
+ * and Opus 5.5 reject `{ type: "disabled" }`. The thinking policy excludes "off"
+ * for them and AIService clamps the effective level, but if a stray path gets
+ * here, omit `thinking` (the API defaults to adaptive) rather than hard-erroring.
+ * Opus 5 rejects disabled thinking above high effort; "off" maps to low, so this
+ * cannot produce that combination.
+ * See https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking#summarized-thinking
+ */
+function resolveAnthropicThinkingShape(
+  capabilityModel: string,
+  capModelName: string | undefined,
+  level: ThinkingLevel
+): AnthropicThinkingShape {
+  if (!anthropicUsesAdaptiveThinking(capabilityModel, capModelName ?? "")) {
+    return budgetThinkingShape(capabilityModel, capModelName ?? "", level);
+  }
+  const thinking =
+    level === "off"
+      ? adaptiveModelOffThinking(capabilityModel)
+      : ({
+          type: "adaptive",
+          summarized: anthropicSupportsNativeXhigh(capabilityModel),
+        } as const);
+  return {
+    usesAdaptiveThinking: true,
+    effort: getAnthropicEffort(level, capabilityModel),
+    ...(thinking && { thinking }),
+  };
+}
+
+function anthropicUsesAdaptiveThinking(capabilityModel: string, capModelName: string): boolean {
+  return (
+    capModelName.includes("opus-4-6") ||
+    capModelName.includes("sonnet-4-6") ||
+    anthropicSupportsNativeXhigh(capabilityModel)
+  );
+}
+
+/** Opus 4.5 and older Claude: a thinking budget; only Opus 4.5 has effort. */
+function budgetThinkingShape(
+  capabilityModel: string,
+  capModelName: string,
+  level: ThinkingLevel
+): AnthropicThinkingShape {
+  const budgetTokens = ANTHROPIC_THINKING_BUDGETS[level];
+  return {
+    usesAdaptiveThinking: false,
+    ...(capModelName.includes("opus-4-5") && {
+      effort: getAnthropicEffort(level, capabilityModel),
+    }),
+    ...(budgetTokens > 0 && { thinking: { type: "enabled" as const, budgetTokens } }),
+  };
+}
+
+/** The "off" thinking field of an adaptive model; undefined omits `thinking`. */
+function adaptiveModelOffThinking(capabilityModel: string): AnthropicThinkingShape["thinking"] {
+  if (anthropicSupportsBetweenToolsThinking(capabilityModel)) {
+    return { type: "between_tools" };
+  }
+  return anthropicRejectsDisabledThinking(capabilityModel) ? undefined : { type: "disabled" };
+}
+
+/**
+ * The canonical `anthropic:claude-*` id of a Claude model on Bedrock, or null for
+ * other models. Cross-region inference profiles (`us.`, `global.` ...) keep the
+ * `bedrock:` origin, and Bedrock ids end in -vN[:M]; both defeat the anchored
+ * capability matchers (a missed "rejects disabled" match would send a 400).
+ */
+function bedrockClaudeCapabilityModel(
+  formatProvider: string | undefined,
+  capabilityModel: string
+): string | null {
+  if (formatProvider !== "bedrock") return null;
+  const match = /(?:^|[.:])(claude-[a-z0-9-]+?)(?:-v\d+(?::\d+)?)?$/i.exec(capabilityModel);
+  return match ? `anthropic:${match[1].toLowerCase()}` : null;
+}
+
+/**
+ * Bedrock Converse fields for one thinking shape. Adaptive thinking and effort go
+ * through the SDK's typed `reasoningConfig`. The SDK serializes
+ * `reasoningConfig: { type: "disabled" }` as nothing for Claude, so "disabled"
+ * goes through additionalModelRequestFields verbatim.
+ *
+ * Budget-thinking models (Opus 4.5, Sonnet 4.5, Haiku 4.5 and older) keep the
+ * Bedrock default, which is no thinking, at every level (#7180). A budget there
+ * must fit the request's max_tokens, which the SDK's reasoningConfig budget
+ * overshoots, and Bedrock reasoning signatures are not yet kept for replay.
+ */
+function buildBedrockClaudeOptions(shape: AnthropicThinkingShape): ProviderOptions {
+  return shape.usesAdaptiveThinking ? bedrockAdaptiveClaudeOptions(shape) : {};
+}
+
+function bedrockAdaptiveClaudeOptions(shape: AnthropicThinkingShape): ProviderOptions {
+  const effort = shape.effort;
+  assert(effort != null, "adaptive Claude thinking always carries an effort");
+  if (shape.thinking?.type === "disabled") {
+    return {
+      bedrock: {
+        additionalModelRequestFields: {
+          thinking: { type: "disabled" },
+          output_config: { effort },
+        },
+      },
+    };
+  }
+  // between_tools needs the Anthropic payload (resolveBetweenToolsThinkingLevel
+  // never yields it here); like an omitted `thinking`, send the effort alone.
+  const adaptive = shape.thinking?.type === "adaptive" ? shape.thinking : undefined;
+  return {
+    bedrock: {
+      reasoningConfig: {
+        ...(adaptive && {
+          type: "adaptive" as const,
+          ...(adaptive.summarized && { display: "summarized" as const }),
+        }),
+        maxReasoningEffort: effort,
+      },
+    },
+  };
 }
 
 function resolveAnthropic1MCapabilityModel(
@@ -593,8 +753,11 @@ export function buildProviderOptions(
   // Sonnet 5.5 "off" is `between_tools` only for the Anthropic payload on an eligible
   // route and with the effort pinned; elsewhere it runs as "low" adaptive. The turn
   // path already resolved this; the pass covers headless callers (e.g. compaction).
+  // Claude on Bedrock resolves its rules from the canonical id (see
+  // bedrockClaudeCapabilityModel), the "off" clamp included.
+  const bedrockClaudeModel = bedrockClaudeCapabilityModel(formatProvider, capabilityModel);
   const effectiveThinking = resolveBetweenToolsThinkingLevel(
-    capabilityModel,
+    bedrockClaudeModel ?? capabilityModel,
     thinkingLevel,
     formatProvider === "anthropic" &&
       anthropicBetweenToolsRouteAvailable(modelString, routeProvider, providersConfig),
@@ -621,88 +784,33 @@ export function buildProviderOptions(
     // serializes it to a top-level cache_control block, which adds an extra
     // breakpoint on direct Anthropic requests.
 
-    // Opus 4.5+, Sonnet 4.6, and Sonnet 5 use the effort parameter for reasoning control.
-    // Opus 4.6+ / Sonnet 4.6 / Sonnet 5 use adaptive thinking (model decides when/how much).
-    // Opus 4.5 uses enabled thinking with a budgetTokens ceiling.
-    const isOpus45 = capModelName?.includes("opus-4-5") ?? false;
-    const isOpus46 = capModelName?.includes("opus-4-6") ?? false;
-    // Opus 4.7+, Sonnet 5+ and Haiku 5+ — the native-xhigh tier, which also uses adaptive
-    // thinking. Haiku 5.5 must land here: it rejects `budget_tokens` (400).
-    const supportsNativeXhigh = anthropicSupportsNativeXhigh(capabilityModel);
-    const isSonnet46 = capModelName?.includes("sonnet-4-6") ?? false;
-    const usesAdaptiveThinking = isOpus46 || supportsNativeXhigh || isSonnet46;
+    const shape = resolveAnthropicThinkingShape(capabilityModel, capModelName, effectiveThinking);
+    // Replayed history is not yet append-only (model-only tool-result fields are
+    // stripped before replay), which invalidates later thinking blocks on models
+    // that bind them to the prefix. Ask the API to drop those blocks instead of
+    // rejecting the whole request.
+    const blockBinding =
+      shape.thinking?.type === "adaptive" &&
+      shape.thinking.summarized &&
+      anthropicBindsThinkingToPrefix(capabilityModel) &&
+      anthropicBlockBindingRouteAvailable(
+        modelString,
+        routeProvider,
+        providersConfig,
+        muxProviderOptions
+      )
+        ? ({ prefixMismatchBehavior: "drop_block" } as const)
+        : undefined;
+    const thinking: AnthropicProviderOptions["thinking"] =
+      shape.thinking?.type === "adaptive"
+        ? shape.thinking.summarized
+          ? { type: "adaptive", display: "summarized", ...(blockBinding && { blockBinding }) }
+          : { type: "adaptive" }
+        : shape.thinking;
 
-    if (isOpus45 || usesAdaptiveThinking) {
-      // Model-aware effort: native-xhigh models (Opus 4.7+ / Sonnet 5+ / Mythos)
-      // get the native "xhigh" wire value; other adaptive models keep xhigh → "max".
-      const effortLevel = getAnthropicEffort(effectiveThinking, capabilityModel);
-      const budgetTokens = ANTHROPIC_THINKING_BUDGETS[effectiveThinking];
-      // Replayed history is not yet append-only (model-only tool-result fields are
-      // stripped before replay), which invalidates later thinking blocks on models
-      // that bind them to the prefix. Ask the API to drop those blocks instead of
-      // rejecting the whole request.
-      const blockBinding =
-        anthropicBindsThinkingToPrefix(capabilityModel) &&
-        anthropicBlockBindingRouteAvailable(
-          modelString,
-          routeProvider,
-          providersConfig,
-          muxProviderOptions
-        )
-          ? ({ prefixMismatchBehavior: "drop_block" } as const)
-          : undefined;
-      // Opus 4.6+ / Sonnet 4.6 / Sonnet 5: adaptive thinking when on, disabled when off
-      // Opus 4.5: enabled thinking with budgetTokens ceiling (only when not "off")
-      // Mythos-class (Fable/Mythos) and Opus 5.5 reject `{ type: "disabled" }`. The thinking policy
-      // excludes "off" for them and AIService clamps the effective level via
-      // resolveEffectiveThinkingLevel, so "off" should not reach here — but if a stray
-      // path does, omit `thinking` (API defaults to adaptive) rather than hard-erroring.
-      //
-      // Opus 5 rejects disabled thinking above high effort. "off" maps to low,
-      // so this branch cannot produce that invalid combination. (Opus 5.5 rejects
-      // it at every effort and takes the Mythos-class omit path above.)
-      //
-      // Native-xhigh models require `thinking.display: "summarized"` to return
-      // thinking content on adaptive requests; non-native adaptive models
-      // (Opus 4.6 / Sonnet 4.6) must not receive `display`.
-      // See https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking#summarized-thinking
-      // Sonnet 5.5 "off" reaches here only on an eligible route (see effectiveThinking
-      // above) and becomes `between_tools`, with no display/blockBinding field: the API
-      // rejects either one alongside it.
-      const thinking: AnthropicProviderOptions["thinking"] = usesAdaptiveThinking
-        ? effectiveThinking === "off"
-          ? anthropicSupportsBetweenToolsThinking(capabilityModel)
-            ? { type: "between_tools" }
-            : anthropicRejectsDisabledThinking(capabilityModel)
-              ? undefined
-              : { type: "disabled" }
-          : supportsNativeXhigh
-            ? { type: "adaptive", display: "summarized", ...(blockBinding && { blockBinding }) }
-            : { type: "adaptive" }
-        : budgetTokens > 0
-          ? { type: "enabled", budgetTokens }
-          : undefined;
-
-      log.debug("buildProviderOptions: Anthropic effort model config", {
-        effort: effortLevel,
-        thinking,
-        thinkingLevel: effectiveThinking,
-      });
-
-      const anthropicOptions: AnthropicProviderOptions = {
-        disableParallelToolUse: false,
-        sendReasoning: true,
-        ...(thinking && { thinking }),
-        effort: effortLevel,
-      };
-
-      return { anthropic: anthropicOptions };
-    }
-
-    // Other Anthropic models: Use thinking parameter with budgetTokens
-    const budgetTokens = ANTHROPIC_THINKING_BUDGETS[effectiveThinking];
     log.debug("buildProviderOptions: Anthropic config", {
-      budgetTokens,
+      effort: shape.effort,
+      thinking,
       thinkingLevel: effectiveThinking,
     });
 
@@ -710,13 +818,8 @@ export function buildProviderOptions(
       anthropic: {
         disableParallelToolUse: false, // Always enable concurrent tool execution
         sendReasoning: true, // Include reasoning traces in requests sent to the model
-        // Conditionally add thinking configuration (non-Opus 4.5 models)
-        ...(budgetTokens > 0 && {
-          thinking: {
-            type: "enabled",
-            budgetTokens,
-          },
-        }),
+        ...(thinking && { thinking }),
+        ...(shape.effort && { effort: shape.effort }),
       },
     } satisfies { anthropic: AnthropicProviderOptions };
     log.debug("buildProviderOptions: Returning Anthropic options", options);
@@ -1049,29 +1152,16 @@ export function buildProviderOptions(
     return options;
   }
 
-  // Bedrock gets no thinking options yet, so Claude runs with the model's own
-  // default there (#5839). For Haiku 4.5 that default is no thinking, so the
-  // `haiku` alias kept "off" on Bedrock. Haiku 5.5 thinks adaptively when
-  // `thinking` is omitted, so "off" must be sent explicitly: otherwise Bedrock users
-  // silently pay for reasoning, and the workspace-naming fallback (which runs at "off")
-  // loses its forced tool choice. Mirror the direct route: disabled thinking at low
-  // effort (Haiku 5.5 accepts disabled thinking at high effort or below). The SDK
-  // serializes `reasoningConfig: { type: "disabled" }` as nothing for Claude, so the
-  // fields go through additionalModelRequestFields verbatim.
-  if (
-    formatProvider === "bedrock" &&
-    origin === "anthropic" &&
-    effectiveThinking === "off" &&
-    anthropicThinksUnlessDisabled(capabilityModel)
-  ) {
-    const options = {
-      bedrock: {
-        additionalModelRequestFields: {
-          thinking: { type: "disabled" },
-          output_config: { effort: getAnthropicEffort(effectiveThinking, capabilityModel) },
-        },
-      },
-    } satisfies { bedrock: BedrockProviderOptions };
+  // Claude on Bedrock gets the same per-model thinking shape as the direct route
+  // (#5839); without it the level picker did nothing there.
+  if (bedrockClaudeModel != null) {
+    const options = buildBedrockClaudeOptions(
+      resolveAnthropicThinkingShape(
+        bedrockClaudeModel,
+        bedrockClaudeModel.slice("anthropic:".length),
+        effectiveThinking
+      )
+    );
     log.debug("buildProviderOptions: Returning Bedrock options", options);
     return options;
   }

@@ -1,6 +1,10 @@
-import React, { useEffect, useRef, useState } from "react";
-import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
-import { refocusFallenFocus } from "@/browser/utils/ui/refocusFallenFocus";
+import React, { useContext, useEffect, useRef, useState } from "react";
+import {
+  PinnedViewToolbarSpacerContext,
+  usePinnedViewCoversWindow,
+  usePinnedViewEscape,
+} from "@/browser/hooks/usePinnedViewCoversWindow";
+import { pinnedViewClass, pinnedViewRole, pinView } from "@/browser/utils/ui/pinnedView";
 import {
   Download,
   Maximize2,
@@ -689,26 +693,33 @@ export function ArtifactsPanel(props: {
     setFullscreen(next);
   };
 
-  // Fullscreen is the panel itself pinned over the window, not a portaled dialog: moving the
-  // viewer into a portal remounted it, which rebuilt the document, re-read its relative assets
-  // and reloaded HTML/SVG frames (losing their in-page state) on every enter and exit.
-  // Everything outside the panel goes inert meanwhile, which gives the modal behaviour the
-  // dialog provided: no focus or pointer input behind it, and hidden from assistive tech.
+  // Fullscreen is the panel itself pinned in place, not a portaled dialog: moving the viewer into
+  // a portal remounted it, which rebuilt the document, re-read its relative assets and reloaded
+  // HTML/SVG frames (losing their in-page state) on every enter and exit.
+  // In a wide window it covers the workspace shell, like immersive review, so the left sidebar
+  // stays visible and usable (consistency with immersive review was the ask); the shell's other
+  // content goes inert. In a narrow window the left sidebar is a drawer that would open under the
+  // panel, and inside the full-window right sidebar overlay the left sidebar is covered already,
+  // so then it covers the window, everything else goes inert, and it is a modal dialog.
+  const coversWindow = usePinnedViewCoversWindow();
+  const ToolbarSpacer = useContext(PinnedViewToolbarSpacerContext);
+  // Escape from the usable left sidebar ends a workspace-scoped fullscreen too.
+  usePinnedViewEscape(showFullscreen, coversWindow, () => setFullscreenMode(false));
   useEffect(() => {
     const panel = panelRef.current;
     if (!showFullscreen || panel == null) return;
     // Where focus was when fullscreen opened (the Fullscreen button, or the panel for Shift+F).
     // Closing returns there, as dialogs do (#5694).
     const opener = document.activeElement;
-    const restore = makeOthersInert(panel);
+    // Both also catch focus that falls out with a removed node, as the old dialog's focus scope
+    // did: a poll that swaps the viewer for a new version, or a closing comment box. Focus then
+    // sat on <body>, so J/K and Escape missed the panel (Escape could even reach
+    // Escape-to-interrupt).
+    const unpin = pinView(panel, coversWindow);
     // Focus the panel itself, not the button that opened fullscreen, so J/K, Shift+F and C work
     // at once. Script focus is not :focus-visible in Chrome, so mark the ring by hand.
     panel.focus();
     setShortcutFocused(document.activeElement === panel);
-    // The dialog's focus scope also caught focus that fell out with a removed node: a poll that
-    // swaps the viewer for a new version, or a closing comment box. Focus then sat on <body>, so
-    // J/K and Escape missed the panel (Escape could even reach Escape-to-interrupt). Do the same.
-    const stopRefocus = refocusFallenFocus(panel);
     // A hidden ancestor hides the pinned panel too (the phone sidebar, hidden again after its
     // full-screen view closed on a rotation), which would leave the rest of the app inert
     // behind nothing. Leave fullscreen once the panel has no box.
@@ -721,8 +732,7 @@ export function ArtifactsPanel(props: {
     sizeObserver.observe(panel);
     return () => {
       sizeObserver.disconnect();
-      stopRefocus();
-      restore();
+      unpin();
       // Back to the opener when it is still a control of this panel, else to the panel, so J/K
       // keep working without another click: keys from the panel's controls bubble to it. Not to
       // whatever had focus at close: a control or an HTML frame inside the viewer (Escape in a
@@ -737,7 +747,7 @@ export function ArtifactsPanel(props: {
       // focus on <body>.
       if (document.activeElement !== returnTo) panel.focus();
     };
-  }, [showFullscreen, setAnnotationPick]);
+  }, [showFullscreen, coversWindow, setAnnotationPick]);
 
   // Picker order: pinned files first, then artifacts, then deleted artifacts with stored
   // versions. A selected version whose working file is gone keeps its own entry so the picker
@@ -1085,6 +1095,8 @@ export function ArtifactsPanel(props: {
   // files have no versions; their slot holds the unpin action instead.
   const artbar = (
     <div className="border-border-light bg-sidebar flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
+      {/* In a wide window, fullscreen can sit under the left sidebar's toggle bar. */}
+      {showFullscreen && <ToolbarSpacer />}
       <ArtifactPickerSelect
         value={selected ? pickerValue(selected.scope, selected.path) : ""}
         onToggleOtherFiles={() => setOtherFilesExpanded(!otherFilesExpanded)}
@@ -1397,23 +1409,21 @@ export function ArtifactsPanel(props: {
       ref={panelRef}
       tabIndex={0}
       onKeyDown={handleKeyDown}
-      // Same element and children in both modes, so fullscreen never remounts the viewer.
-      // z-[1500] matches the shared Dialog layer, so portaled menus and tooltips stay above it.
+      // Same element and children in both modes, so fullscreen never remounts the viewer. The
+      // pinned layers are in pinnedViewClass; portaled menus and tooltips stay above them.
       // The ring is an overlay: the sidebar clips anything drawn outside the panel, and an inset
       // ring on the panel itself is hidden under the toolbar's and viewer's backgrounds.
       className={cn(
         "after:ring-accent flex flex-col outline-none after:pointer-events-none after:absolute after:inset-0 after:z-10 after:hidden after:ring-1 after:ring-inset focus-visible:after:block data-[shortcut-focus=true]:after:block",
-        showFullscreen
-          ? "bg-background ios-standalone:top-px fixed inset-0 z-[1500]"
-          : "relative h-full min-h-0"
+        showFullscreen ? pinnedViewClass(coversWindow) : "relative h-full min-h-0"
       )}
       data-shortcut-focus={shortcutFocused || undefined}
       onBlur={(e) => {
         // Only the panel's own blur: focus moving into a toolbar button shows that button's ring.
         if (e.target === e.currentTarget) setShortcutFocused(false);
       }}
-      role={showFullscreen ? "dialog" : undefined}
-      aria-modal={showFullscreen ? true : undefined}
+      // A modal dialog over the window, or a region over the workspace shell.
+      {...(showFullscreen ? pinnedViewRole(coversWindow) : {})}
       aria-label={showFullscreen && selected != null ? `Artifact ${selected.path}` : undefined}
       data-testid="artifacts-panel"
     >

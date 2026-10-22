@@ -32,6 +32,7 @@ import {
   listWorkspacePluginSlashCommands,
   setWorkspaceMcpOverrides,
 } from "@/node/services/agentPlugins/workspacePluginOperations";
+import { skillsCliCommandResult } from "@/node/services/agentPlugins/skillsCli";
 import { handlerGen } from "@orpc/experimental-effect";
 import { Effect } from "effect";
 import {
@@ -1420,6 +1421,10 @@ export const router = (authToken?: string) => {
             subpath: input.subpath ?? undefined,
           })
         ),
+      skillsCliCommand: t
+        .input(schemas.agentPlugins.skillsCliCommand.input)
+        .output(schemas.agentPlugins.skillsCliCommand.output)
+        .handler(({ input }) => skillsCliCommandResult(input)),
       install: t
         .input(schemas.agentPlugins.install.input)
         .output(schemas.agentPlugins.install.output)

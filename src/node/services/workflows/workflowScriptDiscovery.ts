@@ -70,6 +70,8 @@ export async function discoverWorkflowScripts(
           ? { roots: skillCtx.roots, containment: skillCtx.containment }
           : {
               projectSearchRoot: input.projectSearchRoot,
+              // #6426: default roots include project plugin skills only in a trusted project.
+              projectPluginsTrusted: input.projectTrusted,
               containment: {
                 kind: "runtime",
                 root: input.projectSearchRoot ?? input.workspacePath,

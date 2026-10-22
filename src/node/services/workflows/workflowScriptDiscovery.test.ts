@@ -46,4 +46,41 @@ describe("discoverWorkflowScripts (agent plugins)", () => {
     expect(pluginEntry?.descriptor.sourceKind).toBe("plugin");
     expect(pluginEntry?.descriptor.scope).toBe("project");
   }, 60_000);
+
+  // #6426: a project plugin skill (and so its workflow.js) loads only in a trusted project.
+  test.each([true, false])(
+    "lists a project plugin skill's workflow only in a trusted project (trusted: %s)",
+    async (projectTrusted) => {
+      using tempDir = new TestTempDir("workflow-discovery-plugin-skill");
+      await writePluginWithWorkflow(tempDir.path, "skill-fixture-plugin");
+      const skillDir = path.join(
+        tempDir.path,
+        ".mux",
+        "plugins",
+        "skill-fixture-plugin",
+        "skills",
+        "plugin-skill-flow"
+      );
+      await fs.mkdir(skillDir, { recursive: true });
+      await fs.writeFile(
+        path.join(skillDir, "SKILL.md"),
+        "---\nname: plugin-skill-flow\ndescription: Plugin skill with a workflow\n---\nBody\n",
+        "utf-8"
+      );
+      await fs.writeFile(
+        path.join(skillDir, "workflow.js"),
+        "export const meta = { name: 'plugin-skill-flow', description: 'Skill workflow' };",
+        "utf-8"
+      );
+
+      const discovered = await discoverWorkflowScripts({
+        runtime: new LocalRuntime(tempDir.path),
+        workspacePath: tempDir.path,
+        projectTrusted,
+      });
+      const names = discovered.map((workflow) => workflow.scriptPath);
+      expect(names.some((name) => name.includes("plugin-skill-flow"))).toBe(projectTrusted);
+    },
+    60_000
+  );
 });

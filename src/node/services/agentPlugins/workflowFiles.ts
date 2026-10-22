@@ -2,6 +2,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 import { SkillNameSchema } from "@/common/orpc/schemas";
+import { listPluginSkillFolders, type PluginSkillsRoot } from "./discovery";
 
 /**
  * Top-level `*.js` entries of a plugin workflows/ dir, files and symlinks, sorted. The one lister
@@ -41,7 +42,10 @@ export const SKILL_WORKFLOW_ENTRY = "workflow.js";
  */
 export function pluginSkillScriptKey(pluginRoot: string, scriptPath: string): string {
   // Only the platform separator becomes `/`: on POSIX a backslash is a literal name character.
-  return path.relative(pluginRoot, scriptPath).split(path.sep).join("/");
+  const key = path.relative(pluginRoot, scriptPath).split(path.sep).join("/");
+  // A single skill at the plugin root (PluginSkillsRoot `single`) puts its script directly in
+  // the root. `./` keeps that key out of the bare-name space of top-level workflows.
+  return key.includes("/") ? key : `./${key}`;
 }
 
 /**
@@ -52,32 +56,28 @@ export function pluginSkillScriptKey(pluginRoot: string, scriptPath: string): st
  */
 export async function listPluginSkillScripts(plugin: {
   rootPath: string;
-  skillsDirs?: string[];
+  skillsDirs?: PluginSkillsRoot[];
+  skillsOnly?: true;
+  claudeFallback?: true;
 }): Promise<Array<{ file: string; filePath: string }>> {
   const scripts: Array<{ file: string; filePath: string }> = [];
-  for (const skillsDir of plugin.skillsDirs ?? []) {
-    for (const dirName of await listSubdirectories(skillsDir)) {
+  // A skills-only package runs no scripts, so none is offered for review either.
+  if (plugin.skillsOnly === true) return scripts;
+  // A Claude Code package runs no Xum code, so none of its skill scripts is offered for review.
+  if (plugin.claudeFallback === true) return scripts;
+  for (const skillsRoot of plugin.skillsDirs ?? []) {
+    // A Claude command's folder is the commands folder, not a skill folder: no script of its own.
+    if (skillsRoot.command) continue;
+    for (const { name, dir } of await listPluginSkillFolders(skillsRoot)) {
       // Only a folder the runtime loads as a skill: a valid skill name with a SKILL.md.
-      if (!SkillNameSchema.safeParse(dirName).success) continue;
-      if (!(await isFileOrLink(path.join(skillsDir, dirName, "SKILL.md")))) continue;
-      const filePath = path.join(skillsDir, dirName, SKILL_WORKFLOW_ENTRY);
+      if (!SkillNameSchema.safeParse(name).success) continue;
+      if (!(await isFileOrLink(path.join(dir, "SKILL.md")))) continue;
+      const filePath = path.join(dir, SKILL_WORKFLOW_ENTRY);
       if (!(await isFileOrLink(filePath))) continue;
       scripts.push({ file: pluginSkillScriptKey(plugin.rootPath, filePath), filePath });
     }
   }
   return scripts;
-}
-
-async function listSubdirectories(dir: string): Promise<string[]> {
-  try {
-    const entries = await fsPromises.readdir(dir, { withFileTypes: true });
-    return entries
-      .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-      .map((entry) => entry.name)
-      .sort((a, b) => a.localeCompare(b));
-  } catch {
-    return [];
-  }
 }
 
 async function isFileOrLink(filePath: string): Promise<boolean> {

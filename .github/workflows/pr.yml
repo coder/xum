@@ -184,18 +184,27 @@ jobs:
           set -euo pipefail
           curl --retry 5 --retry-all-errors --retry-delay 2 -LsSf https://astral.sh/uv/install.sh | sh
       - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # ESLint's result cache hashes the Node version, and setup-xum takes the runner's Node 22.x,
+      # so a runner with a newer Node misses every entry (#7191). Key the cache by Node version so
+      # each version restores a cache it can use.
+      - name: Read Node version
+        id: node-version
+        run: echo "version=$(node --version)" >> "$GITHUB_OUTPUT"
       - name: Cache lint/format state
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             .eslintcache
             node_modules/.cache/prettier
-          key: ${{ runner.os }}-lint-fmt-${{ hashFiles('eslint.config.mjs', '.prettierrc', '.prettierignore') }}-${{ github.sha }}
+          key: ${{ runner.os }}-lint-fmt-node-${{ steps.node-version.outputs.version }}-${{ hashFiles('eslint.config.mjs', '.prettierrc', '.prettierignore') }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-lint-fmt-${{ hashFiles('eslint.config.mjs', '.prettierrc', '.prettierignore') }}-
+            ${{ runner.os }}-lint-fmt-node-${{ steps.node-version.outputs.version }}-${{ hashFiles('eslint.config.mjs', '.prettierrc', '.prettierignore') }}-
       - run: make -j static-check-full
         env:
           MUX_ESLINT_CONCURRENCY: 4
+          # ESLint's lint workers inherit this heap limit. A cold type-aware run needs about 4 GiB
+          # per worker, above Node's default (#7191): 4 workers x 8 GiB fit the 64 GB runner.
+          NODE_OPTIONS: --max-old-space-size=8192
 
   nix-build:
     name: Nix Build
@@ -836,6 +845,9 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     with:
       model: anthropic:claude-haiku-5-5
+      # Haiku missed layout defects on screenshots (caught 21 of 25 on a bug build, Sonnet 25 of
+      # 25), so Sonnet judges the story asserts. Haiku still drives the steps.
+      judge_model: anthropic:claude-sonnet-5-5
       budget_usd: "1"
 
   stories-pr-comment:

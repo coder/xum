@@ -16,10 +16,10 @@ import { InlineReviewNote, type ReviewActionCallbacks } from "./InlineReviewNote
 import { groupDiffLines } from "@/browser/utils/highlighting/diffChunking";
 import { useTheme, type ThemeMode } from "@/browser/contexts/ThemeContext";
 import {
-  escapeHtml,
   highlightDiffChunks,
   type HighlightedChunk,
 } from "@/browser/utils/highlighting/highlightDiffChunk";
+import { escapeHtml } from "@/browser/utils/highlighting/shiki-shared";
 import { LRUCache } from "lru-cache";
 import { DIFF_ADDED_TEXT_COLOR, DIFF_REMOVED_TEXT_COLOR } from "@/constants/diffColors";
 import {

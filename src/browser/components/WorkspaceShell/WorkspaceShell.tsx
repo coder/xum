@@ -54,6 +54,7 @@ import {
 } from "@/constants/layout";
 import { ChatPane } from "../ChatPane/ChatPane";
 import {
+  PinnedViewToolbarSpacerProvider,
   RightSidebarToggle,
   RightSidebarToggleHole,
 } from "../SidebarCollapseButton/SidebarCollapseButton";
@@ -641,24 +642,28 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         immersive={isReviewImmersive}
       />
 
-      <LazyRightSidebar
-        held={heldSidebarInput}
-        collapsed={rightSidebarCollapsed}
-        key={props.workspaceId}
-        workspaceId={props.workspaceId}
-        workspacePath={props.namedWorkspacePath}
-        projectPath={props.projectPath}
-        width={sidebarWidth}
-        onStartResize={startResize}
-        isResizing={isResizing}
-        onReviewNote={handleReviewNote}
-        isCreating={props.isInitializing === true}
-        immersiveHidden={isReviewImmersive}
-        addTerminalRef={addTerminalRef}
-        fullscreen={sidebarFullscreen}
-        onCloseFullscreen={closeSidebarFullscreen}
-        onRequestFullscreen={handleRequestSidebarFullscreen}
-      />
+      {/* App's resolved left sidebar state (not the persisted key, whose default App picks at
+          mount) decides whether pinned views in the sidebar reserve the toggle bar's width. */}
+      <PinnedViewToolbarSpacerProvider leftSidebarCollapsed={props.leftSidebarCollapsed}>
+        <LazyRightSidebar
+          held={heldSidebarInput}
+          collapsed={rightSidebarCollapsed}
+          key={props.workspaceId}
+          workspaceId={props.workspaceId}
+          workspacePath={props.namedWorkspacePath}
+          projectPath={props.projectPath}
+          width={sidebarWidth}
+          onStartResize={startResize}
+          isResizing={isResizing}
+          onReviewNote={handleReviewNote}
+          isCreating={props.isInitializing === true}
+          immersiveHidden={isReviewImmersive}
+          addTerminalRef={addTerminalRef}
+          fullscreen={sidebarFullscreen}
+          onCloseFullscreen={closeSidebarFullscreen}
+          onRequestFullscreen={handleRequestSidebarFullscreen}
+        />
+      </PinnedViewToolbarSpacerProvider>
 
       {/* After the sidebar in DOM order: see RightSidebarToggleHole. */}
       <RightSidebarToggleHole />

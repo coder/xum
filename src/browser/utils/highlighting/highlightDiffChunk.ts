@@ -1,5 +1,5 @@
 import { highlightCode, isHighlightStartFailure } from "./highlightWorkerClient";
-import { isLightThemeMode } from "./shiki-shared";
+import { escapeHtml, isLightThemeMode } from "./shiki-shared";
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import type { DiffChunk } from "./diffChunking";
 
@@ -307,16 +307,4 @@ function extractLinesFromHtml(html: string): string[] {
       return chunk.substring(contentStart, closeIndex);
     })
     .filter((line) => line !== null); // Remove malformed lines
-}
-
-/**
- * Escape HTML entities for plain text fallback
- */
-export function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
 }

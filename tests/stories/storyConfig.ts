@@ -6,10 +6,12 @@
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CACHE_SEED, seedCacheDir } from "../bugbash/sandbox/cacheSeed";
-import { proxyModel } from "../bugbash/sandbox/explorerModel";
+import { proxyJudgeModel, proxyModel } from "../bugbash/sandbox/explorerModel";
 
 // Every command with a story config is model-driven (`run` too), so it always gets the model.
 export const model = proxyModel();
+// The model that judges `agent.assert`; unset, the agent's own model judges.
+export const judge = proxyJudgeModel();
 
 // A plain user, not a bug-hunting persona: a story checks one flow, it does not hunt for bugs.
 // The web stories pass no `surface`: their text, which the replay cache keys on, stays the same.

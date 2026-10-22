@@ -49,9 +49,11 @@ export async function startFakeUpstream(port = 0, onRequest?: (request: FakeRequ
       const request = { method: req.method ?? "", url: req.url ?? "", headers: req.headers, body };
       requests.push(request);
       onRequest?.(request);
-      const mode = /\[fake:(\w+)\]/.exec(body)?.[1] ?? state.mode;
+      const asked = /\[fake:(\w+)\]/.exec(body)?.[1] ?? state.mode;
       const parsed = JSON.parse(body || "{}") as { model?: string; stream?: boolean };
       const model = parsed.model ?? "claude-haiku-5-5";
+      // 403opus: a key that may use every model but Opus (a judge it cannot reach).
+      const mode = asked === "403opus" ? (model === "claude-opus-5-5" ? "403" : undefined) : asked;
       const headers = { "request-id": "req_fake", "x-fake-internal": "dropped by the proxy" };
       if (mode === "stall") return;
       // The request arrived, then the connection drops without an answer.

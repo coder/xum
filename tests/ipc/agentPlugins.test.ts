@@ -66,6 +66,7 @@ function unwrap<T>(result: Result<T, string>): T {
     const selection = { skills: ["selective-first"], mcpServers: ["selective-first"] };
     const invalid = await env.orpc.agentPlugins.install({
       source: preview.source,
+      method: preview.method,
       expectedSha: preview.lockedSha,
       expectedConsentDigest: preview.consentDigest,
       importedComponents: { ...selection, skills: ["unknown"] },
@@ -78,6 +79,7 @@ function unwrap<T>(result: Result<T, string>): T {
     const installed = unwrap(
       await env.orpc.agentPlugins.install({
         source: preview.source,
+        method: preview.method,
         expectedSha: preview.lockedSha,
         expectedConsentDigest: preview.consentDigest,
         importedComponents: selection,

@@ -1,7 +1,13 @@
+import type { ReactNode } from "react";
 import { PanelLeft, PanelRight, SquarePen } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import {
+  NoToolbarSpacer,
+  PinnedViewToolbarSpacerContext,
+  usePinnedViewCoversWindow,
+} from "@/browser/hooks/usePinnedViewCoversWindow";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { cn } from "@/common/lib/utils";
@@ -132,6 +138,36 @@ export function LeftSidebarToggleBarSpacer(props: { showNewChat: boolean }) {
         </>
       )}
     </div>
+  );
+}
+
+/**
+ * The spacer for the toolbar of a pinned view (Artifacts fullscreen, a maximized App View tab;
+ * render it only while pinned). RightSidebar provides it while the left sidebar is collapsed (from
+ * App's resolved state, not the persisted key, whose default App picks at mount): in a wide window
+ * the view covers the workspace shell and the toggle bar sits over its top-left corner, as over
+ * the workspace header. Renders nothing when the view covers the window: it covers the bar.
+ */
+export function PinnedViewToggleBarSpacer() {
+  const coversWindow = usePinnedViewCoversWindow();
+  // Collapsed inside a workspace, so the bar offers New chat too (App's toggleBarShowsNewChat).
+  return coversWindow ? null : <LeftSidebarToggleBarSpacer showNewChat />;
+}
+
+/**
+ * Gives the pinned views inside (the right sidebar's Artifacts fullscreen and App View maximize)
+ * the toggle bar spacer while the left sidebar is collapsed, and none while it is expanded.
+ */
+export function PinnedViewToolbarSpacerProvider(props: {
+  leftSidebarCollapsed: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <PinnedViewToolbarSpacerContext.Provider
+      value={props.leftSidebarCollapsed ? PinnedViewToggleBarSpacer : NoToolbarSpacer}
+    >
+      {props.children}
+    </PinnedViewToolbarSpacerContext.Provider>
   );
 }
 

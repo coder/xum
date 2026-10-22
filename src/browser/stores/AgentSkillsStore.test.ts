@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { createTestApiClient } from "@/browser/testUtils";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
+import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import { SkillNameSchema } from "@/common/orpc/schemas/agentSkill";
 import type { AgentSkillDescriptor, AgentSkillListResult } from "@/common/types/agentSkill";
 import { AgentSkillsStore, type AgentSkillsDiscovery } from "./AgentSkillsStore";
@@ -93,6 +94,19 @@ describe("AgentSkillsStore", () => {
     await settle();
 
     expect(list).toHaveBeenCalledTimes(fetches);
+  });
+
+  // #6426: trusting or revoking a project changes which project plugin skills load.
+  test("a project trust change fetches the list again", async () => {
+    const { store, list } = track(createStore([listResult(["review"]), listResult(["plugin"])]));
+    store.subscribe(DISCOVERY, () => undefined);
+    await settle();
+
+    publishProjectTrustChanged();
+    await settle();
+
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(skillNames(store)).toEqual(["plugin"]);
   });
 
   test.each<{

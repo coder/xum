@@ -20,7 +20,8 @@ import { Refusal } from "./runner";
 export const INPUTS = ["src", "tests/bugbash", "tests/stories", "tsconfig.json", "package.json"];
 /** The host env names that e2e.config.ts and startApp.ts read. No other host value passes. */
 // Not BUGBASH_AI_REASON: after a failed probe it holds the provider URL and response text.
-// Not BUGBASH_MODEL: the launcher sets it per job kind, and only for a model-driven job.
+// Not BUGBASH_MODEL: the launcher sets it per job kind, and only for a model-driven job. Not
+// BUGBASH_JUDGE_MODEL either: the launcher sets it for story jobs only.
 const PASS_ENV = ["BUGBASH_AI", "BUGBASH_AI_RESOLVED", "BUGBASH_APP_MODEL", "BUGBASH_EFFORT",
   "BUGBASH_SCENARIO", "E2E_TELEMETRY_DISABLED"]; // prettier-ignore
 // Any name that looks like a credential, anywhere in it (AWS_SECRET_ACCESS_KEY, GH_TOKEN), or a

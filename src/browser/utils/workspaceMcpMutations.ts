@@ -27,9 +27,23 @@ export function publishGlobalMcpEnablementChanged(): void {
   }
 }
 
+/** Consumers of trust-gated lists other than MCP (#6426: project plugin skills). */
+const trustListeners = new Set<() => void>();
+
 /** Trust is per project; listeners re-check every workspace (they hold no project paths). */
 export function publishProjectTrustChanged(): void {
   publishGlobalMcpEnablementChanged();
+  for (const listener of trustListeners) {
+    listener();
+  }
+}
+
+/** Subscribe a mounted consumer to project trust changes; returns an unsubscribe. */
+export function subscribeProjectTrustChanged(listener: () => void): () => void {
+  trustListeners.add(listener);
+  return () => {
+    trustListeners.delete(listener);
+  };
 }
 
 /** Subscribe a mounted consumer; returns an unsubscribe. */

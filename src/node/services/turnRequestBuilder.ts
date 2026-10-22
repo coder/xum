@@ -8,6 +8,7 @@ import { shellQuote } from "@/common/utils/shell";
 import type { OnStepSettled } from "./streamManager";
 import { measureAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
+import type { ContextBudgetExceeded } from "@/common/utils/compaction/contextBudget";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
 import { measureCompactionInputTokens } from "./compactionInputSizing";
@@ -253,6 +254,7 @@ import {
   type SimulationContext,
 } from "./streamSimulation";
 import { applyToolPolicyAndExperiments, captureMcpToolTelemetry } from "./toolAssembly";
+
 import { applyCapabilityGrants } from "@/common/utils/tools/capabilityGrants";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 
@@ -299,6 +301,8 @@ export function resolveXumToolScope(
     projectStorageAuthority:
       runtimeType === "ssh" || runtimeType === "docker" ? "runtime" : "host-local",
     ...(checkoutRoot != null ? { checkoutRoot } : {}),
+    // #6426: the project's own plugins contribute skills only once the project is trusted.
+    projectPluginsTrusted: isWorkspaceProjectTrusted(config, metadata),
   };
 }
 
@@ -308,6 +312,16 @@ import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/to
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+
+/**
+ * Whether PTC actually ran for this assembly. Policy can stop it (#7028), and
+ * then the MCP tools are flat again, so tool search must treat the request as
+ * non-PTC. code_execution is only ever synthesized by the PTC branch, so its
+ * presence says PTC ran.
+ */
+function ptcRanForTools(ptcEnabled: boolean, tools: Record<string, Tool>): boolean {
+  return ptcEnabled && tools.code_execution !== undefined;
+}
 
 /** Options used to prepare and execute a turn. */
 export interface StreamMessageOptions {
@@ -565,6 +579,78 @@ async function retryBudgetFromHistory(
   const size = await measureCompactionInputTokens(history, model.modelString);
   const budget = Math.floor(size * scale);
   return budget > 0 ? budget : undefined;
+}
+
+interface FoldedStreamState<TMessages, TTail> {
+  thinkingLevel: ThinkingLevel;
+  providerOptions: Record<string, unknown>;
+  messages: TMessages;
+  volatileSystemTail: TTail;
+  systemMessageTokens: number;
+}
+
+/**
+ * Fold PREPARING-window pending thinking overrides into the ACTUAL request build, not just the
+ * envelope: message preparation is thinking-level-dependent (Anthropic signed-reasoning
+ * transforms), so recording the new level while streaming old-level messages would make wire and
+ * replay diverge — or send an invalid extended-thinking request. Consuming pending here (applied
+ * set below) is safe: createStreamAtomically seeds streamInfo.thinkingLevel from `applied`, and
+ * prepareStep simply sees no pending to re-apply. Loops until pending is quiescent:
+ * setActiveTurnThinkingLevel can write a NEW pending while the awaited message rebuild runs, and
+ * stamping the first level after the await would leave step 0 rebuilding only provider options
+ * while the messages stay at the stale level.
+ */
+async function foldPendingThinkingOverrides<TMessages, TTail>(
+  input: {
+    holder: ActiveTurnThinkingOverride | undefined;
+    computeRebuiltProviderOptions: (
+      level: ThinkingLevel,
+      currentLevel: ThinkingLevel,
+      beforeFirstStep: boolean
+    ) => { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null;
+    rebuild: (level: ThinkingLevel) => Promise<{
+      messages: TMessages;
+      volatileSystemTail: TTail;
+      systemMessageTokens: number;
+    }>;
+    currentEffectiveLevelRef: { current: ThinkingLevel };
+  },
+  initial: FoldedStreamState<TMessages, TTail>
+): Promise<FoldedStreamState<TMessages, TTail> | { exceeded: ContextBudgetExceeded }> {
+  const { holder } = input;
+  let state = initial;
+  while (holder?.pending != null) {
+    const pendingPreparingLevel = holder.pending;
+    holder.pending = undefined;
+    const folded = input.computeRebuiltProviderOptions(
+      pendingPreparingLevel,
+      state.thinkingLevel,
+      true
+    );
+    // No-op fold (same effective level / non-foldable variant swap):
+    // re-check pending — a change may have raced the previous rebuild.
+    if (folded == null) continue;
+    try {
+      const rebuilt = await input.rebuild(folded.effectiveLevel);
+      state = {
+        thinkingLevel: folded.effectiveLevel,
+        providerOptions: folded.providerOptions,
+        messages: rebuilt.messages,
+        volatileSystemTail: rebuilt.volatileSystemTail,
+        systemMessageTokens: rebuilt.systemMessageTokens,
+      };
+    } catch (error) {
+      if (error instanceof ContextBudgetExceededError) return { exceeded: error.details };
+      throw error;
+    }
+    holder.applied = folded.effectiveLevel;
+    // Keep the mid-turn rebuild baseline in sync so a later identical
+    // request is correctly treated as a no-op.
+    input.currentEffectiveLevelRef.current = folded.effectiveLevel;
+    // Loop re-checks pending: a change during the awaits above re-folds
+    // against the level just applied.
+  }
+  return state;
 }
 
 /**
@@ -2994,6 +3080,7 @@ export class TurnRequestBuilder {
         // XUM_DISABLE_AGENT_TOOLS: drop every tool here, so tool search, the system prompt and the
         // context budgets all see the toolless request that StreamManager sends.
         if (isAgentToolsDisabled()) attemptTools = {};
+        const ptcActive = ptcRanForTools(ptcEnabled, attemptTools);
 
         // Intuition's internal memory_read must not bypass a policy denying memory
         // (a denied memory is never a refusal stub, see toolAssembly).
@@ -3035,7 +3122,7 @@ export class TurnRequestBuilder {
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
               toolPolicy: toolSearchPolicy,
-              ptcEnabled,
+              ptcEnabled: ptcActive,
               promptCacheActive: toolSearchPromptCacheActive,
               overviewMemo: toolCatalogOverviewMemo,
             });
@@ -3049,7 +3136,7 @@ export class TurnRequestBuilder {
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
               toolPolicy: toolSearchPolicy,
-              ptcEnabled,
+              ptcEnabled: ptcActive,
               promptCacheActive: toolSearchPromptCacheActive,
               overviewMemo: toolCatalogOverviewMemo,
             }).tools;
@@ -3113,7 +3200,7 @@ export class TurnRequestBuilder {
               mcpToolNames: Object.keys(mcpTools ?? {}),
               mcpToolServers: mcpToolServerNames,
               toolPolicy: toolSearchPolicy,
-              ptcEnabled,
+              ptcEnabled: ptcActive,
               promptCacheActive: toolSearchPromptCacheActive,
               overviewMemo: toolCatalogOverviewMemo,
             }).tools;
@@ -3493,6 +3580,40 @@ export class TurnRequestBuilder {
         primaryRequest.engineSystem == null
           ? finalMessages.slice(leadingSystemRows === -1 ? finalMessages.length : leadingSystemRows)
           : finalMessages;
+      const mergedProviderOptions = primaryRequest.providerOptions;
+      const currentEffectiveLevelRef = primaryRequest.currentEffectiveLevelRef;
+      const computeRebuiltProviderOptions = primaryRequest.computeRebuiltProviderOptions;
+      // Fold PREPARING-window pending thinking overrides into the ACTUAL
+      // request build, not just the envelope (see foldPendingThinkingOverrides).
+      // The fold runs before the assistant placeholder is appended: its budget-checked rebuild
+      // is the last count of this request, so a refusal leaves no row to delete, and a Token
+      // Budget stage decided after it is never re-counted after publication (#5286). A turn
+      // already stopped skips the rebuild.
+      if (combinedAbortSignal.aborted)
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+          ),
+        };
+      const foldInput = {
+        holder: activeTurnThinkingOverride,
+        computeRebuiltProviderOptions,
+        rebuild: primaryRequest.rebuildMessagesForThinkingLevel,
+        currentEffectiveLevelRef,
+      };
+      let streamState = await foldPendingThinkingOverrides(foldInput, {
+        thinkingLevel: effectiveThinkingLevel,
+        providerOptions: mergedProviderOptions,
+        messages: finalMessages,
+        volatileSystemTail: primaryRequest.volatileSystemTail,
+        systemMessageTokens,
+      });
+      if ("exceeded" in streamState) {
+        runLanguageModelCleanup(modelResult.data.model);
+        return { type: "finished", result: Err(streamState.exceeded) };
+      }
+      ({ systemMessageTokens } = streamState);
       if (combinedAbortSignal.aborted)
         return {
           type: "finished",
@@ -3516,6 +3637,32 @@ export class TurnRequestBuilder {
       if (!appendResult.success) {
         return { type: "finished", result: Err({ type: "unknown", raw: appendResult.error }) };
       }
+      // A stop that arrived during the append wins over the refold below: a refused rebuild
+      // must not turn a stopped turn into a budget error.
+      if (combinedAbortSignal.aborted) {
+        await deleteAbortedPlaceholder(assistantMessageId);
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+          ),
+        };
+      }
+      // A change written while the append's file I/O ran still reaches the messages, as when
+      // the fold ran after the append.
+      streamState = await foldPendingThinkingOverrides(foldInput, streamState);
+      if ("exceeded" in streamState) {
+        runLanguageModelCleanup(modelResult.data.model);
+        await deleteAbortedPlaceholder(assistantMessageId);
+        return { type: "finished", result: Err(streamState.exceeded) };
+      }
+      const {
+        thinkingLevel: streamThinkingLevel,
+        providerOptions: streamProviderOptions,
+        messages: streamFinalMessages,
+        volatileSystemTail: streamVolatileSystemTail,
+      } = streamState;
+      ({ systemMessageTokens } = streamState);
 
       const historySequence = assistantMessage.metadata?.historySequence ?? 0;
 
@@ -3540,7 +3687,7 @@ export class TurnRequestBuilder {
           effectiveAgentId,
           effectiveMode,
           metadataMode: legacyModeForMetadata,
-          effectiveThinkingLevel,
+          effectiveThinkingLevel: streamThinkingLevel,
           emit: (event, data) => this.dependencies.emit(event, data),
         };
 
@@ -3578,10 +3725,7 @@ export class TurnRequestBuilder {
       }
 
       let requestHeaders = primaryRequest.headers;
-      const mergedProviderOptions = primaryRequest.providerOptions;
       const resolvedOverrides = primaryRequest.resolvedOverrides;
-      const currentEffectiveLevelRef = primaryRequest.currentEffectiveLevelRef;
-      const computeRebuiltProviderOptions = primaryRequest.computeRebuiltProviderOptions;
       const rebuildProviderOptionsForThinkingLevel =
         primaryRequest.rebuildProviderOptionsForThinkingLevel;
       // Debug dump: Log the complete LLM request when MUX_DEBUG_LLM_REQUEST is set
@@ -3803,59 +3947,6 @@ export class TurnRequestBuilder {
           : undefined;
 
       const forcedFirstStepToolNames = primaryRequest.forcedFirstStepToolNames;
-
-      // Fold PREPARING-window pending thinking overrides into the ACTUAL
-      // request build, not just the envelope: message preparation is
-      // thinking-level-dependent (Anthropic signed-reasoning transforms), so
-      // recording the new level while streaming old-level messages would make
-      // wire and replay diverge — or send an invalid extended-thinking
-      // request. Consuming pending here (applied set below) is safe:
-      // createStreamAtomically seeds streamInfo.thinkingLevel from `applied`,
-      // and prepareStep simply sees no pending to re-apply.
-      // Loop until pending is quiescent: setActiveTurnThinkingLevel can write
-      // a NEW pending while the awaited message rebuild runs, and stamping the
-      // first level after the await would leave step 0 rebuilding only
-      // provider options while the messages stay at the stale level.
-      let streamThinkingLevel = effectiveThinkingLevel;
-      let streamProviderOptions = mergedProviderOptions;
-      let streamFinalMessages = finalMessages;
-      let streamVolatileSystemTail = primaryRequest.volatileSystemTail;
-      while (activeTurnThinkingOverride?.pending != null) {
-        const pendingPreparingLevel = activeTurnThinkingOverride.pending;
-        activeTurnThinkingOverride.pending = undefined;
-        const folded = computeRebuiltProviderOptions(
-          pendingPreparingLevel,
-          streamThinkingLevel,
-          true
-        );
-        if (folded == null) {
-          // No-op fold (same effective level / non-foldable variant swap):
-          // re-check pending — a change may have raced the previous rebuild.
-          continue;
-        }
-        try {
-          ({
-            messages: streamFinalMessages,
-            volatileSystemTail: streamVolatileSystemTail,
-            systemMessageTokens,
-          } = await primaryRequest.rebuildMessagesForThinkingLevel(folded.effectiveLevel));
-        } catch (error) {
-          if (error instanceof ContextBudgetExceededError) {
-            runLanguageModelCleanup(modelResult.data.model);
-            await deleteAbortedPlaceholder(assistantMessageId);
-            return { type: "finished", result: Err(error.details) };
-          }
-          throw error;
-        }
-        streamProviderOptions = folded.providerOptions;
-        streamThinkingLevel = folded.effectiveLevel;
-        activeTurnThinkingOverride.applied = folded.effectiveLevel;
-        // Keep the mid-turn rebuild baseline in sync so a later identical
-        // request is correctly treated as a no-op.
-        currentEffectiveLevelRef.current = folded.effectiveLevel;
-        // Loop re-checks pending: a change during the awaits above re-folds
-        // against the level just applied.
-      }
 
       const emitPrimaryEnvelope = (): Promise<void> =>
         primaryRequest.emitEnvelopeWith(streamThinkingLevel, streamProviderOptions);

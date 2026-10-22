@@ -20,7 +20,8 @@ import {
   type ComponentConsent,
 } from "./componentConsent";
 import { updateApprovedCopies, type ApprovedCopies } from "./approvedCopies";
-import { discoverAgentPluginAt, type AgentPluginScope } from "./discovery";
+import { discoverAgentPluginAt, listPluginSkillFolders, type AgentPluginScope } from "./discovery";
+import { pluginSkillMarkdown } from "./claudeCommands";
 import { getPluginDataPath, loadPluginMcpServers, resolvePluginInstanceId } from "./mcpConfig";
 import { listPluginSkillScripts, listPluginWorkflowFiles } from "./workflowFiles";
 import { listPluginAgentFiles } from "./agentFiles";
@@ -75,13 +76,13 @@ export async function reviewedComponentConsent(args: {
     agents: {},
     slashCommands: {},
   };
-  for (const skillsDir of plugin.skillsDirs ?? []) {
-    for (const dirName of await fs.readdir(skillsDir)) {
+  for (const skillsRoot of plugin.skillsDirs ?? []) {
+    for (const { name: dirName, dir: skillDir, file } of await listPluginSkillFolders(skillsRoot)) {
       const directoryName = SkillNameSchema.safeParse(dirName);
       if (!directoryName.success) continue;
       let content: string;
       try {
-        content = await fs.readFile(path.join(skillsDir, dirName, "SKILL.md"), "utf8");
+        content = pluginSkillMarkdown(dirName, await fs.readFile(file, "utf8"), skillsRoot.command);
       } catch {
         continue;
       }
@@ -94,7 +95,7 @@ export async function reviewedComponentConsent(args: {
       });
       // The scan keeps the first skill of a name, in declared root order.
       consent.skills[parsed.frontmatter.name] ??= skillConsentFingerprint({
-        relativeDir: path.relative(plugin.rootPath, path.join(skillsDir, dirName)),
+        relativeDir: path.relative(plugin.rootPath, skillDir),
         frontmatter: skillConsentFrontmatter(parsed),
         body: parsed.body,
       });

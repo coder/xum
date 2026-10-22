@@ -34,6 +34,7 @@ Xum discovers skills from these locations:
 - **Project (cross-tool)**: `.agents/skills/<skill-name>/SKILL.md`
 - **Global (Xum-specific)**: `~/.xum/skills/<skill-name>/SKILL.md`
 - **Universal (cross-tool)**: `~/.agents/skills/<skill-name>/SKILL.md`
+- **Skills CLI (`npx skills add -g --agent mux`)**: `~/.mux/skills/<skill-name>/SKILL.md`, read-only, after `~/.agents/skills`
 - **Built-in**: shipped with Xum
 
 For a workspace that executes in a subproject, Xum checks the working directory and each parent directory through the checkout root. It never searches above the checkout. A nearer project definition wins over a farther one; within the same directory, `.xum/skills` wins over `.agents/skills`.
@@ -63,7 +64,11 @@ Xum also discovers skills packaged in [Agent Plugins 1.0.0](https://agent-plugin
 - **Workspace-local**: `.xum/plugins/<plugin>/` and `.agents/plugins/<plugin>/`
 - **Global**: `~/.xum/plugins/<plugin>/` and `~/.agents/plugins/<plugin>/`
 
+Project plugins load their skills only in a trusted project, as their MCP servers, hooks and slash commands already do. In an untrusted project, Xum neither lists nor reads the skills of `.xum/plugins` and `.agents/plugins`, and it skips them under the project-automation kill switch too. Plain project skills (`.xum/skills`, `.agents/skills`) and global plugins do not depend on Project Trust. To use a repository's plugin skills, trust the project in **Settings → Security**.
+
 Xum reads plugins from the Xum host only. SSH, Docker, and devcontainer workspaces load the global plugins (their skills, agents, and workflows) from the Xum host. Xum does not load project plugins inside an SSH or Docker checkout, because that checkout is not on the Xum host.
+
+As in Claude Code, a skills path (`contributes.skills`) that holds a `SKILL.md` itself is one skill. Its name is the folder name, or the plugin name when the path is the plugin root (`.`). The default `skills/` folder always holds skill folders.
 
 Plugin skills have the lowest precedence within their scope and are read-only. A broken plugin (or a broken skill inside one) never affects other plugins or skills. Plugins can also ship MCP servers; see [MCP servers](/config/mcp-servers#agent-plugins-servers).
 
@@ -76,6 +81,24 @@ Installed rows show imported-of-available counts. For a managed, present plugin,
 Removing imports does not delete source files, plugin data, or workspace MCP settings (including enablement and tool allowlists). New MCP imports remain disabled until enabled per workspace; re-adding a server honors its saved workspace enablement. Agents, hooks, workflows, and slash commands are not changed by this selection. Legacy installs continue to import all components until you save a different selection. Once a selection is explicit, updates preserve it and do not automatically import newly added components.
 
 Updates preserve explicit selections: newly available skills and MCP servers stay unimported until you add them. Updates still require consent for full-package capability changes, including unimported components. Older managed installs without a saved selection continue importing everything, including new components on update. Unmanaged and project-local plugins are unchanged.
+
+#### Claude Code plugins
+
+Xum also reads a plugin whose only manifest is `.claude-plugin/plugin.json`, and **Settings → Plugins** installs one. A repository with only `.claude-plugin/marketplace.json` is a marketplace: install one of its plugins by its folder (`owner/repo/path/to/plugin`).
+
+| Claude Code component                      | In Xum                                                                                                                                               |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `skills/` and the `skills` paths           | Skills. The `skills` paths add to `skills/`.                                                                                                         |
+| `commands/*.md`, or the `commands` paths   | Skills that only you invoke, as `/name`. The model does not see them. A skill with the same name wins.                                               |
+| `agents/`, or `agents` files in one folder | [Agents](/agents).                                                                                                                                   |
+| `.mcp.json`, or one `mcpServers` JSON file | MCP servers. `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_DATA}` work in `args`, `env` and `cwd`. A `command` can be `${CLAUDE_PLUGIN_ROOT}/<path>`. |
+| `hooks/hooks.json` and the `hooks` files   | Listed in Settings. They never run. See [Plugin hooks](/hooks/plugins#claude-code-plugin-hooks).                                                     |
+
+Xum reads one MCP file: an `mcpServers` path replaces `.mcp.json` instead of adding to it. Xum ignores every other manifest key with a warning, for example `lspServers`, `outputStyles`, `userConfig`, `settings`, `dependencies` and `workflows`, and also inline `mcpServers`, `hooks` and `commands` objects. A Claude Code plugin runs no Xum code: Xum ignores its `hooks.js`, `workflows/`, `bin/` and every skill's `workflow.js`. Commands get the same [component review](#component-review) as skills. An `agents` list that spans more than one folder loads no agents. A plugin name with capitals or `_` (`My_Plugin`) loads as its lowercase form with `-` (`my-plugin`).
+
+#### Skills repositories
+
+**Settings → Plugins** also installs a repository of plain skills (`SKILL.md` folders, without a plugin manifest) as a managed plugin. Xum finds the skills with the rules of the [skills CLI](https://github.com/vercel-labs/skills) 1.7.4: a valid `SKILL.md` at the root, or skill folders directly below the root and up to three levels below `skills/`, `.agents/skills/`, `.claude/skills/`, `.github/skills/` and the other folders that the CLI searches. Xum writes a `plugin.json` for them (named after the repository or the plugin folder), and the install gets the same review, component selection and updates as any plugin. A skills install loads skills only: no hooks, agents, workflows or MCP servers. Xum tries the install methods in this order: Agent Plugin (`plugin.json` or `.codex-plugin/plugin.json`), Claude Code plugin, then Skills. When more than one method fits, the preview shows an **Install as** choice. Skills never replace a repository's own `plugin.json` or `.codex-plugin/plugin.json`. The **Skills CLI** choice shows the command of the pinned skills CLI for the checked skills, for you to copy and run in a terminal. Xum does not run the CLI itself: the CLI clones the repository again and follows symlinks when it copies a skill, so its run can copy files that the preview did not show. The command uses `--global --agent codex`, which copies the skills into `~/.agents/skills` (with `--agent mux`, as above, the CLI writes `~/.mux/skills` instead), and the CLI asks before it installs. Xum does not review, update or remove skills that the CLI installs. The choice is offered only for a source made of letters, digits and `@ _ + = : , . / -`, so the command is safe to paste into any shell.
 
 #### Component review
 

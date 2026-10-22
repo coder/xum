@@ -266,6 +266,45 @@ describe("agent_skill_read", () => {
     }
   });
 
+  // #6426: an untrusted project's plugin skill must not load by name either.
+  it.each([false, true])(
+    "reads a project plugin skill only in a trusted project (trusted: %s)",
+    async (projectPluginsTrusted) => {
+      using tempDir = new TestTempDir("test-agent-skill-read-plugin-trust");
+      const pluginDir = path.join(tempDir.path, ".xum", "plugins", "repo-plugin");
+      await fs.mkdir(path.join(pluginDir, "skills", "repo-skill"), { recursive: true });
+      await fs.writeFile(
+        path.join(pluginDir, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: "repo-plugin",
+        })
+      );
+      await fs.writeFile(
+        path.join(pluginDir, "skills", "repo-skill", "SKILL.md"),
+        "---\nname: repo-skill\ndescription: from a project plugin\n---\nPlugin body\n"
+      );
+      const tool = createAgentSkillReadTool(
+        createTestToolConfig(tempDir.path, {
+          workspaceId: "regular-workspace",
+          xumScope: {
+            type: "project",
+            xumHome: path.join(tempDir.path, "home"),
+            projectRoot: tempDir.path,
+            projectStorageAuthority: "host-local",
+            projectPluginsTrusted,
+          },
+        })
+      );
+
+      const parsed = AgentSkillReadToolResultSchema.safeParse(
+        await Promise.resolve(tool.execute!({ name: "repo-skill" }, mockToolCallOptions))
+      );
+      if (!parsed.success) throw new Error(parsed.error.message);
+      expect(parsed.data.success).toBe(projectPluginsTrusted);
+    }
+  );
+
   it("rejects project skill when skill directory symlink escapes project root", async () => {
     using tempDir = new TestTempDir("test-agent-skill-read-project-escape");
 
@@ -616,6 +655,7 @@ describe("agent_skill_read", () => {
           xumHome,
           projectRoot,
           projectStorageAuthority: "host-local",
+          projectPluginsTrusted: true,
         },
       });
 
@@ -736,6 +776,7 @@ describe("agent_skill_read skill directory", () => {
           xumHome,
           projectRoot,
           projectStorageAuthority: "host-local",
+          projectPluginsTrusted: true,
         },
       });
 
@@ -788,6 +829,7 @@ describe("agent_skill_read skill directory", () => {
           xumHome: hostXumHome,
           projectRoot: "/remote/workspace",
           projectStorageAuthority: "runtime",
+          projectPluginsTrusted: true,
         },
       }),
       cwd: "/remote/workspace",
@@ -840,6 +882,7 @@ describe("agent_skill_read skill directory", () => {
         xumHome: path.join(projectRoot, "xum-home"),
         projectRoot,
         projectStorageAuthority: "host-local",
+        projectPluginsTrusted: true,
       },
     });
 
