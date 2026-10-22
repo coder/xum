@@ -109,7 +109,6 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
           ? "Model refused to respond"
           : "Stream Error";
   const pill = isAnthropicOverloaded ? "overloaded" : message.errorType;
-  const body = message.error;
 
   const ctaAction = isAnthropicOverloaded ? (
     <Button
@@ -147,7 +146,7 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
         </div>
       </div>
       <div className="text-foreground font-mono text-[13px] leading-relaxed break-words whitespace-pre-wrap">
-        {body}
+        {message.error}
       </div>
       {compactionDetails}
       {compactRetryAction ? (

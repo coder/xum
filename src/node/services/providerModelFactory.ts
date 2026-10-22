@@ -1844,11 +1844,7 @@ export class ProviderModelFactory {
     }
 
     // Route resolution must honor the shared provider-level enabled=false switch.
-    if (isProviderDisabledInConfig(providerConfig as { enabled?: unknown })) {
-      return false;
-    }
-
-    return true;
+    return !isProviderDisabledInConfig(providerConfig as { enabled?: unknown });
   }
 
   /**
@@ -2006,8 +2002,9 @@ export class ProviderModelFactory {
         }
 
         // Backend config is authoritative for Anthropic prompt cache TTL on any
-        // Anthropic-routed model (direct Anthropic, openrouter:anthropic/*). We still allow request-level values when config
-        // is unset for backward compatibility with older clients.
+        // Anthropic-routed model (direct Anthropic, openrouter:anthropic/*). We
+        // still allow request-level values when config is unset for backward
+        // compatibility with older clients.
         const configAnthropicCacheTtl = parseAnthropicCacheTtl(providersConfig.anthropic?.cacheTtl);
         // Coder gateway instances classify by their resolved WIRE type, not the
         // route name: a custom-named Anthropic instance (coder:prod-anthropic/x)

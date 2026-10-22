@@ -635,7 +635,6 @@ export function ModelsSection() {
     );
   }
 
-  // Get all custom models across providers
   const getCustomModels = (): Array<{
     provider: string;
     modelId: string;

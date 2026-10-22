@@ -167,9 +167,9 @@ export class CodexOauthService {
   /**
    * Wire-shaped Effect surface for handlerGen router handlers. Uninterruptible:
    * a client abort between the loopback-server acquisition and
-   * `desktopFlows.register` would leak the server with nothing left to close it. Flow startup is quick
-   * and local, so running it to completion on abort is cheap; an abandoned
-   * flow still self-cleans via the registered timeout.
+   * `desktopFlows.register` would leak the server with nothing left to close
+   * it. Flow startup is quick and local, so running it to completion on abort
+   * is cheap; an abandoned flow still self-cleans via the registered timeout.
    */
   startDesktopFlowEffect(): Effect.Effect<
     Result<{ flowId: string; authorizeUrl: string }, string>

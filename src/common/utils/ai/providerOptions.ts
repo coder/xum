@@ -578,7 +578,8 @@ function anthropicBlockBindingRouteAvailable(
  * It needs no beta header but must reach the API verbatim, which only
  * @ai-sdk/anthropic 4.0.67+ does: the direct `anthropic` route (a base URL proxy
  * forwards the body) and the `coder` route (Coder AI gateway, anthropic type).
- * Everything else fails closed: Bedrock pins an older @ai-sdk/anthropic, and custom providers may validate the enum.
+ * Everything else fails closed: Bedrock pins an older @ai-sdk/anthropic, and custom providers
+ * may validate the enum.
  * On the coder route only an instance whose type is exactly "anthropic" qualifies:
  * a bedrock-typed instance also speaks the Anthropic wire, but its upstream is
  * Bedrock, and any other or unknown type may reject the enum.

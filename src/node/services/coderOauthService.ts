@@ -1,8 +1,9 @@
 /**
  * Coder deployment OAuth service.
  *
- * Internals are Effect-native (see codexOauthService.ts for the shape): fallible pipelines are `Effect.gen` programs whose error
- * channel carries a single reason-carrying tagged error, and the public
+ * Internals are Effect-native (see codexOauthService.ts for the shape):
+ * fallible pipelines are `Effect.gen` programs whose error channel carries a
+ * single reason-carrying tagged error, and the public
  * Promise methods are thin `Effect.runPromise` facades folding back into the
  * wire `Result<_, string>` shape, so pre-Effect callers keep working
  * unchanged. The cross-process file-lock critical sections

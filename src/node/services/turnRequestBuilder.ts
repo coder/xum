@@ -1475,8 +1475,9 @@ export class TurnRequestBuilder {
       }
       if (!effective.startsWith("coder:")) {
         // Fallback away from Coder. A PASSTHROUGH gateway fallback must
-        // normalize to the canonical wire identity: getToolsForModel only runs Anthropic/OpenAI-specific
-        // assembly (native web tools, MCP schema sanitization) for direct
+        // normalize to the canonical wire identity: getToolsForModel only runs
+        // Anthropic/OpenAI-specific assembly (native web tools, MCP schema
+        // sanitization) for direct
         // provider prefixes, and passthrough gateways forward origin-shaped
         // payloads. Transforming gateways (openrouter) keep their own
         // identity, same as a direct selection of that gateway.

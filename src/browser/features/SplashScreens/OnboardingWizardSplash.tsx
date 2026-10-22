@@ -566,22 +566,21 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
   // Clamp stepIndex to valid range when the step list changes. Skip while still
   // loading provider config — the temporary single-item "loading" array would
   // reset a restored stepIndex (e.g. after resuming from paused onboarding).
-  const isLoading = providersLoading;
   useEffect(() => {
-    if (isLoading) return;
+    if (providersLoading) return;
     setStepIndex((index) => Math.min(index, steps.length - 1));
-  }, [isLoading, steps.length]);
+  }, [providersLoading, steps.length]);
 
   const totalSteps = steps.length;
   const currentStep = steps[stepIndex] ?? steps[0];
-  const firstRunView = useFirstRunViewHandoff(isLoading);
+  const firstRunView = useFirstRunViewHandoff(providersLoading);
 
   if (!currentStep || firstRunView.hideWhileLoading) {
     return null;
   }
 
-  const canGoBack = !isLoading && stepIndex > 0;
-  const canGoForward = !isLoading && stepIndex < totalSteps - 1;
+  const canGoBack = !providersLoading && stepIndex > 0;
+  const canGoForward = !providersLoading && stepIndex < totalSteps - 1;
 
   const goBack = () => {
     if (!canGoBack) {
@@ -607,9 +606,9 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
   const isProjectStep = currentStep.key === "projects";
 
-  const primaryLabel = isLoading ? "Next" : canGoForward ? "Next" : "Done";
+  const primaryLabel = providersLoading ? "Next" : canGoForward ? "Next" : "Done";
   const primaryButtonLabel = isProjectStep && isProjectCreating ? "Adding..." : primaryLabel;
-  const primaryDisabled = isLoading || (isProjectStep && isProjectCreating);
+  const primaryDisabled = providersLoading || (isProjectStep && isProjectCreating);
 
   return (
     <SplashScreen
