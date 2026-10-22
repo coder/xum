@@ -163,7 +163,10 @@ async function countOtherRefCommits(
         .filter((line) => line !== "")
     : [];
   for (const sha of stashEntries) {
-    assert(/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(sha), `stash reflog line is not a commit ID: ${sha}`);
+    assert(
+      /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(sha),
+      `stash reflog line is not a commit ID: ${sha}`
+    );
   }
   const stash = hasStash ? `refs/stash ${stashEntries.join(" ")} ` : "";
   // A copy starts with the source's branches (and, for `cp` copies, its stash). Commits the source
