@@ -727,8 +727,9 @@ function removeTabFromTabset(
 
 /**
  * Close one tab of one tabset (the strip's X, middle-click, Close Tab shortcut). A tabset left
- * empty collapses into its sibling; when it was the last tabset, the New tab takes its place.
- * Closing the New tab when it is the only tab of the layout does nothing.
+ * empty collapses into its sibling; when it was the last tabset, the New tab takes its place
+ * (RightSidebar closes the sidebar then, so it shows on the next expand). Closing the New tab
+ * when it is the only tab of the layout does nothing.
  *
  * Scoped to a tabset (unlike removeTabEverywhere) because each tabset may hold its own New tab.
  */

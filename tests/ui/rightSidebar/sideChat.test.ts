@@ -422,6 +422,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
         },
         { timeout: 10_000 }
       );
+      // It was the only tab, so the sidebar closed with it.
+      expect(readPersistedState(getRightSidebarCollapsedKey(app.workspaceId), false)).toBe(true);
       await waitFor(
         async () => {
           expect(await app.env.orpc.workspace.getInfo({ workspaceId: sideChatId })).toBeNull();
