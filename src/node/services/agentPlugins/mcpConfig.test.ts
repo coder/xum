@@ -341,6 +341,31 @@ describe("loadPluginMcpServers", () => {
     expect(codexResult.diagnostics[0].message).toContain("executable token");
   });
 
+  test("the Claude dialect skips a url entry without a type instead of inferring one", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const servers = {
+      untyped: { url: "https://mcp.example.com/mcp" },
+      typed: { type: "http", url: "https://mcp.example.com/mcp" },
+    };
+    const plugin: AgentPluginInfo = {
+      ...(await makePlugin(tmp.path, "claude", servers, { fileName: ".mcp.json" })),
+      mcpConfigDialect: "claude",
+    };
+
+    const { servers: loaded, diagnostics } = await loadPluginMcpServers(plugin, {
+      xumHome: tmp.path,
+    });
+
+    // Claude Code skips the untyped entry as a configuration error; Xum does the same.
+    expect(Object.values(loaded).map((s) => s.plugin?.serverName)).toEqual(["typed"]);
+    expect(diagnostics.map((d) => [d.severity, d.message])).toEqual([
+      [
+        "warning",
+        ".mcp.json server 'untyped': a 'url' entry needs a 'type' ('http' or 'sse') in a Claude .mcp.json; skipping this server",
+      ],
+    ]);
+  });
+
   test("the Codex dialect forwards only the host variables that env_vars names", async () => {
     using tmp = new DisposableTempDir("plugin-mcp");
     const plugin = await makePlugin(
