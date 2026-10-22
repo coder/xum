@@ -36,6 +36,7 @@ import { isCommandAvailable, findAvailableCommand } from "@/node/utils/commandDi
 import { resolveContainerCli } from "@/node/runtime/containerCli";
 import { sanitizeXumChildEnv } from "@/node/runtime/childProcessEnv";
 import { appendDaytonaOpenSSHArgs } from "@/node/runtime/sshConnectionPool";
+import { cdCommandForSSH } from "@/node/runtime/tildeExpansion";
 import { Terminal } from "@xterm/headless";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { NO_OSC_IDLE_FALLBACK_MS } from "@/constants/terminalActivity";
@@ -1013,9 +1014,8 @@ export class TerminalService {
       // Add host
       sshArgs.push(config.sshConfig.host);
       // Add remote command to cd into directory and start shell
-      // Use single quotes to prevent local shell expansion
       // exec $SHELL replaces the SSH process with the shell, avoiding nested processes
-      sshArgs.push(`cd '${config.remotePath.replace(/'/g, "'\\''")}' && exec $SHELL`);
+      sshArgs.push(`${cdCommandForSSH(config.remotePath)} && exec $SHELL`);
     }
 
     const logPrefix = isSSH ? "SSH terminal" : "terminal";

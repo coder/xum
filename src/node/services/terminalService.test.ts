@@ -1898,7 +1898,7 @@ describe("TerminalService.openNative", () => {
       "-F",
       writer.paths.includePath,
       host,
-      `cd '${remotePath.replace(/'/g, "'\\''")}' && exec $SHELL`,
+      `cd "${remotePath}" && exec $SHELL`,
     ];
     const configWithDaytonaWorkspace = {
       ...configWithSSHWorkspace,
@@ -1957,6 +1957,27 @@ describe("TerminalService.openNative", () => {
       );
       const args = await spawnedArgs();
       expect(shellArgv(args[1])).toEqual(expectedArgv);
+    });
+
+    it("expands a ~ workspace path on the remote host", async () => {
+      setPlatform("linux");
+      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) =>
+        cmd === "which" && args?.[0] === "xfce4-terminal" ? { status: 0 } : { status: 1 }
+      );
+      const [workspace] = await configWithDaytonaWorkspace.getAllWorkspaceMetadata();
+      service = new TerminalService(
+        {
+          ...configWithDaytonaWorkspace,
+          getAllWorkspaceMetadata: mock(() =>
+            Promise.resolve([{ ...workspace, namedWorkspacePath: "~/src/project/feature" }])
+          ),
+        } as unknown as Config,
+        mockPTYService,
+        mockSecretsStore
+      );
+      await service.openNative("ws-daytona");
+      const args = (spawnSpy.mock.calls[0] as [string, string[]])[1];
+      expect(shellArgv(args[1]).at(-1)).toBe('cd "$HOME/src/project/feature" && exec $SHELL');
     });
   });
 
