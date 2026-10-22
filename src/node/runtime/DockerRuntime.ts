@@ -203,7 +203,8 @@ function buildCredentialArgs(): string[] {
  * #6426: how often this process created or deleted each container name. Module level, because a
  * runtime object is made per call. It is part of getAgentHostKey, so a container that Xum created
  * again under the same name never reuses the cached plugin snapshot of the old one, and no docker
- * process runs to tell them apart.
+ * process runs to tell them apart. Bumped AFTER each create attempt and removal: a snapshot is
+ * keyed when its read starts, so a read that raced the change keeps the old key.
  */
 const containerGenerations = new Map<string, number>();
 
@@ -222,7 +223,6 @@ async function streamDockerRun(
   options?: { abortSignal?: AbortSignal; shareCredentials?: boolean; timeoutMs?: number }
 ): Promise<DockerCommandResult> {
   const { abortSignal, shareCredentials, timeoutMs = 600000 } = options ?? {};
-  bumpContainerGeneration(containerName);
   const cli = await resolveContainerCli();
 
   return new Promise((resolve) => {
@@ -774,6 +774,8 @@ export class DockerRuntime extends RemoteRuntime {
       abortSignal,
       shareCredentials: this.config.shareCredentials,
     });
+    // #6426: after the attempt (even a failed run can leave a container under this name).
+    bumpContainerGeneration(containerName);
     if (runResult.exitCode !== 0) {
       await runDockerCommand(`rm -f ${containerName}`, 10000);
       throw new Error(`Failed to create container: ${runResult.stderr}`);
@@ -988,7 +990,6 @@ export class DockerRuntime extends RemoteRuntime {
 
     const containerName = getContainerName(projectPath, workspaceName);
     const deletedPath = CONTAINER_SRC_DIR;
-    bumpContainerGeneration(containerName);
 
     try {
       // Check if container exists
@@ -997,6 +998,7 @@ export class DockerRuntime extends RemoteRuntime {
       if (inspectResult.exitCode !== 0) {
         // Only treat as "doesn't exist" if Docker says so
         if (inspectResult.stderr.toLowerCase().includes("no such object")) {
+          bumpContainerGeneration(containerName);
           return { success: true, deletedPath };
         }
         return {
@@ -1065,6 +1067,7 @@ export class DockerRuntime extends RemoteRuntime {
 
       // Stop and remove container
       const rmResult = await runDockerCommand(`rm -f ${containerName}`, 30000);
+      bumpContainerGeneration(containerName);
 
       if (rmResult.exitCode !== 0) {
         return {
@@ -1162,6 +1165,7 @@ export class DockerRuntime extends RemoteRuntime {
       dockerArgs.push(this.config.image, "sleep", "infinity");
       throwIfAborted();
       const runResult = await runContainerSpawnCommand(dockerArgs, 60000, abortSignal);
+      bumpContainerGeneration(destContainerName);
       if (runResult.exitCode !== 0) {
         // Handle TOCTOU race - container may have been created between check and run
         if (runResult.stderr.includes("already in use")) {

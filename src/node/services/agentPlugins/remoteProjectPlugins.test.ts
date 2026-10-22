@@ -131,6 +131,51 @@ describe("createRemoteProjectPluginSnapshot", () => {
   });
 });
 
+describe("buildRemotePluginListingScript", () => {
+  test("without `readlink -f` it falls back to realpath; with neither, no plugins", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-readlink");
+    const { root, container } = await checkoutWithKit(checkout.path);
+    const bin = path.join(root, "bin");
+    const fake = async (tool: string, script: string) => {
+      await writeFile(path.join(bin, tool), `#!/bin/sh\n${script}\n`);
+      await fs.chmod(path.join(bin, tool), 0o755);
+    };
+    await fake(
+      "readlink",
+      `[ "$1" = -f ] && exit 1\nexec ${Bun.which("readlink") ?? "readlink"} "$@"`
+    );
+    const snapshot = () =>
+      createRemoteProjectPluginSnapshot({
+        runtime: new CountingRemoteRuntime(root, "test", `PATH=${bin}:$PATH\n`),
+        checkoutRoot: root,
+        containers: [container],
+      });
+    expect((await snapshot())?.plugins.map((plugin) => plugin.name)).toEqual(["kit"]);
+    await fake("realpath", "exit 1");
+    expect(await snapshot()).toBeNull();
+  });
+
+  test("a plugin link to a folder inside its container is walked once", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-alias");
+    const { root, container, kit } = await checkoutWithKit(checkout.path);
+    // Walked twice, these entries would pass the entry cap.
+    const many = path.join(kit, "skills", "review", "many");
+    await fs.mkdir(many);
+    await Promise.all(
+      Array.from({ length: MAX_REMOTE_PLUGIN_ENTRIES / 2 + 100 }, (_, i) =>
+        fs.mkdir(path.join(many, `d${i}`))
+      )
+    );
+    await fs.symlink(kit, path.join(container, "alias"));
+    const snapshot = await createRemoteProjectPluginSnapshot({
+      runtime: new CountingRemoteRuntime(root, "test"),
+      checkoutRoot: root,
+      containers: [container],
+    });
+    expect(snapshot?.plugins.map((plugin) => plugin.rootPath)).toContain(kit);
+  });
+});
+
 describe("getRemoteProjectPluginSnapshot", () => {
   test("one exec per key, shared while in flight, until trust changes", async () => {
     using checkout = new DisposableTempDir("remote-plugins-cache");
