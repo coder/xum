@@ -95,6 +95,13 @@ test("a unit test that ran without coverage makes coverage incomplete", () => {
   expect(unitCoverage(dir, 2)).toEqual({ files: [], complete: false });
 });
 
+test("the summary names each error row and its reason", () => {
+  const row = { ...report.mutants[0], outcome: "error" as const, reason: "OSError: disk full" };
+  const text = summary({ ...report, mutants: [row] }, true, "");
+  expect(text).toContain(`${row.path}:${row.line}`);
+  expect(text).toContain("OSError: disk full");
+});
+
 test("the summary says when the run cut a source's test files", () => {
   const text = summary({ ...report, cappedTests: ["src/a.ts"] }, true, "");
   expect(text).toContain("src/a.ts");

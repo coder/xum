@@ -242,8 +242,7 @@ def make_worker(root: Path, tracked: list[str], into: Path) -> Path:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
     if (root / "node_modules").is_dir():
-        # A directory link on Windows too (it needs symlink rights: Developer Mode).
-        (into / "node_modules").symlink_to(root / "node_modules", target_is_directory=True)
+        (into / "node_modules").symlink_to(root / "node_modules")
     # src/version.ts is generated (gitignored), and many modules import it.
     version = root / "src" / "version.ts"
     if version.is_file():
@@ -268,10 +267,7 @@ def run_test(worker: Path, test: str, timeout: float) -> tuple[bool, float, bool
     try:
         code = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        if hasattr(os, "killpg"):
-            os.killpg(proc.pid, signal.SIGKILL)
-        else:  # Windows has no process groups: kill bun itself
-            proc.kill()
+        os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
         return False, time.monotonic() - started, True
     return code == 0, time.monotonic() - started, False
@@ -436,6 +432,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--max-seconds", type=float, default=15 * 60)
     parser.add_argument("--max-test-files", type=int, default=MAX_TEST_FILES)
     args = parser.parse_args(argv)
+    if os.name == "nt":
+        # run_test kills each test's process group (os.killpg), and the
+        # workers run bash helpers: both need a POSIX host.
+        print("mutate-check needs Linux or macOS: it runs no mutant on Windows", file=sys.stderr)
+        return 2
     started = time.monotonic()
     root = args.root.resolve()
     changes = json.loads(args.changes.read_text(encoding="utf-8"))

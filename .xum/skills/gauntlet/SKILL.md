@@ -88,7 +88,8 @@ small changes ("mutants") in the functions you changed, one at a time: `===`
 to `!==`, `>` to `>=`, `&&` to `||`, `??` to `||`, `true` to `false`, `0` to
 `1`, and more ([mutator](https://github.com/unclebob/mutator)'s rules). For
 each mutant it runs the Bun unit tests that import the file. A mutant that no
-test fails on "survived": no test checks that behaviour.
+test fails on "survived": no test checks that behaviour. It runs on Linux and
+macOS only (it kills each test's process group); on Windows it is a tool error.
 
 ```
 mutate-check: 2 survived, 7 killed, 0 uncovered, 0 without a test, 0 not run
