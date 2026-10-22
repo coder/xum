@@ -211,9 +211,9 @@ def new_pairs(
     stands in for its base form.
 
     A form made only of added lines can still be old code that moved from
-    another file (or from another place git did not pair). It stands for the
-    removed base form (one that no head form maps back to) that it matches
-    best, so moving a function does not report its old pairs as new.
+    another file (or from another place git did not pair). It stands for a
+    removed base form (one that no head form maps back to) that it matches,
+    so moving a function does not report its old pairs as new.
     """
 
     own = {
@@ -224,14 +224,28 @@ def new_pairs(
     kept = {id(base) for base in own.values() if base is not None}
     removed = [base for forms in base_by_path.values() for base in forms if id(base) not in kept]
 
-    def moved_from(form: Form) -> Form | None:
-        scored = [(similar(form.fingerprints, base.fingerprints, threshold), base) for base in removed]
-        return max(((score, base) for score, base in scored if score is not None), key=lambda sb: sb[0], default=(0, None))[1]
+    cache: dict[int, list[Form]] = {}
 
-    def at_base(form: Form) -> Form | None:
+    def at_base(form: Form) -> list[Form]:
+        """The base forms that `form` can stand for: itself if its file did not
+        change, its counterpart, or else every removed form it matches (so two
+        old duplicates moved together can each take a different one)."""
+
         if form.path not in changed_paths:
-            return form
-        return own[id(form)] or moved_from(form)
+            return [form]
+        if own[id(form)] is not None:
+            return [own[id(form)]]
+        if id(form) not in cache:
+            cache[id(form)] = [base for base in removed if similar(form.fingerprints, base.fingerprints, threshold)]
+        return cache[id(form)]
+
+    def matched_before(left: Form, right: Form) -> bool:
+        # Two distinct base forms: one base function split in two is not an old pair.
+        return any(
+            lb is not rb and similar(lb.fingerprints, rb.fingerprints, threshold)
+            for lb in at_base(left)
+            for rb in at_base(right)
+        )
 
     pairs: dict[tuple[str, str], dict] = {}
     items = list(head.items())
@@ -244,10 +258,7 @@ def new_pairs(
             score = similar(left.fingerprints, right.fingerprints, threshold)
             if score is None:
                 continue
-            left_base, right_base = at_base(left), at_base(right)
-            # Two distinct base forms: one base function split in two is not an old pair.
-            old = left_base is not None and right_base is not None and left_base is not right_base
-            if old and similar(left_base.fingerprints, right_base.fingerprints, threshold):
+            if matched_before(left, right):
                 continue  # the same two functions matched before the diff
             pair = tuple(sorted((key, other)))
             if pair not in pairs:
