@@ -103,16 +103,16 @@ export function quoteBracketedArgumentHint(yaml: string): string {
   // Top-level keys share the indent of the first content line (YAML allows an indented root
   // mapping). Deeper lines, such as block scalar text, are left alone.
   const rootIndent = /^([ \t]*)[^\s#]/m.exec(yaml)?.[1] ?? "";
-  // A `#` after whitespace starts a YAML comment: it stays a comment, outside the quoted hint.
-  const hintLine = new RegExp(
-    `^(${rootIndent}argument-hint[ \\t]*:)[ \\t]*(\\[.*?)((?:[ \\t]+#.*)?)[ \\t]*$`,
-    "m"
-  );
-  return yaml.replace(
-    hintLine,
-    (_line, key: string, hint: string, comment: string) =>
-      `${key} ${JSON.stringify(hint)}${comment}`
-  );
+  // Keep the pattern free of nested or adjacent variable-length groups: SKILL.md can be 1 MB from
+  // a cloned repo, and a lazy hint followed by an optional comment group backtracked in O(n^2).
+  const hintLine = new RegExp(`^(${rootIndent}argument-hint[ \\t]*:)[ \\t]*(\\[.*)$`, "m");
+  return yaml.replace(hintLine, (_line, key: string, rest: string) => {
+    // A `#` after whitespace starts a YAML comment: it stays a comment, outside the quoted hint.
+    const commentStart = rest.search(/[ \t]#/);
+    const hint = (commentStart === -1 ? rest : rest.slice(0, commentStart)).trimEnd();
+    const comment = commentStart === -1 ? "" : rest.slice(commentStart);
+    return `${key} ${JSON.stringify(hint)}${comment}`;
+  });
 }
 
 export function parseSkillMarkdown(input: {
