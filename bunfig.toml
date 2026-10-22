@@ -1,3 +1,10 @@
 [test]
 root = "src"
 preload = ["./tests/setup.ts"]
+
+[install]
+# Resolve only releases at least a week old (in seconds) when bun.lock changes (bun add, bun
+# update, a non-frozen install): a compromised release is usually caught and pulled within days
+# (#7227). Installs from bun.lock (--frozen-lockfile) are unaffected. To take a newer release on
+# purpose (an urgent fix), list the package in minimumReleaseAgeExcludes.
+minimumReleaseAge = 604800

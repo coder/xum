@@ -25,6 +25,8 @@ import { noComponentConsent, type ComponentConsent } from "./componentConsent";
 import type { ApprovedCopiesSource } from "./approvedCopies";
 import {
   hasGeneratedFromMarker,
+  INERT_COMPONENT_PATH,
+  readGeneratedFrom,
   isPlainObject,
   isValidAgentPluginName,
   validatePluginManifest,
@@ -353,16 +355,19 @@ export interface AgentPluginInfo {
    */
   codexFallback?: true;
   /**
-   * Found through `.claude-plugin/plugin.json`: skills, agents and MCP are honored, hooks are
-   * listed but never run, and there is no hooks.js, workflows/, slash command or
-   * `extensions.mux` (see normalizeClaudeManifest's SECURITY AUDIT).
+   * A Claude Code package: found through `.claude-plugin/plugin.json`, or a plugin.json that Xum
+   * generated from a Claude marketplace entry (the `claude-marketplace` marker). Skills, agents
+   * and MCP are honored, hooks are listed but never run, and there is no hooks.js, workflows/,
+   * slash command or `extensions.mux` (see normalizeClaudeManifest's SECURITY AUDIT).
    */
   claudeFallback?: true;
-  /** Claude components without a `contributes` member (claudeFallback only). */
+  /** Claude components without a `contributes` member (claudeFallback only; a marketplace
+   * package carries its commands paths in the marker). */
   claude?: ClaudePluginComponents;
   /**
-   * The plugin.json carries `extensions.mux.generatedFrom` (Xum wrote it for a skills repository,
-   * or the repository claims so): only skills load. No hooks.js, hooks.json, agents, workflows,
+   * The plugin.json carries an `extensions.mux.generatedFrom` marker other than a well-formed
+   * `claude-marketplace` one (Xum wrote it for a skills repository, or the repository claims
+   * so): only skills load. No hooks.js, hooks.json, agents, workflows,
    * MCP, slash commands or com.openai (see discoverPluginAt).
    */
   skillsOnly?: true;
@@ -627,7 +632,7 @@ async function resolveSkillsRoots(args: {
 /**
  * The skills roots that a manifest `skills` value names in `pluginDir`, resolved as discovery
  * resolves them (containment, and a path that holds SKILL.md is one skill). For callers that
- * count skills without a plugin manifest on disk (the Skills CLI names).
+ * count skills without a plugin manifest on disk (the Skills CLI names, marketplace entries).
  */
 export async function resolveDeclaredSkillsRoots(args: {
   pluginDir: string;
@@ -916,6 +921,72 @@ function skillsOnlyManifest(manifest: AgentPluginManifest): AgentPluginManifest 
   };
 }
 
+/**
+ * The manifest of a package generated from a Claude marketplace entry: metadata, the Claude
+ * component paths (skills, agents, MCP file) and the marker. No slash commands, hooks.js or
+ * workflows paths, hook tool grants or com.openai survive.
+ */
+function claudeMarketplaceManifest(manifest: AgentPluginManifest): AgentPluginManifest {
+  const { contributes, extensions, ...metadata } = manifest;
+  // Absent members stay undefined, which every reader treats as "not declared". The generator
+  // writes the inert path for an agents or MCP path the entry did not declare (downgrade
+  // safety, inertGeneratedComponents), so it reads as "not declared" too: the Claude defaults.
+  const { skills, agents, mcp } = contributes ?? {};
+  const declared = (value: string | undefined) =>
+    value === INERT_COMPONENT_PATH ? undefined : value;
+  const mux = extensions?.mux;
+  return {
+    ...metadata,
+    contributes: { skills, agents: declared(agents), mcp: declared(mcp) },
+    extensions: { mux: { generatedFrom: isPlainObject(mux) ? mux.generatedFrom : undefined } },
+  };
+}
+
+/**
+ * What a package loads, by its manifest file and its generatedFrom marker.
+ *
+ * SECURITY AUDIT: `extensions.mux.generatedFrom` marks a plugin.json that Xum generated
+ * (installMethods.ts). A repository can write the marker itself, so it may only REMOVE
+ * capabilities relative to a plain plugin.json. A well-formed `claude-marketplace` marker gets
+ * the Claude package set: skills, commands as user-only skills (prompt files that a plain
+ * plugin.json can ship as skills already), agents/ and MCP, but no hooks.js, workflows/, slash
+ * commands, extensions.mux grants or com.openai, and its hooks.json never runs. Every other
+ * marker, also a malformed or unknown one, is skills-only.
+ */
+function packageRules(args: {
+  manifest: AgentPluginManifest;
+  /** The manifest is the root plugin.json (the only file Xum generates). */
+  rootManifest: boolean;
+  claudeFallback: boolean;
+  claude: ClaudePluginComponents | undefined;
+}): {
+  manifest: AgentPluginManifest;
+  skillsOnly: boolean;
+  /** A .claude-plugin/plugin.json package, or one generated from a marketplace entry. */
+  claudePackage: boolean;
+  claudeComponents: ClaudePluginComponents | undefined;
+} {
+  const generatedFrom = args.rootManifest ? readGeneratedFrom(args.manifest) : undefined;
+  if (generatedFrom?.kind === "claude-marketplace") {
+    return {
+      manifest: claudeMarketplaceManifest(args.manifest),
+      skillsOnly: false,
+      claudePackage: true,
+      claudeComponents: {
+        ...(generatedFrom.commands !== undefined ? { commands: generatedFrom.commands } : {}),
+        ...(generatedFrom.agentFiles !== undefined ? { agentFiles: generatedFrom.agentFiles } : {}),
+      },
+    };
+  }
+  const skillsOnly = hasGeneratedFromMarker(args.manifest);
+  return {
+    manifest: skillsOnly ? skillsOnlyManifest(args.manifest) : args.manifest,
+    skillsOnly,
+    claudePackage: args.claudeFallback,
+    claudeComponents: args.claudeFallback ? args.claude : undefined,
+  };
+}
+
 type XumComponent = "hooks" | "agents" | "workflows";
 
 /** Where each Xum component lives by default and the AgentPluginInfo field that names it. */
@@ -1051,12 +1122,12 @@ async function discoverPluginAt(args: {
     diagnostics.push({ path: manifestPath, scope, severity: "warning", message: warning });
   }
 
-  // SECURITY AUDIT: `extensions.mux.generatedFrom` marks a plugin.json that Xum generated for a
-  // skills repository (installMethods.ts). A repository can write the marker itself, so it may
-  // only REMOVE capabilities: such a package loads skills and nothing else. The only generated
-  // kind is skills, so a marker of any shape (also a malformed or unknown one) is skills-only.
-  const skillsOnly = hasGeneratedFromMarker(validation.manifest);
-  const manifest = skillsOnly ? skillsOnlyManifest(validation.manifest) : validation.manifest;
+  const { manifest, skillsOnly, claudePackage, claudeComponents } = packageRules({
+    manifest: validation.manifest,
+    rootManifest: manifestRelative === PLUGIN_MANIFEST_RELATIVE_PATH,
+    claudeFallback,
+    claude: normalized.claude,
+  });
 
   const { openaiSource, openaiPath, openaiManifestPath } = await selectOpenAISource({
     rootReal,
@@ -1066,7 +1137,7 @@ async function discoverPluginAt(args: {
     // overlay either. Nor does a skills-only package: com.openai can point at hooks.
     overlay:
       !codexFallback &&
-      !claudeFallback &&
+      !claudePackage &&
       !skillsOnly &&
       !isPlainObject(manifest.extensions?.["com.openai"]),
     scope,
@@ -1107,15 +1178,15 @@ async function discoverPluginAt(args: {
   const skillsDirs = await resolveSkillsRoots({
     declared:
       contributes?.skills ??
-      (claudeFallback && (await isClaudeRootSkill(rootReal)) ? ["."] : undefined),
+      (claudePackage && (await isClaudeRootSkill(rootReal)) ? ["."] : undefined),
     rootReal,
     pluginName: manifest.name,
     resolveComponent,
   });
   // Claude commands load as user-only skills, after every skills root (a skill wins).
-  const commandRoots = claudeFallback
+  const commandRoots = claudePackage
     ? await resolveCommandRoots({
-        declared: normalized.claude?.commands,
+        declared: claudeComponents?.commands,
         skillsDirs,
         resolveComponent,
         rootReal,
@@ -1131,17 +1202,17 @@ async function discoverPluginAt(args: {
     : await resolvePluginMcpConfig({
         rootReal,
         declared: contributes?.mcp,
-        manifestDialect: claudeFallback ? "claude" : codexFallback ? "codex" : undefined,
+        manifestDialect: claudePackage ? "claude" : codexFallback ? "codex" : undefined,
         resolveComponent,
       });
   const { agentsDir: resolvedAgentsDir, ...xumComponents } = await resolveXumComponents({
-    allowed: xumComponentGate({ codexFallback, foreign: claudeFallback || skillsOnly, skillsOnly }),
+    allowed: xumComponentGate({ codexFallback, foreign: claudePackage || skillsOnly, skillsOnly }),
     contributes,
     resolveComponent,
   });
   const agentsDir = await keepDeclaredAgentsOnly({
     agentsDir: resolvedAgentsDir,
-    declaredFiles: claudeFallback ? normalized.claude?.agentFiles : undefined,
+    declaredFiles: claudePackage ? claudeComponents?.agentFiles : undefined,
     warn: (message) => {
       log.debug(`Agent plugin ${pluginDir}: ${message}`);
       diagnostics.push({ path: rootReal, scope, severity: "warning", message });
@@ -1157,7 +1228,7 @@ async function discoverPluginAt(args: {
     manifest,
     ...(codexFallback ? { codexFallback: true } : {}),
     ...(skillsOnly ? { skillsOnly: true } : {}),
-    ...(claudeFallback ? { claudeFallback: true, claude: normalized.claude ?? {} } : {}),
+    ...(claudePackage ? { claudeFallback: true, claude: claudeComponents ?? {} } : {}),
     ...(openai.extension !== undefined ? { openai: openai.extension, openaiManifestPath } : {}),
     ...(allSkillsRoots.length > 0 ? { skillsDirs: allSkillsRoots } : {}),
     ...mcp,
