@@ -376,6 +376,45 @@ describe("resolveSSHConfig", () => {
     });
   });
 
+  // glob(3) matches a leading "." with a literal one, escaped or not, never with a wildcard
+  // or a bracket expression.
+  test("matches dot files with an escaped leading dot in an Include pattern", async () => {
+    // Windows file names and paths differ (and the escape is a separator there).
+    if (process.platform === "win32") return;
+    await withTempHome(async (homeDir) => {
+      // Absolute: OpenSSH resolves a relative Include against the real user's ~/.ssh.
+      const confDir = path.join(homeDir, ".ssh", "conf.d");
+      await fs.mkdir(confDir);
+      for (const [name, host] of [
+        [".escaped.conf", "escaped"],
+        [".plain.conf", "plain"],
+        [".bracket.conf", "bracket"],
+      ]) {
+        await fs.writeFile(path.join(confDir, name), `Host ${host}\n  User user-${host}\n`, "utf8");
+      }
+      const configPath = path.join(homeDir, ".ssh", "config");
+      await fs.writeFile(
+        configPath,
+        [
+          `Include ${confDir}/\\.e*.conf ${confDir}/.p*.conf ${confDir}/[.]b*.conf`,
+          "Host *",
+          "  User none",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+
+      for (const [host, user] of [
+        ["escaped", "user-escaped"],
+        ["plain", "user-plain"],
+        ["bracket", "none"],
+      ]) {
+        expect((await resolveSSHConfig(host)).user).toBe(user);
+        if (hasOpenSsh) expect(opensshOptions(configPath, host)("user")).toBe(user);
+      }
+    });
+  });
+
   test("matches an Include wildcard as glob(3) does: ? is one character, * skips dot files", async () => {
     await withTempHome(async (homeDir) => {
       const confDir = path.join(homeDir, ".ssh", "conf.d");

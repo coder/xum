@@ -384,25 +384,34 @@ async function globPath(pattern: string): Promise<string[]> {
   const { root } = path.parse(normalized);
   let matches = [root];
   for (const segment of normalized.slice(root.length).split(path.sep).filter(Boolean)) {
-    const { matcher, literal } = segmentPattern(segment);
+    const { matcher, literal, literalLeadingDot } = segmentPattern(segment);
     if (!matcher) {
       matches = matches.map((dir) => path.join(dir, literal));
       continue;
     }
     const next: string[][] = [];
-    for (const dir of matches) next.push(await matchingEntries(dir, segment, matcher));
+    for (const dir of matches) {
+      next.push(await matchingEntries(dir, segment, { matcher, literalLeadingDot }));
+    }
     matches = next.flat();
   }
   return matches.sort();
 }
 
-async function matchingEntries(dir: string, segment: string, matcher: RegExp): Promise<string[]> {
+async function matchingEntries(
+  dir: string,
+  segment: string,
+  pattern: { matcher: RegExp; literalLeadingDot: boolean }
+): Promise<string[]> {
   try {
     const entries = await fs.readdir(dir);
-    // glob(3) matches a leading "." only with a literal one.
-    const dotFiles = segment.startsWith(".");
+    // glob(3) matches a leading "." only with a literal one (escaped or not), never with a
+    // wildcard or a bracket expression.
     return entries
-      .filter((entry) => (dotFiles || !entry.startsWith(".")) && matcher.test(entry))
+      .filter(
+        (entry) =>
+          (pattern.literalLeadingDot || !entry.startsWith(".")) && pattern.matcher.test(entry)
+      )
       .map((entry) => path.join(dir, entry));
   } catch (error) {
     log.debug("Failed to expand SSH config Include", {
@@ -420,20 +429,27 @@ const escapeRegExp = (text: string) => text.replace(REGEXP_SPECIAL, "\\$&");
  * One path segment of a glob(3) pattern as a RegExp: `*`, `?` (one character), bracket
  * expressions (`[ab]`, `[a-z]`, negated by a leading `!` or `^`; an unclosed `[` is literal)
  * and `\` escapes. Without a wildcard there is no matcher, only the unescaped `literal` name
- * glob(3) opens.
+ * glob(3) opens. `literalLeadingDot`: the pattern starts with a literal "." once unescaped.
  */
-function segmentPattern(segment: string): { matcher?: RegExp; literal: string } {
+function segmentPattern(segment: string): {
+  matcher?: RegExp;
+  literal: string;
+  literalLeadingDot: boolean;
+} {
   let source = "";
   let literal = "";
   let wildcard = false;
+  let literalLeadingDot = false;
   for (let i = 0; i < segment.length; i++) {
     const token = segmentToken(segment, i);
+    if (i === 0) literalLeadingDot = !token.wildcard && segment[token.end] === ".";
     source += token.source;
     wildcard ||= token.wildcard;
     if (!token.wildcard) literal += segment[token.end];
     i = token.end;
   }
-  return wildcard ? { matcher: new RegExp(`^${source}$`, "s"), literal } : { literal };
+  const matcher = wildcard ? new RegExp(`^${source}$`, "s") : undefined;
+  return { matcher, literal, literalLeadingDot };
 }
 
 const WILDCARD_SOURCES = new Map([
