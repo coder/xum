@@ -51,7 +51,7 @@ describe("openInEditor", () => {
   // navigations and close() calls, mirroring a real popup.
   function createBrowserModeWindow(
     calls: OpenCall[],
-    opts?: { popupBlocked?: boolean; denyEditorPlaceholders?: boolean }
+    opts?: { popupBlocked?: boolean; denyEditorPlaceholders?: boolean; hostname?: string }
   ) {
     const placeholder = {
       closed: false,
@@ -68,7 +68,7 @@ describe("openInEditor", () => {
     });
     const windowValue = {
       localStorage: { getItem: () => null },
-      location: { hostname: "localhost" },
+      location: { hostname: opts?.hostname ?? "localhost" },
       open: (url: string, target?: string) => {
         calls.push([url, target]);
         const wrapperBlocked =
@@ -197,6 +197,33 @@ describe("openInEditor", () => {
       );
 
       expect(result).toEqual({ success: false, error: "sandbox is archived" });
+      expect(placeholder.navigations).toEqual([]);
+      expect(placeholder.closed).toBe(true);
+    });
+
+    test("remote browser: refuses before preparing, recording or launching", async () => {
+      const calls: OpenCall[] = [];
+      const { windowValue, placeholder } = createBrowserModeWindow(calls, {
+        hostname: "xum.example.com",
+      });
+      const ensureDaytonaSandboxReady = mock(() =>
+        Promise.resolve({ success: true as const, data: undefined })
+      );
+      const recordEditorOpen = mock(() =>
+        Promise.resolve({ success: true as const, data: undefined })
+      );
+      const api = createTestApiClient({
+        general: { recordEditorOpen },
+        workspace: { ensureDaytonaSandboxReady },
+      });
+
+      const result = await withWindow(windowValue, () =>
+        openInEditor({ api, workspaceId, targetPath: parentDir, runtimeConfig: daytonaConfig })
+      );
+
+      expect(result.success).toBe(false);
+      expect(ensureDaytonaSandboxReady).not.toHaveBeenCalled();
+      expect(recordEditorOpen).not.toHaveBeenCalled();
       expect(placeholder.navigations).toEqual([]);
       expect(placeholder.closed).toBe(true);
     });

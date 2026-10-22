@@ -246,12 +246,26 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
  * The editor connects to a Daytona sandbox's ssh alias on its own, so nothing in Xum would
  * start a stopped sandbox or refresh the token (the alias's ssh user) first. Disconnected
  * (api null) skips this: the recording step then refuses the open.
+ *
+ * A browser on another machine is refused: the deep link launches the editor there, but the
+ * alias, token and pinned host keys exist only in the Xum server's ~/.ssh/config. Refused
+ * before recording, so no editor-open marker is left for an editor that cannot connect.
  */
 async function launchAfterDaytonaPrepare(
   args: OpenInEditorArgs,
   launch: () => Promise<OpenInEditorResult>
 ): Promise<OpenInEditorResult> {
-  if (!isSSHRuntime(args.runtimeConfig) || !args.runtimeConfig.daytona || !args.api) {
+  if (!isSSHRuntime(args.runtimeConfig) || !args.runtimeConfig.daytona) {
+    return launch();
+  }
+  if (isBrowserModeNow() && !isLocalhost(window.location.hostname)) {
+    return {
+      success: false,
+      error:
+        "Daytona sandboxes open in an editor only from the Xum desktop app or a browser on the Xum server's machine.",
+    };
+  }
+  if (!args.api) {
     return launch();
   }
   const ready = await args.api.workspace.ensureDaytonaSandboxReady({
