@@ -10,8 +10,11 @@
  * It writes artifacts/loop-tests/<sha>[-dirty].json and .md (git-ignored: never commit a record,
  * it goes stale). With --base it also measures <ref> in a temporary worktree, pairs the rounds of
  * each file, and writes compare-<base>-<head>.json and .md with the trips of loopTestStats.ts.
+ * Stage 2 reruns each tripped file alone, paired, RECHECK_RUNS rounds: only a trip that repeats
+ * there counts. The report lists every stage 1 trip with its stage 2 result.
  * The numbers are tripwire data for the refactor, not targets: a trip pauses the PR for review.
- * Exit codes: 0 no trip (or a record), 1 a trip, 2 bad input or a runner error. The last line is
+ * Exit codes: 0 no trip (or a record), 1 a repeated trip, 2 bad input or a runner error (stage 2
+ * included). The last line is
  * "loop-tests: ...". make reports every failure as 2, so gates call this script directly.
  */
 import assert from "node:assert/strict";
@@ -20,6 +23,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { git, gitState, repoRoot } from "./bench";
+import { compareBenchRounds } from "./benchStats";
 import {
   type LoopTestCompare,
   type LoopTestFileRecord,
@@ -27,7 +31,11 @@ import {
   type LoopTestRun,
   median,
   type PreloadOutput,
+  RECHECK_RUNS,
+  recheck,
   summarizeFile,
+  type Trip,
+  type TripCheck,
   trips,
 } from "./loopTestStats";
 
@@ -211,27 +219,104 @@ interface Side {
   dirty: boolean;
 }
 
+/**
+ * Runs `files` for `runs` rounds, `jobs` processes at a time, and returns one record per side.
+ * Round-major order, as the spike ran: the rounds of one file do not run side by side. In a
+ * compare each task runs one file on base, then on head (the order flips each round), so host
+ * load drift hits both sides of a round alike.
+ */
+async function measure(
+  sides: Side[],
+  files: string[],
+  runs: number,
+  jobs: number,
+  scratchDir: string
+): Promise<LoopTestRecord[]> {
+  // Scan first, so a scan error stops the run before any test process starts.
+  const timePatched = sides.map((side) => files.map((file) => patchesGlobalTime(side.root, file)));
+  const loadavg = [os.loadavg()[0]];
+  const sampler = setInterval(() => loadavg.push(os.loadavg()[0]), 60_000);
+  let results: Array<Map<Side["label"], LoopTestRun>>;
+  try {
+    const tasks = Array.from({ length: runs }, (_, round) =>
+      files.map((file) => async () => {
+        const order = round % 2 === 0 ? sides : [...sides].reverse();
+        const byLabel = new Map<Side["label"], LoopTestRun>();
+        for (const side of order)
+          byLabel.set(side.label, await runFile(side.root, file, scratchDir));
+        return byLabel;
+      })
+    ).flat();
+    results = await runPool(tasks, jobs);
+  } finally {
+    clearInterval(sampler);
+  }
+  loadavg.push(os.loadavg()[0]);
+  return sides.map(
+    (side, s): LoopTestRecord => ({
+      commit: side.commit,
+      dirty: side.dirty,
+      bun: Bun.version,
+      loadavg,
+      rounds: runs,
+      files: files.map((file, i) => {
+        const fileRuns = Array.from({ length: runs }, (_, round) => {
+          const run = results[round * files.length + i].get(side.label);
+          assert(run, `${side.label} ${file} round ${round}: no run`);
+          return run;
+        });
+        return summarizeFile(file, fileRuns, timePatched[s][i]);
+      }),
+    })
+  );
+}
+
+const load = (record: LoopTestRecord) => record.loadavg.map((l) => l.toFixed(1)).join(" ");
+
+/** "slower: 30% [14%, 47%], 1585 ms -> 2032 ms, failed base 0/3 head 0/3" for `file`. */
+function describeFile(
+  base: LoopTestRecord,
+  head: LoopTestRecord,
+  file: string,
+  trip: Trip | null
+): string {
+  const b = base.files.find((f) => f.file === file);
+  const h = head.files.find((f) => f.file === file);
+  assert(b && h, `${file}: not on both sides`);
+  const c = trip?.comparison ?? compareBenchRounds(b.wallMs, h.wallMs);
+  const kinds =
+    trip === null
+      ? ["no trip"]
+      : [trip.slower ? "slower" : "", trip.failsMore ? "fails more" : ""].filter(Boolean);
+  return (
+    `${kinds.join(", ")}: ${c.deltaPct.toFixed(0)}% [${c.ciLowPct.toFixed(0)}%, ${c.ciHighPct.toFixed(0)}%], ` +
+    `${c.baseMedian.toFixed(0)} ms -> ${c.headMedian.toFixed(0)} ms, ` +
+    `failed base ${b.failedRuns}/${b.wallMs.length} head ${h.failedRuns}/${h.wallMs.length}`
+  );
+}
+
 function renderCompare(compare: LoopTestCompare): string {
+  const { base, head } = compare;
   const lines = [
-    `Loop test compare: base ${compare.base.commit.slice(0, 10)}, head ${compare.head.commit.slice(0, 10)}` +
-      `${compare.head.dirty ? " (dirty)" : ""}, ${compare.head.files.length} files, ${compare.head.rounds} paired rounds`,
+    `Loop test compare: base ${base.commit.slice(0, 10)}, head ${head.commit.slice(0, 10)}` +
+      `${head.dirty ? " (dirty)" : ""}, ${head.files.length} files, ${head.rounds} paired rounds, ` +
+      `load ${load(head)}`,
     "",
   ];
   for (const file of compare.skipped) lines.push(`skip ${file} (no change to it)`);
   for (const file of compare.newFiles) lines.push(`new ${file} (no base, no trip)`);
-  for (const trip of compare.trips) {
-    const c = trip.comparison;
-    const b = compare.base.files.find((f) => f.file === trip.file);
-    const h = compare.head.files.find((f) => f.file === trip.file);
-    const kinds = [trip.slower ? "slower" : "", trip.failsMore ? "fails more" : ""].filter(Boolean);
+  // Every stage 1 trip, so a reviewer sees what stage 2 cleared.
+  for (const check of compare.checks) {
+    const { file } = check.first;
+    const rerun = check.rerun;
     lines.push(
-      `TRIP ${trip.file} ${kinds.join(", ")}: ${c.deltaPct.toFixed(0)}% ` +
-        `[${c.ciLowPct.toFixed(0)}%, ${c.ciHighPct.toFixed(0)}%], ` +
-        `${c.baseMedian.toFixed(0)} ms -> ${c.headMedian.toFixed(0)} ms, ` +
-        `failed base ${b?.failedRuns}/${b?.wallMs.length} head ${h?.failedRuns}/${h?.wallMs.length}`
+      `${check.again === null ? "cleared" : "TRIP"} ${file}`,
+      `  stage 1 (whole set): ${describeFile(base, head, file, check.first)}`,
+      `  stage 2 (alone, ${rerun.head.rounds} paired rounds, load ${load(rerun.head)}): ` +
+        describeFile(rerun.base, rerun.head, file, check.again)
     );
   }
-  lines.push("", "Base", "", renderRecord(compare.base), "Head", "", renderRecord(compare.head));
+  lines.push("", "Base", "", renderRecord(base), "Head", "", renderRecord(head));
   return lines.join("\n");
 }
 
@@ -267,8 +352,6 @@ async function main(): Promise<number> {
       process.exit(code);
     });
   }
-  const loadavg = [os.loadavg()[0]];
-  const sampler = setInterval(() => loadavg.push(os.loadavg()[0]), 60_000);
   try {
     const sides: Side[] = [{ label: "head", root, commit: state.gitSha, dirty: state.dirty }];
     let skipped: string[] = [];
@@ -287,43 +370,10 @@ async function main(): Promise<number> {
       files = files.filter((file) => baseFiles.has(file) && !skipped.includes(file));
     }
     assert(files.length > 0, `no loop test files match --filter ${values.filter}`);
-    // Scan first, so a scan error stops the run before any test process starts.
-    const timePatched = sides.map((side) =>
-      files.map((file) => patchesGlobalTime(side.root, file))
-    );
     console.error(
       `loop tests · ${files.length} files · ${runs} ${sides.length > 1 ? "paired " : ""}rounds · ${jobs} jobs`
     );
-    // Round-major order, as the spike ran: the rounds of one file do not run side by side. In a
-    // compare each task runs one file on base, then on head (the order flips each round), so
-    // host load drift hits both sides of a round alike.
-    const tasks = Array.from({ length: runs }, (_, round) =>
-      files.map((file) => async () => {
-        const order = round % 2 === 0 ? sides : [...sides].reverse();
-        const byLabel = new Map<Side["label"], LoopTestRun>();
-        for (const side of order)
-          byLabel.set(side.label, await runFile(side.root, file, scratchDir));
-        return byLabel;
-      })
-    ).flat();
-    const results = await runPool(tasks, jobs);
-    const records = sides.map(
-      (side, s): LoopTestRecord => ({
-        commit: side.commit,
-        dirty: side.dirty,
-        bun: Bun.version,
-        loadavg,
-        rounds: runs,
-        files: files.map((file, i) => {
-          const fileRuns = Array.from({ length: runs }, (_, round) => {
-            const run = results[round * files.length + i].get(side.label);
-            assert(run, `${side.label} ${file} round ${round}: no run`);
-            return run;
-          });
-          return summarizeFile(file, fileRuns, timePatched[s][i]);
-        }),
-      })
-    );
+    const records = await measure(sides, files, runs, jobs, scratchDir);
     const outDir = path.join(root, "artifacts", "loop-tests");
     fs.mkdirSync(outDir, { recursive: true });
     const headName = `${state.gitSha.slice(0, 10)}${state.dirty ? "-dirty" : ""}`;
@@ -338,7 +388,15 @@ async function main(): Promise<number> {
       return 0;
     }
     const base = records[0];
-    const compare: LoopTestCompare = { base, head, skipped, trips: trips(base, head), newFiles };
+    // Stage 2: rerun each stage 1 trip alone (one process at a time), paired with base.
+    const checks: TripCheck[] = [];
+    for (const trip of trips(base, head)) {
+      console.error(`loop tests · stage 2 · ${trip.file} alone · ${RECHECK_RUNS} paired rounds`);
+      const [rerunBase, rerunHead] = await measure(sides, [trip.file], RECHECK_RUNS, 1, scratchDir);
+      checks.push(recheck(trip, { base: rerunBase, head: rerunHead }));
+    }
+    const counted = checks.flatMap((check) => (check.again === null ? [] : [check.again]));
+    const compare: LoopTestCompare = { base, head, skipped, checks, trips: counted, newFiles };
     const name = `compare-${base.commit.slice(0, 10)}-${headName}`;
     const markdown = renderCompare(compare);
     fs.writeFileSync(path.join(outDir, `${name}.json`), `${JSON.stringify(compare, null, 2)}\n`);
@@ -348,7 +406,6 @@ async function main(): Promise<number> {
     console.log(`loop-tests: ${compare.trips.length} trips`);
     return compare.trips.length > 0 ? 1 : 0;
   } finally {
-    clearInterval(sampler);
     cleanup();
   }
 }

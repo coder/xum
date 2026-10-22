@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { type LoopTestRecord, type LoopTestRun, summarizeFile, trips } from "./loopTestStats";
+import {
+  type LoopTestRecord,
+  type LoopTestRun,
+  recheck,
+  summarizeFile,
+  trips,
+} from "./loopTestStats";
 
 const run = (wallMs: number, exitCode: number, fsMs?: number, timerMs = 0): LoopTestRun => ({
   wallMs,
@@ -86,5 +92,45 @@ describe("trips", () => {
       ["b", [1000, 1000, 1000], 2],
     ]);
     expect(trips(base, head)).toMatchObject([{ file: "a", slower: false, failsMore: true }]);
+  });
+});
+
+describe("recheck", () => {
+  const record = (wallMs: number[], failedRuns: number): LoopTestRecord => ({
+    commit: "c",
+    dirty: false,
+    bun: "1.4.3",
+    loadavg: [1],
+    rounds: wallMs.length,
+    files: [
+      {
+        file: "a",
+        wallMs,
+        failedRuns,
+        usesTempDir: true,
+        patchesGlobalTime: false,
+        fsShare: 0.1,
+        timerShare: 0,
+      },
+    ],
+  });
+  const fast = [1000, 1010, 990, 1005, 995];
+  const slow = [2000, 2030, 1990, 2010, 2005];
+  const first = trips(record(fast.slice(0, 3), 0), record(slow.slice(0, 3), 0))[0];
+
+  test("a trip that repeats alone counts, of either kind", () => {
+    expect(recheck(first, { base: record(fast, 0), head: record(slow, 0) }).again).toMatchObject({
+      file: "a",
+      slower: true,
+    });
+    expect(recheck(first, { base: record(fast, 0), head: record(fast, 2) }).again).toMatchObject({
+      file: "a",
+      slower: false,
+      failsMore: true,
+    });
+  });
+
+  test("a trip that does not repeat alone does not count", () => {
+    expect(recheck(first, { base: record(fast, 0), head: record(fast, 1) }).again).toBeNull();
   });
 });
