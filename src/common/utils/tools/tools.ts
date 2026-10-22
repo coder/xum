@@ -324,7 +324,7 @@ export interface ToolConfiguration {
   allowLegacyInvalidWorkflowAgentOutputSchema?: boolean;
   /** Enable agent_report tool (only valid for child task workspaces) */
   enableAgentReport?: boolean;
-  /** A scratch chat: no repository, and its sub-agents share its folder. */
+  /** A scratch chat (no repository). */
   scratchWorkspace?: boolean;
   /**
    * Enable RLM family messaging tools (task_message_parent / task_message_sibling).
@@ -964,14 +964,13 @@ function toolAllowlistOptions(
       config.experiments?.artifacts === true && config.xumEnv?.XUM_SCRATCH_DIR != null,
     enableToolSearch: Boolean(config.toolSearchRuntime),
     enableMcpPromptGet: Boolean(config.mcpPromptRuntime),
-    // The Review pane belongs to the user-facing parent workspace. config
-    // .enableAgentReport is the canonical "is sub-agent" signal (set true iff
-    // the workspace has a parentWorkspaceId), so withhold the review_pane_*
-    // tools from sub-agents to keep the toolset in sync with the system prompt.
-    // Scratch chats have no repository, so no Review pane either.
-    enableReviewPane: !config.enableAgentReport && config.scratchWorkspace !== true,
+    // The Review pane belongs to the user-facing parent workspace, so sub-agents
+    // (enableAgentReport is set iff the workspace has a parentWorkspaceId) do not get it,
+    // which keeps the toolset in sync with the system prompt. Scratch chats have no
+    // repository to review.
+    enableReviewPane: !config.enableAgentReport && !config.scratchWorkspace,
     // Scratch sub-agents share the chat's folder and never produce patches.
-    enableGitPatches: config.scratchWorkspace !== true,
+    enableGitPatches: !config.scratchWorkspace,
     // Xum global tools are always created; tool policy (agent frontmatter)
     // controls which agents can actually use them.
     enableMuxGlobalAgentsTools: true,

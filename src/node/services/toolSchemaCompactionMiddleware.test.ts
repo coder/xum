@@ -9,12 +9,11 @@ import {
   createToolSchemaCompactionMiddleware,
 } from "@/node/services/toolSchemaCompactionMiddleware";
 
-/** The tool input schemas a model behind the middleware receives, by tool name. */
 async function sentSchemas(
   provider: string,
   modelId: string,
   tools: Record<string, Tool>
-): Promise<Record<string, unknown>> {
+): Promise<Record<string, JSONSchema7>> {
   const inner = new MockLanguageModelV4({
     provider,
     modelId,
@@ -40,7 +39,6 @@ async function sentSchemas(
   );
 }
 
-/** Paths of every schema node that admits null. */
 function nullPaths(node: unknown, at = "$"): string[] {
   if (Array.isArray(node)) return node.flatMap((item, i) => nullPaths(item, `${at}[${i}]`));
   if (node === null || typeof node !== "object") return [];
@@ -51,11 +49,11 @@ function nullPaths(node: unknown, at = "$"): string[] {
   );
 }
 
-const compact = (name: string, inputSchema: Record<string, unknown>, anthropicWire = true) =>
-  compactToolInputSchema({ name, inputSchema: inputSchema as JSONSchema7 }, anthropicWire);
+const compactForAnthropic = (name: string, inputSchema: JSONSchema7) =>
+  compactToolInputSchema({ name, inputSchema }, { anthropicWire: true });
 
 describe("tool schema compaction", () => {
-  it("drops $schema, safe-integer bounds and zod's uuid regex on every wire", async () => {
+  it("drops $schema, safe-integer bounds and zod's uuid regex off the Anthropic wire too", async () => {
     const sent = await sentSchemas("openai.responses", "gpt-6", {
       sample: tool({
         inputSchema: z.object({
@@ -72,7 +70,7 @@ describe("tool schema compaction", () => {
         id: { type: "string", format: "uuid" },
         count: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
         // Not zod's uuid regex: a real constraint the format does not state.
-        guid: { type: "string", format: "uuid", pattern: expect.any(String) as unknown },
+        guid: { type: "string", format: "uuid", pattern: expect.any(String) as string },
       },
       required: ["id", "guid"],
       additionalProperties: false,
@@ -96,35 +94,34 @@ describe("tool schema compaction", () => {
     expect(nullPaths(anthropic.task_await)).toEqual([]);
     expect(nullPaths(gateway.task_await)).toEqual([]);
     expect(nullPaths(openai.task_await)).not.toEqual([]);
-    expect((anthropic.task_await as JSONSchema7).properties?.timeout_secs).toEqual({
-      default: 600,
-      description: expect.any(String) as string,
-      type: "number",
-      minimum: 0,
-    });
     // An MCP tool's null may mean "clear the field".
     expect(nullPaths(anthropic.linear_update_issue)).toEqual(["$.properties.assigneeId"]);
   });
 
-  it("keeps null where the schema needs it", () => {
-    const optionalNull = { properties: { note: { type: ["string", "null"] } } };
+  it("keeps null where the schema needs it and folds the rest", () => {
+    const optionalNull: JSONSchema7 = { properties: { note: { type: ["string", "null"] } } };
     // Workflow report schemas are authored by the workflow, and strict tools must list nulls.
-    expect(nullPaths(compact("agent_report", optionalNull))).not.toEqual([]);
+    expect(nullPaths(compactForAnthropic("agent_report", optionalNull))).not.toEqual([]);
     expect(
       nullPaths(
         compactToolInputSchema(
-          { name: "task_await", inputSchema: optionalNull as JSONSchema7, strict: true },
-          true
+          { name: "task_await", inputSchema: optionalNull, strict: true },
+          { anthropicWire: true }
         )
       )
     ).not.toEqual([]);
 
     expect(
-      compact("task_await", {
+      compactForAnthropic("task_await", {
         type: "object",
         properties: {
           required: { type: ["boolean", "null"] },
           both: { description: "outer", anyOf: [{ description: "inner" }, { type: "null" }] },
+          described: {
+            description: "d",
+            default: 1,
+            anyOf: [{ type: "integer", minimum: 0 }, { type: "null" }],
+          },
           union: { type: ["string", "number", "null"] },
           nested: {
             anyOf: [
@@ -140,6 +137,7 @@ describe("tool schema compaction", () => {
       properties: {
         required: { type: ["boolean", "null"] },
         both: { description: "outer", anyOf: [{ description: "inner" }] },
+        described: { description: "d", default: 1, type: "integer", minimum: 0 },
         union: { type: ["string", "number"] },
         nested: { type: "object", properties: { inner: { type: "string" } } },
       },

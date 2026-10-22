@@ -107,10 +107,8 @@ import {
 } from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware } from "@/node/services/devToolsMiddleware";
 import { createToolInputDepthGuardMiddleware } from "@/node/services/toolInputDepthGuardMiddleware";
-import {
-  createToolSchemaCompactionMiddleware,
-  mapToolSubschemas,
-} from "@/node/services/toolSchemaCompactionMiddleware";
+import { mapToolSubschemas } from "@/common/utils/tools/schemaSanitizer";
+import { createToolSchemaCompactionMiddleware } from "@/node/services/toolSchemaCompactionMiddleware";
 import {
   attachLanguageModelCleanup,
   moveLanguageModelCleanup,

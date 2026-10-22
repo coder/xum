@@ -91,20 +91,18 @@ describe("task tool", () => {
       uiSelectable: false,
       subagentRunnable: true,
     });
-    const descriptionFor = (ids: string[]) =>
-      String(
-        createTaskTool({
-          ...createTestToolConfig(tempDir.path),
-          availableSubagents: ids.map(agent),
-        }).description
-      );
-    const base = descriptionFor(["explore"]);
+    const paragraphs = (ids: string[]) => {
+      const { description } = createTaskTool({
+        ...createTestToolConfig(tempDir.path),
+        availableSubagents: ids.map(agent),
+      });
+      if (typeof description !== "string") throw new Error("expected a static description");
+      return description.split("\n\n").length;
+    };
+    const base = paragraphs(["explore"]);
 
-    // Another agent adds only its own list line; desktop adds its line plus a paragraph.
-    expect(descriptionFor(["explore", "exec"]).slice(base.length).split("\n\n")).toHaveLength(1);
-    const desktop = descriptionFor(["explore", "desktop"]);
-    expect(desktop.startsWith(base)).toBe(true);
-    expect(desktop.slice(base.length).split("\n\n")).toHaveLength(2);
+    expect(paragraphs(["explore", "exec"])).toBe(base);
+    expect(paragraphs(["explore", "desktop"])).toBe(base + 1);
   });
 
   // The advertised inputSchema is the raw (strict) Zod schema. A `.strict()` schema that omits

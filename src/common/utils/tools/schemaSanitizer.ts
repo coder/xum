@@ -164,6 +164,35 @@ export function makeNullable(schema: unknown): unknown {
   return widened ? schema : { anyOf: [schema, { type: "null" }] };
 }
 
+// Recurse only into subschemas: const, enum, default and examples hold data. Draft-07
+// `dependencies` is a map whose values are schemas or property-name lists; a list holds only
+// strings, which a rewrite leaves alone.
+const TOOL_SUBSCHEMA_KEY =
+  /^(items|prefixItems|additionalItems|contains|additionalProperties|propertyNames|not|if|then|else|anyOf|allOf|oneOf|unevaluatedItems|unevaluatedProperties)$/;
+const TOOL_SCHEMA_MAP_KEY =
+  /^(properties|patternProperties|\$defs|definitions|dependentSchemas|dependencies)$/;
+
+/** Rewrite every subschema of a JSON Schema bottom-up: children first, then the schema itself. */
+export function mapToolSubschemas(
+  node: unknown,
+  rewrite: (schema: Record<string, unknown>) => Record<string, unknown>
+): unknown {
+  if (Array.isArray(node)) return node.map((item) => mapToolSubschemas(item, rewrite));
+  if (!isPlainObject(node)) return node;
+  const out = Object.fromEntries(
+    Object.entries(node).map(([key, value]) => {
+      if (TOOL_SUBSCHEMA_KEY.test(key)) return [key, mapToolSubschemas(value, rewrite)];
+      if (!TOOL_SCHEMA_MAP_KEY.test(key) || !isPlainObject(value)) return [key, value];
+      const schemas = Object.entries(value).map(([name, schema]) => [
+        name,
+        mapToolSubschemas(schema, rewrite),
+      ]);
+      return [key, Object.fromEntries(schemas)];
+    })
+  );
+  return rewrite(out);
+}
+
 /** Property names an object schema requires, including those declared in `allOf` branches. */
 export function requiredPropertyNames(schema: unknown): Set<string> {
   const required = new Set<string>();

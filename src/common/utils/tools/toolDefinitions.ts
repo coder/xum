@@ -16,7 +16,9 @@
  * values for fields it would normally skip.  `.nullish()` (= `.optional().nullable()`)
  * emits both `null` in the type union AND keeps the field out of `required`,
  * which satisfies strict-mode providers (OpenAI) while remaining compatible
- * with non-strict providers (Anthropic, Google).
+ * with non-strict providers (Anthropic, Google). On the Anthropic wire,
+ * toolSchemaCompactionMiddleware drops that `null` from optional built-in
+ * fields again, since Anthropic lets the model omit them.
  *
  * Implementation handlers that consume these values should use `!= null`
  * (loose equality) instead of `!== undefined` to correctly treat both

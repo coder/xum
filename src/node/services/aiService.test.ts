@@ -5152,7 +5152,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
                       ? t.args
                       : compactToolInputSchema(
                           { name, inputSchema: await asSchema(t.inputSchema).jsonSchema },
-                          true
+                          { anthropicWire: true }
                         )
                   ).length,
               }))
