@@ -123,11 +123,7 @@ describe("QueuedMessage banner", () => {
   test("a blocked Edit does nothing and says why", async () => {
     const onEdit = mock(() => undefined);
     const view = render(
-      <QueuedMessage
-        message={createQueuedMessage()}
-        onEdit={onEdit}
-        editBlockedReason="Finish or cancel the open edit first"
-      />
+      <QueuedMessage message={createQueuedMessage()} onEdit={onEdit} editBlocked />
     );
 
     const edit = view.getByRole("button", { name: "Edit" });
