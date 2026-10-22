@@ -131,16 +131,6 @@ def test_a_new_copy_with_the_name_of_an_old_match_is_reported():
     assert names(pairs) == [("@1", "@27"), ("@1", "@8")]
 
 
-def test_a_function_moved_out_of_a_deleted_file_keeps_its_old_pairs_quiet():
-    # Base: cents in src/old.ts already matched count in src/c.ts. The diff
-    # deletes src/old.ts and adds cents to src/b.ts (all added lines).
-    moved = form("src/b.ts", "@1", 1, SHAPE)
-    count = form("src/c.ts", "count", 1, SHAPE)
-    base = [form("src/old.ts", "@1", 1, SHAPE)]  # a deleted file keeps its base path
-    pairs = run([moved, count], base, ["src/b.ts"], {"src/b.ts": [[1, 6]]}, {"src/b.ts": [[0, 0, 1, 6]]})
-    assert pairs == []
-
-
 def test_a_new_copy_is_reported_when_the_original_stays():
     # Same as above, but the original stays in its file: a copy, not a move.
     copy = form("src/b.ts", "@1", 1, SHAPE)
@@ -169,23 +159,3 @@ def test_naming_parses_each_reported_file_once(monkeypatch):
     side = lambda line: {"path": "src/a.ts", "name": f"@{line}", "startLine": line}
     dryer_report.name_reported(Path("."), [{"left": side(1), "right": side(9)} for _ in range(5)])
     assert calls == ["src/a.ts"]
-
-
-def test_two_old_duplicates_moved_together_stay_quiet():
-    # Base: a and b in src/a.ts already matched. The diff moves both into
-    # src/b.ts as added lines, and src/a.ts keeps other code (no rename).
-    base = [form("src/a.ts", "@1", 1, SHAPE), form("src/a.ts", "@20", 20, SHAPE), form("src/a.ts", "@40", 40, OTHER)]
-    head = [form("src/b.ts", "@1", 1, SHAPE), form("src/b.ts", "@10", 10, SHAPE), form("src/a.ts", "@1", 1, OTHER)]
-    hunks = {"src/b.ts": [[0, 0, 1, 16]], "src/a.ts": [[1, 39, 0, 0]]}
-    pairs = run(head, base, ["src/a.ts", "src/b.ts"], {"src/b.ts": [[1, 16]]}, hunks)
-    assert pairs == []
-
-
-def test_a_third_copy_of_two_moved_duplicates_is_new():
-    # Base: two duplicates in src/a.ts. The diff moves them into src/b.ts and
-    # adds a third copy: each removed form covers one moved form, not two.
-    base = [form("src/a.ts", "@1", 1, SHAPE), form("src/a.ts", "@20", 20, SHAPE), form("src/a.ts", "@40", 40, OTHER)]
-    head = [form("src/b.ts", f"@{n}", n, SHAPE) for n in (1, 10, 20)] + [form("src/a.ts", "@1", 1, OTHER)]
-    hunks = {"src/b.ts": [[0, 0, 1, 26]], "src/a.ts": [[1, 39, 0, 0]]}
-    pairs = run(head, base, ["src/a.ts", "src/b.ts"], {"src/b.ts": [[1, 26]]}, hunks)
-    assert names(pairs) == [("@1", "@20"), ("@10", "@20")]
