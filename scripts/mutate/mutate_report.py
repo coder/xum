@@ -64,6 +64,8 @@ BASELINE_TIMEOUT = 120.0  # a test file that hangs unmutated is dropped
 DEADLINE = "the run's deadline came first"
 
 EXTENSIONS = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
+# The tsconfig.json, tsconfig.tooling.json and vscode/tsconfig.json paths: all map to src/.
+ALIASES = ("@/", "@shared/", "xum/", "mux/")
 
 
 @dataclass(frozen=True)
@@ -84,8 +86,11 @@ class Site:
 def resolve(importer: str, specifier: str, files: set[str]) -> str | None:
     """The repo-relative file that an import specifier in `importer` names."""
 
-    if specifier.startswith("@/"):
-        base = "src/" + specifier[2:]
+    # Bun's `?real=1`-style suffix loads the same file.
+    specifier = specifier.split("?", 1)[0]
+    alias = next((a for a in ALIASES if specifier.startswith(a)), None)
+    if alias is not None:
+        base = "src/" + specifier[len(alias) :]
     elif specifier.startswith("."):
         base = os.path.normpath(os.path.join(os.path.dirname(importer), specifier))
     else:
