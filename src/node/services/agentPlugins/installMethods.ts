@@ -1,0 +1,532 @@
+/**
+ * Install methods: how Xum reads a staged repository as a managed plugin.
+ *
+ * - `agent-plugin`: the repository's plugin.json (or .codex-plugin/plugin.json).
+ * - `claude-plugin`: its .claude-plugin/plugin.json.
+ * - `skills`: SKILL.md folders only. Xum writes a plugin.json into the staged tree before the
+ *   review, so the consent preview, receipts and updates treat it like any plugin.
+ *
+ * Xum never overwrites or shadows a root or Codex manifest: `skills` fits only without them. A
+ * Claude manifest does not block `skills`: the generated root plugin.json wins by discovery order,
+ * which is the user's explicit choice.
+ */
+import * as fsPromises from "node:fs/promises";
+import * as path from "node:path";
+
+import YAML from "yaml";
+
+import { AGENT_PLUGIN_INSTALL_METHOD_LABELS } from "@/common/constants/agentPluginInstallMethods";
+import type { AgentPluginGitSource } from "@/common/config/schemas/agentPluginInstalls";
+import { SkillNameSchema } from "@/common/orpc/schemas";
+import type { AgentPluginInstallMethod } from "@/common/orpc/schemas/agentPlugins";
+import {
+  AGENT_PLUGIN_NAME_MAX_LENGTH,
+  isValidAgentPluginName,
+} from "@/common/utils/agentPluginName";
+import { displayRepoUrl } from "@/common/utils/agentPluginSource";
+import assert from "@/common/utils/assert";
+import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
+import { SKILL_FILENAME } from "@/node/services/tools/skillFileUtils";
+import {
+  CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
+  CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+  MAX_PLUGIN_MANIFEST_BYTES,
+  PLUGIN_MANIFEST_RELATIVE_PATH,
+  ensurePluginPathContained,
+  readPluginFileWithinRootCapped,
+} from "./discovery";
+import {
+  AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+  MAX_SKILLS_ROOTS,
+  isPlainObject,
+  readGeneratedFrom,
+  type GeneratedFrom,
+} from "./manifest";
+
+/**
+ * The priority skill folders of the pinned skills CLI, in its order (skills@1.7.4, src/skills.ts:
+ * `prioritySearchDirs` = the repository root, `skills`, its `.curated`, `.experimental` and
+ * `.system` folders, then `AGENT_PROJECT_SKILL_DIRS`). The root itself is walked one level deep
+ * (findSkillsPackageRoots); these containers are walked MAX_CONTAINER_DEPTH levels deep. Keep this
+ * a plain copy of the pinned version so a repository installs the same skills as Skills and with
+ * the CLI. Not mirrored: plugin-manifest skill paths and the CLI's deep fallback search when these
+ * folders hold no skill (Xum then offers no Skills install).
+ */
+const SKILL_CONTAINERS = [
+  "skills",
+  "skills/.curated",
+  "skills/.experimental",
+  "skills/.system",
+  ".agents/skills",
+  ".claude/skills",
+  ".cline/skills",
+  ".codebuddy/skills",
+  ".codex/skills",
+  ".commandcode/skills",
+  ".continue/skills",
+  ".factory/skills",
+  ".github/skills",
+  ".goose/skills",
+  ".grok/skills",
+  ".iflow/skills",
+  ".junie/skills",
+  ".kilo/skills",
+  ".kilocode/skills",
+  ".kimchi/skills",
+  ".kiro/skills",
+  ".minimax/skills",
+  ".mux/skills",
+  ".neovate/skills",
+  ".opencode/skills",
+  ".openhands/skills",
+  ".pi/skills",
+  ".posit/assistant/skills",
+  ".qoder/skills",
+  ".roo/skills",
+  ".trae/skills",
+  ".windsurf/skills",
+  ".zcode/skills",
+  ".zencoder/skills",
+] as const;
+
+/** The CLI walks each container this deep: `c/<name>`, `c/<group>/<name>`, `c/<g>/<g>/<name>`. */
+const MAX_CONTAINER_DEPTH = 3;
+/** The CLI walks the repository root one level deep only: `<repo>/<name>/SKILL.md`. */
+const ROOT_WALK_DEPTH = 1;
+
+/** One `contributes.skills` entry of a generated manifest. */
+export interface SkillsPackageRoot {
+  /**
+   * Root-relative and "/"-separated. "." is the repository root: one skill when the root holds
+   * SKILL.md (`skills` empty), else the folder of the root's own skill folders.
+   */
+  root: string;
+  /**
+   * The skill folder names under `root`, sorted, or `[basename]` when `root` holds SKILL.md
+   * itself. Empty for the root skill: it takes the plugin name (discovery's single-root rule).
+   */
+  skills: string[];
+}
+
+interface WalkContext {
+  rootReal: string;
+  /**
+   * Real paths already walked, with the child depth of that walk: two containers (or a symlink)
+   * can reach one folder. A folder reached again at a smaller depth (an explicit container such
+   * as `skills/.curated` after the walk of `skills/`) is walked again for its deeper levels.
+   */
+  visited: Map<string, number>;
+  roots: SkillsPackageRoot[];
+}
+
+/** The real path of a directory inside the tree; undefined when missing, outside it or in .git. */
+async function containedDirectory(
+  rootReal: string,
+  candidate: string
+): Promise<string | undefined> {
+  try {
+    const real = await ensurePluginPathContained(rootReal, candidate);
+    return (await fsPromises.stat(real)).isDirectory() ? real : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function holdsSkillFile(rootReal: string, dirReal: string): Promise<boolean> {
+  try {
+    const real = await ensurePluginPathContained(rootReal, path.join(dirReal, SKILL_FILENAME));
+    return (await fsPromises.stat(real)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function childNames(dirReal: string): Promise<string[]> {
+  const entries = await fsPromises.readdir(dirReal, { withFileTypes: true }).catch(() => []);
+  return entries
+    .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * Record `relative` as a skills root when a child holds SKILL.md, then walk the other children.
+ * A folder with SKILL.md is a skill: Xum does not look below it (a shallower SKILL.md shadows
+ * deeper ones, as in the CLI). `depth` is the level of the children (1 = `c/<name>`).
+ */
+async function walkSkillParent(
+  ctx: WalkContext,
+  relative: string,
+  dirReal: string,
+  depth: number,
+  maxDepth: number
+): Promise<void> {
+  const seenDepth = ctx.visited.get(dirReal);
+  if (seenDepth !== undefined && seenDepth <= depth) return;
+  ctx.visited.set(dirReal, depth);
+  const skills: string[] = [];
+  const groups: Array<{ name: string; real: string }> = [];
+  for (const name of await childNames(dirReal)) {
+    // Symlinks are followed only while they stay inside the tree.
+    const real = await containedDirectory(ctx.rootReal, path.join(dirReal, name));
+    if (real === undefined) continue;
+    if (await holdsSkillFile(ctx.rootReal, real)) {
+      // As in the CLI (tryAddSkillAt): a SKILL.md that does not parse is no skill, and the
+      // walk does not go below it.
+      if ((await readSkillsCliName(ctx.rootReal, real)) !== undefined) skills.push(name);
+    } else if (depth < maxDepth) groups.push({ name, real });
+  }
+  // A walk again from a smaller depth finds the same children: record them once.
+  if (skills.length > 0 && seenDepth === undefined) ctx.roots.push({ root: relative, skills });
+  for (const group of groups) {
+    await walkSkillParent(ctx, `${relative}/${group.name}`, group.real, depth + 1, maxDepth);
+  }
+}
+
+/**
+ * The skills CLI identity of the skill in `dirReal` (skills@1.7.4 parseSkillMd): its frontmatter
+ * `name`, when SKILL.md starts with YAML frontmatter that has a non-empty string `name` and
+ * `description`. Undefined when the CLI would skip the file.
+ */
+export async function readSkillsCliName(
+  rootReal: string,
+  dirReal: string
+): Promise<string | undefined> {
+  try {
+    const { content } = await readPluginFileWithinRootCapped({
+      filePath: path.join(dirReal, SKILL_FILENAME),
+      pluginRoot: rootReal,
+      maxBytes: MAX_FILE_SIZE,
+      label: SKILL_FILENAME,
+    });
+    // The CLI's frontmatter pattern (src/frontmatter.ts).
+    const match = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(content);
+    if (match === null) return undefined;
+    const data: unknown = YAML.parse(match[1] ?? "");
+    if (!isPlainObject(data)) return undefined;
+    const { name, description } = data;
+    const valid =
+      typeof name === "string" &&
+      name !== "" &&
+      typeof description === "string" &&
+      description !== "";
+    return valid ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The skills of a repository by the skills CLI rules, as `contributes.skills` entries (skill
+ * PARENT folders, so 16 roots can hold many skills). A root SKILL.md makes the repository one
+ * skill. Empty when no SKILL.md exists.
+ */
+export async function findSkillsPackageRoots(dir: string): Promise<SkillsPackageRoot[]> {
+  const rootReal = await fsPromises.realpath(dir);
+  const ctx: WalkContext = { rootReal, visited: new Map(), roots: [] };
+  if (await holdsSkillFile(rootReal, rootReal)) {
+    // The CLI returns the root skill alone only when its SKILL.md parses (parseSkillMd).
+    if ((await readSkillsCliName(rootReal, rootReal)) !== undefined) {
+      return [{ root: ".", skills: [] }];
+    }
+    // An invalid root SKILL.md: the CLI skips it and walks the folders below. Xum walks the
+    // containers but not the root's own skill folders: discovery would read a declared "." that
+    // holds SKILL.md as that one (invalid) skill.
+    ctx.visited.set(rootReal, 0);
+  } else {
+    await walkSkillParent(ctx, ".", rootReal, 1, ROOT_WALK_DEPTH);
+  }
+  for (const container of SKILL_CONTAINERS) {
+    const real = await containedDirectory(rootReal, path.join(rootReal, container));
+    if (real === undefined) continue;
+    const seenDepth = ctx.visited.get(real);
+    if (seenDepth !== undefined && seenDepth <= 1) continue;
+    if (seenDepth === undefined && (await holdsSkillFile(rootReal, real))) {
+      // Discovery reads a declared path that holds SKILL.md as one skill, so the folders
+      // below it are not skills either.
+      ctx.visited.set(real, 0);
+      if ((await readSkillsCliName(rootReal, real)) !== undefined) {
+        ctx.roots.push({ root: container, skills: [path.posix.basename(container)] });
+      }
+      continue;
+    }
+    await walkSkillParent(ctx, container, real, 1, MAX_CONTAINER_DEPTH);
+  }
+  assert(
+    ctx.roots.every((root) => !path.isAbsolute(root.root) && !root.root.split("/").includes("..")),
+    "findSkillsPackageRoots: roots must be relative paths inside the tree"
+  );
+  return ctx.roots;
+}
+
+/** True when anything exists at `relative`, even a dangling symlink or a folder. */
+async function entryExists(dir: string, relative: string): Promise<boolean> {
+  return (await fsPromises.lstat(path.join(dir, relative)).catch(() => null)) !== null;
+}
+
+export interface DetectedInstallMethods {
+  /** Every method that fits, in order: agent-plugin, claude-plugin, skills. */
+  methods: AgentPluginInstallMethod[];
+  /** The skills CLI view of the tree (empty without SKILL.md), for the "Skills CLI" choice. */
+  skillsRoots: SkillsPackageRoot[];
+}
+
+/** The install methods that fit a staged tree (see the module comment for the rules). */
+export async function detectInstallMethods(stagedDir: string): Promise<DetectedInstallMethods> {
+  // An entry of any kind counts: Xum never writes over a link or a folder named plugin.json.
+  const ownManifest =
+    (await entryExists(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH)) ||
+    (await entryExists(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH));
+  const skillsRoots = await findSkillsPackageRoots(stagedDir);
+  if (ownManifest) return { methods: [{ kind: "agent-plugin" }], skillsRoots };
+  const methods: AgentPluginInstallMethod[] = [];
+  if (await entryExists(stagedDir, CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH)) {
+    methods.push({ kind: "claude-plugin" });
+  }
+  if (skillsRoots.length > 0) methods.push({ kind: "skills" });
+  return { methods, skillsRoots };
+}
+
+/** Which method a staged clone must use. */
+export type InstallMethodRequest =
+  /** Preview without a method: the first that fits. */
+  | { mode: "first" }
+  /** Preview with a method, and install: exactly this one. */
+  | { mode: "exact"; method: AgentPluginInstallMethod }
+  /**
+   * Update: the repository's own manifest when it has one now, else the generator of the
+   * installed plugin.json (`generatedFrom`), else a Claude manifest. A tree that only fits
+   * `skills` does not update an install that Xum did not generate.
+   */
+  | { mode: "update"; generatedFrom: GeneratedFrom | undefined };
+
+/** The request of a preview or an install: the given method, or the first that fits. */
+export function installMethodRequest(
+  method: AgentPluginInstallMethod | null | undefined
+): InstallMethodRequest {
+  return method != null ? { mode: "exact", method } : { mode: "first" };
+}
+
+function sameInstallMethod(a: AgentPluginInstallMethod, b: AgentPluginInstallMethod): boolean {
+  // Exhaustive: a method with fields (a marketplace entry) must compare them here.
+  switch (a.kind) {
+    case "agent-plugin":
+    case "claude-plugin":
+    case "skills":
+      return b.kind === a.kind;
+  }
+}
+
+export function methodLabel(method: AgentPluginInstallMethod): string {
+  return AGENT_PLUGIN_INSTALL_METHOD_LABELS[method.kind];
+}
+
+/** The method to use, or undefined when none fits (the caller names every format). */
+export function chooseInstallMethod(
+  methods: AgentPluginInstallMethod[],
+  request: InstallMethodRequest
+): AgentPluginInstallMethod | undefined {
+  switch (request.mode) {
+    case "first":
+      return methods[0];
+    case "exact": {
+      if (methods.some((method) => sameInstallMethod(method, request.method))) {
+        return request.method;
+      }
+      const fits = methods.map(methodLabel).join(", ");
+      throw new Error(
+        `This repository cannot be installed as ${methodLabel(request.method)}${fits.length > 0 ? `; it fits: ${fits}` : ""}. Preview it again.`
+      );
+    }
+    case "update": {
+      const own = methods.find((method) => method.kind === "agent-plugin");
+      if (own !== undefined) return own;
+      const generated = request.generatedFrom;
+      if (generated !== undefined) return methods.find((method) => method.kind === generated.kind);
+      return methods.find((method) => method.kind === "claude-plugin");
+    }
+  }
+}
+
+/** The error when no method fits: it names every format Xum looked for. */
+export function noInstallMethodMessage(subpath: string | undefined): string {
+  const formats =
+    "No plugin.json (or .codex-plugin/plugin.json or .claude-plugin/plugin.json) and no SKILL.md files";
+  return subpath === undefined
+    ? `${formats} found at the repository root. The repo is not a plugin — if the plugin lives in a subdirectory, install it as owner/repo/path/to/plugin.`
+    : `${formats} found in '${subpath}'. The folder is not a plugin.`;
+}
+
+/**
+ * A plugin name from free text: lowercase, every run of other characters becomes "-", and runs
+ * of "-" or "." collapse, trimmed to the name grammar (isValidAgentPluginName). Throws when the
+ * result is still invalid (for example a Windows device name or no letters at all).
+ */
+export function toPluginName(raw: string): string {
+  const name = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9.-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/\.{2,}/g, ".")
+    .replace(/^[^a-z0-9]+/, "")
+    .slice(0, AGENT_PLUGIN_NAME_MAX_LENGTH)
+    .replace(/[^a-z0-9]+$/, "");
+  if (!isValidAgentPluginName(name)) {
+    throw new Error(
+      `Xum cannot make a plugin name from '${raw}'. Install the skills from a folder with a name of letters and digits.`
+    );
+  }
+  return name;
+}
+
+/** The last segment of a clone URL without `.git` ("skills" for github.com/anthropics/skills). */
+function repositoryName(url: string): string {
+  // A Windows path (`C:\Users\me\repo`) separates with backslashes.
+  const trimmed = url.replace(/[/\\]+$/, "").replace(/\.git$/, "");
+  return trimmed.split(/[/\\:]/).pop() ?? trimmed;
+}
+
+/** The generated plugin name: the subpath's last folder, or the repository name. */
+export function generatedPluginName(source: Pick<AgentPluginGitSource, "url" | "subpath">): string {
+  return toPluginName(
+    source.subpath !== undefined ? path.posix.basename(source.subpath) : repositoryName(source.url)
+  );
+}
+
+/**
+ * Skill names for the skills CLI's `--skill` (valid skill names only, no repeats). The CLI names
+ * a skill by its SKILL.md frontmatter `name` (skills@1.7.4 parseSkillMd, filterSkills), so these
+ * are the frontmatter names, also for a root SKILL.md (not the repository name). A name that is
+ * not a valid skill name cannot be passed safely, so that skill is not offered. Two folders with
+ * the same name are both left out, with a warning: `--skill` would install every copy under that
+ * one name, so a later copy could replace the reviewed one.
+ */
+export async function skillsCliSkillNames(
+  stagedDir: string,
+  roots: SkillsPackageRoot[]
+): Promise<{ names: string[]; warnings: string[] }> {
+  const rootReal = await fsPromises.realpath(stagedDir);
+  const names: string[] = [];
+  // One folder can be listed twice (`skills/SKILL.md` is a root child and the `skills`
+  // container), so each canonical folder counts once before the shared-name check below.
+  const seen = new Set<string>();
+  const add = async (dir: string): Promise<boolean> => {
+    const name = await readSkillsCliName(rootReal, dir);
+    if (name === undefined) return false;
+    const real = await fsPromises.realpath(dir);
+    if (!seen.has(real)) names.push(name);
+    seen.add(real);
+    return true;
+  };
+  for (const root of roots) {
+    const rootDir = path.join(rootReal, root.root);
+    // A root that holds SKILL.md is one skill (the repository root, or a container path).
+    if (await add(rootDir)) continue;
+    for (const skill of root.skills) await add(path.join(rootDir, skill));
+  }
+  const valid = names.filter((name) => SkillNameSchema.safeParse(name).success);
+  const shared = new Set(valid.filter((name, index) => valid.indexOf(name) !== index));
+  return {
+    names: valid.filter((name) => !shared.has(name)),
+    warnings: [...shared].map(
+      (name) =>
+        `Skills CLI: more than one skill folder has the SKILL.md name '${name}', so the Skills CLI choice leaves it out`
+    ),
+  };
+}
+
+/**
+ * SECURITY AUDIT (downgrade): a build that predates `generatedFrom` reads a generated plugin.json
+ * as an ordinary Agent Plugin and fills in the default component paths: hooks.js, agents/,
+ * workflows/, mcp.json or .mcp.json (`contributes`), and hooks/hooks.json (Codex hooks, which an
+ * `extensions["com.openai"].hooks` list replaces). So the generated manifest names each of them
+ * explicitly: `contributes` paths point into `.git`, which no commit can create (git refuses to
+ * track a `.git` path), so they never resolve, and an empty Codex hooks list turns the default
+ * file off. Those builds then load only the skills roots the manifest lists. Builds before
+ * `contributes` existed (#3872, the experimental flag) read only skills/ and mcp.json.
+ */
+export const INERT_COMPONENT_PATH = ".git/xum-generated-no-component";
+
+/** The `contributes` and `extensions["com.openai"]` members that keep older builds inert. */
+export function inertGeneratedComponents(): {
+  contributes: Record<"hooks" | "agents" | "workflows" | "mcp", string>;
+  openai: { hooks: [] };
+} {
+  return {
+    contributes: {
+      hooks: INERT_COMPONENT_PATH,
+      agents: INERT_COMPONENT_PATH,
+      workflows: INERT_COMPONENT_PATH,
+      mcp: INERT_COMPONENT_PATH,
+    },
+    openai: { hooks: [] },
+  };
+}
+
+/**
+ * Write the plugin.json of a `skills` install into the staged tree and return preview warnings.
+ * The file is part of the tree that the receipts hash and that install promotes, and preview and
+ * install generate it from the same commit, so their consent digests match. Callers run it only
+ * when `skills` fits (no root or Codex manifest).
+ */
+export async function writeGeneratedManifest(
+  stagedDir: string,
+  method: Extract<AgentPluginInstallMethod, { kind: "skills" }>,
+  source: Pick<AgentPluginGitSource, "url" | "subpath">
+): Promise<string[]> {
+  assert(method.kind === "skills", "writeGeneratedManifest: only skills generate a manifest");
+  const roots = await findSkillsPackageRoots(stagedDir);
+  if (roots.length === 0) throw new Error(noInstallMethodMessage(source.subpath));
+  // manifest.ts reads at most MAX_SKILLS_ROOTS roots; name the skills past the cap instead of
+  // losing them without a word.
+  const kept = roots.slice(0, MAX_SKILLS_ROOTS);
+  const dropped = roots
+    .slice(MAX_SKILLS_ROOTS)
+    .flatMap((root) => root.skills.map((skill) => `${root.root}/${skill}`));
+  const inert = inertGeneratedComponents();
+  const manifest = {
+    $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+    name: generatedPluginName(source),
+    description: `Skills from ${displayRepoUrl(source.url)}${source.subpath !== undefined ? `/${source.subpath}` : ""}`,
+    contributes: { skills: kept.map((root) => root.root), ...inert.contributes },
+    extensions: {
+      mux: { generatedFrom: { kind: method.kind } satisfies GeneratedFrom },
+      "com.openai": inert.openai,
+    },
+  };
+  // "wx": fail instead of replacing an entry. A dangling symlink at plugin.json would otherwise
+  // redirect the write outside the staged tree.
+  await fsPromises.writeFile(
+    path.join(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+    { flag: "wx" }
+  );
+  return dropped.length > 0
+    ? [
+        `Xum reads at most ${MAX_SKILLS_ROOTS} skill folders; these skills do not install: ${dropped.join(", ")}`,
+      ]
+    : [];
+}
+
+/**
+ * The `generatedFrom` marker of an installed plugin.json, read through the capped contained
+ * reader. Undefined when the file is missing, unreadable or has no known marker.
+ */
+export async function readInstalledGeneratedFrom(
+  pluginRoot: string
+): Promise<GeneratedFrom | undefined> {
+  try {
+    const rootReal = await fsPromises.realpath(pluginRoot);
+    const { content } = await readPluginFileWithinRootCapped({
+      filePath: path.join(rootReal, PLUGIN_MANIFEST_RELATIVE_PATH),
+      pluginRoot: rootReal,
+      maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
+      label: PLUGIN_MANIFEST_RELATIVE_PATH,
+    });
+    const raw: unknown = JSON.parse(content);
+    if (!isPlainObject(raw) || !isPlainObject(raw.extensions)) return undefined;
+    return readGeneratedFrom({ extensions: raw.extensions });
+  } catch {
+    return undefined;
+  }
+}

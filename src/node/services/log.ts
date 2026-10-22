@@ -436,24 +436,6 @@ function getTimestamp(): string {
   return `${hours}:${mm}.${ms}${ampm}`;
 }
 
-function isLoggerStackFrame(functionName: string, filePath: string): boolean {
-  const normalizedPath = filePath.replace(/\\/g, "/");
-
-  // Raw call sites name the compiled file (dist/node/services/log.js), not the mapped source.
-  if (
-    normalizedPath.endsWith("/node/services/log.ts") ||
-    normalizedPath.endsWith("/node/services/log.js")
-  ) {
-    return true;
-  }
-
-  return (
-    functionName.includes("getCallerLocation") ||
-    functionName.includes("safePipeLog") ||
-    functionName.includes("formatLogLine")
-  );
-}
-
 function formatCallerLocation(filePath: string, lineNum: string): string {
   const normalizedPath = filePath.replace(/\\/g, "/");
   const normalizedCwd = process.cwd().replace(/\\/g, "/");
@@ -470,6 +452,9 @@ function formatCallerLocation(filePath: string, lineNum: string): string {
   return `${path.basename(normalizedPath)}:${lineNum}`;
 }
 
+/** A public log function: the caller's frame is the one directly below it. */
+type LogEntryFunction = (...args: never[]) => void;
+
 /**
  * The current stack as raw V8 call sites. `new Error().stack` would run the global
  * Error.prepareStackTrace, which source-map-support replaces (desktop/main.ts, cli/server.ts):
@@ -479,13 +464,13 @@ function formatCallerLocation(filePath: string, lineNum: string): string {
  * builds (also `make dev`) the location is the compiled .js line, not the .ts line. Logged
  * Error objects and uncaught exceptions keep their source-mapped stacks.
  */
-function rawCallSites(): NodeJS.CallSite[] {
+function rawCallSites(stackTop: LogEntryFunction): NodeJS.CallSite[] {
   // eslint-disable-next-line @typescript-eslint/unbound-method -- only stored and restored, never called
   const previous = Error.prepareStackTrace;
   try {
     Error.prepareStackTrace = (_error, callSites) => callSites;
     const holder: { stack?: unknown } = {};
-    Error.captureStackTrace(holder, rawCallSites);
+    Error.captureStackTrace(holder, stackTop);
     // Read inside the override: V8 formats the stack on first access.
     const stack = holder.stack;
     return Array.isArray(stack) ? (stack as NodeJS.CallSite[]) : [];
@@ -495,14 +480,14 @@ function rawCallSites(): NodeJS.CallSite[] {
 }
 
 /**
- * Get the first non-logger caller frame from the stack trace.
+ * The first frame below `stackTop`, the public log function the caller called.
  *
- * We intentionally scan frames instead of using a fixed stack index because
- * wrapper levels can shift over time and otherwise collapse locations to the
- * logger wrapper (e.g. log.ts:488) instead of the real call site.
+ * V8 drops `stackTop` and every frame above it, so the logger's own frames never appear. This
+ * holds in every build: a match on the logger's file path or function names fails in the
+ * minified Docker server bundle, where all code shares one file and names are mangled (#7146).
  */
-function getCallerLocation(): string {
-  for (const callSite of rawCallSites()) {
+function getCallerLocation(stackTop: LogEntryFunction): string {
+  for (const callSite of rawCallSites(stackTop)) {
     const fileName = callSite.getFileName();
     const lineNumber = callSite.getLineNumber();
     if (!fileName || lineNumber === null) {
@@ -514,10 +499,6 @@ function getCallerLocation(): string {
     }
 
     const filePath = fileName.startsWith("file:") ? fileURLToPath(fileName) : fileName;
-    if (isLoggerStackFrame(callSite.getFunctionName() ?? "", filePath)) {
-      continue;
-    }
-
     return formatCallerLocation(filePath, String(lineNumber));
   }
 
@@ -530,14 +511,17 @@ function getCallerLocation(): string {
  * @param level - Log level
  * @param args - Arguments to log
  */
-function formatLogLine(level: LogLevel): {
+function formatLogLine(
+  level: LogLevel,
+  stackTop: LogEntryFunction
+): {
   timestamp: string;
   location: string;
   useColor: boolean;
   prefix: string;
 } {
   const timestamp = getTimestamp();
-  const location = getCallerLocation();
+  const location = getCallerLocation(stackTop);
   const useColor = supportsColor();
 
   // Apply colors based on level (if terminal supports it)
@@ -564,7 +548,7 @@ function formatLogLine(level: LogLevel): {
   return { timestamp, location, useColor, prefix };
 }
 
-function safePipeLog(level: LogLevel, ...args: unknown[]): void {
+function safePipeLog(level: LogLevel, stackTop: LogEntryFunction, ...args: unknown[]): void {
   const shouldConsoleLog = shouldLog(level);
 
   // Fast path: skip formatting entirely for debug entries that won't be
@@ -574,7 +558,7 @@ function safePipeLog(level: LogLevel, ...args: unknown[]): void {
     return;
   }
 
-  const { timestamp, location, useColor, prefix } = formatLogLine(level);
+  const { timestamp, location, useColor, prefix } = formatLogLine(level, stackTop);
 
   try {
     if (shouldConsoleLog) {
@@ -687,10 +671,10 @@ function debugObject(filename: string, obj: unknown): void {
     // Write the object as pretty-printed JSON
     fs.writeFileSync(filePath, JSON.stringify(obj, null, 2), "utf-8");
 
-    safePipeLog("debug", `Dumped object to ${filePath}`);
+    safePipeLog("debug", debugObject, `Dumped object to ${filePath}`);
   } catch (error) {
     // Don't crash if we can't write debug files
-    safePipeLog("error", `Failed to dump debug object to ${filename}:`, error);
+    safePipeLog("error", debugObject, `Failed to dump debug object to ${filename}:`, error);
   }
 }
 
@@ -740,11 +724,12 @@ function appendFieldsToArgs(args: unknown[], fields?: LogFields): unknown[] {
 
 function createLogger(boundFields?: LogFields): Logger {
   const normalizedFields = normalizeFields(boundFields);
-  const logAtLevel =
-    (level: LogLevel) =>
-    (...args: unknown[]): void => {
-      safePipeLog(level, ...appendFieldsToArgs(args, normalizedFields));
+  const logAtLevel = (level: LogLevel) => {
+    const entry = (...args: unknown[]): void => {
+      safePipeLog(level, entry, ...appendFieldsToArgs(args, normalizedFields));
     };
+    return entry;
+  };
 
   return {
     ...baseLogger,

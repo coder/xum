@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
+import os from "node:os";
 
 import {
   isRuntimeReadFailure,
@@ -53,7 +54,11 @@ import {
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { ensureRuntimePathWithinWorkspace } from "@/node/services/tools/runtimeSkillPathUtils";
-import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import {
+  ensurePathContained,
+  hasErrorCode,
+  isSameHostDirectory,
+} from "@/node/services/tools/skillFileUtils";
 import { AgentSkillParseError, parseSkillMarkdown } from "./parseSkillMarkdown";
 import { getBuiltInSkillByName, getBuiltInSkillDescriptors } from "./builtInSkillDefinitions";
 import type { ProjectSkillContainment } from "./skillStorageContext";
@@ -63,6 +68,10 @@ import {
   readPluginFileWithinRootCapped,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
 } from "@/node/services/agentPlugins/discovery";
+import {
+  pluginSkillFileName,
+  pluginSkillMarkdown,
+} from "@/node/services/agentPlugins/claudeCommands";
 import type {
   ComponentConsent,
   PluginSkillConsentGate,
@@ -75,6 +84,7 @@ import {
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import {
   getCanonicalProjectMetadataRelativePath,
+  LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR,
   listProjectMetadataRelativePaths,
 } from "@/common/compat/legacyMux";
 
@@ -101,6 +111,11 @@ export interface AgentSkillsRoots {
   projectSearchRoot?: string;
   globalRoot: string;
   universalRoot?: string;
+  /**
+   * ~/.mux/skills, where the skills CLI writes for `--agent mux` (read-only). Discovery skips it
+   * when it is the Xum home's own skills dir (globalRoot).
+   */
+  legacyMuxGlobalRoot?: string;
   /** ~/.claude/skills (claude-skills-compat experiment; read-only). */
   globalClaudeRoot?: string;
   /** Agent Plugins container dirs, e.g. <projectRoot>/.xum/plugins (read-only). */
@@ -195,6 +210,7 @@ export function getDefaultAgentSkillsRoots(
     }),
     globalRoot: `${runtime.getXumHome()}/skills`,
     universalRoot: UNIVERSAL_SKILLS_ROOT,
+    legacyMuxGlobalRoot: getLegacyMuxGlobalSkillsRoot(runtime, workspacePath),
     // Claude roots are added only when the experiment is enabled so the default
     // (off) behavior stays byte-identical to the pre-experiment scan order.
     ...(options?.includeClaudeSkills ? { globalClaudeRoot: CLAUDE_SKILLS_ROOT } : {}),
@@ -226,11 +242,58 @@ export function getProjectSkillRoots(roots: AgentSkillsRoots): string[] {
   return Array.from(new Set(roots.projectRoots ?? [roots.projectRoot]));
 }
 
-function getGlobalSkillRoots(roots: AgentSkillsRoots): string[] {
-  // Precedence within global scope: ~/.xum > ~/.agents > ~/.claude.
-  const orderedRoots = [roots.globalRoot, roots.universalRoot, roots.globalClaudeRoot].filter(
-    (root): root is string => root != null && root.length > 0
-  );
+/**
+ * ~/.mux/skills as the global runtime reads it, like universalRoot: on the Xum host (local, SSH)
+ * or in the runtime's own home (Docker). The host needs the absolute path because expandTilde
+ * maps a `~/.mux` path to the Xum home.
+ */
+export function getLegacyMuxGlobalSkillsRoot(runtime: Runtime, workspacePath: string): string {
+  return resolveGlobalRuntime(runtime, workspacePath) instanceof RemoteRuntime
+    ? `~/${LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR}`
+    : path.join(os.homedir(), LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR);
+}
+
+/** True when ~/.mux/skills is the Xum home's own skills dir (the home is ~/.mux, or links to it). */
+async function isLegacyMuxRootTheGlobalRoot(
+  globalRuntime: Runtime,
+  globalRoot: string,
+  legacyMuxRoot: string
+): Promise<boolean> {
+  try {
+    const [resolvedGlobal, resolvedLegacy] = await Promise.all(
+      [globalRoot, legacyMuxRoot].map((root) => globalRuntime.resolvePath(root))
+    );
+    if (resolvedGlobal === resolvedLegacy) return true;
+    return (
+      !(globalRuntime instanceof RemoteRuntime) &&
+      (await isSameHostDirectory(resolvedGlobal, resolvedLegacy))
+    );
+  } catch {
+    // Unresolvable: keep the root, so its scan reports why it is unavailable.
+    return false;
+  }
+}
+
+async function getGlobalSkillRoots(
+  roots: AgentSkillsRoots,
+  globalRuntime: Runtime
+): Promise<string[]> {
+  const legacyMuxRoot =
+    roots.legacyMuxGlobalRoot != null &&
+    !(await isLegacyMuxRootTheGlobalRoot(
+      globalRuntime,
+      roots.globalRoot,
+      roots.legacyMuxGlobalRoot
+    ))
+      ? roots.legacyMuxGlobalRoot
+      : undefined;
+  // Precedence within global scope: ~/.xum > ~/.agents > ~/.mux (skills CLI) > ~/.claude.
+  const orderedRoots = [
+    roots.globalRoot,
+    roots.universalRoot,
+    legacyMuxRoot,
+    roots.globalClaudeRoot,
+  ].filter((root): root is string => root != null && root.length > 0);
 
   return Array.from(new Set(orderedRoots));
 }
@@ -246,6 +309,17 @@ interface AgentSkillScanCandidate {
   pluginRoot?: string;
   /** Agent Plugins only: contributing plugin name for descriptor attribution. */
   pluginName?: string;
+  /**
+   * Agent Plugins only: `root` holds SKILL.md itself and is this one skill
+   * (PluginSkillsRoot `single`), instead of a folder of skill folders.
+   */
+  singleSkillName?: string;
+  /** Agent Plugins only: the single skill is a Claude command, `<root>/<name>.md` (claudeCommands.ts). */
+  commandSkill?: true | undefined;
+  /** Agent Plugins only: the plugin is skills-only (a generated Skills install): no scripts run. */
+  skillsOnlyPlugin?: true | undefined;
+  /** Agent Plugins only: the plugin is a Claude Code package (AgentPluginInfo.claudeFallback). */
+  claudePackagePlugin?: true | undefined;
   importedSkills?: string[];
   /** Managed plugins only: the reviewed skill fingerprints (#6498). */
   skillConsent?: PluginSkillConsentGate;
@@ -317,10 +391,14 @@ async function buildPluginScanCandidates(args: {
     candidates.push(
       ...plugin.skillsDirs.map((root) => ({
         scope: args.scope,
-        root,
+        root: root.dir,
         runtime: localRuntime,
         pluginRoot: plugin.rootPath,
         pluginName: plugin.name,
+        singleSkillName: root.name,
+        commandSkill: root.command,
+        skillsOnlyPlugin: plugin.skillsOnly,
+        claudePackagePlugin: plugin.claudeFallback,
         importedSkills,
         skillConsent,
         pluginConsent: plugin.componentConsent,
@@ -373,7 +451,7 @@ async function buildScanCandidates(
   return [
     ...getProjectSkillRoots(roots).map((root) => ({ scope: "project" as const, root, runtime })),
     ...projectPluginCandidates,
-    ...getGlobalSkillRoots(roots).map((root) => ({
+    ...(await getGlobalSkillRoots(roots, globalRuntime)).map((root) => ({
       scope: "global" as const,
       root,
       runtime: globalRuntime,
@@ -563,6 +641,41 @@ class ShadowedPluginSkills {
   }
 }
 
+/** The folder of skill `name` in a scan root: the root itself when it is a single skill. */
+function candidateSkillDir(
+  candidate: Pick<AgentSkillScanCandidate, "runtime" | "singleSkillName">,
+  resolvedRoot: string,
+  name: SkillName
+): string {
+  return candidate.singleSkillName != null
+    ? resolvedRoot
+    : candidate.runtime.normalizePath(name, resolvedRoot);
+}
+
+/** The Markdown file of skill `name` in `skillDir`: SKILL.md, or a Claude command's `<name>.md`. */
+function candidateSkillFile(
+  candidate: Pick<AgentSkillScanCandidate, "runtime" | "commandSkill">,
+  skillDir: string,
+  name: SkillName
+): string {
+  return candidate.runtime.normalizePath(
+    pluginSkillFileName(name, candidate.commandSkill),
+    skillDir
+  );
+}
+
+/** The skill folder names of a scan root: its own name when it is a single skill. */
+async function listCandidateSkillNames(
+  candidate: Pick<AgentSkillScanCandidate, "runtime" | "singleSkillName">,
+  resolvedRoot: string,
+  workspacePath: string
+): Promise<string[]> {
+  if (candidate.singleSkillName != null) return [candidate.singleSkillName];
+  return candidate.runtime instanceof RemoteRuntime
+    ? listSkillDirectoriesFromRuntime(candidate.runtime, resolvedRoot, { cwd: workspacePath })
+    : listSkillDirectoriesFromLocalFs(resolvedRoot);
+}
+
 async function listSkillDirectoriesFromLocalFs(root: string): Promise<string[]> {
   try {
     const entries = await fs.readdir(root, { withFileTypes: true });
@@ -676,6 +789,8 @@ async function readRuntimeSkillFileForScan(
 async function readSkillDescriptorFromDir(
   runtime: Runtime,
   skillDir: string,
+  /** The skill's Markdown file in `skillDir` (candidateSkillFile). */
+  skillFilePath: string,
   directoryName: SkillName,
   scope: AgentSkillScope,
   options?: {
@@ -684,10 +799,10 @@ async function readSkillDescriptorFromDir(
     pluginName?: string;
     pluginRoot?: string;
     skillConsent?: PluginSkillConsentGate;
+    /** A Claude command: read `<name>.md` as SKILL.md text (plugin skills only). */
+    commandSkill?: true | undefined;
   }
 ): Promise<AgentSkillDescriptor | null> {
-  const skillFilePath = runtime.normalizePath("SKILL.md", skillDir);
-
   // Every invalid-skill diagnostic for this directory shares the same identity
   // (directoryName / scope / displayPath); only message + hint vary per failure.
   const pushInvalidSkill = (message: string, hint: string): void => {
@@ -715,7 +830,7 @@ async function readSkillDescriptorFromDir(
         maxBytes: MAX_FILE_SIZE,
         label: `plugin skill '${directoryName}' SKILL.md`,
       });
-      content = result.content;
+      content = pluginSkillMarkdown(directoryName, result.content, options.commandSkill);
       byteSize = result.byteSize;
     } catch (err) {
       const message = getErrorMessage(err);
@@ -871,10 +986,7 @@ export async function discoverAgentSkills(
 
   const scanRoot = async (scan: AgentSkillScanCandidate): Promise<void> => {
     const resolvedRoot = await scan.runtime.resolvePath(scan.root);
-    const directoryNames =
-      scan.runtime instanceof RemoteRuntime
-        ? await listSkillDirectoriesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
-        : await listSkillDirectoriesFromLocalFs(resolvedRoot);
+    const directoryNames = await listCandidateSkillNames(scan, resolvedRoot, workspacePath);
 
     for (const directoryNameRaw of directoryNames) {
       const nameParsed = SkillNameSchema.safeParse(directoryNameRaw);
@@ -901,8 +1013,8 @@ export async function discoverAgentSkills(
       const diagnostics: { invalidSkills: AgentSkillIssue[]; skillWarnings: AgentSkillIssue[] } =
         shadowed ? { invalidSkills: [], skillWarnings: [] } : { invalidSkills, skillWarnings };
 
-      const skillDir = scan.runtime.normalizePath(directoryName, resolvedRoot);
-      const skillFilePath = scan.runtime.normalizePath("SKILL.md", skillDir);
+      const skillDir = candidateSkillDir(scan, resolvedRoot, directoryName);
+      const skillFilePath = candidateSkillFile(scan, skillDir, directoryName);
       const pushInvalidSkill = (message: string, hint: string): void => {
         diagnostics.invalidSkills.push({
           directoryName,
@@ -926,6 +1038,7 @@ export async function discoverAgentSkills(
       const descriptor = await readSkillDescriptorFromDir(
         scan.runtime,
         skillDir,
+        skillFilePath,
         directoryName,
         scan.scope,
         {
@@ -933,6 +1046,7 @@ export async function discoverAgentSkills(
           ...(scan.pluginName !== undefined ? { pluginName: scan.pluginName } : {}),
           ...(scan.pluginRoot !== undefined ? { pluginRoot: scan.pluginRoot } : {}),
           skillConsent: scan.skillConsent,
+          commandSkill: scan.commandSkill,
         }
       );
       if (!descriptor) continue;
@@ -1032,12 +1146,29 @@ export interface ResolvedAgentSkill {
   pluginConsent?: ComponentConsent | undefined;
   /** A managed plugin skill's approved copies: the `skill://` resolver falls back to them. */
   pluginApprovedCopies?: ApprovedCopiesSource | undefined;
+  /**
+   * A Claude command (claudeCommands.ts): `skillDir` is its commands folder, not a skill folder
+   * of its own, so the `skill://` resolver runs no script for it.
+   */
+  commandSkill?: true | undefined;
+  /** The skill's plugin is skills-only (AgentPluginInfo.skillsOnly): the resolver runs no script. */
+  skillsOnlyPlugin?: true | undefined;
+  /** The skill's plugin is a Claude Code package (AgentPluginInfo.claudeFallback): no script runs. */
+  claudePackagePlugin?: true | undefined;
 }
 
 /** Stamp a plugin skill's provenance on its read result (see ResolvedAgentSkill.pluginName). */
 function withPluginName(
   resolved: ResolvedAgentSkill | null,
-  candidate: Pick<AgentSkillScanCandidate, "pluginName" | "pluginConsent" | "pluginApprovedCopies">
+  candidate: Pick<
+    AgentSkillScanCandidate,
+    | "pluginName"
+    | "pluginConsent"
+    | "pluginApprovedCopies"
+    | "commandSkill"
+    | "skillsOnlyPlugin"
+    | "claudePackagePlugin"
+  >
 ): ResolvedAgentSkill | null {
   if (resolved == null || candidate.pluginName == null) return resolved;
   return {
@@ -1045,6 +1176,9 @@ function withPluginName(
     pluginName: candidate.pluginName,
     pluginConsent: candidate.pluginConsent,
     pluginApprovedCopies: candidate.pluginApprovedCopies,
+    ...(candidate.commandSkill === true ? { commandSkill: true } : {}),
+    ...(candidate.skillsOnlyPlugin === true ? { skillsOnlyPlugin: true } : {}),
+    ...(candidate.claudePackagePlugin === true ? { claudePackagePlugin: true } : {}),
   };
 }
 
@@ -1072,9 +1206,11 @@ async function readAgentSkillFromDir(
   directoryName: SkillName,
   scope: AgentSkillScope,
   pluginRoot?: string,
-  skillConsent?: PluginSkillConsentGate
+  skillConsent?: PluginSkillConsentGate,
+  /** A Claude command: read `<name>.md` as SKILL.md text (plugin skills only). */
+  commandSkill?: true
 ): Promise<ResolvedAgentSkill | null> {
-  const skillFilePath = runtime.normalizePath("SKILL.md", skillDir);
+  const skillFilePath = candidateSkillFile({ runtime, commandSkill }, skillDir, directoryName);
 
   let content: string;
   let byteSize: number;
@@ -1088,7 +1224,7 @@ async function readAgentSkillFromDir(
       maxBytes: MAX_FILE_SIZE,
       label: `plugin skill '${directoryName}' SKILL.md`,
     });
-    content = result.content;
+    content = pluginSkillMarkdown(directoryName, result.content, commandSkill);
     byteSize = result.byteSize;
   } else {
     ({ content, byteSize } = await readRuntimeSkillFile(runtime, skillFilePath));
@@ -1168,8 +1304,10 @@ async function readCandidateSkill(
     return null;
   }
 
-  const skillDir = candidate.runtime.normalizePath(name, resolvedRoot);
-  const skillFilePath = candidate.runtime.normalizePath("SKILL.md", skillDir);
+  // A single-skill root serves only its own name.
+  if (candidate.singleSkillName != null && candidate.singleSkillName !== name) return null;
+  const skillDir = candidateSkillDir(candidate, resolvedRoot, name);
+  const skillFilePath = candidateSkillFile(candidate, skillDir, name);
 
   const contained = await isCandidateSkillContained({
     candidate,
@@ -1191,7 +1329,8 @@ async function readCandidateSkill(
         name,
         candidate.scope,
         candidate.pluginRoot,
-        candidate.skillConsent
+        candidate.skillConsent,
+        candidate.commandSkill
       ),
       candidate
     );

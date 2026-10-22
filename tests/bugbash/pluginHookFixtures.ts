@@ -185,14 +185,17 @@ export async function seedPluginHooks(
   for (const name of PREINSTALLED_PLUGINS) {
     const source = sources.get(name);
     if (source == null) throw new Error(`plugin hook seed: no source for ${name}`);
-    const preview = ok<{ source: unknown; lockedSha: string; consentDigest: string }>(
-      `preview ${name}`,
-      await api("agentPlugins/preview", { input: source })
-    );
+    const preview = ok<{
+      source: unknown;
+      method: unknown;
+      lockedSha: string;
+      consentDigest: string;
+    }>(`preview ${name}`, await api("agentPlugins/preview", { input: source }));
     ok(
       `install ${name}`,
       await api("agentPlugins/install", {
         source: preview.source,
+        method: preview.method,
         expectedSha: preview.lockedSha,
         expectedConsentDigest: preview.consentDigest,
       })

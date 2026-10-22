@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { isMac, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { Keybind } from "@/common/types/keybind";
 import {
   ARTIFACT_ANNOTATION_CONTEXT_CHARS,
@@ -23,6 +23,10 @@ import {
  *   frame (focus then sits in it) made unreachable from the keyboard. It can turn annotate mode
  *   on, so the host honours it only during a live user gesture in this frame
  *   (hasLiveUserGesture, SandboxedArtifactFrame.tsx).
+ * - Frame -> host: `{ type: "sidebarKey", ctrlKey, metaKey }`, the right-sidebar chord
+ *   (KEYBINDS.TOGGLE_RIGHT_SIDEBAR), which a click into the frame also made unreachable: keys in
+ *   the frame never reach the app's window listener. The host honours it only while the frame
+ *   holds focus (SandboxedArtifactFrame.tsx).
  * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) only fills the
  *   host-owned confirm strip, never sends by itself; `{ type: "setState", state }`
  *   (window.xum.setState) is persisted per artifact, for all its versions. Text and JSON sizes
@@ -118,6 +122,20 @@ const ArtifactAnnotateMessageSchema = z
   })
   .strict();
 
+/**
+ * The right-sidebar chord (KEYBINDS.TOGGLE_RIGHT_SIDEBAR) pressed inside the frame, with the
+ * modifiers the host needs to match the keybind exactly (matchesKeybind). See the host side in
+ * SandboxedArtifactFrame.tsx.
+ */
+const ArtifactSidebarKeyMessageSchema = z
+  .object({
+    ...bridgeEnvelope,
+    type: z.literal("sidebarKey"),
+    ctrlKey: z.boolean(),
+    metaKey: z.boolean(),
+  })
+  .strict();
+
 const ArtifactOpenWorkspaceMessageSchema = z
   .object({
     ...bridgeEnvelope,
@@ -128,6 +146,7 @@ const ArtifactOpenWorkspaceMessageSchema = z
 
 export const ArtifactFrameToHostMessageSchema = z.discriminatedUnion("type", [
   ArtifactKeyMessageSchema,
+  ArtifactSidebarKeyMessageSchema,
   ArtifactOpenWorkspaceMessageSchema,
   ArtifactSendMessageSchema,
   ArtifactSetStateMessageSchema,
@@ -449,6 +468,45 @@ const ANNOTATE_KEY_LISTENER =
     }, 0);
   });`;
 
+/**
+ * The right-sidebar key the frame forwards, lowercased, from KEYBINDS.TOGGLE_RIGHT_SIDEBAR. The
+ * shim checks only a Ctrl (Cmd on macOS) plus Shift chord of one key, so another keybind shape
+ * turns forwarding off (null), like plainSingleKey. The shim tests send the keybind's key.
+ */
+function ctrlShiftKey(keybind: Keybind): string | null {
+  const chord =
+    keybind.key.length === 1 &&
+    keybind.code == null &&
+    keybind.ctrl === true &&
+    keybind.shift === true &&
+    keybind.macCtrlBehavior === "command" &&
+    !keybind.alt &&
+    !keybind.meta;
+  return chord ? keybind.key.toLowerCase() : null;
+}
+const SIDEBAR_FRAME_KEY = ctrlShiftKey(KEYBINDS.TOGGLE_RIGHT_SIDEBAR);
+
+/**
+ * The right-sidebar chord, with this platform's modifier as matchesKeybind reads the keybind: on
+ * macOS only Cmd (Ctrl may be held too), elsewhere only Ctrl. The shim claims nothing else, so the
+ * other form of the chord stays the artifact's. The host matches the keybind again (it decides).
+ * No editable exclusion: the chord types nothing, and the host's own handler works from the chat
+ * input too. Built per frame: isMac() needs the window.
+ */
+function sidebarKeyListener(): string {
+  if (SIDEBAR_FRAME_KEY == null) return "";
+  const modifier = isMac() ? "event.metaKey" : "event.ctrlKey && !event.metaKey";
+  return `
+  window.addEventListener("keydown", function (event) {
+    // A held key would flip the sidebar on every repeat and spend the frame's message budget.
+    if (event.repeat || event.altKey || !event.shiftKey || !(${modifier})) return;
+    if (typeof event.key !== "string" || event.key.toLowerCase() !== ${JSON.stringify(SIDEBAR_FRAME_KEY)}) return;
+    // Claimed like the host claims it: in a browser, Chrome binds the chord to its bookmarks bar.
+    event.preventDefault();
+    host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "sidebarKey", ctrlKey: event.ctrlKey, metaKey: event.metaKey }, "*");
+  }, true);`;
+}
+
 export function buildArtifactBridgeScript(
   initialTheme: ArtifactTheme,
   initialState: unknown = null
@@ -597,6 +655,7 @@ export function buildArtifactBridgeScript(
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: key, shiftKey: event.shiftKey }, "*");
   }, true);
   ${ANNOTATE_KEY_LISTENER}
+  ${sidebarKeyListener()}
   ${ARTIFACT_IN_PAGE_LINK_SCRIPT}
 })();`;
 }
