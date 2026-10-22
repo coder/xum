@@ -96,6 +96,23 @@ const CLAUDE_HOOK_EVENTS = new Set([
 /** Codex ignores the matcher on these events (codex-rs/hooks/src/events/common.rs). */
 const MATCHERLESS_CODEX_HOOK_EVENTS = new Set(["UserPromptSubmit", "Stop", "Interrupt"]);
 
+/**
+ * Claude Code has no matcher support on these events and silently ignores a matcher there
+ * (hooks.md "Matcher patterns"), so Xum does not check it: the never-run hook stays listed.
+ */
+const MATCHERLESS_CLAUDE_HOOK_EVENTS = new Set([
+  "UserPromptSubmit",
+  "PostToolBatch",
+  "Stop",
+  "TeammateIdle",
+  "TaskCreated",
+  "TaskCompleted",
+  "WorktreeCreate",
+  "WorktreeRemove",
+  "MessageDisplay",
+  "CwdChanged",
+]);
+
 const DEFAULT_HOOKS_FILE = "hooks/hooks.json";
 const MAX_HOOKS_FILE_BYTES = 256 * 1024;
 /**
@@ -332,13 +349,12 @@ function parseMatcherGroup(
     warnings.push(`${source}: a '${event}' matcher group needs a "hooks" array; ignoring it`);
     return;
   }
-  const matcher = readGroupMatcher(group.matcher, source, event, warnings);
+  const claude = where.status === "claude-plugin";
+  const matcher = readGroupMatcher(group.matcher, source, event, warnings, claude);
   if (matcher === null) return;
   for (const [handlerIndex, raw] of group.hooks.entries()) {
     if (out.length > MAX_PLUGIN_HOOKS) return;
-    const handler = parseHandler(raw, `${source}: '${event}'`, warnings, {
-      claude: where.status === "claude-plugin",
-    });
+    const handler = parseHandler(raw, `${source}: '${event}'`, warnings, { claude });
     if (handler === undefined) continue;
     let hash: string;
     try {
@@ -374,14 +390,11 @@ function readGroupMatcher(
   matcher: unknown,
   source: string,
   event: string,
-  warnings: HookWarnings
+  warnings: HookWarnings,
+  claude: boolean
 ): string | undefined | null {
-  if (
-    matcher == null ||
-    matcher === "*" ||
-    matcher === "" ||
-    MATCHERLESS_CODEX_HOOK_EVENTS.has(event)
-  ) {
+  const matcherless = claude ? MATCHERLESS_CLAUDE_HOOK_EVENTS : MATCHERLESS_CODEX_HOOK_EVENTS;
+  if (matcher == null || matcher === "*" || matcher === "" || matcherless.has(event)) {
     return undefined;
   }
   const error = typeof matcher === "string" ? hookMatcherError(matcher) : "not a string";
