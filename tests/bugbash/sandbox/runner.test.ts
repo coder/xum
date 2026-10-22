@@ -1211,9 +1211,20 @@ test("a story job gets BUGBASH_JUDGE_MODEL, and its proxy lets the judge through
     .split("\n")
     .find((line) => line.startsWith("run "))!;
   expect(run).toContain("--env BUGBASH_JUDGE_MODEL=anthropic:claude-opus-5-5");
-  expect(requests).toHaveLength(2); // the probe of the driving model, then the judge's call
-  expect(JSON.parse(requests[1].body)).toMatchObject({ model: "claude-opus-5-5" });
+  // A probe of each model, then the judge's call.
+  expect(requests.map((r) => (JSON.parse(r.body) as { model: string }).model)).toEqual([
+    "claude-sonnet-5-5",
+    "claude-opus-5-5",
+    "claude-opus-5-5",
+  ]);
   expectNothingLeft();
+});
+
+test("a story job refuses a judge its key cannot use before the container starts", async () => {
+  const { code } = await mcpLaunch({ RUN: "proxycall" }, JUDGE, undefined, "403opus", STORIES);
+  expect(code).toBeInstanceOf(Refusal);
+  expect((code as Error).message).toContain("claude-opus-5-5 (BUGBASH_JUDGE_MODEL)");
+  expect(calls()).not.toContain("created ");
 });
 
 test("the agent repros read no judge: no judge env, and the proxy refuses its model", async () => {

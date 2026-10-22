@@ -664,30 +664,34 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
           probeRefusedBy[category] = (probeRefusedBy[category] ?? 0) + 1;
         }
       };
-      const probe = await probeApp(
-        driven,
-        driven.model,
-        ledger,
-        o.stop,
-        undefined,
-        onProbeRecord
-      ).catch((error: Error) => {
-        probeFault = error.message;
-        fault(probeFault);
-        throw error;
-      });
-      if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
-      if (probe.status !== 200)
-        throw new Refusal(
-          probeUnreachable(probe.records)
-            ? `${cannotReach(driven)}: check the URL and the network`
-            : (keyRejected(driven, probe.status, probe.records, {
-                model: driven.model,
-                variable: "BUGBASH_MODEL",
-              }) ??
-                `the ${driven.model} probe failed (HTTP ${probe.status}): check ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL and BUGBASH_BUDGET_USD`)
-        );
-      log(`${name} probe: ${driven.model} answered`);
+      // The judge too (story jobs): a key that cannot use it would fail each judgment late,
+      // and each such call keeps its reservation.
+      const probed = [{ model: driven.model, variable: "BUGBASH_MODEL" }];
+      if (judgeModel != null && judgeModel !== driven.model)
+        probed.push({ model: judgeModel, variable: "BUGBASH_JUDGE_MODEL" });
+      for (const target of probed) {
+        const probe = await probeApp(
+          driven,
+          target.model,
+          ledger,
+          o.stop,
+          undefined,
+          onProbeRecord
+        ).catch((error: Error) => {
+          probeFault = error.message;
+          fault(probeFault);
+          throw error;
+        });
+        if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
+        if (probe.status !== 200)
+          throw new Refusal(
+            probeUnreachable(probe.records)
+              ? `${cannotReach(driven)}: check the URL and the network`
+              : (keyRejected(driven, probe.status, probe.records, target) ??
+                  `the ${target.model} probe failed (HTTP ${probe.status}): check ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL and BUGBASH_BUDGET_USD`)
+          );
+        log(`${name} probe: ${target.model} answered`);
+      }
     }
     const proxyMount: string[] = [];
     if (driven) {
