@@ -176,6 +176,28 @@ describe("buildRemotePluginListingScript", () => {
   });
 });
 
+// Root reads any directory, so the unreadable one would not fail there.
+test.skipIf(process.getuid?.() === 0)(
+  "a directory the remote walk cannot read loads no plugins, not a partial set",
+  async () => {
+    using checkout = new DisposableTempDir("remote-plugins-unreadable");
+    const { root, container, kit } = await checkoutWithKit(checkout.path);
+    const locked = path.join(kit, "skills", "locked");
+    await fs.mkdir(locked);
+    await fs.chmod(locked, 0o000);
+    try {
+      const snapshot = await createRemoteProjectPluginSnapshot({
+        runtime: new CountingRemoteRuntime(root, "test"),
+        checkoutRoot: root,
+        containers: [container],
+      });
+      expect(snapshot).toBeNull();
+    } finally {
+      await fs.chmod(locked, 0o755);
+    }
+  }
+);
+
 describe("getRemoteProjectPluginSnapshot", () => {
   test("one exec per key, shared while in flight, until trust changes", async () => {
     using checkout = new DisposableTempDir("remote-plugins-cache");

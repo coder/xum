@@ -80,9 +80,13 @@ export function buildRemotePluginListingScript(checkoutRoot: string, containers:
     `  count=$((count + $(${tree} | head -n ${limit} | wc -l)))`,
     `  [ "$count" -lt ${limit} ] || exit 5`,
     `  [ -z "$(${tree} -name "*$nl*" | head -n 1)" ] || exit 4`,
-    `  ${tree} -type d | sed "s|^|D\${tab}\${tab}|"`,
-    `  ${tree} -type l | while IFS= read -r e; do t=$(rp "$e") || t=; printf 'L\\t%s\\t%s\\n' "$t" "$e"; done`,
-    `  f=$(${tree} -type f -size -${MAX_FILE_SIZE + 1}c)`,
+    // Each list is captured first, so a find error (an unreadable or vanished directory) exits
+    // the script instead of leaving a partial tree: a pipeline's status is its last command's.
+    `  d=$(${tree} -type d) || exit 7`,
+    `  l=$(${tree} -type l) || exit 7`,
+    `  f=$(${tree} -type f -size -${MAX_FILE_SIZE + 1}c) || exit 7`,
+    `  [ -z "$d" ] || printf '%s\\n' "$d" | sed "s|^|D\${tab}\${tab}|"`,
+    `  [ -z "$l" ] || printf '%s\\n' "$l" | while IFS= read -r e; do t=$(rp "$e") || t=; printf 'L\\t%s\\t%s\\n' "$t" "$e"; done`,
     `  [ -z "$f" ] || { printf '%s\\n' "$f" | sed "s|^|F\${tab}\${tab}|"; files="$files$f$nl"; }`,
     `}`,
     `for c in "$@"; do`,
@@ -102,7 +106,8 @@ export function buildRemotePluginListingScript(checkoutRoot: string, containers:
     `done`,
     `printf 'ROOT\\t\\t%s\\nT\\n' "$root"`,
     // tar exits non-zero on a vanished file; the host then sees a member set that differs.
-    `[ -z "$files" ] || printf '%s' "$files" | tar -cf - -T - | base64`,
+    // COPYFILE_DISABLE: macOS bsdtar would add `._name` metadata members, which the host refuses.
+    `[ -z "$files" ] || printf '%s' "$files" | COPYFILE_DISABLE=1 tar -cf - -T - | base64`,
     `printf '.\\nEND\\n'`,
   ].join("\n");
 }
