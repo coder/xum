@@ -3623,6 +3623,17 @@ export class TurnRequestBuilder {
       if (!appendResult.success) {
         return { type: "finished", result: Err({ type: "unknown", raw: appendResult.error }) };
       }
+      // A stop that arrived during the append wins over the refold below: a refused rebuild
+      // must not turn a stopped turn into a budget error.
+      if (combinedAbortSignal.aborted) {
+        await deleteAbortedPlaceholder(assistantMessageId);
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+          ),
+        };
+      }
       // A change written while the append's file I/O ran still reaches the messages, as when
       // the fold ran after the append.
       streamState = await foldPendingThinkingOverrides(foldInput, streamState);

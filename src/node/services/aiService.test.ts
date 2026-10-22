@@ -6547,7 +6547,7 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
   // file I/O runs must still reach the messages, as when the fold ran after the append.
   it("folds a thinking change written while the assistant placeholder is appended", async () => {
     using xumHome = new DisposableTempDir("ai-service-fold-during-append");
-    const { send, historyService } = await setup(xumHome);
+    const { send, historyService, workspaceId } = await setup(xumHome);
     const history = [
       createMuxMessage("u1", "user", "first"),
       createMuxMessage("a1", "assistant", "answer", {
@@ -6564,10 +6564,13 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
       createMuxMessage("u3", "user", "third"),
     ];
     const override: ActiveTurnThinkingOverride = {};
-    spyOn(historyService, "appendToHistory").mockImplementation((_workspaceId, message) => {
+    // The real append writes the placeholder. The change lands while its file I/O is in flight.
+    spyOn(historyService, "appendToHistory").mockRestore();
+    const realAppend = historyService.appendToHistory.bind(historyService);
+    spyOn(historyService, "appendToHistory").mockImplementation((appendWorkspaceId, message) => {
+      const appended = realAppend(appendWorkspaceId, message);
       if (message.role === "assistant") override.pending = "off";
-      message.metadata = { ...(message.metadata ?? {}), historySequence: 7 };
-      return Promise.resolve({ success: true, data: undefined });
+      return appended;
     });
     const call = await send(history, "B", {
       modelString: KNOWN_MODELS.HAIKU.id,
@@ -6577,6 +6580,48 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
     expect(call.thinkingLevel).toBe("off");
     // At "off" the reasoning-only row is dropped, so the request appends row B again.
     expect(call.messages.at(-1)?.role).toBe("system");
+    const persisted = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!persisted.success) throw new Error(persisted.error);
+    const placeholder = persisted.data.find((row) => row.id === call.messageId);
+    expect(placeholder?.role).toBe("assistant");
+    expect(placeholder?.metadata?.historySequence).toBeNumber();
+  });
+
+  it("a stop during the placeholder append skips the refold and deletes the placeholder", async () => {
+    using xumHome = new DisposableTempDir("ai-service-stop-during-append");
+    const { service, historyService, workspaceId } = await setup(xumHome);
+    const controller = new AbortController();
+    const override: ActiveTurnThinkingOverride = {};
+    spyOn(historyService, "appendToHistory").mockRestore();
+    const realAppend = historyService.appendToHistory.bind(historyService);
+    spyOn(historyService, "appendToHistory").mockImplementation((appendWorkspaceId, message) => {
+      const appended = realAppend(appendWorkspaceId, message);
+      if (message.role === "assistant") {
+        override.pending = "off";
+        controller.abort();
+      }
+      return appended;
+    });
+    const assemblies = spyOn(turnContextAssembler, "assemblePromptPayload");
+    try {
+      const result = await service.streamMessage({
+        messages: [createMuxMessage("u1", "user", "first")],
+        workspaceId,
+        modelString: KNOWN_MODELS.HAIKU.id,
+        thinkingLevel: "high",
+        abortSignal: controller.signal,
+        activeTurnThinkingOverride: override,
+      });
+      // The stopped turn returns its aborted handle: no refold ran, the pending level stays.
+      expect(result.success).toBe(true);
+      expect(override).toEqual({ pending: "off" });
+      expect(assemblies).toHaveBeenCalledTimes(1);
+    } finally {
+      assemblies.mockRestore();
+    }
+    const persisted = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!persisted.success) throw new Error(persisted.error);
+    expect(persisted.data.filter((row) => row.role === "assistant")).toEqual([]);
   });
 
   it("a turn stopped before start folds no pending thinking change", async () => {
