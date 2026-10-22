@@ -45,6 +45,7 @@ test("the trap is installed before tests/setup.ts", () => {
 test("named, namespace, default, require and dynamic import forms", async () => {
   // eslint-disable-next-line @typescript-eslint/no-require-imports -- the CommonJS form is under test
   const required = require("fs") as typeof fsNs;
+  // eslint-disable-next-line no-restricted-syntax -- the dynamic import form is under test
   const dynamic = await import("node:fs");
   const apis = await within(() => {
     readFileSync(FILE);
@@ -190,9 +191,8 @@ test("fs callbacks and fs streams", async () => {
     );
   });
   // The stream reads through fs.open and fs.read, which add rows too.
-  expect(apis).toEqual(
-    expect.arrayContaining(["fs.readFile", "fs.statSync", "fs.createReadStream"])
-  );
+  for (const api of ["fs.readFile", "fs.statSync", "fs.createReadStream"])
+    expect(apis).toContain(api);
 });
 
 test("child_process, Bun.spawn, Bun.spawnSync and fetch", async () => {
@@ -203,9 +203,8 @@ test("child_process, Bun.spawn, Bun.spawnSync and fetch", async () => {
     await (await fetch(server.url)).text();
   });
   // execFile spawns through Bun.spawn, which adds a row too.
-  expect(apis).toEqual(
-    expect.arrayContaining(["cp.execFile", "Bun.spawn", "Bun.spawnSync", "fetch"])
-  );
+  for (const api of ["cp.execFile", "Bun.spawn", "Bun.spawnSync", "fetch"])
+    expect(apis).toContain(api);
 });
 
 test("Bun.file reads", async () => {
@@ -213,7 +212,7 @@ test("Bun.file reads", async () => {
     await Bun.file(FILE).text();
     await Bun.file(FILE).exists();
   });
-  expect(apis).toEqual(expect.arrayContaining(["Bun.file", "Bun.file.text", "Bun.file.exists"]));
+  for (const api of ["Bun.file", "Bun.file.text", "Bun.file.exists"]) expect(apis).toContain(api);
 });
 
 test("a WriteStream write, the shape of the log sink", async () => {
