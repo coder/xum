@@ -2825,9 +2825,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         },
       });
       // The counted candidate is dispatched at its level. The builder leaves the change pending
-      // for StreamManager's step 0, so no refold can refuse the turn after the warning is out.
+      // and holds it until after the first request, so no refold and no step-0 rebuild can
+      // change the payload after the warning is out.
       expect(turn.history.filter(isWarning)).toHaveLength(1);
-      expect(override).toEqual({ pending: "high" });
+      expect(override).toEqual({ pending: "high", holdBeforeFirstRequest: true });
       const sent = turn.sent!;
       expect(sent.thinkingLevel).toBe("off");
       expect(turn.measured).toEqual([await countRequest(turn, sent.messages)]);
@@ -2839,7 +2840,13 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         stageCallback: false,
       });
       // A 50% slider puts the handoff point far above this request.
-      const notDue = await runStageTurn(path.join(xumHome.path, "not-due"), { slider: 0.5 });
+      const override: ActiveTurnThinkingOverride = {};
+      const notDue = await runStageTurn(path.join(xumHome.path, "not-due"), {
+        slider: 0.5,
+        activeTurnThinkingOverride: override,
+      });
+      // No stage, no hold: later thinking changes apply as on any turn.
+      expect(override.holdBeforeFirstRequest).toBeUndefined();
       // Non-vacuous: the stage decision ran and declined.
       expect(notDue.estimates).toHaveLength(1);
       expect(notDue.offered).toBeUndefined();

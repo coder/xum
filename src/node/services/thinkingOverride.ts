@@ -41,6 +41,11 @@ export interface ActiveTurnThinkingOverride {
   manual?: boolean;
   /** Effective level after the most recent successful application. */
   applied?: ThinkingLevel;
+  /**
+   * Set when the turn published a Token Budget stage (#5286): its first provider request is the
+   * payload the stage counted, so `pending` waits until after that request.
+   */
+  holdBeforeFirstRequest?: boolean;
   /** Sink wired by StreamManager to the owning streamInfo (metadata). */
   onApplied?: (level: ThinkingLevel) => void;
   /**

@@ -672,14 +672,13 @@ export type OnTurnStartStage = (budget: {
 }) => Promise<TurnStartStage | undefined>;
 /**
  * A due, unclaimed stage. `publish` resolves false when the send lost its admission first, or
- * when history holds a row newer than `readSequence` (the request's stamp): the request does not
- * carry that row, and the warning's later sequence must not mark it as seen.
+ * when history holds a row the turn's history read did not see (AgentSession fences that).
  */
 export interface TurnStartStage {
   row: MuxMessage;
   /** Whether E′, the count of the request with `row` appended, leaves the stage its reserve. */
   fits: (estimate: number) => boolean;
-  publish: (readSequence: number) => Promise<boolean>;
+  publish: () => Promise<boolean>;
 }
 
 /** What a primary start dispatches: the built request, or the counted candidate with a stage. */
@@ -710,22 +709,20 @@ async function applyTurnStartStage<TMessages, TTail>(input: {
   }>;
   abortSignal: AbortSignal;
   current: TurnStartPayload<TMessages, TTail>;
+  /** A published stage holds later thinking changes until after its counted first request. */
+  thinkingOverride: ActiveTurnThinkingOverride | undefined;
 }): Promise<TurnStartPayload<TMessages, TTail>> {
   const { onTurnStartStage, estimate, limit, messages, current } = input;
   if (onTurnStartStage == null || estimate == null || limit == null) return current;
   const stage = await onTurnStartStage({ estimate, limit, model: input.model, messages });
   if (!stage) return current;
   messages.push(stage.row);
-  const candidate = await countAndPublishStage(
-    stage,
-    input.rebuild,
-    input.abortSignal,
-    current.requestHistorySequence
-  );
+  const candidate = await countAndPublishStage(stage, input.rebuild, input.abortSignal);
   if (!candidate) {
     messages.pop();
     return current;
   }
+  holdThinkingChanges(input.thinkingOverride);
   return {
     messages: candidate.messages,
     volatileSystemTail: candidate.volatileSystemTail,
@@ -734,12 +731,16 @@ async function applyTurnStartStage<TMessages, TTail>(input: {
   };
 }
 
+/** After a published stage, StreamManager applies thinking changes only after the first request. */
+function holdThinkingChanges(holder: ActiveTurnThinkingOverride | undefined): void {
+  if (holder) holder.holdBeforeFirstRequest = true;
+}
+
 /** Counts E′ with the row and publishes it only when it fits and the turn was not stopped. */
 async function countAndPublishStage<TCandidate extends { contextBudgetEstimate?: number }>(
   stage: TurnStartStage,
   rebuild: () => Promise<TCandidate>,
-  abortSignal: AbortSignal,
-  readSequence: number
+  abortSignal: AbortSignal
 ): Promise<TCandidate | undefined> {
   let candidate: TCandidate;
   try {
@@ -752,7 +753,7 @@ async function countAndPublishStage<TCandidate extends { contextBudgetEstimate?:
   const fits =
     candidate.contextBudgetEstimate != null && stage.fits(candidate.contextBudgetEstimate);
   if (!fits || abortSignal.aborted) return undefined;
-  return (await stage.publish(readSequence)) ? candidate : undefined;
+  return (await stage.publish()) ? candidate : undefined;
 }
 
 /**
@@ -3730,6 +3731,7 @@ export class TurnRequestBuilder {
         rebuild: () => primaryRequest.rebuildMessagesForThinkingLevel(foldedLevel),
         abortSignal: combinedAbortSignal,
         current: unstaged,
+        thinkingOverride: activeTurnThinkingOverride,
       });
       const stagePublished = staged !== unstaged;
       ({ requestHistorySequence } = staged);
@@ -3776,8 +3778,8 @@ export class TurnRequestBuilder {
       }
       // A change written while the append's file I/O ran still reaches the messages, as when
       // the fold ran after the append. A published stage skips this refold: its counted payload
-      // is dispatched, and the change applies at step 0 like any change written after dispatch,
-      // so a refusal here cannot leave the warning unanswered (#5286).
+      // is dispatched, and StreamManager holds the change until after that first request
+      // (holdBeforeFirstRequest), so a refusal cannot leave the warning unanswered (#5286).
       streamState = await foldPendingThinkingOverrides(
         { ...foldInput, skip: stagePublished },
         streamState

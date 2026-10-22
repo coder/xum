@@ -10,6 +10,7 @@ import * as path from "node:path";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { filterEmptyAssistantMessages } from "@/browser/utils/messages/modelMessageTransform";
 import type { SendMessageError } from "@/common/types/errors";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -213,12 +214,7 @@ async function emulateTurnStartStage(
   });
   if (!stage?.fits(estimate + TURN_START_ROW_TOKENS)) return;
   await control.beforePublish?.();
-  // The request's stamp, as TurnRequestBuilder passes it: the newest row it read.
-  const readSequence = Math.max(
-    -1,
-    ...request.messages.map((message) => message.metadata?.historySequence ?? -1)
-  );
-  if (await stage.publish(readSequence)) request.messages.push(stage.row);
+  if (await stage.publish()) request.messages.push(stage.row);
 }
 
 describe("AgentSession token-budget lifecycle", () => {
@@ -4446,6 +4442,35 @@ describe("AgentSession token-budget lifecycle", () => {
       expect(warningRows(rows)).toHaveLength(0);
       expect(handoffClaimed(h)).toBe(false);
       expect(text(h.requests[0].messages.at(-1)!)).toBe("Keep working");
+    });
+
+    // The fence compares with the newest row the turn's history READ saw, not with the rows the
+    // provider request keeps. A crash can leave an empty partial assistant row as the newest row:
+    // the resume reads it, and the builder's provider filter drops it, yet it is no unread row.
+    test("an empty newest row the request drops does not refuse the turn-start warning", async () => {
+      let h = await setup();
+      await seedHistory(h, 90_000);
+      h.turnStart.estimate = () => NOT_DUE;
+      expect((await h.session.sendMessage("First try", options)).success).toBe(true);
+      await stopStream(h, 0, 90_000);
+      const crashLeft = createMuxMessage("crash-left", "assistant", "", { model, partial: true });
+      expect((await h.historyService.appendToHistory(workspaceId, crashLeft)).success).toBe(true);
+      // A restart, as after the crash: the new session reads history fresh.
+      await h.session.dispose();
+      h = await setup({ previous: h });
+      const accept = spyOn(h.historyService, "acceptCompactionReplacement");
+      h.turnStart.estimate = () => 100_000;
+      expect((await h.session.resumeStream(options)).success).toBe(true);
+      await h.waitForRequest(1);
+      const rows = await allRows(h);
+      const newest = rows.find((row) => row.id === crashLeft.id)?.metadata?.historySequence;
+      assert(newest != null);
+      // Non-vacuous: the provider request drops the row, and it was the newest before the warning.
+      expect(filterEmptyAssistantMessages(rows).map((row) => row.id)).not.toContain(crashLeft.id);
+      const fenced = accept.mock.calls.map(([, , , observer]) => observer.maxHistorySequence);
+      expect(fenced.filter((sequence) => sequence != null)).toEqual([newest]);
+      expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
+      expect(handoffClaimed(h)).toBe(true);
     });
 
     // The builder drops a stage once its abort signal fires. The session's publish fence covers a

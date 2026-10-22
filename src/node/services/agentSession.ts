@@ -1417,6 +1417,11 @@ function stopHookModel(
     : payload.metadata.model;
 }
 
+/** The newest historySequence among `rows`, or -1 when none has one. */
+function newestHistorySequence(rows: readonly MuxMessage[]): number {
+  return rows.reduce((newest, row) => Math.max(newest, row.metadata?.historySequence ?? -1), -1);
+}
+
 export class AgentSession {
   private readonly replayPublication = new AsyncLocalStorage<{
     listener: (event: AgentSessionReplayEvent) => void;
@@ -6924,11 +6929,9 @@ export class AgentSession {
         {
           isCurrent: () => !isStreamStartAborted() && stopFence(),
           onCommitted: () => undefined,
-          // A row appended after the request's history read (a sub-agent report, a queued
-          // send) is not in the request: the warning's later sequence would mark it as seen.
-          // A stage row is rare (two per window), so the full scan is cheap enough.
-          admitsFullHistory: (rows) =>
-            rows.every((message) => (message.metadata?.historySequence ?? -1) <= readSequence),
+          // A row appended after the turn's history read (a sub-agent report, a queued send) is
+          // not in the request: the warning's later sequence would mark it as seen.
+          maxHistorySequence: readSequence,
         }
       )
       .catch((error: unknown) => Err(getErrorMessage(error)));
@@ -8956,6 +8959,10 @@ export class AgentSession {
       // A crash between snapshot and user-row appends can leave orphaned prompt
       // expansions on disk; exclude them from every provider request.
       let requestMessages = filterOrphanedMcpPromptSnapshots(historyResult.data);
+      // The newest sequence this turn's history read saw, before any filter: a stage warning is
+      // refused after a row above it (#5286). Rows the filters drop are never delivered, so
+      // counting them as seen is right.
+      let historyReadSequence = newestHistorySequence(historyResult.data);
 
       if (requestMessages.length === 0) {
         return await fail(createUnknownSendMessageError(EMPTY_RESUME_HISTORY_ERROR));
@@ -9001,6 +9008,7 @@ export class AgentSession {
           );
           if (refreshed.success) {
             requestMessages = filterOrphanedMcpPromptSnapshots(refreshed.data);
+            historyReadSequence = newestHistorySequence(refreshed.data);
           }
         }
       }
@@ -9195,10 +9203,10 @@ export class AgentSession {
         }),
         // The stage warning follows the user row (#5286). It is published under this send's
         // admission, like the user row itself, unless the start was superseded or stopped.
-        onTurnStartStage: this.contextController.turnStartStage(options, (row, readSequence) =>
+        onTurnStartStage: this.contextController.turnStartStage(options, (row) =>
           this.publishTurnStartStage(
             row,
-            readSequence,
+            historyReadSequence,
             admissionCapture,
             isStreamStartAborted,
             stopFence

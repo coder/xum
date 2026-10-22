@@ -3216,7 +3216,8 @@ export class StreamManager {
   ): Record<string, unknown> | undefined {
     const state = request.thinkingOverrideState;
     const pending = state?.pending;
-    if (state == null || pending == null) {
+    // A stage turn sends its counted payload first (#5286): the change applies after it.
+    if (state == null || pending == null || (beforeFirstStep && state.holdBeforeFirstRequest)) {
       return undefined;
     }
     state.pending = undefined;
