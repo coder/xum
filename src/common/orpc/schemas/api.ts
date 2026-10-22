@@ -3440,6 +3440,11 @@ export const config = {
       toolSearchEnabled: z.boolean(),
       bashAiProxyEnabled: z.boolean(),
       agentHeartbeatsEnabled: z.boolean(),
+      telemetryEnabled: z.boolean(),
+      // True when the environment (MUX_DISABLE_TELEMETRY, CI, tests) hard-disables
+      // telemetry regardless of the config toggle — the UI renders the switch
+      // disabled instead of pretending it controls anything.
+      telemetryDisabledByEnv: z.boolean(),
       heartbeatDefaultPrompt: z.string().optional(),
       heartbeatDefaultIntervalMs: z.number().optional(),
       goalDefaults: GoalDefaultsConfigSchema,
@@ -3581,6 +3586,7 @@ export const config = {
   updateToolSearchEnabled: booleanToggleRoute,
   updateBashAiProxyEnabled: booleanToggleRoute,
   updateAgentHeartbeatsEnabled: booleanToggleRoute,
+  updateTelemetryEnabled: booleanToggleRoute,
   updateHeartbeatDefaultPrompt: {
     input: z
       .object({

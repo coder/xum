@@ -189,6 +189,8 @@ export interface MockORPCClientOptions {
   agentAiDefaults?: AgentAiDefaults;
   /** Agent definitions to expose via agents.list */
   agentDefinitions?: AgentDefinitionDescriptor[];
+  /** Initial telemetry opt-in state for config.getConfig (Settings → General → Privacy) */
+  telemetryEnabled?: boolean;
   /** Coder lifecycle preferences for config.getConfig (e.g., Settings → Coder section) */
   coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;
   /** What to do with xum-managed worktrees when archiving a chat. */
@@ -544,6 +546,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     userPreferences: initialUserPreferences,
     taskSettings: initialTaskSettings,
     agentAiDefaults: initialAgentAiDefaults,
+    telemetryEnabled: initialTelemetryEnabled,
     coderWorkspaceArchiveBehavior: initialCoderWorkspaceArchiveBehavior = "stop",
     worktreeArchiveBehavior: initialWorktreeArchiveBehavior = "keep",
     chatTranscriptFullWidth: initialChatTranscriptFullWidth = false,
@@ -835,6 +838,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     unapprovedProjectImports: [],
   };
 
+  let telemetryEnabled = initialTelemetryEnabled ?? true;
+
   const mockStats: ChatStats = {
     consumers: [],
     totalTokens: 0,
@@ -976,6 +981,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           bashAiProxyEnabled,
           agentHeartbeatsEnabled,
           experiments,
+          telemetryEnabled,
+          telemetryDisabledByEnv: false,
         }),
       saveConfig: (input: { taskSettings?: unknown; agentAiDefaults?: unknown }) => {
         if (input.taskSettings != null) {
@@ -1055,6 +1062,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             ...(chosen.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
           },
         });
+      },
+      updateTelemetryEnabled: (input: { enabled: boolean }) => {
+        telemetryEnabled = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
       },
       updateMuxGatewayPrefs: (input: {
         muxGatewayEnabled: boolean;
