@@ -8,6 +8,8 @@
  * shared `bun test ./scripts/` process without patching that process.
  */
 import assert from "node:assert/strict";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** [start, end] in milliseconds of one open fs call or timer. */
 export type Interval = readonly [number, number];
@@ -42,13 +44,21 @@ const FUNCTION_KEYS = new Set<PropertyKey>(["length", "name", "prototype", "argu
 /**
  * Copies the own properties of `from` to `to`, symbols included, so a wrapper keeps the
  * extras callers use: `util.promisify(setTimeout)` reads `setTimeout[util.promisify.custom]`,
- * and `fs.realpath.native` is a property of `fs.realpath`.
+ * and `fs.realpath.native` is a property of `fs.realpath`. `wrap`, when given, wraps each
+ * function-valued property, so those entry points are timed too.
  */
-export function copyOwnProperties(from: AnyFunction, to: AnyFunction): void {
+export function copyOwnProperties(
+  from: AnyFunction,
+  to: AnyFunction,
+  wrap?: (fn: AnyFunction) => AnyFunction
+): void {
   for (const key of Reflect.ownKeys(from)) {
     if (FUNCTION_KEYS.has(key)) continue;
     const descriptor = Object.getOwnPropertyDescriptor(from, key);
     assert(descriptor, `missing own property ${String(key)}`);
+    if (wrap && typeof descriptor.value === "function") {
+      descriptor.value = wrap(descriptor.value as AnyFunction);
+    }
     Object.defineProperty(to, key, descriptor);
   }
 }
@@ -85,12 +95,41 @@ export function timed<F extends AnyFunction>(fn: F, record: RecordInterval, now:
       throw error;
     }
     if (isThenable(result)) {
-      const settle = () => record([start, now()]);
-      result.then(settle, settle);
-    } else {
-      record([start, now()]);
+      // Return the chained promise, not `result`: a rejection the caller leaves unhandled
+      // must stay unhandled, as it is without the preload.
+      return result.then(
+        (value) => {
+          record([start, now()]);
+          return value;
+        },
+        (error: unknown) => {
+          record([start, now()]);
+          throw error;
+        }
+      );
     }
+    record([start, now()]);
     return result;
+  };
+  copyOwnProperties(fn, wrapper as AnyFunction, (prop) => timed(prop, record, now));
+  return wrapper as unknown as F;
+}
+
+/**
+ * Wraps a promise-returning delay whose first argument is the delay: Bun.sleep(ms | Date) and
+ * setTimeout[util.promisify.custom](ms, value). It records until the promise settles, except a
+ * delay below 1 ms (an event loop yield), as timedTimeout does.
+ */
+export function timedDelay<F extends AnyFunction>(
+  fn: F,
+  record: RecordInterval,
+  now: () => number
+): F {
+  const recorded = timed(fn, record, now);
+  const wrapper = function (this: unknown, delay?: unknown, ...rest: unknown[]): unknown {
+    const yields = !(delay instanceof Date) && !(Number(delay) >= 1);
+    const call = (yields ? fn : recorded) as unknown as (...a: unknown[]) => unknown;
+    return call.call(this, delay, ...rest);
   };
   copyOwnProperties(fn, wrapper as AnyFunction);
   return wrapper as unknown as F;
@@ -117,7 +156,7 @@ export function timedTimeout<F extends AnyFunction>(
     };
     return call.call(this, fire, delay, ...rest);
   };
-  copyOwnProperties(setTimeoutFn, wrapper as AnyFunction);
+  copyOwnProperties(setTimeoutFn, wrapper as AnyFunction, (prop) => timedDelay(prop, record, now));
   return wrapper as unknown as F;
 }
 
@@ -134,9 +173,12 @@ export function isTimedFsName(name: string, value: unknown): boolean {
   );
 }
 
-/** True for a mkdir or mkdtemp call whose path is under the OS temp dir. */
+/** True for a mkdir or mkdtemp call whose path is the OS temp dir or under it. */
 export function isTempDirCall(name: string, firstArg: unknown, tmpDir: string): boolean {
   if (!/^mk(dir|dtemp)/.test(name)) return false;
-  const target = firstArg instanceof URL ? firstArg.pathname : firstArg;
-  return typeof target === "string" && target.startsWith(tmpDir);
+  const target = firstArg instanceof URL ? fileURLToPath(firstArg) : firstArg;
+  if (typeof target !== "string") return false;
+  // On a path component boundary: /tmp-backup is not under /tmp.
+  const relative = path.relative(tmpDir, path.resolve(target));
+  return !path.isAbsolute(relative) && relative.split(path.sep)[0] !== "..";
 }

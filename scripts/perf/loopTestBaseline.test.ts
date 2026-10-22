@@ -8,6 +8,7 @@ import {
   loopTestFiles,
   patchesGlobalTime,
   runFile,
+  runPool,
 } from "./loopTestBaseline";
 import { summarizeFile } from "./loopTestStats";
 
@@ -160,4 +161,51 @@ test("an unknown --base exits 2 with a last loop-tests line", () => {
   );
   expect(result.exitCode).toBe(2);
   expect(result.stdout.toString().trim().split("\n").at(-1)).toBe("loop-tests: error");
+});
+
+describe("runPool", () => {
+  test("never runs two tasks of one key at once, and other keys side by side", async () => {
+    const active = new Map<string, number>();
+    let most = 0;
+    let mostOfOneKey = 0;
+    const task = (key: string, value: number) => ({
+      key,
+      run: async () => {
+        active.set(key, (active.get(key) ?? 0) + 1);
+        mostOfOneKey = Math.max(mostOfOneKey, ...active.values());
+        most = Math.max(
+          most,
+          [...active.values()].reduce((a, b) => a + b, 0)
+        );
+        await Bun.sleep(5);
+        active.set(key, (active.get(key) ?? 0) - 1);
+        return value;
+      },
+    });
+    const tasks = [task("a", 1), task("a", 2), task("a", 3), task("b", 4), task("b", 5)];
+    expect(await runPool(tasks, 6)).toEqual([1, 2, 3, 4, 5]);
+    expect(mostOfOneKey).toBe(1);
+    expect(most).toBe(2);
+  });
+
+  test("after a failure it starts no task and waits for the running ones", async () => {
+    const started: string[] = [];
+    let slowDone = false;
+    const tasks = [
+      { key: "fail", run: () => Promise.reject(new Error("broken record")) },
+      {
+        key: "slow",
+        run: async () => {
+          started.push("slow");
+          await Bun.sleep(20);
+          slowDone = true;
+        },
+      },
+      { key: "late", run: () => Promise.resolve(started.push("late")).then(() => undefined) },
+    ];
+    await expect(runPool(tasks, 2).finally(() => expect(slowDone).toBe(true))).rejects.toThrow(
+      "broken record"
+    );
+    expect(started).toEqual(["slow"]);
+  });
 });
