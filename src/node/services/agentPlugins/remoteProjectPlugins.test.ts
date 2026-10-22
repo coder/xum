@@ -207,6 +207,18 @@ describe("parseRemotePluginListing", () => {
     expect(parseRemotePluginListing("ROOT\t0\t/r\t\nF\t2\t\t/r/x/plugin.json\nEND\n")).toBeNull();
   });
 
+  test("refuses the whole listing when two paths fold to one name on a case-insensitive host", () => {
+    const withDirs = (...dirs: string[]) =>
+      parseRemotePluginListing(
+        `${dirs.map((dir) => `D\t0\t\t${dir}\n`).join("")}ROOT\t0\t/r\t\nEND\n`
+      );
+    expect(withDirs("/r/p/guide", "/r/p/GUIDE")).toBeNull();
+    // NFC: a precomposed and a decomposed accent are one name on APFS.
+    expect(withDirs("/r/p/caf\u00e9", "/r/p/cafe\u0301")).toBeNull();
+    // One directory listed twice (two containers resolve to it) is fine.
+    expect(withDirs("/r/p/guide", "/r/p/guide")?.entries).toHaveLength(2);
+  });
+
   test("refuses the whole listing for a name a Windows host could read as a path", () => {
     const withDir = (dir: string, target = "") =>
       parseRemotePluginListing(`D\t0\t\t/r/p/ok\nL\t0\t${target}\t${dir}\nROOT\t0\t/r\t\nEND\n`);
@@ -267,6 +279,13 @@ describe("getRemoteProjectPluginSnapshot", () => {
       path.join(await writePlugin(container, "cached", manifest("cached")), "skills"),
       "review"
     );
+    const deepRelative = path.join(
+      ".xum/plugins/cached/skills/review/refs",
+      ..."abcdefghijkl".split(""),
+      "deep.md"
+    );
+    await fs.mkdir(path.dirname(path.join(root, deepRelative)), { recursive: true });
+    await fs.writeFile(path.join(root, deepRelative), "deep");
     const runtime = new CountingRemoteRuntime(root, `test:${root}`);
 
     const [first, second] = await Promise.all([
@@ -277,6 +296,10 @@ describe("getRemoteProjectPluginSnapshot", () => {
     expect(second).toBe(first);
     expect(runtime.execs).toBe(1);
     expect(first?.plugins.map((plugin) => plugin.name)).toEqual(["cached"]);
+    // No depth limit: a file far below its skill is in the mirror.
+    expect(await fs.readFile(path.join(first?.mirrorRoot ?? "", deepRelative), "utf8")).toBe(
+      "deep"
+    );
     const mirror = first?.mirrorRoot ?? "";
 
     clearRemoteProjectPluginSnapshots();
@@ -292,6 +315,7 @@ describe("getRemoteProjectPluginSnapshot", () => {
     const container = path.join(root, ".xum", "plugins");
     await writePlugin(container, "late", manifest("late"));
     const runtime = new CountingRemoteRuntime(root, `test:${root}`);
+    // The clear runs while the create is in flight: its result is not cached.
     const inFlight = getRemoteProjectPluginSnapshot(runtime, root, [container]);
     clearRemoteProjectPluginSnapshots();
     expect(await inFlight).toBeNull();
