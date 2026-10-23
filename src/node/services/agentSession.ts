@@ -127,6 +127,7 @@ import {
   needsTodoTurnEndNudge,
   type TurnStopContinuation,
 } from "@/node/services/agentNotifications/todoTurnEndNudge";
+import { resolveLegacyTodoNudgeToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
 import {
@@ -283,6 +284,8 @@ import {
   type RetryStatusEvent,
 } from "./retryManager";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
+import { hostClockFor } from "./di/hostClockLive";
+import type { HostClock } from "@/node/utils/hostClock";
 import type { Scope } from "effect";
 import type { TelemetryService } from "./telemetryService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
@@ -1021,6 +1024,23 @@ export interface AgentSessionStreamManager {
    * global runtime.
    */
   readonly effectRunner?: EffectRunner;
+  /** The stream's HostClock (StreamManager.hostClock). Absent on test doubles. */
+  readonly hostClock?: HostClock;
+}
+
+/**
+ * One clock with the runner that supervises a session and runs RetryManager's sleeps: the
+ * explicit clock first, then the stream's, else the clock of the runner that supervise() uses.
+ */
+function resolveSessionHostClock(
+  options: Pick<AgentSessionOptions, "hostClock" | "effectRunner">,
+  streamManager: AgentSessionStreamManager
+): HostClock {
+  return (
+    options.hostClock ??
+    streamManager.hostClock ??
+    hostClockFor(options.effectRunner ?? streamManager.effectRunner ?? defaultEffectRunner)
+  );
 }
 
 /** Keeps AgentSession coupled only to the AI operations and events it consumes. */
@@ -1083,6 +1103,8 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
 interface AgentSessionOptions {
   contextManagement: ContextManagementService;
   effectRunner?: EffectRunner;
+  /** WorkspaceService passes the HostClock service. Default: see the constructor. */
+  hostClock?: HostClock;
   appFiberScope?: Scope.Scope;
   workspaceId: string;
   config: Config;
@@ -1418,6 +1440,23 @@ function stopHookModel(
 }
 
 /** The newest historySequence among `rows`, or -1 when none has one. */
+/**
+ * The retried row's tool policy. Only that row and older tail rows can prove that Xum added a
+ * legacy TODO-nudge rule (see resolveLegacyTodoNudgeToolPolicy).
+ */
+function resolveStartupRetryToolPolicy(
+  retryRow: MuxMessage | undefined,
+  historyTail: readonly MuxMessage[],
+  retrySnapshotPolicy: ToolPolicy | undefined
+): ToolPolicy | undefined {
+  const policy = retryRow?.metadata?.toolPolicy ?? retrySnapshotPolicy;
+  const retryRowIndex = retryRow != null ? historyTail.indexOf(retryRow) : -1;
+  return resolveLegacyTodoNudgeToolPolicy(
+    policy,
+    historyTail.slice(0, retryRowIndex + 1).reverse()
+  );
+}
+
 function newestHistorySequence(rows: readonly MuxMessage[]): number {
   return rows.reduce((newest, row) => Math.max(newest, row.metadata?.historySequence ?? -1), -1);
 }
@@ -1432,6 +1471,8 @@ export class AgentSession {
   private readonly historyService: HistoryService;
   private readonly aiService: AgentSessionAIService;
   private readonly streamManager: AgentSessionStreamManager;
+  /** Record timestamps and deadlines; the same clock as the runner's sleeps. */
+  private readonly hostClock: HostClock;
   private readonly mcpServerManager?: MCPServerManager;
   private readonly initStateManager: InitStateManager;
   private readonly backgroundProcessManager: BackgroundProcessManager;
@@ -1951,6 +1992,7 @@ export class AgentSession {
       "AgentSession requires stream lifecycle access"
     );
     this.streamManager = streamManagerCandidate as AgentSessionStreamManager;
+    this.hostClock = resolveSessionHostClock(options, this.streamManager);
     this.mcpServerManager = mcpServerManager;
     this.initStateManager = initStateManager;
     this.backgroundProcessManager = backgroundProcessManager;
@@ -1979,6 +2021,7 @@ export class AgentSession {
     const session = this;
     const contextHost: SessionContextHost = {
       workspaceId: this.workspaceId,
+      hostClock: this.hostClock,
       sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
       emitter: this.emitter,
       coordinator: this.coordinator,
@@ -2060,7 +2103,8 @@ export class AgentSession {
       () => {
         const retry = this.coordinator.beginRetry();
         return { [Symbol.dispose]: () => this.coordinator.finishRetry(retry) };
-      }
+      },
+      this.hostClock
     );
 
     // App close can interrupt the guardian synchronously. Attach only after retry/compaction
@@ -3333,8 +3377,11 @@ export class AgentSession {
       persistedRetrySendOptions?.serviceTier ?? agentSettings?.serviceTier
     ).data;
 
-    const persistedToolPolicy =
-      lastUserMessage?.metadata?.toolPolicy ?? persistedRetrySendOptions?.toolPolicy;
+    const persistedToolPolicy = resolveStartupRetryToolPolicy(
+      lastUserMessage,
+      params.historyTail,
+      persistedRetrySendOptions?.toolPolicy
+    );
     const persistedDisableWorkspaceAgents =
       lastUserMessage?.metadata?.disableWorkspaceAgents ??
       persistedRetrySendOptions?.disableWorkspaceAgents;
@@ -3704,7 +3751,11 @@ export class AgentSession {
         (state) => state === "blocked",
         { signal, wait: (delay) => this.waitForStartupReadRetry(delay, signal) }
       );
-      const result = await raceWithAbortAndTimeout(probe, { signal, timeoutMs });
+      const result = await raceWithAbortAndTimeout(probe, {
+        signal,
+        timeoutMs,
+        clock: this.hostClock,
+      });
       return result.kind === "ok" ? (result.value ?? "blocked") : "blocked";
     } catch {
       return "blocked";
@@ -5712,7 +5763,7 @@ export class AgentSession {
       "user",
       message,
       {
-        timestamp: Date.now(),
+        timestamp: this.hostClock.nowMs(),
         toolPolicy: typedToolPolicy,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         retrySendOptions: pickStartupRetrySendOptions(
@@ -5887,7 +5938,7 @@ export class AgentSession {
           "user",
           autoCompactionRequest.messageText,
           {
-            timestamp: Date.now(),
+            timestamp: this.hostClock.nowMs(),
             toolPolicy: autoCompactionRequest.sendOptions.toolPolicy,
             disableWorkspaceAgents: optionsForStream.disableWorkspaceAgents,
             retrySendOptions: pickStartupRetrySendOptions(
@@ -7465,7 +7516,7 @@ export class AgentSession {
           // pre-goal (queued before the goal existed) vs a real intervention.
           // Without it a rejected queued send would pause a never-driven goal
           // on the next getGoal.
-          timestamp: Date.now(),
+          timestamp: this.hostClock.nowMs(),
           ...(enqueuedAtMs != null ? { enqueuedAtMs } : {}),
         },
         additionalParts.length > 0 ? additionalParts : undefined
@@ -8986,7 +9037,7 @@ export class AgentSession {
           }
         );
         const sentinelMessage = createMuxMessage(createUserMessageId(), "user", "[CONTINUE]", {
-          timestamp: Date.now(),
+          timestamp: this.hostClock.nowMs(),
           synthetic: true,
         });
         if (leaseRefusal != null) {
@@ -10628,7 +10679,7 @@ export class AgentSession {
 
           goalContinuationRequest = {
             sendOptions,
-            streamEndedAtMs: Date.now(),
+            streamEndedAtMs: this.hostClock.nowMs(),
           };
         }
       }
@@ -11850,7 +11901,10 @@ export class AgentSession {
       return;
     }
     const deadline = Promise.withResolvers<"deadline">();
-    const timer = setTimeout(() => deadline.resolve("deadline"), this.planSnapshotCaptureTimeoutMs);
+    const cancelDeadline = this.hostClock.setTimer(
+      () => deadline.resolve("deadline"),
+      this.planSnapshotCaptureTimeoutMs
+    );
     try {
       // Captures remove themselves from the set when they finish. The wait races the deadline
       // rather than relying on the capture to notice the abort: the stall can be inside the
@@ -11874,7 +11928,7 @@ export class AgentSession {
         }
       }
     } finally {
-      clearTimeout(timer);
+      cancelDeadline();
     }
   }
 
@@ -13412,7 +13466,7 @@ export class AgentSession {
         // model-visible in RLM mode, keeping RLM-off prompts byte-identical.
         readFilePaths: includeReadFiles ? pendingState.readFiles : [],
         // Compaction just completed, so every already-completed report predates the boundary.
-        reportsCompletedBeforeMs: Date.now(),
+        reportsCompletedBeforeMs: this.hostClock.nowMs(),
       });
     }
 
@@ -13465,7 +13519,7 @@ export class AgentSession {
       diffs: fileDiffs,
       loadedSkills,
       readFilePaths,
-      reportsCompletedBeforeMs: boundaryTimestampMs ?? Date.now(),
+      reportsCompletedBeforeMs: boundaryTimestampMs ?? this.hostClock.nowMs(),
     });
   }
 
@@ -13635,7 +13689,7 @@ export class AgentSession {
 
     const snapshotId = createFileSnapshotMessageId();
     const snapshotMessage = createMuxMessage(snapshotId, "user", blocks, {
-      timestamp: Date.now(),
+      timestamp: this.hostClock.nowMs(),
       synthetic: true,
       fileAtMentionSnapshot: tokens,
     });
@@ -13670,7 +13724,7 @@ export class AgentSession {
             cancelSignal !== undefined ? { signal: cancelSignal } : undefined
           );
           return createMuxMessage(createMcpPromptSnapshotMessageId(), "user", prompt.text, {
-            timestamp: Date.now(),
+            timestamp: this.hostClock.nowMs(),
             synthetic: true,
             mcpPromptSnapshot: {
               serverName: ref.serverName,
@@ -13902,7 +13956,7 @@ export class AgentSession {
       const snapshotId = createAgentSkillSnapshotMessageId();
       snapshotMessages.push(
         createMuxMessage(snapshotId, "user", snapshotText, {
-          timestamp: Date.now(),
+          timestamp: this.hostClock.nowMs(),
           synthetic: true,
           agentSkillSnapshot: {
             skillName: ref.skillName,

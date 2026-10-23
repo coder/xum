@@ -1644,6 +1644,7 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
   test("a step-0 thinking rebuild after the repair sends no thinking", async () => {
     // #5886: the rebuild reads history, which does not hold this turn's receipt yet.
     const rebuiltTail = { text: "\n\n<hot_memories>B</hot_memories>", placement: "row" as const };
+    const rebuiltInstructions = { text: "\n<custom-instructions>\nB\n</custom-instructions>" };
     const thinkingOverrideState: NonNullable<TurnExecutionOptions["thinkingOverrideState"]> = {
       applied: "medium",
     };
@@ -1682,7 +1683,10 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
         rebuildFirstStepForThinkingLevel: () =>
           Promise.resolve({
             messages: messages(),
-            volatileSystemTail: rebuiltTail,
+            systemRecords: {
+              volatileSystemTail: rebuiltTail,
+              customInstructions: { ...rebuiltInstructions, placement: "row" },
+            },
             systemMessageTokens: 4321,
           }),
       },
@@ -1692,6 +1696,10 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
     const history = await historyService.getHistoryFromLatestBoundary("anthropic-receipt-rebuild");
     if (!history.success) throw new Error(history.error);
     expect(history.data.at(-1)?.metadata?.volatileSystemTail).toEqual(rebuiltTail);
+    expect(history.data.at(-1)?.metadata?.customInstructions).toEqual({
+      ...rebuiltInstructions,
+      placement: "row",
+    });
     expect(history.data.at(-1)?.metadata?.systemMessageTokens).toBe(4321);
     expect(thinkingOverrideState.applied).toBe("high");
     expect(requestBlockTypes).toHaveLength(2);

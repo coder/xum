@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 
+import { makeTestEffectRunner } from "@/node/services/di/testEffectRunner";
 import { raceWithAbortAndTimeout } from "./withTimeout";
 
 afterEach(() => {
@@ -72,6 +73,43 @@ describe("raceWithAbortAndTimeout", () => {
       expect(error).toEqual(new Error("read failed"));
     }
   );
+
+  it("keeps the timer unref'd on the default clock", async () => {
+    const unref = vi.fn();
+    const realSetTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      handler: () => void,
+      timeoutMs?: number
+    ) => {
+      const timer = realSetTimeout(handler, timeoutMs);
+      return Object.assign(timer, { unref: () => (unref(), timer) });
+    }) as unknown as typeof setTimeout);
+
+    await raceWithAbortAndTimeout(Promise.resolve("done"), { timeoutMs: 1000 });
+
+    expect(unref).toHaveBeenCalledTimes(1);
+  });
+
+  it("times out on a passed HostClock, not on real time", async () => {
+    const clock = makeTestEffectRunner();
+    try {
+      const timerSpy = vi.spyOn(globalThis, "setTimeout");
+      let outcome: string | undefined;
+      const result = raceWithAbortAndTimeout(new Promise<never>(() => undefined), {
+        timeoutMs: 30_000,
+        clock: clock.hostClock,
+      }).then((value) => (outcome = value.kind));
+
+      await clock.adjust(29_999);
+      expect(outcome).toBeUndefined();
+      await clock.adjust(1);
+      await result;
+      expect(outcome).toBe("timeout");
+      expect(timerSpy).not.toHaveBeenCalledWith(expect.any(Function), 30_000);
+    } finally {
+      await clock.dispose();
+    }
+  });
 
   it("returns aborted when the signal aborts", async () => {
     const controller = new AbortController();

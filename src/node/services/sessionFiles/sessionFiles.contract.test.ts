@@ -3,10 +3,17 @@ import * as nodeFs from "node:fs";
 import * as nodeFsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { SessionFilesMemory, symlinkInMemory } from "./memorySessionFiles.testHarness";
 import { nodeSessionFiles, SessionFilesNode } from "./nodeSessionFiles";
-import { describeSessionFilesContract } from "./sessionFiles.contract.testHarness";
+import {
+  describeFaultCases,
+  describeSessionFilesContract,
+} from "./sessionFiles.contract.testHarness";
 
 describeSessionFilesContract("node", SessionFilesNode);
+describeSessionFilesContract("memory", SessionFilesMemory, symlinkInMemory);
+describeFaultCases("node", SessionFilesNode);
+describeFaultCases("memory", SessionFilesMemory);
 
 // Existing tests fail or observe single history steps by spying on the fs namespaces. They keep
 // working only if nodeSessionFiles reads each binding when it is called.

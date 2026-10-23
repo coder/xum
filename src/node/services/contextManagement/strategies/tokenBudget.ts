@@ -757,7 +757,7 @@ export class TokenBudgetStrategy {
       id: createUserMessageId(),
       metadata: {
         ...metadata,
-        timestamp: Date.now(),
+        timestamp: this.host.hostClock.nowMs(),
         muxMetadata: { ...muxMetadata, rolloverId: rollover.rolloverId },
       },
     };

@@ -9,6 +9,8 @@ import { CompactionPendingState } from "./compactionPendingState";
 import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
 import { Effect, type Scope } from "effect";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
+import { hostClockFor } from "./di/hostClockLive";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import {
   DesktopInputCoordinator,
   settleArchivedSharedDesktopTask,
@@ -1813,7 +1815,8 @@ async function collectReferencedStagedAttachmentPaths(input: {
       try {
         // Streamed: every snapshot archive scans the full append-only history.
         for (const stagedPath of await extractStagedAttachmentPathsFromFile(
-          path.join(input.sessionDir, fileName)
+          path.join(input.sessionDir, fileName),
+          input.historyService.files
         )) {
           paths.add(stagedPath);
         }
@@ -3254,7 +3257,10 @@ export class WorkspaceService
     // construction builds its own from the stores above, like the other defaults.
     private readonly autoModelRouter: Pick<AutoModelRouter, "classify"> = new AutoModelRouter({
       providersConfigStore,
-    })
+    }),
+    // The turn path stamps the user message, its recency and the stream end on the sessions'
+    // clock. WorkspaceLive passes the HostClock service; by default the clock of the runner.
+    private readonly hostClock: HostClock = hostClockFor(effectRunner)
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
@@ -5405,7 +5411,8 @@ export class WorkspaceService
       // can lose the race against the frontend's lastRead (set via Date.now()
       // after the IPC round-trip). Using a fresh timestamp here ensures the
       // completion recency is strictly after any earlier lastRead write.
-      await this.updateRecencyTimestamp(workspaceId, Date.now());
+      // Wall clock on purpose: the renderer writes lastRead with Date.now() (#7282).
+      await this.updateRecencyTimestamp(workspaceId, nodeClock.nowMs());
     }
 
     await this.stopStreamingStatus(workspaceId, generation);
@@ -5824,6 +5831,7 @@ export class WorkspaceService
     return new AgentSession({
       contextManagement: this.contextManagement,
       effectRunner: this.effectRunner,
+      hostClock: this.hostClock,
       appFiberScope: this.appFiberScope,
       workspaceId,
       config: this.config,
@@ -6026,7 +6034,8 @@ export class WorkspaceService
       return null;
     const pending = new CompactionPendingState(
       pendingPath,
-      this.historyService.getCompactionPendingHistory(workspaceId)
+      this.historyService.getCompactionPendingHistory(workspaceId),
+      this.historyService.files
     );
     const receipt = await pending.load(() => true).catch(() => undefined);
     return receipt?.attachments.diffs.map((diff) => diff.path) ?? null;
@@ -14776,7 +14785,9 @@ export class WorkspaceService
 
           // Forking from a prior assistant response intentionally discards any later in-flight
           // state so the new workspace resumes cleanly at the chosen branch point.
-          await fsPromises.rm(path.join(newSessionDir, "partial.json"), { force: true });
+          await this.historyService.files.promises.rm(path.join(newSessionDir, "partial.json"), {
+            force: true,
+          });
           if (this.sessionTimingService) {
             await this.sessionTimingService.clearTimingFile(newWorkspaceId);
           } else {
@@ -16530,7 +16541,9 @@ export class WorkspaceService
     // sampling later — at enqueue or dispatch — would misclassify a message
     // the user authored before a goal became visible as an intervention
     // against it, pausing the fresh goal.
-    const authoredAtMs = Date.now();
+    // Wall clock on purpose: messageQueue folds it with Date.now() and
+    // WorkspaceGoalService.acknowledgeUser compares it with its wall-clock gate (#7282).
+    const authoredAtMs = nodeClock.nowMs();
     // Deliberate picker intent pins agent-task AI fields; only a person's own send may carry
     // it. Strip it here so it never reaches the queue, AgentSession, or persisted options.
     const { aiSelectionIntent, ...optionsWithoutAiSelectionIntent } = options;
@@ -16802,7 +16815,7 @@ export class WorkspaceService
         muxMeta?.type === "compaction-request" && muxMeta?.source === "idle-compaction";
       // Use current time for recency - this matches the timestamp used on the message
       // in agentSession.sendMessage(). Keeps ExtensionMetadata in sync with chat.jsonl.
-      const messageTimestamp = Date.now();
+      const messageTimestamp = this.hostClock.nowMs();
       if (!isIdleCompaction) {
         void this.updateRecencyTimestamp(workspaceId, messageTimestamp);
       }

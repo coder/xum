@@ -318,9 +318,9 @@ describe("inactive local compaction preparation lifecycle", () => {
     const bInput = { ...(await input("B")), shouldPersist: () => false };
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    const remove = syncFs.promises.rm;
+    const remove = fs.rm;
     let paused = false;
-    spyOn(syncFs.promises, "rm").mockImplementation(async (file, options) => {
+    const removing = spyOn(fs, "rm").mockImplementation(async (file, options) => {
       if (String(file).startsWith(`${pendingPath}.continuous-`) && !paused) {
         paused = true;
         entered.resolve();
@@ -341,6 +341,7 @@ describe("inactive local compaction preparation lifecycle", () => {
       expect(await lifecycle.capture("pending")).toBeUndefined();
       expect(await restart().load(() => true)).toBeUndefined();
       expect(await historyIds()).toEqual(["seed"]);
+      expect(removing).toHaveBeenCalled();
     } finally {
       release.resolve();
       await a;
@@ -356,9 +357,9 @@ describe("inactive local compaction preparation lifecycle", () => {
       assert(snapshot);
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
-      const remove = syncFs.promises.rm;
+      const remove = fs.rm;
       let paused = false;
-      spyOn(syncFs.promises, "rm").mockImplementation(async (file, options) => {
+      const removing = spyOn(fs, "rm").mockImplementation(async (file, options) => {
         if (String(file).startsWith(`${pendingPath}.continuous-`) && !paused) {
           paused = true;
           entered.resolve();
@@ -384,6 +385,7 @@ describe("inactive local compaction preparation lifecycle", () => {
           disposition === "ack" ? ["/A.ts"] : undefined
         );
         expect(await restart().load(() => true)).toBeUndefined();
+        expect(removing).toHaveBeenCalled();
       } finally {
         release.resolve();
         await b;

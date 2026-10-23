@@ -746,6 +746,10 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
           expect.arrayContaining([closing, other])
         )
       );
+      // More refreshes can start after this point. The chats stay in the backend, so one that lands
+      // with the drop below re-emits a chat and its tab comes back (#7293). Stub them before the
+      // await, so a call that starts during it is a no-op too.
+      refresh.mockImplementation(async () => undefined);
       await Promise.all(
         refresh.mock.results.flatMap((result) => (result.type === "return" ? [result.value] : []))
       );
@@ -785,6 +789,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await waitFor(() =>
         expect(refresh.mock.calls.map(([workspaceId]) => workspaceId)).toContain(id)
       );
+      // As above: every later refresh is a no-op (#7293).
+      refresh.mockImplementation(async () => undefined);
       await Promise.all(
         refresh.mock.results.flatMap((result) => (result.type === "return" ? [result.value] : []))
       );

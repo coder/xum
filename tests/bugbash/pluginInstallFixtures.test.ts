@@ -78,6 +78,7 @@ test("plain-skills installs as Skills only, without the skill whose description 
     "changelog",
     "commit-message",
     "doc-outline",
+    "merge-risk",
     "plain-english",
     "release-check",
   ]);

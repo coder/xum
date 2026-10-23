@@ -1,9 +1,10 @@
-import { describe, test, expect, setSystemTime } from "bun:test";
+import { describe, test, expect } from "bun:test";
 import { tool, type ToolExecutionOptions } from "ai";
 import { z } from "zod";
 import { ToolCallStartEventSchema } from "@/common/orpc/schemas/stream";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
+import { makeTestEffectRunner } from "./di/testEffectRunner";
 import { createLiveStreamHarness, eventsOfType } from "./streamManager.liveStream.testHarness";
 import {
   installStreamManagerTestHistory,
@@ -463,38 +464,37 @@ describe("StreamManager - tool execution start timing", () => {
   }
 
   test("stamps executionStartedAt and emits tool-call-execution-start when the part already exists", async () => {
-    const harness = createLiveStreamHarness();
+    // A TestClock that the test never advances holds the stream's clock still, so a
+    // raw clock reading for the execution start would equal the tool-call part
+    // timestamp; reconnect replay's `executionStartedAt > cursor` repair predicate
+    // would then never fire for a cursor at that part.
+    const clock = makeTestEffectRunner();
+    const harness = createLiveStreamHarness({ runner: clock.runner });
     const workspaceId = "execution-start-workspace";
     const messageId = "execution-start-message";
     const live = await harness.start({ workspaceId, messageId, tools: { bash } });
-
-    // Freeze the wall clock so a raw Date.now() execution start would equal the
-    // tool-call part timestamp; reconnect replay's `executionStartedAt > cursor`
-    // repair predicate would then never fire for a cursor at that part.
-    setSystemTime(new Date(Date.now()));
-    let partTimestamp: number | undefined;
     try {
       await live.push(dynamicToolCall("tool-call-1", "bash"));
-      partTimestamp = eventsOfType(harness.events, "tool-call-start")[0]?.timestamp;
+      const partTimestamp = eventsOfType(harness.events, "tool-call-start")[0]?.timestamp;
       await executeTool(harness, "tool-call-1");
-    } finally {
-      setSystemTime();
-    }
 
-    const events = eventsOfType(harness.events, "tool-call-execution-start");
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
-      type: "tool-call-execution-start",
-      workspaceId,
-      messageId,
-      toolCallId: "tool-call-1",
-    });
-    // Cursor-monotonic: strictly after the tool-call part timestamp even when the wall
-    // clock has not advanced past it.
-    if (partTimestamp == null) throw new Error("Expected tool-call-start");
-    expect(events[0].timestamp).toBeGreaterThan(partTimestamp);
-    expect(liveParts(harness, workspaceId)[0].executionStartedAt).toBe(events[0].timestamp);
-    await live.finish();
+      const events = eventsOfType(harness.events, "tool-call-execution-start");
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        type: "tool-call-execution-start",
+        workspaceId,
+        messageId,
+        toolCallId: "tool-call-1",
+      });
+      // Cursor-monotonic: strictly after the tool-call part timestamp even when the wall
+      // clock has not advanced past it.
+      if (partTimestamp == null) throw new Error("Expected tool-call-start");
+      expect(events[0].timestamp).toBeGreaterThan(partTimestamp);
+      expect(liveParts(harness, workspaceId)[0].executionStartedAt).toBe(events[0].timestamp);
+      await live.finish();
+    } finally {
+      await clock.dispose();
+    }
   });
 
   test("applies execution starts that arrive before the tool part lands", async () => {

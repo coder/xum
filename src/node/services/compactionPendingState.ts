@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
   MAX_EDITED_FILES,
@@ -12,6 +11,8 @@ import { Err, Ok, type Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { FileEditDiff } from "@/common/utils/messages/extractEditedFiles";
 import { mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { log } from "./log";
 import {
   createLoadedSkillSnapshot,
@@ -344,7 +345,8 @@ export class CompactionPendingState {
 
   constructor(
     private readonly filePath: string,
-    private readonly history: CompactionPendingHistory
+    private readonly history: CompactionPendingHistory,
+    private readonly files: SessionFiles = nodeSessionFiles
   ) {}
 
   /** Compare authenticated write identity, not receipt object identity or attachment content. */
@@ -412,7 +414,7 @@ export class CompactionPendingState {
       if (
         noLocalOwnership() &&
         warmth.length === 0 &&
-        (await fs.stat(this.filePath).then(
+        (await this.files.promises.stat(this.filePath).then(
           () => false,
           (error: NodeJS.ErrnoException) => error.code === "ENOENT"
         ))
@@ -446,16 +448,18 @@ export class CompactionPendingState {
   }
 
   private async readBytes(assertStillOwned?: () => Promise<void>): Promise<string | undefined> {
-    return fs.readFile(this.filePath, "utf8").catch(async (error: NodeJS.ErrnoException) => {
-      if (error.code === "EISDIR") {
-        // Only empty directories are safe to remove; preserve unrelated contents and errors.
-        if (assertStillOwned) await assertStillOwned();
-        await fs.rmdir(this.filePath);
+    return this.files.promises
+      .readFile(this.filePath, "utf8")
+      .catch(async (error: NodeJS.ErrnoException) => {
+        if (error.code === "EISDIR") {
+          // Only empty directories are safe to remove; preserve unrelated contents and errors.
+          if (assertStillOwned) await assertStillOwned();
+          await this.files.promises.rmdir(this.filePath);
+          return undefined;
+        }
+        if (error.code !== "ENOENT") throw error;
         return undefined;
-      }
-      if (error.code !== "ENOENT") throw error;
-      return undefined;
-    });
+      });
   }
 
   private receipt(
@@ -509,7 +513,7 @@ export class CompactionPendingState {
       ) {
         // Attachments are already suppressed; inability to prune them must not block a request.
         await view.assertStillOwned();
-        if (isCurrent()) await fs.unlink(this.filePath).catch(() => undefined);
+        if (isCurrent()) await this.files.promises.unlink(this.filePath).catch(() => undefined);
       }
     });
   }
@@ -540,7 +544,7 @@ export class CompactionPendingState {
     if (!boundaryMessageId.trim()) throw new Error("Pending state requires a boundary message ID");
     if (!isCurrent() || !(await view.isPublicationCurrent(publication))) return;
     await view.assertStillOwned();
-    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+    await this.files.promises.mkdir(path.dirname(this.filePath), { recursive: true });
     const parsed = parseJson(await this.readBytes(view.assertStillOwned));
     // Unsupported future schemas remain owned by their version, even after a new boundary.
     if (parsed !== undefined && record(parsed)?.version !== 1) return;
@@ -569,6 +573,7 @@ export class CompactionPendingState {
       this.filePath,
       JSON.stringify(state),
       isCurrent,
+      this.files,
       () => {
         receipt = this.receipt(state, publication.generation, true, startingBoundary);
       },
@@ -747,7 +752,7 @@ export class CompactionPendingState {
     if (!expected) return false;
     if (identity(state) === expected.identity) {
       await view.assertStillOwned();
-      await fs.unlink(this.filePath);
+      await this.files.promises.unlink(this.filePath);
       return true;
     }
     if (!state.previousState || identity(state.previousState) !== expected.identity) return false;
@@ -757,6 +762,7 @@ export class CompactionPendingState {
       this.filePath,
       JSON.stringify(head(state)),
       () => true,
+      this.files,
       undefined,
       view.assertStillOwned
     );
@@ -996,6 +1002,7 @@ export class CompactionPendingState {
           this.filePath,
           JSON.stringify(head(previous)),
           canRestore,
+          this.files,
           () => {
             cleanup?.onRestored(previousReceipt);
           },
@@ -1006,7 +1013,7 @@ export class CompactionPendingState {
     }
     await view.assertStillOwned();
     try {
-      await fs.unlink(this.filePath);
+      await this.files.promises.unlink(this.filePath);
     } catch (error) {
       // Preparation rollback remains retryable with its original receipt. Only committed
       // heartbeat cleanup has irrevocably retired this head and may replace its contents.
@@ -1031,6 +1038,7 @@ export class CompactionPendingState {
       this.filePath,
       JSON.stringify({ ...head(current), diffs: [], loadedSkills: [], readFiles: [] }),
       () => true,
+      this.files,
       undefined,
       view.assertStillOwned
     );
@@ -1049,7 +1057,7 @@ export class CompactionPendingState {
         return;
       if (state.publicationGeneration === (view.generation ?? null)) return;
       await view.assertStillOwned();
-      await fs.unlink(this.filePath);
+      await this.files.promises.unlink(this.filePath);
     });
   }
 }

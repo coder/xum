@@ -1,5 +1,4 @@
 import type { MCPServerPluginProvenance } from "@/common/types/mcp";
-import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import {
   AgentPluginInstallEntrySchema,
@@ -10,6 +9,7 @@ import { getOwn } from "@/common/utils/getOwn";
 import { log } from "@/node/services/log";
 import { noComponentConsent, type ComponentConsent } from "./componentConsent";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 
 export const PLUGIN_REGISTRY_FILE_NAME = "plugins.json";
 
@@ -29,7 +29,7 @@ export async function readPluginRegistryDocument(
 
   let raw: string;
   try {
-    raw = await fsPromises.readFile(registryFile, "utf8");
+    raw = await nodeHostFiles.promises.readFile(registryFile, "utf8");
   } catch (error) {
     // Only a MISSING file is an empty registry. Any other read failure
     // (e.g. an unreadable mode-000 file in a writable ~/.mux) must block
@@ -231,17 +231,17 @@ function mcpPolicySnapshot(
 export async function readPluginMcpPolicy(registryFile: string): Promise<PluginMcpPolicy> {
   try {
     const home = path.dirname(registryFile);
-    const owner = await fsPromises.realpath(home);
-    const container = await fsPromises.realpath(path.join(owner, "plugins"));
+    const owner = await nodeHostFiles.promises.realpath(home);
+    const container = await nodeHostFiles.promises.realpath(path.join(owner, "plugins"));
     const registryPath = path.join(owner, path.basename(registryFile));
     const selection = await readPluginComponentImports(registryPath);
     // The registry belongs to the pinned owner, not to an alias that can move
     // during the read. Recheck both logical and canonical bindings.
     if (
-      (await fsPromises.realpath(home)) !== owner ||
-      (await fsPromises.realpath(owner)) !== owner ||
-      (await fsPromises.realpath(path.join(home, "plugins"))) !== container ||
-      (await fsPromises.realpath(path.join(owner, "plugins"))) !== container
+      (await nodeHostFiles.promises.realpath(home)) !== owner ||
+      (await nodeHostFiles.promises.realpath(owner)) !== owner ||
+      (await nodeHostFiles.promises.realpath(path.join(home, "plugins"))) !== container ||
+      (await nodeHostFiles.promises.realpath(path.join(owner, "plugins"))) !== container
     )
       throw new Error("Managed plugin owner changed during policy read");
     return {
