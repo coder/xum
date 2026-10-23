@@ -23,9 +23,10 @@ import { nestShrinkwrap, pinnedDigests, shrinkwrapSchema, type Shrinkwrap } from
 
 /**
  * Installs the stage's package.json and npm package-lock.json, which hold the already verified
- * local tarball and the tree its shrinkwrap pins: npm installs that lockfile as written, bun
- * migrates it to bun.lock, and pnpm imports it into pnpm-lock.yaml before installing. Only the
- * pinned dependencies come from the registry.
+ * local tarball and the tree its shrinkwrap pins: npm installs that lockfile as written, while bun
+ * migrates it to bun.lock and pnpm imports it into pnpm-lock.yaml before installing. A frozen bun
+ * install migrates in memory only (since bun 1.4.4), so it would leave no lockfile to verify. Only
+ * the pinned dependencies come from the registry.
  */
 export function installCommands(layout: InstallLayout): Array<{ file: string; args: string[] }> {
   // CLI flags outrank npmrc files and npm_config_* env, so an inherited strict-ssl=false cannot
@@ -40,7 +41,8 @@ export function installCommands(layout: InstallLayout): Array<{ file: string; ar
   const registry = ["--registry", layout.registry];
   const commands = {
     bun: [
-      ["install", "--frozen-lockfile", "--ignore-scripts", "--save-text-lockfile", ...registry],
+      ["pm", "migrate", "--ignore-scripts", "--save-text-lockfile", ...registry],
+      ["install", "--frozen-lockfile", "--ignore-scripts", ...registry],
     ],
     npm: [
       [

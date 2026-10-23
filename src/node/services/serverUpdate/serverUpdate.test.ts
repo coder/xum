@@ -197,15 +197,19 @@ function bunLock(tarball: string, packages: Record<string, string | null> = {}, 
   ].join("\n");
 }
 
-/** Stands in for the package manager: writes the staged package and the lockfile bun would. */
+/**
+ * Stands in for bun: the lockfile migration writes the bun.lock for the staged release, and the
+ * install writes the package but no lockfile, as a frozen install of bun 1.4.4 does.
+ */
 const fakeInstall =
   (version: string, packages: Record<string, string | null> = {}) =>
-  async (_file: string, _args: string[], cwd: string) => {
-    await writePackage(cwd, version);
-    await fs.writeFile(
-      path.join(cwd, "bun.lock"),
-      bunLock(path.join(cwd, `xum-${version}.tgz`), packages)
-    );
+  async (_file: string, args: string[], cwd: string) => {
+    if (args[0] === "pm")
+      await fs.writeFile(
+        path.join(cwd, "bun.lock"),
+        bunLock(path.join(cwd, `xum-${version}.tgz`), packages)
+      );
+    else await writePackage(cwd, version);
   };
 
 /** The stage directory a staged CLI entry lives in. */
@@ -320,14 +324,15 @@ describe("staging and activation", () => {
       expect(install?.args.slice(-2)).toEqual(["--registry", layout.registry]);
     }
     // npm and bun install the staged lockfile itself, which records the release tarball, and
-    // must not resolve anything it lacks.
+    // must not resolve anything it lacks. bun writes its text lockfile from it first.
     const [npm] = commands("npm");
     expect(npm.args[0]).toBe("ci");
     expect(npm.args).toContain("--strict-ssl");
     expect(npm.args).toContain("--include=optional");
-    const [bun] = commands("bun");
-    expect(bun.args.slice(0, 2)).toEqual(["install", "--frozen-lockfile"]);
-    expect(bun.args).toContain("--save-text-lockfile");
+    const [bunMigrate, bunInstall] = commands("bun");
+    expect(bunMigrate.args.slice(0, 2)).toEqual(["pm", "migrate"]);
+    expect(bunMigrate.args).toContain("--save-text-lockfile");
+    expect(bunInstall.args.slice(0, 2)).toEqual(["install", "--frozen-lockfile"]);
     // pnpm converts it first; both steps must keep TLS and the lockfile on, and the conversion
     // must ask the configured registry.
     const [pnpmImport, pnpmInstall] = commands("pnpm");
@@ -443,7 +448,7 @@ describe("staging and activation", () => {
       expect(installs).toBe(0);
     }
   });
-  test("npm installs the staged lockfile as written, and pnpm replaces it with its own", async () => {
+  test("npm installs the staged lockfile as written; bun and pnpm convert it to their own first", async () => {
     const deps = { "zod@4.5.4": sriOf("zod") };
     const pnpmLock = [
       "lockfileVersion: '9.0'",
@@ -457,9 +462,10 @@ describe("staging and activation", () => {
     ].join("\n");
     const expected = {
       npm: { steps: ["npm ci"], lockfiles: ["package-lock.json"] },
+      bun: { steps: ["bun pm", "bun install"], lockfiles: ["bun.lock"] },
       pnpm: { steps: ["pnpm import", "pnpm install"], lockfiles: ["pnpm-lock.yaml"] },
     };
-    for (const packageManager of ["npm", "pnpm"] as const) {
+    for (const packageManager of ["npm", "bun", "pnpm"] as const) {
       const { layout } = await fixture(packageManager);
       const registry = fakeRegistry("2.0.0", undefined, {}, deps);
       const steps: string[] = [];
@@ -468,7 +474,9 @@ describe("staging and activation", () => {
         install: async (file, args, cwd) => {
           steps.push(`${file} ${args[0]}`);
           // pnpm writes its lockfile while importing npm's; `npm ci` leaves the staged one as is.
-          if (args[0] === "import") await fs.writeFile(path.join(cwd, "pnpm-lock.yaml"), pnpmLock);
+          if (file === "bun") await fakeInstall("2.0.0", deps)(file, args, cwd);
+          else if (args[0] === "import")
+            await fs.writeFile(path.join(cwd, "pnpm-lock.yaml"), pnpmLock);
           else await writePackage(cwd, "2.0.0");
         },
       });
