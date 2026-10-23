@@ -6,7 +6,7 @@ import {
 } from "@/node/utils/gitNoHooksEnv";
 import type { HostProcesses } from "./hostProcesses";
 import { nodeHostProcesses } from "./nodeHostProcesses";
-import { createScriptedHostProcesses } from "./scriptedCommands.testHarness";
+import { commandLine, createScriptedHostProcesses } from "./scriptedCommands.testHarness";
 
 // Two real commands: the running binary (bun) evaluates a one-line script.
 const PRINTS_OK: [string, string[]] = [process.execPath, ["-e", "process.stdout.write('ok')"]];
@@ -14,6 +14,7 @@ const FAILS: [string, string[]] = [
   process.execPath,
   ["-e", "process.stderr.write('boom'); process.exit(3)"],
 ];
+const HANGS: [string, string[]] = [process.execPath, ["-e", "setTimeout(() => {}, 60_000)"]];
 
 async function outcome(processes: HostProcesses, [file, args]: [string, string[]]) {
   using proc = processes.execFile(file, args);
@@ -34,8 +35,9 @@ describe.each([
     "scripted",
     () =>
       createScriptedHostProcesses({
-        [[PRINTS_OK[0], ...PRINTS_OK[1]].join(" ")]: { stdout: "ok" },
-        [[FAILS[0], ...FAILS[1]].join(" ")]: { stderr: "boom", exitCode: 3 },
+        [commandLine(...PRINTS_OK)]: { stdout: "ok" },
+        [commandLine(...FAILS)]: { stderr: "boom", exitCode: 3 },
+        [commandLine(...HANGS)]: () => new Promise(() => undefined),
       }),
   ],
 ] as const)("HostProcesses on the %s layer", (_name, create) => {
@@ -48,9 +50,34 @@ describe.each([
       error: { message: "boom", code: 3, stderr: "boom" },
     });
   });
+
+  test("an abort after the start rejects as a kill by SIGTERM", async () => {
+    const controller = new AbortController();
+    using proc = create().execFile(HANGS[0], HANGS[1], { signal: controller.signal });
+    controller.abort();
+    const error = await proc.result.then(
+      () => null,
+      (rejection: Error & { code: unknown; signal: unknown }) => rejection
+    );
+    expect([error?.message, error?.code, error?.signal]).toEqual([
+      "Command killed by signal SIGTERM",
+      null,
+      "SIGTERM",
+    ]);
+  });
 });
 
 describe("the scripted layer", () => {
+  test("a key tells apart argv arrays that join to the same string", async () => {
+    const processes = createScriptedHostProcesses({ 'git show "a b"': { stdout: "one arg" } });
+    expect(await outcome(processes, ["git", ["show", "a b"]])).toEqual({
+      output: { stdout: "one arg", stderr: "" },
+    });
+    expect(await outcome(processes, ["git", ["show a", "b"]])).toEqual({
+      error: { message: 'No scripted command: git "show a" b', code: null, stderr: "" },
+    });
+  });
+
   test("a command without an entry rejects and names the command, and every call is recorded", async () => {
     const processes = createScriptedHostProcesses({});
     expect(await outcome(processes, ["git", ["--version"]])).toEqual({

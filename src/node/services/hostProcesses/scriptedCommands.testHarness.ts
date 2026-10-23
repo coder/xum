@@ -22,7 +22,7 @@ export interface ScriptedOutcome {
 }
 
 /**
- * Command line (file and args joined by spaces, see commandLine) -> outcome. A function entry
+ * Command line (see commandLine) -> outcome. A function entry
  * gets the call, so it can act on it (for example delete the cwd) before it answers.
  */
 export type ScriptTable = Record<
@@ -30,8 +30,21 @@ export type ScriptTable = Record<
   ScriptedOutcome | ((call: ScriptedCall) => ScriptedOutcome | Promise<ScriptedOutcome>)
 >;
 
+// A token with no whitespace, quote or backslash stays as is. Any other token, and the empty
+// one, is JSON-quoted.
+const PLAIN_TOKEN = /^[^\s"\\]+$/;
+
+/**
+ * The table key of a call: the file and each arg, joined by spaces. Two different argv arrays
+ * never share a key, so a caller that splits or joins args wrongly finds no entry: a plain token
+ * cannot start with a quote, and a quoted token ends at its closing quote.
+ * For example, git with ["show", "a b"] is `git show "a b"`, and git with ["show a", "b"] is
+ * `git "show a" b`.
+ */
 export function commandLine(file: string, args: readonly string[]): string {
-  return [file, ...args].join(" ");
+  return [file, ...args]
+    .map((token) => (PLAIN_TOKEN.test(token) ? token : JSON.stringify(token)))
+    .join(" ");
 }
 
 type ExecError = Error & {
@@ -41,21 +54,30 @@ type ExecError = Error & {
   stderr: string;
 };
 
-function execError(message: string, code: number | null, stdout: string, stderr: string) {
+function execError(
+  message: string,
+  code: number | null,
+  stdout: string,
+  stderr: string,
+  signal: string | null = null
+) {
   const error = new Error(message) as ExecError;
   error.code = code;
-  error.signal = null;
+  error.signal = signal;
   error.stdout = stdout;
   error.stderr = stderr;
   return error;
 }
 
-/** The outcome of one call on the table, or undefined when the table has no entry for it. */
+/**
+ * The outcome of the entry for line, or undefined when the table has none. line is the key:
+ * commandLine of the call for HostProcesses, the whole shell command for FakeRuntime.exec.
+ */
 export async function lookupScriptedCommand(
   table: ScriptTable,
+  line: string,
   call: ScriptedCall
 ): Promise<ScriptedOutcome | undefined> {
-  const line = commandLine(call.file, call.args);
   const entry = Object.hasOwn(table, line) ? table[line] : undefined;
   if (entry === undefined) return undefined;
   return typeof entry === "function" ? await entry(call) : entry;
@@ -66,7 +88,7 @@ export async function runScriptedCommand(
   table: ScriptTable,
   call: ScriptedCall
 ): Promise<{ stdout: string; stderr: string }> {
-  const outcome = await lookupScriptedCommand(table, call);
+  const outcome = await lookupScriptedCommand(table, commandLine(call.file, call.args), call);
   if (outcome === undefined) {
     throw execError(`No scripted command: ${commandLine(call.file, call.args)}`, null, "", "");
   }
@@ -82,6 +104,20 @@ export async function runScriptedCommand(
     );
   }
   return { stdout, stderr };
+}
+
+/**
+ * The run, or a rejection once signal aborts. execFileAsync kills the child on abort, and the
+ * close then rejects with "Command killed by signal SIGTERM", code null and signal SIGTERM.
+ */
+function untilAborted<T>(run: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return run;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () =>
+      reject(execError("Command killed by signal SIGTERM", null, "", "", "SIGTERM"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    run.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }
 
 export interface ScriptedHostProcesses extends HostProcesses {
@@ -103,9 +139,10 @@ export function createScriptedHostProcesses(
     execFile: (file, args, options): HostProcess => {
       const call: ScriptedCall = { file, args: [...args], cwd: options?.cwd };
       calls.push(call);
-      const result = options?.signal?.aborted
+      const signal = options?.signal;
+      const result = signal?.aborted
         ? Promise.reject(execError("Command aborted before execution", null, "", ""))
-        : runScriptedCommand(commands, call);
+        : untilAborted(runScriptedCommand(commands, call), signal);
       // As execFileAsync: a caller that disposes without awaiting must not see an unhandled
       // rejection.
       result.catch(() => undefined);
