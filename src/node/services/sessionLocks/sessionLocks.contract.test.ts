@@ -15,17 +15,20 @@ import { fileLockTimeoutMessage } from "@/node/utils/concurrency/fileLock";
 import type { ProcessIdentity } from "@/node/utils/concurrency/processLiveness";
 import { describeHolder } from "@/node/utils/main/crossProcessLock";
 import {
+  foreignIdentity,
+  foreignPid,
   foreignRecord,
   liveBlocker,
   makeForeignHolders,
   withForeignHolders,
+  wrapWithForeignHolders,
 } from "./foreignHolders.testHarness";
 import {
   MemoryLockTable,
   memorySessionLocks,
   SessionLocksMemory,
 } from "./memorySessionLocks.testHarness";
-import { SessionLocksNode } from "./nodeSessionLocks";
+import { nodeSessionLocks, SessionLocksNode } from "./nodeSessionLocks";
 import {
   buildSessionLocks,
   describeSessionLocksContract,
@@ -106,10 +109,10 @@ async function memoryLocks(): Promise<LocksUnderTest> {
     layer: Layer.succeed(SessionLocksTag)(memorySessionLocks(clock.hostClock, table)),
     dir,
     foreignHolder: (lockPath, state) => {
-      table.hold(lockPath, state, { pid: 4242 });
+      table.hold(lockPath, state, { pid: foreignPid(1) });
       return Promise.resolve({
-        pid: 4242,
-        identity: null,
+        pid: foreignPid(1),
+        identity: foreignIdentity(),
         release: () => Promise.resolve(table.release(lockPath)),
       });
     },
@@ -130,10 +133,10 @@ function withForeign(make: () => Promise<LocksUnderTest>): () => Promise<LocksUn
       ...t,
       layer: withForeignHolders(t.layer, holders),
       foreignHolder: (lockPath, state) => {
-        holders.hold(lockPath, state, { pid: 4343 });
+        holders.hold(lockPath, state, { pid: foreignPid(2) });
         return Promise.resolve({
-          pid: 4343,
-          identity: null,
+          pid: foreignPid(2),
+          identity: foreignIdentity(),
           release: () => Promise.resolve(holders.release(lockPath)),
         });
       },
@@ -202,7 +205,7 @@ test("memory: a 60 s timeout passes on TestClock.adjust, with no real wait", () 
     expect(settled).toBe(false);
     await t.advance(1);
     expect(((await refused) as Error).message).toBe(
-      fileLockTimeoutMessage("contract lock", lockPath, 60_000, liveBlocker(4242))
+      fileLockTimeoutMessage("contract lock", lockPath, 60_000, liveBlocker(foreignPid(1)))
     );
   }));
 
@@ -287,7 +290,7 @@ test("foreign: a live foreign mutator makes hold() refuse with today's text", as
     const config = { rootDir: t.dir };
     const leases = locks.useLeasesFor(config);
     expect(locks.useLeasesFor(config)).toBe(leases);
-    holders.hold(workspaceMutationLockPath(t.dir, "ws-gate"), "live", { pid: 4444 });
+    holders.hold(workspaceMutationLockPath(t.dir, "ws-gate"), "live", { pid: foreignPid(3) });
     const error = await leases.hold("ws-gate", "turn").then(
       () => null,
       (caught: unknown) => caught
@@ -295,14 +298,44 @@ test("foreign: a live foreign mutator makes hold() refuse with today's text", as
     expect(error).toBeInstanceOf(WorkspaceMutationInProgressError);
     expect((error as Error).message).toBe(
       workspaceMutationInProgressMessage("ws-gate", {
-        holder: describeHolder(foreignRecord(4444)),
-        why: liveBlocker(4444).why,
+        holder: describeHolder(foreignRecord(foreignPid(3))),
+        why: liveBlocker(foreignPid(3)).why,
       })
     );
     expect(await leases.isHeld("ws-gate", "turn")).toBe(false);
     holders.release(workspaceMutationLockPath(t.dir, "ws-gate"));
     const lease = await leases.hold("ws-gate", "turn");
     await lease.release();
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("foreign: hold() publishes its lease before it probes the gate", async () => {
+  const t = await nodeLocks();
+  try {
+    const holders = makeForeignHolders();
+    const gate = workspaceMutationLockPath(t.dir, "ws-order");
+    // A mutator takes the gate while the inner hold publishes the lease.
+    const inner = {
+      ...nodeSessionLocks,
+      useLeasesFor: (config: { readonly rootDir: string }) => {
+        const leases = nodeSessionLocks.useLeasesFor(config);
+        return {
+          hold: async (...args: Parameters<typeof leases.hold>) => {
+            const lease = await leases.hold(...args);
+            holders.hold(gate, "live", { pid: foreignPid(4) });
+            return lease;
+          },
+          isHeld: (...args: Parameters<typeof leases.isHeld>) => leases.isHeld(...args),
+        };
+      },
+    };
+    const leases = wrapWithForeignHolders(inner, holders).useLeasesFor({ rootDir: t.dir });
+    await expect(leases.hold("ws-order", "turn")).rejects.toBeInstanceOf(
+      WorkspaceMutationInProgressError
+    );
+    expect(await leases.isHeld("ws-order", "turn")).toBe(false);
   } finally {
     await t.cleanup();
   }

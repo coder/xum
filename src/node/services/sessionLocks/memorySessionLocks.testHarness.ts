@@ -10,6 +10,7 @@
  *   backends' lease files. Phase 5 moves them.
  */
 import assert from "node:assert";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Effect, Layer } from "effect";
 import { SessionLocksTag } from "@/node/services/di/tags";
@@ -26,7 +27,13 @@ import {
 } from "@/node/utils/main/crossProcessLock";
 import { nodeSessionLocks } from "./nodeSessionLocks";
 import type { SessionLocks } from "./sessionLocks";
-import { foreignRecord, liveBlocker } from "./foreignHolders.testHarness";
+import {
+  abortedAcquireError,
+  foreignIdentity,
+  foreignPid,
+  foreignRecord,
+  liveBlocker,
+} from "./foreignHolders.testHarness";
 
 /** Who holds a lock in the table. */
 interface Entry {
@@ -53,12 +60,12 @@ export class MemoryLockTable {
   /** FIFO per lock path: a release hands the lock to the first waiter. */
   private readonly waiters = new Map<string, Waiter[]>();
 
-  /** Another backend holds lockPath (pid 4242 unless given). */
+  /** Another backend holds lockPath (pid foreignPid() unless given). */
   hold(lockPath: string, state: "live" | "dead", holder?: { pid: number }): void {
     assert(!this.held.has(lockPath), `${lockPath} is already held`);
-    const pid = holder?.pid ?? 4242;
+    const pid = holder?.pid ?? foreignPid();
     assert(pid !== process.pid, "a foreign holder must not be this process");
-    this.held.set(lockPath, { pid, dead: state === "dead" });
+    this.held.set(lockPath, { pid, identity: foreignIdentity(), dead: state === "dead" });
   }
 
   /** The foreign holder of lockPath released it cleanly. */
@@ -129,8 +136,7 @@ function acquireInMemory(
   refusal: (blocker: Blocker) => Error,
   signal?: AbortSignal
 ): Promise<Entry> {
-  const aborted = () => new Error("Lock acquisition was aborted");
-  if (signal?.aborted) return Promise.reject(aborted());
+  if (signal?.aborted) return Promise.reject(abortedAcquireError());
   const taken = table.tryTake(lockPath);
   if (taken !== null) return Promise.resolve(taken);
   const holder = table.owner(lockPath);
@@ -144,7 +150,7 @@ function acquireInMemory(
     };
     const onAbort = () => {
       settle();
-      reject(aborted());
+      reject(abortedAcquireError());
     };
     const leave = table.wait(lockPath, {
       take: (entry) => {
@@ -211,6 +217,9 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
         return await nodeSessionLocks.acquireCrossProcessLock(options);
       }
       const { lockPath, acquireTimeoutMs, timeoutMessage, signal } = options;
+      // Node rejects with ENOENT when the parent is gone and may not be recreated
+      // (a removed workflow run directory). Callers rely on that refusal.
+      if (options.createParentDirectory === false) await fs.stat(path.dirname(lockPath));
       const refusal = (blocker: Blocker) =>
         new CrossProcessLockTimeoutError(
           crossProcessLockTimeoutMessage(timeoutMessage, lockPath, {

@@ -152,6 +152,44 @@ export function describeSessionLocksContract(
         await release();
       }));
 
+    test("an aborted signal wins over a live holder of a record", () =>
+      withLayer(async (locks, t) => {
+        const lockPath = path.join(t.dir, "aborted.lock");
+        const holder = await t.foreignHolder(lockPath, "live", "record");
+        const error = await locks
+          .acquireCrossProcessLock({
+            lockPath,
+            acquireTimeoutMs: SHORT_MS,
+            staleMs: 60_000,
+            timeoutMessage: "contract record is held.",
+            signal: AbortSignal.abort(),
+          })
+          .then(
+            () => null,
+            (caught: unknown) => caught
+          );
+        expect(error).not.toBeInstanceOf(CrossProcessLockTimeoutError);
+        expect((error as Error).message).toBe("Lock acquisition was aborted");
+        await holder.release();
+      }));
+
+    test("createParentDirectory false on a missing parent rejects with ENOENT", () =>
+      withLayer(async (locks, t) => {
+        const error = await locks
+          .acquireCrossProcessLock({
+            lockPath: path.join(t.dir, "removed-run", "run.lock"),
+            createParentDirectory: false,
+            acquireTimeoutMs: 0,
+            staleMs: 60_000,
+            timeoutMessage: "contract record is held.",
+          })
+          .then(
+            () => null,
+            (caught: unknown) => caught
+          );
+        expect((error as NodeJS.ErrnoException).code).toBe("ENOENT");
+      }));
+
     test("useLeasesFor gives one object per config: hold, isHeld, release", () =>
       withLayer(async (locks, t) => {
         const config = { rootDir: t.dir };
