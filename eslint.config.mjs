@@ -163,7 +163,6 @@ const HOST_IMPORT_ALLOW = {
   "src/node/services/tools/skillFileUtils.ts": ["fs/promises"],
   "src/node/services/tools/skillsCatalogFetch.ts": ["fs/promises", "os"],
   "src/node/services/tools/todo.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
-  "src/node/services/tools/web_fetch.ts": ["net"],
   "src/node/services/tools/xum_agents_path.ts": ["fs/promises"],
   "src/node/services/tools/xum_agents_read.ts": ["fs/promises"],
   "src/node/services/tools/xum_agents_write.ts": ["fs/promises"],
