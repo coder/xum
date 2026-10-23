@@ -1,4 +1,5 @@
 import assert from "@/common/utils/assert";
+import { clockOf, nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { tool } from "ai";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -81,14 +82,15 @@ function parseTimestampMs(value: string | undefined): number | undefined {
 }
 
 function getAgentTaskElapsedMs(
-  timestamps: AgentTaskTimestamps | null | undefined
+  timestamps: AgentTaskTimestamps | null | undefined,
+  clock: HostClock
 ): number | undefined {
   const createdAtMs = parseTimestampMs(timestamps?.createdAt);
   if (createdAtMs == null) {
     return undefined;
   }
 
-  const endAtMs = parseTimestampMs(timestamps?.reportedAt) ?? Date.now();
+  const endAtMs = parseTimestampMs(timestamps?.reportedAt) ?? clock.nowMs();
   return Math.max(0, endAtMs - createdAtMs);
 }
 
@@ -142,14 +144,15 @@ function isPageableReport<T extends { status: string; taskId: string }>(
   return "reportMarkdown" in result && typeof result.reportMarkdown === "string";
 }
 
+// Wall clock on purpose: WorkflowService stamps createdAt/updatedAt with Date.now() (#7282).
 function getWorkflowRunElapsedMs(run: WorkflowRunRecord): number | undefined {
   const createdAtMs = parseTimestampMs(run.createdAt);
   if (createdAtMs == null) {
     return undefined;
   }
   const updatedAtMs = parseTimestampMs(run.updatedAt);
-  const endAtMs = isTerminalWorkflowRunStatus(run.status) ? updatedAtMs : Date.now();
-  return Math.max(0, (endAtMs ?? Date.now()) - createdAtMs);
+  const endAtMs = isTerminalWorkflowRunStatus(run.status) ? updatedAtMs : nodeClock.nowMs();
+  return Math.max(0, (endAtMs ?? nodeClock.nowMs()) - createdAtMs);
 }
 
 function getWorkflowRunReport(run: WorkflowRunRecord): {
@@ -255,16 +258,20 @@ function buildWorkflowAwaitResult(run: WorkflowRunRecord) {
   }
 }
 
-async function waitForDelayOrAbort(delayMs: number, signal: AbortSignal): Promise<void> {
+async function waitForDelayOrAbort(
+  clock: HostClock,
+  delayMs: number,
+  signal: AbortSignal
+): Promise<void> {
   if (signal.aborted) {
     return;
   }
   await new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, delayMs);
+    const cancelTimer = clock.setTimer(resolve, delayMs);
     signal.addEventListener(
       "abort",
       () => {
-        clearTimeout(timer);
+        cancelTimer();
         resolve();
       },
       { once: true }
@@ -273,6 +280,7 @@ async function waitForDelayOrAbort(delayMs: number, signal: AbortSignal): Promis
 }
 
 export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
+  const clock = clockOf(config);
   return tool({
     description: TOOL_DEFINITIONS.task_await.description,
     inputSchema: TOOL_DEFINITIONS.task_await.schema,
@@ -399,7 +407,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       // Agent task records currently store creation/report timestamps, but not a separate
       // running-start timestamp, so this elapsed value intentionally includes queued time.
       const getAgentTaskElapsedField = (taskId: string) =>
-        withElapsedMs(getAgentTaskElapsedMs(taskService.getAgentTaskTimestamps?.(taskId)));
+        withElapsedMs(getAgentTaskElapsedMs(taskService.getAgentTaskTimestamps?.(taskId), clock));
 
       const descendantAgentTaskIds =
         typeof bulkFilter === "function"
@@ -465,17 +473,18 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           return buildWorkflowAwaitResult(run);
         }
 
-        const deadline = Date.now() + (timeoutMs ?? DEFAULT_TASK_AWAIT_TIMEOUT_MS);
+        const deadline = clock.nowMs() + (timeoutMs ?? DEFAULT_TASK_AWAIT_TIMEOUT_MS);
         while (!isTerminalWorkflowRunStatus(run.status)) {
           if (abortSignal?.aborted) {
             return { status: "error" as const, taskId: runId, error: "Interrupted" };
           }
-          if (taskSignal.aborted || Date.now() >= deadline) {
+          if (taskSignal.aborted || clock.nowMs() >= deadline) {
             return buildWorkflowAwaitResult(run);
           }
 
-          const remainingMs = Math.max(1, deadline - Date.now());
+          const remainingMs = Math.max(1, deadline - clock.nowMs());
           await waitForDelayOrAbort(
+            clock,
             Math.min(WORKFLOW_AWAIT_POLL_INTERVAL_MS, remainingMs),
             taskSignal
           );

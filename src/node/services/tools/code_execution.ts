@@ -7,6 +7,7 @@
  */
 
 import { tool } from "ai";
+import { clockOf, nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { Tool } from "ai";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
@@ -469,6 +470,8 @@ function capKernelConsoleOutput(result: PTCExecutionResult): void {
 
 /** Model-facing description options for createCodeExecutionTool. */
 export interface CodeExecutionToolOptions {
+  /** The session's HostClock (call timestamps and durations). Absent: nodeClock. */
+  clock?: HostClock;
   /**
    * RLM + PTC-exclusive posture: code_execution is the single kernel tool, so
    * its description leads with a short preamble tying the kernel features
@@ -494,6 +497,7 @@ export async function createCodeExecutionTool(
 ): Promise<Tool> {
   const bridgeableTools = toolBridge.getBridgeableTools();
   const state: DispatchState = { toolBridge, withMount, loadFile: options?.loadFile };
+  const clock = clockOf(options);
 
   // Kernel mode = persistent mount available (RLM experiment, or the
   // XUM_SANDBOX_PERSISTENT_MOUNTS dev override that rides the same path).
@@ -574,7 +578,8 @@ ${xumTypes}
       { code, timeout_secs },
       { abortSignal, toolCallId }
     ): Promise<PTCExecutionResult> => {
-      const execStartTime = Date.now();
+      // Wall clock on purpose: QuickJSRuntime measures duration_ms with Date.now() (#7282).
+      const execStartTime = nodeClock.nowMs();
 
       const { toolBridge: activeBridge, withMount: activeMount, loadFile: activeLoadFile } = state;
 
@@ -601,7 +606,7 @@ ${xumTypes}
           error: `Code analysis failed:\n${errorMessages.join("\n")}`,
           toolCalls: [],
           consoleOutput: [],
-          duration_ms: Date.now() - execStartTime,
+          duration_ms: nodeClock.nowMs() - execStartTime,
         };
       }
 
@@ -773,7 +778,7 @@ ${xumTypes}
                 result.consoleOutput.push({
                   level: "warn",
                   args: [`[kernel] ${persistError.message}`],
-                  timestamp: Date.now(),
+                  timestamp: clock.nowMs(),
                 });
               }
               // Foreign-instance conflict (r68): the eval may have READ stale

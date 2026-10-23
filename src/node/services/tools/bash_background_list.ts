@@ -2,6 +2,7 @@ import { tool } from "ai";
 import type { BashBackgroundListResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import { clockOf } from "@/node/utils/hostClock";
 
 /**
  * Tool for listing background processes in the current workspace
@@ -26,7 +27,7 @@ export const createBashBackgroundListTool: ToolFactory = (config: ToolConfigurat
       }
 
       const processes = await config.backgroundProcessManager.list(config.workspaceId);
-      const now = Date.now();
+      const now = clockOf(config).nowMs();
 
       return {
         success: true,

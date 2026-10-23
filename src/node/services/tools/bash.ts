@@ -1,4 +1,5 @@
 import { tool } from "ai";
+import { clockOf } from "@/node/utils/hostClock";
 import assert from "node:assert/strict";
 // NOTE: We avoid readline; consume Web Streams directly to prevent race conditions
 import * as fs from "fs";
@@ -1342,7 +1343,7 @@ ${scriptWithEnv}`;
             toolCallId,
             text,
             isError,
-            timestamp: Date.now(),
+            timestamp: clockOf(config).nowMs(),
           } satisfies BashOutputEvent,
           "bash"
         );
@@ -1575,7 +1576,7 @@ ${scriptWithEnv}`;
             (await Promise.race([
               execStream.exitCode.then(() => true).catch(() => true),
               new Promise<boolean>((resolve) =>
-                setTimeout(() => resolve(false), BACKGROUND_EXIT_GRACE_MS)
+                clockOf(config).setTimer(() => resolve(false), BACKGROUND_EXIT_GRACE_MS)
               ),
             ]));
 
@@ -1707,6 +1708,7 @@ ${scriptWithEnv}`;
             );
             await raceWithAbortAndTimeout(execStream.exitCode, {
               timeoutMs: FAILED_MIGRATION_EXIT_JOIN_MS,
+              clock: config.clock,
             }).catch(() => undefined);
             return withNotice({
               success: false,
