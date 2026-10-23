@@ -29,12 +29,18 @@ import {
   workspaceUseLockDir,
 } from "@/node/services/workspaceUseLeases";
 import {
+  lockCallStep,
   type LockNames,
+  oneArtifactAndRun,
+  oneChildReport,
   oneFork,
+  oneInitAndPlan,
   oneRefineApply,
   oneRefusal,
   oneRemoval,
   oneTurn,
+  oneUsageAndGoal,
+  oneWorkspaceRefine,
 } from "./sessionLocks.callOptions.scenarios.testHarness";
 
 const FIXTURE = path.join(import.meta.dir, "__fixtures__", "callOptions.json");
@@ -57,6 +63,10 @@ function callSite(): string {
     if (rel.startsWith("node/services/sessionLocks/") && !TEST_FILE.test(rel)) continue;
     return TEST_FILE.test(rel) ? "test" : rel;
   }
+  // JSC makes proper tail calls, so a caller that returns the lock call from a
+  // non-async function leaves no frame. A full clear has one such row:
+  // compactionPendingState's queued `() => this.history.withLock(op)` reaches
+  // historyService's `withLock: (operation) => this.fileLocks.withLock(...)`.
   return "unknown";
 }
 
@@ -150,11 +160,13 @@ type Row = Record<string, unknown>;
 function recordLockCalls() {
   const { names, mask, unknown } = createNames();
   /** Each call in order, unmasked: the scenarios name their roots while they run. */
-  const calls: Array<{ site: string; fn: string; args: unknown[] }> = [];
+  const calls: Array<{ site: string; step: string | undefined; fn: string; args: unknown[] }> = [];
   const waiters: Array<{ lockPath: string; resolve: () => void }> = [];
   const add = (fn: string, args: unknown[], lockPath?: string) => {
     const site = callSite();
-    if (site !== "test") calls.push({ site, fn, args });
+    // Function names on the stack change with the process state (another test file in the
+    // same bun process changes the frame format), so a scenario names its step instead.
+    if (site !== "test") calls.push({ site, step: lockCallStep(), fn, args });
     if (lockPath === undefined) return;
     for (const waiter of waiters.splice(0)) {
       if (waiter.lockPath === lockPath) waiter.resolve();
@@ -188,6 +200,17 @@ function recordLockCalls() {
   ) {
     add("WorkspaceUseLeases.hold", [workspaceId, kind]);
     return hold.call(this, workspaceId, kind);
+  });
+  // A probe that only reads the lease files: InitStateManager's replay asks it.
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- called with .call(this) below
+  const isHeld = WorkspaceUseLeases.prototype.isHeld;
+  spyOn(WorkspaceUseLeases.prototype, "isHeld").mockImplementation(function (
+    this: WorkspaceUseLeases,
+    workspaceId,
+    kind
+  ) {
+    add("WorkspaceUseLeases.isHeld", [workspaceId, kind]);
+    return isHeld.call(this, workspaceId, kind);
   });
   const withLock = workspaceFileLocks.withLock.bind(workspaceFileLocks);
   spyOn(workspaceFileLocks, "withLock").mockImplementation(((key, fn) => {
@@ -234,6 +257,11 @@ test("moved lock calls keep their options", async () => {
   expect(removalLocks).toEqual(["refine-apply", "target", "history"]);
   await oneRefineApply(record.names); // the staging lock of a pass, the apply lock
   await oneFork(record.names, record.nextLockCall); // the branch summary marker and its wait
+  await oneUsageAndGoal(record.names); // usage (with the headless target lock), timing and goal files
+  await oneChildReport(record.names); // the subagent artifact indexes, the turn publication lock
+  await oneInitAndPlan(record.names); // the init record lock seen by two backends, plan migration
+  await oneWorkspaceRefine(record.names); // a full clear under the refine serialization lock
+  await oneArtifactAndRun(record.names); // pins, artifact versions, workflow run locks, rollback, journal
 
   const actual = record.normalized();
   if (process.env.UPDATE_FIXTURE === "1") {
