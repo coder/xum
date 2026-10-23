@@ -434,6 +434,18 @@ export function planToolInstructions(
   );
 }
 
+/**
+ * Whether this request folds the live section and the earlier rows into the system prompt: a
+ * caller's re-freeze, and on replay a turn that recorded one (a "system" record after the
+ * freeze is only ever that). With nothing to fold it changes nothing and records nothing.
+ */
+function refreezes(
+  replayedTurn: { record?: VolatileSystemTailRecord } | undefined,
+  refreeze: boolean
+): boolean {
+  return replayedTurn ? replayedTurn.record?.placement === "system" : refreeze;
+}
+
 function planSystemSection(
   channel: SystemSectionChannel,
   messages: MuxMessage[],
@@ -455,12 +467,17 @@ function planSystemSection(
   };
   if (restored == null) return asBefore;
   const { appliedTail, ...withRows } = restored;
+  // Before the no-change check: a switch with no new edit still folds an earlier row.
+  if (
+    refreezes(replayedTurn, refreeze) &&
+    (liveTail !== withRows.systemTail || withRows.rowsText)
+  ) {
+    return asBefore;
+  }
   if (liveTail === appliedTail) return withRows;
   // A row must follow a user message. Otherwise (a resume after an assistant row) send the new
-  // tail as before, which re-freezes the segment at it. So does a caller's re-freeze, and on
-  // replay a turn that recorded one (a "system" record after the freeze is only ever that).
-  const refrozen = replayedTurn ? replayedTurn.record?.placement === "system" : refreeze;
-  if (messages.at(-1)?.role !== "user" || refrozen) return asBefore;
+  // tail as before, which re-freezes the segment at it.
+  if (messages.at(-1)?.role !== "user") return asBefore;
   const appendedRow = systemRow(`${channel.rowId}-pending`, channel, liveTail);
   return {
     ...withRows,

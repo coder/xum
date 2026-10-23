@@ -1224,6 +1224,31 @@ describe("assemblePromptPayload", () => {
       }
       const sameModel = await send(block("model-opus-v2"), history);
       expect(sameModel.customInstructions?.placement).toBe("row");
+
+      // Codex PRRT_kwDOPxxmWM6vjONA: a switch with no new edit after that row turn still folds
+      // the row's blocks into the system prompt instead of keeping the stale frozen ones.
+      const rowTurn = [
+        ...history,
+        createMuxMessage("a2", "assistant", "answer", {
+          model: "anthropic:claude-opus-5-5",
+          agentId: "exec",
+          customInstructions: sameModel.customInstructions,
+        }),
+        createMuxMessage("u3", "user", "third"),
+      ];
+      const live = block("model-opus-v2");
+      const folded = await send(live, rowTurn, sonnet);
+      expect(folded.messages[0]).toMatchObject({ role: "system", content: stable + live });
+      expect(folded.messages.filter((message) => message.role === "system")).toHaveLength(1);
+      expect(folded.customInstructions).toEqual({ text: live, placement: "system" });
+      const replayed = await send(live, rowTurn, {
+        ...sonnet,
+        replayedTurn: { customInstructions: folded.customInstructions },
+      });
+      expect(withoutMarkers(replayed.messages)).toBe(withoutMarkers(folded.messages));
+      // With nothing to fold, a switch changes nothing and records nothing.
+      const unchanged = await send(block("model-opus"), history, sonnet);
+      expect(unchanged.customInstructions).toBeUndefined();
     });
 
     test("a Tool: section change keeps the frozen tool descriptions and sends a row", async () => {
