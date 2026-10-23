@@ -173,10 +173,21 @@ const HOST_MODULES = [
       "getXumSessionsDir",
     ],
   },
+  // The session lock modules (phase 4): loop code takes its locks through SessionLocks. Not
+  // mutexMap: tools/file_edit_operation.ts keeps a pure in-memory map.
+  "@/node/utils/concurrency/workspaceFileLocks",
+  "@/node/utils/concurrency/fileLock",
+  "@/node/utils/concurrency/processLiveness",
+  "@/node/utils/main/crossProcessLock",
+  "@/node/services/workspaceUseLeases",
 ];
 // File -> the host modules it still imports. Phase plans list the pairs they add or remove.
 const HOST_IMPORT_ALLOW = {
-  "src/node/services/agentSession.ts": ["@/node/runtime/runtimeHelpers", "fs/promises"],
+  "src/node/services/agentSession.ts": [
+    "@/node/runtime/runtimeHelpers",
+    "@/node/services/workspaceUseLeases",
+    "fs/promises",
+  ],
   "src/node/services/aiService.ts": [
     "@/node/runtime/multiProjectRuntime",
     "@/node/runtime/runtimeFactory",
@@ -187,16 +198,28 @@ const HOST_IMPORT_ALLOW = {
   "src/node/services/contextManagement/strategies/tokenBudget.ts": [
     "@/node/runtime/runtimeHelpers",
   ],
+  "src/node/services/historyService.ts": [
+    "@/node/utils/concurrency/fileLock",
+    "@/node/utils/concurrency/workspaceFileLocks",
+  ],
   "src/node/services/tools/agent_skill_read_file.ts": ["@/node/runtime/RemoteRuntime"],
   "src/node/services/tools/bash.ts": ["@/node/runtime/LocalBaseRuntime", "fs"],
   "src/node/services/tools/notify.ts": ["electron"],
-  "src/node/services/tools/review_pane.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
+  "src/node/services/tools/review_pane.ts": [
+    "@/node/utils/concurrency/workspaceFileLocks",
+    "@/node/utils/writeFileAtomic",
+    "fs/promises",
+  ],
   "src/node/services/tools/shared/configReadWrite.ts": [
     "@/node/utils/writeFileAtomic",
     "fs/promises",
   ],
   "src/node/services/tools/skillFileHint.ts": ["@/node/runtime/RemoteRuntime"],
-  "src/node/services/tools/todo.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
+  "src/node/services/tools/todo.ts": [
+    "@/node/utils/concurrency/workspaceFileLocks",
+    "@/node/utils/writeFileAtomic",
+    "fs/promises",
+  ],
   "src/node/services/tools/xum_agents_path.ts": ["fs/promises"],
   "src/node/services/tools/xum_agents_read.ts": ["fs/promises"],
   "src/node/services/tools/xum_agents_write.ts": ["fs/promises"],
