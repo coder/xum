@@ -2,6 +2,7 @@ import type { HistoryService } from "@/node/services/historyService";
 import type { HostClock } from "@/node/utils/hostClock";
 import { createSessionHistoryTool } from "@/node/services/tools/session_history";
 import { createNewContextTool } from "@/node/services/tools/new_context";
+import { nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 import { xai } from "@ai-sdk/xai";
 import type { Tool } from "ai";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -85,7 +86,6 @@ import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 
 import type { Result } from "@/common/types/result";
 import type { Runtime } from "@/node/runtime/Runtime";
-import * as os from "os";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
@@ -598,8 +598,9 @@ function wrapToolsWithModelOnlyNotifications(
           new HomeClutterReminderSource({
             // The host user's real home is where clutter piles up. A HOME override (project
             // secret, .xum/tool_env) already sends writes elsewhere, so it is not tracked.
-            homeDir: os.homedir(),
+            homeDir: nodeHostPaths.userHome(),
             workspaceId: config.workspaceId,
+            clock: config.clock,
           }),
         ]
       : []),
