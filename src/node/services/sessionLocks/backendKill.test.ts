@@ -63,7 +63,13 @@ test("a SIGKILL in a turn recovers as today", async () => {
   expect(atKill.partialText.length).toBeGreaterThan(0);
   expect(recovered.rowTexts[1].startsWith(atKill.partialText)).toBe(true);
 
-  const actual = normalize(ws, { atKill, recovered });
+  // The retry must persist its own output too, not only keep A's prefix. Today
+  // it streams the whole mock reply again into row 1 (#7204), so the length of
+  // the text after the prefix is the same in every run.
+  const actual: Record<string, unknown> = {
+    ...normalize(ws, { atKill, recovered }),
+    retryTextLength: recovered.rowTexts[1].length - atKill.partialText.length,
+  };
   if (process.env.UPDATE_FIXTURE === "1") {
     await fs.mkdir(path.dirname(FIXTURE), { recursive: true });
     await fs.writeFile(FIXTURE, `${JSON.stringify(actual, null, 2)}\n`);
