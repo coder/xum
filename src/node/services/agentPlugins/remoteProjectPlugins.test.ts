@@ -15,6 +15,7 @@ import {
   getRemoteProjectPluginSnapshot,
   MAX_CACHED_SNAPSHOTS,
   MAX_COLD_READS,
+  MAX_COLD_READS_PER_HOST,
 } from "./remoteProjectPlugins";
 import { MAX_REMOTE_PLUGIN_ENTRIES } from "./remotePluginListing";
 
@@ -314,6 +315,39 @@ describe("getRemoteProjectPluginSnapshot", () => {
     clearRemoteProjectPluginSnapshots();
     expect(await Promise.all(reads)).toEqual(late.map(() => null));
     expect(late.reduce((sum, runtime) => sum + runtime.execs, 0)).toBe(MAX_COLD_READS);
+  });
+
+  test("a host that hangs takes at most MAX_COLD_READS_PER_HOST slots; another host still reads", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-per-host");
+    const { root, container } = await checkoutWithKit(checkout.path);
+    let release: (() => void) | undefined;
+    const hung = new Promise<void>((resolve) => (release = resolve));
+    let started = 0;
+    class HangingRuntime extends CountingRemoteRuntime {
+      override async exec(command: string, options: ExecOptions): Promise<ExecStream> {
+        started++;
+        await hung;
+        return super.exec(command, options);
+      }
+    }
+    // Distinct keys on one host: the same root with different container lists.
+    const stuck = Array.from({ length: MAX_COLD_READS }, (_, i) =>
+      getRemoteProjectPluginSnapshot(new HangingRuntime(root, "hung-host"), root, [
+        container,
+        ...Array.from({ length: i }, (_, j) => `${root}/extra-${j}`),
+      ])
+    );
+    // The healthy host's read ends while the hung host still holds its slots; by then the hung
+    // reads that got a slot have all reached exec.
+    expect(
+      await getRemoteProjectPluginSnapshot(new CountingRemoteRuntime(root, "healthy-host"), root, [
+        container,
+      ])
+    ).not.toBeNull();
+    expect(started).toBe(MAX_COLD_READS_PER_HOST);
+    release?.();
+    expect((await Promise.all(stuck)).every((snapshot) => snapshot !== null)).toBe(true);
+    expect(started).toBe(MAX_COLD_READS);
   });
 
   test("a host key that throws or a failed read never throws, and a failed read is retried", async () => {
