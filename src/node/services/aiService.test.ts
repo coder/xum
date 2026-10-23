@@ -4494,6 +4494,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       agentsMd?: string;
       xumAgentsMd?: string;
       additionalSystemInstructions?: string;
+      // A project skill this request discovers (written before it, kept after).
+      skill?: string;
     }
 
     // Captured right after each request, while its state is current.
@@ -4596,6 +4598,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         if (state.xumAgentsMd != null) {
           await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
           await fs.writeFile(path.join(projectPath, ".xum", "AGENTS.md"), state.xumAgentsMd);
+        }
+        if (state.skill != null) {
+          const skillDir = path.join(projectPath, ".xum", "skills", state.skill);
+          await fs.mkdir(skillDir, { recursive: true });
+          await fs.writeFile(
+            path.join(skillDir, "SKILL.md"),
+            `---\nname: ${state.skill}\ndescription: Added mid-session\n---\n\nBody.\n`
+          );
         }
         const history =
           typeof state.history === "function" ? state.history(requests) : (state.history ?? []);
@@ -4824,6 +4834,61 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(stableSystemRow(changed)).not.toContain("note A");
       expect(changed.initialMetadata?.customInstructions).toBeUndefined();
       expect(lastRow(changed)).not.toContain("custom instructions (AGENTS.md) changed");
+    });
+
+    it("keeps the tool block across a skill added mid-segment", async () => {
+      // D9: a skill commit merged into the worktree grew the agent_skill_read description and
+      // rewrote the cached tool block. Inside a segment the description now keeps its list,
+      // and a row names the new one (agent_skill_read loads any skill by name).
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const ledger = (requests: TurnExecutionOptions[]) =>
+        requests.flatMap((request, index) => [
+          createMuxMessage(`u${index}`, "user", "hello"),
+          createMuxMessage(`a${index}`, "assistant", `answer ${index}`, {
+            volatileSystemTail: request.initialMetadata?.volatileSystemTail,
+            customInstructions: request.initialMetadata?.customInstructions,
+            skillIndex: request.initialMetadata?.skillIndex,
+          }),
+        ]);
+      const boundary = createMuxMessage("boundary", "assistant", "Compacted summary", {
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      });
+      const skill = "f10-added-skill";
+      const {
+        requests: [first, changed, next, compacted],
+      } = await streamPair(
+        xumHome.path,
+        [
+          {},
+          { skill, history: ledger },
+          { history: ledger },
+          { history: (requests) => [...ledger(requests), boundary] },
+        ],
+        undefined,
+        "anthropic"
+      );
+      const skillRows = (request: TurnExecutionOptions) =>
+        request.messages
+          .slice(1)
+          .map((message) => JSON.stringify(message.content))
+          .filter((content) => content.includes("Available skills:"));
+      expect(first.tools?.agent_skill_read?.description).toBeDefined();
+      expect(toolBlock(first)).not.toContain(skill);
+      for (const request of [changed, next]) {
+        expect(toolBlock(request)).toBe(toolBlock(first));
+        expect(stableSystemRow(request)).toBe(stableSystemRow(first));
+      }
+      expect(changed.initialMetadata?.skillIndex?.placement).toBe("row");
+      expect(skillRows(changed)).toHaveLength(1);
+      expect(skillRows(changed)[0]).toContain(skill);
+      expect(skillRows(next)).toEqual(skillRows(changed));
+      expect(next.initialMetadata?.skillIndex).toBeUndefined();
+      // A compaction folds the new list into the tool description.
+      expect(toolBlock(compacted)).toContain(skill);
+      expect(skillRows(compacted)).toEqual([]);
+      expect(compacted.initialMetadata?.skillIndex?.placement).toBe("system");
     });
 
     // Native deferred loading (#5262, #5297): a search loads a tool through a

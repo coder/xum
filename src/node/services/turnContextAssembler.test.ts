@@ -1055,6 +1055,55 @@ describe("assemblePromptPayload", () => {
       );
     });
 
+    test("a skill index change keeps the frozen tool description and replays from the records", async () => {
+      const index = (skills: string) => `\n\nAvailable skills:\n${skills}`;
+      const send = (
+        skills: string,
+        history: MuxMessage[],
+        replayedTurn?: { skillIndex?: VolatileSystemTailRecord }
+      ) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable,
+          // Replay rebuilds without tools: the records alone decide its rows.
+          ...(replayedTurn == null && {
+            tools: {
+              agent_skill_read: tool({
+                description: `Read a skill.${skills && index(skills)}\n\nTool instructions.`,
+                inputSchema: jsonSchema({ type: "object" }),
+              }),
+            },
+            skillIndexSection: { prefix: "Read a skill.", block: skills && index(skills) },
+          }),
+          replayedTurn,
+        });
+      const u1 = createMuxMessage("u1", "user", "first");
+      const u2 = createMuxMessage("u2", "user", "second");
+      const start = await send("- a", [u1]);
+      expect(start.skillIndex).toEqual({ text: index("- a"), placement: "system" });
+      const history = [
+        u1,
+        createMuxMessage("a1", "assistant", "answer", { skillIndex: start.skillIndex }),
+        u2,
+      ];
+      const changed = await send("- a\n- b", history);
+      // The description keeps "- a" (and what follows it); the new list goes in a row.
+      expect(changed.tools?.agent_skill_read?.description).toBe(
+        `Read a skill.${index("- a")}\n\nTool instructions.`
+      );
+      expect(JSON.stringify(changed.messages.at(-1))).toContain("- b");
+      expect(changed.skillIndex).toEqual({ text: index("- a\n- b"), placement: "row" });
+      const replayed = await send("", history, { skillIndex: changed.skillIndex });
+      expect(withoutMarkers(replayed.messages)).toBe(withoutMarkers(changed.messages));
+      // No skill listed any more: the description keeps the frozen list, a row says so.
+      const removed = await send("", history);
+      expect(removed.tools?.agent_skill_read?.description).toBe(
+        `Read a skill.${index("- a")}\n\nTool instructions.`
+      );
+      expect(JSON.stringify(removed.messages.at(-1))).toContain("no skills are listed now");
+    });
+
     test("a compaction boundary starts a new segment with the live tail", async () => {
       const boundary = createMuxMessage("boundary", "assistant", "Compacted summary", {
         compacted: "user",

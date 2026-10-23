@@ -52,11 +52,27 @@ function isIndexedSkill(skill: AgentSkillDescriptor): boolean {
  * so the model sees them adjacent to the tool call schema.
  */
 function buildSkillReadDescription(config: ToolConfiguration): string {
-  const baseDescription = TOOL_DEFINITIONS.agent_skill_read.description;
-  const skills = (config.availableSkills ?? []).filter(isIndexedSkill);
+  const { prefix, block } = skillIndexSectionFor(config.availableSkills);
+  return prefix + block;
+}
+
+/**
+ * The agent_skill_read description split at its "Available skills" part (block, "" without
+ * skills). The request assembler keeps that block frozen inside a context segment
+ * (planSkillIndex), so a skill added mid-session does not rewrite the cached tool block.
+ */
+export function skillIndexSectionFor(availableSkills: readonly InvocableSkill[] | undefined) {
+  return {
+    prefix: TOOL_DEFINITIONS.agent_skill_read.description,
+    block: buildSkillIndexSection(availableSkills),
+  };
+}
+
+function buildSkillIndexSection(availableSkills: readonly InvocableSkill[] | undefined) {
+  const skills = (availableSkills ?? []).filter(isIndexedSkill);
 
   if (skills.length === 0) {
-    return baseDescription;
+    return "";
   }
 
   const MAX_SKILLS = 50;
@@ -73,7 +89,7 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
     skillLines.push(`(+${omitted} more not shown)`);
   }
 
-  return `${baseDescription}\n\nAvailable skills:\n${skillLines.join("\n")}`;
+  return `\n\nAvailable skills:\n${skillLines.join("\n")}`;
 }
 
 /**

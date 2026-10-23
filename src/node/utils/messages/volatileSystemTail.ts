@@ -93,6 +93,18 @@ const CUSTOM_INSTRUCTIONS: SystemSectionChannel = {
  */
 const INSTRUCTIONS_REMOVED = "\n(None: the custom instructions were removed.)";
 
+const SKILL_INDEX: SystemSectionChannel = {
+  field: "skillIndex",
+  // A skill missing from the frozen tool description must still reach the model: this row
+  // names it, and agent_skill_read loads any skill by name. Worded like the instructions row.
+  header:
+    'The skill list changed during this session. The list below is the current one from Xum, not from the user. It replaces the "Available skills" list in the agent_skill_read tool description; agent_skill_read loads each skill by name.',
+  rowId: "skill-index",
+};
+
+/** The skill-index row's text when no skill is listed any more (see INSTRUCTIONS_REMOVED). */
+const SKILL_INDEX_REMOVED = "\n(None: no skills are listed now.)";
+
 /** The record, or undefined when absent or corrupt (self-healing: a bad record is ignored). */
 function readSectionRecord(
   message: MuxMessage,
@@ -115,6 +127,10 @@ export function readCustomInstructionsRecord(
   message: MuxMessage
 ): VolatileSystemTailRecord | undefined {
   return readSectionRecord(message, CUSTOM_INSTRUCTIONS.field);
+}
+
+export function readSkillIndexRecord(message: MuxMessage): VolatileSystemTailRecord | undefined {
+  return readSectionRecord(message, SKILL_INDEX.field);
 }
 
 function systemRow(id: string, channel: SystemSectionChannel, section: string): MuxMessage {
@@ -273,26 +289,59 @@ export function planCustomInstructions(
   rowsSupported: boolean,
   replayedTurn?: { record?: VolatileSystemTailRecord }
 ): VolatileSystemTailPlan {
-  const none = { systemTail: "", messages, rowsText: "" };
-  // Replay: the recorded prompt already holds the frozen blocks, so the records decide.
-  if (replayedTurn) {
-    return planSystemSection(CUSTOM_INSTRUCTIONS, messages, "", rowsSupported, replayedTurn);
-  }
-  // No blocks now: as before (none sent, nothing recorded) unless the segment froze some.
-  // Then their removal is a change like any other, sent as a row until the next compaction.
-  const removed = requestBlock === "";
-  if (removed && (!rowsSupported || restoreFrozenSegment(messages, CUSTOM_INSTRUCTIONS) == null)) {
-    return none;
-  }
-  const plan = planSystemSection(
-    CUSTOM_INSTRUCTIONS,
+  return planRemovableSection(
+    { ...CUSTOM_INSTRUCTIONS, removed: INSTRUCTIONS_REMOVED },
     messages,
-    removed ? INSTRUCTIONS_REMOVED : requestBlock,
+    requestBlock,
     rowsSupported,
-    undefined
+    replayedTurn
   );
-  // A re-freeze after a removal freezes "no blocks", not the marker.
-  return plan.systemTail === INSTRUCTIONS_REMOVED ? { ...plan, systemTail: "" } : plan;
+}
+
+/**
+ * planSystemSection for a section that can disappear (an empty `requestSection`). The prompt
+ * then sends none and records nothing, as before, unless the segment froze one: then the
+ * removal is a change like any other, sent as a row with `channel.removed` until the next
+ * compaction, while the frozen section stays. Replay sends the recorded request, which
+ * already holds the frozen section, so there the records alone decide.
+ */
+function planRemovableSection(
+  channel: SystemSectionChannel & { removed: string },
+  messages: MuxMessage[],
+  requestSection: string,
+  rowsSupported: boolean,
+  replayedTurn: { record?: VolatileSystemTailRecord } | undefined
+): VolatileSystemTailPlan {
+  if (replayedTurn) return planSystemSection(channel, messages, "", rowsSupported, replayedTurn);
+  const removed = requestSection === "";
+  if (removed && (!rowsSupported || restoreFrozenSegment(messages, channel) == null)) {
+    return { systemTail: "", messages, rowsText: "" };
+  }
+  const live = removed ? channel.removed : requestSection;
+  const plan = planSystemSection(channel, messages, live, rowsSupported, undefined);
+  // A re-freeze after a removal freezes "no section", not the marker.
+  return plan.systemTail === channel.removed ? { ...plan, systemTail: "" } : plan;
+}
+
+/**
+ * planCustomInstructions for the "Available skills" index in the agent_skill_read tool
+ * description: `systemTail` is the index the tool block carries (frozen inside a segment).
+ * Runs between planCustomInstructions and planVolatileSystemTail, in their row order. On
+ * replay the request has no tools, and the records decide.
+ */
+export function planSkillIndex(
+  messages: MuxMessage[],
+  requestIndex: string,
+  rowsSupported: boolean,
+  replayedTurn?: { record?: VolatileSystemTailRecord }
+): VolatileSystemTailPlan {
+  return planRemovableSection(
+    { ...SKILL_INDEX, removed: SKILL_INDEX_REMOVED },
+    messages,
+    requestIndex,
+    rowsSupported,
+    replayedTurn
+  );
 }
 
 function planSystemSection(
