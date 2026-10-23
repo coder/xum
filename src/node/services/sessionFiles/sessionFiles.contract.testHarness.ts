@@ -7,12 +7,14 @@
  * folder. A layer without host files creates the same paths in its own volume.
  */
 import { describe, expect, test } from "bun:test";
-import { Effect, type Layer } from "effect";
+import type { Layer } from "effect";
 import { randomUUID } from "node:crypto";
 import * as hostFs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SessionFilesTag } from "@/node/services/di/tags";
+import type { SessionFilesTag } from "@/node/services/di/tags";
+import { buildSessionFiles } from "./buildSessionFiles.testHarness";
+import { makeFaults, withFaults, type Faults } from "./faultSessionFiles.testHarness";
 import type { SessionFiles } from "./sessionFiles";
 
 async function errorCode(run: () => unknown): Promise<unknown> {
@@ -47,11 +49,7 @@ export function describeSessionFilesContract(
       // The history code skips directory fsync on win32 too.
       const run = options.posixOnly === true && process.platform === "win32" ? test.skip : test;
       run(title, async () => {
-        const files = Effect.runSync(
-          Effect.gen(function* () {
-            return yield* SessionFilesTag;
-          }).pipe(Effect.provide(layer))
-        );
+        const files = buildSessionFiles(layer);
         // A unique root that exists in the layer under test (on the host for the Node layer).
         const dir = path.join(os.tmpdir(), `xum-session-files-${randomUUID()}`);
         await files.promises.mkdir(dir, { recursive: true });
@@ -330,5 +328,69 @@ export function describeSessionFilesContract(
       },
       { posixOnly: true }
     );
+  });
+}
+
+/** The fault layer's rules on top of a layer: a few cases, run on each layer. */
+export function describeFaultCases(name: string, layer: Layer.Layer<SessionFilesTag>): void {
+  describe(`SessionFiles faults: ${name}`, () => {
+    function it(
+      title: string,
+      body: (files: SessionFiles, faults: Faults, dir: string) => Promise<void>
+    ) {
+      test(title, async () => {
+        const faults = makeFaults();
+        const files = buildSessionFiles(withFaults(layer, faults));
+        const dir = path.join(os.tmpdir(), `xum-session-faults-${randomUUID()}`);
+        await files.promises.mkdir(dir, { recursive: true });
+        try {
+          await body(files, faults, dir);
+        } finally {
+          await files.promises.rm(dir, { recursive: true, force: true });
+        }
+      });
+    }
+
+    it("a cut appendFile keeps N bytes, throws EIO, and the next write passes", async (files, faults, dir) => {
+      const file = path.join(dir, "chat.jsonl");
+      faults.cutNextWrite(file, { afterBytes: 3 });
+      expect(await errorCode(() => files.promises.appendFile(file, "abcdef"))).toBe("EIO");
+      await files.promises.appendFile(file, "\n");
+      expect(await files.promises.readFile(file, "utf8")).toBe("abc\n");
+    });
+
+    it("a cut writeSync(fd) maps the fd to its path and keeps N bytes", async (files, faults, dir) => {
+      const file = path.join(dir, "chat.jsonl");
+      const handle = await files.promises.open(file, "a", 0o600);
+      faults.cutNextWrite(file, { afterBytes: 2 });
+      expect(await errorCode(() => files.writeSync(handle.fd, Buffer.from("row\n")))).toBe("EIO");
+      await handle.close();
+      expect(await files.promises.readFile(file, "utf8")).toBe("ro");
+    });
+
+    it("a cut before writeFileAtomic refuses the write and does not stay queued", async (files, faults, dir) => {
+      const file = path.join(dir, "post-compaction.json");
+      faults.cutNextWrite(file, { afterBytes: 1 });
+      const refused = await files.writeFileAtomic(file, "{}").then(
+        () => "written",
+        (error: Error) => error.message
+      );
+      expect(refused).toContain("does not apply");
+      await files.promises.appendFile(file, "abc");
+      expect(await files.promises.readFile(file, "utf8")).toBe("abc");
+    });
+
+    it("failNext throws the code once on that path only, then passes", async (files, faults, dir) => {
+      const [from, other] = [path.join(dir, "a"), path.join(dir, "b")];
+      await files.promises.appendFile(from, "x");
+      await files.promises.appendFile(other, "y");
+      faults.failNext("rename", from, "ENOSPC");
+      await files.promises.rename(other, path.join(dir, "c"));
+      expect(await errorCode(() => files.promises.rename(from, path.join(dir, "d")))).toBe(
+        "ENOSPC"
+      );
+      await files.promises.rename(from, path.join(dir, "d"));
+      expect((await files.promises.readdir(dir)).sort()).toEqual(["c", "d"]);
+    });
   });
 }
