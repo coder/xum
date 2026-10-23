@@ -5,7 +5,9 @@ import {
   getAskUserQuestionOccurrences,
   isAskUserQuestionOccurrenceOpen,
 } from "@/common/utils/tools/askUserQuestionSummary";
-import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+// Not toolDefinitions.ts: this module is in the main chunk (via the aggregator), and that file
+// would bring every tool schema with it (#7363).
+import { AskUserQuestionToolArgsSchema } from "@/common/utils/tools/askUserQuestionSchemas";
 
 // Which ask_user_question rows still take answers. One selector serves the dock above the chat
 // input, the transcript stubs and transcript truncation (StreamingMessageAggregator keeps these
@@ -70,7 +72,7 @@ export type AskUserQuestionToolMessage = Extract<DisplayedMessage, { type: "tool
  * releases itself from the dock, so they stay in the transcript (checked last: it parses args).
  */
 function hasValidAskUserQuestionArgs(message: AskUserQuestionToolMessage): boolean {
-  return TOOL_DEFINITIONS.ask_user_question.schema.safeParse(message.args).success;
+  return AskUserQuestionToolArgsSchema.safeParse(message.args).success;
 }
 
 function isToolRow(message: DisplayedMessage): message is AskUserQuestionToolMessage {
