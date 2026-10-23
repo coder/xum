@@ -1306,13 +1306,63 @@
     },
     {
       "files": [
+        "src/node/services/agentSession.ts",
+        "src/node/services/aiService.ts",
+        "src/node/services/aiServiceEventGuards.ts",
+        "src/node/services/messagePipeline.ts",
+        "src/node/services/retryManager.ts",
+        "src/node/services/streamManager.ts",
+        "src/node/services/turn*.ts",
+        "src/node/services/contextManagement/**/*.ts",
+        "src/node/services/tools/**/*.ts",
+        "src/node/services/backgroundProcessManager.ts"
+      ],
+      "jsPlugins": [
+        {
+          "name": "local",
+          "specifier": "./eslint-local-rules.mjs"
+        }
+      ],
+      "rules": {
+        "local/no-raw-clock": [
+          "error",
+          {
+            "allow": {
+              "src/node/services/agentSession.ts": 11,
+              "src/node/services/aiService.ts": 7,
+              "src/node/services/backgroundProcessManager.ts": 25,
+              "src/node/services/contextManagement/strategies/continuous.ts": 1,
+              "src/node/services/contextManagement/strategies/tokenBudget.ts": 1,
+              "src/node/services/retryManager.ts": 1,
+              "src/node/services/streamManager.ts": 18,
+              "src/node/services/tools/bash.ts": 3,
+              "src/node/services/tools/bash_background_list.ts": 1,
+              "src/node/services/tools/code_execution.ts": 3,
+              "src/node/services/tools/intuition.ts": 1,
+              "src/node/services/tools/skills_catalog_read.ts": 1,
+              "src/node/services/tools/task.ts": 1,
+              "src/node/services/tools/task_await.ts": 7,
+              "src/node/services/tools/toolUtils.ts": 1,
+              "src/node/services/tools/web_fetch.ts": 2,
+              "src/node/services/tools/withHooks.ts": 6,
+              "src/node/services/tools/workflow_resume.ts": 1,
+              "src/node/services/tools/workflow_run.ts": 1,
+              "src/node/services/turnRequestBuilder.ts": 29
+            }
+          }
+        ]
+      }
+    },
+    {
+      "files": [
         "**/*.test.ts",
         "**/*.testHarness.ts",
         "**/*.bench.ts",
         "src/node/services/tools/testHelpers.ts"
       ],
       "rules": {
-        "local/no-host-imports": "off"
+        "local/no-host-imports": "off",
+        "local/no-raw-clock": "off"
       }
     },
     {

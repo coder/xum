@@ -759,6 +759,129 @@ const localPlugin = {
         };
       },
     },
+    "no-raw-clock": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            "Disallow raw clock reads (Date.now(), new Date(), setTimeout(), setInterval()) in agent-loop code",
+        },
+        schema: [
+          {
+            type: "object",
+            properties: {
+              // Repo-relative file -> the exact number of raw clock reads it still has.
+              allow: { type: "object", additionalProperties: { type: "integer", minimum: 1 } },
+            },
+            additionalProperties: false,
+          },
+        ],
+        messages: {
+          raw:
+            "{{what}} reads the host clock. Use the HostClock service (nowMs, setTimer) " +
+            "so tests can drive loop time with the TestClock (agent loop refactor, phase 3).",
+          lowerAllow:
+            "This file has {{found}} raw clock reads, but its local/no-raw-clock allow entry " +
+            "says {{allowed}}. Lower the entry, or remove it at 0.",
+        },
+      },
+      create(context) {
+        const relFile = path.relative(context.cwd, context.filename).split(path.sep).join("/");
+        const allowed = context.options[0]?.allow?.[relFile] ?? 0;
+        const found = [];
+        const isTimer = (node) =>
+          node.type === "Identifier" && (node.name === "setTimeout" || node.name === "setInterval");
+        const memberOf = (node, object) =>
+          node.type === "MemberExpression" &&
+          !node.computed &&
+          node.object.type === "Identifier" &&
+          node.object.name === object;
+        // `Date` or `globalThis.Date`: both name the host clock.
+        const isDate = (node) =>
+          (node.type === "Identifier" && node.name === "Date") ||
+          (memberOf(node, "globalThis") && node.property.name === "Date");
+        return {
+          CallExpression(node) {
+            const callee = node.callee;
+            if (
+              callee.type === "MemberExpression" &&
+              !callee.computed &&
+              isDate(callee.object) &&
+              callee.property.name === "now"
+            ) {
+              found.push({ node, what: "Date.now()" });
+            } else if (isTimer(callee)) {
+              found.push({ node, what: `${callee.name}()` });
+            } else if (memberOf(callee, "globalThis") && isTimer(callee.property)) {
+              found.push({ node, what: `globalThis.${callee.property.name}()` });
+            }
+          },
+          NewExpression(node) {
+            if (isDate(node.callee) && node.arguments.length === 0) {
+              found.push({ node, what: "new Date()" });
+            }
+          },
+          "Program:exit"(program) {
+            // The allow entry is an exact count, so it can only go down: a move PR that
+            // removes reads must lower its entry, and a new read fails.
+            for (const { node, what } of found.slice(allowed)) {
+              context.report({ node, messageId: "raw", data: { what } });
+            }
+            if (found.length < allowed) {
+              context.report({
+                node: program,
+                messageId: "lowerAllow",
+                data: { found: String(found.length), allowed: String(allowed) },
+              });
+            }
+          },
+        };
+      },
+    },
+    "no-global-clock-patch": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            "Disallow global fake timers and Date patches in agent-loop tests that moved to the TestClock",
+        },
+        messages: {
+          patch:
+            "{{what}} patches time for the whole test process. This test drives loop time with " +
+            "makeTestEffectRunner (one TestClock for the runner and the HostClock) instead.",
+        },
+      },
+      create(context) {
+        const PATCHES = new Set(["useFakeTimers", "setSystemTime", "advanceTimersByTime"]);
+        const calleeName = (callee) =>
+          callee.type === "Identifier"
+            ? callee.name
+            : callee.type === "MemberExpression" &&
+                !callee.computed &&
+                callee.property.type === "Identifier"
+              ? callee.property.name
+              : null;
+        return {
+          CallExpression(node) {
+            const name = calleeName(node.callee);
+            if (name !== null && PATCHES.has(name)) {
+              context.report({ node, messageId: "patch", data: { what: `${name}()` } });
+              return;
+            }
+            const [target, method] = node.arguments;
+            if (
+              name === "spyOn" &&
+              target?.type === "Identifier" &&
+              target.name === "Date" &&
+              method?.type === "Literal" &&
+              method.value === "now"
+            ) {
+              context.report({ node, messageId: "patch", data: { what: 'spyOn(Date, "now")' } });
+            }
+          },
+        };
+      },
+    },
     "no-clear-dom-global": {
       meta: {
         type: "problem",
