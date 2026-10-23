@@ -178,8 +178,6 @@ const HOST_IMPORT_ALLOW = {
   "src/node/services/tools/xum_agents_write.ts": ["fs/promises"],
   // Phase 2: each move PR removes its own pairs.
   "src/node/services/compactionCancellation.ts": ["fs"],
-  "src/node/services/compactionPendingState.ts": ["fs/promises"],
-  "src/node/services/continuousCompactionJournal.ts": ["@/node/utils/writeFileAtomic", "fs"],
 };
 
 const SHARED_RESTRICTED_PATHS = [AI_TOKENIZER_ENCODING_RESTRICTION];

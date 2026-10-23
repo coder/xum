@@ -226,7 +226,7 @@ describe("AgentSession turn completion", () => {
       "observeContinuousCompactionAtStreamEnd"
     );
     const accounting = spyOn(internal(h.session), "recordGoalAccountingFromUsage");
-    let reading: ReturnType<typeof spyOn<typeof fileIO, "readFile">> | undefined;
+    let reading: ReturnType<typeof spyOn<typeof fs, "readFile">> | undefined;
     let failed = false;
     try {
       // Keep admission's real frontier stable: only the ordinary completion read fails.
@@ -246,8 +246,8 @@ describe("AgentSession turn completion", () => {
         readCompactionAdmission: () => Promise.resolve(admission),
       });
       // Install the transient fault only after the queue's recorded acquisition completes.
-      const read = fileIO.readFile;
-      reading = spyOn(fileIO, "readFile").mockImplementation((async (
+      const read = fs.readFile;
+      reading = spyOn(fs, "readFile").mockImplementation((async (
         ...args: Parameters<typeof read>
       ) => {
         if (args[0] === generationPath && !failed) {

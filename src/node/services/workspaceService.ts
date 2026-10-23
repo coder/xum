@@ -6026,7 +6026,8 @@ export class WorkspaceService
       return null;
     const pending = new CompactionPendingState(
       pendingPath,
-      this.historyService.getCompactionPendingHistory(workspaceId)
+      this.historyService.getCompactionPendingHistory(workspaceId),
+      this.historyService.files
     );
     const receipt = await pending.load(() => true).catch(() => undefined);
     return receipt?.attachments.diffs.map((diff) => diff.path) ?? null;

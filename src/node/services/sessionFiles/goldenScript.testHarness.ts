@@ -176,7 +176,8 @@ export const STEPS: readonly GoldenStep[] = [
 
       const pending = new CompactionPendingState(
         path.join(sessionDir, POST_COMPACTION_STATE_FILENAME),
-        historyService.getCompactionPendingHistory(workspaceId)
+        historyService.getCompactionPendingHistory(workspaceId),
+        historyService.files
       );
       assert(
         await pending.prepare({

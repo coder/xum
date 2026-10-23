@@ -8,6 +8,7 @@ import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import type { HistoryService } from "./historyService";
 import { publishCompactionFile } from "./continuousCompactionJournal";
+import { nodeSessionFiles } from "./sessionFiles/nodeSessionFiles";
 import { hasAmbiguousResetKeys } from "./historyScanner";
 import type { MuxMessage } from "@/common/types/message";
 import { log } from "./log";
@@ -341,6 +342,8 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
             this.path,
             contents,
             isCurrent,
+            // Host files until this storage takes the history's SessionFiles.
+            nodeSessionFiles,
             () => {
               frontier.nonce = committed.nonce;
               // Install inherited retention before cleanup can admit a newer read.
@@ -395,6 +398,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
           this.path,
           contents,
           isCurrent,
+          nodeSessionFiles,
           () => onCommitted(committed),
           checkLock
         ))
@@ -472,6 +476,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
         this.path,
         contents,
         isCurrent,
+        nodeSessionFiles,
         () => onCommitted(record),
         checkLock
       ))
@@ -536,6 +541,7 @@ export class FileCompactionCancellationStorage implements CompactionCancellation
           this.path,
           serialized.contents,
           isCurrent,
+          nodeSessionFiles,
           onCommitted,
           checkLock
         ))

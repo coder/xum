@@ -1,14 +1,13 @@
 import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import { addInterruptedSentinel } from "@/browser/utils/messages/modelMessageTransform";
 import { applyCacheControl } from "@/common/utils/ai/cacheStrategy";
-import { promises as fs } from "node:fs";
-import { renameSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import { isDeepStrictEqual } from "node:util";
 import { modelMessageSchema, type ModelMessage } from "ai";
-import writeFileAtomic, { fsyncParentDirectory } from "@/node/utils/writeFileAtomic";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { z } from "zod";
 import assert from "@/common/utils/assert";
 import {
@@ -106,17 +105,18 @@ export async function publishCompactionFile(
   filePath: string,
   contents: string | Buffer,
   isCurrent: () => boolean,
+  files: SessionFiles = nodeSessionFiles,
   onCommitted?: () => void,
   assertStillOwned?: () => Promise<void>
 ): Promise<boolean> {
   const stagedPath = `${filePath}.continuous-${randomUUID()}`;
   try {
-    await writeFileAtomic(stagedPath, contents, { mode: 0o600 });
+    await files.writeFileAtomic(stagedPath, contents, { mode: 0o600 });
     await unlockedHistoryScans.waitForClose(filePath);
     // Staging can outlive the lock lease; check ownership after that final I/O.
     if (assertStillOwned) await assertStillOwned();
     if (!isCurrent()) return false;
-    renameSync(stagedPath, filePath);
+    files.renameSync(stagedPath, filePath);
     try {
       onCommitted?.();
     } catch (error) {
@@ -125,10 +125,10 @@ export async function publishCompactionFile(
     }
     // The staged write fsynced its own rename (writeFileAtomic's default); this rename needs
     // the same directory flush to survive a crash (#5344). Best effort, like writeFileAtomic's.
-    await fsyncParentDirectory(filePath);
+    await files.fsyncParentDirectory(filePath);
     return true;
   } finally {
-    await fs.rm(stagedPath, { force: true }).catch((error: unknown) => {
+    await files.promises.rm(stagedPath, { force: true }).catch((error: unknown) => {
       log.warn("[continuous-compaction] staged file cleanup failed", error);
     });
   }
@@ -141,7 +141,8 @@ export class ContinuousCompactionJournalStore {
   constructor(
     readonly path: string,
     private readonly workspaceId: string,
-    private readonly withHistoryLock: <T>(operation: () => Promise<T>) => Promise<T>
+    private readonly withHistoryLock: <T>(operation: () => Promise<T>) => Promise<T>,
+    private readonly files: SessionFiles
   ) {}
 
   private enqueue<T>(
@@ -158,7 +159,7 @@ export class ContinuousCompactionJournalStore {
   async captureGenerationUnderHistoryLock(): Promise<string | undefined> {
     try {
       // Opaque bytes also fence old work if the file is damaged; fresh capture can proceed.
-      const contents = await fs.readFile(
+      const contents = await this.files.promises.readFile(
         path.join(path.dirname(this.path), CONTINUOUS_COMPACTION_GENERATION_FILE)
       );
       return createHash("sha256").update(contents).digest("hex");
@@ -183,6 +184,7 @@ export class ContinuousCompactionJournalStore {
       path.join(path.dirname(this.path), CONTINUOUS_COMPACTION_GENERATION_FILE),
       generation,
       isCurrent,
+      this.files,
       // The cancellation retry must learn its exact frontier at rename, before
       // cleanup or lock release can fail or admit a foreign generation.
       () => onCommitted?.(createHash("sha256").update(generation).digest("hex")),
@@ -200,7 +202,7 @@ export class ContinuousCompactionJournalStore {
   private async readUnderHistoryLock(): Promise<ContinuousCompactionJournal | null> {
     try {
       return ContinuousCompactionJournalSchema.parse(
-        JSON.parse(await fs.readFile(this.path, "utf8"))
+        JSON.parse(await this.files.promises.readFile(this.path, "utf8"))
       );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -225,7 +227,7 @@ export class ContinuousCompactionJournalStore {
 
   private async clearOwnedUnderHistoryLock(expected: ContinuousCompactionJournal): Promise<void> {
     if (isDeepStrictEqual(await this.readUnderHistoryLock(), expected))
-      await fs.rm(this.path, { force: true });
+      await this.files.promises.rm(this.path, { force: true });
   }
 
   clearForReset(): Promise<void> {
@@ -236,14 +238,14 @@ export class ContinuousCompactionJournalStore {
     // lock could time out and silently leave cancelled work recoverable. It does
     // not create a directory or fence a foreign producer's future publication.
     this.generation++;
-    return this.enqueue(() => fs.rm(this.path, { force: true }), "local");
+    return this.enqueue(() => this.files.promises.rm(this.path, { force: true }), "local");
   }
 
   exists(): Promise<boolean> {
     // Ordinary send recovery must not acquire a write lock just to discover no journal exists.
     return this.enqueue(async () => {
       try {
-        await fs.access(this.path);
+        await this.files.promises.access(this.path);
         return true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT")
@@ -255,7 +257,7 @@ export class ContinuousCompactionJournalStore {
 
   private async discardUnusableUnderHistoryLock(): Promise<null> {
     // An unusable journal must not block recovery just because unlink is unavailable.
-    await fs.rm(this.path, { force: true }).catch((error: unknown) => {
+    await this.files.promises.rm(this.path, { force: true }).catch((error: unknown) => {
       log.warn("[continuous-compaction] unusable journal cleanup failed", error);
     });
     return null;
@@ -271,7 +273,7 @@ export class ContinuousCompactionJournalStore {
       if (!current()) return null;
       let contents: string;
       try {
-        contents = await fs.readFile(this.path, "utf8");
+        contents = await this.files.promises.readFile(this.path, "utf8");
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT")
           log.warn("[continuous-compaction] journal unavailable", error);
@@ -336,6 +338,7 @@ export class ContinuousCompactionJournalStore {
           this.path,
           JSON.stringify(payload),
           current,
+          this.files,
           () => {
             onCommitted?.(updated);
           }
@@ -397,6 +400,7 @@ export class ContinuousCompactionJournalStore {
           this.path,
           JSON.stringify(payload),
           current,
+          this.files,
           () => {
             onCommitted?.(parsed);
           }

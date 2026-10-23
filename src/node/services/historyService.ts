@@ -911,7 +911,8 @@ export class HistoryService {
               throw new Error(`workspace ${workspaceId} was removed; refusing journal mutation`);
             await this.files.ensurePrivateDir(this.getSessionDir(workspaceId));
             return operation();
-          })
+          }),
+        this.files
       );
       this.continuousJournals.set(workspaceId, journal);
     }
@@ -1133,6 +1134,7 @@ export class HistoryService {
               partialPath,
               JSON.stringify(cleared),
               isCurrent,
+              this.files,
               undefined,
               assertStillOwned
             ))
@@ -1170,7 +1172,14 @@ export class HistoryService {
         });
         if (
           changed &&
-          !(await publishCompactionFile(filePath, contents, isCurrent, undefined, assertStillOwned))
+          !(await publishCompactionFile(
+            filePath,
+            contents,
+            isCurrent,
+            this.files,
+            undefined,
+            assertStillOwned
+          ))
         )
           return false;
       }
@@ -3237,7 +3246,14 @@ export class HistoryService {
     }
 
     if (assertStillOwned)
-      await publishCompactionFile(chatPath, activeTail, () => true, undefined, assertStillOwned);
+      await publishCompactionFile(
+        chatPath,
+        activeTail,
+        () => true,
+        this.files,
+        undefined,
+        assertStillOwned
+      );
     else await this.files.writeFileAtomic(chatPath, activeTail);
 
     log.debug("Rotated sealed chat history into archive", {
@@ -5634,6 +5650,7 @@ export class HistoryService {
             historyPath,
             serialized,
             () => shouldPersist(sourceMessages),
+            this.files,
             onCommitted,
             assertStillOwned
           ))

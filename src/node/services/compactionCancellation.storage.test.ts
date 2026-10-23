@@ -397,8 +397,8 @@ describe("inactive real cancellation storage", () => {
     ).toBe(true);
     const committed = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    const remove = nodeFs.promises.rm;
-    spyOn(nodeFs.promises, "rm").mockImplementation(async (file, options) => {
+    const remove = fs.rm;
+    const removing = spyOn(fs, "rm").mockImplementation(async (file, options) => {
       if (String(file).startsWith(`${storage.path}.continuous-`)) {
         committed.resolve();
         await release.promise;
@@ -408,6 +408,7 @@ describe("inactive real cancellation storage", () => {
     const stopping = state.cancel();
     try {
       await committed.promise;
+      expect(removing).toHaveBeenCalled();
       expect(await storage.read()).not.toBeNull();
       // Simulate downgrade's lock-free read after a crash at this publication boundary.
       const rows = (await fs.readFile(path.join(sessionDir, "chat.jsonl"), "utf8"))
@@ -810,13 +811,15 @@ describe("inactive real cancellation storage", () => {
         cleanup.resolve();
         await release.promise;
       };
-      if (phase === "publish" || phase === "narrow") {
-        const remove = nodeFs.promises.rm;
-        spyOn(nodeFs.promises, "rm").mockImplementation(async (file, options) => {
-          if (String(file).startsWith(`${storage.path}.continuous-`)) await pauseCleanup();
-          await remove(file, options);
-        });
-      } else {
+      const remove = fs.rm;
+      const removing =
+        phase === "publish" || phase === "narrow"
+          ? spyOn(fs, "rm").mockImplementation(async (file, options) => {
+              if (String(file).startsWith(`${storage.path}.continuous-`)) await pauseCleanup();
+              await remove(file, options);
+            })
+          : undefined;
+      if (removing === undefined) {
         const unlink = fs.unlink;
         spyOn(fs, "unlink").mockImplementation(async (file) => {
           if (file === lockPath) await pauseCleanup();
@@ -826,6 +829,7 @@ describe("inactive real cancellation storage", () => {
       const writing = storage.mutate(mutation, () => true, mutationCommitted);
       try {
         await cleanup.promise;
+        if (removing) expect(removing).toHaveBeenCalled();
         expect(mutationCommitted).toHaveBeenCalledTimes(1);
         assert.deepEqual(mutationCommitted.mock.calls[0]?.[0], expected);
         expect(await storage.read()).toEqual(expected);
