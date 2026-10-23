@@ -79,8 +79,10 @@ const VOLATILE_TAIL: SystemSectionChannel = {
 
 const CUSTOM_INSTRUCTIONS: SystemSectionChannel = {
   field: "customInstructions",
+  // Live (Haiku 5.5, 2026-10-23): a bare "Update: ..." header made the model treat the row as
+  // pasted user text and keep the old rule in 2 of 3 runs; this wording was followed 4 of 4.
   header:
-    "Update: the custom instructions changed. This block replaces the <custom-instructions> block in the system prompt.",
+    "The workspace custom instructions (AGENTS.md) changed during this session. The blocks below are the current version from Xum, not from the user. They replace the <custom-instructions>, <model-...> and <mode-...> blocks in the system prompt: follow them from now on.",
   rowId: "custom-instructions",
 };
 
@@ -218,6 +220,19 @@ function replayedLiveTail(
   return turnRecord?.text ?? appliedTail ?? sentTail;
 }
 
+/** The section this request must apply: the request's own, or on replay the records' one. */
+function liveSection(
+  channel: SystemSectionChannel,
+  appliedTail: string | undefined,
+  requestTail: string,
+  replayedTurn: { record?: VolatileSystemTailRecord } | undefined
+): string {
+  if (replayedTurn) return replayedLiveTail(appliedTail, requestTail, replayedTurn.record);
+  // Replay derives the live section from the records, so only it may pass none.
+  assert(requestTail !== "", `a ${channel.rowId} row needs a non-empty section`);
+  return requestTail;
+}
+
 /**
  * Where this request sends `liveTail`. `messages` are the rows the request sends (after the
  * boundary slice and the empty-row filter), so a dropped assistant row also drops its row.
@@ -251,13 +266,14 @@ export function planCustomInstructions(
   rowsSupported: boolean,
   replayedTurn?: { record?: VolatileSystemTailRecord }
 ): VolatileSystemTailPlan {
-  return planSystemSection(
-    CUSTOM_INSTRUCTIONS,
-    messages,
-    requestBlock,
-    rowsSupported,
-    replayedTurn
-  );
+  const none = { systemTail: "", messages, rowsText: "" };
+  // Replay: the recorded prompt already holds the frozen blocks, so the records decide.
+  if (replayedTurn) {
+    return planSystemSection(CUSTOM_INSTRUCTIONS, messages, "", rowsSupported, replayedTurn);
+  }
+  // No blocks: send none and record nothing.
+  if (requestBlock === "") return none;
+  return planSystemSection(CUSTOM_INSTRUCTIONS, messages, requestBlock, rowsSupported, undefined);
 }
 
 function planSystemSection(
@@ -268,11 +284,8 @@ function planSystemSection(
   replayedTurn: { record?: VolatileSystemTailRecord } | undefined
 ): VolatileSystemTailPlan {
   if (!rowsSupported) return { systemTail: requestTail, messages, rowsText: "" };
-  assert(requestTail !== "", `a ${channel.rowId} row needs a non-empty section`);
   const restored = restoreFrozenSegment(messages, channel);
-  const liveTail = replayedTurn
-    ? replayedLiveTail(restored?.appliedTail, requestTail, replayedTurn.record)
-    : requestTail;
+  const liveTail = liveSection(channel, restored?.appliedTail, requestTail, replayedTurn);
   // Segment start (or a history from before this rule), or a re-freeze below: send as before,
   // with no earlier rows, and freeze here.
   const asBefore: VolatileSystemTailPlan = {

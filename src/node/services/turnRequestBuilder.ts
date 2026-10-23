@@ -3453,6 +3453,7 @@ export class TurnRequestBuilder {
               history: options.sourceMessages,
               systemMessage: attemptSystem,
               volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
+              instructionsSection: systemContext.instructionsSection,
               tools: attemptTools,
               modelString: seed.rawModelString,
               routeProvider: seed.routeProvider,

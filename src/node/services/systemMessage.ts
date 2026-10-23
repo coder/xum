@@ -629,11 +629,32 @@ export interface BuildSystemMessageFromSourcesOptions {
 }
 
 /**
- * Open and close the `<custom-instructions>` block. The request assembler finds the block by
- * them to keep it frozen inside a context segment (planCustomInstructions).
+ * The system message, and where its instruction-file blocks are: `<custom-instructions>` and
+ * the `<model-...>`/`<mode-...>` sections scoped in those files, one contiguous span (empty
+ * when none apply). The request assembler keeps this span frozen inside a context segment
+ * (planCustomInstructions), so an AGENTS.md change does not rewrite the cached prompt. The
+ * builder reports it: parsing the final prompt cannot tell a tag in later text from the end.
  */
-export const CUSTOM_INSTRUCTIONS_OPEN = "\n<custom-instructions>\n";
-export const CUSTOM_INSTRUCTIONS_CLOSE = "\n</custom-instructions>";
+export interface BuiltSystemMessage {
+  systemMessage: string;
+  instructionsSection: { prefix: string; block: string };
+}
+
+/** The instruction-file blocks, in prompt order (see BuiltSystemMessage). */
+function buildInstructionBlocks(
+  customInstructions: string,
+  model: { content: string | null; tag: string },
+  mode: { content: string | null; tag: string }
+): string {
+  const custom = customInstructions
+    ? `\n<custom-instructions>\n${customInstructions}\n</custom-instructions>`
+    : "";
+  return (
+    custom +
+    buildTaggedSection(model.content, model.tag, "model") +
+    buildTaggedSection(mode.content, mode.tag, "mode")
+  );
+}
 
 /**
  * Builds a system message for the AI model by combining instruction sources.
@@ -664,6 +685,7 @@ export const CUSTOM_INSTRUCTIONS_CLOSE = "\n</custom-instructions>";
  * @param additionalSystemInstructions - Optional instructions appended last
  * @param modelString - Active model identifier used for Model-specific sections
  * @param mcpServers - Optional MCP server configuration (name -> command)
+ * @returns The system message and its instruction-file span (BuiltSystemMessage)
  * @throws Error if metadata or workspacePath invalid
  */
 export function buildSystemMessageFromSources(
@@ -674,7 +696,7 @@ export function buildSystemMessageFromSources(
   modelString?: string,
   mcpServers?: MCPServerMap,
   options?: BuildSystemMessageFromSourcesOptions
-): string {
+): BuiltSystemMessage {
   if (!metadata) throw new Error("Invalid workspace metadata: metadata is required");
   if (!workspacePath) throw new Error("Invalid workspace path: workspacePath is required");
 
@@ -777,27 +799,20 @@ export function buildSystemMessageFromSources(
           .join("\n\n")
       : null;
 
-  if (customInstructions) {
-    systemMessage += `${CUSTOM_INSTRUCTIONS_OPEN}${customInstructions}${CUSTOM_INSTRUCTIONS_CLOSE}`;
-  }
-
-  if (modelContent && modelString) {
-    const modelSection = buildTaggedSection(modelContent, `model-${modelString}`, "model");
-    if (modelSection) {
-      systemMessage += modelSection;
-    }
-  }
-
-  if (modeContent && modeCandidates.length > 0) {
-    const modeSection = buildTaggedSection(modeContent, `mode-${modeCandidates[0]}`, "mode");
-    if (modeSection) {
-      systemMessage += modeSection;
-    }
-  }
+  // modelContent is null without a model string, modeContent without mode candidates.
+  const instructionsSection = {
+    prefix: systemMessage,
+    block: buildInstructionBlocks(
+      customInstructions,
+      { content: modelContent, tag: `model-${modelString}` },
+      { content: modeContent, tag: `mode-${modeCandidates[0]}` }
+    ),
+  };
+  systemMessage += instructionsSection.block;
 
   if (additionalSystemInstructions) {
     systemMessage += `\n\n<additional-instructions>\n${additionalSystemInstructions}\n</additional-instructions>`;
   }
 
-  return systemMessage;
+  return { systemMessage, instructionsSection };
 }

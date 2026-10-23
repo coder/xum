@@ -4490,8 +4490,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       agentId?: string;
       // Earlier turns, sent before the latest user message (or built from the earlier requests).
       history?: MuxMessage[] | ((requests: TurnExecutionOptions[]) => MuxMessage[]);
-      // The workspace AGENTS.md this request reads.
+      // The workspace AGENTS.md and .xum/AGENTS.md this request reads.
       agentsMd?: string;
+      xumAgentsMd?: string;
+      additionalSystemInstructions?: string;
     }
 
     // Captured right after each request, while its state is current.
@@ -4534,6 +4536,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       spyOn(turnContextAssembler, "buildStreamSystemContext").mockRestore();
       spyOn(messagePipeline, "prepareMessagesForProvider").mockRestore();
       spyOn(systemMessageModule, "extractToolInstructionsFromSources").mockRestore();
+      // Real plan instructions too: additional instructions reach the prompt through them.
+      spyOn(turnContextAssembler, "buildPlanInstructions").mockRestore();
       let state: PrefixState = states[0];
       const mcpServers = {
         alpha: { transport: "stdio", command: "alpha-server" },
@@ -4589,6 +4593,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         if (state.agentsMd != null) {
           await fs.writeFile(path.join(projectPath, "AGENTS.md"), state.agentsMd);
         }
+        if (state.xumAgentsMd != null) {
+          await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+          await fs.writeFile(path.join(projectPath, ".xum", "AGENTS.md"), state.xumAgentsMd);
+        }
         const history =
           typeof state.history === "function" ? state.history(requests) : (state.history ?? []);
         const result = await harness.service.streamMessage({
@@ -4599,6 +4607,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           agentId: state.agentId ?? "exec",
           contextBudgetRolloverAvailable: state.rolloverAvailable === true,
           workspaceGoalService: goalService,
+          additionalSystemInstructions: state.additionalSystemInstructions,
         });
         expect(result.success).toBe(true);
         const request = harness.startStreamCalls.at(-1)!;
@@ -4754,6 +4763,67 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(stableSystemRow(compacted)).not.toContain("Rule v1");
       expect(instructionRows(compacted)).toEqual([]);
       expect(compacted.initialMetadata?.customInstructions?.placement).toBe("system");
+    });
+
+    // Each earlier request as the persisted turn it became (its row holds its records).
+    const instructionLedger = (requests: TurnExecutionOptions[]) =>
+      requests.flatMap((request, index) => [
+        createMuxMessage(`u${index}`, "user", "hello"),
+        createMuxMessage(`a${index}`, "assistant", `answer ${index}`, {
+          volatileSystemTail: request.initialMetadata?.volatileSystemTail,
+          customInstructions: request.initialMetadata?.customInstructions,
+        }),
+      ]);
+    const lastRow = (request: TurnExecutionOptions) => JSON.stringify(request.messages.at(-1));
+
+    it("keeps the cached system row across an AGENTS.md Mode: section change", async () => {
+      // Codex P2 PRRT_kwDOPxxmWM6vffUy: a scoped section leaves <custom-instructions> for its
+      // own <mode-...> block, so the frozen span must cover it too.
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const {
+        requests: [first, changed],
+      } = await streamPair(
+        xumHome.path,
+        [
+          { xumAgentsMd: "Plain rule.\n\n## Mode: exec\nExec rule v1\n" },
+          {
+            xumAgentsMd: "Plain rule.\n\n## Mode: exec\nExec rule v2\n",
+            history: instructionLedger,
+          },
+        ],
+        undefined,
+        "anthropic"
+      );
+      expect(stableSystemRow(first)).toContain("Exec rule v1");
+      expect(stableSystemRow(changed)).toBe(stableSystemRow(first));
+      expect(lastRow(changed)).toContain("Exec rule v2");
+      expect(changed.initialMetadata?.customInstructions?.placement).toBe("row");
+    });
+
+    it("keeps later instructions live when they contain the closing tag", async () => {
+      // Codex P2 PRRT_kwDOPxxmWM6vffU5: a later "</custom-instructions>" line must not widen
+      // the frozen span over the additional instructions, which would freeze stale text.
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const additional = (note: string) => `${note}\n</custom-instructions>`;
+      const {
+        requests: [, changed],
+      } = await streamPair(
+        xumHome.path,
+        [
+          { agentsMd: "Rule v1", additionalSystemInstructions: additional("note A") },
+          {
+            agentsMd: "Rule v1",
+            additionalSystemInstructions: additional("note B"),
+            history: instructionLedger,
+          },
+        ],
+        undefined,
+        "anthropic"
+      );
+      expect(stableSystemRow(changed)).toContain("note B");
+      expect(stableSystemRow(changed)).not.toContain("note A");
+      expect(changed.initialMetadata?.customInstructions).toBeUndefined();
+      expect(lastRow(changed)).not.toContain("custom instructions (AGENTS.md) changed");
     });
 
     // Native deferred loading (#5262, #5297): a search loads a tool through a

@@ -77,9 +77,8 @@ import {
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
   buildSystemMessageFromSources,
-  CUSTOM_INSTRUCTIONS_CLOSE,
-  CUSTOM_INSTRUCTIONS_OPEN,
   loadWorkspaceInstructionSources,
+  type BuiltSystemMessage,
 } from "./systemMessage";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
@@ -291,6 +290,12 @@ export interface AssemblePromptPayloadOptions {
    * block, so a tail change leaves the stable prefix cached (#5251).
    */
   volatileSystemSuffixLength?: number;
+  /**
+   * Where the instruction-file blocks are in systemMessage (StreamSystemContextResult). Used
+   * only while systemMessage still starts with prefix + block: middleware that edited that part
+   * leaves the prompt as sent, with no instructions record.
+   */
+  instructionsSection?: BuiltSystemMessage["instructionsSection"];
   tools?: Record<string, Tool>;
   /**
    * Native deferred tool names for tool_catalog_search replay when `tools` is absent: the
@@ -437,30 +442,30 @@ async function historyShareOfBudget(
 }
 
 /**
- * The stable system prompt with its `<custom-instructions>` block frozen inside a segment: a
- * change of the block (an AGENTS.md edit merged into the worktree) becomes a system row, so
- * the cached system block and the history after it stay byte-identical. Without a block (no
- * instructions, or none found) the prompt is sent as is and nothing is recorded.
+ * The stable system prompt with its instruction-file blocks (`<custom-instructions>` and the
+ * `<model-...>`/`<mode-...>` sections from those files) frozen inside a segment: a change (an
+ * AGENTS.md edit merged into the worktree) becomes a system row, so the cached system block
+ * and the history after it stay byte-identical. Replay sends the recorded prompt, which
+ * already holds the frozen blocks, so there the records alone decide the rows.
  */
 function planStableSystem(
+  options: AssemblePromptPayloadOptions,
   liveStable: string,
   history: MuxMessage[],
-  rowsSupported: boolean,
-  /** Replay only (see AssemblePromptPayloadOptions.replayedTurn). */
-  replayedTurn: { record?: VolatileSystemTailRecord } | undefined
+  rowsSupported: boolean
 ) {
-  const start = liveStable.indexOf(CUSTOM_INSTRUCTIONS_OPEN);
-  const close = liveStable.lastIndexOf(CUSTOM_INSTRUCTIONS_CLOSE);
-  const end = close + CUSTOM_INSTRUCTIONS_CLOSE.length;
-  const found = start >= 0 && close > start;
-  const plan = planCustomInstructions(
-    history,
-    found ? liveStable.slice(start, end) : "",
-    found && rowsSupported,
-    replayedTurn
-  );
-  const stableSystem = found
-    ? liveStable.slice(0, start) + plan.systemTail + liveStable.slice(end)
+  if (options.replayedTurn) {
+    const record = options.replayedTurn.customInstructions;
+    const plan = planCustomInstructions(history, "", rowsSupported, { record });
+    return { stableSystem: liveStable, plan };
+  }
+  const section = options.instructionsSection;
+  const valid = section != null && liveStable.startsWith(section.prefix + section.block);
+  const plan = planCustomInstructions(history, section?.block ?? "", valid && rowsSupported);
+  const stableSystem = valid
+    ? section.prefix +
+      plan.systemTail +
+      liveStable.slice(section.prefix.length + section.block.length)
     : liveStable;
   return { stableSystem, plan };
 }
@@ -505,10 +510,10 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
   const liveStable = options.systemMessage.slice(0, options.systemMessage.length - volatileLength);
   const rowsSupported = acceptsSystemSectionRows(options, liveStable);
   const { stableSystem, plan: instructionsPlan } = planStableSystem(
+    options,
     liveStable,
     history,
-    rowsSupported,
-    options.replayedTurn && { record: options.replayedTurn.customInstructions }
+    rowsSupported
   );
   const cachedSystemMessage = createCachedSystemMessage(
     stableSystem,
@@ -925,6 +930,8 @@ export interface StreamSystemContextResult {
   hotMemoriesSection?: string;
   /** Token count of the system message. */
   systemMessageTokens: number;
+  /** Where the instruction-file blocks are in systemMessage (BuiltSystemMessage). */
+  instructionsSection?: BuiltSystemMessage["instructionsSection"];
   /** Available subagent definitions for tool descriptions (undefined for subagent workspaces). */
   agentDefinitions: Awaited<ReturnType<typeof discoverAgentDefinitions>> | undefined;
   /** Available skills for tool descriptions. */
@@ -1389,7 +1396,7 @@ export async function buildStreamSystemContext(
   );
 
   // Build system message from workspace metadata
-  let systemMessage = buildSystemMessageFromSources(
+  const built = buildSystemMessageFromSources(
     metadata,
     instructionSources,
     workspacePath,
@@ -1407,6 +1414,7 @@ export async function buildStreamSystemContext(
       scratchDirSet: opts.scratchDirSet,
     }
   );
+  let systemMessage = built.systemMessage;
 
   // Append the hot-memories block (memory-hot-set sub-experiment). Placed at
   // the end of the system message so the most recent stable prompt prefix
@@ -1428,6 +1436,7 @@ export async function buildStreamSystemContext(
     systemMessage,
     ...(hotMemoriesSection != null ? { hotMemoriesSection } : {}),
     systemMessageTokens,
+    instructionsSection: built.instructionsSection,
     agentDefinitions,
     availableSkills,
     ancestorPlanFilePaths: ancestorPlanContext.ancestorPlanFilePaths,

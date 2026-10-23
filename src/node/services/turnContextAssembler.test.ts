@@ -974,6 +974,7 @@ describe("assemblePromptPayload", () => {
           history,
           systemMessage: stable + block(rules) + tail,
           volatileSystemSuffixLength: tail.length,
+          instructionsSection: { prefix: stable, block: block(rules) },
           replayedTurn,
         });
       const turnRow = (id: string, payload: Awaited<ReturnType<typeof send>>) =>
