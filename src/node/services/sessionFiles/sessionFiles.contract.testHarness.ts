@@ -7,12 +7,13 @@
  * folder. A layer without host files creates the same paths in its own volume.
  */
 import { describe, expect, test } from "bun:test";
-import { Effect, type Layer } from "effect";
+import type { Layer } from "effect";
 import { randomUUID } from "node:crypto";
 import * as hostFs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SessionFilesTag } from "@/node/services/di/tags";
+import type { SessionFilesTag } from "@/node/services/di/tags";
+import { buildSessionFiles } from "./buildSessionFiles.testHarness";
 import { makeFaults, withFaults, type Faults } from "./faultSessionFiles.testHarness";
 import type { SessionFiles } from "./sessionFiles";
 
@@ -29,15 +30,6 @@ async function errorCode(run: () => unknown): Promise<unknown> {
 async function stamps(files: SessionFiles, file: string): Promise<string> {
   const s = await files.promises.stat(file, { bigint: true });
   return JSON.stringify([s.dev, s.ino, s.size, s.mtimeNs, s.ctimeNs].map(String));
-}
-
-/** Builds one SessionFiles from a layer. Every test builds its layer here. */
-export function buildSessionFiles(layer: Layer.Layer<SessionFilesTag>): SessionFiles {
-  return Effect.runSync(
-    Effect.gen(function* () {
-      return yield* SessionFilesTag;
-    }).pipe(Effect.provide(layer))
-  );
 }
 
 /** Creates a symlink in the layer's files; SessionFiles itself has no symlink member. */

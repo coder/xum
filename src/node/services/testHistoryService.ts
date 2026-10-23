@@ -18,7 +18,7 @@ import { HistoryService } from "@/node/services/historyService";
 import { Config } from "@/node/config";
 import type { SessionFilesTag } from "@/node/services/di/tags";
 import { SessionFilesNode } from "@/node/services/sessionFiles/nodeSessionFiles";
-import { buildSessionFiles } from "@/node/services/sessionFiles/sessionFiles.contract.testHarness";
+import { buildSessionFiles } from "@/node/services/sessionFiles/buildSessionFiles.testHarness";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import type { Layer } from "effect";
 import * as fs from "fs/promises";
