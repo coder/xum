@@ -200,11 +200,19 @@ test.each(["preview", "install"] as const)(
     const gate = new Promise<void>((resolve) => {
       finish = resolve;
     });
-    const real = api.agentPlugins[slow].bind(api.agentPlugins) as (input: never) => Promise<never>;
-    spyOn(api.agentPlugins, slow).mockImplementation(async (input: never) => {
-      await gate;
-      return real(input);
-    });
+    if (slow === "preview") {
+      const realPreview = api.agentPlugins.preview;
+      spyOn(api.agentPlugins, "preview").mockImplementation(async (input) => {
+        await gate;
+        return realPreview(input);
+      });
+    } else {
+      const realInstall = api.agentPlugins.install;
+      spyOn(api.agentPlugins, "install").mockImplementation(async (input) => {
+        await gate;
+        return realInstall(input);
+      });
+    }
     const { view, pressEnter } = await openAddPanel(api);
     const manage = view.getByRole("button", { name: "Manage components for tools" });
     if (slow === "install") {
