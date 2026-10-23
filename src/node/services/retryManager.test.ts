@@ -7,6 +7,9 @@ import {
 import { makeTestEffectRunner, type TestEffectRunner } from "./di/testEffectRunner";
 import { RetryManager, type RetryStatusEvent } from "./retryManager";
 
+// scheduledAt reads the wall clock (#7282). Its own test checks it against Date.now() bounds.
+const anyNumber = expect.any(Number) as number;
+
 /**
  * The backoff sleep runs on the injected `EffectRunner`'s clock, so the suite
  * drives it with a `TestClock` (`clock.adjust`) instead of intercepting
@@ -115,7 +118,7 @@ describe("RetryManager", () => {
         type: "auto-retry-scheduled",
         attempt: 1,
         delayMs: expectedDelay,
-        scheduledAt: expect.any(Number),
+        scheduledAt: anyNumber,
       },
     ]);
     expect(manager.isRetryPending).toBe(true);
@@ -155,7 +158,7 @@ describe("RetryManager", () => {
       type: "auto-retry-scheduled",
       attempt: 1,
       delayMs: calculateBackoffDelay(1),
-      scheduledAt: expect.any(Number),
+      scheduledAt: anyNumber,
     });
 
     // Snapshot should be defensive-copied.
@@ -168,7 +171,7 @@ describe("RetryManager", () => {
       type: "auto-retry-scheduled",
       attempt: 1,
       delayMs: calculateBackoffDelay(1),
-      scheduledAt: expect.any(Number),
+      scheduledAt: anyNumber,
     });
 
     await clock.adjust(Duration.millis(calculateBackoffDelay(1)));
