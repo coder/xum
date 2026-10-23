@@ -17,9 +17,13 @@ export interface HostFiles {
   readonly promises: Pick<
     typeof nodeFsPromises,
     | "access"
+    // constants and open: plugin discovery reads a file through one handle with O_NONBLOCK, so
+    // a FIFO cannot hang it and the bytes come from the inode it checked (discovery.ts).
+    | "constants"
     | "lstat"
     | "mkdir"
     | "mkdtemp"
+    | "open"
     | "readdir"
     | "readFile"
     | "realpath"
