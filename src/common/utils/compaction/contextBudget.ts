@@ -127,11 +127,13 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   if (input.threshold >= 1) return result;
   // Stages are best-effort. Skip a stage without headroom rather than forcing an early rollover;
   // the final assembled-payload preflight remains authoritative before dispatch. Both stages
-  // open on `projected`, which settlement and the send that publishes the prompt agree on.
+  // open on `hardProjected`, the measure their headroom check and the hard stop use, and the
+  // next turn start decides them on its own estimate too. Opening on provider usage instead let
+  // an estimate above that usage close a stage's band before it opened (#5223).
   if (
     !input.handoffRequested &&
     hardProjected + WARNING_RESERVE_TOKENS < hardCeiling &&
-    projected >= getContextBudgetHandoffPoint(limit, input.threshold)
+    hardProjected >= getContextBudgetHandoffPoint(limit, input.threshold)
   ) {
     return { ...result, decision: "handoff" };
   }
@@ -139,7 +141,7 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
   if (
     input.finalHandoffAvailable &&
     hardProjected + FLUSH_RESERVE_TOKENS < hardCeiling &&
-    projected >= getContextBudgetFinalPoint(limit)
+    hardProjected >= getContextBudgetFinalPoint(limit)
   ) {
     return { ...result, decision: "final" };
   }
