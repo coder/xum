@@ -26,7 +26,11 @@ import {
   filterEmptyAssistantMessages,
 } from "@/browser/utils/messages/modelMessageTransform";
 import type { Instructions, ModelMessage, SystemModelMessage, Tool } from "ai";
-import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
+import {
+  findLatestContextBoundaryIndex,
+  sliceMessagesForProviderFromLatestContextBoundary,
+} from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
 import type { CountCompactionRowTokens } from "@/common/utils/messages/compactionRowSizing";
 import { trimCompactionInput } from "@/common/utils/messages/trimCompactionInput";
@@ -473,13 +477,38 @@ function planStableSystem(
   }
   const section = options.instructionsSection;
   const valid = section != null && liveStable.startsWith(section.prefix + section.block);
-  const plan = planCustomInstructions(history, section?.block ?? "", valid && rowsSupported);
+  const plan = planCustomInstructions(
+    history,
+    section?.block ?? "",
+    valid && rowsSupported,
+    undefined,
+    switchesModelOrAgent(options, history)
+  );
   const stableSystem = valid
     ? section.prefix +
       plan.systemTail +
       liveStable.slice(section.prefix.length + section.block.length)
     : liveStable;
   return { stableSystem, plan };
+}
+
+/**
+ * Whether this request's model or agent differs from the segment's previous turn. The
+ * instruction blocks then re-freeze instead of sending the new model's or agent's
+ * `<model-...>`/`<mode-...>` sections in a row under the old ones: that costs no cache, since
+ * each model has its own prompt cache and an agent switch already changes the
+ * `<agent-instructions>` before the blocks (buildSystemMessageFromSources).
+ */
+function switchesModelOrAgent(options: AssemblePromptPayloadOptions, history: MuxMessage[]) {
+  const previous = history
+    .slice(findLatestContextBoundaryIndex(history) + 1)
+    .findLast((message) => message.role === "assistant")?.metadata;
+  // Rows record the canonical model (Coder ids raw), so compare both sides canonicalized.
+  const model = previous?.model;
+  if (model != null && normalizeToCanonical(model) !== normalizeToCanonical(options.modelString)) {
+    return true;
+  }
+  return previous?.agentId != null && previous.agentId !== options.effectiveAgentId;
 }
 
 /**

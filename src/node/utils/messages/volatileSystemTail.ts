@@ -287,14 +287,21 @@ export function planCustomInstructions(
   messages: MuxMessage[],
   requestBlock: string,
   rowsSupported: boolean,
-  replayedTurn?: { record?: VolatileSystemTailRecord }
+  replayedTurn?: { record?: VolatileSystemTailRecord },
+  /**
+   * The request switches model or agent: a change re-freezes instead of becoming a row. The
+   * blocks hold the `<model-...>`/`<mode-...>` sections of the previous model or agent, and
+   * the switch already rewrites the cache (see turnContextAssembler's switchesModelOrAgent).
+   */
+  refreeze = false
 ): VolatileSystemTailPlan {
   return planRemovableSection(
     { ...CUSTOM_INSTRUCTIONS, removed: INSTRUCTIONS_REMOVED },
     messages,
     requestBlock,
     rowsSupported,
-    replayedTurn
+    replayedTurn,
+    refreeze
   );
 }
 
@@ -310,7 +317,8 @@ function planRemovableSection(
   messages: MuxMessage[],
   requestSection: string,
   rowsSupported: boolean,
-  replayedTurn: { record?: VolatileSystemTailRecord } | undefined
+  replayedTurn: { record?: VolatileSystemTailRecord } | undefined,
+  refreeze = false
 ): VolatileSystemTailPlan {
   if (replayedTurn) return planSystemSection(channel, messages, "", rowsSupported, replayedTurn);
   const removed = requestSection === "";
@@ -327,7 +335,7 @@ function planRemovableSection(
     if (appliedTail === "") return withRows;
   }
   const live = removed ? channel.removed : requestSection;
-  const plan = planSystemSection(channel, messages, live, rowsSupported, undefined);
+  const plan = planSystemSection(channel, messages, live, rowsSupported, undefined, refreeze);
   // A re-freeze after a removal freezes "no section", not the marker.
   return plan.systemTail === channel.removed ? { ...plan, systemTail: "" } : plan;
 }
@@ -358,7 +366,8 @@ function planSystemSection(
   messages: MuxMessage[],
   requestTail: string,
   rowsSupported: boolean,
-  replayedTurn: { record?: VolatileSystemTailRecord } | undefined
+  replayedTurn: { record?: VolatileSystemTailRecord } | undefined,
+  refreeze = false
 ): VolatileSystemTailPlan {
   if (!rowsSupported) return { systemTail: requestTail, messages, rowsText: "" };
   const restored = restoreFrozenSegment(messages, channel);
@@ -375,8 +384,10 @@ function planSystemSection(
   const { appliedTail, ...withRows } = restored;
   if (liveTail === appliedTail) return withRows;
   // A row must follow a user message. Otherwise (a resume after an assistant row) send the new
-  // tail as before, which re-freezes the segment at it.
-  if (messages.at(-1)?.role !== "user") return asBefore;
+  // tail as before, which re-freezes the segment at it. So does a caller's re-freeze, and on
+  // replay a turn that recorded one (a "system" record after the freeze is only ever that).
+  const refrozen = replayedTurn ? replayedTurn.record?.placement === "system" : refreeze;
+  if (messages.at(-1)?.role !== "user" || refrozen) return asBefore;
   const appendedRow = systemRow(`${channel.rowId}-pending`, channel, liveTail);
   return {
     ...withRows,

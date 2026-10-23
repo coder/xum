@@ -1182,6 +1182,49 @@ describe("assemblePromptPayload", () => {
       );
     });
 
+    test("a model or agent switch re-freezes the instruction blocks instead of a row", async () => {
+      // F30a: the new model's (or agent's) sections replace the old ones in the system prompt.
+      // Each model has its own cache, and an agent switch changes <agent-instructions> before
+      // the blocks, so this costs no cache; a same-model, same-agent change is still a row.
+      const block = (tag: string) => `\n<custom-instructions>\nRule\n</custom-instructions>\n<${tag}>\nx\n</${tag}>`;
+      const send = (live: string, history: MuxMessage[], route: object = {}) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable + live,
+          instructionsSection: { prefix: stable, block: live },
+          ...route,
+        });
+      const opusRow = createMuxMessage("a1", "assistant", "answer", {
+        model: "anthropic:claude-opus-5-5",
+        agentId: "exec",
+        customInstructions: { text: block("model-opus"), placement: "system" },
+      });
+      const history = [
+        createMuxMessage("u1", "user", "first"),
+        opusRow,
+        createMuxMessage("u2", "user", "second"),
+      ];
+      const sonnet = { modelString: "anthropic:claude-sonnet-5-5" };
+      for (const [live, route] of [
+        [block("model-sonnet"), sonnet],
+        [block("mode-plan"), { effectiveAgentId: "plan" }],
+      ] as const) {
+        const switched = await send(live, history, route);
+        expect(switched.messages[0]).toMatchObject({ role: "system", content: stable + live });
+        expect(switched.messages.filter((message) => message.role === "system")).toHaveLength(1);
+        expect(switched.customInstructions).toEqual({ text: live, placement: "system" });
+        // The replay verifier rebuilds the same request from the turn's record.
+        const replayed = await send(live, history, {
+          ...route,
+          replayedTurn: { customInstructions: switched.customInstructions },
+        });
+        expect(withoutMarkers(replayed.messages)).toBe(withoutMarkers(switched.messages));
+      }
+      const sameModel = await send(block("model-opus-v2"), history);
+      expect(sameModel.customInstructions?.placement).toBe("row");
+    });
+
     test("a compaction boundary starts a new segment with the live tail", async () => {
       const boundary = createMuxMessage("boundary", "assistant", "Compacted summary", {
         compacted: "user",
