@@ -203,19 +203,42 @@ const FAILURE_RETRY_MS = 60_000;
  * Callers of a pending key still share its read.
  */
 export const MAX_COLD_READS = 4;
+/** Per agent host, inside MAX_COLD_READS: a slow or unreachable host never takes every slot. */
+export const MAX_COLD_READS_PER_HOST = 2;
 let coldReads = 0;
-const waitingColdReads: Array<() => void> = [];
+const coldReadsByHost = new Map<string, number>();
+const waitingColdReads: Array<{ host: string; start: () => void }> = [];
 
-/** Runs `read` when a cold-read slot is free; a waiter takes over the slot of a finished read. */
-async function withColdReadSlot<T>(read: () => Promise<T>): Promise<T> {
-  if (coldReads < MAX_COLD_READS) coldReads++;
-  else await new Promise<void>((resolve) => waitingColdReads.push(resolve));
+function hasColdReadSlot(host: string): boolean {
+  return coldReads < MAX_COLD_READS && (coldReadsByHost.get(host) ?? 0) < MAX_COLD_READS_PER_HOST;
+}
+
+function takeColdReadSlot(host: string): void {
+  coldReads++;
+  coldReadsByHost.set(host, (coldReadsByHost.get(host) ?? 0) + 1);
+}
+
+/** Frees one slot and starts the oldest waiter that now fits (at most one can). */
+function releaseColdReadSlot(host: string): void {
+  coldReads--;
+  const left = (coldReadsByHost.get(host) ?? 1) - 1;
+  if (left === 0) coldReadsByHost.delete(host);
+  else coldReadsByHost.set(host, left);
+  const next = waitingColdReads.findIndex((waiter) => hasColdReadSlot(waiter.host));
+  if (next === -1) return;
+  const [waiter] = waitingColdReads.splice(next, 1);
+  takeColdReadSlot(waiter.host);
+  waiter.start();
+}
+
+/** Runs `read` once a cold-read slot for `host` is free. */
+async function withColdReadSlot<T>(host: string, read: () => Promise<T>): Promise<T> {
+  if (hasColdReadSlot(host)) takeColdReadSlot(host);
+  else await new Promise<void>((start) => waitingColdReads.push({ host, start }));
   try {
     return await read();
   } finally {
-    const next = waitingColdReads.shift();
-    if (next === undefined) coldReads--;
-    else next();
+    releaseColdReadSlot(host);
   }
 }
 
@@ -269,9 +292,9 @@ function freshEntry(key: string): SnapshotEntry | undefined {
 }
 
 /** Starts a read for `key`; it is published only if no trust change overtook it. */
-function startRead(key: string, args: RemotePluginArgs): SnapshotEntry {
+function startRead(key: string, host: string, args: RemotePluginArgs): SnapshotEntry {
   const generation = trustGeneration;
-  const read = withColdReadSlot(() =>
+  const read = withColdReadSlot(host, () =>
     // A trust change while this read waited for a slot: it never runs a command.
     generation === trustGeneration ? createRemoteProjectPluginSnapshot(args) : Promise.resolve(null)
   );
@@ -320,7 +343,7 @@ export function getRemoteProjectPluginSnapshot(
   }
   if (hostKey === undefined) return Promise.resolve(null);
   const key = JSON.stringify([hostKey, checkoutRoot, containers]);
-  const entry = freshEntry(key) ?? startRead(key, { runtime, checkoutRoot, containers });
+  const entry = freshEntry(key) ?? startRead(key, hostKey, { runtime, checkoutRoot, containers });
   return entry.promise;
 }
 
