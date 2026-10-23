@@ -41,7 +41,17 @@ jobs:
       # tests: code or CI config changed, and this isn't the merge queue's post-merge
       # push to main (the merge_group run already validated that exact commit).
       tests: ${{ (steps.filter.outputs.src == 'true' || steps.filter.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-      linux-runner: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+      # Depot runner sizes. Depot bills 2x, 4x and 8x the elapsed minutes on 4, 8 and 16 vCPU, so
+      # each job takes the smallest size that keeps its time. Measured on 2026-10-23 with dispatch
+      # runs 39935678316, 39935681840, 39937158652 and 39937162755: Unit, E2E, the bug-bash
+      # sandbox, Storybook, Smoke / Server and the builds ran as fast on 4 vCPU as on 16.
+      # Integration ran 1.7x longer on 4 vCPU (jest.config.js caps it at 4 workers, which 8 vCPU
+      # fits). On 2 vCPU, E2E and the sandbox ran out of heap and unit test hooks timed out.
+      # Static Checks keeps 16: 4 cold ESLint workers need 8 GiB each. Labels go through these
+      # outputs, not literals, because actionlint refuses unknown runner labels.
+      runner-4: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-4' || 'ubuntu-latest' }}
+      runner-8: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-8' || 'ubuntu-latest' }}
+      runner-16: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -136,7 +146,7 @@ jobs:
     name: Static Checks
     needs: [changes]
     if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-16 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -258,7 +268,7 @@ jobs:
     if: needs.changes.outputs.tests == 'true'
     # Bound hung runs while allowing setup, build, coverage, and cleanup to finish.
     timeout-minutes: 20
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     strategy:
       fail-fast: false
       matrix:
@@ -365,7 +375,7 @@ jobs:
     # 32639270365, 32640298486). 20 minutes lets jest fail the hung test with real
     # diagnostics and still bounds a wedged runner.
     timeout-minutes: 20
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-8 }}
     strategy:
       fail-fast: false
       matrix:
@@ -702,7 +712,7 @@ jobs:
     name: Test / Storybook
     needs: [changes]
     if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -743,7 +753,7 @@ jobs:
           - { os: linux, shard: 3/4 }
           - { os: linux, shard: 4/4 }
           - { os: macos }
-    runs-on: ${{ matrix.os == 'macos' && 'macos-latest' || needs.changes.outputs.linux-runner }}
+    runs-on: ${{ matrix.os == 'macos' && 'macos-latest' || needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -820,7 +830,7 @@ jobs:
     if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
     # 45, not 30: a stale image key adds a local image build of up to 25 minutes (below).
     timeout-minutes: 45
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     # Stale-key local build: only main publishes the image, so a PR that changes its inputs (Dockerfile, build.sh,
     # playwright-core) has a stale image.json. With this opt-in the launcher then builds the image
     # locally with build.sh, for these two jobs only, and prints a warning. Model-driven runs
@@ -889,7 +899,7 @@ jobs:
     name: Smoke / Server
     needs: [changes]
     if: needs.changes.outputs.tests == 'true'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -929,7 +939,7 @@ jobs:
       github.event_name == 'merge_group' ||
       (github.event_name == 'push' && github.actor != 'github-merge-queue[bot]') ||
       (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true')
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-16 }}
     permissions:
       contents: read
       id-token: write # Depot OIDC authentication
@@ -1109,7 +1119,7 @@ jobs:
     name: Build / Linux
     needs: [changes]
     if: needs.changes.outputs.tests == 'true'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -1225,7 +1235,7 @@ jobs:
     name: Build / VS Code
     needs: [changes]
     if: needs.changes.outputs.tests == 'true'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -1244,7 +1254,9 @@ jobs:
     name: Codex Comments
     needs: [changes]
     if: github.event_name == 'pull_request'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    # A waiter (it polls Codex for up to 900 s) needs no CPU, and GitHub-hosted standard runners
+    # are free for this public repo, so it does not take a Depot runner.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
