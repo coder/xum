@@ -42,7 +42,8 @@
   },
   {
     "site": "node/services/compactionCancellation.ts",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-clear"
   },
   {
     "site": "node/services/historyService.ts",
@@ -57,6 +58,11 @@
     "lockPath": "<tmp>/mux-home/locks/history-<h>.lock",
     "timeoutMs": 10000,
     "label": "history write lock"
+  },
+  {
+    "site": "node/services/historyService.ts",
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-clear"
   },
   {
     "site": "node/services/historyService.ts",
@@ -88,7 +94,8 @@
   },
   {
     "site": "node/services/initStateManager.ts",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-init"
   },
   {
     "site": "node/services/initStateManager.ts",
@@ -140,27 +147,33 @@
   },
   {
     "site": "node/services/sessionTimingService.ts",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-usage"
   },
   {
     "site": "node/services/sessionUsageService.ts",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-usage"
   },
   {
     "site": "node/services/subagentFailureArtifacts.ts",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-parent"
   },
   {
     "site": "node/services/subagentGitPatchArtifacts.ts",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-parent"
   },
   {
     "site": "node/services/subagentReportArtifacts.ts",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-parent"
   },
   {
     "site": "node/services/subagentTranscriptArtifacts.ts",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-parent"
   },
   {
     "site": "node/services/taskHandleStore.ts",
@@ -189,7 +202,8 @@
   },
   {
     "site": "node/services/workspaceGoalService.ts",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-usage"
   },
   {
     "site": "node/services/workspaceRemoval.ts",
@@ -283,10 +297,12 @@
   },
   {
     "site": "node/utils/sessionFile.ts",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-init"
   },
   {
     "site": "unknown",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-clear"
   }
 ]
