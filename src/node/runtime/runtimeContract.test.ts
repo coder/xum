@@ -4,7 +4,7 @@ import { createMemoryHost } from "@/node/services/hostFiles/memoryHostFiles.test
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import { LocalRuntime } from "./LocalRuntime";
-import { RuntimeError, isRuntimePathAbsentError, type Runtime } from "./Runtime";
+import { RuntimeError, isRuntimePathAbsentError, type ExecOptions, type Runtime } from "./Runtime";
 
 interface RuntimeUnderTest extends Disposable {
   runtime: Runtime;
@@ -129,6 +129,29 @@ describe("FakeRuntime", () => {
       expect((refusal as RuntimeError).type).toBe("exec");
     }
     expect(await host.runtime.stat(streamDir)).toMatchObject({ isDirectory: true });
+  });
+
+  test("an option that the entry cannot honor is refused by name, and one that holds passes", async () => {
+    const host = createMemoryHost({
+      commands: { "git status": { stdout: "clean\n" }, "git fetch": () => ({ stdout: "" }) },
+    });
+    const run = (command: string, options: Omit<ExecOptions, "cwd">) =>
+      host.runtime.exec(command, { cwd: "/", ...options }).then(
+        (exec) => exec.exitCode,
+        (error: Error) => error.message
+      );
+    // A fixed outcome settles at once and reads no environment.
+    expect(await run("git status", { timeout: 10, env: { A: "1" } })).toBe(0);
+    expect(await run("git status", { forcePTY: true })).toBe(
+      "The scripted layer cannot honor the option forcePTY for: git status"
+    );
+    // A function entry can be slow and gets only the call.
+    expect(await run("git fetch", { timeout: 10 })).toBe(
+      "The scripted layer cannot honor the option timeout for: git fetch"
+    );
+    expect(await run("git fetch", { env: { A: "1" } })).toBe(
+      "The scripted layer cannot honor the option env for: git fetch"
+    );
   });
 
   test("an exec whose signal is already aborted runs nothing", async () => {
