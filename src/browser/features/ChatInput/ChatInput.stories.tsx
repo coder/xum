@@ -48,6 +48,31 @@ export const VoiceInputNoApiKey: AppStory = {
   },
 };
 
+/** Transcription resolves OpenAI keys from env vars and key files too, so those enable the mic. */
+export const VoiceInputEnvApiKey: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          workspaceId: "ws-voice-env-key",
+          messages: [],
+          providersConfig: {
+            openai: { apiKeySet: false, apiKeySource: "env", isEnabled: true, isConfigured: true },
+          },
+        })
+      }
+    />
+  ),
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const canvas = within(storyRoot);
+    const mic = await canvas.findByRole("button", { name: /^Voice input/ });
+    await waitFor(() => expect(mic).toHaveAccessibleName("Voice input"));
+    await expect(mic).toBeEnabled();
+  },
+};
+
 export const ComposerTooltip: AppStory = {
   tags: ["tooltip-visual"],
   globals: {

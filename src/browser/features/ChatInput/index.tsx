@@ -34,6 +34,7 @@ import { useAPI, type APIClient, useLiveAPI } from "@/browser/contexts/API";
 import { CONNECTION_LOST_MESSAGE } from "@/browser/contexts/connectionLink";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
+import { hasOpenAIApiKey } from "@/common/utils/providers/codexOauthRouting";
 import {
   useAdditionalSystemContextHydrated,
   useAdditionalSystemContextSnapshot,
@@ -1571,7 +1572,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         async () => {
           const config = await api.providers.getConfig();
           if (!signal.aborted) {
-            setOpenAIKeySet(config?.openai?.apiKeySet ?? false);
+            // VoiceService resolves keys from config, key files and env vars alike. Codex OAuth
+            // alone cannot transcribe, so isConfigured is not enough.
+            setOpenAIKeySet(hasOpenAIApiKey(config?.openai));
             setOpenAIProviderEnabled(config?.openai?.isEnabled ?? true);
           }
         },
