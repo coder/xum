@@ -1,0 +1,276 @@
+[
+  {
+    "site": "node/config/projectRegistrationLock.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:owner>/locks/project-registration.lock",
+        "timeoutMs": 1,
+        "label": "project registration lock"
+      }
+    ]
+  },
+  {
+    "site": "node/config/projectRegistrationLock.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:refine>/locks/project-registration.lock",
+        "timeoutMs": 1,
+        "label": "project registration lock"
+      }
+    ]
+  },
+  {
+    "site": "node/services/agentSession.ts",
+    "fn": "WorkspaceUseLeases.hold",
+    "args": ["ws-record-refusal", "turn"]
+  },
+  {
+    "site": "node/services/agentSession.ts",
+    "fn": "WorkspaceUseLeases.hold",
+    "args": ["ws-record-turn", "turn"]
+  },
+  {
+    "site": "node/services/branchSummary.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:fork>/sessions/ws-record-fork/branch-summary.lock",
+        "timeoutMs": 21000,
+        "label": "branch summary pending marker"
+      }
+    ]
+  },
+  {
+    "site": "node/services/branchSummary.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:fork>/sessions/ws-record-fork/branch-summary.lock",
+        "timeoutMs": 5000,
+        "label": "branch summary pending marker"
+      }
+    ]
+  },
+  {
+    "site": "node/services/historyService.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:refine>/locks/history-<hash:history:ws-record-refine>.lock",
+        "timeoutMs": 10000,
+        "label": "history write lock"
+      }
+    ]
+  },
+  {
+    "site": "node/services/historyService.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:refusal>/locks/history-<hash:history:ws-record-refusal>.lock",
+        "timeoutMs": 10000,
+        "label": "history write lock"
+      }
+    ]
+  },
+  {
+    "site": "node/services/historyService.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:turn>/locks/history-<hash:history:ws-record-turn>.lock",
+        "timeoutMs": 10000,
+        "label": "history write lock"
+      }
+    ]
+  },
+  {
+    "site": "node/services/historyService.ts",
+    "fn": "workspaceFiles.withLock",
+    "args": ["ws-record-refine", "<function>"]
+  },
+  {
+    "site": "node/services/historyService.ts",
+    "fn": "workspaceFiles.withLock",
+    "args": ["ws-record-refusal", "<function>"]
+  },
+  {
+    "site": "node/services/historyService.ts",
+    "fn": "workspaceFiles.withLock",
+    "args": ["ws-record-turn", "<function>"]
+  },
+  {
+    "site": "node/services/refinement/refineService.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:refine>/locks/refine-apply-<hash:history:ws-record-refine>.lock",
+        "timeoutMs": 10000,
+        "label": "refine apply lock"
+      }
+    ]
+  },
+  {
+    "site": "node/services/refinement/refineService.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:refine>/locks/refine-apply-<hash:history:ws-record-refine>.lock",
+        "timeoutMs": 10000,
+        "label": "refine staging lock"
+      }
+    ]
+  },
+  {
+    "site": "node/services/refinement/targetMutationLocks.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:removal>/xum-home/locks/target-<hash:target:<root:removal>/xum-home/memory>.lock",
+        "timeoutMs": 2000,
+        "label": "target mutation lock"
+      }
+    ]
+  },
+  {
+    "site": "node/services/refinement/targetMutationLocks.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:removal>/xum-home/locks/target-<hash:target:<root:removal>/xum-home/sessions/ws-record-removal/memory>.lock",
+        "timeoutMs": 2000,
+        "label": "target mutation lock"
+      }
+    ]
+  },
+  {
+    "site": "node/services/refinement/targetMutationLocks.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:removal>/xum-home/locks/target-<hash:target:<root:removal>/xum-home/sessions/ws-record-removal/session-memory>.lock",
+        "timeoutMs": 2000,
+        "label": "target mutation lock"
+      }
+    ]
+  },
+  {
+    "site": "node/services/refinement/targetMutationLocks.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:removal>/xum-home/locks/target-<hash:target:<root:removal>/xum-home/sessions/ws-record-removal>.lock",
+        "timeoutMs": 2000,
+        "label": "target mutation lock"
+      }
+    ]
+  },
+  {
+    "site": "node/services/tools/review_pane.ts",
+    "fn": "workspaceFiles.withLock",
+    "args": ["ws-record-turn", "<function>"]
+  },
+  {
+    "site": "node/services/tools/todo.ts",
+    "fn": "workspaceFiles.withLock",
+    "args": ["ws-record-turn", "<function>"]
+  },
+  {
+    "site": "node/services/workspaceRemoval.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:removal>/xum-home/locks/history-<hash:history:ws-record-removal>.lock",
+        "timeoutMs": 10000,
+        "label": "history write lock (removal)"
+      }
+    ]
+  },
+  {
+    "site": "node/services/workspaceRemoval.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:removal>/xum-home/locks/refine-apply-<hash:history:ws-record-removal>.lock",
+        "timeoutMs": 10000,
+        "label": "refine serialization lock (removal)"
+      }
+    ]
+  },
+  {
+    "site": "node/services/workspaceTurnManager.ts",
+    "fn": "acquireCrossProcessLock",
+    "args": [
+      {
+        "lockPath": "<root:owner>/locks/workspace-turns/wst_handle.lock",
+        "acquireTimeoutMs": 0,
+        "staleMs": 300000,
+        "timeoutMessage": "Workspace turn wst_handle is owned by another live Xum backend."
+      }
+    ]
+  },
+  {
+    "site": "node/services/workspaceTurnManager.ts",
+    "fn": "inspectCrossProcessLock",
+    "args": ["<root:owner>/locks/workspace-turns/wst_handle.lock"]
+  },
+  {
+    "site": "node/services/workspaceUseLeases.ts",
+    "fn": "acquireCrossProcessLock",
+    "args": [
+      {
+        "lockPath": "<root:refusal>/locks/workspace-mutation/<hash:workspace-use:ws-record-refusal>.lock",
+        "acquireTimeoutMs": 0,
+        "staleMs": 300000,
+        "timeoutMessage": "Workspace ws-record-refusal is already being renamed, removed or archived."
+      }
+    ]
+  },
+  {
+    "site": "node/services/workspaceUseLeases.ts",
+    "fn": "acquireCrossProcessLock",
+    "args": [
+      {
+        "lockPath": "<root:refusal>/locks/workspace-use/<hash:workspace-use:ws-record-refusal>/<uuid>.turn.lock",
+        "acquireTimeoutMs": 0,
+        "staleMs": 300000,
+        "timeoutMessage": "Workspace use lease <root:refusal>/locks/workspace-use/<hash:workspace-use:ws-record-refusal>/<uuid>.turn.lock is unexpectedly held."
+      }
+    ]
+  },
+  {
+    "site": "node/services/workspaceUseLeases.ts",
+    "fn": "acquireCrossProcessLock",
+    "args": [
+      {
+        "lockPath": "<root:turn>/locks/workspace-use/<hash:workspace-use:ws-record-turn>/<uuid>.turn.lock",
+        "acquireTimeoutMs": 0,
+        "staleMs": 300000,
+        "timeoutMessage": "Workspace use lease <root:turn>/locks/workspace-use/<hash:workspace-use:ws-record-turn>/<uuid>.turn.lock is unexpectedly held."
+      }
+    ]
+  },
+  {
+    "site": "node/services/workspaceUseLeases.ts",
+    "fn": "inspectCrossProcessLock",
+    "args": ["<root:refusal>/locks/workspace-mutation/<hash:workspace-use:ws-record-refusal>.lock"]
+  },
+  {
+    "site": "node/services/workspaceUseLeases.ts",
+    "fn": "inspectCrossProcessLock",
+    "args": ["<root:turn>/locks/workspace-mutation/<hash:workspace-use:ws-record-turn>.lock"]
+  },
+  {
+    "site": "node/utils/journal/durableEventJournal.ts",
+    "fn": "acquireProcessFileLock",
+    "args": [
+      {
+        "lockPath": "<root:turn>/sessions/ws-record-turn/blobs.lock",
+        "timeoutMs": 10000,
+        "label": "blob lock"
+      }
+    ]
+  }
+]
