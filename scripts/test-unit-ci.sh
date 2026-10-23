@@ -14,10 +14,12 @@
 #                    across all shards; consumed by scripts/check-test-routing.sh
 #        --list-no-coverage  prints the isolated files that run without coverage;
 #                    consumed by scripts/mutate/check.ts
+#        --list-isolated  prints every isolated file (they each need their own process);
+#                    consumed by `make test-unit`
 set -euo pipefail
 
 mode="${1:-}"
-if [[ "$mode" == "--list-all" || "$mode" == "--list-no-coverage" ]]; then
+if [[ "$mode" == "--list-all" || "$mode" == "--list-no-coverage" || "$mode" == "--list-isolated" ]]; then
   SHARD_INDEX=1
   SHARD_TOTAL=1
 fi
@@ -323,6 +325,10 @@ if [[ "$mode" == "--list" ]]; then
 fi
 if [[ "$mode" == "--list-all" ]]; then
   printf '%s\n' "${isolated_unit_tests[@]}" "${tooling_files[@]}" "${unit_files[@]}"
+  exit 0
+fi
+if [[ "$mode" == "--list-isolated" ]]; then
+  printf '%s\n' "${isolated_unit_tests[@]}"
   exit 0
 fi
 if [[ "$mode" == "--list-no-coverage" ]]; then

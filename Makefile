@@ -735,9 +735,14 @@ test-integration: node_modules/.installed build-main ## Run all tests (unit + in
 	@bun test src
 	@TEST_INTEGRATION=1 bun x jest tests
 
+# The files in test-unit-ci.sh's isolated list fail when another test file shares their process
+# (#7297), so they run one per process here too, as in CI. The two shared runs skip them.
 test-unit: node_modules/.installed build-main ## Run unit tests
-	@bun test src
-	@bun test ./tests/ui/storybook/ ./tests/ui/domIsolation.test.ts ./vscode/src/ ./scripts/
+	@set -e; isolated="$$(./scripts/test-unit-ci.sh --list-isolated)"; ignores=(); \
+	for f in $$isolated; do ignores+=("--path-ignore-patterns=$${f#./}"); done; \
+	bun test src "$${ignores[@]}"; \
+	bun test ./tests/ui/storybook/ ./tests/ui/domIsolation.test.ts ./vscode/src/ ./scripts/ "$${ignores[@]}"; \
+	for f in $$isolated; do bun test "./$${f#./}"; done
 
 # The host trap self-tests and the in-memory agent-loop proof, in their own bun process.
 # tests/hostProof.bunfig.toml loads the trap before tests/setup.ts. *.hostProof.ts files are
