@@ -1256,6 +1256,43 @@ describe("assemblePromptPayload", () => {
       expect(unchanged.customInstructions).toBeUndefined();
     });
 
+    test("Tool: instructions it cannot place or a corrupt record keep the live descriptions", async () => {
+      const send = (description: string, instructions: string, history: MuxMessage[]) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable,
+          tools: { bash: tool({ description, inputSchema: jsonSchema({ type: "object" }) }) },
+          toolInstructions: { bash: instructions },
+        });
+      const frozenAt = (text: string) => [
+        createMuxMessage("u1", "user", "first"),
+        createMuxMessage("a1", "assistant", "answer", {
+          toolInstructions: { text, placement: "system" },
+        }),
+        createMuxMessage("u2", "user", "second"),
+      ];
+      const systemRows = (payload: Awaited<ReturnType<typeof send>>) =>
+        payload.messages.filter((message) => message.role === "system").length;
+
+      // A wrapper rewrote the description after getToolsForModel, so it no longer ends with
+      // its instructions: the request sends as before, with no record and no row.
+      const rewritten = await send(
+        "Run bash (rewritten).",
+        "Use fd.",
+        frozenAt(JSON.stringify({ bash: "Use rg." }))
+      );
+      expect(rewritten.tools?.bash?.description).toBe("Run bash (rewritten).");
+      expect(rewritten.toolInstructions).toBeUndefined();
+      expect(systemRows(rewritten)).toBe(1);
+
+      // A corrupt frozen record: the live description stays, and a row sends the live text.
+      const corrupt = await send("Run bash.\n\nUse rg.", "Use rg.", frozenAt("{not json"));
+      expect(corrupt.tools?.bash?.description).toBe("Run bash.\n\nUse rg.");
+      expect(corrupt.toolInstructions?.placement).toBe("row");
+      expect(JSON.stringify(corrupt.messages.at(-1))).toContain("Use rg.");
+    });
+
     test("a Tool: section change keeps the frozen tool descriptions and sends a row", async () => {
       // Codex PRRT_kwDOPxxmWM6vgBAW: getToolsForModel appends each tool's Tool: section to its
       // description, inside the cached tool block. A change is a row; the block stays.
