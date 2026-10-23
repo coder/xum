@@ -12,6 +12,8 @@
  *   `<userHome>/.xum-tmp` deletes that entry and exits 0 (not for the names . and ..). Any other command without an entry
  *   rejects with a RuntimeError "exec" that names it. An exec whose signal is already aborted
  *   rejects before it runs anything, as LocalRuntime does.
+ *   An option that the entry cannot honor is refused by name (refuseSetOptions): pathEnv,
+ *   hostEnv and forcePTY always, and timeout and env for a function entry.
  * - idle() resolves when every exec has settled, so a test can drain fire-and-forget execs.
  * - The workspace lifecycle methods reject: loop tests do not create workspaces.
  */
@@ -19,6 +21,7 @@ import * as path from "node:path";
 import type { MemFs } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
 import {
   lookupScriptedCommand,
+  refuseSetOptions,
   type ScriptTable,
   type ScriptedOutcome,
 } from "@/node/services/hostProcesses/scriptedCommands.testHarness";
@@ -83,7 +86,11 @@ export class FakeRuntime implements Runtime {
     return target.replace(/^~(?=\/|$)/, this.options.userHome);
   }
 
-  private async outcomeOf(command: string, cwd: string): Promise<ScriptedOutcome> {
+  // The option rules of refuseSetOptions: the built-in rule and a fixed outcome settle at once
+  // and read no environment, so timeout and env hold for them. A function entry refuses both.
+  private async outcomeOf(command: string, options: ExecOptions): Promise<ScriptedOutcome> {
+    const { cwd } = options;
+    refuseSetOptions(command, options, ["pathEnv", "hostEnv", "forcePTY"]);
     const removal = RM_RF_ONE_NAME.exec(command);
     // "." and ".." name the folder itself and its parent, never one stream folder.
     if (
@@ -95,11 +102,13 @@ export class FakeRuntime implements Runtime {
       await this.fs.promises.rm(path.posix.join(cwd, removal[1]), { recursive: true, force: true });
       return { exitCode: 0 };
     }
-    const outcome = await lookupScriptedCommand(this.options.commands ?? {}, command, {
-      file: command,
-      args: [],
-      cwd,
-    });
+    const outcome = await lookupScriptedCommand(
+      this.options.commands ?? {},
+      command,
+      { file: command, args: [], cwd },
+      options,
+      ["timeout", "env"]
+    );
     if (outcome === undefined) {
       throw new RuntimeError(`FakeRuntime has no scripted command: ${command}`, "exec");
     }
@@ -111,7 +120,7 @@ export class FakeRuntime implements Runtime {
     if (options.abortSignal?.aborted) {
       return Promise.reject(new RuntimeError("Operation aborted before execution", "exec"));
     }
-    const started = this.outcomeOf(command, options.cwd).then((outcome) => ({
+    const started = this.outcomeOf(command, options).then((outcome) => ({
       stdout: streamOf(outcome.stdout ?? ""),
       stderr: streamOf(outcome.stderr ?? ""),
       stdin: new WritableStream<Uint8Array>(),
