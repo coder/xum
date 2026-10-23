@@ -28,9 +28,10 @@ import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import * as jsonc from "jsonc-parser";
 import semver from "semver";
+import { NPM_PUBLIC_REGISTRY } from "../src/constants/serverUpdate";
 import { nestShrinkwrap } from "../src/node/services/serverUpdate/shrinkwrap";
 
-const REGISTRY = "https://registry.npmjs.org";
+const REGISTRY = NPM_PUBLIC_REGISTRY;
 const FETCH_CONCURRENCY = 16;
 const FETCH_ATTEMPTS = 4;
 
@@ -381,7 +382,10 @@ export function tarballInstallFiles(
       bin: wrapper.manifest.bin,
     };
   }
-  Object.assign(packages, nestShrinkwrap(shrinkwrap, pkg.manifest.name, `file:${pkg.path}`));
+  Object.assign(
+    packages,
+    nestShrinkwrap(shrinkwrap, pkg.manifest.name, `file:${pkg.path}`, REGISTRY)
+  );
   return {
     packageJson: { name: "npm-tarball-install", private: true, dependencies },
     lockfile: { name: "npm-tarball-install", lockfileVersion: 3, requires: true, packages },

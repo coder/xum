@@ -19,7 +19,7 @@ import {
   type ReleaseArtifact,
 } from "./registry";
 import { ServerUpdater, type ServerUpdaterDeps } from "./serverUpdater";
-import { SERVER_UPDATE_STAGE_MARKER } from "@/constants/serverUpdate";
+import { NPM_PUBLIC_REGISTRY, SERVER_UPDATE_STAGE_MARKER } from "@/constants/serverUpdate";
 import { createHash } from "node:crypto";
 
 const dirs: string[] = [];
@@ -115,7 +115,7 @@ function shrinkwrapFor(version: string, deps: Record<string, string> = {}) {
           `node_modules/${dep.name}`,
           {
             version: dep.version,
-            resolved: `https://registry.example.com/${dep.name}/-/${dep.version}.tgz`,
+            resolved: `${NPM_PUBLIC_REGISTRY}/${dep.name}/-/${path.posix.basename(dep.name)}-${dep.version}.tgz`,
             integrity: dep.integrity,
           },
         ])
@@ -343,7 +343,8 @@ describe("staging and activation", () => {
     await expectFailure(() => stageUpdate(layout, "../../escape", fakeRegistry("2.0.0")));
   });
   test("stages the digest-checked tarball, refusing a corrupted download before any install", async () => {
-    const { layout, root } = await fixture();
+    const { layout: installed, root } = await fixture();
+    const layout = { ...installed, registry: "https://mirror.example.com/npm" };
     const registry = fakeRegistry("2.0.0", undefined, {}, { "zod@4.5.4": sriOf("zod") });
     const readJson = async (file: string): Promise<Record<string, Record<string, unknown>>> =>
       JSON.parse(await fs.readFile(file, "utf8")) as Record<string, Record<string, unknown>>;
@@ -363,7 +364,7 @@ describe("staging and activation", () => {
     expect(path.basename(stageDir)).toMatch(/^xum-staging-2\.0\.0\./);
     const tarball = path.join(stageDir, "xum-2.0.0.tgz");
     // The manager gets the downloaded tarball and the tree its shrinkwrap pins, nested where npm
-    // installs a published package's shrinkwrap.
+    // installs a published package's shrinkwrap and fetched from the configured registry.
     expect(seed?.dependencies).toEqual({ "@coder/xum": `file:${tarball}` });
     expect(seed?.packages["node_modules/@coder/xum"]).toMatchObject({
       version: "2.0.0",
@@ -371,6 +372,7 @@ describe("staging and activation", () => {
     });
     expect(seed?.packages["node_modules/@coder/xum/node_modules/zod"]).toMatchObject({
       version: "4.5.4",
+      resolved: `${layout.registry}/zod/-/zod-4.5.4.tgz`,
       integrity: sriOf("zod"),
     });
     // bun converted that npm lockfile into its own, which must be the stage's only lockfile.

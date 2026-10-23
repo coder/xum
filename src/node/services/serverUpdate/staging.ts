@@ -221,7 +221,7 @@ export async function stageUpdate(
       requires: true,
       packages: {
         "": { dependencies },
-        ...nestShrinkwrap(shrinkwrap, "@coder/xum", `file:${tarball}`),
+        ...nestShrinkwrap(shrinkwrap, "@coder/xum", `file:${tarball}`, layout.registry),
       },
     })
   );

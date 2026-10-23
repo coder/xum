@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { NPM_PUBLIC_REGISTRY } from "@/constants/serverUpdate";
 import { isExactVersion } from "./installLayout";
 
 /**
@@ -21,18 +22,30 @@ export function installedName(key: string): string {
  * Lockfile `packages` that install `name` from `resolved` at node_modules/<name>, with its
  * shrinkwrap's tree nested under it: the layout npm gives a published package that ships a
  * shrinkwrap. npm ignores the shrinkwrap of a tarball file, so a lockfile has to carry it.
+ *
+ * Tarball URLs on the public registry move to the same path under `registry`, as npm's default
+ * replace-registry-host does: bun, and npm with replace-registry-host=never, fetch a recorded URL
+ * as written, which would bypass a configured private registry.
  */
 export function nestShrinkwrap(
   shrinkwrap: Shrinkwrap,
   name: string,
-  resolved: string
+  resolved: string,
+  registry: string
 ): Record<string, Record<string, unknown>> {
   const at = `node_modules/${name}`;
   const packages: Record<string, Record<string, unknown>> = {};
   for (const [key, entry] of Object.entries(shrinkwrap.packages)) {
-    // A lockfile entry names its package only when it is an alias.
-    packages[key === "" ? at : `${at}/${key}`] =
-      key === "" ? { ...entry, name: undefined, resolved } : entry;
+    if (key === "") {
+      // A lockfile entry names its package only when it is an alias.
+      packages[at] = { ...entry, name: undefined, resolved };
+      continue;
+    }
+    const url = entry.resolved;
+    packages[`${at}/${key}`] =
+      typeof url === "string" && url.startsWith(`${NPM_PUBLIC_REGISTRY}/`)
+        ? { ...entry, resolved: registry + url.slice(NPM_PUBLIC_REGISTRY.length) }
+        : entry;
   }
   return packages;
 }

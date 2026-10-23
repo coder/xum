@@ -32,18 +32,29 @@ describe("release shrinkwrap", () => {
     }
   });
 
-  test("nests the tree under the package that ships it, installed from the given source", () => {
+  test("nests the tree under the package that ships it, fetched from the configured registry", () => {
     const shrinkwrap = {
       packages: {
-        "": {
-          name: "@coder/xum",
-          version: "2.0.0",
-          dependencies: { "left-pad": "1.3.0" },
+        "": { name: "@coder/xum", version: "2.0.0", dependencies: { "left-pad": "1.3.0" } },
+        "node_modules/left-pad": {
+          version: "1.3.0",
+          resolved: "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+          integrity: "sha512-pad",
         },
-        "node_modules/left-pad": { version: "1.3.0", integrity: "sha512-pad" },
+        "node_modules/left-pad/node_modules/other": {
+          version: "1.0.0",
+          resolved: "https://cdn.example.com/other-1.0.0.tgz",
+          integrity: "sha512-other",
+        },
       },
     };
-    expect(nestShrinkwrap(shrinkwrap, "@coder/xum", "file:/stage/xum-2.0.0.tgz")).toEqual({
+    const nested = nestShrinkwrap(
+      shrinkwrap,
+      "@coder/xum",
+      "file:/stage/xum-2.0.0.tgz",
+      "https://mirror.example.com/npm"
+    );
+    expect(nested).toEqual({
       "node_modules/@coder/xum": {
         version: "2.0.0",
         resolved: "file:/stage/xum-2.0.0.tgz",
@@ -51,8 +62,11 @@ describe("release shrinkwrap", () => {
       },
       "node_modules/@coder/xum/node_modules/left-pad": {
         version: "1.3.0",
+        resolved: "https://mirror.example.com/npm/left-pad/-/left-pad-1.3.0.tgz",
         integrity: "sha512-pad",
       },
+      "node_modules/@coder/xum/node_modules/left-pad/node_modules/other":
+        shrinkwrap.packages["node_modules/left-pad/node_modules/other"],
     });
   });
 });
