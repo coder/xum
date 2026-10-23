@@ -226,6 +226,39 @@ test("memory: a release hands the file lock to the waiters in FIFO order", () =>
     await expect(first.assertStillOwned()).rejects.toThrow("is no longer owned by this holder");
   }));
 
+test("memory: a parent removed while the acquire waits refuses with ENOENT", () =>
+  onMemory(async (locks, t) => {
+    const runDir = path.join(t.dir, "run");
+    await fs.mkdir(runDir);
+    const lockPath = path.join(runDir, "run.lock");
+    const holder = await t.foreignHolder(lockPath, "live", "record");
+    const acquire = locks
+      .acquireCrossProcessLock({
+        lockPath,
+        createParentDirectory: false,
+        acquireTimeoutMs: 1_000,
+        staleMs: 60_000,
+        timeoutMessage: "run lock is held.",
+      })
+      .then(
+        () => null,
+        (caught: unknown) => caught
+      );
+    await fs.rm(runDir, { recursive: true });
+    await holder.release();
+    expect(((await acquire) as NodeJS.ErrnoException).code).toBe("ENOENT");
+    // The refusal frees the lock: a later acquire takes it at once.
+    await fs.mkdir(runDir);
+    const release = await locks.acquireCrossProcessLock({
+      lockPath,
+      createParentDirectory: false,
+      acquireTimeoutMs: 0,
+      staleMs: 60_000,
+      timeoutMessage: "run lock is held.",
+    });
+    await release();
+  }));
+
 test("memory: an init-record lock makes a real file, and inspect sees it", () =>
   onMemory(async (locks, t) => {
     const lockPath = path.join(t.dir, "locks", "init-record", "ws", "backend.lock");

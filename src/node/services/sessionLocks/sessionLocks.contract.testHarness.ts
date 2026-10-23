@@ -190,6 +190,24 @@ export function describeSessionLocksContract(
         expect((error as NodeJS.ErrnoException).code).toBe("ENOENT");
       }));
 
+    test("an aborted signal wins over a missing parent", () =>
+      withLayer(async (locks, t) => {
+        const error = await locks
+          .acquireCrossProcessLock({
+            lockPath: path.join(t.dir, "removed-run", "run.lock"),
+            createParentDirectory: false,
+            acquireTimeoutMs: 0,
+            staleMs: 60_000,
+            timeoutMessage: "contract record is held.",
+            signal: AbortSignal.abort(),
+          })
+          .then(
+            () => null,
+            (caught: unknown) => caught
+          );
+        expect((error as Error).message).toBe("Lock acquisition was aborted");
+      }));
+
     test("useLeasesFor gives one object per config: hold, isHeld, release", () =>
       withLayer(async (locks, t) => {
         const config = { rootDir: t.dir };

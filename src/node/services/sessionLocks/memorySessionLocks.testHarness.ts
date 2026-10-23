@@ -217,9 +217,18 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
         return await nodeSessionLocks.acquireCrossProcessLock(options);
       }
       const { lockPath, acquireTimeoutMs, timeoutMessage, signal } = options;
+      // crossProcessLock.ts checks the signal before each attempt, so abort wins.
+      if (signal?.aborted) throw abortedAcquireError();
       // Node rejects with ENOENT when the parent is gone and may not be recreated
-      // (a removed workflow run directory). Callers rely on that refusal.
-      if (options.createParentDirectory === false) await fs.stat(path.dirname(lockPath));
+      // (a removed workflow run directory): each attempt's first write fails, before
+      // any holder is judged. Callers rely on that refusal.
+      const checkParent =
+        options.createParentDirectory === false
+          ? async () => {
+              await fs.stat(path.dirname(lockPath));
+            }
+          : null;
+      await checkParent?.();
       const refusal = (blocker: Blocker) =>
         new CrossProcessLockTimeoutError(
           crossProcessLockTimeoutMessage(timeoutMessage, lockPath, {
@@ -235,6 +244,16 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
         refusal,
         signal
       );
+      // Check again once the lock is taken: a parent removed after the first check
+      // (or while this waited) must refuse here too, as Node's write would.
+      if (checkParent !== null) {
+        try {
+          await checkParent();
+        } catch (error) {
+          table.free(lockPath, entry);
+          throw error;
+        }
+      }
       return () => {
         table.free(lockPath, entry);
         return Promise.resolve();
