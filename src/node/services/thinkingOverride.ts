@@ -16,7 +16,7 @@ import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { ModelMessage } from "ai";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import type { VolatileSystemTailRecord } from "@/common/types/message";
+import type { SystemSectionRecords } from "@/common/types/message";
 
 /** What an Auto-routed stream is running on right now, as StreamManager's stream state has it. */
 export interface LiveTurnRouting {
@@ -93,8 +93,8 @@ export type RebuildFirstStepForThinkingLevel = (
   providerOptions: Record<string, unknown>
 ) => Promise<{
   messages: ModelMessage[];
-  /** The rebuilt request's record for the turn's row (MuxMetadata.volatileSystemTail). */
-  volatileSystemTail?: VolatileSystemTailRecord;
+  /** The rebuilt request's records for the turn's row (MuxMetadata.volatileSystemTail etc.). */
+  systemRecords?: SystemSectionRecords;
   /** Its system content's token count, tail rows included (MuxMetadata.systemMessageTokens). */
   systemMessageTokens?: number;
 }>;

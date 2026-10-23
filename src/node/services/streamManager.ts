@@ -62,7 +62,7 @@ import type {
   MuxMetadata,
   MuxMessage,
   PersistedToolModelUsage,
-  VolatileSystemTailRecord,
+  SystemSectionRecords,
 } from "@/common/types/message";
 import { hasTokenUsage, MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
 import {
@@ -478,20 +478,21 @@ interface StepMessageTracker {
   anthropicThinkingStripStep?: number;
   /** True once this turn holds the Anthropic thinking-repair receipt (reads initialMetadata). */
   hasAnthropicReplayReceipt?: () => boolean;
-  /** After a step-0 rebuild: the row's tail record and system token count follow it. */
-  recordVolatileSystemTail: (rebuilt: {
-    volatileSystemTail?: VolatileSystemTailRecord;
+  /** After a step-0 rebuild: the row's system-section records and token count follow it. */
+  recordSystemSections: (rebuilt: {
+    systemRecords?: SystemSectionRecords;
     systemMessageTokens?: number;
   }) => void;
 }
-/** The row metadata after a step-0 rebuild: its tail record and system token count follow it. */
+/** The row metadata after a step-0 rebuild: its records and system token count follow it. */
 function withRebuiltSystemMetadata(
   metadata: Partial<MuxMetadata> | undefined,
-  rebuilt: { volatileSystemTail?: VolatileSystemTailRecord; systemMessageTokens?: number }
+  rebuilt: { systemRecords?: SystemSectionRecords; systemMessageTokens?: number }
 ): Partial<MuxMetadata> {
   return {
     ...metadata,
-    volatileSystemTail: rebuilt.volatileSystemTail,
+    volatileSystemTail: rebuilt.systemRecords?.volatileSystemTail,
+    customInstructions: rebuilt.systemRecords?.customInstructions,
     systemMessageTokens: rebuilt.systemMessageTokens ?? metadata?.systemMessageTokens,
   };
 }
@@ -3513,7 +3514,7 @@ export class StreamManager {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
               // The rebuilt request decides which volatile-tail rows the row recorded, and
               // what its system content (tail rows included) costs.
-              stepTracker.recordVolatileSystemTail(rebuiltSystem);
+              stepTracker.recordSystemSections(rebuiltSystem);
             }
             // onStepMessages fired above with the pre-rebuild transcript;
             // re-notify so consumers track the
@@ -3686,7 +3687,7 @@ export class StreamManager {
     // The tail hook is wired to streamInfo below, once it exists.
     const stepTracker: StepMessageTracker = {
       workspaceId: options.workspaceId,
-      recordVolatileSystemTail: () => undefined,
+      recordSystemSections: () => undefined,
     };
     const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
     const request = this.buildStreamRequestConfig({
@@ -3776,7 +3777,7 @@ export class StreamManager {
     // Single source for same-turn rebuilds: the receipt lives on initialMetadata (#5886).
     stepTracker.hasAnthropicReplayReceipt = () =>
       streamInfo.initialMetadata?.anthropicThinkingReplay === "off";
-    stepTracker.recordVolatileSystemTail = (rebuilt) => {
+    stepTracker.recordSystemSections = (rebuilt) => {
       streamInfo.initialMetadata = withRebuiltSystemMetadata(streamInfo.initialMetadata, rebuilt);
     };
 
@@ -4651,7 +4652,7 @@ export class StreamManager {
     }
 
     // Before any await: the stream may already be preparing its first step, and a step-0
-    // thinking rebuild there records a newer volatile-tail plan (recordVolatileSystemTail),
+    // thinking rebuild there records a newer volatile-tail plan (recordSystemSections),
     // which must win over the patch's baseline. That rebuild always runs after an await.
     streamInfo.initialMetadata = {
       ...streamInfo.initialMetadata,

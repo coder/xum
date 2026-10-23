@@ -1042,6 +1042,9 @@ export interface VolatileSystemTailRecord {
   placement: "system" | "row";
 }
 
+/** A turn's system-section records (prompt-cache mechanism 10), as its assistant row holds them. */
+export type SystemSectionRecords = Pick<MuxMetadata, "volatileSystemTail" | "customInstructions">;
+
 export interface ModelFallbackRecord {
   requestedModel: string;
   refusedModels: string[];
@@ -1122,6 +1125,13 @@ export interface MuxMetadata {
    * segment. See src/node/utils/messages/volatileSystemTail.ts.
    */
   volatileSystemTail?: VolatileSystemTailRecord;
+  /**
+   * The `<custom-instructions>` block (AGENTS.md files, project instructions) this turn's
+   * request sent, with the same rule as volatileSystemTail: "system" freezes it in the cached
+   * system prompt for the rest of the segment, "row" sent a changed block as a system row
+   * right before this row. Without it an AGENTS.md change rewrote the whole cached history.
+   */
+  customInstructions?: VolatileSystemTailRecord;
   // Last step's provider metadata (for context window cache display)
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)

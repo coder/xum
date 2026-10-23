@@ -419,7 +419,7 @@ describe("StreamManager - fallback volatile-tail record (mechanism 10)", () => {
           rebuildFirstStepForThinkingLevel: () =>
             Promise.resolve({
               messages: [{ role: "user" as const, content: "hello" }],
-              volatileSystemTail: rebuiltTail,
+              systemRecords: { volatileSystemTail: rebuiltTail },
             }),
           // Activation awaits this; the eager first step finishes meanwhile.
           onStreamConstructed: async () => {

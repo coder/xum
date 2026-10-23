@@ -259,6 +259,11 @@ export const MuxMessageSchema = z.object({
         .object({ text: z.string(), placement: z.enum(["system", "row"]) })
         .optional()
         .catch(undefined),
+      // Same shape for the custom-instructions block (MuxMetadata.customInstructions).
+      customInstructions: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
+        .optional()
+        .catch(undefined),
       usage: z.any().optional(),
       contextUsage: z.any().optional(),
       providerMetadata: z.record(z.string(), z.unknown()).optional(),
