@@ -77,6 +77,15 @@ describeIntegration("remote project plugins over SSH (BusyBox)", () => {
     const result = await runtime.deleteWorkspace("/projects/p6426", "gone", true);
     expect(result.success).toBe(true);
     expect((runtime as SSHRuntime).getAgentHostKey()).not.toBe(before);
+    // Another spelling of the same host (here another identity file) sees the removal too.
+    if (!sshConfig) throw new Error("SSH fixture not started");
+    const other = createTestRuntime("ssh", sshConfig.workdir, {
+      ...sshConfig,
+      privateKeyPath: `${sshConfig.privateKeyPath}-other`,
+    }) as SSHRuntime;
+    const otherBefore = other.getAgentHostKey();
+    expect((await runtime.deleteWorkspace("/projects/p6426", "gone", true)).success).toBe(true);
+    expect(other.getAgentHostKey()).not.toBe(otherBefore);
   }, 60000);
 
   test("cold listing times: small, a 100k-entry subtree, near the output cap", async () => {
