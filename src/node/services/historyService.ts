@@ -632,7 +632,7 @@ const BOUNDARY_NEEDLES = [
 
 export class HistoryService {
   private getAppendProvenance(workspaceId: string): HistoryAppendProvenance {
-    return new HistoryAppendProvenance(this.getSessionDir(workspaceId));
+    return new HistoryAppendProvenance(this.getSessionDir(workspaceId), this.files);
   }
 
   /**
@@ -740,6 +740,7 @@ export class HistoryService {
           },
           options,
           receipt.epoch,
+          this.files,
           Math.max(
             0,
             (options.budget?.maxBytes ?? SESSION_HISTORY_MAX_SCAN_BYTES) -
@@ -828,7 +829,7 @@ export class HistoryService {
     const attempt = async () => {
       const opened = await locked(async () => ({
         receiptKey: await this.captureTokenStatsReceiptKey(workspaceId, true),
-        snapshot: await openHistorySnapshot(paths),
+        snapshot: await openHistorySnapshot(paths, this.files),
       }));
       try {
         const messages = await readProviderHistoryFromSnapshot(opened.snapshot);
@@ -954,7 +955,8 @@ export class HistoryService {
     };
     const { boundary, boundaryPublicationId } = await readCompactionPendingHistoryObservation(
       paths,
-      skippedBoundaries
+      skippedBoundaries,
+      this.files
     );
     const rows = activeRows ?? (await this.readHistoryForRewrite(paths.chat)).rows;
     const identityCounts = new Map<string, number>();
@@ -996,7 +998,7 @@ export class HistoryService {
     if (reachableBoundaryIds) {
       // One verified lookup finds the base, including when successful rotation archived it.
       const base = suffix
-        ? await readCompactionPendingHistoryBoundary(paths, suffix + skippedBoundaries)
+        ? await readCompactionPendingHistoryBoundary(paths, suffix + skippedBoundaries, this.files)
         : boundary;
       if (base.kind === "identified") reachableBoundaryIds.add(base.messageId);
       if (base.kind === "none") reachableBoundaryIds.add(undefined);
@@ -1032,7 +1034,12 @@ export class HistoryService {
         // Preparation uses provider history, including archive rows exposed by a
         // heartbeat rollback. Compare that same privacy-filtered view under the locks;
         // active chat rows alone would reject an unchanged archive-backed source.
-        const providerMessages = await readProviderHistoryFromLatestBoundary(paths, 0);
+        const providerMessages = await readProviderHistoryFromLatestBoundary(
+          paths,
+          0,
+          undefined,
+          this.files
+        );
         return this.persistBoundaryWithTailCopiesUnderWriteLock(
           workspaceId,
           input.summaryMessage,
@@ -2892,7 +2899,8 @@ export class HistoryService {
               chat: this.getChatHistoryPath(workspaceId),
               archive: this.getChatArchivePath(workspaceId),
             },
-            caps
+            caps,
+            this.files
           )
         );
       }
@@ -2914,7 +2922,7 @@ export class HistoryService {
           chat: this.getChatHistoryPath(workspaceId),
           archive: this.getChatArchivePath(workspaceId),
         };
-        return Ok(await readProviderHistoryPage(paths, caps, beforeHistorySequence));
+        return Ok(await readProviderHistoryPage(paths, caps, beforeHistorySequence, this.files));
       }
     );
   }
@@ -2934,7 +2942,7 @@ export class HistoryService {
           chat: this.getChatHistoryPath(workspaceId),
           archive: this.getChatArchivePath(workspaceId),
         };
-        return Ok(await readProviderHistorySince(paths, caps, since));
+        return Ok(await readProviderHistorySince(paths, caps, since, this.files));
       }
     );
   }
@@ -2991,7 +2999,7 @@ export class HistoryService {
     };
     const lockedRead = () =>
       this.withRecoveredHistoryResultLock(workspaceId, STATUS_SUFFIX_ERROR_PREFIX, async () =>
-        read(await openHistorySnapshot(paths))
+        read(await openHistorySnapshot(paths, this.files))
       );
     // Only truncate recovery + open + fstat need the lock (see the doc comment). read() closes
     // the snapshot before any lockedRead() fallback: a writer waiting for this scan holds
@@ -2999,7 +3007,7 @@ export class HistoryService {
     let snapshot: OpenHistorySnapshot;
     try {
       snapshot = await this.withRecoveredHistoryLock(workspaceId, async () => {
-        const opened = await openHistorySnapshot(paths);
+        const opened = await openHistorySnapshot(paths, this.files);
         const release = unlockedHistoryScans.track([paths.chat, paths.archive]);
         return { ...opened, close: () => opened.close().finally(release) };
       });
@@ -3031,7 +3039,8 @@ export class HistoryService {
               chat: this.getChatHistoryPath(workspaceId),
               archive: this.getChatArchivePath(workspaceId),
             },
-            0
+            0,
+            this.files
           )
         );
       }
@@ -3059,8 +3068,8 @@ export class HistoryService {
     // epochs keep the two-pass reader, whose clamp-to-oldest fallback needs the full location.
     return Ok(
       skip === 0
-        ? await readProviderHistory(paths, { onBytesRead })
-        : await readProviderHistoryFromLatestBoundary(paths, skip, { onBytesRead })
+        ? await readProviderHistory(paths, { onBytesRead }, this.files)
+        : await readProviderHistoryFromLatestBoundary(paths, skip, { onBytesRead }, this.files)
     );
   }
 
@@ -4420,7 +4429,7 @@ export class HistoryService {
               !reusesWitness ||
               !firstMatch ||
               chatMatches > 1 ||
-              !(await equalHistoryReplacementRows(firstMatch, row))
+              !(await equalHistoryReplacementRows(firstMatch, row, undefined, this.files))
             )
               matches++;
             firstMatch ??= row;
@@ -4578,7 +4587,9 @@ export class HistoryService {
           const { identities, onDecision } = observer.sendIds;
           const decision = await decideSendIdsFromHistory(
             [this.getChatArchivePath(workspaceId), this.getChatHistoryPath(workspaceId)],
-            identities
+            identities,
+            undefined,
+            this.files
           );
           onDecision(decision);
           if (decision.kind !== "append") return Ok({ kind: "skipped" });
@@ -4689,7 +4700,9 @@ export class HistoryService {
         Ok(
           await decideSendIdsFromHistory(
             [this.getChatArchivePath(workspaceId), this.getChatHistoryPath(workspaceId)],
-            identities
+            identities,
+            undefined,
+            this.files
           )
         )
     );
@@ -4711,7 +4724,8 @@ export class HistoryService {
       async () => {
         const evidence = await readSendIdEvidence(
           [this.getChatArchivePath(workspaceId), this.getChatHistoryPath(workspaceId)],
-          ids
+          ids,
+          this.files
         );
         return Ok(decide((id) => evidence.get(id) ?? []));
       }
@@ -4810,7 +4824,8 @@ export class HistoryService {
           const complete = await scanHistoryReplacementRows(
             file,
             (row) => visit({ ...row, artifact }),
-            { nonce, signal }
+            { nonce, signal },
+            this.files
           );
           if (!complete) return;
         }
@@ -4865,7 +4880,7 @@ export class HistoryService {
           if (candidate.artifact === "chat") chatMatches++;
           // Fingerprint collisions only add conservative conflicts; replay authority still
           // requires exact bytes from both captured ranges, including their original encoding.
-          identical &&= await equalHistoryReplacementRows(candidate, row, signal);
+          identical &&= await equalHistoryReplacementRows(candidate, row, signal, this.files);
           artifacts.add(candidate.artifact);
         }
         return identical && chatMatches <= 1;
@@ -5102,10 +5117,11 @@ export class HistoryService {
         );
         let removedCurrentBoundary = false;
         if (action === "rollback-heartbeat") {
-          const boundary = await readCompactionPendingHistoryBoundary({
-            chat: historyPath,
-            archive: this.getChatArchivePath(workspaceId),
-          }).catch(() => undefined);
+          const boundary = await readCompactionPendingHistoryBoundary(
+            { chat: historyPath, archive: this.getChatArchivePath(workspaceId) },
+            undefined,
+            this.files
+          ).catch(() => undefined);
           const latest = messages.findLast(isDurableContextBoundaryMarker);
           removedCurrentBoundary =
             boundary?.kind === "identified" &&
@@ -5734,7 +5750,8 @@ export class HistoryService {
         archive: this.getChatArchivePath(workspaceId),
       },
       0,
-      { includeReadableResetFloor: true }
+      { includeReadableResetFloor: true },
+      this.files
     );
     // Archive fallback excludes all newer chat rows. Matching IDs across files
     // would conflate retained duplicates with occurrences this write removes.
@@ -6379,7 +6396,9 @@ export class HistoryService {
               chat: this.getChatHistoryPath(workspaceId),
               archive: this.getChatArchivePath(workspaceId),
             },
-            0
+            0,
+            undefined,
+            this.files
           );
           const activeRemoveCount = Math.max(
             0,
@@ -6477,7 +6496,9 @@ export class HistoryService {
             chat: this.getChatHistoryPath(workspaceId),
             archive: this.getChatArchivePath(workspaceId),
           },
-          0
+          0,
+          undefined,
+          this.files
         );
         await assertStillOwned();
         // The no-op decision and generation publication share this lease: a foreign reset,

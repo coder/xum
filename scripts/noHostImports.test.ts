@@ -154,13 +154,6 @@ const FROZEN_ALLOW_PAIRS = [
   "src/node/services/compactionPendingState.ts fs/promises",
   "src/node/services/continuousCompactionJournal.ts @/node/utils/writeFileAtomic",
   "src/node/services/continuousCompactionJournal.ts fs",
-  "src/node/services/historyAppendProvenance.ts @/node/utils/fs",
-  "src/node/services/historyAppendProvenance.ts @/node/utils/writeFileAtomic",
-  "src/node/services/historyAppendProvenance.ts fs",
-  "src/node/services/historyAppendProvenance.ts fs/promises",
-  "src/node/services/historyReplacementRows.ts fs/promises",
-  "src/node/services/historyScanner.ts fs/promises",
-  "src/node/services/sendIds.ts fs/promises",
 ];
 
 function allowMap(): Record<string, string[]> {
