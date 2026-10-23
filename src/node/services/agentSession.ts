@@ -1068,8 +1068,7 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   isExperimentEnabled(experimentId: ExperimentId): boolean;
   buildMemorySessionContext?(
     workspaceId: string,
-    modelString: string,
-    options?: { includeHotMemories?: boolean }
+    modelString: string
   ): Promise<MemorySessionContext | null>;
   isClaudeSkillsCompatEnabled?(): boolean;
   captureRequestAssemblySnapshot?(
@@ -1187,16 +1186,12 @@ function contextWindowKey(rows: readonly MuxMessage[]): string | undefined {
   return rows[0]?.id;
 }
 
-/** Memory/HotSet gate changes must not reuse a context built under the old gates. */
+/** A Memory gate change must not reuse a context built under the old gate. */
 function canReuseMemoryContext(
   cached: CachedMemoryContext | undefined,
-  wanted: { memoryEnabled: boolean; hotSetEnabled: boolean; includeHotMemories: boolean }
+  wanted: { memoryEnabled: boolean }
 ): cached is CachedMemoryContext {
-  return (
-    cached?.memoryEnabled === wanted.memoryEnabled &&
-    cached.hotSetEnabled === wanted.hotSetEnabled &&
-    (cached.includesHotMemories || !wanted.includeHotMemories)
-  );
+  return cached?.memoryEnabled === wanted.memoryEnabled;
 }
 
 interface SendMessageInternalOptions {
@@ -1767,9 +1762,7 @@ export class AgentSession {
 
   /**
    * Cached memory session context (memory experiment): index snapshot for
-   * the memory tool description plus an optional hot-memories block, keyed by
-   * model. Index-only entries can be upgraded once final tool policy keeps
-   * the memory tool.
+   * the memory tool description, keyed by model.
    *
    * Frozen per context window (#5248, user-requested prompt-cache stability):
    * only a new window (compaction, rollover, reset) clears it. Memory writes do
@@ -7351,8 +7344,7 @@ export class AgentSession {
         recordFileState: this.fileChangeTracker.record.bind(this.fileChangeTracker),
         recordProposedPlan: this.recordProposedPlan,
         postCompactionAttachments: null,
-        resolveMemoryContext: (model, memoryOptions) =>
-          this.resolveMemoryContext(model, memoryOptions, cache, { windowKey }),
+        resolveMemoryContext: (model) => this.resolveMemoryContext(model, cache, { windowKey }),
         workspaceGoalService: this.workspaceGoalService,
         goalTurnKind: goalKind,
         goalTurnGoalId: goalId,
@@ -9234,8 +9226,8 @@ export class AgentSession {
         // post-compaction check above: a just-consumed compaction boundary has
         // already reset the segment cache, so this stream recomputes the context.
         // The window's first row keys the saved context (see resolveMemoryContext).
-        resolveMemoryContext: (forModelString, memoryOptions) =>
-          this.resolveMemoryContext(forModelString, memoryOptions, undefined, {
+        resolveMemoryContext: (forModelString) =>
+          this.resolveMemoryContext(forModelString, undefined, {
             windowKey: contextWindowKey(historyResult.data),
           }),
         workspaceGoalService: this.workspaceGoalService,
@@ -13338,34 +13330,27 @@ export class AgentSession {
   }
 
   /**
-   * Resolve the memory session context (index snapshot + optional hot block)
-   * for the current session segment.
+   * Resolve the memory session context (index snapshot) for the current
+   * session segment.
    *
-   * Computed lazily on the first stream for each model. The first pass is
-   * index-only so final tool policy can strip memory without paying hot-set
-   * file reads; if memory survives policy, the cache is upgraded with the
-   * byte-budgeted hot block. Compaction clears the cache. Invoked by
-   * AIService.streamMessage after runtime.ensureReady(): caching before the
-   * runtime is started (stopped Docker/remote workspace) would pin an
+   * Computed lazily on the first stream for each model. Compaction clears the
+   * cache. Invoked by AIService.streamMessage after runtime.ensureReady():
+   * caching before the runtime is started (stopped Docker/remote workspace) would pin an
    * empty/partial context for the whole segment.
    */
   private async resolveMemoryContext(
     modelString: string,
-    options?: { includeHotMemories?: boolean },
     cache = this.memoryContextByModelString,
     persistence?: { windowKey: string | undefined }
   ): Promise<MemorySessionContext | undefined> {
     assert(modelString.length > 0, "resolveMemoryContext requires a model string");
-    const includeHotMemories = options?.includeHotMemories !== false;
-    const enabled = (id: ExperimentId) => this.aiService.isExperimentEnabled(id);
-    const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
-    const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
+    const memoryEnabled = this.aiService.isExperimentEnabled(EXPERIMENT_IDS.MEMORY);
     const windowKey = persistence?.windowKey;
     // The rollover candidate cache belongs to a window that may never start: only the
     // live map is restored from disk.
     if (cache === this.memoryContextByModelString) await this.restoreMemoryContext(windowKey);
     const cached = cache.get(modelString);
-    if (canReuseMemoryContext(cached, { memoryEnabled, hotSetEnabled, includeHotMemories })) {
+    if (canReuseMemoryContext(cached, { memoryEnabled })) {
       await this.persistMemoryContext(cache, windowKey, { force: false });
       return cached.context ?? undefined;
     }
@@ -13373,16 +13358,9 @@ export class AgentSession {
     // buildMemorySessionContext is an optional AgentSessionAIService capability.
     const context =
       typeof this.aiService.buildMemorySessionContext === "function"
-        ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
-            includeHotMemories,
-          })
+        ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString)
         : null;
-    cache.set(modelString, {
-      context,
-      includesHotMemories: includeHotMemories,
-      memoryEnabled,
-      hotSetEnabled,
-    });
+    cache.set(modelString, { context, memoryEnabled });
     await this.persistMemoryContext(cache, windowKey, { force: true });
     return context ?? undefined;
   }
@@ -13456,8 +13434,7 @@ export class AgentSession {
       this.compactionOccurred = true;
       this.turnsSinceLastAttachment = 0;
       // Compaction boundary: invalidate the session-cached memory context so
-      // the next stream recomputes the index and hot set from current
-      // files/pins/usage stats.
+      // the next stream recomputes the index from current files.
       await this.discardMemoryContext();
       // Clear file state cache since history context is gone
       this.clearFileState();

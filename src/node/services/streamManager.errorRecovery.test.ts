@@ -1643,7 +1643,7 @@ describe("StreamManager - Anthropic thinking signature recovery", () => {
 
   test("a step-0 thinking rebuild after the repair sends no thinking", async () => {
     // #5886: the rebuild reads history, which does not hold this turn's receipt yet.
-    const rebuiltTail = { text: "\n\n<hot_memories>B</hot_memories>", placement: "row" as const };
+    const rebuiltTail = { text: "\n\n[Warning: B]", placement: "row" as const };
     const rebuiltInstructions = { text: "\n<custom-instructions>\nB\n</custom-instructions>" };
     const thinkingOverrideState: NonNullable<TurnExecutionOptions["thinkingOverrideState"]> = {
       applied: "medium",

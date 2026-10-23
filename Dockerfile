@@ -14,7 +14,9 @@
 # ==============================================================================
 # node:22-slim is deliberately not pinned by digest (unlike the bug-bash sandbox): each release
 # build must pick up the newest Node 22 security release, as the unpinned apt packages below do
-# for Debian. Docker reviews and builds every Official Image update.
+# for Debian. Docker reviews and builds every Official Image update. The runtime stage fails the
+# build when the tag still resolves to a Node affected by CVE-2026-111497 (for example a stale
+# cached base).
 FROM node:22-slim AS builder
 
 WORKDIR /app
@@ -166,6 +168,12 @@ ENV MUX_ROOT=/root/.mux
 # Remove the flag when this image moves to Node 24.
 # Fail the build if this Node rejects the flag or ignores it.
 RUN node --experimental-async-context-frame -e 'const { AsyncLocalStorage } = require("node:async_hooks"); if (!String(AsyncLocalStorage).includes("AsyncContextFrame")) { console.error("AsyncContextFrame is not active"); process.exit(1); }'
+
+# Fail the build if this Node is unsupported or affected by CVE-2026-111497 (crafted Brotli data
+# runs code). The check reuses the CLI's table of fixed releases (src/cli/nodeVersion.ts).
+COPY --from=builder /app/dist/cli/nodeVersion.js /tmp/nodeVersion.js
+RUN node -e 'const warning = require("/tmp/nodeVersion.js").nodeVersionWarning(process.versions); if (warning !== undefined) { console.error(warning); process.exit(1); }' && \
+    rm /tmp/nodeVersion.js
 
 # Expose server port
 EXPOSE 3000

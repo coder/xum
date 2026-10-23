@@ -26,14 +26,7 @@ import {
   resolveScratchDirSpec,
 } from "@/node/runtime/runtimeScratchDir";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
-import {
-  MEMORY_INTUITION_MAX_USES_PER_TURN,
-  type MemoryScopeAccess,
-} from "@/common/constants/memory";
-import {
-  resolveHeadlessAgentDefinition,
-  resolveHeadlessAgentSettings,
-} from "@/node/services/memoryConsolidationService";
+import type { MemoryScopeAccess } from "@/common/constants/memory";
 import {
   EXPERIMENT_IDS,
   isTokenBudgetActive,
@@ -71,8 +64,6 @@ import {
 import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
-import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
-import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/builtInAgentDefinitions";
 import { AgentDefinitionRequestCache } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
@@ -99,7 +90,6 @@ import { emitTurnEnvelope } from "./turnEnvelope";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { listAvailableModels } from "@/common/utils/ai/selectableModels";
 import { DEFAULT_ROUTE_PRIORITY } from "@/common/routing";
-import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DesktopNotifications } from "@/node/services/desktopNotifications/desktopNotifications";
@@ -185,10 +175,7 @@ import type {
 import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isRuntimeReadFailure, isRuntimeTransportError } from "@/node/runtime/Runtime";
-import {
-  normalizeUsageModelKey,
-  resolveModelForMetadata,
-} from "@/common/utils/providers/modelEntries";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import {
   computeActiveToolNames,
   computeLoadedToolNames,
@@ -241,7 +228,7 @@ import {
   formatMcpWarningSection,
   measureWholeVolatileSystemSuffix,
   prepareProviderRequestMessages,
-  removeIntuitionGuidance,
+  removeMemoryGuidance,
   type PromptPayload,
   selectActiveContextMessages,
 } from "./turnContextAssembler";
@@ -307,7 +294,7 @@ export function resolveXumToolScope(
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
-import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -363,17 +350,14 @@ export interface StreamMessageOptions {
   postCompactionAttachments?: PostCompactionAttachment[] | null;
   /**
    * Resolver for the session-segment memory context (memory experiment):
-   * index snapshot for the memory tool description + hot-memories block.
+   * index snapshot for the memory tool description.
    * AgentSession caches the result per model/session segment. A callback
    * (not a pre-resolved value) because it must be computed after
    * runtime.ensureReady(): project-scope listing on a
    * stopped Docker/remote workspace would otherwise cache an empty/partial
    * context for the whole segment.
    */
-  resolveMemoryContext?: (
-    modelString: string,
-    options?: { includeHotMemories?: boolean }
-  ) => Promise<MemorySessionContext | undefined>;
+  resolveMemoryContext?: (modelString: string) => Promise<MemorySessionContext | undefined>;
   workspaceGoalService?: WorkspaceGoalService;
   /** Backend-owned kind of an automatic goal turn; gates set_goal (see GoalToolContext). */
   goalTurnKind?: GoalSyntheticMessageKind;
@@ -2035,7 +2019,7 @@ export class TurnRequestBuilder {
     // workspace would yield an empty/partial context, and AgentSession caches
     // the result per model/session segment).
     const memoryContext = resolveMemoryContext
-      ? await resolveMemoryContext(modelString, { includeHotMemories: false })
+      ? await resolveMemoryContext(modelString)
       : undefined;
 
     const cfg = this.dependencies.config.loadConfigOrDefault();
@@ -2045,24 +2029,7 @@ export class TurnRequestBuilder {
     // runs follow the same config.
     const toolSearchEnabled = cfg.toolSearchEnabled !== false;
     const artifactsExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS);
-    const memoryIntuitionExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.MEMORY_INTUITION);
-    const memoryHotSetExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
     const claudeSkillsCompatExperimentEnabled = this.dependencies.isClaudeSkillsCompatEnabled();
-    // Once final tool policy keeps the memory tool, upgrade the index-only
-    // memory context (resolved pre-policy with includeHotMemories: false) to
-    // the byte-budgeted hot block for the model that will actually stream.
-    // Returns the unchanged pre-policy `memoryContext` reference when hot
-    // preloading is off or the memory tool was stripped, so callers can use
-    // identity comparison to decide whether the system prompt must be rebuilt.
-    const upgradeMemoryContextForModel = async (
-      memoryToolAvailableForModel: boolean,
-      modelStringForContext: string
-    ): Promise<MemorySessionContext | undefined> =>
-      memoryToolAvailableForModel &&
-      memoryHotSetExperimentEnabled &&
-      resolveMemoryContext !== undefined
-        ? await resolveMemoryContext(modelStringForContext, { includeHotMemories: true })
-        : memoryContext;
     emitStartupBreadcrumb("loading_workspace_context");
     // One cache per request: resolution, plan handoff, prompt body, and
     // sub-agent discovery share definition reads; the next turn starts fresh.
@@ -2347,32 +2314,6 @@ export class TurnRequestBuilder {
     // below so the prompt never advertises an absent tool.
     const memoryToolEligible =
       memoryExperimentEnabled && this.dependencies.bindings.memoryService !== undefined;
-    // Gate and execute the same global-only definition snapshot: edits during
-    // turn assembly must not swap the body after its enablement was checked.
-    const intuitionDefinition =
-      memoryToolEligible && memoryIntuitionExperimentEnabled && !isSubagentWorkspace
-        ? await resolveHeadlessAgentDefinition(this.dependencies.config.rootDir, "intuition")
-        : null;
-    const intuitionToolEligible =
-      intuitionDefinition !== null &&
-      !isAgentEffectivelyDisabled({
-        cfg,
-        agentId: "intuition",
-        resolvedFrontmatter: intuitionDefinition.frontmatter,
-      });
-    const evaluationService = this.dependencies.bindings.evaluationService;
-    const builtInIntuitionBody = getBuiltInAgentDefinitions().find(
-      (definition) => definition.id === "intuition"
-    )?.body;
-    const intuitionSettings = intuitionToolEligible
-      ? resolveHeadlessAgentSettings(
-          this.dependencies.config,
-          workspaceId,
-          "intuition",
-          modelString,
-          intuitionDefinition.frontmatter.ai
-        )
-      : undefined;
     const runtimeType = getRuntimeType(metadata.runtimeConfig);
     // The scratch dir lives where commands run: the host session dir for local/worktree, the
     // remote host or container otherwise (runtimeScratchDir.ts). Undefined leaves
@@ -2406,10 +2347,8 @@ export class TurnRequestBuilder {
     const buildStreamSystemContextForToolset = (
       toolset: {
         memoryToolAvailable: boolean;
-        intuitionToolAvailable: boolean;
       },
-      modelStringForSystem: string = modelString,
-      contextForModel: MemorySessionContext | undefined = memoryContext
+      modelStringForSystem: string = modelString
     ) =>
       buildStreamSystemContext({
         runtime,
@@ -2433,8 +2372,6 @@ export class TurnRequestBuilder {
         memoryToolAvailable: toolset.memoryToolAvailable,
         tokenBudgetEnabled,
         workspaceMemoryWritable: memoryAccess.workspace === "readwrite",
-        intuitionToolAvailable: toolset.intuitionToolAvailable,
-        hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
         instructionSources: turnInstructionSources.current,
         agentDefinitionCache,
@@ -2446,7 +2383,6 @@ export class TurnRequestBuilder {
     const buildStreamSystemContextStartedAt = this.hostClock.nowMs();
     const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset({
       memoryToolAvailable: memoryToolEligible,
-      intuitionToolAvailable: intuitionToolEligible,
     });
     // The MCP inventory the pre-policy context was built with; a later
     // rebuild from the validated serve makes that context stale.
@@ -2809,8 +2745,8 @@ export class TurnRequestBuilder {
           })
         : undefined;
 
-    // Create assistant message ID early so tool-side usage reporting and nested tool events
-    // stay scoped to this specific assistant turn. The placeholder is appended to history below
+    // Create assistant message ID early so nested tool events stay scoped to this specific
+    // assistant turn. The placeholder is appended to history below
     // (after the abort check).
     const assistantMessageId = createAssistantMessageId();
     // Bind ownership before cached MCP tools are captured by the PTC bridge.
@@ -2818,22 +2754,6 @@ export class TurnRequestBuilder {
     const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };
     const allowLegacyInvalidWorkflowAgentOutputSchema =
       await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
-    // Share creation-time provider/pricing snapshots for both headless tools.
-    const createToolModel = async (ms: string, toolThinkingLevel?: ThinkingLevel) => {
-      const toolModelString = ms.trim();
-      assert(
-        toolModelString.length > 0,
-        "tool model string must be non-empty when creating a tool model"
-      );
-      const created = await this.dependencies.providerModelFactory.createModelWithPinnedOptions(
-        toolModelString,
-        { thinkingLevel: toolThinkingLevel, workspaceId, agentInitiated: true }
-      );
-      if (!created.success) {
-        throw new Error(`Failed to create tool model: ${getErrorMessage(created.error)}`);
-      }
-      return created.data;
-    };
     // Codex hook fields: one turn ID for every tool call of this turn (its assistant message).
     // One object for every attempt: each attempt sets the model it streams with, so a refusal
     // fallback's tool calls, and the host-side hook config built once below (kernel file loads),
@@ -2849,28 +2769,6 @@ export class TurnRequestBuilder {
       secrets: projectSecretsRecord,
       xumEnv,
       runtimeTempDir,
-      ...(intuitionSettings
-        ? {
-            intuitionRuntime: {
-              modelString: intuitionSettings.model,
-              thinkingLevel: intuitionSettings.thinkingLevel,
-              maxUsesPerTurn: MEMORY_INTUITION_MAX_USES_PER_TURN,
-              usesThisTurn: 0,
-              createModel: (ms) => createToolModel(ms, intuitionSettings.thinkingLevel),
-              resolveAgentBody: () => Promise.resolve(intuitionDefinition?.body ?? null),
-              // Evaluation recall replaces only the built-in body's tool loop: a custom
-              // body was written for that loop, and evaluation ignores prompt bodies.
-              ...(evaluationService && intuitionDefinition?.body === builtInIntuitionBody
-                ? {
-                    createEvaluationModel: (ms: string) =>
-                      this.dependencies.providerModelFactory.createEvaluationModel(ms),
-                    evaluationService,
-                  }
-                : {}),
-              abortSignal: combinedAbortSignal,
-            },
-          }
-        : {}),
       ...(toolSearchRuntime ? { toolSearchRuntime } : {}),
       capabilityModelString,
       openaiWireFormat: effectiveMuxProviderOptions?.openai?.wireFormat,
@@ -2934,86 +2832,6 @@ export class TurnRequestBuilder {
       allowLegacyInvalidWorkflowAgentOutputSchema,
       recordFileState,
       recordProposedPlan,
-      reportModelUsage: (event) => {
-        try {
-          const eventModel = event.model.trim();
-          assert(eventModel.length > 0, "tool model usage event model must be non-empty");
-          // Persist tool-side model usage under its own model bucket so session costs keep
-          // tool/system-side pricing separate from the parent chat model.
-          const providerMetadata = event.providerMetadata;
-          // Prefer the creation-time identity captured when the tool model
-          // was created; models not created through the tool runtime fall
-          // back to live resolution (their identity is not coder-scoped).
-          const pinnedMetadataModel = event.metadataModel;
-          const metadataModel =
-            pinnedMetadataModel ??
-            resolveModelForMetadata(eventModel, this.dependencies.providerService.getConfig());
-          this.dependencies.streamManager.recordToolModelUsage(workspaceId, assistantMessageId, {
-            toolName: event.toolName,
-            toolCallId: event.toolCallId,
-            timestamp: event.timestamp,
-            model: eventModel,
-            metadataModel,
-            usage: event.usage,
-            ...(providerMetadata != null ? { providerMetadata } : {}),
-          });
-          void (async () => {
-            try {
-              if (!this.dependencies.sessionUsageService) {
-                return;
-              }
-              const displayUsage = createDisplayUsage(
-                event.usage,
-                eventModel,
-                providerMetadata,
-                metadataModel
-              );
-              if (!displayUsage) {
-                return;
-              }
-              // Ledger keys resolve Coder identities to their record-time
-              // metadata identity — the CREATION-TIME pin when available,
-              // mirroring StreamManager.recordSessionUsage. Non-coder
-              // models keep the canonical key (their metadata identity can
-              // be a mappedToModel pricing alias, not the ledger bucket).
-              const canonicalModel =
-                eventModel.startsWith("coder:") && pinnedMetadataModel
-                  ? pinnedMetadataModel
-                  : normalizeUsageModelKey(
-                      eventModel,
-                      this.dependencies.providerService.getConfig()
-                    );
-              await this.dependencies.sessionUsageService.recordUsage(
-                workspaceId,
-                canonicalModel,
-                displayUsage
-              );
-              this.dependencies.emit("session-usage-delta", {
-                type: "session-usage-delta" as const,
-                workspaceId,
-                sourceWorkspaceId: workspaceId,
-                byModelDelta: { [canonicalModel]: displayUsage },
-                // Record time: wall clock until #7282 moves its consumers to HostClock.
-                timestamp: nodeClock.nowMs(),
-              });
-            } catch (error) {
-              log.warn("Failed to record tool model usage", {
-                error,
-                workspaceId,
-                toolName: event.toolName,
-                model: event.model,
-              });
-            }
-          })();
-        } catch (error) {
-          log.warn("Failed to record tool model usage", {
-            error,
-            workspaceId,
-            toolName: event.toolName,
-            model: event.model,
-          });
-        }
-      },
       onConfigChanged: () => this.dependencies.providerService.notifyConfigChanged(),
       taskService: this.dependencies.bindings.taskService,
       workspaceTurnManager: this.dependencies.bindings.workspaceTurnManager,
@@ -3217,17 +3035,6 @@ export class TurnRequestBuilder {
         if (isAgentToolsDisabled()) attemptTools = {};
         const ptcActive = ptcRanForTools(ptcEnabled, attemptTools);
 
-        // Intuition's internal memory_read must not bypass a policy denying memory
-        // (a denied memory is never a refusal stub, see toolAssembly).
-        if (attemptTools.memory === undefined) delete attemptTools.intuition;
-        // #5253: the advertised union can hold refusal stubs, so presence no
-        // longer means the ACTIVE agent may use a tool; guidance follows the
-        // active policy.
-        const activeAgentAllows = (name: string): boolean =>
-          attemptTools[name] !== undefined &&
-          (switchableAgents === undefined ||
-            applyToolPolicyToNames([name], effectiveToolPolicy).length > 0);
-
         // Same predicate and model as the tools cache breakpoint
         // (applyCacheControlToTools), so "caches the tools block" and "keeps the
         // tool list stable" cannot disagree (#5250): these attempts use native
@@ -3281,34 +3088,22 @@ export class TurnRequestBuilder {
           }
         }
 
-        const intuitionAdvertised = attemptTools.intuition !== undefined;
-        const intuitionToolAvailable = activeAgentAllows("intuition");
         const memoryToolAvailable = attemptTools.memory !== undefined;
-        const memoryContextForModel = await upgradeMemoryContextForModel(
-          memoryToolAvailable,
-          seed.rawModelString
-        );
         const canReuseSystemContext =
           options.reusePrePolicySystemContext &&
           mcpServers === mcpServersAtPrePolicy &&
-          memoryToolAvailable === memoryToolEligible &&
-          intuitionToolAvailable === intuitionToolEligible &&
-          memoryContextForModel === memoryContext;
+          memoryToolAvailable === memoryToolEligible;
         const rebuildSystemStartedAt = this.hostClock.nowMs();
         const systemContext = canReuseSystemContext
           ? prePolicyStreamSystemContext
-          : await buildStreamSystemContextForToolset(
-              { memoryToolAvailable, intuitionToolAvailable },
-              seed.rawModelString,
-              memoryContextForModel
-            );
+          : await buildStreamSystemContextForToolset({ memoryToolAvailable }, seed.rawModelString);
         if (options.recordTimings && !canReuseSystemContext) {
           recordStartupPhaseTiming("rebuildStreamSystemContextMs", rebuildSystemStartedAt);
         }
         let attemptSystem = systemContext.systemMessage;
         let attemptSystemTokens = systemContext.systemMessageTokens;
-        // Volatile sections (hot memories, this warning, the context-window
-        // ids) go last so the stable prefix stays cacheable (#5251).
+        // Volatile sections (this warning, the context-window ids) go last so
+        // the stable prefix stays cacheable (#5251).
         if (mcpWarningSection != null) {
           attemptSystem = attemptSystem + mcpWarningSection;
           const tokenizer = await getTokenizerForModel(
@@ -3340,18 +3135,12 @@ export class TurnRequestBuilder {
               overviewMemo: toolCatalogOverviewMemo,
             }).tools;
           }
-          // Middleware may filter tools too, but must not restore policy-denied
-          // recall or leave its private memory reader available without memory.
-          if (!intuitionAdvertised || attemptTools.memory === undefined) {
-            delete attemptTools.intuition;
-          }
-          if (attemptTools.intuition === undefined || !activeAgentAllows("intuition")) {
-            assembleCtx.systemMessage = removeIntuitionGuidance(
-              assembleCtx.systemMessage,
-              attemptTools.memory !== undefined,
-              memoryContextForModel?.hotMemoriesBlock
-            );
-          }
+          // Middleware may filter tools too: drop the memory guidance it left
+          // describing a removed memory tool.
+          assembleCtx.systemMessage = removeMemoryGuidance(
+            assembleCtx.systemMessage,
+            attemptTools.memory !== undefined
+          );
           if (assembleCtx.systemMessage !== attemptSystem) {
             attemptSystem = assembleCtx.systemMessage;
             const tokenizer = await getTokenizerForModel(
@@ -3394,7 +3183,6 @@ export class TurnRequestBuilder {
           // Re-measured on every render: the window section can change length. A tail that
           // middleware edited is not split at all (no rows either, see planSystemPrompt).
           attemptVolatileSystemSuffixLength = measureWholeVolatileSystemSuffix(attemptSystem, [
-            systemContext.hotMemoriesSection,
             mcpWarningSection,
             section,
           ]);

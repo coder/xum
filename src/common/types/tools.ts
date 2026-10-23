@@ -30,10 +30,6 @@ import type {
   FileReadToolResultSchema,
   HeartbeatToolResultSchema,
   MemoryToolResultSchema,
-  IntuitionToolResultSchema,
-  IntuitionMemorySchema,
-  IntuitionCandidateSchema,
-  IntuitionStatsSchema,
   AttachFileToolResultSchema,
   TaskToolResultSchema,
   TaskSendMessageToolResultSchema,
@@ -199,13 +195,6 @@ export type SessionHistoryToolResult = z.infer<
 // Memory tool types, derived from schema (avoid drift)
 export type MemoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.memory.schema>;
 export type MemoryToolResult = z.infer<typeof MemoryToolResultSchema>;
-
-export type IntuitionToolArgs = z.infer<typeof TOOL_DEFINITIONS.intuition.schema>;
-export type IntuitionToolResult = z.infer<typeof IntuitionToolResultSchema>;
-export type IntuitionMemory = z.infer<typeof IntuitionMemorySchema>;
-export type IntuitionCandidate = z.infer<typeof IntuitionCandidateSchema>;
-export type IntuitionStats = z.infer<typeof IntuitionStatsSchema>;
-export type IntuitionReportToolArgs = z.infer<typeof TOOL_DEFINITIONS.intuition_report.schema>;
 
 // AttachFileToolResult derived from Zod schema (single source of truth)
 export type AttachFileToolResult = z.infer<typeof AttachFileToolResultSchema>;

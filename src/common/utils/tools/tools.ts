@@ -3,12 +3,10 @@ import type { HostClock } from "@/node/utils/hostClock";
 import { createSessionHistoryTool } from "@/node/services/tools/session_history";
 import { createNewContextTool } from "@/node/services/tools/new_context";
 import { xai } from "@ai-sdk/xai";
-import { type LanguageModel, type Tool } from "ai";
-import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+import type { Tool } from "ai";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
-import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
-import { isGrokFrontierModel, type ThinkingLevel } from "@/common/types/thinking";
-import type { ProviderName } from "@/common/constants/providers";
+import type { SendMessageOptions } from "@/common/orpc/types";
+import { isGrokFrontierModel } from "@/common/types/thinking";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import type { AvailableModel } from "@/common/utils/ai/selectableModels";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
@@ -21,7 +19,6 @@ import { createBashBackgroundTerminateTool } from "@/node/services/tools/bash_ba
 import { createFileEditReplaceStringTool } from "@/node/services/tools/file_edit_replace_string";
 import { createFileEditInsertTool } from "@/node/services/tools/file_edit_insert";
 import { createAskUserQuestionTool } from "@/node/services/tools/ask_user_question";
-import { createIntuitionTool } from "@/node/services/tools/intuition";
 import { createProposePlanTool } from "@/node/services/tools/propose_plan";
 import { createTodoWriteTool, createTodoReadTool } from "@/node/services/tools/todo";
 import {
@@ -97,8 +94,6 @@ import type { ComputerUseService } from "@/node/services/computerUse/computerUse
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import type { MemoryIndexEntry, MemoryService } from "@/node/services/memoryService";
-import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
-import type { ProviderModelFactory } from "@/node/services/providerModelFactory";
 import type { MemoryScope, MemoryScopeAccess } from "@/common/constants/memory";
 import { createMemoryTool } from "@/node/services/tools/memory";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -121,18 +116,6 @@ import {
 import { isPtcBridgedExecution } from "@/node/services/ptc/toolBridge";
 import type { GoalDefaults } from "@/constants/goals";
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
-
-export interface ToolModelUsageEvent {
-  source: "tool";
-  toolName: string;
-  model: string;
-  /** Pricing identity pinned by this invocation, independent of other creations of the same model. */
-  metadataModel?: string;
-  usage: LanguageModelV2Usage;
-  providerMetadata?: Record<string, unknown>;
-  toolCallId?: string;
-  timestamp: number;
-}
 
 export type WorkspaceHeartbeatSettings = NonNullable<WorkspaceMetadata["heartbeat"]>;
 export type WorkspaceHeartbeatSettingsUpdate = Partial<WorkspaceHeartbeatSettings>;
@@ -240,8 +223,6 @@ export interface ToolConfiguration {
   recordProposedPlan?: (toolCallId: string, content: string) => void;
   /** Callback to notify that provider/config was written (triggers hot-reload). */
   onConfigChanged?: () => void;
-  /** Best-effort callback for recording tool-initiated model usage in session totals. */
-  reportModelUsage?: (event: ToolModelUsageEvent) => void;
   /** Task orchestration for sub-agent tasks */
   taskService?: TaskService;
   workspaceTurnManager?: WorkspaceTurnManager;
@@ -379,39 +360,6 @@ export interface ToolConfiguration {
   /** Analytics service for raw SQL queries against DuckDB analytics data */
   analyticsService?: {
     executeRawQuery(sql: string): Promise<unknown>;
-  };
-  /** Pinned, host-only recall runtime; present only for eligible parent turns. */
-  intuitionRuntime?: {
-    modelString: string;
-    thinkingLevel?: ThinkingLevel;
-    maxUsesPerTurn: number;
-    /** Shared by every tool rebuild in this parent turn (including refusal fallback). */
-    usesThisTurn: number;
-    /**
-     * Creates a model and pins its request identity, route, and config together.
-     * Coder identities retain their actual instance and scoped aliases; option
-     * construction resolves their wire from this snapshot, never live config.
-     */
-    createModel: (modelString: string) => Promise<{
-      model: LanguageModel;
-      metadataModel?: string;
-      optionsModelString: string;
-      /**
-       * Providers snapshot captured at model-creation time for option
-       * construction. Required so buildProviderOptions can remap
-       * custom-provider wire namespaces while still resolving mappedToModel
-       * alias metadata from the raw custom identity.
-       */
-      optionsProvidersConfig: ProvidersConfigMap | null;
-      /** Pinned wire/route options keep Pro restricted to supported Responses routes. */
-      optionsMuxProviderOptions?: MuxProviderOptions;
-      optionsRouteProvider?: ProviderName;
-    }>;
-    resolveAgentBody: () => Promise<string | null>;
-    /** Evaluation recall; present only for the built-in body with a bound EvaluationService. */
-    createEvaluationModel?: ProviderModelFactory["createEvaluationModel"];
-    evaluationService?: EvaluationService;
-    abortSignal: AbortSignal;
   };
   /**
    * Runtime holder for the tool_catalog_search tool (present only when tool
@@ -961,7 +909,6 @@ function toolAllowlistOptions(
     enableFamilyMessaging: config.enableFamilyMessaging,
     enableAnalyticsQuery: Boolean(config.analyticsService),
     enableDynamicWorkflows: Boolean(config.workflowService),
-    enableIntuition: Boolean(config.intuitionRuntime),
     enableSessionHistory: config.experiments?.tokenBudget === true,
     enableMemory: Boolean(config.memoryService && config.experiments?.memory),
     enableTimelineEvent: Boolean(config.timelineService),
@@ -1072,7 +1019,6 @@ export async function getToolsForModel(
     mux_config_write: createXumConfigWriteTool(config),
     skills_catalog_search: createSkillsCatalogSearchTool(config),
     skills_catalog_read: createSkillsCatalogReadTool(config),
-    ...(config.intuitionRuntime ? { intuition: createIntuitionTool(config) } : {}),
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
     ...(config.mcpPromptRuntime ? { mcp_prompt_get: createMcpPromptGetTool(config) } : {}),
     ...(config.timelineService ? { timeline_event: createTimelineEventTool(config) } : {}),
