@@ -1251,7 +1251,10 @@
                 "module": "@/node/runtime/runtimeHelpers",
                 "names": ["createRuntimeForWorkspace", "createRuntimeContextForWorkspace"]
               },
-              { "module": "@/common/constants/paths", "names": ["getXumHome"] }
+              {
+                "module": "@/common/constants/paths",
+                "names": ["cleanupObsoleteXumBinArtifacts", "getXumExtensionMetadataPath", "getXumHome", "getXumLogsDir", "getXumPerfCapturesDir", "getXumPerfReportsDir", "getXumPerfTapesDir", "getXumProjectsDir", "getXumSessionsDir"]
+              }
             ],
             "allow": {
               "src/node/services/agentSession.ts": ["@/node/runtime/runtimeHelpers", "fs/promises"],
