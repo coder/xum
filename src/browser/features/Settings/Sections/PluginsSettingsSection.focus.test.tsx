@@ -41,6 +41,24 @@ function createApi() {
           mcpServerCount: 0,
         },
       ],
+      preview: {
+        source,
+        lockedSha: "b".repeat(40),
+        manifest: { name: "tools-next" },
+        skills: [{ name: "alpha" }],
+        mcpServers: [],
+        agents: [],
+        workflows: [],
+        slashCommands: [],
+        reviewedComponents: [],
+        codexHooks: [],
+        warnings: [],
+        targetPath: "~/.mux/plugins/tools-next",
+        consentDigest: "c".repeat(64),
+        method: { kind: "agent-plugin" },
+        methods: [{ kind: "agent-plugin" }],
+        skillsCliSkills: [],
+      },
     },
   });
 }
@@ -91,4 +109,38 @@ test("Escape in Manage components closes only the panel and refocuses its button
     expect(view.queryByText(/Manage components from the installed version/)).toBeNull()
   );
   expect(document.activeElement).toBe(manage);
+});
+
+// The other half of #7122: an Escape that the panel does not own still closes Settings.
+test("Escape outside Manage components still closes Settings (#7122)", async () => {
+  const onOpenChange = mock((_open: boolean) => undefined);
+  const view = renderInSettings(createApi(), onOpenChange);
+  const manage = await view.findByRole("button", { name: "Manage components for tools" });
+  fireEvent.click(manage);
+  await view.findByText(/Manage components from the installed version/);
+  manage.focus();
+  fireEvent.keyDown(manage, { key: "Escape" });
+  expect(onOpenChange).toHaveBeenCalledWith(false);
+});
+
+/** Focus that falls out of an unmounted control lands on the Settings dialog (or the body). */
+function focusFellOut(): boolean {
+  const active = document.activeElement;
+  return !(active instanceof HTMLElement) || active === document.body || active.role === "dialog";
+}
+
+// #7121: the source form unmounts when the preview opens, and the preview unmounts on Install.
+test("Preview on Enter and Install keep focus on a control of the new view (#7121)", async () => {
+  const view = renderInSettings(createApi(), () => undefined);
+  fireEvent.click(await view.findByRole("button", { name: "Add plugin" }));
+  await userEvent.type(await view.findByLabelText(/Git URL or owner\/repo/), "acme/tools{Enter}");
+  await view.findByText("tools-next");
+  const afterPreview = focusFellOut();
+
+  await userEvent.click(view.getByRole("button", { name: "Install" }));
+  await view.findByText("Plugin installed.");
+  expect({ afterPreview, afterInstall: focusFellOut() }).toEqual({
+    afterPreview: false,
+    afterInstall: false,
+  });
 });
