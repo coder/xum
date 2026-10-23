@@ -19,6 +19,7 @@ import type {
   InitLogger,
   EnsureReadyResult,
   ReadFileOptions,
+  RuntimeLocation,
 } from "./Runtime";
 import { RuntimeError as RuntimeErrorClass } from "./Runtime";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
@@ -214,6 +215,12 @@ export function localRuntimeTempRoot(): string {
  * - forkWorkspace()
  */
 export abstract class LocalBaseRuntime implements Runtime {
+  /** Runtime.location. A prototype getter, so subclasses and Object.create doubles inherit it. */
+  // eslint-disable-next-line @typescript-eslint/class-literal-property-style -- a readonly field is set by the constructor, so Object.create(X.prototype) doubles (mcpServerManager.test.ts) would read undefined
+  get location(): RuntimeLocation {
+    return "local";
+  }
+
   /**
    * The config path of the project whose agent resource limit binds this runtime's commands, or
    * undefined when it is not known; those commands get only the limit that all projects share.

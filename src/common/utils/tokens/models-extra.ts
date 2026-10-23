@@ -626,6 +626,28 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_response_schema: true,
   },
 
+  // Gemini 4 Argon Cyber Permissive - Vertex AI only (`google-vertex:`), for projects on
+  // its own allowlist (Fairwind program), in the `global` and `us` locations. Limits as
+  // Gemini 4 Argon above, including the 65,536-token synchronous output cap. Argon's
+  // introductory rates do not apply: $4/M input, $20/M output, $0.20/M cached input at
+  // `global` (`us` bills 10% more). Source: Vertex AI model and pricing docs, 2026-10-23.
+  "gemini-4-argon-cyber-permissive": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 65536,
+    input_cost_per_token: 0.000004, // $4 per million input tokens
+    output_cost_per_token: 0.00002, // $20 per million output tokens, including thinking tokens
+    cache_read_input_token_cost: 0.0000002, // $0.20 per million cached input tokens
+    litellm_provider: "vertex_ai-language-models",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_audio_input: true,
+    supports_video_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
   // Gemini 3.8 Flash - GA on September 2, 2026. Stable `gemini-3.8-flash` model ID with
   // 1M context, 64K max output (DeepMind model card). Like 3.7 Flash, we encode the
   // introductory rates Google actually bills through December 31, 2026 ($0.75/M input,
@@ -639,6 +661,30 @@ export const modelsExtra: Record<string, ModelData> = {
     input_cost_per_token: 0.00000075, // $0.75 per million input tokens (intro rate)
     output_cost_per_token: 0.00000375, // $3.75 per million output tokens, including thinking tokens (intro rate)
     cache_read_input_token_cost: 0.000000075, // $0.075 per million cached input tokens (intro rate)
+    litellm_provider: "vertex_ai-language-models",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_audio_input: true,
+    supports_video_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
+  // Gemini 3.8 Flash Cyber - GA on September 16, 2026, on Vertex AI only (`google-vertex:`;
+  // the Gemini API returns not found), for allowlisted projects (Fairwind program), in the
+  // `global` and `us` locations. Limits as 3.8 Flash, but 3.8 Flash's introductory rates do
+  // not apply: $1.50/M input, $7.50/M output, $0.15/M cached input at `global` (`us` bills
+  // 10% more). Google's model page lists function calling as unsupported, yet Vertex took
+  // function declarations and returned a functionCall on 2026-10-23, so agent tools work.
+  // Source: Vertex AI model and pricing docs, 2026-10-23.
+  "gemini-3.8-flash-cyber": {
+    max_input_tokens: 1048576,
+    max_output_tokens: 65536,
+    input_cost_per_token: 0.0000015, // $1.50 per million input tokens
+    output_cost_per_token: 0.0000075, // $7.50 per million output tokens, including thinking tokens
+    cache_read_input_token_cost: 0.00000015, // $0.15 per million cached input tokens
     litellm_provider: "vertex_ai-language-models",
     mode: "chat",
     supports_function_calling: true,

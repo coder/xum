@@ -202,9 +202,7 @@ const HOST_IMPORT_ALLOW = {
     "@/node/utils/concurrency/fileLock",
     "@/node/utils/concurrency/workspaceFileLocks",
   ],
-  "src/node/services/tools/agent_skill_read_file.ts": ["@/node/runtime/RemoteRuntime"],
-  "src/node/services/tools/bash.ts": ["@/node/runtime/LocalBaseRuntime", "fs"],
-  "src/node/services/tools/notify.ts": ["electron"],
+  "src/node/services/tools/bash.ts": ["fs"],
   "src/node/services/tools/review_pane.ts": [
     "@/node/utils/concurrency/workspaceFileLocks",
     "@/node/utils/writeFileAtomic",
@@ -214,7 +212,6 @@ const HOST_IMPORT_ALLOW = {
     "@/node/utils/writeFileAtomic",
     "fs/promises",
   ],
-  "src/node/services/tools/skillFileHint.ts": ["@/node/runtime/RemoteRuntime"],
   "src/node/services/tools/todo.ts": [
     "@/node/utils/concurrency/workspaceFileLocks",
     "@/node/utils/writeFileAtomic",

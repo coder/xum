@@ -65,7 +65,7 @@ export interface HookConfig {
 
 /**
  * Derive the hook config every hook-wrapped tool runs with, or null when
- * hooks must not run. Host-side reads (mux.load and intuition) share this
+ * hooks must not run. Host-side reads (mux.load) share this
  * trust gate with public tools: repo-controlled hooks run only for trusted projects.
  */
 export function deriveToolHookConfig(config: ToolConfiguration): HookConfig | null {
@@ -209,7 +209,7 @@ function readToolOption(options: unknown, key: "abortSignal" | "toolCallId"): un
     : undefined;
 }
 
-/** A host-side call (mux.load, intuition) has no SDK call ID: its Pre and Post hooks share one. */
+/** A host-side call (mux.load) has no SDK call ID: its Pre and Post hooks share one. */
 function hookCallId(toolCallId: string | undefined): string {
   return toolCallId ?? `xum-hook-call-${randomUUID()}`;
 }

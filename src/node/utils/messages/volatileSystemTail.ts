@@ -10,8 +10,8 @@ import { findLatestContextBoundaryIndex } from "@/common/utils/messages/compacti
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
 /**
- * Prompt-cache mechanism 10: the volatile system tail (hot memories, MCP warning, context-window
- * ids) ends the system prompt, and Anthropic puts the system prompt before the messages. So a
+ * Prompt-cache mechanism 10: the volatile system tail (MCP warning, context-window ids) ends
+ * the system prompt, and Anthropic puts the system prompt before the messages. So a
  * tail change rewrote the whole cached history, and its replayed thinking (bound to the prefix)
  * could 400.
  *
@@ -74,6 +74,10 @@ interface SystemSectionChannel {
 
 const VOLATILE_TAIL: SystemSectionChannel = {
   field: "volatileSystemTail",
+  // Model-facing bytes, rebuilt into every put-back row: keep them unchanged. The removed
+  // Memory Hot Set experiment's "hot memories" stays named, because a new header would
+  // rewrite the cached history of chats that already sent this row (and their replayed
+  // thinking can 400, see the module comment).
   header:
     "Update: these volatile system sections replace the earlier ones (hot memories, MCP warning, context window).",
   rowId: "volatile-tail",

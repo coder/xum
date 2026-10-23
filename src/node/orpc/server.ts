@@ -1047,8 +1047,12 @@ export async function createOrpcServer({
 
   // OAuth providers may use POST redirects (307/308) or response_mode=form_post.
   // Support both JSON API requests and form-encoded callback payloads.
-  app.use(express.json({ limit: "50mb" }));
-  app.use(express.urlencoded({ extended: false }));
+  // inflate: false answers 415 for any Content-Encoding but identity before body-parser creates a
+  // decompression stream. These parsers run before auth, so otherwise any client that reaches the
+  // port could feed bytes to Node's Brotli decoder (CVE-2026-111497, which runs code on affected
+  // Node releases, including the desktop app's Electron). No xum client compresses request bodies.
+  app.use(express.json({ limit: "50mb", inflate: false }));
+  app.use(express.urlencoded({ extended: false, inflate: false }));
 
   // Health check. Must be registered ahead of express.static: serve-static stats
   // "<staticDir>/health" on every request before falling through, so a wedged libuv threadpool

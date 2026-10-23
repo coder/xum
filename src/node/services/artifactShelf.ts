@@ -25,8 +25,8 @@ import { parseArtifactRelativePath } from "./artifactStore";
  *   <xumRoot>/artifacts/global/<entry>/{meta.json, <file>}
  *   <xumRoot>/artifacts/project/<projectMemoryDirName>/<entry>/{meta.json, <file>}
  *
- * Deliberately NOT under /memories: memory files feed the memory index, the hot set, intuition
- * recall and the consolidation agent, which may rewrite or delete them. An entry is a byte copy of
+ * Deliberately NOT under /memories: memory files feed the memory index and the
+ * consolidation agent, which may rewrite or delete them. An entry is a byte copy of
  * one published version, so the shelf never changes under a reader; pinning the same artifact
  * path from the same workspace again replaces its entry (see chooseShelfEntryName). Agents write the shelf only through the
  * `artifact` tool's pin; everything else is read-only for them.

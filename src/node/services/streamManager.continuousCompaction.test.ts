@@ -563,8 +563,8 @@ describe("continuous prefix prepareStep and journal", () => {
   it("a swap lifts each volatile-tail row to the front once, in order", async () => {
     // Mechanism 10 rows are system messages inside the history, and the swap moves every
     // system message to the front. The cut lies in the live turn's steps, after every row.
-    const hot = (text: string) => `\n\n<hot_memories>${text}</hot_memories>`;
-    const tail = hot("C");
+    const warning = (text: string) => `\n\n[Warning: ${text}]`;
+    const tail = warning("C");
     const payload = await assemblePromptPayload({
       modelString: "anthropic:claude-opus-5-5",
       providerForMessages: "anthropic",
@@ -578,11 +578,11 @@ describe("continuous prefix prepareStep and journal", () => {
       history: [
         createMuxMessage("u1", "user", "first"),
         createMuxMessage("a1", "assistant", "one", {
-          volatileSystemTail: { text: hot("A"), placement: "system" },
+          volatileSystemTail: { text: warning("A"), placement: "system" },
         }),
         createMuxMessage("u2", "user", "second"),
         createMuxMessage("a2", "assistant", "two", {
-          volatileSystemTail: { text: hot("B"), placement: "row" },
+          volatileSystemTail: { text: warning("B"), placement: "row" },
         }),
         createMuxMessage("u3", "user", "current prompt"),
       ],
@@ -593,7 +593,7 @@ describe("continuous prefix prepareStep and journal", () => {
       messages.flatMap((message) =>
         message.role === "system" ? [message.content.replace(/^Update: [^\n]*/, "row")] : []
       );
-    const expected = ["stable", hot("A"), `row${hot("B")}`, `row${tail}`];
+    const expected = ["stable", warning("A"), `row${warning("B")}`, `row${tail}`];
     expect(systemTexts(payload.messages)).toEqual(expected);
 
     const turn = await startLiveTurn({ requestOptions: { messages: payload.messages } });

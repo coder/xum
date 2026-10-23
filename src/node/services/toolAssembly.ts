@@ -166,7 +166,7 @@ function refuseToolForAgent(
  * - Provider-executed tools (native web_search) and tools without a local
  *   execute never run the refusal.
  * - Memory's description carries the memory index, so an agent denied memory
- *   must not see it (intuition, which reads memory directly, follows memory).
+ *   must not see it.
  * - A refused tool_catalog_search would still make tool search defer the MCP
  *   tools (prepareToolSearch reads presence), and every search would then be
  *   refused, leaving those allowed tools unreachable.

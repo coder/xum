@@ -27,6 +27,7 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { ensurePrivateDir } from "@/node/utils/fs";
 import {
   TurnRequestBuilder,
+  type LoopHostServices,
   type TurnRequestBuilderBindings,
   resolveXumToolScope,
   type StreamMessageOptions,
@@ -101,7 +102,6 @@ import {
   resolveMemoryProjectIdentity,
   type MemorySessionContext,
 } from "@/node/services/memoryService";
-import { formatHotMemoriesBlock } from "@/node/services/memoryHotSet";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 
 import { isWorkspaceArchived } from "@/common/utils/archive";
@@ -216,7 +216,9 @@ export class AIService extends EventEmitter {
     providersConfigStore?: ProvidersConfigStore,
     private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
       config.rootDir
-    )
+    ),
+    /** Absent members: the Node layer (`new AIService(` in tests passes none). */
+    hostServices: LoopHostServices = {}
   ) {
     super();
     // No listener cap: every live AgentSession adds one listener per forwarded event, and a
@@ -269,6 +271,7 @@ export class AIService extends EventEmitter {
       experimentsService: this.experimentsService,
       lastLlmRequestByWorkspace: this.lastLlmRequestByWorkspace,
       bindings: this.turnRequestBuilderBindings,
+      hostServices,
       emit: (event, ...args) => this.emit(event, ...args),
       createAbortedTurnHandle: (messageId, signal) =>
         this.createAbortedTurnHandle(messageId, signal),
@@ -308,9 +311,8 @@ export class AIService extends EventEmitter {
 
   /**
    * Build the session-segment memory context: the index snapshot advertised
-   * in the memory tool description, plus the hot-memories block (pinned +
-   * frequently used memory files; memory-hot-set sub-experiment). Returns
-   * null when the memory experiment is off.
+   * in the memory tool description. Returns null when the memory experiment
+   * is off.
    *
    * Callers (AgentSession) cache the result per model and recompute it only
    * on the first use of a model in a session segment, or at compaction
@@ -321,12 +323,9 @@ export class AIService extends EventEmitter {
    */
   async buildMemorySessionContext(
     workspaceId: string,
-    // The byte-budgeted context no longer depends on the model; the parameter
-    // keeps AgentSession's per-model cache contract unchanged.
-    _modelString: string,
-    options?: {
-      includeHotMemories?: boolean;
-    }
+    // The memory context does not depend on the model; the parameter keeps
+    // AgentSession's per-model cache contract unchanged.
+    _modelString: string
   ): Promise<MemorySessionContext | null> {
     if (!this.turnRequestBuilderBindings.memoryService) return null;
     if (this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY) !== true) {
@@ -347,31 +346,7 @@ export class AIService extends EventEmitter {
       };
       const indexEntries =
         await this.turnRequestBuilderBindings.memoryService.listIndexEntries(ctx);
-      // Hot preloading is a sub-experiment: without it, memories stay
-      // pull-based like skills (index only, contents fetched on demand).
-      let hotMemoriesBlock: string | null = null;
-      if (
-        options?.includeHotMemories !== false &&
-        this.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET) === true
-      ) {
-        try {
-          // Sub-agents preload pinned files only: auto-hot files mirror the
-          // parent's usage, and every child would otherwise pay for the same
-          // block again. The index and on-demand reads stay available.
-          const items = await this.turnRequestBuilderBindings.memoryService.listHotMemories(ctx, {
-            pinnedOnly: metadata.parentWorkspaceId != null,
-          });
-          hotMemoriesBlock = items.length === 0 ? null : formatHotMemoriesBlock(items);
-        } catch (error) {
-          // Hot preloading is best-effort context. Preserve the pull-based
-          // memory index when ranked selection fails.
-          log.warn("Failed to build hot memories; continuing with memory index only", {
-            workspaceId,
-            error,
-          });
-        }
-      }
-      return { indexEntries, hotMemoriesBlock };
+      return { indexEntries };
     } catch (error) {
       // Self-healing: memory context is best-effort, never a stream blocker.
       log.warn("Failed to build memory session context", { workspaceId, error });

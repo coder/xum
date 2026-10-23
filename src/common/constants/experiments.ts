@@ -15,8 +15,6 @@ export const EXPERIMENT_IDS = {
   AGENT_BROWSER: "agent-browser",
   PORTABLE_DESKTOP: "portable-desktop",
   MEMORY: "memory",
-  MEMORY_HOT_SET: "memory-hot-set",
-  MEMORY_INTUITION: "memory-intuition",
   MEMORY_CONSOLIDATION: "memory-consolidation",
   CLAUDE_SKILLS_COMPAT: "claude-skills-compat",
   CLAUDE_DESIGN_MCP: "claude-design-mcp",
@@ -41,6 +39,8 @@ export const PROMOTED_EXPERIMENT_IDS: ReadonlySet<string> = new Set([
   "advisor-tool", // Retired; accepted only for CLI compatibility.
   "agent-plugins",
   "dynamic-workflows",
+  "memory-hot-set", // Retired; accepted only for CLI compatibility.
+  "memory-intuition", // Retired; accepted only for CLI compatibility.
   "timeline",
   "tool-search",
   "workspace-heartbeats",
@@ -148,24 +148,6 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Agent Memory",
     description:
       "Enable the agent memory tool and memory index (global / project / workspace scopes, plus a session scope in token-budget mode)",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  // Sub-experiment of Agent Memory (flat flag, gated on the parent at the call
-  // site; Settings nests it under the Agent Memory toggle). Without it, memories
-  // stay pull-based like skills: index advertised in the memory tool description,
-  // contents fetched on demand.
-  [EXPERIMENT_IDS.MEMORY_INTUITION]: {
-    id: EXPERIMENT_IDS.MEMORY_INTUITION,
-    name: "Memory Intuition",
-    description: "Recall relevant memories with a bounded, read-only intuition agent",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.MEMORY_HOT_SET]: {
-    id: EXPERIMENT_IDS.MEMORY_HOT_SET,
-    name: "Memory Hot Set",
-    description: "Preload pinned and frequently used memory files into the system prompt",
     enabledByDefault: false,
     showInSettings: true,
   },
