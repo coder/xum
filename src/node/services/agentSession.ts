@@ -176,11 +176,8 @@ import {
 } from "@/node/services/utils/fileChangeTracker";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
-import {
-  WorkspaceMutationInProgressError,
-  workspaceUseLeasesFor,
-  type WorkspaceUseLease,
-} from "@/node/services/workspaceUseLeases";
+import { WorkspaceMutationInProgressError } from "@/node/services/sessionLocks/sessionLocks";
+import type { WorkspaceUseLease } from "@/node/services/workspaceUseLeases";
 import {
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
@@ -4707,7 +4704,10 @@ export class AgentSession {
   private beginTurnUseLease(): void {
     // A refusal (or an unexpected lock error) resolves to the error, so a preparation that ends
     // before streamWithHistory confirms the lease leaves no unhandled rejection.
-    this.turnUseLease ??= workspaceUseLeasesFor(this.config)
+    // The lease comes from the history service's SessionLocks (phase 4), so a test layer can
+    // play another backend's mutation gate.
+    this.turnUseLease ??= this.historyService.locks
+      .useLeasesFor(this.config)
       .hold(this.workspaceId, "turn")
       .catch((error: unknown) => (error instanceof Error ? error : new Error(String(error))));
   }
