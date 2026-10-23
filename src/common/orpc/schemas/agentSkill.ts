@@ -28,6 +28,22 @@ export const SkillLookupNameSchema = z
   .max(129)
   .regex(/^(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?:)?[a-z0-9]+(?:-[a-z0-9]+)*$/);
 
+/**
+ * True when no object or array in `value` contains itself. A recursive YAML alias
+ * (`a: &A { self: *A }`) parses to a cyclic object, which `z.json()` accepts but the
+ * oRPC serializer and the consent fingerprint cannot walk. Shared (non-recursive)
+ * aliases are fine, so this tracks the current path, not every visited node.
+ */
+function isAcyclic(value: unknown, ancestors = new Set<object>()): boolean {
+  if (typeof value !== "object" || value === null) return true;
+  if (ancestors.has(value)) return false;
+  ancestors.add(value);
+  const children: unknown[] = Array.isArray(value) ? value : Object.values(value);
+  const acyclic = children.every((child) => isAcyclic(child, ancestors));
+  ancestors.delete(value);
+  return acyclic;
+}
+
 export const AgentSkillFrontmatterSchema = z.object({
   name: SkillNameSchema,
   description: z.string().min(1).max(1024),
@@ -36,7 +52,12 @@ export const AgentSkillFrontmatterSchema = z.object({
   // agentskills.io says string values, but skills-ref (the spec's own validator)
   // accepts any value. Xum only displays metadata, so a nested value must not
   // hide the skill (warpdotdev/common-skills merge-risk uses metadata.credits).
-  metadata: z.record(z.string(), z.unknown()).optional(),
+  // Values must stay JSON: tagged YAML (`!!set`, `!!omap`, `!!binary`) parses to
+  // Set/Map/Uint8Array, which the tool card and the consent fingerprint show as `{}`.
+  metadata: z
+    .record(z.string(), z.json())
+    .refine((value) => isAcyclic(value), { message: "must not contain a recursive YAML alias" })
+    .optional(),
 
   // When false, skill is NOT listed in the tool description's skill index.
   // Unadvertised skills can still be invoked via /skill-name or agent_skill_read({ name: "skill-name" }).

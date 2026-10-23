@@ -77,6 +77,49 @@ Body
     });
   });
 
+  // Tagged YAML parses to Set/Map/Uint8Array, and a recursive alias to a cyclic object.
+  // Neither survives the RPC serializer or the consent fingerprint, so both reject the skill.
+  test.each([
+    ["!!set", "metadata:\n  tags: !!set\n    ? a\n    ? b\n", "metadata.tags"],
+    ["!!omap", "metadata:\n  order: !!omap\n    - a: 1\n", "metadata.order"],
+    ["!!binary", "metadata:\n  blob: !!binary aGVsbG8=\n", "metadata.blob"],
+    ["a recursive alias", "metadata:\n  loop: &A\n    self: *A\n", "recursive YAML alias"],
+  ])("rejects metadata with %s", (_label, metadataYaml, expectedError) => {
+    const content = `---\nname: foo\ndescription: Hello\n${metadataYaml}---\nBody\n`;
+
+    expect(() =>
+      parseSkillMarkdown({
+        content,
+        byteSize: Buffer.byteLength(content, "utf-8"),
+        directoryName: SkillNameSchema.parse("foo"),
+      })
+    ).toThrow(expectedError);
+  });
+
+  test("accepts a shared, non-recursive YAML alias in metadata", () => {
+    const content = `---
+name: foo
+description: Hello
+metadata:
+  base: &B
+    owner: team
+  copy: *B
+---
+Body
+`;
+
+    const result = parseSkillMarkdown({
+      content,
+      byteSize: Buffer.byteLength(content, "utf-8"),
+      directoryName: SkillNameSchema.parse("foo"),
+    });
+
+    expect(result.frontmatter.metadata).toEqual({
+      base: { owner: "team" },
+      copy: { owner: "team" },
+    });
+  });
+
   test("parses advertise field in frontmatter", () => {
     const content = `---
 name: internal-skill
