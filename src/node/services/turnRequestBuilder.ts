@@ -1,4 +1,4 @@
-import type { HostClock } from "@/node/utils/hostClock";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { withExecutionScope } from "./tools/withExecutionScope";
 import { getArtifactShelfRoot } from "@/node/services/artifactShelf";
 import { usesInstallationScopedPlans } from "@/common/utils/planStorage";
@@ -1152,7 +1152,8 @@ export class TurnRequestBuilder {
     if (this.dependencies.initStateManager.getUnsanitizedCheckoutError(workspaceId)) return false;
     const ready = await runtime.ensureReady({ signal });
     if (!ready.ready || signal.aborted) return false;
-    const readStartedAt = this.hostClock.nowMs();
+    // Wall clock: MCPServerManager subtracts Date.now() from the deadline (#7282).
+    const readStartedAt = nodeClock.nowMs();
     const read = await this.dependencies.workspaceMcpOverridesService
       .getOverridesForWorkspace(workspaceId, { timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS, signal })
       .catch(() => ({ overrides: undefined, authoritative: false }));
@@ -2156,6 +2157,8 @@ export class TurnRequestBuilder {
     // unreadable document disables.
     let mcpOverridesAuthoritative = false;
     const loadWorkspaceMcpOverridesStartedAt = this.hostClock.nowMs();
+    // Wall clock: MCPServerManager subtracts Date.now() from this deadline (#7282).
+    const mcpOverridesReadDeadlineAt = nodeClock.nowMs() + MCP_OVERRIDES_READ_TIMEOUT_MS;
     try {
       // Bounded and cancellable: an inheriting child's resolution probes and
       // reads every ancestor's document on that ancestor's runtime (SSH/Docker
@@ -2476,8 +2479,7 @@ export class TurnRequestBuilder {
             ...(mcpOverridesAuthoritative
               ? {}
               : {
-                  overridesReadDeadlineAt:
-                    loadWorkspaceMcpOverridesStartedAt + MCP_OVERRIDES_READ_TIMEOUT_MS,
+                  overridesReadDeadlineAt: mcpOverridesReadDeadlineAt,
                 }),
             projectSecrets: await secretsToRecord(projectSecrets),
             agentPlugins: agentPluginsMcpContext,
