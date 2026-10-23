@@ -65,7 +65,7 @@ export interface StepBudgetInput {
   toolResultTokens?: number;
   /**
    * Assembled estimate of the next provider request (the measure the per-step preflight
-   * enforces), when known. Floors only the hard stop, never the advisory stages.
+   * enforces), when known. Floors the measure both the hard stop and the advisory stages open on.
    */
   nextRequestTokens?: number;
   modelContextLimit: number | null | undefined;
