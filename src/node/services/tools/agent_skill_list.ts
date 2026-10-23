@@ -1,5 +1,3 @@
-import * as fsPromises from "fs/promises";
-import os from "node:os";
 import * as path from "path";
 import { tool } from "ai";
 
@@ -42,6 +40,7 @@ import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillSto
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { ensurePathContained, hasErrorCode, isSameHostDirectory } from "./skillFileUtils";
+import { nodeHostFiles, nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 
 interface AgentSkillListToolArgs {
   includeUnadvertised?: boolean | null;
@@ -49,7 +48,7 @@ interface AgentSkillListToolArgs {
 
 async function listSkillDirectories(skillsRoot: string): Promise<string[]> {
   try {
-    const entries = await fsPromises.readdir(skillsRoot, { withFileTypes: true });
+    const entries = await nodeHostFiles.promises.readdir(skillsRoot, { withFileTypes: true });
     // Include symlinked entries: skill package managers install skills by
     // symlinking directories into skills roots. readSkillDescriptor enforces
     // realpath containment per skill, so escaping symlinks stay rejected.
@@ -154,9 +153,9 @@ async function readContainedSkillFile(
     return null;
   }
 
-  let stat: Awaited<ReturnType<typeof fsPromises.stat>>;
+  let stat: Awaited<ReturnType<typeof nodeHostFiles.promises.stat>>;
   try {
-    stat = await fsPromises.stat(containedPath);
+    stat = await nodeHostFiles.promises.stat(containedPath);
   } catch {
     log.warn(
       `Skipping ${scope} skill '${directoryName}' because SKILL.md is missing: ${skillFilePath}`
@@ -177,7 +176,7 @@ async function readContainedSkillFile(
   }
 
   try {
-    return { content: await fsPromises.readFile(containedPath, "utf-8"), byteSize: stat.size };
+    return { content: await nodeHostFiles.promises.readFile(containedPath, "utf-8"), byteSize: stat.size };
   } catch (error) {
     log.warn(
       `Skipping ${scope} skill '${directoryName}' because SKILL.md could not be read: ${getErrorMessage(error)}`
@@ -324,7 +323,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           throw new Error("agent_skill_list requires xumScope");
         }
 
-        const userHome = os.homedir();
+        const userHome = nodeHostPaths.userHome();
 
         // Always list global skills; also list project skills when in a project workspace.
         const roots: ListedSkillsRoot[] = await getHostGlobalSkillsRoots(
@@ -420,7 +419,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
         } of roots) {
           let skillsRootReal: string;
           try {
-            skillsRootReal = await fsPromises.realpath(skillsRoot);
+            skillsRootReal = await nodeHostFiles.promises.realpath(skillsRoot);
           } catch (error) {
             log.warn(
               `Skipping ${scope} skills root '${skillsRoot}' because path could not be resolved: ${getErrorMessage(error)}`
