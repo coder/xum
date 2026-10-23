@@ -1,4 +1,3 @@
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
 
@@ -39,17 +38,20 @@ import { log } from "@/node/services/log";
 import {
   isProjectTrusted,
   isWorkspaceProjectTrusted,
-  projectPluginsAllowed,
+  projectPluginContainerPaths,
 } from "@/node/utils/projectTrust";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import {
   discoverAgentPlugins,
+  nodePluginFs,
   readPluginFileWithinRootCapped,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
   type AgentPluginContainer,
+  type PluginFs,
 } from "@/node/services/agentPlugins/discovery";
+import { getRemoteProjectPluginSnapshot } from "@/node/services/agentPlugins/remoteProjectPlugins";
 import {
   isPluginAgentConsented,
   type ComponentConsent,
@@ -123,6 +125,11 @@ export interface AgentDefinitionsRoots {
   projectPluginRoots?: string[];
   /** Agent Plugins container dirs, e.g. ~/.xum/plugins (read-only). */
   globalPluginRoots?: string[];
+  /**
+   * #6426: plugin container dirs of a TRUSTED remote checkout (remote paths). Their agents are
+   * read from the host's cached snapshot (getRemoteProjectPluginSnapshot), never per turn.
+   */
+  remoteProjectPluginRoots?: string[];
 }
 
 export function getDefaultAgentDefinitionsRoots(
@@ -140,30 +147,36 @@ export function getDefaultAgentDefinitionsRoots(
       runtime.normalizePath(relativePath, workspacePath)
     ),
     globalRoot: GLOBAL_AGENTS_ROOT,
-    // Agent Plugins discovery reads the host filesystem only. Remote runtimes
-    // (SSH/Docker) get the GLOBAL host plugin containers (read through a host
-    // LocalRuntime) but no project plugin containers, because a remote
-    // checkout is not on the host filesystem (mirrors agentSkillsService).
-    ...(!(runtime instanceof RemoteRuntime)
-      ? {
-          // #6426: a project plugin's agents load only in a trusted project, like its skills,
-          // MCP servers, hooks and slash commands. Missing trust is untrusted.
-          ...(projectPluginsAllowed(projectPluginsTrusted)
-            ? {
-                projectPluginRoots: [
-                  ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
-                    runtime.normalizePath(relativePath, workspacePath)
-                  ),
-                  runtime.normalizePath(".agents/plugins", workspacePath),
-                ],
-              }
-            : {}),
-          globalPluginRoots: [`${runtime.getXumHome()}/plugins`, UNIVERSAL_AGENT_PLUGINS_CONTAINER],
-        }
-      : {
-          // Tilde form: the host LocalRuntime maps ~/.xum to the host Xum home.
-          globalPluginRoots: ["~/.xum/plugins", UNIVERSAL_AGENT_PLUGINS_CONTAINER],
-        }),
+    ...pluginRootsOf(
+      runtime,
+      projectPluginContainerPaths(runtime, workspacePath, projectPluginsTrusted)
+    ),
+  };
+}
+
+/**
+ * Remote runtimes (SSH/Docker) get the GLOBAL host plugin containers (read through a host
+ * LocalRuntime). Their checkout's own plugin containers are remote paths, read from a cached
+ * snapshot of the remote checkout (#6426), as in agentSkillsService. A project plugin's agents
+ * load only in a trusted project (projectPluginContainerPaths gives none otherwise).
+ */
+function pluginRootsOf(
+  runtime: Runtime,
+  projectContainers: string[]
+): Pick<
+  AgentDefinitionsRoots,
+  "projectPluginRoots" | "remoteProjectPluginRoots" | "globalPluginRoots"
+> {
+  if (runtime instanceof RemoteRuntime) {
+    return {
+      ...(projectContainers.length > 0 ? { remoteProjectPluginRoots: projectContainers } : {}),
+      // Tilde form: the host LocalRuntime maps ~/.xum to the host Xum home.
+      globalPluginRoots: ["~/.xum/plugins", UNIVERSAL_AGENT_PLUGINS_CONTAINER],
+    };
+  }
+  return {
+    ...(projectContainers.length > 0 ? { projectPluginRoots: projectContainers } : {}),
+    globalPluginRoots: [`${runtime.getXumHome()}/plugins`, UNIVERSAL_AGENT_PLUGINS_CONTAINER],
   };
 }
 
@@ -177,6 +190,36 @@ interface AgentDefinitionScanCandidate {
   pluginName?: string;
   /** Managed plugins only: the reviewed fingerprints (#6629). Unmanaged plugins have none. */
   pluginConsent?: ComponentConsent | undefined;
+  /**
+   * #6426: a remote checkout's plugin agents. Their files are read from this snapshot (no remote
+   * round trip), and every path stays a remote path; `runtime` is the RemoteRuntime.
+   */
+  pluginFs?: PluginFs;
+}
+
+/** #6426: scan candidates for the plugin agents of a trusted remote checkout's snapshot. */
+async function buildRemotePluginAgentCandidates(
+  runtime: Runtime,
+  roots: AgentDefinitionsRoots,
+  workspacePath: string
+): Promise<AgentDefinitionScanCandidate[]> {
+  const containers = roots.remoteProjectPluginRoots ?? [];
+  if (containers.length === 0) return [];
+  const snapshot = await getRemoteProjectPluginSnapshot(runtime, workspacePath, containers);
+  return (snapshot?.plugins ?? []).flatMap((plugin) =>
+    plugin.agentsDir == null
+      ? []
+      : [
+          {
+            scope: "project" as const,
+            root: plugin.agentsDir,
+            runtime,
+            pluginRoot: plugin.rootPath,
+            pluginName: plugin.name,
+            pluginFs: snapshot?.fs,
+          },
+        ]
+  );
 }
 
 /**
@@ -278,6 +321,7 @@ async function buildScanCandidates(
       runtime,
     })),
     ...projectPluginCandidates,
+    ...(await buildRemotePluginAgentCandidates(runtime, roots, workspacePath)),
     {
       scope: "global",
       root: roots.globalRoot,
@@ -315,8 +359,9 @@ async function resolvePluginAgentFile(args: {
   pluginRoot: string;
   agentsDir: string;
   agentId: AgentId;
+  pluginFs?: PluginFs;
 }): Promise<string | null> {
-  const names = await listAgentFilesFromLocalFs(args.agentsDir);
+  const names = await listAgentFiles(args.pluginFs, args.agentsDir);
   const ambiguous = warnAmbiguousPluginAgents(names);
   const name = names.find((candidate) => pluginAgentIdOf(candidate) === args.agentId);
   if (name === undefined || ambiguous.has(args.agentId)) return null;
@@ -332,9 +377,11 @@ async function isPluginAgentContained(args: {
   pluginRoot: string;
   filePath: string;
   agentId: AgentId;
+  /** A remote plugin's snapshot; the host filesystem when absent. */
+  pluginFs?: PluginFs;
 }): Promise<boolean> {
   try {
-    await ensurePathContained(args.pluginRoot, args.filePath);
+    await (args.pluginFs ?? nodePluginFs).ensureContained(args.pluginRoot, args.filePath);
     return true;
   } catch (error) {
     if (!hasErrorCode(error, "ENOENT")) {
@@ -346,15 +393,44 @@ async function isPluginAgentContained(args: {
   }
 }
 
-async function listAgentFilesFromLocalFs(root: string): Promise<string[]> {
+/** The agent files of a plugin agents dir: in a remote snapshot, else on the host. */
+async function listAgentFiles(pluginFs: PluginFs | undefined, root: string): Promise<string[]> {
   try {
-    const entries = await fs.readdir(root, { withFileTypes: true });
+    const entries = await (pluginFs ?? nodePluginFs).readdir(root);
     return entries
       .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"))
       .map((entry) => entry.name);
   } catch {
     return [];
   }
+}
+
+/** A scan root's agent files: from its snapshot, over its remote runtime, or on the host. */
+function listCandidateAgentFiles(
+  scan: Pick<AgentDefinitionScanCandidate, "runtime" | "pluginFs">,
+  resolvedRoot: string,
+  workspacePath: string
+): Promise<string[]> {
+  return scan.pluginFs == null && scan.runtime instanceof RemoteRuntime
+    ? listAgentFilesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
+    : listAgentFiles(scan.pluginFs, resolvedRoot);
+}
+
+/** A scan root, resolved. A remote plugin root is already a real remote path: no round trip. */
+function resolveCandidateRoot(
+  candidate: Pick<AgentDefinitionScanCandidate, "runtime" | "root" | "pluginFs">
+): Promise<string> {
+  return candidate.pluginFs != null
+    ? Promise.resolve(candidate.root)
+    : candidate.runtime.resolvePath(candidate.root);
+}
+
+/** A plugin agent file: from its remote snapshot, else the host's contained reader. */
+function readPluginAgentFile(
+  pluginFs: PluginFs | undefined,
+  args: Parameters<typeof readPluginFileWithinRootCapped>[0]
+): ReturnType<typeof readPluginFileWithinRootCapped> {
+  return pluginFs != null ? pluginFs.readFileCapped(args) : readPluginFileWithinRootCapped(args);
 }
 
 async function listAgentFilesFromRuntime(
@@ -451,13 +527,15 @@ async function readAgentDescriptorFromFile(
    * otherwise control agent policy (runnable/base/tools).
    */
   pluginRoot?: string,
-  pluginConsent?: ComponentConsent
+  pluginConsent?: ComponentConsent,
+  /** A remote plugin's snapshot (AgentDefinitionScanCandidate.pluginFs). */
+  pluginFs?: PluginFs
 ): Promise<AgentDefinitionDescriptor | null> {
   let content: string;
   let byteSize: number;
   if (pluginRoot != null) {
     try {
-      const result = await readPluginFileWithinRootCapped({
+      const result = await readPluginAgentFile(pluginFs, {
         filePath,
         pluginRoot,
         maxBytes: MAX_FILE_SIZE,
@@ -582,7 +660,7 @@ export async function discoverAgentDefinitions(
   for (const scan of scans) {
     let resolvedRoot: string;
     try {
-      resolvedRoot = await scan.runtime.resolvePath(scan.root);
+      resolvedRoot = await resolveCandidateRoot(scan);
     } catch (err) {
       if (isRuntimeTransportError(err)) throw err;
       log.warn(`Failed to resolve agents root ${scan.root}: ${getErrorMessage(err)}`);
@@ -591,9 +669,7 @@ export async function discoverAgentDefinitions(
 
     const filenames = withoutAmbiguousPluginAgents(
       scan,
-      scan.runtime instanceof RemoteRuntime
-        ? await listAgentFilesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
-        : await listAgentFilesFromLocalFs(resolvedRoot)
+      await listCandidateAgentFiles(scan, resolvedRoot, workspacePath)
     );
 
     for (const filename of filenames) {
@@ -614,6 +690,7 @@ export async function discoverAgentDefinitions(
           pluginRoot: scan.pluginRoot,
           filePath,
           agentId,
+          pluginFs: scan.pluginFs,
         });
         if (!contained) continue;
       }
@@ -625,7 +702,8 @@ export async function discoverAgentDefinitions(
         scan.scope,
         scan.pluginName,
         scan.pluginRoot,
-        scan.pluginConsent
+        scan.pluginConsent,
+        scan.pluginFs
       );
       if (!descriptor) continue;
 
@@ -824,7 +902,7 @@ async function loadAgentDefinition(
 
     let resolvedRoot: string;
     try {
-      resolvedRoot = await candidate.runtime.resolvePath(candidate.root);
+      resolvedRoot = await resolveCandidateRoot(candidate);
     } catch (error) {
       // An unreachable host is not a missing root: never fall through to a
       // lower scope or the built-in agent on a transport failure (#4438).
@@ -839,6 +917,7 @@ async function loadAgentDefinition(
         pluginRoot: candidate.pluginRoot,
         agentsDir: resolvedRoot,
         agentId,
+        pluginFs: candidate.pluginFs,
       });
       if (pluginFile === null) continue;
       filePath = pluginFile;
@@ -853,7 +932,7 @@ async function loadAgentDefinition(
         // This frontmatter controls agent policy (runnable/base/tools), so a
         // replacement symlink promoted after isPluginAgentContained must not
         // have its outside target read here.
-        const result = await readPluginFileWithinRootCapped({
+        const result = await readPluginAgentFile(candidate.pluginFs, {
           filePath,
           pluginRoot: candidate.pluginRoot,
           maxBytes: MAX_FILE_SIZE,
