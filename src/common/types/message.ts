@@ -552,7 +552,7 @@ export interface TranscriptAnchor {
 
 /**
  * A message sent from an agent-written artifact (Artifacts M5b): `window.xum.send` or a canvas
- * button, confirmed by the user in the host-owned strip. Only the backend sets it (generic sends
+ * button, sent by the user's click in the artifact or confirmed in the host-owned strip. Only the backend sets it (generic sends
  * refuse it), so the "from artifact" label cannot be faked by typing the model-facing tag.
  */
 export interface ArtifactInteractionMetadata {

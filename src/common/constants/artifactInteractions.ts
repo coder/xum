@@ -4,6 +4,13 @@
  * session files.
  */
 export const ARTIFACT_SEND_TEXT_MAX_CHARS = 4000;
+/**
+ * One click in an HTML artifact sends at most one message without the confirm strip: a second
+ * send from the same frame within this window asks in the strip. It covers the transient user
+ * activation a click leaves behind (about 5 s in Chromium), during which the page's script could
+ * post more sends that still pass the gesture gate.
+ */
+export const ARTIFACT_CLICK_SEND_WINDOW_MS = 5000;
 /** Serialized JSON size cap for `send` data and `setState` state. */
 export const ARTIFACT_JSON_MAX_BYTES = 16 * 1024;
 /** artifact_list shows at most this much of the latest version's state. */

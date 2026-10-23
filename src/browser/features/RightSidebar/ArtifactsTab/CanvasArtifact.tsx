@@ -300,15 +300,15 @@ function CanvasBlockView(props: {
       );
     }
     case "button": {
-      // Hidden where artifacts are read-only. The click only fills the host's confirm strip;
-      // the user's Send there is what delivers the message.
+      // Hidden where artifacts are read-only. Xum draws this button and a canvas runs no
+      // script, so a click on it is always the user's own: it sends at once.
       const interactions = props.interactions;
       if (interactions == null) return null;
       return (
         <Padded>
           <button
             type="button"
-            onClick={() => interactions.requestSend(block.send, block.data)}
+            onClick={() => interactions.requestSend(block.send, block.data, "click")}
             className="border-border-light text-foreground hover:bg-hover focus-visible:ring-accent max-w-full truncate rounded border px-2 py-1 text-xs focus-visible:ring-1"
           >
             {block.label}
