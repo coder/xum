@@ -5,11 +5,13 @@
  * Node locks would wait the whole timeout first), so tests need no real wait.
  */
 import assert from "node:assert";
+import * as path from "node:path";
 import { Effect, Layer } from "effect";
 import { SessionLocksTag } from "@/node/services/di/tags";
 import {
   workspaceMutationInProgressMessage,
   workspaceMutationLockPath,
+  workspaceUseLockDir,
 } from "@/node/services/workspaceUseLeases";
 import { fileLockTimeoutMessage, type FileLockBlocker } from "@/node/utils/concurrency/fileLock";
 import {
@@ -187,7 +189,16 @@ export function wrapWithForeignHolders(inner: SessionLocks, holders: ForeignHold
           }
           return lease;
         },
-        isHeld: (workspaceId, kind) => leases.isHeld(workspaceId, kind),
+        // WorkspaceUseLeases.isHeld lists every backend's "<token>.<kind>.lock" in the
+        // workspace's lease folder. A live fake there is another backend's lease.
+        isHeld: async (workspaceId, kind) => {
+          const dir = workspaceUseLockDir(config.rootDir, workspaceId);
+          for (const [lockPath, holder] of table) {
+            const lease = path.dirname(lockPath) === dir && lockPath.endsWith(`.${kind}.lock`);
+            if (lease && holder.state === "live") return true;
+          }
+          return await leases.isHeld(workspaceId, kind);
+        },
       };
       leasesByConfig.set(config, wrapped);
       return wrapped;

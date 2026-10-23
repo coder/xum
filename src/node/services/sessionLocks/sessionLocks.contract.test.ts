@@ -10,6 +10,7 @@ import {
   WorkspaceMutationInProgressError,
   workspaceMutationInProgressMessage,
   workspaceMutationLockPath,
+  workspaceUseLockDir,
 } from "@/node/services/workspaceUseLeases";
 import { fileLockTimeoutMessage } from "@/node/utils/concurrency/fileLock";
 import type { ProcessIdentity } from "@/node/utils/concurrency/processLiveness";
@@ -226,39 +227,6 @@ test("memory: a release hands the file lock to the waiters in FIFO order", () =>
     await expect(first.assertStillOwned()).rejects.toThrow("is no longer owned by this holder");
   }));
 
-test("memory: a parent removed while the acquire waits refuses with ENOENT", () =>
-  onMemory(async (locks, t) => {
-    const runDir = path.join(t.dir, "run");
-    await fs.mkdir(runDir);
-    const lockPath = path.join(runDir, "run.lock");
-    const holder = await t.foreignHolder(lockPath, "live", "record");
-    const acquire = locks
-      .acquireCrossProcessLock({
-        lockPath,
-        createParentDirectory: false,
-        acquireTimeoutMs: 1_000,
-        staleMs: 60_000,
-        timeoutMessage: "run lock is held.",
-      })
-      .then(
-        () => null,
-        (caught: unknown) => caught
-      );
-    await fs.rm(runDir, { recursive: true });
-    await holder.release();
-    expect(((await acquire) as NodeJS.ErrnoException).code).toBe("ENOENT");
-    // The refusal frees the lock: a later acquire takes it at once.
-    await fs.mkdir(runDir);
-    const release = await locks.acquireCrossProcessLock({
-      lockPath,
-      createParentDirectory: false,
-      acquireTimeoutMs: 0,
-      staleMs: 60_000,
-      timeoutMessage: "run lock is held.",
-    });
-    await release();
-  }));
-
 test("memory: an init-record lock makes a real file, and inspect sees it", () =>
   onMemory(async (locks, t) => {
     const lockPath = path.join(t.dir, "locks", "init-record", "ws", "backend.lock");
@@ -369,6 +337,24 @@ test("foreign: hold() publishes its lease before it probes the gate", async () =
       WorkspaceMutationInProgressError
     );
     expect(await leases.isHeld("ws-order", "turn")).toBe(false);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("foreign: a live fake lease of another backend makes isHeld true", async () => {
+  const t = await nodeLocks();
+  try {
+    const holders = makeForeignHolders();
+    const leases = (await buildSessionLocks(withForeignHolders(t.layer, holders))).useLeasesFor({
+      rootDir: t.dir,
+    });
+    const dir = workspaceUseLockDir(t.dir, "ws-leases");
+    holders.hold(path.join(dir, "other-backend.turn.lock"), "live");
+    holders.hold(path.join(dir, "other-backend.exec.lock"), "dead");
+    expect(await leases.isHeld("ws-leases", "turn")).toBe(true);
+    expect(await leases.isHeld("ws-leases", "exec")).toBe(false);
+    expect(await leases.isHeld("ws-leases", "terminal")).toBe(false);
   } finally {
     await t.cleanup();
   }

@@ -4,6 +4,7 @@
  * case builds a fresh layer: no holders, clock or lock state is shared.
  */
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Effect, type Layer } from "effect";
 import { SessionLocksTag } from "@/node/services/di/tags";
@@ -188,6 +189,19 @@ export function describeSessionLocksContract(
             (caught: unknown) => caught
           );
         expect((error as NodeJS.ErrnoException).code).toBe("ENOENT");
+      }));
+
+    test("a record lock creates its missing parent by default", () =>
+      withLayer(async (locks, t) => {
+        const lockPath = path.join(t.dir, "new-dir", "record.lock");
+        const release = await locks.acquireCrossProcessLock({
+          lockPath,
+          acquireTimeoutMs: 0,
+          staleMs: 60_000,
+          timeoutMessage: "contract record is held.",
+        });
+        expect((await fs.stat(path.dirname(lockPath))).isDirectory()).toBe(true);
+        await release();
       }));
 
     test("an aborted signal wins over a missing parent", () =>

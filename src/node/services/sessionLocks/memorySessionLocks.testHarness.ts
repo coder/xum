@@ -2,10 +2,13 @@
  * SessionLocks in memory: the lock files and records live in a table, and a
  * waiter waits on the HostClock, so under a TestClock a test moves time
  * instead of waiting. Refusals use today's text (fileLockTimeoutMessage,
- * crossProcessLockTimeoutMessage). Two parts stay on the Node locks:
+ * crossProcessLockTimeoutMessage). Three parts stay on the Node locks:
  * - Init-record locks: InitStateManager lists their folder (initStateManager.ts
  *   isRecordLockHeld), so a holder in memory would leave no file, and a live
  *   init would look abandoned.
+ * - Record locks with createParentDirectory false: WorkflowRunStore needs their
+ *   acquire to fail with ENOENT once the run directory is gone, with no window
+ *   between a check and the take. Only the Node lock's own write gives that.
  * - The use leases: the mutation gate, isHeld and taskService read other
  *   backends' lease files. Phase 5 moves them.
  */
@@ -213,22 +216,12 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
       };
     },
     acquireCrossProcessLock: async (options) => {
-      if (foundByReaddir(options.lockPath)) {
+      if (foundByReaddir(options.lockPath) || options.createParentDirectory === false) {
         return await nodeSessionLocks.acquireCrossProcessLock(options);
       }
       const { lockPath, acquireTimeoutMs, timeoutMessage, signal } = options;
-      // crossProcessLock.ts checks the signal before each attempt, so abort wins.
-      if (signal?.aborted) throw abortedAcquireError();
-      // Node rejects with ENOENT when the parent is gone and may not be recreated
-      // (a removed workflow run directory): each attempt's first write fails, before
-      // any holder is judged. Callers rely on that refusal.
-      const checkParent =
-        options.createParentDirectory === false
-          ? async () => {
-              await fs.stat(path.dirname(lockPath));
-            }
-          : null;
-      await checkParent?.();
+      // As crossProcessLock.ts does first: a caller may write into the folder once it holds the lock.
+      await fs.mkdir(path.dirname(lockPath), { recursive: true });
       const refusal = (blocker: Blocker) =>
         new CrossProcessLockTimeoutError(
           crossProcessLockTimeoutMessage(timeoutMessage, lockPath, {
@@ -244,23 +237,14 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
         refusal,
         signal
       );
-      // Check again once the lock is taken: a parent removed after the first check
-      // (or while this waited) must refuse here too, as Node's write would.
-      if (checkParent !== null) {
-        try {
-          await checkParent();
-        } catch (error) {
-          table.free(lockPath, entry);
-          throw error;
-        }
-      }
       return () => {
         table.free(lockPath, entry);
         return Promise.resolve();
       };
     },
+    // A path the table does not hold may be a Node lock (see the module doc).
     inspectCrossProcessLock: async (lockPath) =>
-      foundByReaddir(lockPath)
+      table.owner(lockPath) === undefined
         ? await nodeSessionLocks.inspectCrossProcessLock(lockPath)
         : inspectInMemory(table, lockPath),
     useLeasesFor: (config) => nodeSessionLocks.useLeasesFor(config),
