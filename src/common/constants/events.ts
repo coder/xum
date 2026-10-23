@@ -79,12 +79,6 @@ export const CUSTOM_EVENTS = {
   SKILLS_REFRESH_REQUESTED: "mux:skillsRefreshRequested",
 
   /**
-   * Event emitted when the mux gateway session expires.
-   * No detail
-   */
-  MUX_GATEWAY_SESSION_EXPIRED: "mux:muxGatewaySessionExpired",
-
-  /**
    * Event to switch to a different workspace after fork
    * Detail: { workspaceId: string, projectPath: string, projectName: string, workspacePath: string, branch: string }
    */
@@ -248,7 +242,6 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED]: never; // No payload
   [CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED]: never; // No payload
   [CUSTOM_EVENTS.OPEN_MODEL_SELECTOR]: never; // No payload
-  [CUSTOM_EVENTS.MUX_GATEWAY_SESSION_EXPIRED]: never; // No payload
   [CUSTOM_EVENTS.WORKSPACE_FORK_SWITCH]: {
     workspaceId: string;
     projectPath: string;

@@ -210,7 +210,7 @@ describe("service worker caching (#6848)", () => {
   });
 
   test.each([
-    ["an OAuth start", `${ORIGIN}/auth/mux-gateway/start`, "cors"],
+    ["an OAuth start", `${ORIGIN}/auth/coder/start`, "cors"],
     ["an OAuth callback", `${ORIGIN}/auth/coder/callback?code=c0de&state=st4te`, "navigate"],
     ["an upper-case OAuth callback", `${ORIGIN}/AUTH/coder/callback?code=c0de`, "navigate"],
     ["an oRPC GET", `${ORIGIN}/orpc/workspace/list`, "cors"],

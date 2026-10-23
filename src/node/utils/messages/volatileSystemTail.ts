@@ -29,9 +29,9 @@ import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 /**
  * Routes and models that accept a mid-conversation system row after a user message. Anthropic
  * rejects one after an assistant message (live, Opus 5.5). Only direct Anthropic and the Coder
- * gateway send the Messages API body Xum builds; mux-gateway and OpenRouter convert it on
- * their side. The model list is the one that binds thinking to the prefix (a tail change also
- * breaks its thinking replay). Live through the Coder gateway (2026-10-15), Opus 5.5, Sonnet
+ * gateway send the Messages API body Xum builds; OpenRouter converts it on its side. The model
+ * list is the one that binds thinking to the prefix (a tail change also breaks its thinking
+ * replay). Live through the Coder gateway (2026-10-15), Opus 5.5, Sonnet
  * 5.5, Haiku 5.5 and Fable 5.1 accepted the row after a user message, then with an assistant
  * row after it, and read the whole earlier request from the cache.
  */

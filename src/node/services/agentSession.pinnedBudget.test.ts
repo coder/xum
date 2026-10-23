@@ -83,7 +83,6 @@ async function setup(
         canonicalProviderName: "openai",
         canonicalModelId: requestedModel.slice("openai:".length),
         wireProviderName: "openai",
-        routedThroughGateway: false,
       })
     );
   });
