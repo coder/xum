@@ -28,8 +28,15 @@ import {
   type PrepareModelAttemptOptions,
 } from "./turnRequestBuilder";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
+import { makeTestEffectRunner } from "./di/testEffectRunner";
+import type { EffectRunner } from "./di/effectRunner";
+import { Ok } from "@/common/types/result";
 
-async function createPreparationHarness() {
+type TurnRequestBuilderDependencies = ConstructorParameters<typeof TurnRequestBuilder>[0];
+
+async function createPreparationHarness(
+  overrides: { runner?: EffectRunner; dependencies?: Partial<TurnRequestBuilderDependencies> } = {}
+) {
   const testHistory = await createTestHistoryService();
   const { config, historyService } = testHistory;
   const providerService = new ProviderService(config);
@@ -38,7 +45,8 @@ async function createPreparationHarness() {
     historyService,
     undefined,
     () => providerService.getConfig(),
-    () => undefined
+    () => undefined,
+    overrides.runner
   );
   const builder = new TurnRequestBuilder({
     config,
@@ -73,6 +81,7 @@ async function createPreparationHarness() {
     shouldAllowLegacyInvalidWorkflowAgentOutputSchema: () => Promise.resolve(false),
     isStreaming: () => false,
     trackPendingDevToolsRunMetadata: () => undefined,
+    ...overrides.dependencies,
   });
   return { ...testHistory, builder, providerService, providersConfigStore };
 }
@@ -432,6 +441,61 @@ describe("TurnRequestBuilder assembled preflight", () => {
     );
     const off = await assembleBudgetCheckedPromptPayload(request, { enabled: false });
     expect(off.contextBudgetEstimate).toBeUndefined();
+  });
+});
+
+describe("TurnRequestBuilder MCP overrides deadline", () => {
+  it("leaves MCPServerManager a positive reread budget when the turn's TestClock trails wall time", async () => {
+    // MCPServerManager computes the reread budget as deadline - Date.now(). A deadline on the
+    // TestClock (months behind wall time) would leave 0 ms, skip the mandatory reread and serve
+    // closed, so the deadline reads the wall clock until #7282 moves both sides.
+    const clock = makeTestEffectRunner();
+    const getToolsForWorkspace = mock((_options: { overridesReadDeadlineAt?: number }) =>
+      Promise.resolve({})
+    );
+    const metadata: WorkspaceMetadata = {
+      id: "workspace",
+      name: "workspace",
+      projectName: "project",
+      projectPath: "/tmp/project",
+      runtimeConfig: { type: "local" },
+    };
+    const harness = await createPreparationHarness({
+      runner: clock.runner,
+      dependencies: {
+        bindings: {
+          mcpServerManager: { getToolsForWorkspace } as unknown as NonNullable<
+            TurnRequestBuilderDependencies["bindings"]["mcpServerManager"]
+          >,
+        },
+        workspaceMcpOverridesService: {
+          getOverridesForWorkspace: () =>
+            Promise.resolve({ overrides: undefined, authoritative: false }),
+        } as unknown as WorkspaceMcpOverridesService,
+        getWorkspaceMetadata: () => Promise.resolve(Ok(metadata)),
+        createWorkspaceRuntimeContext: () =>
+          Ok({
+            runtime: { ensureReady: () => Promise.resolve({ ready: true }) },
+            workspacePath: "/tmp/project",
+          }) as unknown as ReturnType<
+            TurnRequestBuilderDependencies["createWorkspaceRuntimeContext"]
+          >,
+      },
+    });
+    try {
+      const started = await harness.builder.startWorkspaceMcpServers(
+        "workspace",
+        new AbortController().signal
+      );
+
+      expect(started).toBe(true);
+      const deadline = getToolsForWorkspace.mock.calls[0]?.[0].overridesReadDeadlineAt;
+      if (deadline == null) throw new Error("expected a non-authoritative reread deadline");
+      expect(deadline - Date.now()).toBeGreaterThan(0);
+    } finally {
+      await harness.cleanup();
+      await clock.dispose();
+    }
   });
 });
 
