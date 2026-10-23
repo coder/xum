@@ -69,12 +69,15 @@ function execError(
   return error;
 }
 
-/** The outcome of one call on the table, or undefined when the table has no entry for it. */
+/**
+ * The outcome of the entry for line, or undefined when the table has none. line is the key:
+ * commandLine of the call for HostProcesses, the whole shell command for FakeRuntime.exec.
+ */
 export async function lookupScriptedCommand(
   table: ScriptTable,
+  line: string,
   call: ScriptedCall
 ): Promise<ScriptedOutcome | undefined> {
-  const line = commandLine(call.file, call.args);
   const entry = Object.hasOwn(table, line) ? table[line] : undefined;
   if (entry === undefined) return undefined;
   return typeof entry === "function" ? await entry(call) : entry;
@@ -85,7 +88,7 @@ export async function runScriptedCommand(
   table: ScriptTable,
   call: ScriptedCall
 ): Promise<{ stdout: string; stderr: string }> {
-  const outcome = await lookupScriptedCommand(table, call);
+  const outcome = await lookupScriptedCommand(table, commandLine(call.file, call.args), call);
   if (outcome === undefined) {
     throw execError(`No scripted command: ${commandLine(call.file, call.args)}`, null, "", "");
   }

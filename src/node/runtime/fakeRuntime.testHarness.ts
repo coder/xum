@@ -9,7 +9,7 @@
  *   as the line. One entry is built in: the stream temp-dir cleanup of streamManager.ts.
  *   createTempDirForStream makes `~/.xum-tmp/<token>`, and cleanupStreamTempDir runs
  *   `rm -rf '<token>'` with that folder's parent as cwd. So `rm -rf '<name>'` with the cwd
- *   `<userHome>/.xum-tmp` deletes that entry and exits 0. Any other command without an entry
+ *   `<userHome>/.xum-tmp` deletes that entry and exits 0 (not for the names . and ..). Any other command without an entry
  *   rejects with a RuntimeError "exec" that names it. An exec whose signal is already aborted
  *   rejects before it runs anything, as LocalRuntime does.
  * - idle() resolves when every exec has settled, so a test can drain fire-and-forget execs.
@@ -85,11 +85,17 @@ export class FakeRuntime implements Runtime {
 
   private async outcomeOf(command: string, cwd: string): Promise<ScriptedOutcome> {
     const removal = RM_RF_ONE_NAME.exec(command);
-    if (removal && cwd === path.posix.join(this.options.userHome, STREAM_TEMP_ROOT)) {
+    // "." and ".." name the folder itself and its parent, never one stream folder.
+    if (
+      removal &&
+      removal[1] !== "." &&
+      removal[1] !== ".." &&
+      cwd === path.posix.join(this.options.userHome, STREAM_TEMP_ROOT)
+    ) {
       await this.fs.promises.rm(path.posix.join(cwd, removal[1]), { recursive: true, force: true });
       return { exitCode: 0 };
     }
-    const outcome = await lookupScriptedCommand(this.options.commands ?? {}, {
+    const outcome = await lookupScriptedCommand(this.options.commands ?? {}, command, {
       file: command,
       args: [],
       cwd,

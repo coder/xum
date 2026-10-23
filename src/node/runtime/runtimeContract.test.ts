@@ -118,6 +118,19 @@ describe("FakeRuntime", () => {
     expect(isRuntimePathAbsentError(gone)).toBe(true);
   });
 
+  test("the cleanup rule refuses . and .., which name the temp root and the home", async () => {
+    const host = createMemoryHost();
+    const streamDir = await host.runtime.resolvePath("~/.xum-tmp/stream-1");
+    await host.runtime.ensureDir(streamDir);
+    for (const name of [".", ".."]) {
+      const refusal = await host.runtime
+        .exec(`rm -rf '${name}'`, { cwd: path.posix.dirname(streamDir) })
+        .catch((error: unknown) => error);
+      expect((refusal as RuntimeError).type).toBe("exec");
+    }
+    expect(await host.runtime.stat(streamDir)).toMatchObject({ isDirectory: true });
+  });
+
   test("an exec whose signal is already aborted runs nothing", async () => {
     const host = createMemoryHost();
     const streamDir = await host.runtime.resolvePath("~/.xum-tmp/stream-1");
