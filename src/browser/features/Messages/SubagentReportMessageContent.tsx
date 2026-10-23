@@ -2,10 +2,9 @@ import { useState, type ReactElement } from "react";
 import { Bot, Braces, ChevronRight, CircleCheck, Radio } from "lucide-react";
 
 import { cn } from "@/common/lib/utils";
-import { getThinkingOptionLabel } from "@/common/types/thinking";
 import type { SubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { MarkdownRenderer } from "./MarkdownRenderer";
-import { ModelDisplay } from "./ModelDisplay";
+import { ModelDisplay, ThinkingLevelLabel } from "./ModelDisplay";
 
 export { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 
@@ -62,7 +61,11 @@ export function SubagentReportMessageContent(
               <>
                 <span aria-hidden="true">·</span>
                 <span className="shrink-0">
-                  thinking: {getThinkingOptionLabel(props.report.thinkingLevel, props.report.model)}
+                  thinking:{" "}
+                  <ThinkingLevelLabel
+                    level={props.report.thinkingLevel}
+                    modelString={props.report.model}
+                  />
                 </span>
               </>
             )}

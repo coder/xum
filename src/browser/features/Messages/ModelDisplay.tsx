@@ -1,12 +1,15 @@
 import React from "react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { ProviderIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
+import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
 import {
   formatModelStringForDisplay,
   getModelProvider,
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
 interface ModelDisplayProps {
   modelString: string;
@@ -75,4 +78,19 @@ export const ModelDisplay: React.FC<ModelDisplayProps> = (props) => {
       </TooltipContent>
     </Tooltip>
   );
+};
+
+/**
+ * A thinking level labeled for the model it ran on. Labels come from a mapped alias's
+ * target, as the thinking selector's do: an alias id alone labels a native-max target's
+ * max as xhigh.
+ */
+export const ThinkingLevelLabel: React.FC<{ level: ThinkingLevel; modelString?: string }> = (
+  props
+) => {
+  const { config: providersConfig } = useProvidersConfig();
+  const labelModel = props.modelString
+    ? resolveModelForMetadata(props.modelString, providersConfig)
+    : undefined;
+  return <>{getThinkingOptionLabel(props.level, labelModel)}</>;
 };
