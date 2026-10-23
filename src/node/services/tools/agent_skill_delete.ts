@@ -1,4 +1,3 @@
-import * as fsPromises from "fs/promises";
 import * as path from "path";
 import { tool } from "ai";
 
@@ -38,6 +37,7 @@ import {
   SKILL_FILENAME,
   validateLocalSkillDirectory,
 } from "./skillFileUtils";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 
 interface AgentSkillDeleteToolArgs {
   name: string;
@@ -125,7 +125,7 @@ async function captureLocalSkillFiles(
   try {
     const captures: RefinementFileCapture[] = [];
     const walk = async (dir: string): Promise<void> => {
-      const entries = await fsPromises.readdir(dir, { withFileTypes: true });
+      const entries = await nodeHostFiles.promises.readdir(dir, { withFileTypes: true });
       if (entries.length === 0) {
         // restore-files recreates parent dirs of files only; an empty dir
         // would silently vanish from a rollback-restored skill.
@@ -137,9 +137,12 @@ async function captureLocalSkillFiles(
         if (entry.isDirectory()) {
           await walk(entryPath);
         } else if (entry.isFile()) {
-          const { size } = await fsPromises.stat(entryPath);
+          const { size } = await nodeHostFiles.promises.stat(entryPath);
           assertCaptureBudget(totals, size);
-          const content = assertLosslessUtf8(entryPath, await fsPromises.readFile(entryPath));
+          const content = assertLosslessUtf8(
+            entryPath,
+            await nodeHostFiles.promises.readFile(entryPath)
+          );
           captures.push({ path: entryPath, content });
         } else {
           // Symlink/socket/fifo: unrepresentable in a restore-files inverse.
@@ -586,7 +589,7 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
                   // Missing dirs are fine (force-rm semantics); a dir that
                   // exists but cannot be captured faithfully skips journaling.
                   try {
-                    await fsPromises.access(dir);
+                    await nodeHostFiles.promises.access(dir);
                     skillCaptures = null;
                   } catch {
                     // Dir absent: nothing to capture for it.
@@ -596,7 +599,9 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
                 }
               }
               await Promise.all(
-                dirsToDelete.map((dir) => fsPromises.rm(dir, { recursive: true, force: true }))
+                dirsToDelete.map((dir) =>
+                  nodeHostFiles.promises.rm(dir, { recursive: true, force: true })
+                )
               );
               if (skillCaptures !== null && skillCaptures.length > 0) {
                 await appendRefinementEventFromTool(config, {
@@ -639,7 +644,7 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
           async () => {
             let targetStat;
             try {
-              targetStat = await fsPromises.lstat(targetPath);
+              targetStat = await nodeHostFiles.promises.lstat(targetPath);
             } catch (error) {
               if (hasErrorCode(error, "ENOENT")) {
                 return {
@@ -682,7 +687,10 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
                 assertCaptureBudget(captureTotals, size);
                 return {
                   path: capturePath,
-                  content: assertLosslessUtf8(capturePath, await fsPromises.readFile(capturePath)),
+                  content: assertLosslessUtf8(
+                    capturePath,
+                    await nodeHostFiles.promises.readFile(capturePath)
+                  ),
                 };
               } catch (error) {
                 if (error instanceof CaptureSkippedError) {
@@ -704,7 +712,7 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
               targetCapture === null ? null : [targetCapture];
             if (fileCaptures !== null && legacyManifestPath != null) {
               try {
-                const legacyStat = await fsPromises.lstat(legacyManifestPath);
+                const legacyStat = await nodeHostFiles.promises.lstat(legacyManifestPath);
                 if (!legacyStat.isFile()) {
                   // Symlink/dir: unrepresentable in a files-only inverse.
                   log.debug("[agent_skill_delete] skipping refinement inverse", {
@@ -734,9 +742,9 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
             // manifest so stale duplicates cannot shadow the delete (upstream
             // .xum-canonical migration semantics).
             if (legacyManifestPath != null) {
-              await fsPromises.rm(legacyManifestPath, { force: true });
+              await nodeHostFiles.promises.rm(legacyManifestPath, { force: true });
             }
-            await fsPromises.unlink(targetPath);
+            await nodeHostFiles.promises.unlink(targetPath);
 
             if (fileCaptures !== null) {
               await appendRefinementEventFromTool(config, {

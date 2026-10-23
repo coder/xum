@@ -189,9 +189,7 @@ const HOST_IMPORT_ALLOW = {
   "src/node/services/contextManagement/strategies/tokenBudget.ts": [
     "@/node/runtime/runtimeHelpers",
   ],
-  "src/node/services/tools/agent_skill_delete.ts": ["fs/promises"],
   "src/node/services/tools/agent_skill_read_file.ts": ["@/node/runtime/RemoteRuntime"],
-  "src/node/services/tools/agent_skill_write.ts": ["fs/promises"],
   "src/node/services/tools/bash.ts": ["@/node/runtime/LocalBaseRuntime", "fs"],
   "src/node/services/tools/notify.ts": ["electron"],
   "src/node/services/tools/review_pane.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
@@ -200,7 +198,6 @@ const HOST_IMPORT_ALLOW = {
     "fs/promises",
   ],
   "src/node/services/tools/skillFileHint.ts": ["@/node/runtime/RemoteRuntime"],
-  "src/node/services/tools/skillsCatalogFetch.ts": ["fs/promises", "os"],
   "src/node/services/tools/todo.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
   "src/node/services/tools/xum_agents_path.ts": ["fs/promises"],
   "src/node/services/tools/xum_agents_read.ts": ["fs/promises"],
