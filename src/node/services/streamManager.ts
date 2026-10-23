@@ -726,8 +726,8 @@ const OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN = /Item with id 'rs_[A-Za-z0-9_-]+
 const OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN =
   /encrypted content\b[\s\S]*?\bcould not be verified/;
 // Anthropic rejecting a replayed thinking signature, e.g. Opus 5.5 binding the
-// block to a system prompt or tool list that has since changed (hot memories
-// and the memory index live there). Routes without the drop_block control
+// block to a system prompt or tool list that has since changed (the memory
+// index lives there). Routes without the drop_block control
 // (Coder gateway, custom providers) otherwise fail every retry identically.
 const ANTHROPIC_THINKING_SIGNATURE_INVALID_PATTERN = /Invalid `signature` in `thinking` block/;
 

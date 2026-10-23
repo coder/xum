@@ -11,7 +11,6 @@ import {
   Bell,
   BookOpen,
   Brain,
-  BrainCircuit,
   CircleCheck,
   Cpu,
   Database,
@@ -256,7 +255,7 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   // from" — distinct from the GraduationCap used when reading a single skill.
   agent_skill_list: LayoutGrid,
   // Cpu reads as "the models (compute) you can pick from"; distinct from the
-  // Brain/BrainCircuit glyphs used for memory tools.
+  // Brain glyph used for the memory tool.
   models_list: Cpu,
   ask_user_question: MessageCircleQuestion,
   file_read: BookOpen,
@@ -264,7 +263,6 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   // A model-requested fresh window: the same "start over" affordance as workflow_resume.
   new_context: RotateCcw,
   memory: Brain,
-  intuition: BrainCircuit,
   attach_file: Paperclip,
   // Publishing shows the file in the Artifacts tab of the right sidebar.
   artifact: PanelRight,

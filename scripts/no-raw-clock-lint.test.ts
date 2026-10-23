@@ -101,7 +101,6 @@ const RAW_CLOCK_CEILING: Record<string, number> = {
   "src/node/services/tools/bash.ts": 3,
   "src/node/services/tools/bash_background_list.ts": 1,
   "src/node/services/tools/code_execution.ts": 3,
-  "src/node/services/tools/intuition.ts": 1,
   "src/node/services/tools/skills_catalog_read.ts": 1,
   "src/node/services/tools/task.ts": 1,
   "src/node/services/tools/task_await.ts": 7,

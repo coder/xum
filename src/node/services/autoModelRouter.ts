@@ -179,8 +179,7 @@ function billedFailureFields(
 ): Omit<AutoModelRouterFailure, "reason"> {
   if (billed === undefined) return {};
   const { inputTokens, outputTokens, totalTokens } = billed.usage;
-  // Unknown counts are skipped, as for intuition evaluations: recording them as zero would
-  // under-count spend.
+  // Unknown counts are skipped: recording them as zero would under-count spend.
   if (inputTokens === null || outputTokens === null) return {};
   const metadata = billed.usageProviderMetadata;
   return {

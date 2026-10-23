@@ -200,25 +200,25 @@ describe("PortableDesktopExperimentWarning", () => {
     }
   );
 
-  test("hides Memory Intuition when Agent Memory is off without clearing its toggle", () => {
+  test("hides Memory Consolidation when Agent Memory is off without clearing its toggle", () => {
     experimentEnabled = false;
     experimentValues = {
       [EXPERIMENT_IDS.MEMORY]: false,
-      [EXPERIMENT_IDS.MEMORY_INTUITION]: true,
+      [EXPERIMENT_IDS.MEMORY_CONSOLIDATION]: true,
     };
     const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
-    expect(view.queryByLabelText("Toggle Memory Intuition")).toBeNull();
+    expect(view.queryByLabelText("Toggle Memory Consolidation")).toBeNull();
 
     fireEvent.click(view.getByLabelText("Toggle Agent Memory"));
     view.rerender(<ExperimentsSection />);
-    expect(view.getByLabelText("Toggle Memory Intuition").getAttribute("aria-checked")).toBe(
+    expect(view.getByLabelText("Toggle Memory Consolidation").getAttribute("aria-checked")).toBe(
       "true"
     );
 
     fireEvent.click(view.getByLabelText("Toggle Agent Memory"));
     view.rerender(<ExperimentsSection />);
-    expect(view.queryByLabelText("Toggle Memory Intuition")).toBeNull();
-    expect(experimentValues[EXPERIMENT_IDS.MEMORY_INTUITION]).toBe(true);
+    expect(view.queryByLabelText("Toggle Memory Consolidation")).toBeNull();
+    expect(experimentValues[EXPERIMENT_IDS.MEMORY_CONSOLIDATION]).toBe(true);
   });
 
   test("shows RLM Mode nested under Programmatic Tool Calling only when PTC is enabled", () => {

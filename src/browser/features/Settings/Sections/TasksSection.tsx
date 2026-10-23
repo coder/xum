@@ -63,7 +63,7 @@ const OFFLINE_SAVE_MESSAGE =
 // apply reasoningMode. Never offer a Pro/Cyber toggle that cannot affect requests.
 // Compact stays eligible: compaction goes through the send path, which
 // threads reasoningMode.
-const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace", "intuition"]);
+const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace"]);
 
 function getAgentDefinitionPath(agent: AgentDefinitionDescriptor): string | null {
   switch (agent.scope) {
@@ -307,7 +307,6 @@ interface AiDefaultsControlsProps {
   reasoningModeValue: OpenAIReasoningMode;
   reasoningModeInherited?: boolean;
   modelCapabilitiesDeferred?: boolean;
-  applyMinimumThinkingLevel?: boolean;
   /** Forwarded to the picker; false hides the Pro and Cyber toggles (e.g. Dream, whose requests never apply reasoningMode). */
   allowReasoningModes?: boolean;
   effectiveModel: string | undefined;
@@ -362,7 +361,6 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
           <ThinkingSelectorControl
             modelString={props.effectiveModel}
             modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
-            applyMinimumThinkingLevel={props.applyMinimumThinkingLevel}
             thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
             onThinkingLevelChange={(level) => props.onThinkingChange(level)}
             reasoningMode={props.reasoningModeValue}
@@ -440,8 +438,6 @@ export function TasksSection() {
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationFlag = useExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION);
   const memoryConsolidationEnabled = memoryEnabled && memoryConsolidationFlag;
-  const memoryIntuitionFlag = useExperimentValue(EXPERIMENT_IDS.MEMORY_INTUITION);
-  const memoryIntuitionEnabled = memoryEnabled && memoryIntuitionFlag;
 
   // Resolve the workspace's active model so that when a sub-agent's model is
   // "Inherit", we show thinking levels for the workspace model (falling back to
@@ -867,15 +863,8 @@ export function TasksSection() {
         agentAiDefaults,
         portableDesktopEnabled,
         memoryConsolidationEnabled,
-        memoryIntuitionEnabled,
       }),
-    [
-      agentAiDefaults,
-      listedAgents,
-      portableDesktopEnabled,
-      memoryConsolidationEnabled,
-      memoryIntuitionEnabled,
-    ]
+    [agentAiDefaults, listedAgents, portableDesktopEnabled, memoryConsolidationEnabled]
   );
   const execSubagentAgent = listedAgents.find(
     (agent) => agent.id === "exec" && agent.subagentRunnable && agent.uiSelectable
@@ -933,8 +922,7 @@ export function TasksSection() {
     // a base-chain model wins over the ambient default (otherwise an agent
     // inheriting GPT-5.6+pro from its base would hide the Pro toggle whenever
     // the ambient model isn't pro-capable).
-    // Intuition resolves without ancestors, falling back to the parent turn's model.
-    const inheritedDefaults = agent.id === "intuition" ? {} : resolveBaseChainDefaults(agent.id);
+    const inheritedDefaults = resolveBaseChainDefaults(agent.id);
     const effectiveModel =
       modelValue !== INHERIT
         ? modelValue
@@ -1039,8 +1027,6 @@ export function TasksSection() {
           thinkingValue={thinkingValue}
           reasoningModeValue={entry?.reasoningMode ?? inheritedDefaults.reasoningMode ?? "standard"}
           allowReasoningModes={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
-          // Intuition clamps to model capabilities, not the chat's minimum effort.
-          applyMinimumThinkingLevel={agent.id !== "intuition"}
           effectiveModel={effectiveModel}
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}
