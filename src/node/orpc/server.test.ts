@@ -400,9 +400,12 @@ describe("createOrpcServer compressed request bodies", () => {
         cancelGithubDeviceFlow: () => undefined,
       } as unknown as ORPCContext["serverAuthService"],
     };
+    // The server requires a token and the request sends none: the 415 must come from body-parser,
+    // which an unauthenticated client reaches.
     const server = await createOrpcServer({
       host: "127.0.0.1",
       port: 0,
+      authToken: "test-token",
       context: context as ORPCContext,
     });
     try {
