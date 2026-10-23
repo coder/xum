@@ -155,6 +155,12 @@ function wrapWithFaults(inner: SessionFiles, rules: FaultRules): SessionFiles {
   const run = (api: FaultApi, call: AnyFunction, args: unknown[]): unknown => {
     const target = targetOf(args[0]);
     rules.checkFail(api, target);
+    // writeFileAtomic writes a temp file through the inner layer's own fs, so a cut cannot reach
+    // it. Refuse the rule instead of leaving it queued for a later write to the same path.
+    if (api === "writeFileAtomic" && rules.takeCut(target) !== undefined)
+      throw new Error(
+        `fault layer: cutNextWrite does not apply to writeFileAtomic (${String(target)})`
+      );
     const cut = api === "appendFile" || api === "writeSync" ? rules.takeCut(target) : undefined;
     if (cut === undefined) {
       if (api !== "open") return call(...args);

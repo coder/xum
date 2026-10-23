@@ -37,8 +37,8 @@ test("today's code writes the golden session folder", async () => {
   }
 });
 
-/** Every file under root on the host disk, relative to root. */
-async function listHostFiles(root: string): Promise<string[]> {
+/** Every file and folder under root on the host disk, relative to root. */
+async function listHostEntries(root: string): Promise<string[]> {
   const entries = await fs
     .readdir(root, { recursive: true, withFileTypes: true })
     .catch((error: NodeJS.ErrnoException) => {
@@ -46,7 +46,6 @@ async function listHostFiles(root: string): Promise<string[]> {
       throw error;
     });
   return entries
-    .filter((entry) => !entry.isDirectory())
     .map((entry) => path.relative(root, path.join(entry.parentPath, entry.name)))
     .sort();
 }
@@ -60,7 +59,7 @@ test("the memory layer writes the golden bytes and nothing on disk", async () =>
     const snapshots = await runGoldenScript(historyService, config, STEPS, files);
     const fixture = JSON.parse(await fs.readFile(FIXTURE, "utf8")) as GoldenSnapshot[];
     expect(snapshots).toEqual(fixture);
-    expect(await listHostFiles(path.join(tempDir, "sessions"))).toEqual([]);
+    expect(await listHostEntries(path.join(tempDir, "sessions"))).toEqual([]);
   } finally {
     await cleanup();
   }

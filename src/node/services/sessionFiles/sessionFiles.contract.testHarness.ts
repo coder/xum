@@ -368,6 +368,18 @@ export function describeFaultCases(name: string, layer: Layer.Layer<SessionFiles
       expect(await files.promises.readFile(file, "utf8")).toBe("ro");
     });
 
+    it("a cut before writeFileAtomic refuses the write and does not stay queued", async (files, faults, dir) => {
+      const file = path.join(dir, "post-compaction.json");
+      faults.cutNextWrite(file, { afterBytes: 1 });
+      const refused = await files.writeFileAtomic(file, "{}").then(
+        () => "written",
+        (error: Error) => error.message
+      );
+      expect(refused).toContain("does not apply");
+      await files.promises.appendFile(file, "abc");
+      expect(await files.promises.readFile(file, "utf8")).toBe("abc");
+    });
+
     it("failNext throws the code once on that path only, then passes", async (files, faults, dir) => {
       const [from, other] = [path.join(dir, "a"), path.join(dir, "b")];
       await files.promises.appendFile(from, "x");
