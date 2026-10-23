@@ -7,6 +7,7 @@ import {
   type ConfigStores,
 } from "@/node/config";
 import type { CoreServicesOptions } from "@/node/services/coreServices";
+import { SessionLocksNode } from "@/node/services/sessionLocks/nodeSessionLocks";
 import {
   ConfigTag,
   FileLeaseManagerTag,
@@ -33,6 +34,7 @@ export function StoresLive(stores: ConfigStores): Layer.Layer<StoreTags> {
     // The same for the host files and paths outside the session dirs.
     HostFilesNode,
     HostPathsNode,
+    SessionLocksNode,
     Layer.succeed(ProvidersConfigStoreTag)(stores.providersConfigStore),
     Layer.succeed(SecretsStoreTag)(stores.secretsStore),
     Layer.succeed(FileLeaseManagerTag)(stores.fileLeaseManager)
