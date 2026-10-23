@@ -70,6 +70,14 @@ function fixSuperblock(core: MemCore, fs: MemFs): void {
   // Fix 2, and the ctime part of fix 3.
   const rename = core.rename.bind(core);
   core.rename = (oldPath, newPath) => {
+    // rename(2) onto the same file does nothing on the host: no ENOTEMPTY and no ctime change.
+    // Inode numbers are unique here (fix 3), so the ino tells the same file.
+    const target = fs.lstatSync(newPath, { throwIfNoEntry: false });
+    if (
+      target !== undefined &&
+      fs.lstatSync(oldPath, { throwIfNoEntry: false })?.ino === target.ino
+    )
+      return;
     if (isDirectory(oldPath) && isDirectory(newPath) && fs.readdirSync(newPath).length > 0)
       throw systemError("ENOTEMPTY", "directory not empty", "rename", `${oldPath}' -> '${newPath}`);
     rename(oldPath, newPath);

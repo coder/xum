@@ -221,6 +221,19 @@ export function describeSessionFilesContract(
       expect(await errorCode(() => files.renameSync(`${target}.b`, target))).toBe("ENOENT");
     });
 
+    it("rename onto the same path does nothing and keeps the stamps", async (files, dir) => {
+      const file = path.join(dir, "chat.jsonl");
+      await files.promises.appendFile(file, "row");
+      const sub = path.join(dir, "sub");
+      await files.promises.mkdir(sub);
+      await files.promises.appendFile(path.join(sub, "file"), "x");
+      const before = [await stamps(files, file), await stamps(files, sub)];
+      await files.promises.rename(file, file);
+      files.renameSync(sub, sub);
+      expect([await stamps(files, file), await stamps(files, sub)]).toEqual(before);
+      expect(await files.promises.readFile(file, "utf8")).toBe("row");
+    });
+
     it("readdir withFileTypes tells files from directories", async (files, dir) => {
       await files.promises.mkdir(path.join(dir, "sub"));
       await files.promises.appendFile(path.join(dir, "chat.jsonl"), "x");
