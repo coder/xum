@@ -345,6 +345,34 @@ describe("BackgroundProcessManager", () => {
       }
     });
 
+    it("stamps meta.json start and exit times on the wall clock under a TestClock", async () => {
+      // meta.json is read by other backends and shown by bash_background_list, and the wake
+      // reconciler compares startTime with Date.now() origins, so these record times read the
+      // wall clock until #7282. The TestClock starts months before wall time.
+      const clock = makeTestEffectRunner();
+      const clocked = new BackgroundProcessManager(bgOutputDir, clock.hostClock);
+      try {
+        const before = Date.now();
+        const result = await clocked.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "wall-clock-meta",
+        });
+        if (!result.success) throw new Error(result.error);
+        expect(
+          await clocked.terminate(result.processId, { monitorDisposition: "discard" })
+        ).toEqual({ success: true });
+        const proc = await clocked.getProcess(result.processId);
+        const after = Date.now();
+        for (const stamp of [proc?.startTime, proc?.exitTime]) {
+          expect(stamp).toBeGreaterThanOrEqual(before);
+          expect(stamp).toBeLessThanOrEqual(after);
+        }
+      } finally {
+        await clocked.cleanup(testWorkspaceId);
+        await clock.dispose();
+      }
+    });
+
     it("does not reuse a preserved record directory when retrying a failed remote spawn", async () => {
       // A transport-level throw after dispatch preserves the remote record directory as
       // fail-closed orphan evidence. A same-session retry of the same display name must not
@@ -4731,6 +4759,51 @@ describe("BackgroundProcessManager", () => {
       if (!result.success) return;
       expect(result.processId).toBe("dev (2)");
       expect(await fs.readFile(markerPath, "utf-8")).toBe("0");
+    });
+
+    // The prune age compares file mtimes, which the OS stamps on the wall clock, so it must
+    // read the wall clock too (#7282). The TestClock starts months before wall time and the
+    // second test sets it days ahead, so a HostClock read would flip both outcomes.
+    it("prunes an old settled record under a TestClock behind wall time", async () => {
+      const clock = makeTestEffectRunner();
+      const clocked = new BackgroundProcessManager(bgOutputDir, clock.hostClock);
+      try {
+        const processDir = path.join(workspaceDir, "dev");
+        await writeSpawnRecord("dev", { pid: 999_999, status: "exited" }, { exitCode: "0" });
+        for (const file of ["exit_code", "meta.json"]) {
+          await fs.utimes(path.join(processDir, file), settledLongAgo, settledLongAgo);
+        }
+
+        const result = await clocked.spawn(runtime, orphanWorkspaceId, "sleep 5", {
+          cwd: process.cwd(),
+          displayName: "dev",
+        });
+        if (!result.success) throw new Error(result.error);
+        expect(result.processId).toBe("dev");
+      } finally {
+        await clocked.cleanup(orphanWorkspaceId);
+        await clock.dispose();
+      }
+    });
+
+    it("keeps a freshly settled record after the TestClock moves days ahead", async () => {
+      const clock = makeTestEffectRunner();
+      const clocked = new BackgroundProcessManager(bgOutputDir, clock.hostClock);
+      try {
+        await writeSpawnRecord("dev", { pid: 999_999, status: "exited" }, { exitCode: "0" });
+        await clock.setTime(Date.now() + 2 * 24 * 60 * 60 * 1000);
+
+        const result = await clocked.spawn(runtime, orphanWorkspaceId, "sleep 5", {
+          cwd: process.cwd(),
+          displayName: "dev",
+        });
+        if (!result.success) throw new Error(result.error);
+        expect(result.processId).toBe("dev (2)");
+        expect(await fs.readFile(path.join(workspaceDir, "dev", "exit_code"), "utf-8")).toBe("0");
+      } finally {
+        await clocked.cleanup(orphanWorkspaceId);
+        await clock.dispose();
+      }
     });
 
     it("keeps a record whose owner records the exit while the probe reads meta.json", async () => {

@@ -1,5 +1,5 @@
 import { tool } from "ai";
-import { clockOf } from "@/node/utils/hostClock";
+import { nodeClock } from "@/node/utils/hostClock";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import {
@@ -261,7 +261,8 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
         }
       }
       const createdRun: { id: string | null } = { id: null };
-      const invocationStartedAtMs = clockOf(config).nowMs();
+      // Wall clock: the sidecar stores it as createdAtMs beside WorkflowService times (#7282).
+      const invocationStartedAtMs = nodeClock.nowMs();
       const startInput = {
         script,
         workspaceId,

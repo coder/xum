@@ -464,12 +464,12 @@ describe("StreamManager - tool execution start timing", () => {
   }
 
   test("stamps executionStartedAt and emits tool-call-execution-start when the part already exists", async () => {
-    // A TestClock that the test never advances holds the stream's clock still, so a
-    // raw clock reading for the execution start would equal the tool-call part
-    // timestamp; reconnect replay's `executionStartedAt > cursor` repair predicate
-    // would then never fire for a cursor at that part.
-    const clock = makeTestEffectRunner();
-    const harness = createLiveStreamHarness({ runner: clock.runner });
+    // A raw clock reading for the execution start could equal the tool-call part
+    // timestamp in the same millisecond; reconnect replay's `executionStartedAt > cursor`
+    // repair predicate would then never fire for a cursor at that part. Part timestamps
+    // read the wall clock until #7282, and this file may not patch Date.now, so the
+    // test cannot hold that clock still: it checks the ordering only.
+    const harness = createLiveStreamHarness();
     const workspaceId = "execution-start-workspace";
     const messageId = "execution-start-message";
     const live = await harness.start({ workspaceId, messageId, tools: { bash } });
@@ -491,8 +491,38 @@ describe("StreamManager - tool execution start timing", () => {
       if (partTimestamp == null) throw new Error("Expected tool-call-start");
       expect(events[0].timestamp).toBeGreaterThan(partTimestamp);
       expect(liveParts(harness, workspaceId)[0].executionStartedAt).toBe(events[0].timestamp);
-      await live.finish();
     } finally {
+      await live.finish();
+    }
+  });
+
+  test("stamps part timestamps on the wall clock, not on the stream's TestClock", async () => {
+    // Part timestamps are record times: history, the renderer and replay compare them with
+    // Date.now() times, so they stay on the wall clock until #7282. The TestClock starts
+    // months before the wall clock, so a part stamped on it falls outside the bounds.
+    const clock = makeTestEffectRunner();
+    const harness = createLiveStreamHarness({ runner: clock.runner });
+    const before = Date.now();
+    const live = await harness.start({
+      workspaceId: "wall-clock-workspace",
+      messageId: "wall-clock-message",
+      tools: { bash },
+    });
+    try {
+      await live.push(dynamicToolCall("tool-call-wall", "bash"));
+      await executeTool(harness, "tool-call-wall");
+      const after = Date.now();
+      const stamps = [
+        eventsOfType(harness.events, "tool-call-start")[0]?.timestamp,
+        eventsOfType(harness.events, "tool-call-execution-start")[0]?.timestamp,
+      ];
+      for (const stamp of stamps) {
+        expect(stamp).toBeGreaterThanOrEqual(before);
+        // nextPartTimestamp adds 1 ms per same-millisecond part.
+        expect(stamp).toBeLessThanOrEqual(after + stamps.length);
+      }
+    } finally {
+      await live.finish();
       await clock.dispose();
     }
   });

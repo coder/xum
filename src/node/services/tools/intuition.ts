@@ -1,5 +1,5 @@
 import { tool } from "ai";
-import { clockOf } from "@/node/utils/hostClock";
+import { nodeClock } from "@/node/utils/hostClock";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { sanitizeErrorMessageForDisplay } from "@/common/utils/providerOutputSanitization";
@@ -75,7 +75,8 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
                 usage,
                 providerMetadata,
                 toolCallId,
-                timestamp: clockOf(config).nowMs(),
+                // Record time: wall clock until #7282 moves its consumers to HostClock.
+                timestamp: nodeClock.nowMs(),
               })
             ),
         });

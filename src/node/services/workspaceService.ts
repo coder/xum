@@ -16815,7 +16815,8 @@ export class WorkspaceService
         muxMeta?.type === "compaction-request" && muxMeta?.source === "idle-compaction";
       // Use current time for recency - this matches the timestamp used on the message
       // in agentSession.sendMessage(). Keeps ExtensionMetadata in sync with chat.jsonl.
-      const messageTimestamp = this.hostClock.nowMs();
+      // Wall clock, like the user message timestamp that AgentSession stamps (#7282).
+      const messageTimestamp = nodeClock.nowMs();
       if (!isIdleCompaction) {
         void this.updateRecencyTimestamp(workspaceId, messageTimestamp);
       }

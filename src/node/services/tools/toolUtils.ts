@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { clockOf } from "@/node/utils/hostClock";
+import { nodeClock } from "@/node/utils/hostClock";
 
 import type { z } from "zod";
 
@@ -85,7 +85,8 @@ export async function emitWorkflowRunAttachedEvent(input: {
     toolCallId: input.toolCallId,
     runId: input.runId,
     ...(parsedRun.success ? { run: parsedRun.data } : {}),
-    timestamp: clockOf(input.config).nowMs(),
+    // Record time: wall clock until #7282 moves its consumers to HostClock.
+    timestamp: nodeClock.nowMs(),
   };
   await input.config.emitChatEvent(event);
 }

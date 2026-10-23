@@ -121,8 +121,6 @@ const CLOCK_PATCH_FREE_TESTS = [
   "src/node/services/backgroundProcessManager.test.ts",
   "src/node/services/retryManager.test.ts",
   "src/node/services/streamManager.toolEvents.test.ts",
-  "src/node/services/tools/skills_catalog_read.test.ts",
-  "src/node/services/tools/task_await.test.ts",
   "src/node/services/tools/web_fetch.test.ts",
 ];
 // File -> the exact number of raw clock reads it still has. Phase 3 lowers each entry as it

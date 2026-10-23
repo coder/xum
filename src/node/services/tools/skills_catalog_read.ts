@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { clockOf, type HostClock } from "@/node/utils/hostClock";
+import { nodeClock } from "@/node/utils/hostClock";
 import { tool } from "ai";
 
 import type { SkillsCatalogReadToolResult } from "@/common/types/tools";
@@ -96,13 +96,13 @@ function findPinnedSkillForPage(args: SkillsCatalogReadToolArgs, now: number) {
  * requested snapshot, the page says so.
  */
 async function loadSkillForPage(
-  args: SkillsCatalogReadToolArgs,
-  clock: HostClock
+  args: SkillsCatalogReadToolArgs
 ): Promise<PinnedSkill & { pinNote?: string }> {
   const { owner, repo, skillId } = args;
   const laterPage = (args.offset_chars ?? 0) > 0;
   const requested = args.snapshot ?? undefined;
-  const now = clock.nowMs();
+  // Wall clock: the pins live in a process-wide cache shared by every session (#7282).
+  const now = nodeClock.nowMs();
   const pinned = findPinnedSkillForPage(args, now);
   if (pinned != null) return pinned;
   const loaded = await fetchAndParseSkill(owner, repo, skillId, now);
@@ -138,17 +138,14 @@ function joinNotes(...notes: Array<string | undefined>): { note?: string } {
   return present.length > 0 ? { note: present.join(" ") } : {};
 }
 
-export const createSkillsCatalogReadTool: ToolFactory = (config: ToolConfiguration) => {
+export const createSkillsCatalogReadTool: ToolFactory = (_config: ToolConfiguration) => {
   return tool({
     description: TOOL_DEFINITIONS.skills_catalog_read.description,
     inputSchema: TOOL_DEFINITIONS.skills_catalog_read.schema,
     execute: async (args: SkillsCatalogReadToolArgs): Promise<SkillsCatalogReadToolResult> => {
       const { owner, repo, skillId } = args;
       try {
-        const { fetched, parsed, snapshot, pinNote } = await loadSkillForPage(
-          args,
-          clockOf(config)
-        );
+        const { fetched, parsed, snapshot, pinNote } = await loadSkillForPage(args);
 
         // Catalog SKILL.md files can reach MAX_FILE_SIZE (1 MB): return the body in pages.
         const { text: body, ...paging } = pageToolTextForResult(

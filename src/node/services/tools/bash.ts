@@ -1,5 +1,5 @@
 import { tool } from "ai";
-import { clockOf } from "@/node/utils/hostClock";
+import { clockOf, nodeClock } from "@/node/utils/hostClock";
 import assert from "node:assert/strict";
 // NOTE: We avoid readline; consume Web Streams directly to prevent race conditions
 import * as fs from "fs";
@@ -1343,7 +1343,8 @@ ${scriptWithEnv}`;
             toolCallId,
             text,
             isError,
-            timestamp: clockOf(config).nowMs(),
+            // Record time: wall clock until #7282 moves its consumers to HostClock.
+            timestamp: nodeClock.nowMs(),
           } satisfies BashOutputEvent,
           "bash"
         );

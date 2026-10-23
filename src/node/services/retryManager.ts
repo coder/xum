@@ -11,8 +11,7 @@ import {
   isNonRetryableStreamError,
 } from "@/common/utils/messages/retryEligibility";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
-import { hostClockFor } from "./di/hostClockLive";
-import type { HostClock } from "@/node/utils/hostClock";
+import { nodeClock } from "@/node/utils/hostClock";
 
 export interface RetryFailureError {
   type: string;
@@ -78,9 +77,7 @@ export class RetryManager {
      */
     private readonly runner: EffectRunner = defaultEffectRunner,
     /** Logical ownership precedes status publication; it never leases sleeping or physical work. */
-    private readonly beginRetry?: () => Disposable,
-    /** Stamps `scheduledAt`; the clock of `runner` by default, so it matches the backoff sleep. */
-    private readonly hostClock: HostClock = hostClockFor(runner)
+    private readonly beginRetry?: () => Disposable
   ) {
     assert(this.workspaceId.trim().length > 0, "RetryManager: workspaceId must be non-empty");
     assert(typeof this.onRetry === "function", "RetryManager: onRetry must be a function");
@@ -124,7 +121,8 @@ export class RetryManager {
       type: "auto-retry-scheduled",
       attempt: this.state.attempt,
       delayMs: delay,
-      scheduledAt: this.hostClock.nowMs(),
+      // Wall clock: the renderer counts down from it with Date.now() (#7282).
+      scheduledAt: nodeClock.nowMs(),
     };
     this.pendingScheduledEvent = scheduledEvent;
     this.retryPending = true;
