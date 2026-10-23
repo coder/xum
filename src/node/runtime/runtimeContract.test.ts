@@ -10,6 +10,8 @@ interface RuntimeUnderTest extends Disposable {
   runtime: Runtime;
   /** An existing, empty folder. */
   root: string;
+  /** The path API the runtime resolves with: the platform's for LocalRuntime, POSIX for the fake. */
+  resolve: (...segments: string[]) => string;
 }
 
 // The file members that loop tools use must behave alike on LocalRuntime and on FakeRuntime, so a
@@ -22,6 +24,7 @@ describe.each<[string, () => RuntimeUnderTest]>([
       return {
         runtime: new LocalRuntime(dir.path),
         root: dir.path,
+        resolve: (...segments) => path.resolve(...segments),
         [Symbol.dispose]: () => dir[Symbol.dispose](),
       };
     },
@@ -33,6 +36,7 @@ describe.each<[string, () => RuntimeUnderTest]>([
       return {
         runtime: host.runtime,
         root: host.paths.tmpDir(),
+        resolve: (...segments) => path.posix.resolve(...segments),
         [Symbol.dispose]: () => undefined,
       };
     },
@@ -80,8 +84,8 @@ describe.each<[string, () => RuntimeUnderTest]>([
 
   test("normalizePath resolves a relative path and '.' against the base", () => {
     using under = create();
-    expect(under.runtime.normalizePath("c/d", "/a/b")).toBe("/a/b/c/d");
-    expect(under.runtime.normalizePath(".", "/a/b")).toBe("/a/b");
+    expect(under.runtime.normalizePath("c/d", "/a/b")).toBe(under.resolve("/a/b", "c/d"));
+    expect(under.runtime.normalizePath(".", "/a/b")).toBe(under.resolve("/a/b"));
   });
 });
 
@@ -98,17 +102,45 @@ describe("FakeRuntime", () => {
     expect(await host.files.promises.readFile(file, "utf-8")).toBe("# hi\n");
   });
 
+  // The paths of streamManager.ts: createTempDirForStream makes ~/.xum-tmp/<token>, and
+  // cleanupStreamTempDir runs rm -rf '<token>' in its parent.
   test("the stream temp-dir cleanup deletes the folder and exits 0, and idle waits for it", async () => {
     const host = createMemoryHost();
-    const tempRoot = await host.runtime.tempDir();
-    await host.runtime.ensureDir(path.join(tempRoot, "stream-1", "inner"));
-    const exec = await host.runtime.exec("rm -rf 'stream-1'", { cwd: tempRoot, timeout: 10 });
+    const streamDir = await host.runtime.resolvePath("~/.xum-tmp/stream-1");
+    await host.runtime.ensureDir(path.posix.join(streamDir, "inner"));
+    const exec = await host.runtime.exec("rm -rf 'stream-1'", {
+      cwd: path.posix.dirname(streamDir),
+      timeout: 10,
+    });
     expect(await exec.exitCode).toBe(0);
     await host.runtime.idle();
-    const gone = await host.runtime
-      .stat(path.join(tempRoot, "stream-1"))
-      .catch((error: unknown) => error);
+    const gone = await host.runtime.stat(streamDir).catch((error: unknown) => error);
     expect(isRuntimePathAbsentError(gone)).toBe(true);
+  });
+
+  test("an exec whose signal is already aborted runs nothing", async () => {
+    const host = createMemoryHost();
+    const streamDir = await host.runtime.resolvePath("~/.xum-tmp/stream-1");
+    await host.runtime.ensureDir(streamDir);
+    const refusal = await host.runtime
+      .exec("rm -rf 'stream-1'", {
+        cwd: path.posix.dirname(streamDir),
+        abortSignal: AbortSignal.abort(),
+      })
+      .catch((error: unknown) => error);
+    expect((refusal as RuntimeError).type).toBe("exec");
+    expect(await host.runtime.stat(streamDir)).toMatchObject({ isDirectory: true });
+  });
+
+  test("a write keeps each chunk as it was when written", async () => {
+    const host = createMemoryHost();
+    const writer = host.runtime.writeFile("/tmp/chunks.txt").getWriter();
+    const scratch = new TextEncoder().encode("ab");
+    await writer.write(scratch);
+    scratch.set(new TextEncoder().encode("cd"));
+    await writer.write(scratch);
+    await writer.close();
+    expect(await readFileString(host.runtime, "/tmp/chunks.txt")).toBe("abcd");
   });
 
   test("answers a scripted command and refuses any other with its name", async () => {

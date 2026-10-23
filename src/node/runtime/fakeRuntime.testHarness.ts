@@ -6,9 +6,12 @@
  * - readFile and stat of a missing path fail with a RuntimeError "file_io" whose cause has the
  *   fs code (isRuntimePathAbsentError), as LocalRuntime does.
  * - exec answers from a script table (scriptedCommands.testHarness.ts), with the command string
- *   as the line. One entry is built in: `rm -rf '<name>'` in a cwd under tempDir() deletes that
- *   entry and exits 0, the stream temp-dir cleanup of streamManager.ts (cleanupStreamTempDir).
- *   Any other command without an entry rejects with a RuntimeError "exec" that names it.
+ *   as the line. One entry is built in: the stream temp-dir cleanup of streamManager.ts.
+ *   createTempDirForStream makes `~/.xum-tmp/<token>`, and cleanupStreamTempDir runs
+ *   `rm -rf '<token>'` with that folder's parent as cwd. So `rm -rf '<name>'` with the cwd
+ *   `<userHome>/.xum-tmp` deletes that entry and exits 0. Any other command without an entry
+ *   rejects with a RuntimeError "exec" that names it. An exec whose signal is already aborted
+ *   rejects before it runs anything, as LocalRuntime does.
  * - idle() resolves when every exec has settled, so a test can drain fire-and-forget execs.
  * - The workspace lifecycle methods reject: loop tests do not create workspaces.
  */
@@ -63,6 +66,8 @@ function lifecycleRefusal(method: string): Promise<never> {
 
 /** Matches the cleanup command of streamManager.ts: rm -rf of one shell-quoted name. */
 const RM_RF_ONE_NAME = /^rm -rf '([^'/]+)'$/;
+/** The folder under the home that createTempDirForStream (streamManager.ts) uses. */
+const STREAM_TEMP_ROOT = ".xum-tmp";
 
 export class FakeRuntime implements Runtime {
   /** Every exec command line, in order, answered or not. */
@@ -80,8 +85,7 @@ export class FakeRuntime implements Runtime {
 
   private async outcomeOf(command: string, cwd: string): Promise<ScriptedOutcome> {
     const removal = RM_RF_ONE_NAME.exec(command);
-    const tempRoot = this.options.tempDir;
-    if (removal && (cwd === tempRoot || cwd.startsWith(`${tempRoot}/`))) {
+    if (removal && cwd === path.posix.join(this.options.userHome, STREAM_TEMP_ROOT)) {
       await this.fs.promises.rm(path.posix.join(cwd, removal[1]), { recursive: true, force: true });
       return { exitCode: 0 };
     }
@@ -98,6 +102,9 @@ export class FakeRuntime implements Runtime {
 
   exec(command: string, options: ExecOptions): Promise<ExecStream> {
     this.execs.push(command);
+    if (options.abortSignal?.aborted) {
+      return Promise.reject(new RuntimeError("Operation aborted before execution", "exec"));
+    }
     const started = this.outcomeOf(command, options.cwd).then((outcome) => ({
       stdout: streamOf(outcome.stdout ?? ""),
       stderr: streamOf(outcome.stderr ?? ""),
@@ -143,7 +150,8 @@ export class FakeRuntime implements Runtime {
     const chunks: Uint8Array[] = [];
     return new WritableStream({
       write(chunk) {
-        chunks.push(chunk);
+        // A copy: the writer may reuse its buffer once the write resolves.
+        chunks.push(chunk.slice());
       },
       async close() {
         try {
