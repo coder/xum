@@ -154,6 +154,40 @@ describe("FakeRuntime", () => {
     );
   });
 
+  test("readFile and ensureDir with an already aborted signal reject before they act", async () => {
+    const host = createMemoryHost();
+    await writeFileString(host.runtime, "/tmp/note.txt", "hi");
+    const signal = AbortSignal.abort();
+    const read = await readFileString(host.runtime, "/tmp/note.txt", signal).catch(
+      (error: unknown) => error
+    );
+    expect([(read as RuntimeError).type, (read as RuntimeError).message]).toEqual([
+      "file_io",
+      "Read of /tmp/note.txt aborted",
+    ]);
+    const made = await host.runtime.ensureDir("/tmp/new", signal).catch((error: unknown) => error);
+    expect((made as RuntimeError).type).toBe("file_io");
+    expect(await host.files.promises.readdir("/tmp")).toEqual(["note.txt"]);
+  });
+
+  test("a read whose signal aborts after it started errors the stream", async () => {
+    const host = createMemoryHost();
+    await writeFileString(host.runtime, "/tmp/note.txt", "hi");
+    const controller = new AbortController();
+    const stream = host.runtime.readFile("/tmp/note.txt", controller.signal);
+    controller.abort();
+    const read = await new Response(stream).text().catch((error: unknown) => error);
+    expect((read as RuntimeError).message).toBe("Read of /tmp/note.txt aborted");
+  });
+
+  test("a function entry refuses an abort signal, which it could outlive", async () => {
+    const host = createMemoryHost({ commands: { "git fetch": () => ({ stdout: "" }) } });
+    const refusal = await host.runtime
+      .exec("git fetch", { cwd: "/", abortSignal: new AbortController().signal })
+      .catch((error: Error) => error.message);
+    expect(refusal).toBe("The scripted layer cannot honor the option abortSignal for: git fetch");
+  });
+
   test("an exec whose signal is already aborted runs nothing", async () => {
     const host = createMemoryHost();
     const streamDir = await host.runtime.resolvePath("~/.xum-tmp/stream-1");
