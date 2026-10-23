@@ -2993,7 +2993,8 @@ export class TurnRequestBuilder {
                 workspaceId,
                 sourceWorkspaceId: workspaceId,
                 byModelDelta: { [canonicalModel]: displayUsage },
-                timestamp: this.hostClock.nowMs(),
+                // Record time: wall clock until #7282 moves its consumers to HostClock.
+                timestamp: nodeClock.nowMs(),
               });
             } catch (error) {
               log.warn("Failed to record tool model usage", {
@@ -3207,7 +3208,6 @@ export class TurnRequestBuilder {
             sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             kernelFileLoader,
           },
-          clock: this.hostClock,
         });
         if (options.recordTimings) {
           recordStartupPhaseTiming("applyToolPolicyAndExperimentsMs", applyPolicyStartedAt);
@@ -3773,7 +3773,8 @@ export class TurnRequestBuilder {
         };
       const assistantMessage = createMuxMessage(assistantMessageId, "assistant", "", {
         ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
-        timestamp: this.hostClock.nowMs(),
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        timestamp: nodeClock.nowMs(),
         model: canonicalModelString,
         systemMessageTokens,
         agentId: effectiveAgentId,
@@ -3944,7 +3945,8 @@ export class TurnRequestBuilder {
       }
 
       const snapshot: DebugLlmRequestSnapshot = {
-        capturedAt: this.hostClock.nowMs(),
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        capturedAt: nodeClock.nowMs(),
         workspaceId,
         messageId: assistantMessageId,
         model: modelString,
@@ -4137,7 +4139,8 @@ export class TurnRequestBuilder {
         initialMetadata: {
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
           systemMessageTokens,
-          timestamp: this.hostClock.nowMs(),
+          // Record time: wall clock until #7282 moves its consumers to HostClock.
+          timestamp: nodeClock.nowMs(),
           agentId: effectiveAgentId,
           // Where this request sent the volatile system tail, so the next rebuild repeats it.
           ...systemRecordsMetadata(streamSystemRecords),

@@ -1,3 +1,4 @@
+import { WorkspaceMutationInProgressError } from "@/node/utils/concurrency/lockErrors";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
@@ -48,7 +49,7 @@ export type WorkspaceUseKind =
   | "launch";
 
 /** Thrown by hold() while a structural mutation of the workspace is in progress. */
-export class WorkspaceMutationInProgressError extends Error {}
+export { WorkspaceMutationInProgressError };
 
 /** Thrown by withMutationGate() when the workspace is in use or already being mutated. */
 export class WorkspaceBusyError extends Error {}
@@ -108,6 +109,20 @@ export function workspaceMutationLockPath(rootDir: string, workspaceId: string):
 interface HeldFile {
   count: number;
   release: () => Promise<void>;
+}
+
+/**
+ * The text of a WorkspaceMutationInProgressError. Exported so the SessionLocks
+ * test layers refuse with today's text, byte for byte.
+ */
+export function workspaceMutationInProgressMessage(
+  workspaceId: string,
+  gate: { holder: string; why: string }
+): string {
+  return (
+    `Workspace ${workspaceId} is being renamed, removed or archived by ${gate.holder}; ` +
+    `try again when it finishes (${gate.why}).`
+  );
 }
 
 /** One instance per backend (ServiceContainer). */
@@ -336,8 +351,7 @@ export class WorkspaceUseLeases {
       if (gate.state === "held") {
         await release?.();
         throw new WorkspaceMutationInProgressError(
-          `Workspace ${workspaceId} is being renamed, removed or archived by ${gate.holder}; ` +
-            `try again when it finishes (${gate.why}).`
+          workspaceMutationInProgressMessage(workspaceId, gate)
         );
       }
       if (existing != null) {

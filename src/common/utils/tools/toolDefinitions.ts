@@ -3180,7 +3180,7 @@ export const TOOL_DEFINITIONS = {
       "Folders are per workspace, sub-agents included. " +
       'JSON {"$xum":"table","columns":[..],"rows":[..]} is a table (columns optional; rows: objects or arrays). ' +
       "HTML is sandboxed (its CSP blocks network, not guaranteed): never put secrets in it. Inline JS/CSS or use relative files; scripts may load from cdnjs, unpkg, jsDelivr (/npm/), code.jquery.com, cdn.tailwindcss.com if the user allows. " +
-      "HTML may call window.xum.send(text, data?) (user-confirmed; arrives as an <artifact_interaction> message) and window.xum.setState(obj) (shown here). " +
+      "HTML may call window.xum.send(text, data?) from a click handler (sent at once; the user did not review the text; arrives as an <artifact_interaction> message) and window.xum.setState(obj) (shown here). " +
       "If agent-browser is available, screenshot new HTML via file:// at 390px and desktop widths and attach_file them (unsandboxed there: CDN content can differ).",
     schema: z
       .object({

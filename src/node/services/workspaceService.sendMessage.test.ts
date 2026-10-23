@@ -187,11 +187,11 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(remembered?.plan).toBeUndefined();
   });
 
-  test("stamps the turn's recency on the runner's clock and its authoring time on the wall clock", async () => {
-    // Recency must match the user message timestamp that AgentSession stamps on the same
-    // HostClock. Both come from one makeTestEffectRunner(), so neither reads real time.
-    // authoredAtMs must stay on the wall clock: its consumers (messageQueue, the goal
-    // acknowledgment gate) compare it with Date.now() times (#7282).
+  test("stamps the turn's recency and authoring time on the wall clock, not on the runner's TestClock", async () => {
+    // Recency must match the user message timestamp, which AgentSession stamps on the wall
+    // clock, and the renderer compares it with lastRead (Date.now()). authoredAtMs reaches
+    // messageQueue and the goal acknowledgment gate, which compare it with Date.now() times.
+    // Both stay on the wall clock until #7282.
     const clock = makeTestEffectRunner();
     const wallNowMs = TEST_CLOCK_START_MS + 1_234_567;
     const service = createWorkspaceServiceForTest({
@@ -216,7 +216,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
       });
 
       expect(result.success).toBe(true);
-      expect(updateRecency).toHaveBeenCalledWith("test-workspace", TEST_CLOCK_START_MS + 7_000);
+      expect(updateRecency).toHaveBeenCalledWith("test-workspace", wallNowMs);
       expect(fakeSession.queueMessage).toHaveBeenCalledWith(
         "hello",
         expect.anything(),

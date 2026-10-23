@@ -441,9 +441,45 @@ async function seed(
   fs.writeFileSync(guide, GUIDE_ARTIFACT_HTML);
   const anHourAgo = new Date(Date.now() - 60 * 60 * 1000);
   fs.utimesSync(guide, anHourAgo, anHourAgo);
+  // Artifacts that send a message to the agent: an HTML page that sends on a click (at once) and
+  // from a timer after a click (the confirm strip asks), and a canvas whose button sends at once.
+  // Dated back like the guide, so the default artifact stays the same.
+  for (const [name, body] of [
+    ["feedback.html", FEEDBACK_ARTIFACT_HTML],
+    ["decision.canvas.json", DECISION_ARTIFACT_CANVAS],
+  ] as const) {
+    const file = path.join(artifactsDir, name);
+    fs.writeFileSync(file, body);
+    fs.utimesSync(file, anHourAgo, anHourAgo);
+  }
   await seedVersionedArtifact(base, xumRoot, workspaceId, artifactsDir);
   return workspaceId;
 }
+
+/** A form that sends its answer with window.xum.send: on a click, and from a timer 7 s after one. */
+const FEEDBACK_ARTIFACT_HTML = `<!doctype html>
+<html>
+  <body>
+    <h1>Feedback</h1>
+    <label>Answer <input id="answer" value="Ship plan B" /></label>
+    <button id="send" onclick="window.xum.send(document.getElementById('answer').value)">
+      Send to agent
+    </button>
+    <button id="later" onclick="setTimeout(() => window.xum.send('Sent by a timer'), 7000)">
+      Send in 7 seconds
+    </button>
+  </body>
+</html>
+`;
+
+/** A canvas with one button that sends a message. */
+const DECISION_ARTIFACT_CANVAS = JSON.stringify({
+  $xum: "canvas",
+  blocks: [
+    { type: "markdown", text: "Plan **B** keeps the old path for a week." },
+    { type: "button", label: "Approve plan B", send: "Approve plan B.", data: { plan: "B" } },
+  ],
+});
 
 /** Contents, two tall sections with a link back to the top, and a status line its own script updates on scroll. */
 const GUIDE_ARTIFACT_HTML = `<!doctype html>

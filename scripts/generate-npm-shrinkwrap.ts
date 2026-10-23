@@ -28,8 +28,10 @@ import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import * as jsonc from "jsonc-parser";
 import semver from "semver";
+import { NPM_PUBLIC_REGISTRY } from "../src/constants/serverUpdate";
+import { nestShrinkwrap } from "../src/node/services/serverUpdate/shrinkwrap";
 
-const REGISTRY = "https://registry.npmjs.org";
+const REGISTRY = NPM_PUBLIC_REGISTRY;
 const FETCH_CONCURRENCY = 16;
 const FETCH_ATTEMPTS = 4;
 
@@ -368,26 +370,22 @@ export function tarballInstallFiles(
 ): { packageJson: object; lockfile: object } {
   const top = wrapper ?? pkg;
   const dependencies = { [top.manifest.name]: `file:${top.path}` };
-  const entry = (tarball: Tarball, fields: Record<string, unknown>) => ({
-    ...fields,
-    name: undefined,
-    version: tarball.manifest.version,
-    resolved: `file:${tarball.path}`,
-  });
   const packages: Record<string, unknown> = {
     "": { name: "npm-tarball-install", dependencies },
   };
   if (wrapper != null) {
-    packages[`node_modules/${wrapper.manifest.name}`] = entry(wrapper, {
+    packages[`node_modules/${wrapper.manifest.name}`] = {
+      version: wrapper.manifest.version,
+      resolved: `file:${wrapper.path}`,
       license: wrapper.manifest.license,
       dependencies: wrapper.manifest.dependencies,
       bin: wrapper.manifest.bin,
-    });
+    };
   }
-  const at = `node_modules/${pkg.manifest.name}`;
-  for (const [key, value] of Object.entries(shrinkwrap.packages)) {
-    packages[key === "" ? at : `${at}/${key}`] = key === "" ? entry(pkg, value) : value;
-  }
+  Object.assign(
+    packages,
+    nestShrinkwrap(shrinkwrap, pkg.manifest.name, `file:${pkg.path}`, REGISTRY)
+  );
   return {
     packageJson: { name: "npm-tarball-install", private: true, dependencies },
     lockfile: { name: "npm-tarball-install", lockfileVersion: 3, requires: true, packages },

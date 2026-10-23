@@ -161,7 +161,7 @@ import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import { hostClockFor } from "./di/hostClockLive";
-import type { HostClock } from "@/node/utils/hostClock";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { shellQuote } from "@/common/utils/shell";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
 import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
@@ -750,7 +750,7 @@ function applyTurnReplayReceipt(
  * (`getRetryDelayInMs` in `ai`): `retry-after-ms` first, then `retry-after` as seconds or an
  * HTTP date. A RetryError (the SDK exhausted its retries) reports its last attempt's headers.
  */
-function getProviderRetryAfterMs(error: unknown, clock: HostClock): number | null {
+function getProviderRetryAfterMs(error: unknown): number | null {
   const apiError = RetryError.isInstance(error) ? error.lastError : error;
   if (!APICallError.isInstance(apiError)) return null;
   // Header names are lowercase: the SDK collects them from a fetch Headers object.
@@ -765,7 +765,8 @@ function getProviderRetryAfterMs(error: unknown, clock: HostClock): number | nul
     const retryAfter = headers["retry-after"];
     if (!retryAfter) return Number.NaN;
     const seconds = Number.parseFloat(retryAfter);
-    return Number.isNaN(seconds) ? Date.parse(retryAfter) - clock.nowMs() : seconds * 1000;
+    // Wall clock: the header is an HTTP date (#7282).
+    return Number.isNaN(seconds) ? Date.parse(retryAfter) - nodeClock.nowMs() : seconds * 1000;
   };
   const ms = parse();
   return Number.isFinite(ms) && ms >= 0 ? ms : null;
@@ -1116,8 +1117,11 @@ export type { WorkspaceStreamInfo };
 //
 // Date.now() is millisecond-granularity, so two distinct chunks with identical text emitted in the
 // same millisecond can otherwise collide on (timestamp, delta) during reconnect replay buffering.
-function nextPartTimestamp(streamInfo: WorkspaceStreamInfo, clock: HostClock): number {
-  const now = clock.nowMs();
+//
+// Part timestamps are record times (stored in history, shown and replayed), so they read the
+// wall clock until #7282 moves their consumers to HostClock.
+function nextPartTimestamp(streamInfo: WorkspaceStreamInfo): number {
+  const now = nodeClock.nowMs();
   const last = streamInfo.lastPartTimestamp;
   const timestamp = now <= last ? last + 1 : now;
   streamInfo.lastPartTimestamp = timestamp;
@@ -1392,7 +1396,8 @@ export class StreamManager {
     acpPromptId?: string;
   }): PendingStreamStartHandle {
     const abortController = new AbortController();
-    const startTime = this.hostClock.nowMs();
+    // Record time: wall clock until #7282 moves its consumers to HostClock.
+    const startTime = nodeClock.nowMs();
     const syntheticMessageId =
       "starting-" + startTime + "-" + Math.random().toString(36).substring(2, 11);
     const unlinkAbortSignal = linkAbortSignal(input.abortSignal, abortController);
@@ -1622,7 +1627,7 @@ export class StreamManager {
     // <= it. Reconnect replay repairs missed execution starts only when
     // executionStartedAt > cursor, and the cursor sits at the tool-call timestamp when the
     // client disconnected right after tool-call-start.
-    const timestamp = nextPartTimestamp(streamInfo, this.hostClock);
+    const timestamp = nextPartTimestamp(streamInfo);
     if (!this.applyToolExecutionStart(workspaceId, streamInfo, toolCallId, timestamp)) {
       // execute() won the race against the fullStream consumer; the "tool-call" case
       // consumes this entry right after storing the part.
@@ -1857,7 +1862,8 @@ export class StreamManager {
     }
 
     const tokens = await this.tokenTracker.countTokens(deltaText);
-    const timestamp = this.hostClock.nowMs();
+    // Record time: wall clock until #7282 moves its consumers to HostClock.
+    const timestamp = nodeClock.nowMs();
 
     this.emitTurnEvent({
       type: "tool-call-delta",
@@ -1920,7 +1926,8 @@ export class StreamManager {
         finalStep?.usage
       ),
       finishReason,
-      duration: this.hostClock.nowMs() - streamInfo.startTime,
+      // Duration from the wall-clock streamInfo.startTime.
+      duration: nodeClock.nowMs() - streamInfo.startTime,
     };
   }
 
@@ -2091,7 +2098,8 @@ export class StreamManager {
     part: CompletedMessagePart,
     options?: { replay?: boolean }
   ): Promise<void> {
-    const timestamp = part.timestamp ?? this.hostClock.nowMs();
+    // Record time: wall clock until #7282 moves its consumers to HostClock.
+    const timestamp = part.timestamp ?? nodeClock.nowMs();
     const isReplay = options?.replay === true;
 
     if (part.type === "text") {
@@ -2173,7 +2181,8 @@ export class StreamManager {
           toolName: part.toolName,
           result: part.output,
           ...(part.mcpServer ? { mcpServer: part.mcpServer } : {}),
-          timestamp: this.hostClock.nowMs(),
+          // Record time: wall clock until #7282 moves its consumers to HostClock.
+          timestamp: nodeClock.nowMs(),
         });
       }
     }
@@ -2229,7 +2238,8 @@ export class StreamManager {
           toolName: nested.toolName,
           result: nested.output,
           ...(nested.mcpServer ? { mcpServer: nested.mcpServer } : {}),
-          timestamp: this.hostClock.nowMs(),
+          // Record time: wall clock until #7282 moves its consumers to HostClock.
+          timestamp: nodeClock.nowMs(),
           parentToolCallId,
         });
       }
@@ -2310,7 +2320,8 @@ export class StreamManager {
           streamInfo.messageId,
           part.toolCallId,
           bufferedNestedCalls,
-          { fallbackTimestamp: part.timestamp ?? this.hostClock.nowMs() }
+          // Record time: wall clock until #7282 moves its consumers to HostClock.
+          { fallbackTimestamp: part.timestamp ?? nodeClock.nowMs() }
         );
       }
       if (pendingAttachment != null && part.type === "dynamic-tool") {
@@ -2564,7 +2575,8 @@ export class StreamManager {
     // cumulativeUsage is updated on each finish-step event (before tool execution),
     // so it has accurate data even when the stream is interrupted mid-tool-call.
     // AI SDK's totalUsage may return zeros or stale data when aborted.
-    const duration = this.hostClock.nowMs() - streamInfo.startTime;
+    // Duration from the wall-clock streamInfo.startTime.
+    const duration = nodeClock.nowMs() - streamInfo.startTime;
     const usage = hasTokenUsage(streamInfo.cumulativeUsage)
       ? streamInfo.cumulativeUsage
       : undefined;
@@ -3740,7 +3752,8 @@ export class StreamManager {
       throw error;
     }
 
-    const startTime = this.hostClock.nowMs();
+    // Record time: wall clock until #7282 moves its consumers to HostClock.
+    const startTime = nodeClock.nowMs();
     const streamInfo: WorkspaceStreamInfo = {
       state: StreamState.STARTING,
       streamResult,
@@ -3897,7 +3910,7 @@ export class StreamManager {
         output,
         ...modelOnlyNotificationsField(modelOnlyNotifications),
         ...(mcpServer ? { mcpServer } : {}),
-        timestamp: nextPartTimestamp(streamInfo, this.hostClock),
+        timestamp: nextPartTimestamp(streamInfo),
         ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
       });
     }
@@ -3917,7 +3930,7 @@ export class StreamManager {
     }
 
     // Emit tool-call-end event (listeners can now safely read partial)
-    const completionTimestamp = nextPartTimestamp(streamInfo, this.hostClock);
+    const completionTimestamp = nextPartTimestamp(streamInfo);
     streamInfo.toolCompletionTimestamps ??= new Map();
     streamInfo.toolCompletionTimestamps.set(toolCallId, completionTimestamp);
     this.emitTurnEvent({
@@ -4037,7 +4050,8 @@ export class StreamManager {
         // disconnected (same mechanism as top-level tool completions).
         streamInfo.toolCompletionTimestamps.set(
           event.callId,
-          event.endTime ?? this.hostClock.nowMs()
+          // Record time: wall clock until #7282 moves its consumers to HostClock.
+          event.endTime ?? nodeClock.nowMs()
         );
       }
       const parentPartIndex = streamInfo.parts.findIndex(
@@ -4329,7 +4343,8 @@ export class StreamManager {
     // committed hop rows and sidecar rows together.
     streamInfo.toolModelUsages.push({
       toolName: MODEL_FALLBACK_REFUSAL_TOOL_NAME,
-      timestamp: this.hostClock.nowMs(),
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      timestamp: nodeClock.nowMs(),
       model: this.usageAttributionModel(refusedModel, streamInfo.metadataModel),
       metadataModel: streamInfo.metadataModel,
       usage: usage ?? zeroTokenUsage(),
@@ -4928,7 +4943,7 @@ export class StreamManager {
                 const textPart = {
                   type: "text" as const,
                   text: deltaText,
-                  timestamp: nextPartTimestamp(streamInfo, this.hostClock),
+                  timestamp: nextPartTimestamp(streamInfo),
                 };
                 await this.appendPartAndEmit(workspaceId, streamInfo, textPart, true);
                 break;
@@ -4956,7 +4971,7 @@ export class StreamManager {
                   const redactedPart = {
                     type: "reasoning" as const,
                     text: "",
-                    timestamp: nextPartTimestamp(streamInfo, this.hostClock),
+                    timestamp: nextPartTimestamp(streamInfo),
                     providerOptions: startOptions,
                   };
                   await this.appendPartAndEmit(workspaceId, streamInfo, redactedPart, true);
@@ -4976,7 +4991,7 @@ export class StreamManager {
                       {
                         type: "reasoning" as const,
                         text: "",
-                        timestamp: nextPartTimestamp(streamInfo, this.hostClock),
+                        timestamp: nextPartTimestamp(streamInfo),
                         providerOptions: startOptions,
                       },
                       true
@@ -5012,7 +5027,7 @@ export class StreamManager {
                     const signedPart = {
                       type: "reasoning" as const,
                       text: "",
-                      timestamp: nextPartTimestamp(streamInfo, this.hostClock),
+                      timestamp: nextPartTimestamp(streamInfo),
                       signature,
                       providerOptions: deltaOptions,
                     };
@@ -5036,7 +5051,7 @@ export class StreamManager {
                         messageId: streamInfo.messageId,
                         delta: "",
                         tokens: 0,
-                        timestamp: nextPartTimestamp(streamInfo, this.hostClock),
+                        timestamp: nextPartTimestamp(streamInfo),
                         signature,
                       });
                     }
@@ -5050,7 +5065,7 @@ export class StreamManager {
                 const newPart = {
                   type: "reasoning" as const,
                   text: delta,
-                  timestamp: nextPartTimestamp(streamInfo, this.hostClock),
+                  timestamp: nextPartTimestamp(streamInfo),
                   signature, // May be undefined, will be filled by subsequent signature delta
                   providerOptions: deltaOptions,
                 };
@@ -5122,7 +5137,7 @@ export class StreamManager {
                   state: "input-available" as const,
                   // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
                   input: part.input,
-                  timestamp: nextPartTimestamp(streamInfo, this.hostClock),
+                  timestamp: nextPartTimestamp(streamInfo),
                 };
 
                 // Emit using shared logic (ensures replay consistency)
@@ -5880,8 +5895,7 @@ export class StreamManager {
     errorType = coerceStreamErrorTypeForMessage(errorType, errorMessage);
     // The AI SDK honors Retry-After only for its own short in-request retries; once they are
     // exhausted, Xum's auto-retry must not come back sooner than the provider asked.
-    const retryAfterMs =
-      errorType === "rate_limit" ? getProviderRetryAfterMs(actualError, this.hostClock) : null;
+    const retryAfterMs = errorType === "rate_limit" ? getProviderRetryAfterMs(actualError) : null;
 
     return {
       messageId: streamInfo.messageId,
@@ -7028,7 +7042,8 @@ export class StreamManager {
           this.emitStreamAbort(
             typedWorkspaceId,
             pending.syntheticMessageId,
-            { duration: this.hostClock.nowMs() - pending.startTime },
+            // Duration from the wall-clock pending.startTime.
+            { duration: nodeClock.nowMs() - pending.startTime },
             this.getStartupAbortReason(pending.abortController.signal),
             options?.abandonPartial,
             pending.acpPromptId

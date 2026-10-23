@@ -96,6 +96,7 @@ import type { AppFiberScopeTag } from "./appFiberScope";
 import type { EffectRunnerTag } from "./effectRunner";
 import type { HostClockTag } from "./hostClockLive";
 import type { CoreOptionsTag } from "./layers/core";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 export class ConfigTag extends Context.Service<ConfigTag, Config>()("xum/Config") {}
 export class SessionLocatorTag extends Context.Service<
@@ -110,6 +111,10 @@ export class SessionFilesTag extends Context.Service<SessionFilesTag, SessionFil
 export class HostFilesTag extends Context.Service<HostFilesTag, HostFiles>()("xum/HostFiles") {}
 /** The Xum home, the user home and the temp folder (hostFiles/hostFiles.ts). */
 export class HostPathsTag extends Context.Service<HostPathsTag, HostPaths>()("xum/HostPaths") {}
+/** Every lock that guards a session write (phase 4); StoresLive gives the Node layer. */
+export class SessionLocksTag extends Context.Service<SessionLocksTag, SessionLocks>()(
+  "xum/SessionLocks"
+) {}
 export class ProvidersConfigStoreTag extends Context.Service<
   ProvidersConfigStoreTag,
   ProvidersConfigStore
@@ -335,6 +340,7 @@ export type StoreTags =
   | SessionFilesTag
   | HostFilesTag
   | HostPathsTag
+  | SessionLocksTag
   | ProvidersConfigStoreTag
   | SecretsStoreTag
   | FileLeaseManagerTag
