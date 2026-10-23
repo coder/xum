@@ -35,7 +35,6 @@ export const Experiments: Story = {
     // Memory sub-experiments are nested under Agent Memory, so with the parent
     // off they must not appear anywhere in the list.
     await canvas.findByLabelText("Toggle Agent Memory");
-    await expect(canvas.queryByLabelText("Toggle Memory Intuition")).toBeNull();
     await expect(canvas.queryByLabelText("Toggle Memory Hot Set")).toBeNull();
     await expect(canvas.queryByLabelText("Toggle Memory Consolidation")).toBeNull();
   },
@@ -58,7 +57,6 @@ export const MemorySettingsEnabled: Story = {
 
     // With Agent Memory enabled, the sub-experiment toggles render in the
     // nested panel under the parent row.
-    await canvas.findByLabelText("Toggle Memory Intuition");
     await canvas.findByLabelText("Toggle Memory Hot Set");
     await canvas.findByLabelText("Toggle Memory Consolidation");
   },

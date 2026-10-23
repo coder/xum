@@ -58,7 +58,6 @@ import type {
   StreamAbortEvent,
   StreamEndEvent,
 } from "@/common/types/stream";
-import { log } from "./log";
 import type { SessionUsageService } from "./sessionUsageService";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -96,20 +95,14 @@ import * as budgetCountingModule from "./contextBudgetCounting";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { compactToolInputSchema } from "@/node/services/toolSchemaCompactionMiddleware";
-import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { buildReplayRequest } from "@/node/services/replay/replayRequestBuilder";
 import { MemoryService, projectMemoryDirName } from "@/node/services/memoryService";
 import * as toolAssembly from "./toolAssembly";
-import type {
-  ToolModelUsageEvent,
-  WorkspaceHeartbeatToolService,
-} from "@/common/utils/tools/tools";
+import type { WorkspaceHeartbeatToolService } from "@/common/utils/tools/tools";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
-import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import * as toolsModule from "@/common/utils/tools/tools";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
@@ -1318,7 +1311,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     preparedToolNamesForSentinel: string[][];
     streamSystemContextMuxScopes: XumToolScope[];
     streamSystemContextMemoryToolFlags: Array<boolean | undefined>;
-    streamSystemContextIntuitionFlags: Array<boolean | undefined>;
     streamSystemContextHotMemoriesBlocks: Array<string | undefined>;
     /** Snapshot passed into each system-context build (undefined = load from disk). */
     streamSystemContextInstructionInputs: Array<InstructionSources | undefined>;
@@ -1371,7 +1363,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const preparedToolNamesForSentinel: string[][] = [];
     const streamSystemContextMuxScopes: XumToolScope[] = [];
     const streamSystemContextMemoryToolFlags: Array<boolean | undefined> = [];
-    const streamSystemContextIntuitionFlags: Array<boolean | undefined> = [];
     const streamSystemContextHotMemoriesBlocks: Array<string | undefined> = [];
     const streamSystemContextInstructionInputs: Array<InstructionSources | undefined> = [];
     const streamSystemContextInstructionOutputs: InstructionSources[] = [];
@@ -1404,7 +1395,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         }
         streamSystemContextMuxScopes.push(contextArgs.xumScope);
         streamSystemContextMemoryToolFlags.push(contextArgs.memoryToolAvailable);
-        streamSystemContextIntuitionFlags.push(contextArgs.intuitionToolAvailable);
         streamSystemContextHotMemoriesBlocks.push(contextArgs.hotMemoriesBlock);
       },
       onPrepareMessagesForProvider: (pipelineArgs) => {
@@ -1431,7 +1421,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       preparedToolNamesForSentinel,
       streamSystemContextMuxScopes,
       streamSystemContextMemoryToolFlags,
-      streamSystemContextIntuitionFlags,
       streamSystemContextHotMemoriesBlocks,
       streamSystemContextInstructionInputs,
       streamSystemContextInstructionOutputs,
@@ -1445,23 +1434,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       providerService,
       historyService,
     };
-  }
-
-  async function enableIntuitionForHarness(
-    harness: StreamMessageHarness,
-    model: string
-  ): Promise<void> {
-    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
-      harness.config,
-      new MemoryMetaService(harness.config.rootDir)
-    );
-    await harness.config.editConfig((cfg) => ({
-      ...cfg,
-      agentAiDefaults: {
-        ...cfg.agentAiDefaults,
-        intuition: { modelString: model, thinkingLevel: "high" },
-      },
-    }));
   }
 
   async function startTestStream(
@@ -3071,325 +3043,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(memoryCalls).toEqual([{ includeHotMemories: false }]);
   });
 
-  for (const scenario of [
-    {
-      name: "enabled parent",
-      memory: true,
-      intuition: true,
-      child: false,
-      service: true,
-      eligible: true,
-    },
-    {
-      name: "disabled flag",
-      memory: true,
-      intuition: false,
-      child: false,
-      service: true,
-      eligible: false,
-    },
-    {
-      name: "disabled intuition agent",
-      memory: true,
-      intuition: true,
-      child: false,
-      service: true,
-      agentEnabled: false,
-      eligible: false,
-    },
-    {
-      name: "explicitly enabled intuition agent",
-      memory: true,
-      intuition: true,
-      child: false,
-      service: true,
-      agentEnabled: true,
-      eligible: true,
-    },
-    ...[
-      { frontmatterDisabled: true, agentEnabled: undefined, eligible: false },
-      { frontmatterDisabled: true, agentEnabled: undefined, emptyBody: true, eligible: false },
-      { frontmatterDisabled: true, agentEnabled: true, eligible: true },
-      { frontmatterDisabled: false, agentEnabled: false, eligible: false },
-    ].map((definition) => ({
-      name: `frontmatter disabled=${definition.frontmatterDisabled}, enabled override=${String(definition.agentEnabled)}, empty body=${"emptyBody" in definition}`,
-      memory: true,
-      intuition: true,
-      child: false,
-      service: true,
-      ...definition,
-    })),
-    {
-      name: "disabled memory",
-      memory: false,
-      intuition: true,
-      child: false,
-      service: true,
-      eligible: false,
-    },
-    {
-      name: "missing service",
-      memory: true,
-      intuition: true,
-      child: false,
-      service: false,
-      eligible: false,
-    },
-    {
-      name: "subagent",
-      memory: true,
-      intuition: true,
-      child: true,
-      service: true,
-      eligible: false,
-    },
-  ]) {
-    it(`gates the intuition runtime and prompt for ${scenario.name}`, async () => {
-      using xumHome = new DisposableTempDir("ai-intuition-gating");
-      const metadata = createLocalWorkspaceMetadata("intuition-gating", xumHome.path);
-      const experimentsService = new ExperimentsService({
-        telemetryService: new TelemetryService(xumHome.path),
-        xumHome: xumHome.path,
-      });
-      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) =>
-          (id === EXPERIMENT_IDS.MEMORY_INTUITION && scenario.intuition) ||
-          (id === EXPERIMENT_IDS.MEMORY && scenario.memory)
-      );
-      const harness = createHarness(xumHome.path, metadata, { experimentsService });
-      const agent = resolvedAgentResultFor(metadata);
-      if (!agent.success) throw new Error("Expected resolved agent");
-      agent.data.isSubagentWorkspace = scenario.child;
-      spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(agent);
-      if (scenario.service)
-        harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
-          harness.config,
-          new MemoryMetaService(xumHome.path)
-        );
-      const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
-      harness.getToolsForModelSpy.mockImplementation((_model, config) =>
-        Promise.resolve({
-          ...(config?.memoryService && config.experiments?.memory ? { memory: stubTool } : {}),
-          ...(config?.intuitionRuntime ? { intuition: stubTool } : {}),
-        })
-      );
-      await harness.config.editConfig((cfg) => {
-        cfg.agentAiDefaults = {
-          ...cfg.agentAiDefaults,
-          intuition: {
-            modelString: KNOWN_MODELS.SONNET.id,
-            enabled: scenario.agentEnabled,
-            thinkingLevel: "high",
-          },
-        };
-        return cfg;
-      });
-      const frontmatterDisabled =
-        "frontmatterDisabled" in scenario ? scenario.frontmatterDisabled : undefined;
-      const definitionPath = path.join(xumHome.path, "agents", "intuition.md");
-      if (frontmatterDisabled !== undefined) {
-        await fs.mkdir(path.dirname(definitionPath), { recursive: true });
-        await fs.writeFile(
-          definitionPath,
-          `---\nname: Intuition\ndisabled: ${frontmatterDisabled}\n---\n${"emptyBody" in scenario ? "" : "Pinned global intuition body."}`
-        );
-      }
-      const createModel = spyOn(harness.service, "createModel");
-      const result = await harness.service.streamMessage({
-        messages: [createMuxMessage("user", "user", "hello")],
-        workspaceId: metadata.id,
-        modelString: "openai:gpt-5.2",
-        thinkingLevel: "off",
-      });
-      expect(result.success).toBe(true);
-      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime;
-      expect(runtime !== undefined).toBe(scenario.eligible);
-      if (runtime) {
-        expect(runtime.modelString).toBe(KNOWN_MODELS.SONNET.id);
-        expect(runtime.thinkingLevel).toBe("high");
-        // No EvaluationService is bound in these scenarios: the tool loop stays.
-        expect(runtime.createEvaluationModel).toBeUndefined();
-        if (frontmatterDisabled !== undefined) {
-          await fs.writeFile(
-            definitionPath,
-            "---\nname: Intuition\ndisabled: true\n---\nChanged after gate."
-          );
-          expect(await runtime.resolveAgentBody()).toBe("Pinned global intuition body.");
-        }
-      }
-      expect(harness.streamSystemContextIntuitionFlags).toEqual([scenario.eligible]);
-      expect(harness.startStreamCalls[0]?.tools?.intuition !== undefined).toBe(scenario.eligible);
-      expect(createModel).not.toHaveBeenCalled();
-    });
-  }
-
-  it.each([false, true])(
-    "pins intuition to the resolved definition route before its parent fallback (definition override=%s)",
-    async (definitionOverride) => {
-      using xumHome = new DisposableTempDir("ai-intuition-selected-route");
-      const metadata = createLocalWorkspaceMetadata("intuition-selected-route", xumHome.path);
-      const experimentsService = new ExperimentsService({
-        telemetryService: new TelemetryService(xumHome.path),
-        xumHome: xumHome.path,
-      });
-      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
-      );
-      const harness = createHarness(xumHome.path, metadata, { experimentsService });
-      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
-        harness.config,
-        new MemoryMetaService(xumHome.path)
-      );
-      const evaluationService = makeEvaluationService();
-      harness.service.turnRequestBuilderBindings.evaluationService = evaluationService;
-      const selected = "private:exec-global";
-      if (definitionOverride) {
-        const agents = path.join(xumHome.path, "agents");
-        await fs.mkdir(agents, { recursive: true });
-        await fs.writeFile(
-          path.join(agents, "intuition.md"),
-          "---\nname: Intuition\nbase: private-base\n---\nLocal guidance."
-        );
-        await fs.writeFile(
-          path.join(agents, "private-base.md"),
-          "---\nname: Private base\nai:\n  model: private:definition-route\n  thinkingLevel: low\n---\nPrivate guidance."
-        );
-      }
-      await harness.config.editConfig((cfg) => {
-        cfg.agentAiDefaults = { exec: { modelString: selected } };
-        cfg.projects.set(metadata.projectPath, {
-          workspaces: [
-            {
-              path: metadata.projectPath,
-              id: metadata.id,
-              agentId: "exec",
-              aiSettingsByAgent: { plan: { model: "openai:stale-plan", thinkingLevel: "off" } },
-            },
-          ],
-        });
-        return cfg;
-      });
-      const result = await harness.service.streamMessage({
-        messages: [createMuxMessage("user", "user", "hello")],
-        workspaceId: metadata.id,
-        modelString: selected,
-        thinkingLevel: "high",
-      });
-      expect(result.success).toBe(true);
-      expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.thinkingLevel).toBe(
-        definitionOverride ? "low" : "off"
-      );
-      expect(harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime?.modelString).toBe(
-        definitionOverride ? "private:definition-route" : selected
-      );
-      // A custom body was written for the tool loop, so only the built-in body evaluates.
-      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime;
-      expect(runtime?.createEvaluationModel !== undefined).toBe(!definitionOverride);
-      expect(runtime?.evaluationService).toBe(definitionOverride ? undefined : evaluationService);
-    }
-  );
-
-  it.each(["off", "high"] as const)(
-    "creates Intuition's effort-dependent model variant with %s reasoning from one provider snapshot",
-    async (thinkingLevel) => {
-      using xumHome = new DisposableTempDir("ai-intuition-model-variant");
-      const metadata = createLocalWorkspaceMetadata("intuition-variant", xumHome.path);
-      const experimentsService = new ExperimentsService({
-        telemetryService: new TelemetryService(xumHome.path),
-        xumHome: xumHome.path,
-      });
-      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
-      );
-      const harness = createHarness(xumHome.path, metadata, { experimentsService });
-      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
-        harness.config,
-        new MemoryMetaService(xumHome.path)
-      );
-      const providersStore = new ProvidersConfigStore(harness.config.rootDir);
-      providersStore.saveProvidersConfig({ xai: { apiKey: "test-xai-key" } });
-      await harness.config.editConfig((cfg) => ({
-        ...cfg,
-        agentAiDefaults: { intuition: { modelString: "xai:grok-4-1-fast", thinkingLevel } },
-      }));
-      const result = await harness.service.streamMessage({
-        messages: [createMuxMessage("user", "user", "hello")],
-        workspaceId: metadata.id,
-        modelString: "openai:gpt-5.2",
-        thinkingLevel: "off",
-      });
-      expect(result.success).toBe(true);
-      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime;
-      if (!runtime) throw new Error("Expected Intuition runtime");
-      const resolve = harness.resolveAndCreateModelSpy.mockImplementation(function (
-        this: ProviderModelFactory,
-        ...args
-      ) {
-        // A concurrent config change must not replace the tool's creation-time snapshot.
-        providersStore.saveProvidersConfig({ xai: { enabled: false } });
-        return realResolveAndCreateModel.apply(this, args);
-      });
-      const created = await runtime.createModel(runtime.modelString);
-      expect(typeof created.model).not.toBe("string");
-      if (typeof created.model === "string") throw new Error("Expected model instance");
-      expect(created.model.modelId).toBe(
-        thinkingLevel === "off" ? "grok-4-1-fast-non-reasoning" : "grok-4-1-fast-reasoning"
-      );
-      expect(resolve).toHaveBeenCalledWith(
-        "xai:grok-4-1-fast",
-        thinkingLevel,
-        expect.anything(),
-        expect.objectContaining({
-          workspaceId: metadata.id,
-          agentInitiated: true,
-          providersConfig: { xai: { apiKey: "test-xai-key" } },
-        })
-      );
-      expect(created.optionsProvidersConfig?.xai?.isEnabled).toBe(true);
-    }
-  );
-
-  for (const denied of ["memory", "intuition"]) {
-    it(`strips intuition and its guidance when policy denies ${denied}`, async () => {
-      using xumHome = new DisposableTempDir("ai-intuition-policy");
-      const metadata = createLocalWorkspaceMetadata("intuition-policy", xumHome.path);
-      const experimentsService = new ExperimentsService({
-        telemetryService: new TelemetryService(xumHome.path),
-        xumHome: xumHome.path,
-      });
-      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
-      );
-      const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
-      const harness = createHarness(xumHome.path, metadata, {
-        experimentsService,
-        allTools: { memory: stubTool, intuition: stubTool },
-      });
-      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
-        harness.config,
-        new MemoryMetaService(xumHome.path)
-      );
-      const agent = resolvedAgentResultFor(metadata);
-      if (!agent.success) throw new Error("Expected resolved agent");
-      agent.data.effectiveToolPolicy = [
-        { regex_match: "intuition", action: "enable" },
-        { regex_match: denied, action: "disable" },
-      ];
-      spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(agent);
-      const result = await harness.service.streamMessage({
-        messages: [createMuxMessage("user", "user", "hello")],
-        workspaceId: metadata.id,
-        modelString: "openai:gpt-5.2",
-        thinkingLevel: "off",
-      });
-      expect(result.success).toBe(true);
-      expect(harness.startStreamCalls[0]?.tools?.intuition).toBeUndefined();
-      expect(harness.startStreamCalls[0]?.tools?.memory !== undefined).toBe(denied !== "memory");
-      expect(harness.streamSystemContextIntuitionFlags).toEqual([true, false]);
-      expect(harness.streamSystemContextMemoryToolFlags).toEqual([true, denied !== "memory"]);
-    });
-  }
-
   it("sends MCP Apps model context at the start of the newest user message, not in the system prompt", async () => {
     using xumHome = new DisposableTempDir("ai-mcp-app-context");
     const metadata = createLocalWorkspaceMetadata("mcp-app-context", xumHome.path);
@@ -3885,52 +3538,46 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   );
 
-  it.each(["memory", "intuition", "restore-denied"])(
-    "keeps recall policy enforced after request middleware: %s",
-    async (mode) => {
-      using xumHome = new DisposableTempDir("ai-intuition-middleware");
-      const metadata = createLocalWorkspaceMetadata("intuition-middleware", xumHome.path);
-      const experimentsService = new ExperimentsService({
-        telemetryService: new TelemetryService(xumHome.path),
-        xumHome: xumHome.path,
+  it("keeps plugin context when request middleware removes memory", async () => {
+    using xumHome = new DisposableTempDir("ai-memory-middleware");
+    const metadata = createLocalWorkspaceMetadata("memory-middleware", xumHome.path);
+    const experimentsService = new ExperimentsService({
+      telemetryService: new TelemetryService(xumHome.path),
+      xumHome: xumHome.path,
+    });
+    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.MEMORY
+    );
+    const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
+    const harness = createHarness(xumHome.path, metadata, {
+      experimentsService,
+      allTools: { memory: stubTool },
+    });
+    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+      harness.config,
+      new MemoryMetaService(xumHome.path)
+    );
+    const removeHook = eventSpine.useBefore("request.assemble", (ctx) => {
+      if (ctx.workspaceId !== metadata.id) return;
+      delete ctx.tools.memory;
+      ctx.systemMessage += "\nPreserved plugin context.";
+    });
+    try {
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "hello")],
+        workspaceId: metadata.id,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
       });
-      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
+      expect(result.success).toBe(true);
+      expect(harness.startStreamCalls[0]?.tools?.memory).toBeUndefined();
+      expect(JSON.stringify(harness.startStreamCalls[0]?.system)).toContain(
+        "Preserved plugin context."
       );
-      const stubTool: Tool = { inputSchema: jsonSchema({ type: "object" }) };
-      const harness = createHarness(xumHome.path, metadata, {
-        experimentsService,
-        allTools: { memory: stubTool, intuition: stubTool },
-        ...(mode === "restore-denied" ? { postPolicyTools: { memory: stubTool } } : {}),
-      });
-      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
-        harness.config,
-        new MemoryMetaService(xumHome.path)
-      );
-      const removeHook = eventSpine.useBefore("request.assemble", (ctx) => {
-        if (ctx.workspaceId !== metadata.id) return;
-        if (mode === "restore-denied") ctx.tools.intuition = stubTool;
-        else delete ctx.tools[mode];
-        ctx.systemMessage += "\nPreserved plugin context.";
-      });
-      try {
-        const result = await harness.service.streamMessage({
-          messages: [createMuxMessage("user", "user", "hello")],
-          workspaceId: metadata.id,
-          modelString: "openai:gpt-5.2",
-          thinkingLevel: "off",
-        });
-        expect(result.success).toBe(true);
-        expect(harness.startStreamCalls[0]?.tools?.intuition).toBeUndefined();
-        expect(harness.startStreamCalls[0]?.tools?.memory !== undefined).toBe(mode !== "memory");
-        expect(JSON.stringify(harness.startStreamCalls[0]?.system)).toContain(
-          "Preserved plugin context."
-        );
-      } finally {
-        removeHook();
-      }
+    } finally {
+      removeHook();
     }
-  );
+  });
 
   it("does not upgrade memory context when the hot-set sub-experiment is disabled", async () => {
     using xumHome = new DisposableTempDir("ai-service-memory-hot-set-disabled");
@@ -4217,7 +3864,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           xumHome: xumHomePath,
         });
         spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-          (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
+          (id) => id === EXPERIMENT_IDS.MEMORY
         );
       }
       const harness = createHarness(
@@ -4433,15 +4080,13 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         ["exec", "forgetful"],
         { memory: true }
       );
-      const { memory, intuition, ...execWithoutMemory } = toolsByAgent.exec;
+      const { memory, ...execWithoutMemory } = toolsByAgent.exec;
       expect(memory).toBeDefined();
-      expect(intuition).toBeDefined();
       // Memory's description carries the memory index, so an agent denied
-      // memory gets no refusal stub, and intuition (reads memory) goes too.
+      // memory gets no refusal stub.
       expect(shape(toolsByAgent.forgetful)).toBe(shape(execWithoutMemory));
-      // No hot memories or memory/intuition guidance for the agent without memory.
+      // No hot memories or memory guidance for the agent without memory.
       expect(harness.streamSystemContextMemoryToolFlags.at(-1)).toBe(false);
-      expect(harness.streamSystemContextIntuitionFlags.at(-1)).toBe(false);
     });
 
     it("does not defer a tool that one switchable agent requires", async () => {
@@ -5254,162 +4899,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
   });
 
   it.each([
-    { model: "openai:gpt-5.6", wireFormat: "responses", route: "openai" },
-    { model: "openai:gpt-5.6", wireFormat: "chatCompletions", route: "openai" },
-    { model: "openrouter:openai/gpt-5.6", wireFormat: "responses", route: "openrouter" },
-  ] as const)(
-    "pins intuition wire and route independently of live config: %j",
-    async (testCase) => {
-      using xumHome = new DisposableTempDir("ai-service-intuition-reasoning-route");
-      const projectPath = path.join(xumHome.path, "project");
-      await fs.mkdir(projectPath, { recursive: true });
-      const workspaceId = "workspace-intuition-reasoning-route";
-      const harness = createHarness(
-        xumHome.path,
-        createLocalWorkspaceMetadata(workspaceId, projectPath),
-        {
-          experimentsService: await experimentsServiceWith(xumHome.path, [
-            EXPERIMENT_IDS.MEMORY,
-            EXPERIMENT_IDS.MEMORY_INTUITION,
-          ]),
-        }
-      );
-      const providersStore = new ProvidersConfigStore(harness.config.rootDir);
-      providersStore.saveProvidersConfig({
-        openai: { apiKey: "sk-test-key", wireFormat: testCase.wireFormat },
-        openrouter: { apiKey: "or-test-key" },
-      });
-      await harness.config.editConfig((cfg) => ({
-        ...cfg,
-        routePriority: ["direct"],
-      }));
-      await enableIntuitionForHarness(harness, testCase.model);
-      await startTestStream(harness, workspaceId);
-      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].intuitionRuntime;
-      if (!runtime) throw new Error("Expected intuition runtime");
-      harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
-      const created = await runtime.createModel(testCase.model);
-      providersStore.saveProvidersConfig({
-        openai: { apiKey: "changed-key", wireFormat: "responses" },
-      });
-
-      expect(created.optionsRouteProvider).toBe(testCase.route);
-      expect(normalizeToCanonical(created.optionsModelString)).toBe("openai:gpt-5.6");
-      if (testCase.route === "openai") {
-        expect(created.optionsMuxProviderOptions?.openai?.wireFormat).toBe(testCase.wireFormat);
-      }
-    }
-  );
-
-  it.each([
-    { modelId: "gpt-6-astra", refresh: "none" },
-    { modelId: "team-astra", refresh: "none" },
-    { modelId: "team-astra", refresh: "retyped" },
-    { modelId: "team-astra", refresh: "removed" },
-  ])(
-    "preserves the actual Coder instance and scoped alias for intuition Pro: %j",
-    async (testCase) => {
-      using xumHome = new DisposableTempDir("ai-service-intuition-coder-pro");
-      const projectPath = path.join(xumHome.path, "project");
-      await fs.mkdir(projectPath, { recursive: true });
-      const workspaceId = "workspace-intuition-coder-pro";
-      const harness = createHarness(
-        xumHome.path,
-        createLocalWorkspaceMetadata(workspaceId, projectPath),
-        {
-          experimentsService: await experimentsServiceWith(xumHome.path, [
-            EXPERIMENT_IDS.MEMORY,
-            EXPERIMENT_IDS.MEMORY_INTUITION,
-          ]),
-        }
-      );
-      const model = `coder:prod-openai/${testCase.modelId}`;
-      await writeProvidersConfig(xumHome.path, {
-        coder: {
-          coderOauth: {
-            type: "oauth",
-            sessionId: "test",
-            deploymentUrl: "https://coder.example.com",
-            access: "test-access",
-            refresh: "test-refresh",
-            expires: Date.now() + 3_600_000,
-            clientId: "test",
-            clientSecret: "test",
-          },
-          discoveredProviders: [
-            { name: "prod-openai", type: "openai" },
-            { name: "openai", type: "openai-compat" },
-          ],
-          models: [{ id: "prod-openai/team-astra", mappedToModel: "openai:gpt-6-astra" }],
-        },
-      });
-      await enableIntuitionForHarness(harness, model);
-      await startTestStream(harness, workspaceId);
-      // Avoid an OAuth exchange; the real option/route adapter below must retain
-      // the selected instance instead of re-resolving the unrelated "openai" instance.
-      harness.resolveAndCreateModelSpy.mockImplementation(
-        (_model, _thinking, options, creation) => {
-          expect(creation?.providersConfig?.coder).toMatchObject({
-            discoveredProviders: [
-              { name: "prod-openai", type: "openai" },
-              { name: "openai", type: "openai-compat" },
-            ],
-          });
-          if (!options) throw new Error("Expected the adapter's provider-options target");
-          options.openai = { wireFormat: "responses" };
-          return Promise.resolve({
-            success: true,
-            data: {
-              model: Object.create(null) as LanguageModel,
-              effectiveModelString: model,
-              canonicalModelString: "openai:gpt-6-astra",
-              canonicalProviderName: "openai",
-              canonicalModelId: "gpt-6-astra",
-              wireProviderName: "openai",
-              routeProvider: "coder",
-            },
-          });
-        }
-      );
-      const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].intuitionRuntime;
-      if (!runtime) throw new Error("Expected intuition runtime");
-      if (testCase.refresh !== "none") {
-        const snapshot = new ProvidersConfigStore(harness.config.rootDir).loadProvidersConfig();
-        if (!snapshot) throw new Error("Expected the initial Coder configuration");
-        // Model creation gets the first read; an independent options-view read
-        // would see a catalog refresh with incompatible or missing metadata.
-        spyOn(ProvidersConfigStore.prototype, "loadProvidersConfig")
-          .mockReturnValue({
-            ...snapshot,
-            coder: {
-              ...snapshot.coder,
-              discoveredProviders:
-                testCase.refresh === "retyped" ? [{ name: "prod-openai", type: "anthropic" }] : [],
-              models: [],
-            },
-          })
-          .mockReturnValueOnce(snapshot);
-      }
-      const created = await runtime.createModel(model);
-      expect(created.optionsRouteProvider).toBe("coder");
-      const options = buildProviderOptions(
-        created.optionsModelString,
-        "high",
-        undefined,
-        undefined,
-        created.optionsMuxProviderOptions,
-        undefined,
-        undefined,
-        created.optionsProvidersConfig,
-        created.optionsRouteProvider,
-        undefined,
-        "pro"
-      );
-      expect(options).toMatchObject({ openai: { reasoningMode: "pro" } });
-    }
-  );
-
-  it.each([
     {
       modelId: "openai.gpt-5.6-sol",
       origin: "openai" as const,
@@ -5880,312 +5369,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         initialMetadataFromStartStreamCall(run.harness.startStreamCalls[0]).autoModelRouting
       ).toEqual(composerLevel);
     });
-  });
-
-  it("resolves nested tool metadata pricing without changing the stored model bucket", async () => {
-    using xumHome = new DisposableTempDir("ai-service-tool-model-usage");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-tool-model-usage";
-    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    const recordUsage = mock(() => Promise.resolve(undefined));
-    const getSessionUsage = mock(() => Promise.resolve(undefined));
-    const sessionUsageService = {
-      recordUsage,
-      getSessionUsage,
-    } as unknown as SessionUsageService;
-    const harness = createHarness(xumHome.path, metadata, { sessionUsageService });
-    const metadataModel = KNOWN_MODELS.SONNET.id;
-    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
-      anthropic: {
-        models: [{ id: "custom-sonnet", mappedToModel: metadataModel }],
-      },
-    });
-
-    const result = await harness.service.streamMessage({
-      messages: [createMuxMessage("latest-user", "user", "continue")],
-      workspaceId,
-      modelString: "openai:gpt-5.2",
-      thinkingLevel: "off",
-    });
-
-    expect(result.success).toBe(true);
-    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
-    if (!toolConfig || typeof toolConfig !== "object") {
-      throw new Error("Expected getToolsForModel to receive a tool configuration object");
-    }
-
-    const reportModelUsage = (
-      toolConfig as {
-        reportModelUsage?: (event: ToolModelUsageEvent) => void;
-      }
-    ).reportModelUsage;
-    expect(typeof reportModelUsage).toBe("function");
-    if (!reportModelUsage) {
-      throw new Error("Expected reportModelUsage callback on tool configuration");
-    }
-
-    const event: ToolModelUsageEvent = {
-      source: "tool",
-      toolName: "intuition",
-      model: "anthropic:custom-sonnet",
-      usage: {
-        inputTokens: 120,
-        cachedInputTokens: 10,
-        outputTokens: 45,
-        reasoningTokens: 5,
-        totalTokens: 165,
-      },
-      providerMetadata: {
-        anthropic: { cacheCreationInputTokens: 6 },
-      },
-      toolCallId: "call-1",
-      timestamp: Date.now(),
-    };
-    const unresolvedDisplayUsage = createDisplayUsage(
-      event.usage,
-      event.model,
-      event.providerMetadata
-    );
-    expect(unresolvedDisplayUsage).toBeDefined();
-    if (!unresolvedDisplayUsage) {
-      throw new Error("Expected unresolved tool usage event to produce display usage");
-    }
-    expect(unresolvedDisplayUsage.input.cost_usd).toBeUndefined();
-
-    const expectedDisplayUsage = createDisplayUsage(
-      event.usage,
-      event.model,
-      event.providerMetadata,
-      metadataModel
-    );
-    expect(expectedDisplayUsage).toBeDefined();
-    if (!expectedDisplayUsage) {
-      throw new Error("Expected tool usage event to produce display usage");
-    }
-    expect(expectedDisplayUsage.model).toBe(event.model);
-    expect(expectedDisplayUsage.input.cost_usd).toBeDefined();
-
-    const canonicalModel = normalizeToCanonical(event.model);
-    const callSequence: string[] = [];
-    let sessionUsageDeltaEvent: unknown;
-    harness.service.once("session-usage-delta", (payload) => {
-      callSequence.push("emit");
-      sessionUsageDeltaEvent = payload;
-    });
-
-    recordUsage.mockImplementationOnce(() => {
-      callSequence.push("recordUsage");
-      return Promise.resolve(undefined);
-    });
-
-    reportModelUsage(event);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(recordUsage).toHaveBeenCalledWith(workspaceId, canonicalModel, expectedDisplayUsage);
-    expect(callSequence).toEqual(["recordUsage", "emit"]);
-    expect(sessionUsageDeltaEvent).toBeDefined();
-    if (typeof sessionUsageDeltaEvent !== "object" || sessionUsageDeltaEvent === null) {
-      throw new Error("Expected session-usage-delta event payload");
-    }
-    const sessionUsageDeltaRecord = sessionUsageDeltaEvent as Record<string, unknown>;
-    expect(sessionUsageDeltaRecord.type).toBe("session-usage-delta");
-    expect(sessionUsageDeltaRecord.workspaceId).toBe(workspaceId);
-    expect(sessionUsageDeltaRecord.sourceWorkspaceId).toBe(workspaceId);
-    expect(sessionUsageDeltaRecord.byModelDelta).toEqual({
-      [canonicalModel]: expectedDisplayUsage,
-    });
-    expect(typeof sessionUsageDeltaRecord.timestamp).toBe("number");
-  });
-
-  it("records API-equivalent costs for intuition tool usage through Codex OAuth", async () => {
-    const toolName = "intuition";
-    using xumHome = new DisposableTempDir("ai-service-tool-model-usage-oauth");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-tool-model-usage-oauth";
-    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    const recordUsage = mock(() => Promise.resolve(undefined));
-    const getSessionUsage = mock(() => Promise.resolve(undefined));
-    const sessionUsageService = {
-      recordUsage,
-      getSessionUsage,
-    } as unknown as SessionUsageService;
-    const experimentsService = new ExperimentsService({
-      telemetryService: new TelemetryService(xumHome.path),
-      xumHome: xumHome.path,
-    });
-    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-      (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION || id === EXPERIMENT_IDS.MEMORY
-    );
-    const harness = createHarness(xumHome.path, metadata, {
-      sessionUsageService,
-      experimentsService,
-    });
-    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
-      harness.config,
-      new MemoryMetaService(xumHome.path)
-    );
-
-    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
-      openai: {
-        codexOauth: {
-          type: "oauth",
-          access: "test-access-token",
-          refresh: "test-refresh-token",
-          expires: Date.now() + 60_000,
-          accountId: "test-account-id",
-        },
-      },
-    });
-    const result = await harness.service.streamMessage({
-      messages: [createMuxMessage("latest-user", "user", "continue")],
-      workspaceId,
-      modelString: "openai:gpt-5.2",
-      thinkingLevel: "off",
-    });
-
-    expect(result.success).toBe(true);
-    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
-    if (!toolConfig || typeof toolConfig !== "object") {
-      throw new Error("Expected getToolsForModel to receive a tool configuration object");
-    }
-
-    const runtime = toolConfig.intuitionRuntime;
-    if (!runtime) throw new Error(`Expected ${toolName} runtime`);
-    const resolveModel =
-      harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
-    const created = await runtime.createModel(KNOWN_MODELS.GPT.id);
-    const creationOptions = resolveModel.mock.calls.at(-1)?.[3];
-    expect(creationOptions).toMatchObject({
-      agentInitiated: true,
-      workspaceId,
-    });
-    // Cost estimates must remain available after an authentication change.
-    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
-      openai: { apiKey: "new-direct-key" },
-    });
-
-    const reportModelUsage = (
-      toolConfig as {
-        reportModelUsage?: (event: ToolModelUsageEvent) => void;
-      }
-    ).reportModelUsage;
-    if (!reportModelUsage) {
-      throw new Error("Expected reportModelUsage callback on tool configuration");
-    }
-
-    const event: ToolModelUsageEvent = {
-      source: "tool",
-      toolName,
-      model: KNOWN_MODELS.GPT.id,
-      metadataModel: created.metadataModel,
-      usage: {
-        inputTokens: 120,
-        outputTokens: 45,
-        totalTokens: 165,
-      },
-      providerMetadata: {
-        openai: { reasoningTokens: 5 },
-      },
-      timestamp: Date.now(),
-    };
-    const expectedDisplayUsage = createDisplayUsage(
-      event.usage,
-      event.model,
-      event.providerMetadata
-    );
-    expect(expectedDisplayUsage).toBeDefined();
-    if (!expectedDisplayUsage) {
-      throw new Error("Expected tool usage event to produce display usage");
-    }
-    expect(expectedDisplayUsage.costsIncluded).toBeUndefined();
-    expect(expectedDisplayUsage.input.cost_usd).toBeGreaterThan(0);
-    expect(expectedDisplayUsage.output.cost_usd).toBeGreaterThan(0);
-    expect(expectedDisplayUsage.reasoning.cost_usd).toBeGreaterThan(0);
-
-    reportModelUsage(event);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(recordUsage).toHaveBeenCalledWith(
-      workspaceId,
-      normalizeToCanonical(event.model),
-      expectedDisplayUsage
-    );
-  });
-
-  it("logs and swallows tool model usage persistence failures", async () => {
-    using xumHome = new DisposableTempDir("ai-service-tool-model-usage-failure");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-tool-model-usage-failure";
-    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    const recordUsageError = new Error("write failed");
-    const recordUsage = mock(() => Promise.reject(recordUsageError));
-    const getSessionUsage = mock(() => Promise.resolve(undefined));
-    const sessionUsageService = {
-      recordUsage,
-      getSessionUsage,
-    } as unknown as SessionUsageService;
-    const warnSpy = spyOn(log, "warn").mockImplementation(() => undefined);
-    const harness = createHarness(xumHome.path, metadata, { sessionUsageService });
-
-    const result = await harness.service.streamMessage({
-      messages: [createMuxMessage("latest-user", "user", "continue")],
-      workspaceId,
-      modelString: "openai:gpt-5.2",
-      thinkingLevel: "off",
-    });
-
-    expect(result.success).toBe(true);
-    const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
-    if (!toolConfig || typeof toolConfig !== "object") {
-      throw new Error("Expected getToolsForModel to receive a tool configuration object");
-    }
-
-    const reportModelUsage = (
-      toolConfig as {
-        reportModelUsage?: (event: ToolModelUsageEvent) => void;
-      }
-    ).reportModelUsage;
-    if (!reportModelUsage) {
-      throw new Error("Expected reportModelUsage callback on tool configuration");
-    }
-
-    const event: ToolModelUsageEvent = {
-      source: "tool",
-      toolName: "intuition",
-      model: "anthropic:claude-sonnet-4-20250514",
-      usage: {
-        inputTokens: 50,
-        outputTokens: 20,
-        totalTokens: 70,
-      },
-      providerMetadata: {
-        anthropic: { cacheCreationInputTokens: 2 },
-      },
-      toolCallId: "call-2",
-      timestamp: Date.now(),
-    };
-
-    reportModelUsage(event);
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(warnSpy).toHaveBeenCalledWith(
-      "Failed to record tool model usage",
-      expect.objectContaining({
-        error: recordUsageError,
-        workspaceId,
-        toolName: "intuition",
-        model: event.model,
-      })
-    );
   });
 
   it("wires models_list to live provider and config state on every call", async () => {

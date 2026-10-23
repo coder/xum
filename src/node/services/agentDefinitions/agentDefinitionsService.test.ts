@@ -196,25 +196,15 @@ class TrackingRemotePathMappedRuntime extends RemotePathMappedRuntime {
 
 describe("agentDefinitionsService", () => {
   test.each([true, false])(
-    "Settings lists global-only Intuition despite conflicting project metadata (global disabled=%s)",
+    "Settings lists project overrides and filters disabled agents (disabled=%s)",
     async (disabled) => {
-      using project = new DisposableTempDir("intuition-settings-project");
-      using home = new DisposableTempDir("intuition-settings-home");
-      const globalRoot = path.join(home.path, "agents");
+      using project = new DisposableTempDir("agent-list-project");
+      using home = new DisposableTempDir("agent-list-home");
       const projectRoot = path.join(project.path, ".xum", "agents");
-      await fs.mkdir(globalRoot, { recursive: true });
       await fs.mkdir(projectRoot, { recursive: true });
       await fs.writeFile(
-        path.join(globalRoot, "global-base.md"),
-        `---\nname: Global base\ndisabled: ${disabled}\nai:\n  model: private:global-inherited\n---\nGlobal protocol.`
-      );
-      await fs.writeFile(
-        path.join(globalRoot, "intuition.md"),
-        "---\nname: Intuition\nbase: global-base\n---\nGlobal recall."
-      );
-      await fs.writeFile(
-        path.join(projectRoot, "intuition.md"),
-        `---\nname: Wrong project intuition\ndisabled: ${!disabled}\nai:\n  model: public:project-only\n---\nProject recall.`
+        path.join(projectRoot, "reviewer.md"),
+        `---\nname: Reviewer\ndisabled: ${disabled}\n---\nReview changes.`
       );
       await fs.writeFile(
         path.join(projectRoot, "exec.md"),
@@ -238,23 +228,22 @@ describe("agentDefinitionsService", () => {
       const list = (includeDisabled = false) =>
         listAgentDefinitions(context, { projectPath: project.path, includeDisabled });
       const all = await list(true);
-      expect(all.find((agent) => agent.id === "intuition")).toMatchObject({
-        name: "Intuition",
-        scope: "global",
-        aiDefaults: { model: "private:global-inherited" },
+      expect(all.find((agent) => agent.id === "reviewer")).toMatchObject({
+        name: "Reviewer",
+        scope: "project",
       });
       expect(all.find((agent) => agent.id === "exec")).toMatchObject({
         name: "Project Exec",
         scope: "project",
         aiDefaults: { model: "private:project-exec" },
       });
-      expect((await list()).some((agent) => agent.id === "intuition")).toBe(!disabled);
+      expect((await list()).some((agent) => agent.id === "reviewer")).toBe(!disabled);
       for (const enabled of [true, false]) {
         await config.editConfig((cfg) => {
-          cfg.agentAiDefaults = { intuition: { enabled } };
+          cfg.agentAiDefaults = { reviewer: { enabled } };
           return cfg;
         });
-        expect((await list()).some((agent) => agent.id === "intuition")).toBe(enabled);
+        expect((await list()).some((agent) => agent.id === "reviewer")).toBe(enabled);
       }
     }
   );

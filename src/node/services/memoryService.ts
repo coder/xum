@@ -827,11 +827,6 @@ class LocalMemoryStore implements MemoryStore {
 // Frontmatter description extraction (for the injected memory index)
 // ---------------------------------------------------------------------------
 
-/** Memory body without its leading YAML frontmatter (the index already carries the description). */
-export function stripMemoryFrontmatter(content: string): string {
-  return content.replace(FRONTMATTER_PATTERN, "");
-}
-
 /**
  * Extract a sanitized single-line description from optional YAML frontmatter.
  * Self-healing: malformed frontmatter yields an empty description.
@@ -1102,13 +1097,6 @@ export class MemoryService extends EventEmitter {
     } catch (error) {
       log.debug("[MemoryService] failed to record memory usage", { scope, relPath, error });
     }
-  }
-
-  /** Recognition, unlike scanning or UI browsing, is an actual agent recall. */
-  async recordRecall(ctx: MemoryScopeContext, virtualPath: string): Promise<void> {
-    const parsed = parseMemoryPath(virtualPath);
-    const scope = this.requireFilePath(parsed, virtualPath);
-    await this.recordUsage(ctx, scope, parsed.relPath, { write: false });
   }
 
   private async recordRename(

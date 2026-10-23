@@ -31,14 +31,6 @@ describe("built-in agent definitions", () => {
     expect(ids).toContain("plan");
   });
 
-  test("intuition cannot run as an interactive agent or child workspace", () => {
-    const intuition = getBuiltInAgentDefinitions().find((agent) => agent.id === "intuition");
-    expect(intuition?.frontmatter.ui?.hidden).toBe(true);
-    expect(intuition?.frontmatter.subagent?.runnable).toBe(false);
-    expect(intuition?.frontmatter.subagent?.workflow_runnable).not.toBe(true);
-    expect(intuition?.frontmatter.tools?.require).toEqual(["memory_read", "intuition_report"]);
-  });
-
   test("desktop agent gets exactly the desktop tool registry and cannot spawn tasks", () => {
     using tempDir = new TestTempDir("builtin-desktop-agent");
     // Derive the expected set from the registry so a newly added desktop tool cannot silently
