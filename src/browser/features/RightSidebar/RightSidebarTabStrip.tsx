@@ -449,11 +449,15 @@ function revealSelectedTabOnResize(row: HTMLElement): void {
 function observeRowSizes(row: HTMLElement): () => void {
   // A new observer reports every observed element once at the start. That report is no size
   // change, so it reveals the selected tab, as the caller just did: preferring the focused tab
-  // there would scroll a tab that a shortcut just selected back out of view.
+  // there would scroll a tab that a shortcut just selected back out of view. The report comes a
+  // frame later, though, and a key can move focus to another tab before it (#7288). Then the
+  // user's latest move wins, as on a real size change.
+  const focusAtStart = row.ownerDocument.activeElement;
   let initialReport = true;
   const observer = new ResizeObserver(() => {
-    if (initialReport) {
-      initialReport = false;
+    const focusUnchanged = initialReport && row.ownerDocument.activeElement === focusAtStart;
+    initialReport = false;
+    if (focusUnchanged) {
       revealSelectedTab(row);
     } else {
       revealSelectedTabOnResize(row);

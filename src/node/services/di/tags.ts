@@ -63,7 +63,6 @@ import type { MemoryConsolidationService } from "@/node/services/memoryConsolida
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { MemoryService } from "@/node/services/memoryService";
 import type { MenuEventService } from "@/node/services/menuEventService";
-import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
 import type { ProjectService } from "@/node/services/projectService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
@@ -71,6 +70,7 @@ import type { PTYService } from "@/node/services/ptyService";
 import type { RefineService } from "@/node/services/refinement/refineService";
 import type { ServerAuthService } from "@/node/services/serverAuthService";
 import type { ServerService } from "@/node/services/serverService";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
@@ -100,6 +100,10 @@ export class SessionLocatorTag extends Context.Service<
   SessionLocatorTag,
   WorkspaceSessionLocator
 >()("xum/SessionLocator") {}
+/** The host file calls of the history layer (sessionFiles/sessionFiles.ts). */
+export class SessionFilesTag extends Context.Service<SessionFilesTag, SessionFiles>()(
+  "xum/SessionFiles"
+) {}
 export class ProvidersConfigStoreTag extends Context.Service<
   ProvidersConfigStoreTag,
   ProvidersConfigStore
@@ -287,9 +291,6 @@ export class WorktreeArchiveSnapshot extends Context.Service<
 >()("xum/WorktreeArchiveSnapshot") {}
 // OAuth flows (all need the WindowService for the browser hand-off).
 export class McpOauth extends Context.Service<McpOauth, McpOauthService>()("xum/McpOauth") {}
-export class MuxGatewayOauth extends Context.Service<MuxGatewayOauth, MuxGatewayOauthService>()(
-  "xum/MuxGatewayOauth"
-) {}
 export class CodexOauth extends Context.Service<CodexOauth, CodexOauthService>()(
   "xum/CodexOauth"
 ) {}
@@ -325,6 +326,7 @@ export class BashAiProxy extends Context.Service<BashAiProxy, BashAiProxyService
 export type StoreTags =
   | ConfigTag
   | SessionLocatorTag
+  | SessionFilesTag
   | ProvidersConfigStoreTag
   | SecretsStoreTag
   | FileLeaseManagerTag
@@ -416,7 +418,7 @@ export type MiscDesktopTags =
   | ServerAuth
   | WorkspaceLifecycleHooksTag
   | WorktreeArchiveSnapshot;
-export type OauthTags = McpOauth | MuxGatewayOauth | CodexOauth | CoderOauth | CopilotOauth;
+export type OauthTags = McpOauth | CodexOauth | CoderOauth | CopilotOauth;
 export type WorkerTags = IdleCompaction | Heartbeat | Timeline | Refine | AgentStatus | BashAiProxy;
 export type DesktopTags =
   | BrowserTags

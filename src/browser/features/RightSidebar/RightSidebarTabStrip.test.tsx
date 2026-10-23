@@ -61,7 +61,7 @@ describe("RightSidebarTabStrip keyboard (#7102)", () => {
     cleanupDom = null;
   });
 
-  function renderStrip(options: { disabled?: TabType } = {}) {
+  function renderStrip(options: { disabled?: TabType; holdFirstReport?: boolean } = {}) {
     const onSelect = mock((_tab: TabType) => undefined);
     const strip = (selected: TabType) => {
       const items: RightSidebarTabStripItem[] = TABS.map((tab) => ({
@@ -89,7 +89,8 @@ describe("RightSidebarTabStrip keyboard (#7102)", () => {
     const view = render(strip("costs"));
     const row = view.getByRole("tablist");
     stubRowLayout(row);
-    resize();
+    // `holdFirstReport` leaves the first report for the test to send, as a slow frame does.
+    if (!options.holdFirstReport) resize();
     const tabs = view.getAllByRole("tab");
     // Selection from outside the strip (a keyboard shortcut, the launcher). The effect then
     // starts a new observer, whose first report follows.
@@ -194,5 +195,22 @@ describe("RightSidebarTabStrip keyboard (#7102)", () => {
     // A real size change after that keeps the focused tab in view again.
     resize();
     expect(fullyVisible(tabs[3])).toBe(true);
+  });
+
+  test("a key move before the observer's first report keeps the focused tab in view (#7288)", () => {
+    const { row, tabs } = renderStrip({ holdFirstReport: true });
+    const last = tabs[tabs.length - 1];
+    const lastFullyVisible = () => {
+      const tab = last.getBoundingClientRect();
+      return tab.left >= 0 && tab.right <= ROW_WIDTH;
+    };
+
+    tabs[0].focus();
+    fireEvent.keyDown(tabs[0], { key: "End" });
+    expect(lastFullyVisible()).toBe(true);
+    // The first report arrives after the key move; it must not scroll back to the selected tab.
+    resize();
+    expect(lastFullyVisible()).toBe(true);
+    expect(row.scrollLeft).toBeGreaterThan(0);
   });
 });

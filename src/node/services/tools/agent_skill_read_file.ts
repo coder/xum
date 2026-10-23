@@ -22,7 +22,10 @@ import { readBuiltInSkillFile } from "@/node/services/agentSkills/builtInSkillDe
 import { RuntimeError, isRemoteRuntime, type Runtime } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
 import { resolveContainedSkillFilePath } from "./skillFileUtils";
-import { resolveContainedSkillFilePathOnRuntime } from "./runtimeSkillPathUtils";
+import {
+  resolveContainedSkillFilePathOnRuntime,
+  resolveSkillFilePathForRuntime,
+} from "./runtimeSkillPathUtils";
 
 function readContentWithFileReadLimits(input: {
   fullContent: string;
@@ -156,6 +159,49 @@ export async function resolveSkillFileTarget(
 }
 
 /**
+ * #6426: a remote plugin skill's file, read from its snapshot with the plugin-root rules and kept
+ * inside the skill folder. Null when the skill has no snapshot.
+ */
+async function readSnapshotSkillFile(
+  resolvedSkill: ResolvedAgentSkill,
+  skillRuntime: Runtime,
+  filePath: string,
+  page: { offset?: number | null; limit?: number | null }
+): Promise<AgentSkillReadFileToolResult | null> {
+  const snapshotFs = resolvedSkill.pluginFs;
+  const pluginRoot = resolvedSkill.pluginRoot;
+  if (snapshotFs == null || pluginRoot == null) return null;
+  try {
+    const { resolvedPath } = resolveSkillFilePathForRuntime(
+      skillRuntime,
+      resolvedSkill.skillDir,
+      filePath
+    );
+    const read = await snapshotFs.readFileCapped({
+      filePath: await snapshotFs.ensureContained(resolvedSkill.skillDir, resolvedPath),
+      pluginRoot,
+      maxBytes: MAX_FILE_SIZE,
+      label: `plugin skill file '${filePath}'`,
+    });
+    return readContentWithFileReadLimits({
+      fullContent: read.content,
+      fileSize: read.byteSize,
+      modifiedTime: read.modifiedTime.toISOString(),
+      offset: page.offset,
+      limit: page.limit,
+    });
+  } catch (error) {
+    const message = getErrorMessage(error);
+    return {
+      success: false,
+      error: /escape|outside/i.test(message)
+        ? `Resolved file path points outside the skill directory: ${filePath}`
+        : message,
+    };
+  }
+}
+
+/**
  * Agent Skill read_file tool factory.
  * Reads a file within a skill directory with file_read's paging and page caps,
  * but without its per-line cut (see readContentWithFileReadLimits).
@@ -225,6 +271,15 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           );
         }
 
+        // #6426: a remote plugin skill reads from its cached snapshot (no remote round trip).
+        const snapshotRead = await readSnapshotSkillFile(resolvedSkill, skillRuntime, filePath, {
+          offset,
+          limit,
+        });
+        if (snapshotRead != null) {
+          return withPluginSkillNote(snapshotRead, resolvedSkill, config.availableSkills);
+        }
+
         let targetPath: string;
         try {
           targetPath = await resolveSkillFileTarget(
@@ -240,13 +295,6 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
             return {
               success: false,
               error: `Resolved file path points outside the skill directory: ${filePath}`,
-            };
-          }
-
-          if (/symbolic link/i.test(message)) {
-            return {
-              success: false,
-              error: message,
             };
           }
 

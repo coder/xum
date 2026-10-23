@@ -619,7 +619,7 @@ describe("TurnRequestBuilder model attempt preparation", () => {
 
   it.each([
     { routeProvider: "openai" as const, hasCacheKey: true },
-    { routeProvider: "mux-gateway" as const, hasCacheKey: false },
+    { routeProvider: "coder" as const, hasCacheKey: false },
   ])("sets Chat Completions cache keys for $routeProvider routes", async (testCase) => {
     const harness = await createPreparationHarness();
     try {
