@@ -1,3 +1,4 @@
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { withExecutionScope } from "./tools/withExecutionScope";
 import { getArtifactShelfRoot } from "@/node/services/artifactShelf";
 import { usesInstallationScopedPlans } from "@/common/utils/planStorage";
@@ -469,8 +470,8 @@ function isWorkspaceBusyIdleOnlySend(error: SendMessageError): boolean {
   return error.type === "unknown" && error.raw.includes(WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE);
 }
 
-function waitForWorkflowContinuationRetry(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, WORKFLOW_CONTINUATION_RETRY_DELAY_MS));
+function waitForWorkflowContinuationRetry(clock: HostClock): Promise<void> {
+  return new Promise((resolve) => clock.setTimer(resolve, WORKFLOW_CONTINUATION_RETRY_DELAY_MS));
 }
 
 /**
@@ -1060,6 +1061,11 @@ export class TurnRequestBuilder {
 
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
 
+  /** Turn timings, record timestamps and retry delays share the stream's HostClock. */
+  private get hostClock(): HostClock {
+    return this.dependencies.streamManager.hostClock;
+  }
+
   /** Drop a removed or archived workspace's in-memory request state, so it does not grow the map. */
   forgetWorkspace(workspaceId: string): void {
     this.toolCatalogOverviews.delete(workspaceId);
@@ -1151,7 +1157,8 @@ export class TurnRequestBuilder {
     if (this.dependencies.initStateManager.getUnsanitizedCheckoutError(workspaceId)) return false;
     const ready = await runtime.ensureReady({ signal });
     if (!ready.ready || signal.aborted) return false;
-    const readStartedAt = Date.now();
+    // Wall clock: MCPServerManager subtracts Date.now() from the deadline (#7282).
+    const readStartedAt = nodeClock.nowMs();
     const read = await this.dependencies.workspaceMcpOverridesService
       .getOverridesForWorkspace(workspaceId, { timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS, signal })
       .catch(() => ({ overrides: undefined, authoritative: false }));
@@ -1181,7 +1188,7 @@ export class TurnRequestBuilder {
   }
 
   prepareModelAttempt(options: PrepareModelAttemptOptions): PreparedModelAttempt {
-    const buildProviderOptionsStartedAt = Date.now();
+    const buildProviderOptionsStartedAt = this.hostClock.nowMs();
     const providerOptions = buildProviderOptions(
       options.optionsModelString,
       options.effectiveThinkingLevel,
@@ -1196,7 +1203,7 @@ export class TurnRequestBuilder {
       options.reasoningMode
     ) as Record<string, unknown>;
     options.recordStartupPhaseTiming?.("buildProviderOptionsMs", buildProviderOptionsStartedAt);
-    const buildRequestConfigStartedAt = Date.now();
+    const buildRequestConfigStartedAt = this.hostClock.nowMs();
     const requestHeaders = buildRequestHeaders(
       options.optionsModelString,
       options.muxProviderOptions,
@@ -1671,7 +1678,7 @@ export class TurnRequestBuilder {
             providersConfig
           );
 
-      const resolveAndCreateModelStartedAt = Date.now();
+      const resolveAndCreateModelStartedAt = this.hostClock.nowMs();
       const resolved = await this.dependencies.providerModelFactory.resolveAndCreateModel(
         options.rawModelString,
         preliminaryThinkingLevel,
@@ -1853,7 +1860,7 @@ export class TurnRequestBuilder {
     if (wireProviderName === "openai") {
       log.debug("Keeping reasoning parts for OpenAI (managed via explicit history)");
     }
-    const getWorkspaceMetadataStartedAt = Date.now();
+    const getWorkspaceMetadataStartedAt = this.hostClock.nowMs();
     const metadataResult = await this.dependencies.getWorkspaceMetadata(workspaceId);
     recordStartupPhaseTiming("getWorkspaceMetadataMs", getWorkspaceMetadataStartedAt);
     if (!metadataResult.success) {
@@ -1867,7 +1874,7 @@ export class TurnRequestBuilder {
     const isSideChat = capabilityGrants != null;
     const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
     const logSlowStreamStartup = (details: Record<string, unknown>): void => {
-      const totalMs = Date.now() - startTime;
+      const totalMs = this.hostClock.nowMs() - startTime;
       if (totalMs < STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS) {
         return;
       }
@@ -1927,7 +1934,7 @@ export class TurnRequestBuilder {
         startupStage,
         phase: breadcrumb.phase,
         detail: breadcrumb.detail,
-        elapsedMs: Date.now() - startTime,
+        elapsedMs: this.hostClock.nowMs() - startTime,
       });
       if (!context.admissionOnly)
         this.dependencies.emit("runtime-status", {
@@ -1953,7 +1960,7 @@ export class TurnRequestBuilder {
     // Wait for init to complete before any runtime I/O operations
     // (SSH/devcontainer may not be ready until init finishes pulling the container)
     emitStartupBreadcrumb("waiting_for_init");
-    const waitForInitStartedAt = Date.now();
+    const waitForInitStartedAt = this.hostClock.nowMs();
     await this.dependencies.initStateManager.waitForInit(workspaceId, combinedAbortSignal);
     recordStartupPhaseTiming("waitForInitMs", waitForInitStartedAt);
     // Metadata was read before the wait: a checkout whose launch sanitize failed meanwhile
@@ -1979,7 +1986,7 @@ export class TurnRequestBuilder {
     // For Coder workspaces, this may start a stopped workspace and wait for it.
     // If init failed during container creation, ensureReady() will return an error.
     emitStartupBreadcrumb("checking_runtime");
-    const ensureReadyStartedAt = Date.now();
+    const ensureReadyStartedAt = this.hostClock.nowMs();
     const readyResult = await runtime.ensureReady({
       signal: combinedAbortSignal,
       statusSink: (status) => {
@@ -2049,7 +2056,7 @@ export class TurnRequestBuilder {
     // One cache per request: resolution, plan handoff, prompt body, and
     // sub-agent discovery share definition reads; the next turn starts fresh.
     const agentDefinitionCache = new AgentDefinitionRequestCache();
-    const resolveAgentForStreamStartedAt = Date.now();
+    const resolveAgentForStreamStartedAt = this.hostClock.nowMs();
     const agentResult = await resolveAgentForStream({
       workspaceId,
       metadata,
@@ -2154,7 +2161,9 @@ export class TurnRequestBuilder {
     // overrides" would re-enable a globally enabled server that only the
     // unreadable document disables.
     let mcpOverridesAuthoritative = false;
-    const loadWorkspaceMcpOverridesStartedAt = Date.now();
+    const loadWorkspaceMcpOverridesStartedAt = this.hostClock.nowMs();
+    // Wall clock: MCPServerManager subtracts Date.now() from this deadline (#7282).
+    const mcpOverridesReadDeadlineAt = nodeClock.nowMs() + MCP_OVERRIDES_READ_TIMEOUT_MS;
     try {
       // Bounded and cancellable: an inheriting child's resolution probes and
       // reads every ancestor's document on that ancestor's runtime (SSH/Docker
@@ -2206,7 +2215,7 @@ export class TurnRequestBuilder {
       });
     }
 
-    const listMcpServersStartedAt = Date.now();
+    const listMcpServersStartedAt = this.hostClock.nowMs();
     // The system prompt's MCP inventory. When the override read was not
     // authoritative, a listing built from the fallback overrides could
     // advertise servers the manager's serve excludes (it re-reads disk and
@@ -2224,7 +2233,7 @@ export class TurnRequestBuilder {
         : undefined;
     recordStartupPhaseTiming("listMcpServersMs", listMcpServersStartedAt);
 
-    const loadAdditionalSystemContextStartedAt = Date.now();
+    const loadAdditionalSystemContextStartedAt = this.hostClock.nowMs();
     let workspaceAdditionalSystemContext = additionalSystemContext;
     if (workspaceAdditionalSystemContext == null) {
       try {
@@ -2257,7 +2266,7 @@ export class TurnRequestBuilder {
     // Build plan-aware instructions and determine plan→exec transition content.
     // IMPORTANT: Derive this from the same boundary-sliced message payload that is sent to
     // the model so plan hints/handoffs cannot be suppressed by pre-boundary history.
-    const buildPlanInstructionsStartedAt = Date.now();
+    const buildPlanInstructionsStartedAt = this.hostClock.nowMs();
     // Where the plan lives (planLocation.ts). On SSH it needs this installation's identity
     // (#5174); an unusable identity file fails the turn with its repair instructions. Loaded once
     // for the turn, so this plan path and the ancestor paths listed below use one identity even if
@@ -2423,7 +2432,7 @@ export class TurnRequestBuilder {
 
     // Build provisional agent context before tool policy finalizes the toolset.
     // Rebuild after policy application so guidance only describes available tools.
-    const buildStreamSystemContextStartedAt = Date.now();
+    const buildStreamSystemContextStartedAt = this.hostClock.nowMs();
     const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset({
       memoryToolAvailable: memoryToolEligible,
       intuitionToolAvailable: intuitionToolEligible,
@@ -2460,7 +2469,7 @@ export class TurnRequestBuilder {
     // Do not start external servers for a conversation that can never call their tools.
     if (!isSideChat && this.dependencies.bindings.mcpServerManager) {
       const mcpServerManager = this.dependencies.bindings.mcpServerManager;
-      const mcpToolSetupStartedAt = Date.now();
+      const mcpToolSetupStartedAt = this.hostClock.nowMs();
       try {
         const result = await mcpServerManager.getToolsForWorkspace(
           {
@@ -2477,8 +2486,7 @@ export class TurnRequestBuilder {
             ...(mcpOverridesAuthoritative
               ? {}
               : {
-                  overridesReadDeadlineAt:
-                    loadWorkspaceMcpOverridesStartedAt + MCP_OVERRIDES_READ_TIMEOUT_MS,
+                  overridesReadDeadlineAt: mcpOverridesReadDeadlineAt,
                 }),
             projectSecrets: await secretsToRecord(projectSecrets),
             agentPlugins: agentPluginsMcpContext,
@@ -2536,7 +2544,7 @@ export class TurnRequestBuilder {
         mcpServers = undefined;
         workspaceLog.error("Failed to start MCP servers", { error });
       } finally {
-        mcpSetupDurationMs = Date.now() - mcpToolSetupStartedAt;
+        mcpSetupDurationMs = this.hostClock.nowMs() - mcpToolSetupStartedAt;
         startupPhaseTimingsMs.mcpToolSetupMs = mcpSetupDurationMs;
       }
     }
@@ -2549,7 +2557,7 @@ export class TurnRequestBuilder {
     const toolSearchRuntime: ToolSearchRuntime | undefined =
       !isSideChat && toolSearchEnabled && Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
 
-    const createTempDirForStreamStartedAt = Date.now();
+    const createTempDirForStreamStartedAt = this.hostClock.nowMs();
     const runtimeTempDir = await this.dependencies.streamManager.createTempDirForStream(
       streamToken,
       runtime
@@ -2571,7 +2579,7 @@ export class TurnRequestBuilder {
     };
     recordStartupPhaseTiming("createTempDirForStreamMs", createTempDirForStreamStartedAt);
 
-    const readToolInstructionsStartedAt = Date.now();
+    const readToolInstructionsStartedAt = this.hostClock.nowMs();
     // Same snapshot as the system message: no second AGENTS.md scan, and the
     // prompt and tool descriptions cannot disagree about file contents.
     const toolInstructions = extractToolInstructionsFromSources(
@@ -2584,7 +2592,7 @@ export class TurnRequestBuilder {
 
     // Calculate cumulative session costs for MUX_COSTS_USD env var
     let sessionCostsUsd: number | undefined;
-    const loadSessionUsageStartedAt = Date.now();
+    const loadSessionUsageStartedAt = this.hostClock.nowMs();
     if (this.dependencies.sessionUsageService) {
       const sessionUsage = await this.dependencies.sessionUsageService.getSessionUsage(workspaceId);
       if (sessionUsage) {
@@ -2728,7 +2736,7 @@ export class TurnRequestBuilder {
                 );
                 if (!invocationCurrent) {
                   if (this.dependencies.isStreaming(workspaceId)) {
-                    await waitForWorkflowContinuationRetry();
+                    await waitForWorkflowContinuationRetry(this.hostClock);
                     continue;
                   }
                   log.debug("Skipping superseded workflow continuation", { workspaceId, runId });
@@ -2781,7 +2789,7 @@ export class TurnRequestBuilder {
                   });
                   return;
                 }
-                await waitForWorkflowContinuationRetry();
+                await waitForWorkflowContinuationRetry(this.hostClock);
               }
             },
             getCurrentProjectTrusted: () =>
@@ -2972,7 +2980,7 @@ export class TurnRequestBuilder {
                 workspaceId,
                 sourceWorkspaceId: workspaceId,
                 byModelDelta: { [canonicalModel]: displayUsage },
-                timestamp: Date.now(),
+                timestamp: this.hostClock.nowMs(),
               });
             } catch (error) {
               log.warn("Failed to record tool model usage", {
@@ -3135,7 +3143,7 @@ export class TurnRequestBuilder {
             seed.effectiveThinkingLevel
           ).providerRequestMessages;
 
-        const getToolsStartedAt = Date.now();
+        const getToolsStartedAt = this.hostClock.nowMs();
         const allTools = await getToolsForModel(
           seed.toolsModelString,
           {
@@ -3162,7 +3170,7 @@ export class TurnRequestBuilder {
           recordStartupPhaseTiming("getToolsForModelMs", getToolsStartedAt);
         }
 
-        const applyPolicyStartedAt = Date.now();
+        const applyPolicyStartedAt = this.hostClock.nowMs();
         let attemptTools = await applyToolPolicyAndExperiments({
           capabilityGrants,
           allTools: this.dependencies.wrapToolsForDelegation(
@@ -3272,7 +3280,7 @@ export class TurnRequestBuilder {
           memoryToolAvailable === memoryToolEligible &&
           intuitionToolAvailable === intuitionToolEligible &&
           memoryContextForModel === memoryContext;
-        const rebuildSystemStartedAt = Date.now();
+        const rebuildSystemStartedAt = this.hostClock.nowMs();
         const systemContext = canReuseSystemContext
           ? prePolicyStreamSystemContext
           : await buildStreamSystemContextForToolset(
@@ -3496,7 +3504,7 @@ export class TurnRequestBuilder {
           );
           return payload;
         };
-        const prepareMessagesForProviderStartedAt = Date.now();
+        const prepareMessagesForProviderStartedAt = this.hostClock.nowMs();
         const attemptPayload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
         if (options.recordTimings) {
           recordStartupPhaseTiming(
@@ -3751,7 +3759,7 @@ export class TurnRequestBuilder {
         };
       const assistantMessage = createMuxMessage(assistantMessageId, "assistant", "", {
         ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
-        timestamp: Date.now(),
+        timestamp: this.hostClock.nowMs(),
         model: canonicalModelString,
         systemMessageTokens,
         agentId: effectiveAgentId,
@@ -3922,7 +3930,7 @@ export class TurnRequestBuilder {
       }
 
       const snapshot: DebugLlmRequestSnapshot = {
-        capturedAt: Date.now(),
+        capturedAt: this.hostClock.nowMs(),
         workspaceId,
         messageId: assistantMessageId,
         model: modelString,
@@ -4115,7 +4123,7 @@ export class TurnRequestBuilder {
         initialMetadata: {
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
           systemMessageTokens,
-          timestamp: Date.now(),
+          timestamp: this.hostClock.nowMs(),
           agentId: effectiveAgentId,
           // Where this request sent the volatile system tail, so the next rebuild repeats it.
           ...systemRecordsMetadata(streamSystemRecords),
