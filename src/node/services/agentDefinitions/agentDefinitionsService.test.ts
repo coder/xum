@@ -9,6 +9,8 @@ import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
+import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import { log } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
@@ -1255,6 +1257,49 @@ base: a
         if (previousRoot === undefined) delete process.env.XUM_ROOT;
         else process.env.XUM_ROOT = previousRoot;
       }
+    });
+
+    test("a trusted remote checkout's plugin agents load from one cached listing (#6426)", async () => {
+      using checkoutDir = new DisposableTempDir("agent-defs-remote-checkout-plugins");
+      const checkout = await fs.realpath(checkoutDir.path);
+      const container = path.join(checkout, ".xum", "plugins");
+      await writePluginWithAgent(container, "kit", "remote-helper", "Remote Helper");
+      // An agent file that is a link (here to a file outside its plugin) is not listed.
+      await writeAgent(path.join(checkout, "outside"), "escaped", "Escaped");
+      await fs.symlink(
+        path.join(checkout, "outside", "escaped.md"),
+        path.join(container, "kit", "agents", "escaped.md")
+      );
+      const runtime = new HostKeyShellRemoteRuntime(checkout, "agents-remote-plugins");
+
+      const agents = await discoverAgentDefinitions(runtime, checkout, {
+        projectPluginsTrusted: true,
+      });
+      expect(agents.find((agent) => agent.id === "remote-helper")).toMatchObject({
+        scope: "project",
+        pluginName: "kit",
+      });
+      expect(agents.some((agent) => agent.id === "escaped")).toBe(false);
+      const pkg = await readAgentDefinition(runtime, checkout, "remote-helper", {
+        projectPluginsTrusted: true,
+      });
+      expect(pkg.frontmatter.name).toBe("Remote Helper");
+      // The listing and the read by id share one remote listing.
+      expect(runtime.pluginListings).toBe(1);
+      // A warm turn lists skills and agents from the same snapshot: no remote command touches the
+      // plugin folders (plain .xum/skills and .xum/agents roots keep their own reads).
+      const before = runtime.commands.length;
+      await discoverAgentSkills(runtime, checkout, { projectPluginsTrusted: true });
+      await discoverAgentDefinitions(runtime, checkout, { projectPluginsTrusted: true });
+      const warm = runtime.commands.slice(before);
+      expect(warm.some((command) => command.includes(container))).toBe(false);
+      expect(runtime.pluginListings).toBe(1);
+
+      // Untrusted: no remote plugin agents and no listing.
+      const untrusted = new HostKeyShellRemoteRuntime(checkout, "agents-remote-untrusted");
+      const plain = await discoverAgentDefinitions(untrusted, checkout);
+      expect(plain.some((agent) => agent.id === "remote-helper")).toBe(false);
+      expect(untrusted.pluginListings).toBe(0);
     });
 
     test("readAgentDefinition falls back to a plugin agent when no project/global agent exists", async () => {

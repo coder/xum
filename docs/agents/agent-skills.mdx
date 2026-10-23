@@ -66,13 +66,13 @@ Xum also discovers skills packaged in [Agent Plugins 1.0.0](https://agent-plugin
 
 Project plugins load their skills only in a trusted project, as their MCP servers, hooks and slash commands already do. In an untrusted project, Xum neither lists nor reads the skills of `.xum/plugins` and `.agents/plugins`, and it skips them under the project-automation kill switch too. Plain project skills (`.xum/skills`, `.agents/skills`) and global plugins do not depend on Project Trust. To use a repository's plugin skills, trust the project in **Settings → Security**.
 
-SSH, Docker, and devcontainer workspaces load the global plugins (their skills, agents, and workflows) from the Xum host. In a trusted SSH or Docker project, Xum also loads the skills of the checkout's own plugins (`.xum/plugins`, `.mux/plugins` and `.agents/plugins` on the remote host). Xum lists them with one remote command, keeps that copy in memory on the Xum host, and reads the skill files from it, so a turn makes no extra remote round trip. Devcontainer workspaces and Windows hosts do not load project plugins.
+SSH, Docker, and devcontainer workspaces load the global plugins (their skills, agents, and workflows) from the Xum host. In a trusted SSH or Docker project, Xum also loads the skills and agents of the checkout's own plugins (`.xum/plugins`, `.mux/plugins` and `.agents/plugins` on the remote host). Xum lists them with one remote command, keeps that copy in memory on the Xum host, and reads the skill and agent files from it, so a turn makes no extra remote round trip. Devcontainer workspaces and Windows hosts do not load project plugins.
 
 - Edits to a plugin in the remote checkout show after you restart Xum or change the project's trust.
 - A checkout whose plugin folders hold more than 4,000 entries, or more than about 12 MiB of files (less about 1 KiB per file), loads no remote project plugins. Files over 1 MiB are not readable.
 - A plugin folder that is a link to the checkout root itself does not load.
 - A remote plugin skill's `workflow.js` follows the rule of a plain remote project skill workflow: the project must be trusted, and Xum reads the script from the remote host when the workflow starts.
-- The MCP servers, hooks, slash commands and agents of remote project plugins do not load.
+- The MCP servers, hooks and slash commands of remote project plugins do not load.
 
 As in Claude Code, a skills path (`contributes.skills`) that holds a `SKILL.md` itself is one skill. Its name is the folder name, or the plugin name when the path is the plugin root (`.`). The default `skills/` folder always holds skill folders.
 
