@@ -233,6 +233,7 @@ export class WorkflowRunStore {
       "WorkflowRunStore: mutationLockWaitTimeoutMs must be positive"
     );
     this.mutationLockWaitTimeoutMs = options.mutationLockWaitTimeoutMs;
+    // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
     this.locks = options.locks ?? nodeSessionLocks;
   }
 

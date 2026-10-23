@@ -99,6 +99,7 @@ export class Journal<T> {
     assert(this.appendLockTimeoutMs > 0, "Journal appendLockTimeoutMs must be positive");
     this.onAppended = options.onAppended;
     this.testOnlyBeforeAppendWrite = options.testOnlyBeforeAppendWrite;
+    // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
     this.locks = options.locks ?? nodeSessionLocks;
   }
 
