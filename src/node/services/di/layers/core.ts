@@ -26,7 +26,7 @@ import { BackgroundProcessManager } from "@/node/services/backgroundProcessManag
 import type { CoreOptions, CoreServices, CoreServicesOptions } from "@/node/services/coreServices";
 import { AppFiberScopeLive, AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import { EffectRunnerLive, EffectRunnerTag } from "@/node/services/di/effectRunner";
-import { HostClockLive } from "@/node/services/di/hostClockLive";
+import { HostClockLive, HostClockTag } from "@/node/services/di/hostClockLive";
 import {
   AI,
   AutoModelRouterTag,
@@ -133,6 +133,7 @@ export type CoreInputTags =
   | StoreTags
   | CoreOptionsTag
   | EffectRunnerTag
+  | HostClockTag
   | AppFiberScopeTag
   | MemoryMeta
   | WorkspaceMcpOverrides;
@@ -303,7 +304,8 @@ export const StreamManagerLive = Layer.effect(
       // scope before the explicit teardown steps, which aborts and awaits every
       // in-flight stream (StreamManager.superviseEngine).
       yield* AppFiberScopeTag,
-      yield* ToolCallDisplayRegistryTag
+      yield* ToolCallDisplayRegistryTag,
+      { hostClock: yield* HostClockTag }
     );
   })
 );

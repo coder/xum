@@ -1334,7 +1334,6 @@
               "src/node/services/contextManagement/strategies/continuous.ts": 1,
               "src/node/services/contextManagement/strategies/tokenBudget.ts": 1,
               "src/node/services/retryManager.ts": 1,
-              "src/node/services/streamManager.ts": 18,
               "src/node/services/tools/bash.ts": 3,
               "src/node/services/tools/bash_background_list.ts": 1,
               "src/node/services/tools/code_execution.ts": 3,
@@ -1363,6 +1362,18 @@
       "rules": {
         "local/no-host-imports": "off",
         "local/no-raw-clock": "off"
+      }
+    },
+    {
+      "files": ["src/node/services/streamManager.toolEvents.test.ts"],
+      "jsPlugins": [
+        {
+          "name": "local",
+          "specifier": "./eslint-local-rules.mjs"
+        }
+      ],
+      "rules": {
+        "local/no-global-clock-patch": "error"
       }
     },
     {

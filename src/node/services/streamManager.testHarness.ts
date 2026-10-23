@@ -83,7 +83,11 @@ export function createStreamManagerForTests(
     deps.runner,
     deps.engineScope,
     deps.toolCallDisplayRegistry,
-    { streamText: deps.streamText, tokenTracker: deps.tokenTracker ?? noopTokenTracker }
+    {
+      streamText: deps.streamText,
+      tokenTracker: deps.tokenTracker ?? noopTokenTracker,
+      hostClock: deps.hostClock,
+    }
   );
   if (deps.eventSink) constructionSinks.set(streamManager, deps.eventSink);
   return streamManager;
