@@ -1250,6 +1250,10 @@
               {
                 "module": "@/node/runtime/runtimeHelpers",
                 "names": ["createRuntimeForWorkspace", "createRuntimeContextForWorkspace"]
+              },
+              {
+                "module": "@/common/constants/paths",
+                "names": ["cleanupObsoleteXumBinArtifacts", "getXumExtensionMetadataPath", "getXumHome", "getXumLogsDir", "getXumPerfCapturesDir", "getXumPerfReportsDir", "getXumPerfTapesDir", "getXumProjectsDir", "getXumSessionsDir"]
               }
             ],
             "allow": {
