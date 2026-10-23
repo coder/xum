@@ -198,6 +198,7 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
       // (branchSummary and refinementRollback lock inside the session folder). No lock file.
       // Synchronous, so waiters queue in call order: with an awaited mkdir, a later caller's
       // mkdir could finish first and take its place in the FIFO.
+      // eslint-disable-next-line local/no-sync-fs-methods -- keeps the waiters' FIFO order (above).
       fs.mkdirSync(path.dirname(lockPath), { recursive: true });
       const entry = await acquireInMemory(table, lockPath, timeoutMs, clock, (blocker) => {
         const { why, ...holder } = blocker;
@@ -227,6 +228,7 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
       const { lockPath, acquireTimeoutMs, timeoutMessage, signal } = options;
       // As crossProcessLock.ts does first: a caller may write into the folder once it holds the lock.
       // Synchronous for the same FIFO reason as the file lock above.
+      // eslint-disable-next-line local/no-sync-fs-methods -- keeps the waiters' FIFO order (above).
       fs.mkdirSync(path.dirname(lockPath), { recursive: true });
       const refusal = (blocker: Blocker) =>
         new CrossProcessLockTimeoutError(
