@@ -4034,6 +4034,11 @@ export class TurnRequestBuilder {
                   return Err(formatSendMessageError(nextSeedResult.error).message);
                 }
 
+                // No Token Budget stage is decided here (#5286, maintainer's choice): the
+                // turn's placeholder row already exists, so a warning row cannot precede it,
+                // and handing the turn over to a Continue would need a new mechanism. The
+                // fallback request is sent as built. A stage it reaches comes at the next turn
+                // start that reaches it (applyTurnStartStage), one turn late.
                 let nextRequest: Awaited<ReturnType<typeof prepareModelRequest>>;
                 try {
                   nextRequest = await prepareModelRequest({
