@@ -111,7 +111,6 @@ interface HeldFile {
   release: () => Promise<void>;
 }
 
-/** One instance per backend (ServiceContainer). */
 /**
  * The text of a WorkspaceMutationInProgressError. Exported so the SessionLocks
  * test layers refuse with today's text, byte for byte.
@@ -126,6 +125,7 @@ export function workspaceMutationInProgressMessage(
   );
 }
 
+/** One instance per backend (ServiceContainer). */
 export class WorkspaceUseLeases {
   /** Names this backend's lease files; distinct per instance, so two stacks never share one. */
   readonly instanceToken = randomUUID();
