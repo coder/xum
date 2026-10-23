@@ -26,40 +26,16 @@ import {
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { Button } from "@/browser/components/Button/Button";
 import { useSettings } from "@/browser/contexts/SettingsContext";
-import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthTokenModal";
-import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import { useRouting } from "@/browser/hooks/useRouting";
-import {
-  formatMuxGatewayBalance,
-  useMuxGatewayAccountStatus,
-} from "@/browser/hooks/useMuxGatewayAccountStatus";
 import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
-import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { getAgentsInitNudgeKey } from "@/common/constants/storage";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
-import { getErrorMessage } from "@/common/utils/errors";
 import {
   formatProviderDisplayName,
   getProviderIdsForUi,
   isBuiltInProvider,
 } from "@/common/utils/providers/customProviders";
-
-interface OAuthMessage {
-  type?: unknown;
-  state?: unknown;
-  ok?: unknown;
-  error?: unknown;
-}
-
-type MuxGatewayLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
-
-function getServerAuthToken(): string | null {
-  const urlToken = new URLSearchParams(window.location.search).get("token")?.trim();
-  return urlToken?.length ? urlToken : getStoredAuthToken();
-}
 
 // Wizard text uses text-content-secondary, not text-muted: the light theme's muted token is
 // below WCAG AA (4.5:1) on the dialog backgrounds (#5944). The token stays as is because it
@@ -194,12 +170,12 @@ function CommandPalettePreview(props: { shortcut: string }) {
 }
 
 /**
- * T3 #5971, C step 2: the server's static first-run view (#xum-pre) already shows the gateway step.
- * The live wizard renders nothing while it loads under that view, then swaps it out in its first
- * real commit (a layout effect runs before paint). The dialog and overlay never play their entry
- * animation in this mount: they stay open, so clearing the override later would replay it. The
- * step skips its entry animation only until the user moves on. A wizard that starts past the
- * gateway step replaces the view too.
+ * T3 #5971, C step 2: the server's static first-run view (#xum-pre) already shows the providers
+ * step. The live wizard renders nothing while it loads under that view, then swaps it out in its
+ * first real commit (a layout effect runs before paint). The dialog and overlay never play their
+ * entry animation in this mount: they stay open, so clearing the override later would replay it.
+ * The step skips its entry animation only until the user moves on. A wizard that starts past the
+ * providers step replaces the view too.
  */
 function useFirstRunViewHandoff(isLoading: boolean) {
   const [startsUnderFirstRunView] = useState(hasFirstRunView);
@@ -246,301 +222,8 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
   const [direction, setDirection] = useState<Direction>("forward");
 
-  const { api } = useAPI();
-  const liveApi = useLiveAPI();
-  const {
-    data: muxGatewayAccountStatus,
-    error: muxGatewayAccountError,
-    isLoading: muxGatewayAccountLoading,
-    refresh: refreshMuxGatewayAccountStatus,
-  } = useMuxGatewayAccountStatus();
-
-  const backendBaseUrl = getBrowserBackendBaseUrl();
-  const backendOrigin = useMemo(() => {
-    try {
-      return new URL(backendBaseUrl).origin;
-    } catch {
-      return window.location.origin;
-    }
-  }, [backendBaseUrl]);
-
-  const isDesktop = !!window.api;
-
-  const [muxGatewayLoginStatus, setMuxGatewayLoginStatus] = useState<MuxGatewayLoginStatus>("idle");
-  const [muxGatewayLoginError, setMuxGatewayLoginError] = useState<string | null>(null);
-
-  const muxGatewayLoginAttemptRef = useRef(0);
-  const [muxGatewayDesktopFlowId, setMuxGatewayDesktopFlowId] = useState<string | null>(null);
-  const [muxGatewayServerState, setMuxGatewayServerState] = useState<string | null>(null);
-
-  const routing = useRouting();
-
-  const disableMuxGatewayRoute = useCallback(() => {
-    const nextPriority = routing.routePriority.filter((route) => route !== "mux-gateway");
-    if (!nextPriority.includes("direct")) {
-      nextPriority.push("direct");
-    }
-
-    // Legacy configs can persist per-model mux-gateway overrides, and resolve.ts
-    // gives those overrides precedence over route priority order.
-    const nextOverrides = Object.fromEntries(
-      Object.entries(routing.routeOverrides).filter(([, route]) => route !== "mux-gateway")
-    );
-
-    if (
-      nextPriority.length === routing.routePriority.length &&
-      Object.keys(nextOverrides).length === Object.keys(routing.routeOverrides).length
-    ) {
-      return;
-    }
-
-    routing.setRoutePreferences(nextPriority, nextOverrides);
-  }, [routing]);
-
-  const cancelMuxGatewayLogin = useCallback(() => {
-    muxGatewayLoginAttemptRef.current++;
-
-    if (isDesktop && api && muxGatewayDesktopFlowId) {
-      void api.muxGatewayOauth.cancelDesktopFlow({ flowId: muxGatewayDesktopFlowId });
-    }
-
-    setMuxGatewayDesktopFlowId(null);
-    setMuxGatewayServerState(null);
-    setMuxGatewayLoginStatus("idle");
-    setMuxGatewayLoginError(null);
-  }, [api, isDesktop, muxGatewayDesktopFlowId]);
-
-  const startMuxGatewayLogin = useCallback(async () => {
-    const attempt = ++muxGatewayLoginAttemptRef.current;
-
-    try {
-      setMuxGatewayLoginError(null);
-      setMuxGatewayDesktopFlowId(null);
-      setMuxGatewayServerState(null);
-
-      if (isDesktop) {
-        if (!liveApi) {
-          setMuxGatewayLoginStatus("error");
-          setMuxGatewayLoginError("Xum API not connected.");
-          return;
-        }
-
-        setMuxGatewayLoginStatus("starting");
-        const startResult = await liveApi.muxGatewayOauth.startDesktopFlow();
-
-        if (attempt !== muxGatewayLoginAttemptRef.current) {
-          if (startResult.success) {
-            void liveApi.muxGatewayOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
-          }
-          return;
-        }
-
-        if (!startResult.success) {
-          setMuxGatewayLoginStatus("error");
-          setMuxGatewayLoginError(startResult.error);
-          return;
-        }
-
-        const { flowId, authorizeUrl } = startResult.data;
-        setMuxGatewayDesktopFlowId(flowId);
-        setMuxGatewayLoginStatus("waiting");
-
-        // Desktop main process intercepts external window.open() calls and routes them via shell.openExternal.
-        window.open(authorizeUrl, "_blank", "noopener");
-
-        if (attempt !== muxGatewayLoginAttemptRef.current) {
-          return;
-        }
-
-        const waitResult = await liveApi.muxGatewayOauth.waitForDesktopFlow({ flowId });
-
-        if (attempt !== muxGatewayLoginAttemptRef.current) {
-          return;
-        }
-
-        if (waitResult.success) {
-          setMuxGatewayLoginStatus("success");
-
-          const refreshPromise = refreshMuxGatewayAccountStatus();
-          // Time-box the balance check so a stalled gateway endpoint doesn't
-          // block first-time onboarding defaults.
-          const accountStatus = await Promise.race([
-            refreshPromise,
-            new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
-          ]);
-
-          if (attempt !== muxGatewayLoginAttemptRef.current) {
-            return;
-          }
-
-          const hasCredits = accountStatus == null || accountStatus.remaining_microdollars > 0;
-
-          if (!hasCredits) {
-            disableMuxGatewayRoute();
-          }
-
-          // If the timeout won the race, the balance check is still in flight.
-          // When it eventually resolves with depleted credits, disable gateway routing.
-          if (accountStatus == null) {
-            void refreshPromise.then((laterStatus) => {
-              if (muxGatewayLoginAttemptRef.current !== attempt) return;
-              if (laterStatus?.remaining_microdollars === 0) {
-                disableMuxGatewayRoute();
-              }
-            });
-          }
-          return;
-        }
-
-        setMuxGatewayLoginStatus("error");
-        setMuxGatewayLoginError(waitResult.error);
-        return;
-      }
-
-      // Browser/server mode: use unauthenticated bootstrap route.
-      // Open popup synchronously to preserve user gesture context (avoids popup blockers).
-      const popup = window.open("about:blank", "_blank");
-      if (!popup) {
-        throw new Error("Popup blocked - please allow popups and try again.");
-      }
-
-      setMuxGatewayLoginStatus("starting");
-
-      const startUrl = new URL(`${backendBaseUrl}/auth/mux-gateway/start`);
-      const authToken = getServerAuthToken();
-
-      let json: { authorizeUrl?: unknown; state?: unknown; error?: unknown };
-      try {
-        const res = await fetch(startUrl, {
-          headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-        });
-
-        const contentType = res.headers.get("content-type") ?? "";
-        if (!contentType.includes("application/json")) {
-          const body = await res.text();
-          const prefix = body.trim().slice(0, 80);
-          throw new Error(
-            `Unexpected response from ${startUrl.toString()} (expected JSON, got ${
-              contentType || "unknown"
-            }): ${prefix}`
-          );
-        }
-
-        json = (await res.json()) as typeof json;
-
-        if (!res.ok) {
-          const message = typeof json.error === "string" ? json.error : `HTTP ${res.status}`;
-          throw new Error(message);
-        }
-      } catch (err) {
-        popup.close();
-        throw err;
-      }
-
-      if (attempt !== muxGatewayLoginAttemptRef.current) {
-        popup.close();
-        return;
-      }
-
-      if (typeof json.authorizeUrl !== "string" || typeof json.state !== "string") {
-        popup.close();
-        throw new Error(`Invalid response from ${startUrl.pathname}`);
-      }
-
-      setMuxGatewayServerState(json.state);
-      popup.location.href = json.authorizeUrl;
-      setMuxGatewayLoginStatus("waiting");
-    } catch (err) {
-      if (attempt !== muxGatewayLoginAttemptRef.current) {
-        return;
-      }
-
-      const message = getErrorMessage(err);
-      setMuxGatewayLoginStatus("error");
-      setMuxGatewayLoginError(message);
-    }
-  }, [liveApi, backendBaseUrl, disableMuxGatewayRoute, isDesktop, refreshMuxGatewayAccountStatus]);
-
-  useEffect(() => {
-    const attempt = muxGatewayLoginAttemptRef.current;
-
-    if (isDesktop || muxGatewayLoginStatus !== "waiting" || !muxGatewayServerState) {
-      return;
-    }
-
-    const handleMessage = (event: MessageEvent<OAuthMessage>) => {
-      if (event.origin !== backendOrigin) return;
-      if (muxGatewayLoginAttemptRef.current !== attempt) return;
-
-      const data = event.data;
-      if (!data || typeof data !== "object") return;
-      if (data.type !== "mux-gateway-oauth") return;
-      if (data.state !== muxGatewayServerState) return;
-
-      if (data.ok === true) {
-        setMuxGatewayLoginStatus("success");
-
-        const refreshPromise = refreshMuxGatewayAccountStatus();
-        // Time-box the balance check so a stalled gateway endpoint doesn't
-        // block first-time onboarding defaults.
-        void Promise.race([
-          refreshPromise,
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
-        ]).then((accountStatus) => {
-          if (muxGatewayLoginAttemptRef.current !== attempt) return;
-
-          const hasCredits = accountStatus == null || accountStatus.remaining_microdollars > 0;
-
-          if (!hasCredits) {
-            disableMuxGatewayRoute();
-          }
-
-          // If the timeout won the race, the balance check is still in flight.
-          // When it eventually resolves with depleted credits, disable gateway routing.
-          if (accountStatus == null) {
-            void refreshPromise.then((laterStatus) => {
-              if (muxGatewayLoginAttemptRef.current !== attempt) return;
-              if (laterStatus?.remaining_microdollars === 0) {
-                disableMuxGatewayRoute();
-              }
-            });
-          }
-        });
-        return;
-      }
-
-      const msg = typeof data.error === "string" ? data.error : "Login failed";
-      setMuxGatewayLoginStatus("error");
-      setMuxGatewayLoginError(msg);
-    };
-
-    window.addEventListener("message", handleMessage);
-    return () => window.removeEventListener("message", handleMessage);
-  }, [
-    backendOrigin,
-    disableMuxGatewayRoute,
-    isDesktop,
-    muxGatewayLoginStatus,
-    muxGatewayServerState,
-    refreshMuxGatewayAccountStatus,
-  ]);
-
-  const muxGatewayCouponCodeSet = providersConfig?.["mux-gateway"]?.couponCodeSet ?? false;
-  const muxGatewayLoginInProgress =
-    muxGatewayLoginStatus === "waiting" || muxGatewayLoginStatus === "starting";
-  const muxGatewayIsLoggedIn = muxGatewayCouponCodeSet || muxGatewayLoginStatus === "success";
-
-  const muxGatewayLoginButtonLabel =
-    muxGatewayLoginStatus === "error"
-      ? "Try again"
-      : muxGatewayLoginInProgress
-        ? "Waiting for login..."
-        : muxGatewayIsLoggedIn
-          ? "Re-login to Xum Gateway"
-          : "Login with Xum Gateway";
-
   const onboardingProviders = useMemo(() => {
-    const gatewayPriority: ProviderName[] = ["mux-gateway", "openrouter"];
+    const gatewayPriority: ProviderName[] = ["openrouter"];
     const directProviders: string[] = [];
     const localProviders: string[] = [];
     const otherGateways: string[] = [];
@@ -583,29 +266,13 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       .join(", ");
   }, [configuredProviders, providersConfig]);
 
-  const [hasConfiguredProvidersAtStart, setHasConfiguredProvidersAtStart] = useState<
-    boolean | null
-  >(null);
-
-  useEffect(() => {
-    if (hasConfiguredProvidersAtStart !== null) {
-      return;
-    }
-
-    if (providersLoading) {
-      return;
-    }
-
-    setHasConfiguredProvidersAtStart(configuredProviders.length > 0);
-  }, [configuredProviders.length, hasConfiguredProvidersAtStart, providersLoading]);
-
   const commandPaletteShortcut = formatKeybind(KEYBINDS.OPEN_COMMAND_PALETTE);
   const commandPaletteActionsShortcut = formatKeybind(KEYBINDS.OPEN_COMMAND_PALETTE_ACTIONS);
   const agentPickerShortcut = formatKeybind(KEYBINDS.TOGGLE_AGENT);
   const cycleAgentShortcut = formatKeybind(KEYBINDS.CYCLE_AGENT);
 
   const steps = useMemo((): WizardStep[] => {
-    if (hasConfiguredProvidersAtStart === null) {
+    if (providersLoading) {
       return [
         {
           key: "loading",
@@ -621,164 +288,6 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
     }
 
     const nextSteps: WizardStep[] = [];
-
-    if (hasConfiguredProvidersAtStart === false) {
-      nextSteps.push({
-        key: "mux-gateway",
-        title: "Xum Gateway (evaluation credits)",
-        icon: <Sparkles className="h-4 w-4" />,
-        body: (
-          <>
-            <p>
-              Xum Gateway enables you to use free AI tokens from{" "}
-              <a
-                href="https://coder.com"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-accent-text underline"
-              >
-                Coder
-              </a>
-              .
-            </p>
-
-            <p>
-              OSS contributors with GitHub accounts older than 12 months (or GitHub Pro members) can
-              use this to get free evaluation credits.
-            </p>
-
-            {muxGatewayIsLoggedIn ? (
-              <div className="mt-3 space-y-2">
-                <div className="border-border-medium bg-background-secondary rounded-md border p-2 text-xs">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="text-foreground font-medium">Xum Gateway account</div>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      onClick={() => {
-                        void refreshMuxGatewayAccountStatus();
-                      }}
-                      disabled={muxGatewayAccountLoading}
-                    >
-                      {muxGatewayAccountLoading ? "Refreshing..." : "Refresh"}
-                    </Button>
-                  </div>
-
-                  <div className="mt-2 space-y-1">
-                    <div className="flex items-center justify-between gap-4">
-                      <span className="text-content-secondary">Balance</span>
-                      <span className="text-foreground font-mono">
-                        {formatMuxGatewayBalance(muxGatewayAccountStatus?.remaining_microdollars)}
-                      </span>
-                    </div>
-
-                    <div className="flex items-center justify-between gap-4">
-                      <span className="text-content-secondary">Concurrent requests per user</span>
-                      <span className="text-foreground font-mono">
-                        {muxGatewayAccountStatus?.ai_gateway_concurrent_requests_per_user ?? "—"}
-                      </span>
-                    </div>
-                  </div>
-
-                  {muxGatewayAccountError && (
-                    <div className="text-destructive mt-2">{muxGatewayAccountError}</div>
-                  )}
-                </div>
-
-                {muxGatewayAccountStatus?.remaining_microdollars === 0 && (
-                  <div className="border-destructive/20 bg-destructive/5 mt-2 rounded-md border p-2 text-xs">
-                    <p className="text-destructive font-medium">
-                      Your Xum Gateway credits are depleted.
-                    </p>
-                    <p className="text-content-secondary mt-1">
-                      Gateway routing has been disabled. Configure another provider below, or visit{" "}
-                      <a
-                        href={MUX_GATEWAY_ORIGIN}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-accent-text underline"
-                      >
-                        {new URL(MUX_GATEWAY_ORIGIN).host}
-                      </a>{" "}
-                      to add credits.
-                    </p>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  <Button
-                    onClick={() => {
-                      void startMuxGatewayLogin();
-                    }}
-                    disabled={muxGatewayLoginInProgress}
-                  >
-                    {muxGatewayLoginButtonLabel}
-                  </Button>
-
-                  {muxGatewayLoginInProgress && (
-                    <Button variant="secondary" onClick={cancelMuxGatewayLogin}>
-                      Cancel
-                    </Button>
-                  )}
-                </div>
-
-                {muxGatewayLoginStatus === "waiting" && (
-                  <p className="mt-3">Finish the login flow in your browser, then return here.</p>
-                )}
-
-                {muxGatewayLoginStatus === "error" && muxGatewayLoginError && (
-                  <p className="mt-3">
-                    <strong className="text-destructive">Login failed:</strong>{" "}
-                    {muxGatewayLoginError}
-                  </p>
-                )}
-              </>
-            )}
-
-            <p className="mt-3">You can also receive those credits through:</p>
-
-            <ul className="ml-4 list-disc space-y-1">
-              <li>
-                early adopters can request credits tied to their GH logins on our{" "}
-                <a
-                  href="https://discord.gg/VfZXvtnR"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-accent-text underline"
-                >
-                  Discord
-                </a>
-              </li>
-              <li>
-                vouchers which you can{" "}
-                <a
-                  href={MUX_GATEWAY_ORIGIN}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-accent-text underline"
-                >
-                  claim here
-                </a>
-              </li>
-            </ul>
-
-            <p className="mt-3">
-              You can enable this in{" "}
-              <button
-                type="button"
-                className="text-accent-text underline"
-                onClick={() => openProvidersSettings()}
-              >
-                Settings → Providers
-              </button>
-              .
-            </p>
-          </>
-        ),
-      });
-    }
 
     nextSteps.push({
       key: "providers",
@@ -1041,55 +550,37 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
   }, [
     addProject,
     agentPickerShortcut,
-    cancelMuxGatewayLogin,
     commandPaletteActionsShortcut,
     commandPaletteShortcut,
     configuredProviders.length,
     configuredProvidersSummary,
     cycleAgentShortcut,
-    hasConfiguredProvidersAtStart,
-    muxGatewayAccountError,
-    muxGatewayAccountLoading,
-    muxGatewayAccountStatus,
-    muxGatewayIsLoggedIn,
-    muxGatewayLoginButtonLabel,
-    muxGatewayLoginError,
-    muxGatewayLoginInProgress,
-    muxGatewayLoginStatus,
     openProvidersSettings,
     projectFormHasError,
     userProjects.size,
     providersConfig,
-    refreshMuxGatewayAccountStatus,
-    startMuxGatewayLogin,
+    providersLoading,
     onboardingProviders,
   ]);
 
   // Clamp stepIndex to valid range when the step list changes. Skip while still
   // loading provider config — the temporary single-item "loading" array would
   // reset a restored stepIndex (e.g. after resuming from paused onboarding).
-  const isLoading = hasConfiguredProvidersAtStart === null;
   useEffect(() => {
-    if (isLoading) return;
+    if (providersLoading) return;
     setStepIndex((index) => Math.min(index, steps.length - 1));
-  }, [isLoading, steps.length]);
+  }, [providersLoading, steps.length]);
 
   const totalSteps = steps.length;
   const currentStep = steps[stepIndex] ?? steps[0];
-  const firstRunView = useFirstRunViewHandoff(isLoading);
-
-  useEffect(() => {
-    if (currentStep?.key !== "mux-gateway" && muxGatewayLoginInProgress) {
-      cancelMuxGatewayLogin();
-    }
-  }, [cancelMuxGatewayLogin, currentStep?.key, muxGatewayLoginInProgress]);
+  const firstRunView = useFirstRunViewHandoff(providersLoading);
 
   if (!currentStep || firstRunView.hideWhileLoading) {
     return null;
   }
 
-  const canGoBack = !isLoading && stepIndex > 0;
-  const canGoForward = !isLoading && stepIndex < totalSteps - 1;
+  const canGoBack = !providersLoading && stepIndex > 0;
+  const canGoForward = !providersLoading && stepIndex < totalSteps - 1;
 
   const goBack = () => {
     if (!canGoBack) {
@@ -1115,17 +606,14 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
   const isProjectStep = currentStep.key === "projects";
 
-  const primaryLabel = isLoading ? "Next" : canGoForward ? "Next" : "Done";
+  const primaryLabel = providersLoading ? "Next" : canGoForward ? "Next" : "Done";
   const primaryButtonLabel = isProjectStep && isProjectCreating ? "Adding..." : primaryLabel;
-  const primaryDisabled = isLoading || (isProjectStep && isProjectCreating);
+  const primaryDisabled = providersLoading || (isProjectStep && isProjectCreating);
 
   return (
     <SplashScreen
       title={currentStep.title}
-      onDismiss={() => {
-        cancelMuxGatewayLogin();
-        props.onDismiss();
-      }}
+      onDismiss={props.onDismiss}
       dismissLabel={null}
       skipEntryAnimation={firstRunView.skipDialogEntry}
       footerClassName="justify-between"

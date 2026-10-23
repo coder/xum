@@ -10,8 +10,6 @@ const PROVIDER_SECRET_KEYS = new Set([
   "bearerToken",
   "accessKeyId",
   "secretAccessKey",
-  "couponCode",
-  "voucher",
   "codexOauth",
 ]);
 

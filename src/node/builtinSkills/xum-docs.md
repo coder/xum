@@ -53,7 +53,6 @@ Use this index to find a page's:
       - Models (`/config/models`) → `references/docs/config/models.mdx`: Select and configure AI models in Xum
       - Providers (`/config/providers`) → `references/docs/config/providers.mdx`: Configure API keys and settings for AI providers
     - Why Parallelize? (`/getting-started/why-parallelize`) → `references/docs/getting-started/why-parallelize.mdx`: Use cases for running multiple AI agents in parallel
-    - Xum Gateway (`/getting-started/mux-gateway`) → `references/docs/getting-started/mux-gateway.mdx`: Log in to Xum Gateway to get evaluation credits
     - CLI (`/reference/cli`) → `references/docs/reference/cli.mdx`: Run one-off agent tasks and durable workflows from the command line
   - **Workspaces**
     - Workspaces (`/workspaces`) → `references/docs/workspaces/index.mdx`: Isolated development environments for parallel agent work

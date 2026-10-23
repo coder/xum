@@ -55,7 +55,7 @@ const BranchSchema = repairOnLoad(nonBlankString(), trimmedNonBlank);
 
 function repairModelString(value: unknown): string | undefined {
   const model = trimmedNonBlank(value);
-  if (!model || (model.startsWith("mux-gateway:") && !model.includes("/"))) return undefined;
+  if (!model) return undefined;
   const normalized = normalizeSelectedModel(model);
   return isValidModelFormat(normalized) ? normalized : undefined;
 }

@@ -88,8 +88,9 @@ export const formatSendMessageError = (
     case "provider_not_supported": {
       const displayName = getProviderDisplayName(error.provider);
       return {
-        message: `Provider "${displayName}" is not supported.`,
-        errorType: "unknown",
+        message: `Provider "${displayName}" is not supported. Select a different model.`,
+        // A non-retryable type: an unknown provider fails the same way on every retry.
+        errorType: "model_not_found",
       };
     }
     case "model_not_available": {

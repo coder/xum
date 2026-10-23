@@ -3,8 +3,8 @@
  *
  * Usage: LOOP_TESTS_OUT=<file.json> bun test --preload ./scripts/perf/loopTests.preload.ts <test>
  *
- * It replaces the fs and fs/promises functions, the FileHandle methods, setTimeout (global and
- * timers/promises) and Bun.sleep with the timing wrappers of loopTestTiming.ts. In Bun 1.4.3 a
+ * It replaces the fs and fs/promises functions, the FileHandle and Dir methods, setTimeout (global
+ * and timers/promises), setInterval and Bun.sleep with the timing wrappers of loopTestTiming.ts. In Bun 1.4.3 a
  * new value on require("fs/promises") also reaches
  * `import { readFile } from "fs/promises"` in test and product code, so no product file changes.
  * After all tests it writes { fsMs, timerMs, usesTempDir } to $LOOP_TESTS_OUT. The runner times the
@@ -22,6 +22,7 @@ import {
   isTimedFsName,
   timed,
   timedDelay,
+  timedInterval,
   timedTimeout,
   unionMs,
 } from "./loopTestTiming";
@@ -88,6 +89,18 @@ for (const name of FILE_HANDLE_METHODS) {
   fileHandle[name] = timed(method as Fn, recordFs, now);
 }
 
+// Dir methods: opendir() returns a Dir, and `for await (const entry of dir)` calls dir.read(). In
+// Bun 1.4.3 fs.opendir, fs.opendirSync and fs/promises opendir return one Dir class.
+const DIR_METHODS = ["close", "closeSync", "read", "readSync"];
+const dir = (fsModule.opendirSync as (file: string) => object)(tmpDir);
+const dirPrototype = Object.getPrototypeOf(dir) as Record<string, unknown>;
+(dir as { closeSync(): void }).closeSync();
+for (const name of DIR_METHODS) {
+  const method = dirPrototype[name];
+  assert(typeof method === "function", `Dir.${name} is not a function`);
+  dirPrototype[name] = timed(method as Fn, recordFs, now);
+}
+
 for (const mod of [fsModule, fsPromises]) {
   for (const [name, value] of Object.entries(mod)) {
     if (!isTimedFsName(name, value)) continue;
@@ -95,6 +108,7 @@ for (const mod of [fsModule, fsPromises]) {
   }
 }
 globalThis.setTimeout = timedTimeout(globalThis.setTimeout, recordTimer, now);
+globalThis.setInterval = timedInterval(globalThis.setInterval, recordTimer, now);
 // `import { setTimeout } from "timers/promises"` reads this export too.
 const timersPromises = require("timers/promises") as Record<string, unknown>;
 timersPromises.setTimeout = timedDelay(timersPromises.setTimeout as Fn, recordTimer, now);
