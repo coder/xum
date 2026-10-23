@@ -57,7 +57,6 @@ import {
   CODER_OAUTH_SERVER_CALLBACK_PATH,
   CODER_OAUTH_SERVER_START_PATH,
 } from "@/common/constants/coderOAuth";
-import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { assert } from "@/common/utils/assert";
 import {
   FIRST_RUN_EARLY_SCRIPT,
@@ -788,7 +787,6 @@ function buildPublicAbsoluteUrl(
 }
 
 const OAUTH_CALLBACK_ORIGIN_BYPASS_PATHS = new Set<string>([
-  "/auth/mux-gateway/callback",
   "/auth/mcp-oauth/callback",
   CODER_OAUTH_SERVER_CALLBACK_PATH,
 ]);
@@ -1328,29 +1326,18 @@ export async function createOrpcServer({
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark light" />
-    <meta name="theme-color" content="#0e0e0e" />
     <title>${title}</title>
-    <link rel="stylesheet" href="${MUX_GATEWAY_ORIGIN}/static/css/site.css" />
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 600px; margin: 4rem auto; padding: 1rem; }
+      h1 { margin-bottom: 1rem; }
+      .muted { opacity: 0.7; }
+    </style>
   </head>
   <body>
-    <div class="page">
-      <header class="site-header">
-        <div class="container">
-          <div class="header-title">xum</div>
-        </div>
-      </header>
-
-      <main class="site-main">
-        <div class="container">
-          <div class="content-surface">
-            <h1>${title}</h1>
-            <p>${description}</p>
-            ${input.result.success ? '<p class="muted">This tab should close automatically.</p>' : ""}
-            <p><a class="btn primary" href="${returnPathHref}">Return to Xum</a></p>
-          </div>
-        </div>
-      </main>
-    </div>
+    <h1>${title}</h1>
+    <p>${description}</p>
+    ${input.result.success ? '<p class="muted">This tab should close automatically.</p>' : ""}
+    <p><a href="${returnPathHref}">Return to Xum</a></p>
 
     <script>
       (() => {
@@ -1407,46 +1394,6 @@ export async function createOrpcServer({
     res.setHeader("Content-Type", "text/html");
     res.send(html);
   }
-
-  // --- Xum Gateway OAuth (unauthenticated bootstrap routes) ---
-  // These are raw Express routes (not oRPC) because the OAuth provider cannot
-  // send a mux Bearer token during the redirect callback.
-  app.get("/auth/mux-gateway/start", async (req, res) => {
-    if (!(await isHttpRequestAuthenticated(req))) {
-      res.status(401).json({ error: "Invalid or missing auth token/session" });
-      return;
-    }
-
-    const redirectUri = buildPublicAbsoluteUrl(req, "/auth/mux-gateway/callback", allowHttpOrigin);
-    if (!redirectUri) {
-      res.status(400).json({ error: "Missing or invalid Host header" });
-      return;
-    }
-    const { authorizeUrl, state } = context.muxGatewayOauthService.startServerFlow({ redirectUri });
-    res.json({ authorizeUrl, state });
-  });
-
-  app.all("/auth/mux-gateway/callback", async (req, res) => {
-    // Some providers use 307/308 redirects that preserve POST, or response_mode=form_post.
-    if (req.method !== "GET" && req.method !== "POST") {
-      res.sendStatus(405);
-      return;
-    }
-
-    const state = getStringParamFromQueryOrBody(req, "state");
-    const code = getStringParamFromQueryOrBody(req, "code");
-    const error = getStringParamFromQueryOrBody(req, "error");
-    const errorDescription = getStringParamFromQueryOrBody(req, "error_description") ?? undefined;
-
-    const result = await context.muxGatewayOauthService.handleServerCallbackAndExchange({
-      state,
-      code,
-      error,
-      errorDescription,
-    });
-
-    sendOAuthCallbackPage(req, res, { type: "mux-gateway-oauth", state, result });
-  });
 
   // --- MCP OAuth (unauthenticated redirect callback) ---
   // The OAuth provider cannot attach a mux Bearer token during redirects.

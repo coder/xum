@@ -879,7 +879,7 @@ describe("thinking preservation by model", () => {
     ["claude-3.7-sonnet", true],
     // A version that does not parse cleanly is an unknown model, which keeps its thinking.
     ["claude-opus-4.x", false],
-    ["mux-gateway:anthropic/claude-sonnet-4-6", false],
+    ["coder:anthropic/claude-sonnet-4-6", false],
     ["claude-haiku-5-5", false],
     ["claude-opus-5-5", false],
     ["claude-fable-5-1", false],
@@ -968,10 +968,10 @@ describe("thinking preservation by model", () => {
         fingerprintAnthropicRequest(prompt([]), { modelId }),
         fingerprintAnthropicRequest(next, { modelId })
       );
-    expect(compareFor("mux-gateway:anthropic/claude-haiku-4-5")).toMatchObject({
+    expect(compareFor("coder:anthropic/claude-haiku-4-5")).toMatchObject({
       kind: "break",
       previous: { type: "reasoning" },
     });
-    expect(compareFor("mux-gateway:anthropic/claude-haiku-5-5").kind).toBe("extends");
+    expect(compareFor("coder:anthropic/claude-haiku-5-5").kind).toBe("extends");
   });
 });

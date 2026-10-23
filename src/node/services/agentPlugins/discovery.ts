@@ -55,8 +55,9 @@ import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
  * one broken plugin never affects sibling plugins, and one broken component
  * (skills/ or mcp.json) never affects the plugin's other component.
  *
- * Local host filesystem only (v1): plugin containers are host paths, so
- * discovery uses node:fs directly rather than a Runtime.
+ * Discovery reads through a PluginFs, not a Runtime: the host filesystem
+ * (nodePluginFs) by default, or a remote checkout's listing held in memory
+ * (discoverAgentPluginsIn, #6426).
  */
 
 export type AgentPluginScope = "project" | "global";
@@ -174,8 +175,9 @@ function pluginFs(): PluginFs {
 
 /**
  * discoverAgentPlugins on another filesystem (#6426): every read of the discovery goes through
- * `fs`, whose paths are POSIX paths (POSIX hosts only). The exported readers (readPluginFileWithinRootCapped, ensurePluginPathContained) stay
- * host readers outside such a run; a caller reads a non-host plugin's files with `fs` itself.
+ * `fs`, whose paths are POSIX paths (POSIX hosts only). The exported readers
+ * (readPluginFileWithinRootCapped, ensurePluginPathContained) stay host readers outside such a
+ * run; a caller reads a non-host plugin's files with `fs` itself.
  */
 export async function discoverAgentPluginsIn(
   fs: PluginFs,

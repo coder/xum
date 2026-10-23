@@ -150,7 +150,7 @@ describe("StreamManager - refusal usage attribution", () => {
 
   test("refused attempt entries persist the attribution key, not the raw gateway identity", async () => {
     // Sidecar refused_stream rows are keyed by recordHeadlessUsageLocked's
-    // canonical model; a raw mux-gateway identity on committed hop rows would
+    // canonical model; a raw gateway identity on committed hop rows would
     // split one model across two analytics buckets in the refusal queries.
     const usage = createUsageRecorder();
     const streamManager = createStreamManagerForTests(historyService, {
@@ -166,7 +166,7 @@ describe("StreamManager - refusal usage attribution", () => {
 
     const { completion } = await runTurnForTests(streamManager, {
       workspaceId: "ws-gateway-hop",
-      modelString: "mux-gateway:anthropic/claude-opus-4-5",
+      modelString: "openrouter:anthropic/claude-opus-4-5",
       modelFallback: unstartableFallback(),
     });
     expect(completion.status).toBe("failed");
@@ -306,7 +306,7 @@ describe("StreamManager - refusal usage attribution", () => {
     // key that diverges from the backend's ledger.
     ["coder:openai/claude-opus-4-5", "coder:openai/claude-opus-4-5"],
     // Non-Coder gateway strings still canonicalize for display.
-    ["mux-gateway:anthropic/claude-opus-4-5", "anthropic:claude-opus-4-5"],
+    ["openrouter:anthropic/claude-opus-4-5", "anthropic:claude-opus-4-5"],
   ])("message metadata for %s records model %s", async (modelString, expectedModel) => {
     const workspaceId = `ws-metadata-${expectedModel.replace(/[^a-z0-9]/gi, "-")}`;
     const streamManager = createStreamManagerForTests(historyService, {

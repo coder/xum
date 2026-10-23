@@ -34,6 +34,7 @@ import { useAPI, type APIClient, useLiveAPI } from "@/browser/contexts/API";
 import { CONNECTION_LOST_MESSAGE } from "@/browser/contexts/connectionLink";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
+import { hasOpenAIApiKey } from "@/common/utils/providers/codexOauthRouting";
 import {
   useAdditionalSystemContextHydrated,
   useAdditionalSystemContextSnapshot,
@@ -687,10 +688,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Track transcription provider prerequisites from Settings → Providers.
   const [openAIKeySet, setOpenAIKeySet] = useState(false);
   const [openAIProviderEnabled, setOpenAIProviderEnabled] = useState(true);
-  const [muxGatewayCouponSet, setMuxGatewayCouponSet] = useState(false);
-  const [muxGatewayEnabled, setMuxGatewayEnabled] = useState(true);
-  const isTranscriptionAvailable =
-    (openAIProviderEnabled && openAIKeySet) || (muxGatewayEnabled && muxGatewayCouponSet);
+  const isTranscriptionAvailable = openAIProviderEnabled && openAIKeySet;
 
   // Voice input - appends transcribed text to input
   const voiceInput = useVoiceInput({
@@ -710,7 +708,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   });
 
   const voiceInputUnavailableMessage =
-    "Voice input requires a Xum Gateway login or an OpenAI API key. Configure in Settings → Providers.";
+    "Voice input requires an enabled OpenAI provider with an API key. Configure in Settings → Providers.";
 
   // Start creation tutorial when entering creation mode
   useEffect(() => {
@@ -1574,10 +1572,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         async () => {
           const config = await api.providers.getConfig();
           if (!signal.aborted) {
-            setOpenAIKeySet(config?.openai?.apiKeySet ?? false);
+            // VoiceService resolves keys from config, key files and env vars alike. Codex OAuth
+            // alone cannot transcribe, so isConfigured is not enough.
+            setOpenAIKeySet(hasOpenAIApiKey(config?.openai));
             setOpenAIProviderEnabled(config?.openai?.isEnabled ?? true);
-            setMuxGatewayCouponSet(config?.["mux-gateway"]?.couponCodeSet ?? false);
-            setMuxGatewayEnabled(config?.["mux-gateway"]?.isEnabled ?? true);
           }
         },
         () => {
