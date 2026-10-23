@@ -18,6 +18,7 @@ import type { AvailableRoute } from "@/common/routing";
 import { getModelStatsResolved, type ModelStats } from "@/common/utils/tokens/modelStats";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import {
   getAvailableThinkingLevels,
   getThinkingPolicyForModel,
@@ -265,6 +266,9 @@ export function ModelRow(props: ModelRowProps) {
   // with no selector. The dropdown lists the model's full capability so users can pick any
   // floor, including off/low.
   const thinkingCapability = getThinkingPolicyForModel(props.fullId, providersConfig);
+  // Label xhigh/max from the mapped target the ladder comes from, as the chat's thinking
+  // selector does: the raw alias id would label both "xhigh" on a native-max target.
+  const thinkingLabelModel = resolveModelForMetadata(props.fullId, providersConfig);
   const supportsMinThinking =
     hasExplicitThinkingPolicy(props.fullId, providersConfig) && thinkingCapability.length > 1;
   // The selected value is the effective floor shown as a plain level (no "Default" wording).
@@ -473,7 +477,7 @@ export function ModelRow(props: ModelRowProps) {
             <SelectContent>
               {thinkingCapability.map((level) => (
                 <SelectItem key={level} value={level}>
-                  {getThinkingOptionLabel(level, props.fullId)}
+                  {getThinkingOptionLabel(level, thinkingLabelModel)}
                 </SelectItem>
               ))}
             </SelectContent>
