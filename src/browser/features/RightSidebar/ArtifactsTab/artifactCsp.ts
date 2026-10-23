@@ -9,12 +9,12 @@
  * directives exact; the escape-attempt stories and unit tests pin them. CSP cannot stop
  * WebRTC (STUN/TURN), so the bridge script deletes the RTC globals (artifactBridge.ts).
  *
- * Known residual risk (documented in the setting text): with CDN scripts allowed, a hostile
+ * Known residual risk (documented in the setting text): with CDN assets allowed, a hostile
  * artifact can encode data into the request path of an allowlisted CDN URL. Turning the
- * "Allow CDN scripts in artifacts" setting off drops every CDN host, Google Fonts included.
+ * "Allow CDN assets in artifacts" setting off drops every CDN host, Google Fonts included.
  */
 
-/** Script hosts allowed when the user keeps "Allow CDN scripts in artifacts" on. */
+/** Script hosts allowed when the user keeps "Allow CDN assets in artifacts" on. */
 export const ARTIFACT_CDN_SCRIPT_SOURCES = [
   "https://cdnjs.cloudflare.com",
   "https://unpkg.com",
@@ -23,8 +23,17 @@ export const ARTIFACT_CDN_SCRIPT_SOURCES = [
   "https://cdn.jsdelivr.net/npm/",
 ] as const;
 
-export const ARTIFACT_CDN_STYLE_SOURCES = ["https://fonts.googleapis.com"] as const;
-export const ARTIFACT_CDN_FONT_SOURCES = ["https://fonts.gstatic.com"] as const;
+// Styles and fonts may also come from the script CDNs (e.g. highlight.js themes, KaTeX and its
+// fonts on jsDelivr). This adds no new leak: a script from the same hosts can already send the
+// same request paths, and do more than a stylesheet can.
+export const ARTIFACT_CDN_STYLE_SOURCES = [
+  ...ARTIFACT_CDN_SCRIPT_SOURCES,
+  "https://fonts.googleapis.com",
+] as const;
+export const ARTIFACT_CDN_FONT_SOURCES = [
+  ...ARTIFACT_CDN_SCRIPT_SOURCES,
+  "https://fonts.gstatic.com",
+] as const;
 
 export interface ArtifactCspOptions {
   allowCdn: boolean;
