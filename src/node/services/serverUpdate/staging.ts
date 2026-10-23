@@ -6,6 +6,7 @@ import {
   SERVER_UPDATE_CLI_INTERPRETER,
   SERVER_UPDATE_CLI_SHEBANG,
   SERVER_UPDATE_INSTALL_TIMEOUT_MS,
+  SERVER_UPDATE_LOCKFILES,
   SERVER_UPDATE_SMOKE_TIMEOUT_MS,
   SERVER_UPDATE_STAGE_MARKER,
   SERVER_UPDATE_STAGING_PREFIX,
@@ -18,46 +19,74 @@ import {
 } from "./installLayout";
 import { verifyStagedDependencies } from "./lockfile";
 import { downloadArtifact, fetchArtifact, type RegistryRequest } from "./registry";
+import { nestShrinkwrap, pinnedDigests, shrinkwrapSchema, type Shrinkwrap } from "./shrinkwrap";
 
-/** Installs an already verified local tarball; only its dependencies come from the registry. */
-export function installCommand(
-  layout: InstallLayout,
-  tarball: string
-): { file: string; args: string[] } {
+/**
+ * Installs the stage's package.json and npm package-lock.json, which hold the already verified
+ * local tarball and the tree its shrinkwrap pins: npm installs that lockfile as written, bun
+ * migrates it to bun.lock, and pnpm imports it into pnpm-lock.yaml before installing. Only the
+ * pinned dependencies come from the registry.
+ */
+export function installCommands(layout: InstallLayout): Array<{ file: string; args: string[] }> {
   // CLI flags outrank npmrc files and npm_config_* env, so an inherited strict-ssl=false cannot
-  // disable certificate validation for the download, an inherited package-lock=false or
-  // lockfile=false cannot suppress the lockfile that dependency verification reads, and an
-  // inherited omit of the optional platform packages loses to npm's include and pnpm's
-  // optional=true. bun has no such flags; its TLS and lockfile knobs are env variables runInstall
-  // strips, while a global bunfig that disables lockfile saving still fails closed at
+  // disable certificate validation for the download, an inherited lockfile=false cannot
+  // suppress the pnpm lockfile that dependency verification reads (`npm ci` always uses the
+  // lockfile), and an inherited omit of the optional platform packages loses to npm's include and
+  // pnpm's optional=true. bun has no such flags; its TLS and lockfile knobs are env variables
+  // runInstall strips, while a global bunfig that disables lockfile saving still fails closed at
   // verification and one that disables optional dependencies has no override. The text lockfile
-  // is required, so an older bun that only writes bun.lockb must fail here.
-  const flags = {
-    bun: ["add", "--ignore-scripts", "--save-text-lockfile"],
+  // is required, so an older bun that only writes bun.lockb must fail here. `pnpm import` accepts
+  // neither `--registry` nor `--ignore-scripts`; it runs no scripts.
+  const registry = ["--registry", layout.registry];
+  const commands = {
+    bun: [
+      ["install", "--frozen-lockfile", "--ignore-scripts", "--save-text-lockfile", ...registry],
+    ],
     npm: [
-      "install",
-      "--no-global",
-      "--no-audit",
-      "--no-fund",
-      "--omit=dev",
-      "--ignore-scripts",
-      "--strict-ssl",
-      "--package-lock=true",
-      "--include=optional",
+      [
+        "ci",
+        "--no-global",
+        "--no-audit",
+        "--no-fund",
+        "--omit=dev",
+        "--ignore-scripts",
+        "--strict-ssl",
+        "--include=optional",
+        ...registry,
+      ],
     ],
     pnpm: [
-      "add",
-      "--no-global",
-      "--ignore-scripts",
-      "--config.strict-ssl=true",
-      "--config.lockfile=true",
-      "--config.optional=true",
+      [
+        "import",
+        `--config.registry=${layout.registry}`,
+        "--config.strict-ssl=true",
+        "--config.lockfile=true",
+      ],
+      [
+        "install",
+        "--no-global",
+        "--frozen-lockfile",
+        "--ignore-scripts",
+        "--config.strict-ssl=true",
+        "--config.lockfile=true",
+        "--config.optional=true",
+        ...registry,
+      ],
     ],
-  } satisfies Record<InstallLayout["packageManager"], string[]>;
-  return {
-    file: layout.packageManager,
-    args: [...flags[layout.packageManager], tarball, "--registry", layout.registry],
-  };
+  } satisfies Record<InstallLayout["packageManager"], string[][]>;
+  return commands[layout.packageManager].map((args) => ({ file: layout.packageManager, args }));
+}
+
+/** Reads the shrinkwrap that a release tarball ships next to its package.json. */
+async function readShrinkwrap(tarball: string, signal?: AbortSignal): Promise<Shrinkwrap> {
+  // GNU tar also takes options from TAR_OPTIONS, which could name a decompression program.
+  using tar = execFileAsync("tar", ["-xzOf", tarball, "package/npm-shrinkwrap.json"], {
+    env: { TAR_OPTIONS: undefined },
+    timeoutMs: SERVER_UPDATE_INSTALL_TIMEOUT_MS,
+    signal,
+  });
+  const { stdout } = await tar.result;
+  return shrinkwrapSchema.parse(JSON.parse(stdout));
 }
 
 export async function verifyStagedPackage(
@@ -164,18 +193,44 @@ export async function stageUpdate(
     path.join(dir, SERVER_UPDATE_STAGE_MARKER),
     JSON.stringify({ launcher: layout.launcher })
   );
-  await fs.writeFile(path.join(dir, "package.json"), JSON.stringify({ private: true }));
-  // Package managers follow redirects, so the release itself is fetched and digest-checked here;
-  // the dependency tree the manager resolves is anchored to the registry afterwards.
+  // An absolute path: bun records a relative one without the prefix that marks it as local.
   const tarball = path.join(dir, `xum-${version}.tgz`);
+  const dependencies = { "@coder/xum": `file:${tarball}` };
+  await fs.writeFile(
+    path.join(dir, "package.json"),
+    JSON.stringify({ private: true, dependencies })
+  );
+  // Package managers follow redirects, so the release itself is fetched and digest-checked here.
   await downloadArtifact(
     await fetchArtifact(layout.registry, version, request, signal),
     tarball,
     request,
     signal
   );
-  const command = installCommand(layout, tarball);
-  await install(command.file, command.args, dir, signal);
-  await verifyStagedDependencies(layout, dir, request, signal);
+  // No manager honors the shrinkwrap inside a tarball file, so each would resolve every dependency
+  // afresh; the stage's lockfile carries the release's pinned tree instead, and the staged tree is
+  // then held to those pins and anchored to the registry. A dependency the shrinkwrap lacks fails
+  // npm and pnpm but is left out by bun; the publish workflow refuses such a shrinkwrap.
+  const shrinkwrap = await readShrinkwrap(tarball, signal);
+  const pins = pinnedDigests(shrinkwrap);
+  const seed = path.join(dir, SERVER_UPDATE_LOCKFILES.npm);
+  await fs.writeFile(
+    seed,
+    JSON.stringify({
+      lockfileVersion: 3,
+      requires: true,
+      packages: {
+        "": { dependencies },
+        ...nestShrinkwrap(shrinkwrap, "@coder/xum", `file:${tarball}`),
+      },
+    })
+  );
+  for (const command of installCommands(layout)) {
+    await install(command.file, command.args, dir, signal);
+  }
+  // bun and pnpm keep the npm lockfile they converted, and a second lockfile would make the
+  // next update's layout ambiguous.
+  if (layout.packageManager !== "npm") await fs.rm(seed);
+  await verifyStagedDependencies(layout, dir, pins, request, signal);
   return verifyStagedPackage(dir, version, signal);
 }
