@@ -1305,7 +1305,6 @@
               "src/node/services/historyAppendProvenance.ts": ["@/node/utils/fs", "@/node/utils/writeFileAtomic", "fs", "fs/promises"],
               "src/node/services/historyReplacementRows.ts": ["fs/promises"],
               "src/node/services/historyScanner.ts": ["fs/promises"],
-              "src/node/services/historyService.ts": ["@/node/utils/fs", "@/node/utils/writeFileAtomic", "fs", "fs/promises"],
               "src/node/services/sendIds.ts": ["fs/promises"]
             }
           }

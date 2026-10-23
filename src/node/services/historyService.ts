@@ -51,9 +51,8 @@ import { isManualHistoryReset } from "@/common/utils/messages/contextWindows";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
-import { fsyncSync, renameSync, rmdirSync, rmSync, unlinkSync, writeSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
-import * as fs from "fs/promises";
+import type * as fs from "fs/promises";
 import type {
   CompactionPendingHistory,
   CompactionPendingHistoryView,
@@ -71,7 +70,6 @@ import {
   type CompactionReplacementOperation,
   type CompactionReplacementOutcome,
 } from "./compactionCancellation";
-import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import assert from "node:assert";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { Result } from "@/common/types/result";
@@ -85,7 +83,9 @@ import {
 import type { WorkspaceSessionLocator } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { TaskService } from "@/node/services/taskService";
-import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { unlockedHistoryScans } from "./unlockedHistoryScans";
@@ -702,7 +702,7 @@ export class HistoryService {
           // Either artifact counts as retained history (mirrors hasHistory): an archive-only
           // session is a recoverable state the scanner already reads.
           const isFile = (file: string) =>
-            fs.stat(file).then(
+            this.files.promises.stat(file).then(
               (stat) => stat.isFile(),
               (error: NodeJS.ErrnoException) => {
                 if (error.code !== "ENOENT") throw error;
@@ -718,7 +718,7 @@ export class HistoryService {
         // must instead fail closed while a truncate transaction is unresolved.
         const assertNoTruncate = async () => {
           for (const marker of this.getTruncateMarkerPaths(workspaceId)) {
-            const exists = await fs.stat(marker).then(
+            const exists = await this.files.promises.stat(marker).then(
               () => true,
               (error: NodeJS.ErrnoException) => {
                 if (error.code !== "ENOENT") throw error;
@@ -774,9 +774,11 @@ export class HistoryService {
         if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return null;
         for (const marker of this.getTruncateMarkerPaths(workspaceId)) {
           // Any error but ENOENT rethrows, which also yields null below.
-          const marked = await fs.stat(marker).catch((error: NodeJS.ErrnoException) => {
-            if (error.code !== "ENOENT") throw error;
-          });
+          const marked = await this.files.promises
+            .stat(marker)
+            .catch((error: NodeJS.ErrnoException) => {
+              if (error.code !== "ENOENT") throw error;
+            });
           if (marked) return null;
         }
         const provenance = this.getAppendProvenance(workspaceId);
@@ -863,9 +865,12 @@ export class HistoryService {
   // This prevents deadlocks when operations compose while touching the same workspace files.
   private readonly fileLocks = workspaceFileLocks;
   private readonly config: HistorySessionLocation;
+  /** Every host file call of this class goes through here (node:fs in the app). */
+  readonly files: SessionFiles;
 
-  constructor(config: HistorySessionLocation) {
+  constructor(config: HistorySessionLocation, files: SessionFiles = nodeSessionFiles) {
     this.config = config;
+    this.files = files;
   }
 
   private readonly emptyErroredReplyDeletedListeners = new Set<
@@ -903,7 +908,7 @@ export class HistoryService {
           this.withHistoryWriteFileLock(workspaceId, async () => {
             if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
               throw new Error(`workspace ${workspaceId} was removed; refusing journal mutation`);
-            await ensurePrivateDir(this.getSessionDir(workspaceId));
+            await this.files.ensurePrivateDir(this.getSessionDir(workspaceId));
             return operation();
           })
       );
@@ -1011,7 +1016,7 @@ export class HistoryService {
       publishBoundary: async (input, onCommitted) => {
         // The public partial reader treats errors as absence. Admission must refuse
         // unreadable state, and cannot re-enter the history reader's lazy rotation.
-        const raw = await fs
+        const raw = await this.files.promises
           .readFile(this.getPartialPath(workspaceId), "utf8")
           .catch((error: unknown) => {
             if (isErrnoWithCode(error, "ENOENT")) return undefined;
@@ -1058,12 +1063,12 @@ export class HistoryService {
           throw new Error(`workspace ${workspaceId} was removed; refusing compaction mutation`);
         const sessionDir = this.getSessionDir(workspaceId);
         await assertStillOwned();
-        await ensurePrivateDir(sessionDir);
+        await this.files.ensurePrivateDir(sessionDir);
         const result = await operation(sessionDir, assertStillOwned);
         // The receipt tracks visible bytes; success clears debt only after directory sync.
         // Match append provenance's platform policy: Windows cannot sync directory handles.
         if (process.platform !== "win32") {
-          const directory = await fs.open(sessionDir, "r");
+          const directory = await this.files.promises.open(sessionDir, "r");
           try {
             await directory.sync();
           } finally {
@@ -1112,7 +1117,7 @@ export class HistoryService {
           // deletion, so a displaced Stop cannot erase a valid successor's partial.
           await assertStillOwned();
           if (!isCurrent()) return false;
-          rmSync(partialPath, { force: true });
+          this.files.rmSync(partialPath, { force: true });
         } else {
           const cleared = clearFollowUp(partial);
           if (
@@ -1195,7 +1200,7 @@ export class HistoryService {
       if (!isCurrent()) return false;
       // A foreign partial may arrive after workspace preflight; it must not restore the
       // deleted transcript on downgrade. Full deletion also authorizes malformed bytes.
-      rmSync(this.getPartialPath(workspaceId), { force: true });
+      this.files.rmSync(this.getPartialPath(workspaceId), { force: true });
       await this.rewriteHistoryFilesUnlocked(workspaceId, null, null, {
         isCurrent,
         assertStillOwned,
@@ -1370,7 +1375,7 @@ export class HistoryService {
 
   private async readTranscriptPartial(partialPath: string): Promise<MuxMessage | null> {
     try {
-      const raw = await fs.readFile(partialPath, "utf-8");
+      const raw = await this.files.promises.readFile(partialPath, "utf-8");
       return this.normalizeTranscriptMessage(JSON.parse(raw) as unknown);
     } catch (error: unknown) {
       if (isErrnoWithCode(error, "ENOENT")) return null;
@@ -1421,7 +1426,7 @@ export class HistoryService {
     const sessionsDir = path.join(this.config.rootDir, "sessions");
     let dirents: Array<{ name: string; isDirectory: () => boolean }>;
     try {
-      dirents = await fs.readdir(sessionsDir, { withFileTypes: true });
+      dirents = await this.files.promises.readdir(sessionsDir, { withFileTypes: true });
     } catch (error: unknown) {
       if (isErrnoWithCode(error, "ENOENT")) return null;
       throw error;
@@ -1459,7 +1464,7 @@ export class HistoryService {
 
   private async readExistingFileBytes(filePath: string): Promise<Buffer | null> {
     try {
-      return await fs.readFile(filePath);
+      return await this.files.promises.readFile(filePath);
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return null;
@@ -1531,7 +1536,7 @@ export class HistoryService {
   ): Promise<boolean> {
     const archivePath = this.getChatArchivePath(workspaceId);
     const archiveTombstonePath = `${archivePath}.truncate`;
-    const tombstoneExists = await fs.stat(archiveTombstonePath).then(
+    const tombstoneExists = await this.files.promises.stat(archiveTombstonePath).then(
       () => true,
       (error: unknown) => {
         if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
@@ -1549,9 +1554,9 @@ export class HistoryService {
       const archiveExists = (await this.readExistingFileBytes(archivePath)) !== null;
       if (assertStillOwned) await assertStillOwned();
       if (archiveExists) {
-        await fs.rm(archiveTombstonePath);
+        await this.files.promises.rm(archiveTombstonePath);
       } else {
-        await fs.rename(archiveTombstonePath, archivePath);
+        await this.files.promises.rename(archiveTombstonePath, archivePath);
       }
       return false;
     }
@@ -1559,7 +1564,7 @@ export class HistoryService {
     const marker = this.parseTruncateTransaction(markerContents);
     if (!tombstoneExists) {
       if (assertStillOwned) await assertStillOwned();
-      await fs.rm(markerPath, { force: true });
+      await this.files.promises.rm(markerPath, { force: true });
       if (marker === null) {
         return false;
       }
@@ -1595,19 +1600,19 @@ export class HistoryService {
         );
       if (committed) {
         if (assertStillOwned) await assertStillOwned();
-        await fs.rm(archiveTombstonePath);
+        await this.files.promises.rm(archiveTombstonePath);
         if (assertStillOwned) await assertStillOwned();
-        await fs.rm(markerPath, { force: true });
+        await this.files.promises.rm(markerPath, { force: true });
         return true;
       }
     }
 
     if (assertStillOwned) await assertStillOwned();
-    await fs.rm(archivePath, { force: true });
+    await this.files.promises.rm(archivePath, { force: true });
     if (assertStillOwned) await assertStillOwned();
-    await fs.rename(archiveTombstonePath, archivePath);
+    await this.files.promises.rename(archiveTombstonePath, archivePath);
     if (assertStillOwned) await assertStillOwned();
-    await fs.rm(markerPath, { force: true });
+    await this.files.promises.rm(markerPath, { force: true });
     return false;
   }
 
@@ -1618,7 +1623,7 @@ export class HistoryService {
    */
   private async truncateRecoveryArtifactsPresent(workspaceId: string): Promise<boolean> {
     const exists = (p: string) =>
-      fs.stat(p).then(
+      this.files.promises.stat(p).then(
         () => true,
         (error: unknown) => {
           if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
@@ -1703,7 +1708,7 @@ export class HistoryService {
     // the transaction ends.
     await unlockedHistoryScans.waitForClose(this.getChatHistoryPath(workspaceId));
     await unlockedHistoryScans.waitForClose(archivePath);
-    const archiveExists = await fs.stat(archivePath).then(
+    const archiveExists = await this.files.promises.stat(archivePath).then(
       () => true,
       (error: unknown) => {
         if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
@@ -1721,12 +1726,12 @@ export class HistoryService {
           );
           await publication.assertStillOwned();
           if (!publication.isCurrent()) throw new Error("History publication no longer owned");
-          rmSync(this.getChatHistoryPath(workspaceId), { force: true });
-          if (directory) fsyncSync(directory.fd);
+          this.files.rmSync(this.getChatHistoryPath(workspaceId), { force: true });
+          if (directory) this.files.fsyncSync(directory.fd);
           publication.onCommitted();
           return;
         }
-        await fs.rm(this.getChatHistoryPath(workspaceId), { force: true });
+        await this.files.promises.rm(this.getChatHistoryPath(workspaceId), { force: true });
       } else {
         await this.publishHistoryUnderWriteLock(
           this.getChatHistoryPath(workspaceId),
@@ -1765,22 +1770,22 @@ export class HistoryService {
         publication
       );
     }
-    await writeFileAtomic(markerPath, markerContents);
+    await this.files.writeFileAtomic(markerPath, markerContents);
     try {
-      await fs.rename(archivePath, archiveTombstonePath);
+      await this.files.promises.rename(archivePath, archiveTombstonePath);
     } catch (error) {
-      await fs.rm(markerPath, { force: true });
+      await this.files.promises.rm(markerPath, { force: true });
       throw error;
     }
 
     try {
       if (finalArchiveContents !== null) {
-        await writeFileAtomic(archivePath, finalArchiveContents);
+        await this.files.writeFileAtomic(archivePath, finalArchiveContents);
       }
       if (finalChatContents === null) {
-        await fs.rm(this.getChatHistoryPath(workspaceId), { force: true });
+        await this.files.promises.rm(this.getChatHistoryPath(workspaceId), { force: true });
       } else {
-        await writeFileAtomic(this.getChatHistoryPath(workspaceId), finalChatContents);
+        await this.files.writeFileAtomic(this.getChatHistoryPath(workspaceId), finalChatContents);
       }
     } catch (error) {
       let committed = false;
@@ -1799,8 +1804,8 @@ export class HistoryService {
     }
 
     try {
-      await fs.rm(archiveTombstonePath);
-      await fs.rm(markerPath, { force: true });
+      await this.files.promises.rm(archiveTombstonePath);
+      await this.files.promises.rm(markerPath, { force: true });
     } catch (error) {
       this.sealedRotationChecked.delete(workspaceId);
       log.warn("History truncation cleanup deferred to the next operation", {
@@ -1833,7 +1838,7 @@ export class HistoryService {
         if (bytes === null) continue;
         const stagedPath = `${target}.publication-${randomUUID()}`;
         staged.set(target, stagedPath);
-        await writeFileAtomic(stagedPath, bytes, { mode: 0o600 });
+        await this.files.writeFileAtomic(stagedPath, bytes, { mode: 0o600 });
       }
       await using directory = await this.openHistoryPublicationDirectory(chatPath);
       await publication.assertStillOwned();
@@ -1842,13 +1847,13 @@ export class HistoryService {
         // Preserve the existing recovery hashes and tombstone protocol, but leave no await
         // between the final ownership check and the complete destructive transaction.
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        renameSync(staged.get(markerPath)!, markerPath);
-        renameSync(archivePath, `${archivePath}.truncate`);
+        this.files.renameSync(staged.get(markerPath)!, markerPath);
+        this.files.renameSync(archivePath, `${archivePath}.truncate`);
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        if (archive !== null) renameSync(staged.get(archivePath)!, archivePath);
-        if (chat === null) rmSync(chatPath, { force: true });
+        if (archive !== null) this.files.renameSync(staged.get(archivePath)!, archivePath);
+        if (chat === null) this.files.rmSync(chatPath, { force: true });
         // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        else renameSync(staged.get(chatPath)!, chatPath);
+        else this.files.renameSync(staged.get(chatPath)!, chatPath);
         committed = true;
       } catch (error) {
         // Lease loss forbids recovery over a successor. The next owner can reconcile
@@ -1861,7 +1866,7 @@ export class HistoryService {
       }
       // Rename/remove durability is part of the edit receipt. A recovered transaction must
       // pass the same barrier; observing its new contents alone cannot accept the edit.
-      if (directory) fsyncSync(directory.fd);
+      if (directory) this.files.fsyncSync(directory.fd);
       publication.onCommitted();
       try {
         await this.recoverTruncateTransactionUnlocked(workspaceId, publication.assertStillOwned);
@@ -1870,7 +1875,7 @@ export class HistoryService {
       }
     } finally {
       for (const stagedPath of staged.values()) {
-        await fs.rm(stagedPath, { force: true }).catch((error: unknown) => {
+        await this.files.promises.rm(stagedPath, { force: true }).catch((error: unknown) => {
           if (!committed) throw error;
           log.warn("History truncated but staging cleanup failed", { error });
         });
@@ -1904,14 +1909,14 @@ export class HistoryService {
   private async findLastBoundaryByteOffset(filePath: string, skip = 0): Promise<number | null> {
     let fileSize: number;
     try {
-      const stat = await fs.stat(filePath);
+      const stat = await this.files.promises.stat(filePath);
       fileSize = stat.size;
     } catch {
       return null;
     }
     if (fileSize === 0) return null;
 
-    const fh = await fs.open(filePath, "r");
+    const fh = await this.files.promises.open(filePath, "r");
     try {
       let readEnd = fileSize;
       // Raw bytes of the incomplete first line from the previous (rightward) chunk.
@@ -2009,11 +2014,11 @@ export class HistoryService {
    * Self-healing: skips malformed JSON lines the same way readChatHistory does.
    */
   private async readHistoryFromOffset(filePath: string, byteOffset: number): Promise<MuxMessage[]> {
-    const stat = await fs.stat(filePath);
+    const stat = await this.files.promises.stat(filePath);
     const tailSize = stat.size - byteOffset;
     if (tailSize <= 0) return [];
 
-    const fh = await fs.open(filePath, "r");
+    const fh = await this.files.promises.open(filePath, "r");
     try {
       const buffer = Buffer.alloc(tailSize);
       await fh.read(buffer, 0, tailSize, byteOffset);
@@ -2045,14 +2050,14 @@ export class HistoryService {
   private async readLastMessagesFromFile(filePath: string, n: number): Promise<MuxMessage[]> {
     let fileSize: number;
     try {
-      const stat = await fs.stat(filePath);
+      const stat = await this.files.promises.stat(filePath);
       fileSize = stat.size;
     } catch {
       return [];
     }
     if (fileSize === 0) return [];
 
-    const fh = await fs.open(filePath, "r");
+    const fh = await this.files.promises.open(filePath, "r");
     try {
       const collected: MuxMessage[] = [];
       let readEnd = fileSize;
@@ -2179,7 +2184,7 @@ export class HistoryService {
   ): Promise<boolean> {
     let fileSize: number;
     try {
-      const stat = await fs.stat(filePath);
+      const stat = await this.files.promises.stat(filePath);
       fileSize = stat.size;
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
@@ -2189,7 +2194,7 @@ export class HistoryService {
     }
     if (fileSize === 0) return true;
 
-    const fh = await fs.open(filePath, "r");
+    const fh = await this.files.promises.open(filePath, "r");
     try {
       let readPos = 0;
       // Incomplete last line from the previous chunk, kept as Buffer to
@@ -2284,7 +2289,7 @@ export class HistoryService {
   ): Promise<boolean> {
     let fileSize: number;
     try {
-      const stat = await fs.stat(filePath);
+      const stat = await this.files.promises.stat(filePath);
       fileSize = stat.size;
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
@@ -2294,7 +2299,7 @@ export class HistoryService {
     }
     if (fileSize === 0) return true;
 
-    const fh = await fs.open(filePath, "r");
+    const fh = await this.files.promises.open(filePath, "r");
     try {
       let readEnd = fileSize;
       let carryoverBytes = Buffer.alloc(0);
@@ -2440,9 +2445,9 @@ export class HistoryService {
           [this.getChatHistoryPath(targetWorkspaceId), snapshot.data.chat],
         ] as const) {
           if (contents === null) {
-            await fs.rm(targetPath, { force: true });
+            await this.files.promises.rm(targetPath, { force: true });
           } else {
-            await writeFileAtomic(targetPath, contents);
+            await this.files.writeFileAtomic(targetPath, contents);
           }
         }
         return Ok(undefined);
@@ -3090,7 +3095,7 @@ export class HistoryService {
         // write: a reclaimed stale lock must stop rotation before its destructive steps.
         await this.withHistoryWriteFileLock(workspaceId, async (assertLockOwned) => {
           if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return;
-          await ensurePrivateDir(this.getSessionDir(workspaceId));
+          await this.files.ensurePrivateDir(this.getSessionDir(workspaceId));
           await provenance.runMutation(
             () => this.ensureSealedHistoryRotatedUnlocked(workspaceId, assertLockOwned),
             assertLockOwned
@@ -3157,7 +3162,7 @@ export class HistoryService {
     }
 
     invalidateHistoryAppendProvenance();
-    const fileBuffer = await fs.readFile(chatPath);
+    const fileBuffer = await this.files.promises.readFile(chatPath);
     const sealedPrefix = fileBuffer.subarray(0, boundaryOffset);
     const activeTail = fileBuffer.subarray(boundaryOffset);
 
@@ -3200,7 +3205,7 @@ export class HistoryService {
       // Append + fsync BEFORE rewriting chat.jsonl: a crash must never lose
       // sealed rows, only (at worst) duplicate them, which the dedupe above heals.
       if (assertStillOwned) await assertStillOwned();
-      const fh = await fs.open(archivePath, "a+");
+      const fh = await this.files.promises.open(archivePath, "a+");
       try {
         // A failed archive write can leave a torn tail while chat still contains
         // the complete rows. Delimit that evidence before replaying those rows.
@@ -3224,7 +3229,7 @@ export class HistoryService {
 
     if (assertStillOwned)
       await publishCompactionFile(chatPath, activeTail, () => true, undefined, assertStillOwned);
-    else await writeFileAtomic(chatPath, activeTail);
+    else await this.files.writeFileAtomic(chatPath, activeTail);
 
     log.debug("Rotated sealed chat history into archive", {
       workspaceId,
@@ -3275,7 +3280,7 @@ export class HistoryService {
         this.getChatArchivePath(workspaceId),
       ]) {
         try {
-          const stat = await fs.stat(filePath);
+          const stat = await this.files.promises.stat(filePath);
           if (stat.size > 0) {
             return true;
           }
@@ -3323,7 +3328,7 @@ export class HistoryService {
   ): Promise<MuxMessage | null | "oversized"> {
     let handle: fs.FileHandle | undefined;
     try {
-      handle = await fs.open(this.getPartialPath(workspaceId), "r");
+      handle = await this.files.promises.open(this.getPartialPath(workspaceId), "r");
       const buffer = Buffer.allocUnsafe(maxBytes + 1);
       let length = 0;
       // A positioned read can return fewer bytes than asked before EOF (some network filesystems).
@@ -3348,7 +3353,7 @@ export class HistoryService {
   ): Promise<MuxMessage | null> {
     try {
       const partialPath = this.getPartialPath(workspaceId);
-      const bytes = await fs.readFile(partialPath);
+      const bytes = await this.files.promises.readFile(partialPath);
       const data =
         options.status && bytes.length > SESSION_HISTORY_MAX_LINE_BYTES
           ? (projectStatusHistoryRow(bytes) ?? bytes.toString("utf8"))
@@ -3440,7 +3445,7 @@ export class HistoryService {
       return Err(`workspace ${workspaceId} was removed; refusing partial write`);
     }
     const workspaceDir = this.getSessionDir(workspaceId);
-    await ensurePrivateDir(workspaceDir);
+    await this.files.ensurePrivateDir(workspaceDir);
     const partialPath = this.getPartialPath(workspaceId);
 
     const partialMessage: MuxMessage = {
@@ -3453,7 +3458,7 @@ export class HistoryService {
 
     // Atomic write: writes to temp file then renames, preventing corruption
     // if app crashes mid-write (prevents "Unexpected end of JSON input" on read)
-    await writeFileAtomic(partialPath, JSON.stringify(partialMessage, null, 2));
+    await this.files.writeFileAtomic(partialPath, JSON.stringify(partialMessage, null, 2));
     return Ok(undefined);
   }
 
@@ -3467,7 +3472,7 @@ export class HistoryService {
   private async deletePartialUnlocked(workspaceId: string): Promise<Result<void>> {
     try {
       const partialPath = this.getPartialPath(workspaceId);
-      await fs.unlink(partialPath);
+      await this.files.promises.unlink(partialPath);
       return Ok(undefined);
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
@@ -3495,7 +3500,7 @@ export class HistoryService {
         let directory = false;
         let raw: string;
         try {
-          raw = await fs.readFile(partialPath, "utf8");
+          raw = await this.files.promises.readFile(partialPath, "utf8");
         } catch (error) {
           if (isErrnoWithCode(error, "ENOENT")) return Ok(false);
           if (!isErrnoWithCode(error, "EISDIR")) throw error;
@@ -3517,8 +3522,8 @@ export class HistoryService {
         // Both history locks exclude successor flushes from another service/process.
         // A directory at the partial path cannot contain a stream message. Remove only an
         // empty directory: rmdir refuses children, symlinks and any replacement regular file.
-        if (directory) rmdirSync(partialPath);
-        else unlinkSync(partialPath);
+        if (directory) this.files.rmdirSync(partialPath);
+        else this.files.unlinkSync(partialPath);
         return Ok(true);
       }
     );
@@ -3536,12 +3541,12 @@ export class HistoryService {
     return this.fileLocks.withLock(workspaceId, async () => {
       try {
         const partialPath = this.getPartialPath(workspaceId);
-        const data = await fs.readFile(partialPath, "utf-8");
+        const data = await this.files.promises.readFile(partialPath, "utf-8");
         const partialMessage = normalizePersistedMessage(JSON.parse(data) as MuxMessage);
         if (partialMessage.id !== messageId) {
           return Ok(false);
         }
-        await fs.unlink(partialPath);
+        await this.files.promises.unlink(partialPath);
         return Ok(true);
       } catch (error) {
         if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
@@ -3788,7 +3793,7 @@ export class HistoryService {
   ): Promise<Result<void>> {
     try {
       const workspaceDir = this.getSessionDir(workspaceId);
-      await ensurePrivateDir(workspaceDir);
+      await this.files.ensurePrivateDir(workspaceDir);
 
       // DEBUG: Log message append with caller stack trace
       const stack = new Error().stack?.split("\n").slice(2, 6).join("\n") ?? "no stack";
@@ -4064,7 +4069,7 @@ export class HistoryService {
       }
       // Create the session dir with private permissions only for a live
       // workspace (writeFileAtomic and appends assume the parent exists).
-      await ensurePrivateDir(sessionDir);
+      await this.files.ensurePrivateDir(sessionDir);
       // Truncation recovery runs IN-LOCK (r64): recovery mutates the
       // archive/chat/marker files, and outside the lock it cannot tell a
       // crashed transaction from another backend's live rewrite — rolling
@@ -4770,7 +4775,7 @@ export class HistoryService {
               ? this.getChatHistoryPath(workspaceId)
               : this.getChatArchivePath(workspaceId);
           // Windows FlushFileBuffers requires write access even though verification writes no bytes.
-          const handle = await fs.open(file, "r+");
+          const handle = await this.files.promises.open(file, "r+");
           try {
             await handle.sync();
           } finally {
@@ -4887,7 +4892,7 @@ export class HistoryService {
     try {
       await this.refreshSequenceCounterUnderWriteLock(workspaceId);
       const workspaceDir = this.getSessionDir(workspaceId);
-      await ensurePrivateDir(workspaceDir);
+      await this.files.ensurePrivateDir(workspaceDir);
       for (const message of messages) {
         assert(
           message.metadata?.historySequence === undefined,
@@ -5126,14 +5131,14 @@ export class HistoryService {
         const stagedPath = `${historyPath}.follow-up-${randomUUID()}`;
         let published = false;
         try {
-          await writeFileAtomic(stagedPath, serialized, { mode: 0o600 });
+          await this.files.writeFileAtomic(stagedPath, serialized, { mode: 0o600 });
           await unlockedHistoryScans.waitForClose(historyPath);
           await assertStillOwned();
           // Admission may change while the file is staged. The final check and rename
           // are synchronous, so the retired owner cannot publish in that gap.
           if (!isCurrent()) return Ok("skipped");
           invalidateHistoryAppendProvenance();
-          renameSync(stagedPath, historyPath);
+          this.files.renameSync(stagedPath, historyPath);
           published = true;
           // Inactive G2a receipt seam: absence alone cannot authorize restoring pending
           // attachments. Notify exact cleanup before lock disposal admits a replacement.
@@ -5169,7 +5174,7 @@ export class HistoryService {
           if (!published) {
             // A staging cleanup failure must not replace a retired owner's recoverable skip
             // or hide the original publication error.
-            await fs.rm(stagedPath, { force: true }).catch((error: unknown) => {
+            await this.files.promises.rm(stagedPath, { force: true }).catch((error: unknown) => {
               log.warn("Failed to remove staged compaction follow-up file", error);
             });
           }
@@ -5239,7 +5244,7 @@ export class HistoryService {
             workspaceId
           ).advanceGenerationUnderHistoryLock();
         }
-        await writeFileAtomic(historyPath, updated);
+        await this.files.writeFileAtomic(historyPath, updated);
         return Ok(rejected);
       }
     );
@@ -5252,7 +5257,7 @@ export class HistoryService {
     createsFile: boolean
   ): Promise<void> {
     assert(bytes.at(-1) === 10, "History append requires a JSONL delimiter");
-    const handle = await fs.open(historyPath, "a", 0o600);
+    const handle = await this.files.promises.open(historyPath, "a", 0o600);
     let committed = false;
     try {
       await using directory = createsFile
@@ -5265,16 +5270,16 @@ export class HistoryService {
       // cannot define acceptance. Incomplete JSON still receives no receipt.
       let offset = 0;
       while (offset < bytes.length) {
-        const written = writeSync(handle.fd, bytes, offset, bytes.length - offset);
+        const written = this.files.writeSync(handle.fd, bytes, offset, bytes.length - offset);
         assert(written > 0, "History append must make progress");
         offset += written;
         if (!committed && offset >= bytes.length - 1) {
           publication.onPublished?.();
           // Flush this exact descriptor before acceptance; no await may admit Stop between
           // the guarded append, durability barrier and receipt (even without the final LF).
-          fsyncSync(handle.fd);
+          this.files.fsyncSync(handle.fd);
           // A new inode's name must survive a crash before its receipt can retire Stop.
-          if (directory) fsyncSync(directory.fd);
+          if (directory) this.files.fsyncSync(directory.fd);
           committed = true;
           try {
             publication.onCommitted();
@@ -5296,7 +5301,7 @@ export class HistoryService {
     // existing rename boundary; POSIX acceptance additionally requires directory durability.
     return process.platform === "win32"
       ? Promise.resolve(undefined)
-      : fs.open(path.dirname(historyPath), "r");
+      : this.files.promises.open(path.dirname(historyPath), "r");
   }
 
   /** Caller holds both history locks. Ordinary writes retain their existing publication behavior. */
@@ -5305,12 +5310,12 @@ export class HistoryService {
     bytes: Buffer,
     publication?: HistoryPublicationObserver
   ): Promise<void> {
-    if (!publication) return writeFileAtomic(historyPath, bytes);
+    if (!publication) return this.files.writeFileAtomic(historyPath, bytes);
 
     const stagedPath = `${historyPath}.publication-${randomUUID()}`;
     let committed = false;
     try {
-      await writeFileAtomic(stagedPath, bytes, { mode: 0o600 });
+      await this.files.writeFileAtomic(stagedPath, bytes, { mode: 0o600 });
       await using directory = await this.openHistoryPublicationDirectory(historyPath);
       await unlockedHistoryScans.waitForClose(historyPath);
       // Staging can outlive a filesystem lease even while the logical owner is current.
@@ -5318,11 +5323,11 @@ export class HistoryService {
       // Replacement acceptance must capture its receipt in the same synchronous
       // turn as ownership validation and rename, before any observer can yield.
       if (!publication.isCurrent()) throw new Error("History publication no longer owned");
-      renameSync(stagedPath, historyPath);
+      this.files.renameSync(stagedPath, historyPath);
       // Visible rows forbid duplicate retries, but only the durable rename grants acceptance.
       // Keep the final admission, rename, flush, and receipt in one synchronous region.
       publication.onPublished?.();
-      if (directory) fsyncSync(directory.fd);
+      if (directory) this.files.fsyncSync(directory.fd);
       committed = true;
       try {
         publication.onCommitted();
@@ -5330,7 +5335,7 @@ export class HistoryService {
         log.warn("History published but commit observer failed", { error });
       }
     } finally {
-      await fs.rm(stagedPath, { force: true }).catch((error: unknown) => {
+      await this.files.promises.rm(stagedPath, { force: true }).catch((error: unknown) => {
         // A durable write must not invite retry because staging cleanup failed.
         if (!committed) throw error;
         log.warn("History published but staging cleanup failed", { error });
@@ -5507,7 +5512,7 @@ export class HistoryService {
       // updateHistory() replace an unrelated row.
       await this.refreshSequenceCounterUnderWriteLock(workspaceId);
       if (assertStillOwned) await assertStillOwned();
-      await ensurePrivateDir(this.getSessionDir(workspaceId));
+      await this.files.ensurePrivateDir(this.getSessionDir(workspaceId));
       const historyPath = this.getChatHistoryPath(workspaceId);
       const { rows, messages } = await this.readHistoryForRewrite(historyPath);
       const updates = new Map<MuxMessage, MuxMessage>();
@@ -5620,7 +5625,7 @@ export class HistoryService {
           return Err("Compaction snapshot changed");
       } else {
         assert(!commit, "Compaction commit receipts require a final ownership predicate");
-        await writeFileAtomic(historyPath, serialized);
+        await this.files.writeFileAtomic(historyPath, serialized);
         onCommitted();
       }
 
@@ -5663,7 +5668,7 @@ export class HistoryService {
             ids.has(row.id) ? null : row
           );
           await this.fenceDeletedMessagesUnderHistoryLock(workspaceId, rows, ids);
-          await writeFileAtomic(this.getChatHistoryPath(workspaceId), historyEntries);
+          await this.files.writeFileAtomic(this.getChatHistoryPath(workspaceId), historyEntries);
 
           const maxSeq = filteredMessages.reduce((max, message) => {
             const sequence = message.metadata?.historySequence;
@@ -5792,7 +5797,7 @@ export class HistoryService {
           new Set([messageId]),
           messages.length
         );
-        await writeFileAtomic(this.getChatArchivePath(workspaceId), archiveEntries);
+        await this.files.writeFileAtomic(this.getChatArchivePath(workspaceId), archiveEntries);
         return Ok(sequencesOf(archiveMessages));
       }
 
@@ -5803,7 +5808,7 @@ export class HistoryService {
 
       await this.fenceDeletedMessagesUnderHistoryLock(workspaceId, rows, new Set([messageId]));
       // Atomic write prevents corruption if app crashes mid-write
-      await writeFileAtomic(historyPath, historyEntries);
+      await this.files.writeFileAtomic(historyPath, historyEntries);
 
       // Keep the in-memory sequence counter monotonic. It's okay to reuse deleted sequence
       // numbers on restart, but we must not regress within a running process.
@@ -6530,7 +6535,7 @@ export class HistoryService {
             this.getChatArchivePath(newWorkspaceId)
           );
           if (archiveMessages.length > 0) {
-            await writeFileAtomic(
+            await this.files.writeFileAtomic(
               this.getChatArchivePath(newWorkspaceId),
               this.serializeHistoryRewrite(archiveRows, newWorkspaceId, migrate)
             );
@@ -6561,7 +6566,7 @@ export class HistoryService {
           const historyEntries = this.serializeHistoryRewrite(rows, newWorkspaceId, migrate);
 
           // Atomic write prevents corruption if app crashes mid-write
-          await writeFileAtomic(newHistoryPath, historyEntries);
+          await this.files.writeFileAtomic(newHistoryPath, historyEntries);
 
           // Transfer sequence counter to new workspace ID
           this.sequenceCounters.set(newWorkspaceId, oldCounter);

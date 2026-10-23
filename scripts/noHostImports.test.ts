@@ -160,10 +160,6 @@ const FROZEN_ALLOW_PAIRS = [
   "src/node/services/historyAppendProvenance.ts fs/promises",
   "src/node/services/historyReplacementRows.ts fs/promises",
   "src/node/services/historyScanner.ts fs/promises",
-  "src/node/services/historyService.ts @/node/utils/fs",
-  "src/node/services/historyService.ts @/node/utils/writeFileAtomic",
-  "src/node/services/historyService.ts fs",
-  "src/node/services/historyService.ts fs/promises",
   "src/node/services/sendIds.ts fs/promises",
 ];
 
