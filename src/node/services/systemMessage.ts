@@ -804,8 +804,9 @@ export function buildSystemMessageFromSources(
     prefix: systemMessage,
     block: buildInstructionBlocks(
       customInstructions,
-      { content: modelContent, tag: `model-${modelString}` },
-      { content: modeContent, tag: `mode-${modeCandidates[0]}` }
+      // The tags only matter when content is set, and content implies the value (see above).
+      { content: modelContent, tag: `model-${modelString ?? ""}` },
+      { content: modeContent, tag: `mode-${modeCandidates[0] ?? ""}` }
     ),
   };
   systemMessage += instructionsSection.block;
