@@ -66,7 +66,7 @@ test("a SIGKILL in a turn recovers as today", async () => {
   // The retry must persist its own output too, not only keep A's prefix. Today
   // it streams the whole mock reply again into row 1 (#7204), so the length of
   // the text after the prefix is the same in every run.
-  const actual = {
+  const actual: Record<string, unknown> = {
     ...normalize(ws, { atKill, recovered }),
     retryTextLength: recovered.rowTexts[1].length - atKill.partialText.length,
   };
