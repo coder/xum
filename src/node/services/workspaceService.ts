@@ -10,7 +10,7 @@ import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
 import { Effect, type Scope } from "effect";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import { hostClockFor } from "./di/hostClockLive";
-import type { HostClock } from "@/node/utils/hostClock";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import {
   DesktopInputCoordinator,
   settleArchivedSharedDesktopTask,
@@ -5410,7 +5410,8 @@ export class WorkspaceService
       // can lose the race against the frontend's lastRead (set via Date.now()
       // after the IPC round-trip). Using a fresh timestamp here ensures the
       // completion recency is strictly after any earlier lastRead write.
-      await this.updateRecencyTimestamp(workspaceId, this.hostClock.nowMs());
+      // Wall clock on purpose: the renderer writes lastRead with Date.now() (#7282).
+      await this.updateRecencyTimestamp(workspaceId, nodeClock.nowMs());
     }
 
     await this.stopStreamingStatus(workspaceId, generation);
