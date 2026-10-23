@@ -117,16 +117,16 @@ const RAW_CLOCK_FILES = [
 ];
 // Loop test files that moved from global fake timers and Date patches to the TestClock
 // (makeTestEffectRunner). Each phase 3 PR adds the test files it moves.
-const CLOCK_PATCH_FREE_TESTS = ["src/node/services/streamManager.toolEvents.test.ts"];
+const CLOCK_PATCH_FREE_TESTS = [
+  "src/node/services/retryManager.test.ts",
+  "src/node/services/streamManager.toolEvents.test.ts",
+];
 // File -> the exact number of raw clock reads it still has. Phase 3 lowers each entry as it
 // moves the file onto the HostClock service, and the rule fails an entry that is too high.
 const RAW_CLOCK_ALLOW = {
-  "src/node/services/agentSession.ts": 11,
-  "src/node/services/aiService.ts": 7,
   "src/node/services/backgroundProcessManager.ts": 25,
   "src/node/services/contextManagement/strategies/continuous.ts": 1,
   "src/node/services/contextManagement/strategies/tokenBudget.ts": 1,
-  "src/node/services/retryManager.ts": 1,
   "src/node/services/tools/bash.ts": 3,
   "src/node/services/tools/bash_background_list.ts": 1,
   "src/node/services/tools/code_execution.ts": 3,
