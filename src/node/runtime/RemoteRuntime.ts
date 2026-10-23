@@ -30,6 +30,7 @@ import type {
   WorkspaceForkResult,
   EnsureReadyResult,
   ReadFileOptions,
+  RuntimeLocation,
 } from "./Runtime";
 import { RuntimeError, isRuntimeTransportError } from "./Runtime";
 import { LEGACY_REMOTE_MUX_HOME } from "@/common/compat/legacyMux";
@@ -83,6 +84,12 @@ export interface SpawnResult {
  * Abstract base class for remote execution runtimes.
  */
 export abstract class RemoteRuntime implements Runtime {
+  /** Runtime.location. A prototype getter, so subclasses and Object.create doubles inherit it. */
+  // eslint-disable-next-line @typescript-eslint/class-literal-property-style -- a readonly field is set by the constructor, so Object.create(X.prototype) doubles (mcpServerManager.test.ts) would read undefined
+  get location(): RuntimeLocation {
+    return "remote";
+  }
+
   /** Remote stops started by aborts and not finished yet (#6923). */
   private readonly pendingStops = new PendingStops();
 
