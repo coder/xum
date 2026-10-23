@@ -14,6 +14,7 @@ import {
   getAvailableThinkingLevels,
   isXaiGrokFastVariantSwap,
   resolveBetweenToolsThinkingLevel,
+  hasExplicitThinkingPolicy,
 } from "./policy";
 
 describe("Muse Wonder thinking policy", () => {
@@ -53,6 +54,30 @@ describe("getThinkingPolicyForModel", () => {
       expect(enforceThinkingPolicy(id, "max")).toBe("max");
     }
     expect(enforceThinkingPolicy(`openai:${model}-mini`, "max")).toBe("high");
+  });
+
+  // Catalogue GPT-5.6 models are not built in, but OpenAI serves none through
+  // native max on the whole family, so they get the explicit 6-level policy (and
+  // with it the Settings → Models floor selector and default medium floor).
+  test("gives catalogue GPT-5.6 models off through native max and a default floor", () => {
+    const sixLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
+    for (const id of [
+      "openai:gpt-5.6",
+      "openai:gpt-5.6-sol",
+      "openai:gpt-5.6-terra",
+      "openai:gpt-5.6-luna",
+    ]) {
+      expect(getThinkingPolicyForModel(id)).toEqual(sixLevels);
+      expect(hasExplicitThinkingPolicy(id)).toBe(true);
+      expect(getDefaultMinimumThinkingLevel(id)).toBe("medium");
+      expect(enforceThinkingPolicy(id, "xhigh")).toBe("xhigh");
+      expect(enforceThinkingPolicy(id, "max")).toBe("max");
+    }
+    for (const id of ["openai:gpt-5.6-cyber", "openai:gpt-5.5"]) {
+      expect(getThinkingPolicyForModel(id)).toEqual(["off", "low", "medium", "high"]);
+      expect(hasExplicitThinkingPolicy(id)).toBe(false);
+      expect(enforceThinkingPolicy(id, "max")).toBe("high");
+    }
   });
 
   // GPT-6 Astra keeps native max but rejects effort "none" (HTTP 400), so "off"

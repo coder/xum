@@ -2454,6 +2454,13 @@ describe("buildProviderOptions - OpenAI", () => {
       }
     });
 
+    test("sends native max, explicit none, and pro mode for catalogue GPT-5.6 Sol", () => {
+      const max = buildWithMode("openai:gpt-5.6-sol", "pro", { thinkingLevel: "max" });
+      expect(max?.reasoningEffort).toBe("max");
+      expect(max?.reasoningMode).toBe("pro");
+      expect(buildWithMode("openai:gpt-5.6-sol", "standard")?.reasoningEffort).toBe("none");
+    });
+
     test("omits pro mode for standard mode, unsupported models, and Chat Completions", () => {
       const cases = [
         buildWithMode("openai:gpt-6.1-sol", "standard"),

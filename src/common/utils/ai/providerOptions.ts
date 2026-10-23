@@ -827,11 +827,11 @@ export function buildProviderOptions(
 
   // Build OpenAI-specific options
   if (formatProvider === "openai") {
-    // Model-aware: native-max models (the GPT-6 tiers, see
+    // Model-aware: native-max models (the GPT-6 tiers and the GPT-5.6 family, see
     // openaiSupportsNativeMaxEffort) map ThinkingLevel "max" to the native "max"
     // effort; other OpenAI models keep the max -> "xhigh" downgrade. Use
     // capabilityModel so mapped aliases (mappedToModel) inherit their target's
-    // native effort. GPT-6 Luna "off" must be explicit "none" because omission
+    // native effort. GPT-6 Luna and GPT-5.6 "off" must be explicit "none" because omission
     // defaults to medium; Astra and GPT-6.1 Sol instead clamp "off" to "low".
 
     // Xum always sends the latest conversation history explicitly. OpenAI's
@@ -1113,8 +1113,8 @@ export function buildProviderOptions(
   ) {
     // capabilityModel keeps mapped aliases consistent with raw ids on the same route.
     // Copilot's Chat Completions upstream has not published native-max or
-    // explicit-none support, so degrade native-max models' (the GPT-6 tiers) "max"
-    // to xhigh (the older top effort) and Luna's "none" back to omission instead of
+    // explicit-none support, so degrade native-max models' (the GPT-6 tiers and
+    // GPT-5.6) "max" to xhigh (the older top effort) and "none" back to omission instead of
     // risking a rejection.
     // Explicit Copilot IDs gain the tier only; don't reinterpret their reasoning capabilities.
     const nativeReasoningEffort =

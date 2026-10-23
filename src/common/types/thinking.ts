@@ -44,8 +44,8 @@ export function getThinkingDisplayLabel(level: ThinkingLevel, modelString?: stri
     const withoutPrefix = normalized.replace(/^[a-z0-9_-]+:\s*/, "");
 
     // OpenAI: both xhigh and max resolve to "xhigh" reasoning effort — except
-    // native-max models (the GPT-6 tiers), where "max" is a distinct
-    // native effort above xhigh.
+    // native-max models (the GPT-6 tiers and the GPT-5.6 family), where "max"
+    // is a distinct native effort above xhigh.
     if (normalized.startsWith("openai:") || withoutPrefix.startsWith("openai/")) {
       if (level === "max" && openaiSupportsNativeMaxEffort(modelString)) return "MAX";
       return "XHIGH";
@@ -301,7 +301,7 @@ export function isGpt6LunaModel(modelString: string): boolean {
 
 /**
  * The supported OpenAI GPT tiers: GPT-6 Astra, GPT-6.1 Sol, and GPT-6 Luna. Older
- * GPT models are not supported. Every tier has the native "max" reasoning effort,
+ * GPT models are not built in. Every tier has the native "max" reasoning effort,
  * Pro reasoning mode on the same model id, and explicit prompt-cache breakpoints.
  * Unannounced variants (e.g. `gpt-6-astra-mini`) stay outside it.
  */
@@ -312,13 +312,27 @@ export function isGpt6FamilyModel(modelString: string): boolean {
 }
 
 /**
+ * GPT-5.6 family matcher (`gpt-5.6`, `gpt-5.6-sol`, `gpt-5.6-terra`,
+ * `gpt-5.6-luna`, plus dated snapshots). GPT-5.6 is no longer a built-in model
+ * (#5258), but the Settings → Models catalogue still offers it, and OpenAI serves
+ * `none` through native `max` and Pro mode on the whole family. Anchored like
+ * isGpt6AstraModel so `gpt-5.6-cyber` (a separate Daybreak model with an unknown
+ * reasoning surface) and unannounced variants (`gpt-5.6-sol-mini`, `gpt-5.61`)
+ * stay outside it.
+ */
+export function isGpt56FamilyModel(modelString: string): boolean {
+  const withoutPrefix = stripModelProviderPrefixes(modelString);
+  return /^gpt-5\.6(?:-(?:sol|terra|luna))?(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
+}
+
+/**
  * Whether the given OpenAI model supports the native "max" reasoning effort
- * (every GPT-6 tier). Astra and GPT-6.1 Sol reject `none` (see
- * openaiRejectsDisabledReasoning); Luna supports none through max. Pro mode is
- * independent of that effort ladder.
+ * (every GPT-6 tier and the GPT-5.6 family). Astra and GPT-6.1 Sol reject `none`
+ * (see openaiRejectsDisabledReasoning); Luna and GPT-5.6 support none through
+ * max. Pro mode is independent of that effort ladder.
  */
 export function openaiSupportsNativeMaxEffort(modelString: string): boolean {
-  return isGpt6FamilyModel(modelString);
+  return isGpt6FamilyModel(modelString) || isGpt56FamilyModel(modelString);
 }
 
 /**
@@ -353,13 +367,13 @@ export function coerceOpenAIReasoningMode(value: unknown): OpenAIReasoningMode |
 
 /**
  * Whether the given OpenAI model supports `reasoning.mode: "pro"` on the
- * Responses API. Pro is not a separate model id: every GPT-6 tier is served with
- * `reasoning.mode: "pro"` (this superseded ids like gpt-5.5-pro). Keep it
- * independent of effort so choosing native max does not silently opt users into
- * Pro serving.
+ * Responses API. Pro is not a separate model id: every GPT-6 tier and the GPT-5.6
+ * family are served with `reasoning.mode: "pro"` (this superseded ids like
+ * gpt-5.5-pro). Keep it independent of effort so choosing native max does not
+ * silently opt users into Pro serving.
  */
 export function openaiSupportsProMode(modelString: string): boolean {
-  return isGpt6FamilyModel(modelString);
+  return isGpt6FamilyModel(modelString) || isGpt56FamilyModel(modelString);
 }
 
 /**
@@ -503,11 +517,11 @@ export const OPENAI_REASONING_EFFORT: Record<ThinkingLevel, string | undefined> 
  * Model-aware OpenAI reasoning effort resolution.
  *
  * Most OpenAI models top out at "xhigh", so the ThinkingLevel "max" downgrades to
- * "xhigh" (see OPENAI_REASONING_EFFORT). The GPT-6 tiers ship a distinct native
- * effort above xhigh with the wire value "max" on the Responses API (live-verified
+ * "xhigh" (see OPENAI_REASONING_EFFORT). The GPT-6 tiers and the GPT-5.6 family
+ * ship a distinct native effort above xhigh with the wire value "max" on the Responses API (live-verified
  * on GPT-5.6: the response echoes `effort: max`; not yet in the SDK's typed union).
  *
- * GPT-6 Luna "off" maps to the explicit "none" effort: omitting the field defaults
+ * GPT-6 Luna and GPT-5.6 "off" map to the explicit "none" effort: omitting the field defaults
  * the request to medium (live-verified 2026-07-10 — an effort-less request echoed
  * `effort: medium`), which would silently ignore the user's off selection.
  *
