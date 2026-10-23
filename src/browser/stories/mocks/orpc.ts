@@ -255,6 +255,8 @@ export interface MockORPCClientOptions {
     shelfFiles?: Record<string, ArtifactReadResult>;
     /** Persisted window.xum.state per artifact path (artifacts.getState); default null. */
     states?: Record<string, unknown>;
+    /** When set, artifacts.sendInteraction fails with this error (the strip's error state). */
+    sendInteractionError?: string;
   };
   /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
   /** When set, mcpApps.listViewDomains fails with this error (Settings' load error). */
@@ -2622,7 +2624,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }),
       setState: () => Promise.resolve({ success: true as const, data: undefined }),
       sendInteraction: () =>
-        Promise.resolve({ success: true as const, data: { id: "story-interaction" } }),
+        Promise.resolve(
+          artifacts.sendInteractionError != null
+            ? { success: false as const, error: artifacts.sendInteractionError }
+            : { success: true as const, data: { id: "story-interaction" } }
+        ),
     },
     mcpApps: {
       getView: (input: { toolCallId: string }) => {

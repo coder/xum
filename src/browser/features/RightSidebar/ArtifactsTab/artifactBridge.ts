@@ -27,8 +27,9 @@ import {
  *   (ARTIFACT_FRAME_CHORDS: KEYBINDS.TOGGLE_RIGHT_SIDEBAR or KEYBINDS.OPEN_ARTIFACTS_TAB), which a
  *   click into the frame also made unreachable: keys in the frame never reach the app's window
  *   listener. The host honours it only while the frame holds focus (SandboxedArtifactFrame.tsx).
- * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) only fills the
- *   host-owned confirm strip, never sends by itself; `{ type: "setState", state }`
+ * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) sends at once only
+ *   during a live user click or key in this frame, one message per click; any other send fills
+ *   the host-owned confirm strip (SandboxedArtifactFrame.tsx); `{ type: "setState", state }`
  *   (window.xum.setState) is persisted per artifact, for all its versions. Text and JSON sizes
  *   are capped.
  * - Frame -> host (M5b annotate): `{ type: "annotate", x, y, selector?, quote?, prefix?,
@@ -559,7 +560,7 @@ export function buildArtifactBridgeScript(
   }
   Object.defineProperty(api, "theme", { enumerable: true, get: function () { return theme; } });
   Object.defineProperty(api, "state", { enumerable: true, get: function () { return clone(state); } });
-  // send() only asks the host to show its confirm strip; the user decides whether it is sent.
+  // send() only asks: the host sends at once after a user click in this frame, else it asks the user.
   api.send = function (text, data) {
     var message = { xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "send", text: String(text) };
     if (data !== undefined) message.data = clone(data);

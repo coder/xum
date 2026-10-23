@@ -11,6 +11,7 @@ import { useAppConfig, useUserPreferences } from "@/browser/stores/AppConfigStor
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
+import { ARTIFACT_CLICK_SEND_WINDOW_MS } from "@/common/constants/artifactInteractions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createArtifactAssetLoader } from "./artifactAssets";
 import {
@@ -32,7 +33,7 @@ import {
   parseArtifactHtml,
 } from "./artifactDocument";
 import { pickFromFrameAnnotation, type ArtifactAnnotationPick } from "./artifactAnnotation";
-import type { ArtifactInteractionHandlers } from "./artifactInteractions";
+import type { ArtifactInteractionHandlers, ArtifactSendOrigin } from "./artifactInteractions";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { Notice, SourceText } from "./SourceText";
 import { useArtifactAssetReader } from "./useArtifactAssetReader";
@@ -57,14 +58,19 @@ interface BuiltDocument {
 }
 
 /**
- * SECURITY AUDIT: gate for `window.xum.openWorkspace` and the frame's "C" (annotate) key. The
- * artifact's script can post either at any time, so the host honours them only while the user's
+ * SECURITY AUDIT: gate for `window.xum.openWorkspace`, the frame's "C" (annotate) key and a
+ * `window.xum.send` that skips the confirm strip. The artifact's script can post any of them at
+ * any time, so the host honours them only while the user's
  * own click or key press inside `frame` is live: focus is on the iframe (a click or Tab into a
  * frame moves the app's activeElement to it, and a hidden frame cannot hold focus), and the app
  * has transient user activation (a gesture in a child frame also activates its ancestors). Each check alone is not enough: typing in the
  * composer also activates the app, and focus stays on the frame long after the click.
- * No confirm strip: a switch sends nothing and reveals nothing to the frame, the user can switch
- * back, and the right sidebar is keyed by workspace, so the switch unmounts this frame.
+ * No confirm strip for openWorkspace: a switch sends nothing and reveals nothing to the frame,
+ * the user can switch back, and the right sidebar is keyed by workspace, so the switch unmounts
+ * this frame. A send skips the strip only through this gate and only once per click
+ * (ARTIFACT_CLICK_SEND_WINDOW_MS): the user asked for one click, not two, to send from an
+ * artifact. The gate cannot tell a click handler from a timer that fires soon after the click,
+ * so the message text is page data the user did not review (the agent is told so).
  */
 function hasLiveUserGesture(frame: HTMLIFrameElement | null): boolean {
   const activation = (navigator as Navigator & { userActivation?: { isActive?: boolean } })
@@ -102,6 +108,23 @@ function replayFrameSidebarKey(
   // The frame's script can post any modifiers, so the host matches the keybind itself.
   if (!matchesKeybind(event, keybind)) return;
   frame.dispatchEvent(event);
+}
+
+/**
+ * The origin of a `window.xum.send` from `frame`: "click" during a live user gesture there
+ * (hasLiveUserGesture), at most once per ARTIFACT_CLICK_SEND_WINDOW_MS, else "ask" (the strip).
+ * `lastClickSendAt` holds when this frame last sent as a click; a "click" result updates it.
+ */
+function takeFrameSendOrigin(
+  frame: HTMLIFrameElement | null,
+  lastClickSendAt: { current: number | null },
+  now = Date.now()
+): ArtifactSendOrigin {
+  if (!hasLiveUserGesture(frame)) return "ask";
+  const last = lastClickSendAt.current;
+  if (last != null && now - last < ARTIFACT_CLICK_SEND_WINDOW_MS) return "ask";
+  lastClickSendAt.current = now;
+  return "click";
 }
 
 type ArtifactFrameKeyMessage = Extract<
@@ -206,6 +229,8 @@ export function SandboxedArtifactFrame(props: {
   const [built, setBuilt] = useState<BuiltDocument | null>(null);
   const { openWorkspace, openWorkspaceRefused } = useArtifactWorkspaceOpener();
   const frameRef = useRef<HTMLIFrameElement | null>(null);
+  // When this frame last sent without the strip (see ARTIFACT_CLICK_SEND_WINDOW_MS).
+  const lastClickSendAtRef = useRef<number | null>(null);
   const { kind, content, path } = props;
   // SECURITY AUDIT: the persisted state goes into the srcdoc, never through postMessage (which
   // must target "*" and could reach a page the frame navigated to). So an interactive artifact
@@ -264,8 +289,13 @@ export function SandboxedArtifactFrame(props: {
           handleFrameKeyMessage(message, frameRef.current, onFrameKey);
           break;
         case "send":
-          // Only fills the host's confirm strip; the user's click sends.
-          interactions?.requestSend(message.text, message.data);
+          // A live click or key in this frame sends at once, one message per click; any other
+          // send asks in the host's confirm strip.
+          interactions?.requestSend(
+            message.text,
+            message.data,
+            takeFrameSendOrigin(frameRef.current, lastClickSendAtRef)
+          );
           break;
         case "setState":
           interactions?.setState?.(message.state);

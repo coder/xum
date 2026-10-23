@@ -44,8 +44,18 @@ export interface ArtifactInteractionTarget {
 }
 
 /**
- * Host side of artifact interactions for the Artifacts panel (M5b): one pending confirm strip per
- * artifact (sends arriving while it is shown are ignored), the persisted `window.xum.state` of the
+ * The version shown when the artifact asked, not whichever one is selected at Send time. A live
+ * view is pinned to its newest stored version now: null would resolve at Send time and credit a
+ * version published while the strip was open.
+ */
+function shownVersion(target: ArtifactInteractionTarget): number | null {
+  return target.version ?? (target.latestVersionStale === true ? null : target.latestVersion);
+}
+
+/**
+ * Host side of artifact interactions for the Artifacts panel (M5b): a clicked send goes out at
+ * once, any other send fills one pending confirm strip per artifact (sends arriving while a strip
+ * is shown or a send is in flight are ignored), the persisted `window.xum.state` of the
  * artifact (one state for all its versions), and the handlers the viewer passes to the frame.
  * Returns `handlers: undefined` when nothing interactive is selected (pinned files, MCP Apps views). `handleKeyDown` runs the strip's
  * shortcuts; the panel calls it for keys pressed inside the panel, and it returns true when it
@@ -137,21 +147,62 @@ export function useArtifactInteractions(
     return { handlers: undefined, strip: null, handleKeyDown: () => false };
   }
 
+  const clearPending = (forPath: string) => {
+    pendingPathsRef.current.delete(forPath);
+    setPendingByPath((prev) => {
+      const next = new Map(prev);
+      next.delete(forPath);
+      return next;
+    });
+  };
+  const showStrip = (forPath: string, pending: PendingArtifactSend, error: string | null) => {
+    setPendingByPath((prev) => new Map(prev).set(forPath, pending));
+    setSendState({ path: forPath, sending: false, error });
+  };
+  // Sends one message. A failure shows (or keeps) the strip with the error, so the text of a
+  // clicked send is not lost and the user can press Send again.
+  const deliver = (forPath: string, pending: PendingArtifactSend) => {
+    if (!liveApi) {
+      showStrip(forPath, pending, OFFLINE_SEND_ERROR);
+      return;
+    }
+    setSendState({ path: forPath, sending: true, error: null });
+    liveApi.artifacts
+      .sendInteraction({
+        workspaceId,
+        path: forPath,
+        version: pending.version,
+        text: pending.text,
+        ...(pending.data !== undefined ? { data: pending.data } : {}),
+      })
+      .then((result) => {
+        if (result.success) {
+          clearPending(forPath);
+          setSendState({ path: forPath, sending: false, error: null });
+        } else {
+          showStrip(forPath, pending, result.error);
+        }
+      })
+      .catch((error: unknown) => {
+        showStrip(forPath, pending, getErrorMessage(error));
+      });
+  };
+
   const handlers: ArtifactInteractionHandlers = {
-    requestSend: (text, data) => {
+    requestSend: (text, data, origin) => {
       // A shown strip is never replaced, also while its send is in flight: the frame could
       // otherwise swap the text between the user's pointerdown and click, and the earlier send's
-      // success would clear the newer prompt. The artifact can send again after Send or Dismiss.
+      // success would clear the newer prompt. A clicked send in flight blocks new sends too. The
+      // artifact can send again after Send, Dismiss or a delivered click send.
       if (pendingPathsRef.current.has(target.path)) return;
       pendingPathsRef.current.add(target.path);
-      const id = newConfirmPromptId();
-      // The version shown when the artifact asked, not whichever one is selected at Send time. A
-      // live view is pinned to its newest stored version now: null would resolve at Send time and
-      // credit a version published while the strip was open.
-      const version =
-        target.version ?? (target.latestVersionStale === true ? null : target.latestVersion);
-      setPendingByPath((prev) => new Map(prev).set(target.path, { id, text, data, version }));
-      setSendState({ path: target.path, sending: false, error: null });
+      const pending = { id: newConfirmPromptId(), text, data, version: shownVersion(target) };
+      // The user's own click asked for this send: a second confirm click added nothing.
+      if (origin === "click") {
+        deliver(target.path, pending);
+        return;
+      }
+      showStrip(target.path, pending, null);
     },
     initialState: loadedState?.key === stateKey ? loadedState.state : undefined,
     setState: (state) => {
@@ -200,41 +251,8 @@ export function useArtifactInteractions(
   };
 
   const pending = pendingByPath.get(target.path);
-  const clearPending = (forPath: string) => {
-    pendingPathsRef.current.delete(forPath);
-    setPendingByPath((prev) => {
-      const next = new Map(prev);
-      next.delete(forPath);
-      return next;
-    });
-  };
   const send = () => {
-    if (pending == null) return;
-    const forPath = target.path;
-    if (!liveApi) {
-      setSendState({ path: forPath, sending: false, error: OFFLINE_SEND_ERROR });
-      return;
-    }
-    setSendState({ path: forPath, sending: true, error: null });
-    liveApi.artifacts
-      .sendInteraction({
-        workspaceId,
-        path: forPath,
-        version: pending.version,
-        text: pending.text,
-        ...(pending.data !== undefined ? { data: pending.data } : {}),
-      })
-      .then((result) => {
-        if (result.success) {
-          clearPending(forPath);
-          setSendState({ path: forPath, sending: false, error: null });
-        } else {
-          setSendState({ path: forPath, sending: false, error: result.error });
-        }
-      })
-      .catch((error: unknown) => {
-        setSendState({ path: forPath, sending: false, error: getErrorMessage(error) });
-      });
+    if (pending != null) deliver(target.path, pending);
   };
   const ownState = sendState.path === target.path ? sendState : { sending: false, error: null };
   // Dismissing while the send is in flight would let a late failure land on a newer strip.
