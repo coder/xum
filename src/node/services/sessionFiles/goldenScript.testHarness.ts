@@ -6,7 +6,7 @@
  * same files after a downgrade. This harness drives a fixed script of public HistoryService calls
  * and takes a snapshot of the folder after each step: the exact recursive listing and the content
  * of every file. historyFiles.golden.test.ts compares the snapshots with a fixture recorded on the
- * code before the move. The call-trace test (PR 2) reuses STEPS and runGoldenScript.
+ * code before the move. The call-trace test (historyFiles.trace.test.ts) runs the same STEPS.
  *
  * Every input is fixed (ids, timestamps, the cancellation nonce), so only the values listed in
  * RANDOM_FIELDS differ between runs.
@@ -223,7 +223,40 @@ export const STEPS: readonly GoldenStep[] = [
       expectOk(await historyService.writePartial(workspaceId, partial), "writePartial");
     },
   },
+  {
+    name: "h. accept one row (guarded append), then two rows (staged publication)",
+    async run({ historyService, workspaceId }) {
+      // Only an accepted replacement passes a publication observer, so this is the public path to
+      // the guarded append (one row) and to the staged publication (several rows). Ordinary input
+      // (preserveCancellation) keeps the Stop of step e in place.
+      const batches = [
+        [message("user-2", "user", "One more", 6)],
+        [message("user-3", "user", "And two", 7), message("user-4", "user", "rows", 8)],
+      ];
+      for (const messages of batches) {
+        const capture = await historyService.captureCompactionReplacement(workspaceId);
+        assert(capture.success, "captureCompactionReplacement failed");
+        const accepted = await historyService.acceptCompactionReplacement(
+          workspaceId,
+          capture.data,
+          { kind: "append", messages, preserveCancellation: true },
+          { isCurrent: () => true, onCommitted: () => undefined }
+        );
+        expectOk(accepted, "acceptCompactionReplacement");
+        assert(accepted.success && accepted.data.kind === "accepted", "the rows were not accepted");
+      }
+    },
+  },
 ];
+
+/** The context that runGoldenScript gives every step. */
+export function goldenStepContext(
+  historyService: HistoryService,
+  config: Config
+): GoldenStepContext {
+  const workspaceId = GOLDEN_WORKSPACE_ID;
+  return { historyService, workspaceId, sessionDir: path.join(config.sessionsDir, workspaceId) };
+}
 
 /**
  * The only values that change from run to run. Every other byte must match. A path segment "*"
@@ -303,12 +336,11 @@ export async function runGoldenScript(
   config: Config,
   steps: readonly GoldenStep[]
 ): Promise<GoldenSnapshot[]> {
-  const workspaceId = GOLDEN_WORKSPACE_ID;
-  const sessionDir = path.join(config.sessionsDir, workspaceId);
+  const context = goldenStepContext(historyService, config);
   const snapshots: GoldenSnapshot[] = [];
   for (const step of steps) {
-    await step.run({ historyService, workspaceId, sessionDir });
-    snapshots.push(await snapshotFolder(step.name, sessionDir));
+    await step.run(context);
+    snapshots.push(await snapshotFolder(step.name, context.sessionDir));
   }
   return snapshots;
 }
