@@ -15,6 +15,7 @@
 import {
   readCustomInstructionsRecord,
   readSkillIndexRecord,
+  readToolInstructionsRecord,
   readVolatileSystemTailRecord,
 } from "@/node/utils/messages/volatileSystemTail";
 import * as fs from "node:fs/promises";
@@ -859,6 +860,7 @@ export async function replayVerifySession(params: {
         volatileSystemTail: readVolatileSystemTailRecord(turn.message),
         customInstructions: readCustomInstructionsRecord(turn.message),
         skillIndex: readSkillIndexRecord(turn.message),
+        toolInstructions: readToolInstructionsRecord(turn.message),
         planContentForTransition,
         planFilePath: envelope.data.planTransitionFilePath,
         postCompactionAttachments,

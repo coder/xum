@@ -1182,6 +1182,147 @@ describe("assemblePromptPayload", () => {
       );
     });
 
+    test("a model or agent switch re-freezes the instruction blocks instead of a row", async () => {
+      // F30a: the new model's (or agent's) sections replace the old ones in the system prompt.
+      // Each model has its own cache, and an agent switch changes <agent-instructions> before
+      // the blocks, so this costs no cache; a same-model, same-agent change is still a row.
+      const block = (tag: string) =>
+        `\n<custom-instructions>\nRule\n</custom-instructions>\n<${tag}>\nx\n</${tag}>`;
+      const send = (live: string, history: MuxMessage[], route: object = {}) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable + live,
+          instructionsSection: { prefix: stable, block: live },
+          ...route,
+        });
+      const opusRow = createMuxMessage("a1", "assistant", "answer", {
+        model: "anthropic:claude-opus-5-5",
+        agentId: "exec",
+        routeProvider: "anthropic",
+        customInstructions: { text: block("model-opus"), placement: "system" },
+      });
+      const history = [
+        createMuxMessage("u1", "user", "first"),
+        opusRow,
+        createMuxMessage("u2", "user", "second"),
+      ];
+      const sonnet = { modelString: "anthropic:claude-sonnet-5-5" };
+      // Codex PRRT_kwDOPxxmWM6vjdlK: the same canonical model on another route is a switch too
+      // (the model section's tag holds the raw model string).
+      const coder = { modelString: "coder:anthropic/claude-opus-5-5", routeProvider: "coder" };
+      for (const [live, route] of [
+        [block("model-sonnet"), sonnet],
+        [block("mode-plan"), { effectiveAgentId: "plan" }],
+        [block("model-coder:anthropic/claude-opus-5-5"), coder],
+      ] as const) {
+        const switched = await send(live, history, route);
+        expect(switched.messages[0]).toMatchObject({ role: "system", content: stable + live });
+        expect(switched.messages.filter((message) => message.role === "system")).toHaveLength(1);
+        expect(switched.customInstructions).toEqual({ text: live, placement: "system" });
+        // The replay verifier rebuilds the same request from the turn's record.
+        const replayed = await send(live, history, {
+          ...route,
+          replayedTurn: { customInstructions: switched.customInstructions },
+        });
+        expect(withoutMarkers(replayed.messages)).toBe(withoutMarkers(switched.messages));
+      }
+      const sameModel = await send(block("model-opus-v2"), history);
+      expect(sameModel.customInstructions?.placement).toBe("row");
+
+      // Codex PRRT_kwDOPxxmWM6vjONA: a switch with no new edit after that row turn still folds
+      // the row's blocks into the system prompt instead of keeping the stale frozen ones.
+      const rowTurn = [
+        ...history,
+        createMuxMessage("a2", "assistant", "answer", {
+          model: "anthropic:claude-opus-5-5",
+          agentId: "exec",
+          customInstructions: sameModel.customInstructions,
+        }),
+        createMuxMessage("u3", "user", "third"),
+      ];
+      const live = block("model-opus-v2");
+      const folded = await send(live, rowTurn, sonnet);
+      expect(folded.messages[0]).toMatchObject({ role: "system", content: stable + live });
+      expect(folded.messages.filter((message) => message.role === "system")).toHaveLength(1);
+      expect(folded.customInstructions).toEqual({ text: live, placement: "system" });
+      const replayed = await send(live, rowTurn, {
+        ...sonnet,
+        replayedTurn: { customInstructions: folded.customInstructions },
+      });
+      expect(withoutMarkers(replayed.messages)).toBe(withoutMarkers(folded.messages));
+      // With nothing to fold, a switch changes nothing and records nothing.
+      const unchanged = await send(block("model-opus"), history, sonnet);
+      expect(unchanged.customInstructions).toBeUndefined();
+    });
+
+    test("a Tool: section change keeps the frozen tool descriptions and sends a row", async () => {
+      // Codex PRRT_kwDOPxxmWM6vgBAW: getToolsForModel appends each tool's Tool: section to its
+      // description, inside the cached tool block. A change is a row; the block stays.
+      const send = (
+        instructions: Record<string, string>,
+        history: MuxMessage[],
+        replayedTurn?: { toolInstructions?: VolatileSystemTailRecord }
+      ) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable,
+          ...(replayedTurn == null && {
+            tools: Object.fromEntries(
+              ["bash", "first"].map((name) => [
+                name,
+                tool({
+                  description: `Run ${name}.${instructions[name] ? `\n\n${instructions[name]}` : ""}`,
+                  inputSchema: jsonSchema({ type: "object" }),
+                }),
+              ])
+            ),
+            toolInstructions: instructions,
+          }),
+          replayedTurn,
+        });
+      const descriptions = (payload: Awaited<ReturnType<typeof send>>) =>
+        Object.values(payload.tools ?? {}).map((entry) => entry.description);
+      const turnRow = (id: string, payload: Awaited<ReturnType<typeof send>>) =>
+        createMuxMessage(id, "assistant", `answer ${id}`, {
+          toolInstructions: payload.toolInstructions,
+        });
+      const [u1, u2, u3] = ["first", "second", "third"].map((text, index) =>
+        createMuxMessage(`u${index + 1}`, "user", text)
+      );
+      const start = await send({ bash: "Use rg." }, [u1]);
+      expect(start.toolInstructions?.placement).toBe("system");
+      const history = [u1, turnRow("a1", start), u2];
+
+      // bash's section changes and first gets one: both descriptions keep the frozen text.
+      const changed = await send({ bash: "Use fd.", first: "Be brief." }, history);
+      expect(descriptions(changed)).toEqual(descriptions(start));
+      const row = JSON.stringify(changed.messages.at(-1));
+      expect(row).toContain('<tool-instructions tool=\\"bash\\">\\nUse fd.');
+      expect(row).toContain('<tool-instructions tool=\\"first\\">\\nBe brief.');
+      expect(changed.toolInstructions?.placement).toBe("row");
+      const replayed = await send({}, history, { toolInstructions: changed.toolInstructions });
+      expect(withoutMarkers(replayed.messages)).toBe(withoutMarkers(changed.messages));
+
+      // The next turn puts the row back in place and adds none.
+      const next = await send({ bash: "Use fd.", first: "Be brief." }, [
+        ...history,
+        turnRow("a2", changed),
+        u3,
+      ]);
+      expect(next.toolInstructions).toBeUndefined();
+      expect(descriptions(next)).toEqual(descriptions(start));
+      expect(withoutMarkers(next.messages.slice(0, changed.messages.length))).toBe(
+        withoutMarkers(changed.messages)
+      );
+
+      // No Tool: section any more: the frozen text stays, a row says so.
+      const removed = await send({}, history);
+      expect(descriptions(removed)).toEqual(descriptions(start));
+      expect(JSON.stringify(removed.messages.at(-1))).toContain("no tool has Tool: instructions");
+    });
+
     test("a compaction boundary starts a new segment with the live tail", async () => {
       const boundary = createMuxMessage("boundary", "assistant", "Compacted summary", {
         compacted: "user",

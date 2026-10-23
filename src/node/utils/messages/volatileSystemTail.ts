@@ -68,6 +68,8 @@ interface SystemSectionChannel {
   header: string;
   /** Suffix of a put-back row's id, and the id of the appended row. */
   rowId: string;
+  /** The row's section for a record's text, when the text is not model-readable as is. */
+  render?: (text: string) => string;
 }
 
 const VOLATILE_TAIL: SystemSectionChannel = {
@@ -105,6 +107,51 @@ const SKILL_INDEX: SystemSectionChannel = {
 /** The skill-index row's text when no skill is listed any more (see INSTRUCTIONS_REMOVED). */
 const SKILL_INDEX_REMOVED = "\n(None: no skills are listed now.)";
 
+/**
+ * The `Tool: <name>` sections of the instruction files, which getToolsForModel appends to
+ * their tool descriptions (the cached tool block). Its record text is the map of each tool in
+ * the request to its instructions, as JSON sorted by tool ("" for none), so the request can
+ * put the frozen ones back in each description; rows show it as tagged blocks.
+ */
+const TOOL_INSTRUCTIONS: SystemSectionChannel = {
+  field: "toolInstructions",
+  header:
+    "The Tool: sections of the workspace custom instructions (AGENTS.md) changed during this session. The blocks below are the current version from Xum, not from the user. Each one replaces the instructions at the end of that tool's description, and a tool not listed has none now: follow them from now on.",
+  rowId: "tool-instructions",
+  render: (text) => {
+    const instructions = parseToolInstructions(text);
+    // The removal marker (or a corrupt record) is sent as is.
+    if (instructions == null) return text;
+    return Object.entries(instructions)
+      .map(([tool, body]) => `\n<tool-instructions tool="${tool}">\n${body}\n</tool-instructions>`)
+      .join("");
+  },
+};
+
+/** The tool-instructions row's text when no tool has instructions any more. */
+const TOOL_INSTRUCTIONS_REMOVED = "\n(None: no tool has Tool: instructions now.)";
+
+/** The record text of a tool-instructions map (see TOOL_INSTRUCTIONS). */
+function serializeToolInstructions(instructions: Record<string, string>): string {
+  const entries = Object.entries(instructions).sort(([a], [b]) => a.localeCompare(b));
+  return entries.length === 0 ? "" : JSON.stringify(Object.fromEntries(entries));
+}
+
+/** The map a tool-instructions text holds; undefined for the removal marker or a corrupt one. */
+export function parseToolInstructions(text: string): Record<string, string> | undefined {
+  if (text === "") return {};
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (!entries.every(([, body]) => typeof body === "string")) return undefined;
+  return Object.fromEntries(entries) as Record<string, string>;
+}
+
 /** The record, or undefined when absent or corrupt (self-healing: a bad record is ignored). */
 function readSectionRecord(
   message: MuxMessage,
@@ -133,12 +180,18 @@ export function readSkillIndexRecord(message: MuxMessage): VolatileSystemTailRec
   return readSectionRecord(message, SKILL_INDEX.field);
 }
 
+export function readToolInstructionsRecord(
+  message: MuxMessage
+): VolatileSystemTailRecord | undefined {
+  return readSectionRecord(message, TOOL_INSTRUCTIONS.field);
+}
+
 function systemRow(id: string, channel: SystemSectionChannel, section: string): MuxMessage {
   return {
     id,
     role: "system",
     // The section starts with its own newline separator (never empty: see planSystemSection).
-    parts: [{ type: "text", text: channel.header + section }],
+    parts: [{ type: "text", text: channel.header + (channel.render?.(section) ?? section) }],
   };
 }
 
@@ -287,14 +340,21 @@ export function planCustomInstructions(
   messages: MuxMessage[],
   requestBlock: string,
   rowsSupported: boolean,
-  replayedTurn?: { record?: VolatileSystemTailRecord }
+  replayedTurn?: { record?: VolatileSystemTailRecord },
+  /**
+   * The request switches model or agent: a change re-freezes instead of becoming a row. The
+   * blocks hold the `<model-...>`/`<mode-...>` sections of the previous model or agent, and
+   * the switch already rewrites the cache (see turnContextAssembler's switchesModelOrAgent).
+   */
+  refreeze = false
 ): VolatileSystemTailPlan {
   return planRemovableSection(
     { ...CUSTOM_INSTRUCTIONS, removed: INSTRUCTIONS_REMOVED },
     messages,
     requestBlock,
     rowsSupported,
-    replayedTurn
+    replayedTurn,
+    refreeze
   );
 }
 
@@ -310,7 +370,8 @@ function planRemovableSection(
   messages: MuxMessage[],
   requestSection: string,
   rowsSupported: boolean,
-  replayedTurn: { record?: VolatileSystemTailRecord } | undefined
+  replayedTurn: { record?: VolatileSystemTailRecord } | undefined,
+  refreeze = false
 ): VolatileSystemTailPlan {
   if (replayedTurn) return planSystemSection(channel, messages, "", rowsSupported, replayedTurn);
   const removed = requestSection === "";
@@ -327,7 +388,7 @@ function planRemovableSection(
     if (appliedTail === "") return withRows;
   }
   const live = removed ? channel.removed : requestSection;
-  const plan = planSystemSection(channel, messages, live, rowsSupported, undefined);
+  const plan = planSystemSection(channel, messages, live, rowsSupported, undefined, refreeze);
   // A re-freeze after a removal freezes "no section", not the marker.
   return plan.systemTail === channel.removed ? { ...plan, systemTail: "" } : plan;
 }
@@ -353,12 +414,45 @@ export function planSkillIndex(
   );
 }
 
+/**
+ * planSkillIndex for the `Tool: <name>` instructions at the end of the tool descriptions:
+ * `systemTail` is the frozen map's text (parseToolInstructions reads it). Runs after
+ * planSkillIndex and before planVolatileSystemTail, in their row order.
+ */
+export function planToolInstructions(
+  messages: MuxMessage[],
+  requestInstructions: Record<string, string>,
+  rowsSupported: boolean,
+  replayedTurn?: { record?: VolatileSystemTailRecord }
+): VolatileSystemTailPlan {
+  return planRemovableSection(
+    { ...TOOL_INSTRUCTIONS, removed: TOOL_INSTRUCTIONS_REMOVED },
+    messages,
+    serializeToolInstructions(requestInstructions),
+    rowsSupported,
+    replayedTurn
+  );
+}
+
+/**
+ * Whether this request folds the live section and the earlier rows into the system prompt: a
+ * caller's re-freeze, and on replay a turn that recorded one (a "system" record after the
+ * freeze is only ever that). With nothing to fold it changes nothing and records nothing.
+ */
+function refreezes(
+  replayedTurn: { record?: VolatileSystemTailRecord } | undefined,
+  refreeze: boolean
+): boolean {
+  return replayedTurn ? replayedTurn.record?.placement === "system" : refreeze;
+}
+
 function planSystemSection(
   channel: SystemSectionChannel,
   messages: MuxMessage[],
   requestTail: string,
   rowsSupported: boolean,
-  replayedTurn: { record?: VolatileSystemTailRecord } | undefined
+  replayedTurn: { record?: VolatileSystemTailRecord } | undefined,
+  refreeze = false
 ): VolatileSystemTailPlan {
   if (!rowsSupported) return { systemTail: requestTail, messages, rowsText: "" };
   const restored = restoreFrozenSegment(messages, channel);
@@ -373,6 +467,13 @@ function planSystemSection(
   };
   if (restored == null) return asBefore;
   const { appliedTail, ...withRows } = restored;
+  // Before the no-change check: a switch with no new edit still folds an earlier row.
+  if (
+    refreezes(replayedTurn, refreeze) &&
+    (liveTail !== withRows.systemTail || withRows.rowsText)
+  ) {
+    return asBefore;
+  }
   if (liveTail === appliedTail) return withRows;
   // A row must follow a user message. Otherwise (a resume after an assistant row) send the new
   // tail as before, which re-freezes the segment at it.
