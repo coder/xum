@@ -34,7 +34,7 @@ function expectCspFirst(srcdoc: string) {
 describe("artifact CSP", () => {
   test("matches the agreed policy exactly", () => {
     expect(buildArtifactCsp({ allowCdn: true })).toBe(
-      "default-src 'none'; script-src 'unsafe-inline' https://cdnjs.cloudflare.com https://unpkg.com https://cdn.tailwindcss.com https://code.jquery.com https://cdn.jsdelivr.net/npm/; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src data: https://fonts.gstatic.com; img-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-src 'none'"
+      "default-src 'none'; script-src 'unsafe-inline' https://cdnjs.cloudflare.com https://unpkg.com https://cdn.tailwindcss.com https://code.jquery.com https://cdn.jsdelivr.net/npm/; style-src 'unsafe-inline' https://cdnjs.cloudflare.com https://unpkg.com https://cdn.tailwindcss.com https://code.jquery.com https://cdn.jsdelivr.net/npm/ https://fonts.googleapis.com; font-src data: https://cdnjs.cloudflare.com https://unpkg.com https://cdn.tailwindcss.com https://code.jquery.com https://cdn.jsdelivr.net/npm/ https://fonts.gstatic.com; img-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-src 'none'"
     );
     expect(buildArtifactCsp({ allowCdn: false })).toBe(
       "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src data:; img-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-src 'none'"
@@ -157,6 +157,22 @@ describe("inlineArtifactHtmlAssets", () => {
     const doc = parseArtifactHtml('<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>');
     expect(await inlineArtifactHtmlAssets(doc, loader, { allowCdn: false })).toEqual([
       "External asset blocked: https://cdn.jsdelivr.net/npm/chart.js",
+    ]);
+  });
+
+  test("lets CDN stylesheets load only while CDN assets are on", async () => {
+    const loader = createArtifactAssetLoader("index.html", () => Promise.resolve(null));
+    const cdnCss =
+      "https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.12.0/styles/github.min.css";
+    const html = `<link rel="stylesheet" href="${cdnCss}"><link rel="stylesheet" href="https://evil.example/x.css">`;
+    expect(
+      await inlineArtifactHtmlAssets(parseArtifactHtml(html), loader, { allowCdn: true })
+    ).toEqual(["External asset blocked: https://evil.example/x.css"]);
+    expect(
+      (await inlineArtifactHtmlAssets(parseArtifactHtml(html), loader, { allowCdn: false })).sort()
+    ).toEqual([
+      `External asset blocked: ${cdnCss}`,
+      "External asset blocked: https://evil.example/x.css",
     ]);
   });
 
