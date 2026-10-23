@@ -129,7 +129,10 @@ export interface ContainerMutationState {
  */
 export async function readMutationEpochToken(stagingRoot: string): Promise<string | undefined> {
   try {
-    return await nodeHostFiles.promises.readFile(path.join(stagingRoot, MUTATION_EPOCH_FILE), "utf-8");
+    return await nodeHostFiles.promises.readFile(
+      path.join(stagingRoot, MUTATION_EPOCH_FILE),
+      "utf-8"
+    );
   } catch (error) {
     // hasErrorCode, not `instanceof Error`: under babel-jest's vm sandbox,
     // fs errors come from another realm and fail instanceof — every missing
