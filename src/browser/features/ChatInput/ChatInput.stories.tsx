@@ -12,6 +12,9 @@ import {
   waitForChatInputAutofocusDone,
 } from "@/browser/stories/storyPlayHelpers.js";
 import { expect, within, userEvent, waitFor } from "storybook/test";
+import { wrapAsyncIterator } from "@orpc/shared";
+import type { ProviderConfigInfo } from "@/common/orpc/types";
+import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { textContrasts } from "@/browser/stories/helpers/contrast";
@@ -48,19 +51,36 @@ export const VoiceInputNoApiKey: AppStory = {
   },
 };
 
-/** Transcription resolves OpenAI keys from env vars and key files too, so those enable the mic. */
+// Set by VoiceInputEnvApiKey's mock client; its play calls it to drop the key mid-story.
+let leaveOnlyCodexOauth: (() => void) | undefined;
+
+/**
+ * Transcription resolves OpenAI keys from env vars and key files too, so those enable the mic.
+ * Codex OAuth alone cannot transcribe, so once only OAuth is left the mic is disabled again even
+ * though the provider still reports isConfigured.
+ */
 export const VoiceInputEnvApiKey: AppStory = {
   render: () => (
     <AppWithMocks
-      setup={() =>
-        setupSimpleChatStory({
-          workspaceId: "ws-voice-env-key",
-          messages: [],
-          providersConfig: {
-            openai: { apiKeySet: false, apiKeySource: "env", isEnabled: true, isConfigured: true },
-          },
-        })
-      }
+      setup={() => {
+        let openai: ProviderConfigInfo = {
+          apiKeySet: false,
+          apiKeySource: "env",
+          isEnabled: true,
+          isConfigured: true,
+        };
+        const client = setupSimpleChatStory({ workspaceId: "ws-voice-env-key", messages: [] });
+        const changes = createAsyncMessageQueue<void>();
+        client.providers.getConfig = () => Promise.resolve({ openai });
+        client.providers.onConfigChanged = () =>
+          Promise.resolve(wrapAsyncIterator(changes.iterate(), {}));
+        leaveOnlyCodexOauth = () => {
+          // What providerService.getConfig reports for OpenAI with only Codex OAuth tokens.
+          openai = { apiKeySet: false, codexOauthSet: true, isEnabled: true, isConfigured: true };
+          changes.push();
+        };
+        return client;
+      }}
     />
   ),
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
@@ -70,6 +90,11 @@ export const VoiceInputEnvApiKey: AppStory = {
     const mic = await canvas.findByRole("button", { name: /^Voice input/ });
     await waitFor(() => expect(mic).toHaveAccessibleName("Voice input"));
     await expect(mic).toBeEnabled();
+
+    if (!leaveOnlyCodexOauth) throw new Error("mock client was not set up");
+    leaveOnlyCodexOauth();
+    await waitFor(() => expect(mic).toHaveAccessibleName("Voice input (not configured)"));
+    await expect(mic).toBeDisabled();
   },
 };
 
