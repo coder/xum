@@ -30,6 +30,18 @@ export const THINKING_DISPLAY_LABELS: Record<ThinkingLevel, string> = {
 };
 
 /**
+ * OpenAI ids (`openai:` or a gateway's `openai/` model), plus a bare native-max
+ * id: a mappedToModel target written without a provider. The thinking policy
+ * matches that bare id by name, so its labels must too, or xhigh and max both
+ * read MAX.
+ */
+function usesOpenAIThinkingLabels(normalized: string): boolean {
+  if (normalized.startsWith("openai:")) return true;
+  if (normalized.replace(/^[a-z0-9_-]+:\s*/, "").startsWith("openai/")) return true;
+  return !normalized.includes(":") && openaiSupportsNativeMaxEffort(normalized);
+}
+
+/**
  * Display label for thinking levels, with provider-aware xhigh labeling.
  *
  * Models with a native "xhigh" effort level (OpenAI, Anthropic Opus 4.7+,
@@ -40,16 +52,10 @@ export const THINKING_DISPLAY_LABELS: Record<ThinkingLevel, string> = {
  */
 export function getThinkingDisplayLabel(level: ThinkingLevel, modelString?: string): string {
   if ((level === "xhigh" || level === "max") && modelString) {
-    const normalized = modelString.trim().toLowerCase();
-    const withoutPrefix = normalized.replace(/^[a-z0-9_-]+:\s*/, "");
-
     // OpenAI: both xhigh and max resolve to "xhigh" reasoning effort, except on
     // native-max models (the GPT-6 tiers and the GPT-5.6 family), where "max"
-    // is a distinct native effort above xhigh. A bare native-max id (a
-    // mappedToModel target written without a provider) is matched by name, as
-    // the thinking policy matches it, so its two top levels stay distinct.
-    const bareNativeMax = !normalized.includes(":") && openaiSupportsNativeMaxEffort(normalized);
-    if (normalized.startsWith("openai:") || withoutPrefix.startsWith("openai/") || bareNativeMax) {
+    // is a distinct native effort above xhigh.
+    if (usesOpenAIThinkingLabels(modelString.trim().toLowerCase())) {
       if (level === "max" && openaiSupportsNativeMaxEffort(modelString)) return "MAX";
       return "XHIGH";
     }
