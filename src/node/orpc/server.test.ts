@@ -322,7 +322,7 @@ interface RawResponse {
 function rawRequest(
   baseUrl: string,
   urlPath: string,
-  options: { method?: string; headers?: Record<string, string> } = {}
+  options: { method?: string; headers?: Record<string, string>; body?: Buffer } = {}
 ): Promise<RawResponse> {
   return new Promise((resolve, reject) => {
     const req = http.request(
@@ -342,7 +342,7 @@ function rawRequest(
       }
     );
     req.on("error", reject);
-    req.end();
+    req.end(options.body);
   });
 }
 
@@ -381,6 +381,72 @@ function varyIncludesAcceptEncoding(headers: http.IncomingHttpHeaders): boolean 
       .includes("accept-encoding") ?? false
   );
 }
+
+describe("createOrpcServer compressed request bodies", () => {
+  // CVE-2026-111497: body-parser runs before auth and would inflate a br body with Node's
+  // Brotli decoder, so the server must refuse every compressed body without decoding it.
+  async function postWait(
+    contentType: string,
+    body: Buffer,
+    contentEncoding?: string
+  ): Promise<{ status: number; flowIds: string[] }> {
+    const flowIds: string[] = [];
+    const context: Partial<ORPCContext> = {
+      serverAuthService: {
+        waitForGithubDeviceFlow: (flowId: string) => {
+          flowIds.push(flowId);
+          return Promise.resolve({ success: false, error: "stub" });
+        },
+        cancelGithubDeviceFlow: () => undefined,
+      } as unknown as ORPCContext["serverAuthService"],
+    };
+    // The server requires a token and the request sends none: the 415 must come from body-parser,
+    // which an unauthenticated client reaches.
+    const server = await createOrpcServer({
+      host: "127.0.0.1",
+      port: 0,
+      authToken: "test-token",
+      context: context as ORPCContext,
+    });
+    try {
+      const headers: Record<string, string> = { "Content-Type": contentType };
+      if (contentEncoding !== undefined) headers["Content-Encoding"] = contentEncoding;
+      const res = await rawRequest(server.baseUrl, "/auth/server-login/github/wait", {
+        method: "POST",
+        headers,
+        body,
+      });
+      return { status: res.status, flowIds };
+    } finally {
+      await server.close();
+    }
+  }
+
+  const json = Buffer.from(JSON.stringify({ flowId: "flow-1" }));
+  const form = Buffer.from("flowId=flow-1");
+
+  test.each([
+    ["br JSON", "application/json", zlib.brotliCompressSync(json), "br"],
+    ["br form", "application/x-www-form-urlencoded", zlib.brotliCompressSync(form), "br"],
+    ["gzip JSON", "application/json", zlib.gzipSync(json), "gzip"],
+  ] as const)(
+    "refuses a %s body with 415 before auth and before the route",
+    async (_name, contentType, body, encoding) => {
+      const result = await postWait(contentType, body, encoding);
+      expect(result.status).toBe(415);
+      expect(result.flowIds).toEqual([]);
+    }
+  );
+
+  test.each([
+    ["JSON", "application/json", json],
+    ["form", "application/x-www-form-urlencoded", form],
+  ] as const)("still parses an uncompressed %s body", async (_name, contentType, body) => {
+    const result = await postWait(contentType, body);
+    expect(result.status).not.toBe(415);
+    expect(result.flowIds).toEqual(["flow-1"]);
+  });
+});
 
 describe("createOrpcServer hashed static asset compression", () => {
   const HASHED_JS = "main-AbCd1234.js";
