@@ -118,7 +118,8 @@ export interface RecordArtifactVersionParams {
   pin?: ArtifactPin | null;
   nowMs?: number;
   /** Checked under the index lock: an aborted publish writes nothing. */
-  abortSignal?: AbortSignal; /** The session locks (phase 4); callers outside the session lock owners keep the Node layer. */
+  abortSignal?: AbortSignal;
+  /** The session locks (phase 4); every caller today keeps the Node layer. */
   locks?: SessionLocks;
 }
 

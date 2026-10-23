@@ -1744,18 +1744,18 @@ async function acquireWorkflowCrossProcessLock(
   });
 }
 
-/**
- * #4452 gap 1: the former mkdir locks were reclaimed once their mtime aged past the stale window,
- * which a live holder stalled inside its owner-check-then-write section never refreshed, and every
- * finally removed the lock unconditionally, deleting a successor's. crossProcessLock never takes a
- * lock from a live holder and its release removes only its own record.
- */
 interface WorkflowLockOptions {
   staleMs: number;
   acquireTimeoutMs: number;
   locks: SessionLocks;
 }
 
+/**
+ * #4452 gap 1: the former mkdir locks were reclaimed once their mtime aged past the stale window,
+ * which a live holder stalled inside its owner-check-then-write section never refreshed, and every
+ * finally removed the lock unconditionally, deleting a successor's. crossProcessLock never takes a
+ * lock from a live holder and its release removes only its own record.
+ */
 async function withWorkflowFileLock<T>(
   lockPath: string,
   options: WorkflowLockOptions,
