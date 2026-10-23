@@ -86,6 +86,13 @@ const CUSTOM_INSTRUCTIONS: SystemSectionChannel = {
   rowId: "custom-instructions",
 };
 
+/**
+ * The section text a row sends when the instruction files no longer produce any block (the
+ * only AGENTS.md was deleted or emptied): the frozen blocks stay in the system prompt, so the
+ * model must learn they are gone. A system prompt never carries it (planCustomInstructions).
+ */
+const INSTRUCTIONS_REMOVED = "\n(None: the custom instructions were removed.)";
+
 /** The record, or undefined when absent or corrupt (self-healing: a bad record is ignored). */
 function readSectionRecord(
   message: MuxMessage,
@@ -271,9 +278,21 @@ export function planCustomInstructions(
   if (replayedTurn) {
     return planSystemSection(CUSTOM_INSTRUCTIONS, messages, "", rowsSupported, replayedTurn);
   }
-  // No blocks: send none and record nothing.
-  if (requestBlock === "") return none;
-  return planSystemSection(CUSTOM_INSTRUCTIONS, messages, requestBlock, rowsSupported, undefined);
+  // No blocks now: as before (none sent, nothing recorded) unless the segment froze some.
+  // Then their removal is a change like any other, sent as a row until the next compaction.
+  const removed = requestBlock === "";
+  if (removed && (!rowsSupported || restoreFrozenSegment(messages, CUSTOM_INSTRUCTIONS) == null)) {
+    return none;
+  }
+  const plan = planSystemSection(
+    CUSTOM_INSTRUCTIONS,
+    messages,
+    removed ? INSTRUCTIONS_REMOVED : requestBlock,
+    rowsSupported,
+    undefined
+  );
+  // A re-freeze after a removal freezes "no blocks", not the marker.
+  return plan.systemTail === INSTRUCTIONS_REMOVED ? { ...plan, systemTail: "" } : plan;
 }
 
 function planSystemSection(

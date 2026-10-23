@@ -1017,6 +1017,44 @@ describe("assemblePromptPayload", () => {
       );
     });
 
+    test("a removed AGENTS.md keeps the frozen block and sends the removal as a row", async () => {
+      // Codex P2 PRRT_kwDOPxxmWM6vffU2: the only instruction file is deleted mid-segment. The
+      // system prompt keeps the frozen block (no rewrite), and a row says it is gone.
+      const block = "\n<custom-instructions>\nRule v1\n</custom-instructions>";
+      const send = (live: string, history: MuxMessage[]) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage:
+            stable + live + "\n\n<additional-instructions>\nx\n</additional-instructions>",
+          instructionsSection: { prefix: stable, block: live },
+        });
+      const turnRow = (id: string, payload: Awaited<ReturnType<typeof send>>) =>
+        createMuxMessage(id, "assistant", `answer ${id}`, {
+          customInstructions: payload.customInstructions,
+        });
+      const [u1, u2, u3] = ["first", "second", "third"].map((text, index) =>
+        createMuxMessage(`u${index + 1}`, "user", text)
+      );
+      // Old data: a history without a record sends no block and records nothing, as before.
+      const oldData = await send("", [u1]);
+      expect(oldData.customInstructions).toBeUndefined();
+      expect(JSON.stringify(oldData.messages)).not.toContain("custom instructions were removed");
+
+      const start = await send(block, [u1]);
+      const history = [u1, turnRow("a1", start), u2];
+      const removed = await send("", history);
+      expect(withoutMarkers([removed.messages[0]])).toBe(withoutMarkers([start.messages[0]]));
+      expect(JSON.stringify(removed.messages.at(-1))).toContain("custom instructions were removed");
+      expect(removed.customInstructions?.placement).toBe("row");
+      // The next turn repeats the row in place and adds none.
+      const next = await send("", [...history, turnRow("a2", removed), u3]);
+      expect(next.customInstructions).toBeUndefined();
+      expect(withoutMarkers(next.messages.slice(0, removed.messages.length))).toBe(
+        withoutMarkers(removed.messages)
+      );
+    });
+
     test("a compaction boundary starts a new segment with the live tail", async () => {
       const boundary = createMuxMessage("boundary", "assistant", "Compacted summary", {
         compacted: "user",
