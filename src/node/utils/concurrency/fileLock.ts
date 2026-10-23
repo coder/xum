@@ -305,9 +305,7 @@ export async function acquireProcessFileLock(
       }
       const blocker = await reclaimStaleFileLock(lockPath, label, 0, options.testOnlyReclaimSeam);
       if (Date.now() >= deadline) {
-        throw new Error(
-          `Timed out acquiring ${label} ${lockPath} after ${timeoutMs}ms.${describeBlocker(blocker)}`
-        );
+        throw new Error(fileLockTimeoutMessage(label, lockPath, timeoutMs, blocker));
       }
       await new Promise((resolve) =>
         setTimeout(resolve, FILE_LOCK_RETRY_MS + Math.random() * FILE_LOCK_RETRY_MS)
@@ -361,13 +359,14 @@ async function assertLockOwned(lockPath: string, token: string, label: string): 
 }
 
 /** Why an observed lock was not reclaimed; the timeout error reports the last one. */
-interface Blocker {
+export interface FileLockBlocker {
   /** Absent for a malformed token (no owner to name). */
   holder?: HolderEvidence;
   why: string;
   /** What is held, when not the lock itself (its reclaim guard). */
   subject?: string;
 }
+type Blocker = FileLockBlocker;
 
 /**
  * Judge the lock's owner by the shared rule (see processLiveness.judgeHolder):
@@ -403,6 +402,19 @@ function describeBlocker(blocker: Blocker | undefined): string {
     `${hostname != null ? ` on ${hostname}` : ""}) and was not taken over because ` +
     `${blocker.why}. Stop that process to free the lock.`
   );
+}
+
+/**
+ * The text of an acquire timeout. Exported so the SessionLocks test layers
+ * refuse with today's text, byte for byte.
+ */
+export function fileLockTimeoutMessage(
+  label: string,
+  lockPath: string,
+  timeoutMs: number,
+  blocker: FileLockBlocker | undefined
+): string {
+  return `Timed out acquiring ${label} ${lockPath} after ${timeoutMs}ms.${describeBlocker(blocker)}`;
 }
 
 /** True when the lockfile's mtime is older than the stale-lock lease. */

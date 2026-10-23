@@ -92,12 +92,17 @@ import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArc
 import type { AppFiberScopeTag } from "./appFiberScope";
 import type { EffectRunnerTag } from "./effectRunner";
 import type { CoreOptionsTag } from "./layers/core";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 export class ConfigTag extends Context.Service<ConfigTag, Config>()("xum/Config") {}
 export class SessionLocatorTag extends Context.Service<
   SessionLocatorTag,
   WorkspaceSessionLocator
 >()("xum/SessionLocator") {}
+/** Every lock that guards a session write (phase 4); StoresLive gives the Node layer. */
+export class SessionLocksTag extends Context.Service<SessionLocksTag, SessionLocks>()(
+  "xum/SessionLocks"
+) {}
 export class ProvidersConfigStoreTag extends Context.Service<
   ProvidersConfigStoreTag,
   ProvidersConfigStore
@@ -312,6 +317,7 @@ export class BashAiProxy extends Context.Service<BashAiProxy, BashAiProxyService
 export type StoreTags =
   | ConfigTag
   | SessionLocatorTag
+  | SessionLocksTag
   | ProvidersConfigStoreTag
   | SecretsStoreTag
   | FileLeaseManagerTag;
