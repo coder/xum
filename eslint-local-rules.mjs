@@ -617,6 +617,148 @@ const localPlugin = {
         };
       },
     },
+    "no-host-imports": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            "Disallow value imports of host modules (fs, os, net, child_process, electron, disk helpers, concrete runtimes) in agent-loop code",
+        },
+        schema: [
+          {
+            type: "object",
+            properties: {
+              // Canonical specifiers ("fs/promises", "@/node/utils/writeFileAtomic"), or a module
+              // with the value exports that count as host access.
+              modules: {
+                type: "array",
+                items: {
+                  anyOf: [
+                    { type: "string" },
+                    {
+                      type: "object",
+                      properties: {
+                        module: { type: "string" },
+                        names: { type: "array", items: { type: "string" } },
+                      },
+                      required: ["module", "names"],
+                      additionalProperties: false,
+                    },
+                  ],
+                },
+              },
+              // Repo-relative file -> canonical specifiers it still imports (the debt of today).
+              allow: {
+                type: "object",
+                additionalProperties: { type: "array", items: { type: "string" } },
+              },
+            },
+            additionalProperties: false,
+          },
+        ],
+        messages: {
+          host:
+            '"{{module}}" gives host access. Get it from an Effect service ' +
+            "(use one, or add one with a Node layer and a test layer), " +
+            "not by an import in an agent-loop file.",
+          stale:
+            'This file no longer imports "{{module}}". Remove it from the local/no-host-imports allow map.',
+        },
+      },
+      create(context) {
+        const options = context.options[0] ?? {};
+        const relFile = path.relative(context.cwd, context.filename).split(path.sep).join("/");
+        const allowed = new Set(options.allow?.[relFile] ?? []);
+        const whole = new Set();
+        const named = new Map();
+        for (const entry of options.modules ?? []) {
+          if (typeof entry === "string") whole.add(entry);
+          else named.set(entry.module, new Set(entry.names));
+        }
+        // One form per module: "node:" stripped, "@shared/" (an alias of "@/" in tsconfig.json)
+        // and relative paths as "@/...", and no file extension on a repo module.
+        const canonical = (specifier) => {
+          // A Bun query or hash (`?fresh=1`) still loads the module itself.
+          let module = specifier.replace(/[?#].*$/, "");
+          if (module.startsWith("node:")) return module.slice("node:".length);
+          if (module.startsWith("@shared/")) module = "@/" + module.slice("@shared/".length);
+          if (module.startsWith(".")) {
+            const abs = path.resolve(path.dirname(context.filename), module);
+            const fromSrc = path
+              .relative(path.join(context.cwd, "src"), abs)
+              .split(path.sep)
+              .join("/");
+            module = "@/" + fromSrc;
+          }
+          return module.startsWith("@/") ? module.replace(/\.[cm]?[jt]sx?$/, "") : module;
+        };
+        const seen = new Set();
+        // names: the value names taken from the module; null means the whole module.
+        const check = (node, source, names) => {
+          // A string literal, or a template literal without substitutions (`require(\`fs\`)`).
+          const specifier =
+            source?.type === "Literal"
+              ? source.value
+              : source?.type === "TemplateLiteral" && source.expressions.length === 0
+                ? source.quasis[0].value.cooked
+                : null;
+          if (typeof specifier !== "string") return;
+          const module = canonical(specifier);
+          const hostNames = named.get(module);
+          const isHost =
+            whole.has(module) ||
+            (hostNames !== undefined && (names === null || names.some((n) => hostNames.has(n))));
+          if (!isHost) return;
+          seen.add(module);
+          if (!allowed.has(module)) context.report({ node, messageId: "host", data: { module } });
+        };
+        return {
+          ImportDeclaration(node) {
+            if (node.importKind === "type") return;
+            const values = node.specifiers.filter((s) => s.importKind !== "type");
+            if (node.specifiers.length > 0 && values.length === 0) return;
+            const names = values.some((s) => s.type !== "ImportSpecifier")
+              ? null
+              : values.map((s) => s.imported.name ?? s.imported.value);
+            check(node, node.source, node.specifiers.length === 0 ? null : names);
+          },
+          ExportNamedDeclaration(node) {
+            if (node.source == null || node.exportKind === "type") return;
+            // `export {} from "fs"` still loads the module: check it whole.
+            if (node.specifiers.length === 0) return check(node, node.source, null);
+            const values = node.specifiers.filter((s) => s.exportKind !== "type");
+            if (values.length === 0) return;
+            check(
+              node,
+              node.source,
+              values.map((s) => s.local.name ?? s.local.value)
+            );
+          },
+          ExportAllDeclaration(node) {
+            if (node.exportKind !== "type") check(node, node.source, null);
+          },
+          ImportExpression(node) {
+            check(node, node.source, null);
+          },
+          // `import fs = require("fs")` (TypeScript import assignment).
+          TSImportEqualsDeclaration(node) {
+            if (node.importKind === "type") return;
+            if (node.moduleReference.type !== "TSExternalModuleReference") return;
+            check(node, node.moduleReference.expression, null);
+          },
+          CallExpression(node) {
+            if (node.callee.type === "Identifier" && node.callee.name === "require") {
+              check(node, node.arguments[0], null);
+            }
+          },
+          "Program:exit"(node) {
+            for (const module of allowed) {
+              if (!seen.has(module)) context.report({ node, messageId: "stale", data: { module } });
+            }
+          },
+        };
+      },
+    },
     "no-clear-dom-global": {
       meta: {
         type: "problem",

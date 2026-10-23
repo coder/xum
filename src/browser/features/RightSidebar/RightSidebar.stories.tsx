@@ -47,6 +47,9 @@ import {
   selectWorkspace,
 } from "@/browser/stories/helpers/uiState";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
+import { getArtifactKind } from "@/common/utils/artifactKind";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
   RIGHT_SIDEBAR_TAB_KEY,
@@ -61,6 +64,7 @@ import { useEffect, useRef } from "react";
 import type { TabType } from "@/browser/types/rightSidebar";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { RightSidebar } from "./RightSidebar.js";
+import { writeArtifactSelection } from "./ArtifactsTab/artifactSelection";
 
 const meta: Meta = {
   title: "Features/RightSidebar/RightSidebar",
@@ -1751,60 +1755,72 @@ function isHitTarget(element: HTMLElement): boolean {
 }
 
 /**
- * A Windows/Linux titlebar-overlay inset wider than the pane (Linux e2e reported one larger than
- * the whole sidebar) must not squeeze the one-row strip to nothing: tabs stay clickable.
+ * The right sidebar under a Windows/Linux titlebar-overlay inset. The one-row strip must not be
+ * squeezed to nothing, and the selected tab shows whole: capped at the row's width, its label
+ * truncates (#7103). Tabs, "+" and All tabs stay clickable.
  */
-export const TabsReachableUnderWideTitlebarInset: Story = {
-  // Play-only: a regression check, nothing new to look at.
-  parameters: { pixel: PIXEL_DISABLED },
-  render: () => (
-    // On a wrapper, not :root, so the override cannot leak into later stories.
-    <div className="contents" style={{ "--titlebar-right-inset": "2000px" } as CSSProperties}>
-      <RightSidebarStoryShell
-        setup={() => {
-          localStorage.removeItem(RIGHT_SIDEBAR_TAB_KEY);
-          localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "400");
-          seedSidebarLayout("ws-wide-inset", ["costs", "review"], "costs");
-
-          const client = setupSimpleChatStory({
-            workspaceId: "ws-wide-inset",
-            workspaceName: "feature/wide-inset",
-            projectName: "my-app",
-            messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
-          });
-          expandRightSidebar("ws-wide-inset");
-          return client;
-        }}
+function titlebarInsetStory(insetPx: number, sidebarWidthPx: number): Story {
+  const workspaceId = `ws-inset-${insetPx}`;
+  return {
+    // Play-only: a regression check, nothing new to look at.
+    parameters: { pixel: PIXEL_DISABLED },
+    render: () => (
+      // On a wrapper, not :root, so the override cannot leak into later stories.
+      <div
+        className="contents"
+        style={{ "--titlebar-right-inset": `${insetPx}px` } as CSSProperties}
       >
-        <RightSidebarStoryContent workspaceId="ws-wide-inset" />
-      </RightSidebarStoryShell>
-    </div>
-  ),
-  play: async ({ canvasElement }) => {
-    const canvas = within(canvasElement);
-    const stats = await canvas.findByRole("tab", { name: /^stats/i, selected: true });
-    const review = await canvas.findByRole("tab", { name: /^review/i });
-    // The capped inset leaves 10rem for the row, "+", All tabs and the toggle's room, so the
-    // selected Stats tab (with its cost badge) can be cut off at its end. Its start stays in
-    // view and takes the click.
-    // "+" (New tab) and All tabs must stay clickable too.
-    await waitFor(() => {
-      if (!isHitTarget(stats)) throw new Error("selected tab is not under the pointer");
-      for (const name of ["New tab", "All tabs"]) {
-        if (!isHitTarget(canvas.getByRole("button", { name }))) {
-          throw new Error(`${name} is not under the pointer`);
+        <RightSidebarStoryShell
+          setup={() => {
+            localStorage.removeItem(RIGHT_SIDEBAR_TAB_KEY);
+            localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, String(sidebarWidthPx));
+            seedSidebarLayout(workspaceId, ["costs", "review"], "costs");
+
+            const client = setupSimpleChatStory({
+              workspaceId,
+              workspaceName: "feature/wide-inset",
+              projectName: "my-app",
+              messages: [createUserMessage("msg-1", "Hello", { historySequence: 1 })],
+              // The cost badge makes Stats wider than the row the capped inset leaves.
+              sessionUsage: createSessionUsage(0.34),
+            });
+            expandRightSidebar(workspaceId);
+            return client;
+          }}
+        >
+          <RightSidebarStoryContent workspaceId={workspaceId} />
+        </RightSidebarStoryShell>
+      </div>
+    ),
+    play: async ({ canvasElement }) => {
+      const canvas = within(canvasElement);
+      const stats = await canvas.findByRole("tab", { name: /stats.*\$0\.34/i, selected: true });
+      const review = await canvas.findByRole("tab", { name: /^review/i });
+      await expectSelectedTabVisible(canvasElement);
+      // "+" (New tab) and All tabs must stay clickable too.
+      await waitFor(() => {
+        if (!isHitTarget(stats)) throw new Error("selected tab is not under the pointer");
+        for (const name of ["New tab", "All tabs"]) {
+          if (!isHitTarget(canvas.getByRole("button", { name }))) {
+            throw new Error(`${name} is not under the pointer`);
+          }
         }
-      }
-    });
-    // Like Playwright: bring the other tab into view, then it must take the click.
-    review.scrollIntoView({ block: "nearest", inline: "nearest" });
-    await waitFor(() => {
-      if (!isHitTarget(review)) throw new Error("unselected tab is not under the pointer");
-    });
-    await userEvent.click(review);
-    await canvas.findByRole("tab", { name: /^review/i, selected: true });
-  },
-};
+      });
+      // Like Playwright: bring the other tab into view, then it must take the click.
+      review.scrollIntoView({ block: "nearest", inline: "nearest" });
+      await waitFor(() => {
+        if (!isHitTarget(review)) throw new Error("unselected tab is not under the pointer");
+      });
+      await userEvent.click(review);
+      await canvas.findByRole("tab", { name: /^review/i, selected: true });
+    },
+  };
+}
+
+/** An inset wider than the pane (Linux e2e reported one larger than the whole sidebar). */
+export const TabsReachableUnderWideTitlebarInset = titlebarInsetStory(2000, 400);
+/** The 138 px Windows/Linux fallback inset at the sidebar's 300 px minimum width. */
+export const SelectedTabFitsUnderTitlebarInset = titlebarInsetStory(138, 300);
 
 const OVERVIEW_WORKSPACE_ID = "ws-overview";
 
@@ -2225,6 +2241,40 @@ export const ToggleStaysPutWhileSliding: Story = {
 };
 
 /**
+ * Closing the only tab collapses the sidebar, and the panel slides out empty: the New tab that
+ * takes the closed tab's place never paints during the slide (user request). A collapse with the
+ * New tab already open slides out with it (ToggleStaysPutWhileSliding).
+ */
+export const ClosingLastTabSlidesOutEmpty: Story = {
+  ...CollapsedOverview,
+  parameters: { pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const sidebar = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    await userEvent.click(canvas.getByRole("button", { name: "Expand right sidebar" }));
+    // The launcher row's name includes its description.
+    await userEvent.click(await within(sidebar).findByRole("button", { name: /^Stats\b/ }));
+    const close = await within(sidebar).findByRole("button", { name: "Close Stats" });
+    await waitFor(() => {
+      if (sidebar.getAnimations().length > 0) throw new Error("The sidebar is still sliding open");
+    });
+
+    const frames = await sampleToggleFrames(canvasElement, () => userEvent.click(close));
+    await expect(canvas.getByRole("button", { name: "Expand right sidebar" })).toBeVisible();
+    const openWidth = frames[0].sidebarWidth;
+    await expect(openWidth).toBeGreaterThan(200);
+    await expect(frames[frames.length - 1].sidebarWidth).toBe(0);
+    const sliding = frames.filter((frame) => frame.sidebarWidth < openWidth - 1);
+    await expect(sliding.some((frame) => frame.sidebarWidth > 1)).toBe(true);
+    await expect(sliding.some((frame) => frame.panel)).toBe(false);
+  },
+};
+
+/**
  * Dragging the resize handle past the snap point collapses the sidebar, and dragging back
  * reopens it, at once: the width (and the transcript's room for the card) follows the pointer
  * instead of sliding behind it.
@@ -2309,6 +2359,93 @@ export const StripReachableUnderToggleBar: Story = {
       // again on each retry, since it mounts while the panel is still sliding in.
       allTabs.scrollIntoView({ block: "nearest", inline: "nearest" });
       if (!isHitTarget(allTabs)) throw new Error("All tabs is not under the pointer");
+    });
+  },
+};
+
+const PINNED_CLOSE_WORKSPACE_ID = "ws-pinned-last-tab-close";
+const PINNED_REPORT: ArtifactReadResult = {
+  status: "ok",
+  path: "report.md",
+  kind: getArtifactKind("report.md"),
+  size: 26,
+  modifiedMs: 1,
+  encoding: "utf8",
+  content: "# Weekly report\n\nAll good.",
+};
+
+/**
+ * Cmd/Ctrl+W on the only tab while it is pinned (Artifacts fullscreen over the workspace shell)
+ * closes the sidebar, and focus still ends on the sidebar toggle. The pinned view holds the
+ * toggle inert until it unmounts with the tab.
+ */
+export const ClosingPinnedLastTabFocusesToggle: Story = {
+  globals: { viewport: { value: "desktop", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const client = setupSimpleChatStory({
+          workspaceId: PINNED_CLOSE_WORKSPACE_ID,
+          workspaceName: "feature/pinned-close",
+          experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true },
+          messages: [createUserMessage("msg-1", "Show me the report", { historySequence: 1 })],
+        });
+        client.artifacts = {
+          ...client.artifacts,
+          list: () =>
+            Promise.resolve({
+              success: true as const,
+              data: {
+                available: true,
+                dir: "/scratch/artifacts",
+                entries: [
+                  {
+                    path: PINNED_REPORT.path,
+                    kind: PINNED_REPORT.kind,
+                    size: PINNED_REPORT.size,
+                    modifiedMs: 1,
+                  },
+                ],
+                truncated: false,
+              },
+            }),
+          read: () => Promise.resolve({ success: true as const, data: PINNED_REPORT }),
+        };
+        writeArtifactSelection(PINNED_CLOSE_WORKSPACE_ID, {
+          scope: "artifact",
+          path: PINNED_REPORT.path,
+          version: null,
+        });
+        collapseLeftSidebar();
+        seedSidebarLayout(PINNED_CLOSE_WORKSPACE_ID, ["artifacts"]);
+        expandRightSidebar(PINNED_CLOSE_WORKSPACE_ID);
+        return client;
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const sidebar = await canvas.findByRole(
+      "complementary",
+      { name: "Workspace insights" },
+      { timeout: 15_000 }
+    );
+    await userEvent.click(
+      await within(sidebar).findByRole("button", { name: "Fullscreen" }, { timeout: 15_000 })
+    );
+    const pinned = await canvas.findByRole("region", { name: "Artifact report.md" });
+    await waitFor(() => expect(pinned).toHaveFocus());
+
+    await userEvent.keyboard("{Control>}w{/Control}");
+
+    const toggle = await canvas.findByRole("button", { name: "Expand right sidebar" });
+    // A plain throw (not the instrumented expect), so a failure names where focus went.
+    await waitFor(() => {
+      const active = document.activeElement;
+      if (active !== toggle) {
+        throw new Error(`Focus is on <${active?.tagName.toLowerCase() ?? "none"}>, not the toggle`);
+      }
     });
   },
 };

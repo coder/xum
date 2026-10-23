@@ -1093,6 +1093,47 @@ describe("StreamManager - mid-turn thinking override", () => {
     ]);
   });
 
+  // #5286: a turn that published a Token Budget stage sends the payload the stage counted as its
+  // first request. A change written after that count waits for step 1, where it resolves as a
+  // mid-turn change; a reply that ends at step 0 never applies it in this turn.
+  test.each<{ steps: number; calls: Array<[ThinkingLevel, boolean]> }>([
+    { steps: 2, calls: [["off", false]] },
+    { steps: 1, calls: [] },
+  ])(
+    "a stage turn holds a pending change until after its first request ($steps steps)",
+    async ({ steps, calls }) => {
+      const state: ActiveTurnThinkingOverride = { pending: "off", holdBeforeFirstRequest: true };
+      const rebuild = recordingRebuild();
+      const firstStepRebuild = mock(() => Promise.resolve({ messages }));
+      const results: PreparedStepForTests[] = [];
+
+      await runTurn(
+        {
+          thinkingOverrideState: state,
+          rebuildProviderOptionsForThinkingLevel:
+            rebuild as unknown as RebuildProviderOptionsForThinkingLevel,
+          rebuildFirstStepForThinkingLevel:
+            firstStepRebuild as unknown as TurnExecutionOptions["rebuildFirstStepForThinkingLevel"],
+        },
+        [
+          stepsThenAnswer(
+            [
+              { messages, stepNumber: 0 },
+              { messages, stepNumber: 1 },
+            ].slice(0, steps),
+            results
+          ),
+        ]
+      );
+
+      // Step 0 sends the counted payload: no options rebuild, no message rebuild.
+      expect(results[0]).toBeUndefined();
+      expect(firstStepRebuild).not.toHaveBeenCalled();
+      expect(rebuild.mock.calls).toEqual(calls);
+      expect(state.pending).toBe(steps === 1 ? "off" : undefined);
+    }
+  );
+
   test("a fallback stream's step 0 is not the turn's first provider request", async () => {
     const holder: ActiveTurnThinkingOverride = {};
     const fallbackRebuild = recordingRebuild();

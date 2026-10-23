@@ -1,22 +1,10 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   # dryer gives the structural fingerprints and the Jaccard score; Crapper
-#   # gives the function names, so a DRY finding names the same function that
-#   # crap-check names. Keep the Crapper SHA and the grammar pins equal to
-#   # scripts/crap/crapper_report.py: a grammar bump can move every fingerprint.
-#   "dryer @ git+https://github.com/unclebob/dryer@66ff6d21a42c04afcad89c78a80066176d1294b0",
-#   "crapper @ git+https://github.com/unclebob/crapper@9f1bead298b5a9d576bdd6319289fcf426e5b18a",
-#   "tree-sitter==0.26.0",
-#   "tree-sitter-language-pack==1.21.3",
-# ]
-# ///
 """Find near-duplicate functions that a diff makes, and print them as JSON.
 
-Usage (through uv, which reads the pins above; dry/check.ts calls it):
+Usage (through uv, with the dry group of pyproject.toml; dry/check.ts calls it):
 
-    uv run --script scripts/dry/dryer_report.py --root DIR --base-root DIR
-        --changes FILE [--threshold N] [--min-lines N] [--min-nodes N]
+    uv run --locked --only-group dry python scripts/dry/dryer_report.py
+        --root DIR --base-root DIR --changes FILE [--threshold N]
+        [--min-lines N] [--min-nodes N]
 
 `--changes` is a JSON file: {"files": [{"basePath", "headPath"}...],
 "spans": {headPath: [[start, end]...]}, "hunks": {headPath: [[baseStart,
@@ -180,11 +168,15 @@ def base_line(line: int, hunks: list[list[int]]) -> int | None:
 
 def replaced_line(line: int, hunks: list[list[int]]) -> int | None:
     """The base line at the same position in the replacement hunk that holds
-    `line`, or None when no hunk replaced it (an added or unchanged line)."""
+    `line`, or None when no hunk replaced it (an added or unchanged line, or
+    a line past the base side of a hunk that grew)."""
 
     for base_start, base_count, head_start, head_count in hunks:
-        if base_count and head_count and head_start <= line < head_start + head_count:
-            return base_start + min(line - head_start, base_count - 1)
+        offset = line - head_start
+        # Only lines that both sides cover align. Head lines past base_count
+        # are added: a hunk that grows can add a new copy after the rewrite.
+        if base_count and head_count and 0 <= offset < min(base_count, head_count):
+            return base_start + offset
     return None
 
 
@@ -210,6 +202,39 @@ def counterpart(form: Form, base_forms: list[Form], hunks: list[list[int]]) -> F
     return best
 
 
+def reordered(lost: list[Form], removed: list[Form], threshold: float) -> dict[Form, Form]:
+    """A maximum one-to-one matching of added forms to similar removed forms.
+
+    Kuhn's augmenting paths, so each removed form covers at most one added
+    form and no greedy pick leaves a form unmatched when a full matching
+    exists. Candidates are tried best score first.
+    """
+
+    options = {
+        id(form): sorted(
+            (b for b in removed if similar(form.fingerprints, b.fingerprints, threshold) is not None),
+            key=lambda b: -jaccard(form.fingerprints, b.fingerprints),
+        )
+        for form in lost
+    }
+    owner: dict[int, Form] = {}  # id(removed form) -> added form
+
+    def claim(form: Form, seen: set[int]) -> bool:
+        for base in options[id(form)]:
+            if id(base) in seen:
+                continue
+            seen.add(id(base))
+            if id(base) not in owner or claim(owner[id(base)], seen):
+                owner[id(base)] = form
+                return True
+        return False
+
+    for form in sorted(lost, key=lambda f: f.start_line):
+        claim(form, set())
+    by_id = {id(b): b for b in removed}
+    return {form: by_id[base_id] for base_id, form in owner.items()}
+
+
 def new_pairs(
     head: dict[str, Form],
     base_by_path: dict[str, list[Form]],
@@ -224,10 +249,10 @@ def new_pairs(
     of the changed files only, under their head path: an unchanged file is the
     same at the base, so its head form stands in for its base form.
 
-    Moves across files are not tracked: a form made only of added lines is
-    new, so a function moved into another file reports its old pairs again.
-    Matching moved forms to removed ones drew a new edge case in every review
-    round of #7147, and the gate warns unless DRY_MODE=block.
+    Moves across files are not tracked: a form made only of added lines in
+    another file is new, so a function moved into another file reports its
+    old pairs again (the gate warns unless DRY_MODE=block). A move within one
+    file keeps its base form (reordered()).
     """
 
     own = {
@@ -235,6 +260,17 @@ def new_pairs(
         for form in head.values()
         if form.path in changed_paths
     }
+
+    # A function reordered within its file is a pure deletion plus a pure
+    # addition, so the added form has no counterpart. Match such forms to the
+    # removed forms of the same file, one to one (removed: no head form maps
+    # back to it). Moves across files stay untracked.
+    kept = {id(base) for base in own.values() if base is not None}
+    for path, forms in base_by_path.items():
+        removed = [base for base in forms if id(base) not in kept]
+        lost = [f for f in head.values() if f.path == path and own[id(f)] is None]
+        for form, base in reordered(lost, removed, threshold).items():
+            own[id(form)] = base
 
     def at_base(form: Form) -> Form | None:
         return own[id(form)] if form.path in changed_paths else form

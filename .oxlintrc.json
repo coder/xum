@@ -1205,6 +1205,105 @@
     },
     {
       "files": [
+        "src/node/services/agentSession.ts",
+        "src/node/services/aiService.ts",
+        "src/node/services/aiServiceEventGuards.ts",
+        "src/node/services/messagePipeline.ts",
+        "src/node/services/retryManager.ts",
+        "src/node/services/streamManager.ts",
+        "src/node/services/turn*.ts",
+        "src/node/services/contextManagement/**/*.ts",
+        "src/node/services/tools/**/*.ts"
+      ],
+      "jsPlugins": [
+        {
+          "name": "local",
+          "specifier": "./eslint-local-rules.mjs"
+        }
+      ],
+      "rules": {
+        "local/no-host-imports": [
+          "error",
+          {
+            "modules": [
+              "fs",
+              "fs/promises",
+              "os",
+              "net",
+              "child_process",
+              "electron",
+              "@/node/utils/writeFileAtomic",
+              {
+                "module": "@/node/utils/fs",
+                "names": ["ensurePrivateDir", "ensurePrivateDirSync"]
+              },
+              "@/node/runtime/CoderSSHRuntime",
+              "@/node/runtime/DevcontainerRuntime",
+              "@/node/runtime/DockerRuntime",
+              "@/node/runtime/LocalBaseRuntime",
+              "@/node/runtime/LocalRuntime",
+              "@/node/runtime/RemoteRuntime",
+              "@/node/runtime/SSHRuntime",
+              "@/node/runtime/WorktreeRuntime",
+              "@/node/runtime/multiProjectRuntime",
+              "@/node/runtime/runtimeFactory",
+              {
+                "module": "@/node/runtime/runtimeHelpers",
+                "names": ["createRuntimeForWorkspace", "createRuntimeContextForWorkspace"]
+              }
+            ],
+            "allow": {
+              "src/node/services/agentSession.ts": ["@/node/runtime/runtimeHelpers", "fs/promises"],
+              "src/node/services/aiService.ts": [
+                "@/node/runtime/multiProjectRuntime",
+                "@/node/runtime/runtimeFactory",
+                "@/node/runtime/runtimeHelpers",
+                "@/node/utils/fs",
+                "fs/promises"
+              ],
+              "src/node/services/contextManagement/strategies/tokenBudget.ts": [
+                "@/node/runtime/runtimeHelpers"
+              ],
+              "src/node/services/tools/agent_skill_delete.ts": ["fs/promises"],
+              "src/node/services/tools/agent_skill_list.ts": ["fs/promises", "os"],
+              "src/node/services/tools/agent_skill_read_file.ts": ["@/node/runtime/RemoteRuntime"],
+              "src/node/services/tools/agent_skill_write.ts": ["fs/promises"],
+              "src/node/services/tools/bash.ts": ["@/node/runtime/LocalBaseRuntime", "fs"],
+              "src/node/services/tools/notify.ts": ["electron"],
+              "src/node/services/tools/review_pane.ts": [
+                "@/node/utils/writeFileAtomic",
+                "fs/promises"
+              ],
+              "src/node/services/tools/shared/configReadWrite.ts": [
+                "@/node/utils/writeFileAtomic",
+                "fs/promises"
+              ],
+              "src/node/services/tools/skillFileHint.ts": ["@/node/runtime/RemoteRuntime"],
+              "src/node/services/tools/skillFileUtils.ts": ["fs/promises"],
+              "src/node/services/tools/skillsCatalogFetch.ts": ["fs/promises", "os"],
+              "src/node/services/tools/todo.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
+              "src/node/services/tools/web_fetch.ts": ["net"],
+              "src/node/services/tools/xum_agents_path.ts": ["fs/promises"],
+              "src/node/services/tools/xum_agents_read.ts": ["fs/promises"],
+              "src/node/services/tools/xum_agents_write.ts": ["fs/promises"]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "files": [
+        "**/*.test.ts",
+        "**/*.testHarness.ts",
+        "**/*.bench.ts",
+        "src/node/services/tools/testHelpers.ts"
+      ],
+      "rules": {
+        "local/no-host-imports": "off"
+      }
+    },
+    {
+      "files": [
         "src/node/config/index.ts",
         "src/node/config/**/*.ts",
         "src/cli/debug/**/*.ts",

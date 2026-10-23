@@ -386,6 +386,8 @@ export interface StreamMessageOptions {
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
   onStepSettled?: OnStepSettled;
+  /** Token Budget stage decision on the built request (#5286); see prepareTurnStartStage. */
+  onTurnStartStage?: OnTurnStartStage;
   /**
    * Whether a token-budget rollover could actually be sealed for this request (mode active and
    * automatic rollover threshold below 100%). Gates the new_context tool so a request that
@@ -587,6 +589,8 @@ interface FoldedStreamState<TMessages, TTail> {
   messages: TMessages;
   volatileSystemTail: TTail;
   systemMessageTokens: number;
+  /** The full estimate of `messages`, the stage decision's E (#5286). */
+  contextBudgetEstimate?: number;
 }
 
 /**
@@ -612,13 +616,17 @@ async function foldPendingThinkingOverrides<TMessages, TTail>(
       messages: TMessages;
       volatileSystemTail: TTail;
       systemMessageTokens: number;
+      contextBudgetEstimate?: number;
     }>;
     currentEffectiveLevelRef: { current: ThinkingLevel };
+    /** Leave pending changes for StreamManager's step 0 (after a published stage, #5286). */
+    skip?: boolean;
   },
   initial: FoldedStreamState<TMessages, TTail>
 ): Promise<FoldedStreamState<TMessages, TTail> | { exceeded: ContextBudgetExceeded }> {
   const { holder } = input;
   let state = initial;
+  if (input.skip) return state;
   while (holder?.pending != null) {
     const pendingPreparingLevel = holder.pending;
     holder.pending = undefined;
@@ -638,6 +646,7 @@ async function foldPendingThinkingOverrides<TMessages, TTail>(
         messages: rebuilt.messages,
         volatileSystemTail: rebuilt.volatileSystemTail,
         systemMessageTokens: rebuilt.systemMessageTokens,
+        contextBudgetEstimate: rebuilt.contextBudgetEstimate,
       };
     } catch (error) {
       if (error instanceof ContextBudgetExceededError) return { exceeded: error.details };
@@ -651,6 +660,100 @@ async function foldPendingThinkingOverrides<TMessages, TTail>(
     // against the level just applied.
   }
   return state;
+}
+
+/** Called once per primary start() with E, the full estimate of the built request (#5286). */
+export type OnTurnStartStage = (budget: {
+  estimate: number;
+  limit: number;
+  model: string;
+  /** The turn's history rows: their warning rows are this window's stage claims. */
+  messages: readonly MuxMessage[];
+}) => Promise<TurnStartStage | undefined>;
+/**
+ * A due, unclaimed stage. `publish` resolves false when the send lost its admission first, or
+ * when history holds a row the turn's history read did not see (AgentSession fences that).
+ */
+export interface TurnStartStage {
+  row: MuxMessage;
+  /** Whether E′, the count of the request with `row` appended, leaves the stage its reserve. */
+  fits: (estimate: number) => boolean;
+  publish: () => Promise<boolean>;
+}
+
+/** What a primary start dispatches: the built request, or the counted candidate with a stage. */
+interface TurnStartPayload<TMessages, TTail> {
+  messages: TMessages;
+  volatileSystemTail: TTail;
+  systemMessageTokens: number;
+  requestHistorySequence: number;
+}
+
+/**
+ * Turn-start Token Budget stage (#5286). Decided on E, the count of the built request. The request
+ * is counted again with the warning row (E′) and the row is published only if E′ leaves the stage
+ * its reserve, so every published prompt is dispatched: the payload sent is the payload counted.
+ * The candidate carries the row in `messages`, so the fallback's and step 0's rebuilds carry it.
+ */
+async function applyTurnStartStage<TMessages, TTail>(input: {
+  onTurnStartStage: OnTurnStartStage | undefined;
+  estimate: number | undefined;
+  limit: number | undefined;
+  model: string;
+  messages: MuxMessage[];
+  rebuild: () => Promise<{
+    messages: TMessages;
+    volatileSystemTail: TTail;
+    systemMessageTokens: number;
+    contextBudgetEstimate?: number;
+  }>;
+  abortSignal: AbortSignal;
+  current: TurnStartPayload<TMessages, TTail>;
+  /** A published stage holds later thinking changes until after its counted first request. */
+  thinkingOverride: ActiveTurnThinkingOverride | undefined;
+}): Promise<TurnStartPayload<TMessages, TTail>> {
+  const { onTurnStartStage, estimate, limit, messages, current } = input;
+  if (onTurnStartStage == null || estimate == null || limit == null) return current;
+  const stage = await onTurnStartStage({ estimate, limit, model: input.model, messages });
+  if (!stage) return current;
+  messages.push(stage.row);
+  const candidate = await countAndPublishStage(stage, input.rebuild, input.abortSignal);
+  if (!candidate) {
+    messages.pop();
+    return current;
+  }
+  holdThinkingChanges(input.thinkingOverride);
+  return {
+    messages: candidate.messages,
+    volatileSystemTail: candidate.volatileSystemTail,
+    systemMessageTokens: candidate.systemMessageTokens,
+    requestHistorySequence: stage.row.metadata?.historySequence ?? current.requestHistorySequence,
+  };
+}
+
+/** After a published stage, StreamManager applies thinking changes only after the first request. */
+function holdThinkingChanges(holder: ActiveTurnThinkingOverride | undefined): void {
+  if (holder) holder.holdBeforeFirstRequest = true;
+}
+
+/** Counts E′ with the row and publishes it only when it fits and the turn was not stopped. */
+async function countAndPublishStage<TCandidate extends { contextBudgetEstimate?: number }>(
+  stage: TurnStartStage,
+  rebuild: () => Promise<TCandidate>,
+  abortSignal: AbortSignal
+): Promise<TCandidate | undefined> {
+  let candidate: TCandidate;
+  try {
+    candidate = await rebuild();
+  } catch (error) {
+    // A candidate over the ceiling only means the stage does not fit.
+    if (error instanceof ContextBudgetExceededError) return undefined;
+    throw error;
+  }
+  const fits =
+    candidate.contextBudgetEstimate != null && stage.fits(candidate.contextBudgetEstimate);
+  if (!fits || abortSignal.aborted) return undefined;
+  return (await stage.publish()) ? candidate : undefined;
 }
 
 /**
@@ -1374,6 +1477,7 @@ export class TurnRequestBuilder {
       hasQueuedMessages,
       getQueuedInputStopCause,
       onStepSettled,
+      onTurnStartStage,
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
       openaiTruncationModeOverride,
@@ -3423,6 +3527,7 @@ export class TurnRequestBuilder {
           const rebuiltPayload = await assemblePayloadForThinkingLevel(level);
           return {
             messages: rebuiltPayload.messages,
+            contextBudgetEstimate: rebuiltPayload.contextBudgetEstimate,
             systemMessageTokens: sent.tokens,
             volatileSystemTail: rowVolatileSystemTail(
               rebuiltPayload,
@@ -3573,23 +3678,14 @@ export class TurnRequestBuilder {
         systemMessageTokens = primaryRequest.systemMessageTokens;
       }
       const finalMessages = primaryRequest.messages;
-      // Debug sinks pair systemMessage with the message list, so when the
-      // assembler embedded the system prompt as leading rows (engineSystem
-      // undefined; a cached stable row plus an optional volatile row), drop
-      // them to keep the system prompt single-sourced in captures.
-      const leadingSystemRows = finalMessages.findIndex((message) => message.role !== "system");
-      const debugViewMessages =
-        primaryRequest.engineSystem == null
-          ? finalMessages.slice(leadingSystemRows === -1 ? finalMessages.length : leadingSystemRows)
-          : finalMessages;
       const mergedProviderOptions = primaryRequest.providerOptions;
       const currentEffectiveLevelRef = primaryRequest.currentEffectiveLevelRef;
       const computeRebuiltProviderOptions = primaryRequest.computeRebuiltProviderOptions;
       // Fold PREPARING-window pending thinking overrides into the ACTUAL
       // request build, not just the envelope (see foldPendingThinkingOverrides).
-      // The fold runs before the assistant placeholder is appended: its budget-checked rebuild
-      // is the last count of this request, so a refusal leaves no row to delete, and a Token
-      // Budget stage decided after it is never re-counted after publication (#5286). A turn
+      // The fold runs before the assistant placeholder is appended, so a refusal leaves no row
+      // to delete, and a Token Budget stage is decided on the folded request (#5286). Only a
+      // change written during the append counts the request again (the refold below). A turn
       // already stopped skips the rebuild.
       if (combinedAbortSignal.aborted)
         return {
@@ -3610,11 +3706,40 @@ export class TurnRequestBuilder {
         messages: finalMessages,
         volatileSystemTail: primaryRequest.volatileSystemTail,
         systemMessageTokens,
+        contextBudgetEstimate: primaryRequest.contextBudgetEstimate,
       });
       if ("exceeded" in streamState) {
         runLanguageModelCleanup(modelResult.data.model);
         return { type: "finished", result: Err(streamState.exceeded) };
       }
+      // Token Budget stage (#5286), decided on E, the count the turn-start check (or the fold)
+      // just took; see applyTurnStartStage.
+      const foldedLevel = streamState.thinkingLevel;
+      const unstaged = {
+        messages: streamState.messages,
+        volatileSystemTail: streamState.volatileSystemTail,
+        systemMessageTokens: streamState.systemMessageTokens,
+        requestHistorySequence,
+      };
+      const staged = await applyTurnStartStage({
+        onTurnStartStage,
+        estimate: streamState.contextBudgetEstimate,
+        limit: primaryRequest.contextBudgetLimit,
+        model: modelString,
+        messages,
+        rebuild: () => primaryRequest.rebuildMessagesForThinkingLevel(foldedLevel),
+        abortSignal: combinedAbortSignal,
+        current: unstaged,
+        thinkingOverride: activeTurnThinkingOverride,
+      });
+      const stagePublished = staged !== unstaged;
+      ({ requestHistorySequence } = staged);
+      streamState = {
+        ...streamState,
+        messages: staged.messages,
+        volatileSystemTail: staged.volatileSystemTail,
+        systemMessageTokens: staged.systemMessageTokens,
+      };
       ({ systemMessageTokens } = streamState);
       if (combinedAbortSignal.aborted)
         return {
@@ -3650,8 +3775,13 @@ export class TurnRequestBuilder {
         };
       }
       // A change written while the append's file I/O ran still reaches the messages, as when
-      // the fold ran after the append.
-      streamState = await foldPendingThinkingOverrides(foldInput, streamState);
+      // the fold ran after the append. A published stage skips this refold: its counted payload
+      // is dispatched, and StreamManager holds the change until after that first request
+      // (holdBeforeFirstRequest), so a refusal cannot leave the warning unanswered (#5286).
+      streamState = await foldPendingThinkingOverrides(
+        { ...foldInput, skip: stagePublished },
+        streamState
+      );
       if ("exceeded" in streamState) {
         runLanguageModelCleanup(modelResult.data.model);
         await deleteAbortedPlaceholder(assistantMessageId);
@@ -3664,6 +3794,20 @@ export class TurnRequestBuilder {
         volatileSystemTail: streamVolatileSystemTail,
       } = streamState;
       ({ systemMessageTokens } = streamState);
+      // Debug sinks pair systemMessage with the message list, so when the
+      // assembler embedded the system prompt as leading rows (engineSystem
+      // undefined; a cached stable row plus an optional volatile row), drop
+      // them to keep the system prompt single-sourced in captures. Taken from the dispatched
+      // messages, so a stage warning shows.
+      const leadingSystemRows = streamFinalMessages.findIndex(
+        (message) => message.role !== "system"
+      );
+      const debugViewMessages =
+        primaryRequest.engineSystem == null
+          ? streamFinalMessages.slice(
+              leadingSystemRows === -1 ? streamFinalMessages.length : leadingSystemRows
+            )
+          : streamFinalMessages;
 
       const historySequence = assistantMessage.metadata?.historySequence ?? 0;
 

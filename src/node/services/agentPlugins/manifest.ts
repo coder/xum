@@ -25,8 +25,13 @@
 export const AGENT_PLUGIN_SCHEMA_ID_1_0_0 =
   "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
+import * as path from "node:path";
+
 // Name grammar shared with the install registry schema (see the module's doc comment).
-import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
+import {
+  isValidAgentPluginName,
+  isValidMarketplaceEntryName,
+} from "@/common/utils/agentPluginName";
 
 export { isValidAgentPluginName };
 
@@ -259,13 +264,43 @@ export interface AgentPluginManifest {
 }
 
 /**
+ * SECURITY AUDIT (downgrade): a build that predates `generatedFrom` reads a generated plugin.json
+ * as an ordinary Agent Plugin and fills in the default component paths: hooks.js, agents/,
+ * workflows/, mcp.json or .mcp.json (`contributes`), and hooks/hooks.json (Codex hooks, which an
+ * `extensions["com.openai"].hooks` list replaces). So the generated manifest names each of them
+ * explicitly: `contributes` paths point into `.git`, which no commit can create (git refuses to
+ * track a `.git` path), so they never resolve, and an empty Codex hooks list turns the default
+ * file off. Those builds then load only the skills roots the manifest lists. Builds before
+ * `contributes` existed (#3872, the experimental flag) read only skills/ and mcp.json.
+ */
+export const INERT_COMPONENT_PATH = ".git/xum-generated-no-component";
+
+/** The `contributes` and `extensions["com.openai"]` members that keep older builds inert. */
+export function inertGeneratedComponents(): {
+  contributes: Record<"hooks" | "agents" | "workflows" | "mcp", string>;
+  openai: { hooks: [] };
+} {
+  return {
+    contributes: {
+      hooks: INERT_COMPONENT_PATH,
+      agents: INERT_COMPONENT_PATH,
+      workflows: INERT_COMPONENT_PATH,
+      mcp: INERT_COMPONENT_PATH,
+    },
+    openai: { hooks: [] },
+  };
+}
+
+/**
  * `extensions.mux.generatedFrom`: Xum wrote this plugin.json for a repository that had none
  * (installMethods.ts). Update reads it from the installed tree to regenerate with the same
- * method. Only `kind: "skills"` exists today.
+ * method. `claude-marketplace` names the marketplace entry, and carries the entry's `commands`
+ * paths (a Claude component without a `contributes` member) and the agent file names that its
+ * `agents` lists (ClaudePluginComponents.agentFiles).
  */
-export interface GeneratedFrom {
-  kind: "skills";
-}
+export type GeneratedFrom =
+  | { kind: "skills" }
+  | { kind: "claude-marketplace"; entry: string; commands?: string[]; agentFiles?: string[] };
 
 function generatedFromValue(manifest: Pick<AgentPluginManifest, "extensions">): unknown {
   const mux = manifest.extensions?.mux;
@@ -280,12 +315,57 @@ export function hasGeneratedFromMarker(manifest: Pick<AgentPluginManifest, "exte
   return generatedFromValue(manifest) !== undefined;
 }
 
-/** The marker when its kind is one this build generates; undefined for absent or unknown ones. */
+/** `commands` of a claude-marketplace marker: normalized safe paths, at most MAX_SKILLS_ROOTS. */
+function isMarkerCommandList(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= MAX_SKILLS_ROOTS &&
+    value.every(
+      (item) =>
+        typeof item === "string" &&
+        isSafeContributesPath(item) &&
+        path.posix.normalize(item) === item
+    )
+  );
+}
+
+/**
+ * The marker when its kind is one this build generates, in exactly the shape Xum writes;
+ * undefined for absent, unknown or malformed ones (discovery reads those as skills-only).
+ */
 export function readGeneratedFrom(
   manifest: Pick<AgentPluginManifest, "extensions">
 ): GeneratedFrom | undefined {
   const value = generatedFromValue(manifest);
-  return isPlainObject(value) && value.kind === "skills" ? { kind: "skills" } : undefined;
+  if (!isPlainObject(value)) return undefined;
+  if (value.kind === "skills") return { kind: "skills" };
+  if (value.kind !== "claude-marketplace") return undefined;
+  if (typeof value.entry !== "string" || !isValidMarketplaceEntryName(value.entry)) {
+    return undefined;
+  }
+  if (value.commands !== undefined && !isMarkerCommandList(value.commands)) return undefined;
+  if (value.agentFiles !== undefined && !isMarkerAgentFileList(value.agentFiles)) return undefined;
+  return {
+    kind: "claude-marketplace",
+    entry: value.entry,
+    ...(value.commands !== undefined ? { commands: value.commands } : {}),
+    ...(value.agentFiles !== undefined ? { agentFiles: value.agentFiles } : {}),
+  };
+}
+
+/** `agentFiles` of a claude-marketplace marker: `.md` file names without a folder. */
+function isMarkerAgentFileList(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) =>
+        typeof item === "string" &&
+        item.endsWith(".md") &&
+        isSafeContributesPath(item) &&
+        !item.includes("/") &&
+        !item.includes("\\")
+    )
+  );
 }
 
 export type PluginManifestValidation =
