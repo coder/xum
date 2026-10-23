@@ -91,6 +91,9 @@ jobs:
               - 'scripts/**'
               - 'packages/mux-compat/**'
               - 'jest.config.js'
+              # e2e_tests below lists it too: without it here, `tests` stays false on a
+              # Playwright-config-only change and test-e2e never runs.
+              - 'playwright.config.ts'
               - 'bunfig.toml'
               - 'babel.config.cjs'
               - 'package.json'
