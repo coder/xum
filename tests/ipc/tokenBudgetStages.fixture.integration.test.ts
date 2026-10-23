@@ -18,7 +18,11 @@
  *
  * The system prompt also lists global skills and instructions found under HOME, so the first E
  * differs between machines (≈ 37.1k with an empty HOME, as in CI). After the first turn each
- * scenario pads AGENTS.md by the difference, so every later E matches the measured bands.
+ * scenario pads the workspace scratchpad by the difference, so every later E matches the
+ * measured bands. The pad and the later growth go in the scratchpad, not AGENTS.md: inside a
+ * context segment an AGENTS.md change is sent as a row with the whole new block while the
+ * system prompt keeps the old one (prompt-cache mechanism 10), so it would grow E by more
+ * than its own size.
  */
 
 import assert from "node:assert/strict";
@@ -38,6 +42,7 @@ import {
 } from "./setup";
 import { readChatHistory, sendMessage } from "./helpers";
 import * as contextBudgetCounting from "../../src/node/services/contextBudgetCounting";
+import { writeAdditionalSystemContext } from "../../src/node/services/additionalSystemContext";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
@@ -265,16 +270,16 @@ async function startScenario(options: { slider: number; usageFor: UsageFor }) {
 
   let baselinePad: string | undefined;
   const writeInstructions = (extra: string) =>
-    fs.writeFile(
-      path.join(workspacePath, "AGENTS.md"),
-      [baselinePad ?? "", extra].filter((part) => part !== "").join("\n")
-    );
+    writeAdditionalSystemContext(env.config, workspaceId, {
+      content: [baselinePad ?? "", extra].filter((part) => part !== "").join("\n"),
+      enabled: true,
+    });
 
   return {
     env,
     fixture,
     workspacePath,
-    /** AGENTS.md content after the baseline pad; grows E from the next send on. */
+    /** Scratchpad content after the baseline pad; grows E from the next send on. */
     writeInstructions,
     /** Sends one user message and waits until the session (and any queued follow-up) is idle. */
     async send(text: string) {
@@ -450,7 +455,7 @@ describeIntegration("Token Budget stages (loopback fixture)", () => {
       try {
         await scenario.send("Turn 0: read 4 files.");
         await scenario.send("Turn 1: read 4 files.");
-        // Grow AGENTS.md so E ≈ 90.8k: below C (91,808), but E′ + 2,048 ≥ C. The assertions bracket
+        // Grow the instructions so E ≈ 90.8k: below C (91,808), but E′ + 2,048 ≥ C. The assertions bracket
         // the band: less growth publishes a warning, more is refused and rolls the window over.
         await scenario.writeInstructions(filler("Instruction", 14_300));
         await scenario.send("Turn 2: read 0 files.");
