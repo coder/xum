@@ -1343,23 +1343,17 @@ export async function listAgentDefinitions(
   });
   const cfg = context.config.loadConfigOrDefault();
   const resolved = await Promise.all(
-    descriptors.map(async (listedDescriptor) => {
-      let descriptor = listedDescriptor;
+    descriptors.map(async (descriptor) => {
       try {
-        // Settings must show the same host-only Intuition definition used for paid recall,
-        // regardless of a selected workspace's project or plugin overrides.
-        const headless =
-          descriptor.id === "intuition"
-            ? await resolveHeadlessAgentDefinition(context.config.rootDir, descriptor.id)
-            : undefined;
-        if (headless === null) return null;
-        if (headless) descriptor = buildAgentDescriptor(headless);
-        const resolvedFrontmatter =
-          headless?.frontmatter ??
-          (await resolveAgentFrontmatter(runtime, discoveryPath, descriptor.id, {
+        const resolvedFrontmatter = await resolveAgentFrontmatter(
+          runtime,
+          discoveryPath,
+          descriptor.id,
+          {
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
             projectPluginsTrusted,
-          }));
+          }
+        );
         if (
           isAgentEffectivelyDisabled({ cfg, agentId: descriptor.id, resolvedFrontmatter }) &&
           input.includeDisabled !== true
