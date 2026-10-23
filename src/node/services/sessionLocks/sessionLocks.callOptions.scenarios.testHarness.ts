@@ -64,6 +64,25 @@ import { workspaceUseLeasesFor } from "../workspaceUseLeases";
 const sendOptions = { model: "openai:gpt-4o", agentId: "exec" };
 const idle = { hasRunningBackgroundProcesses: () => Promise.resolve(false) };
 
+let currentStep: string | undefined;
+
+/**
+ * The step of a scenario that makes the current lock calls, or undefined. The
+ * record adds it to each row, so two lock calls of one file stay two rows.
+ */
+export function lockCallStep(): string | undefined {
+  return currentStep;
+}
+
+async function step<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  currentStep = name;
+  try {
+    return await fn();
+  } finally {
+    currentStep = undefined;
+  }
+}
+
 async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), `xum-lock-record-${prefix}-`));
   try {
@@ -330,10 +349,13 @@ export async function oneChildReport(): Promise<void> {
       parentWorkspaceId: workspaceId,
       ancestorWorkspaceIds: [workspaceId],
     };
-    await upsertSubagentReportArtifact({ ...child, reportMarkdown: "Done." });
+    // subagentReportArtifacts.ts has two lock calls: a step name keeps them apart.
+    await step("upsert report", () =>
+      upsertSubagentReportArtifact({ ...child, reportMarkdown: "Done." })
+    );
     await upsertSubagentFailureArtifact({ ...child, errorType: "unknown", errorMessage: "down" });
     const unchanged = { workspaceId, workspaceSessionDir, update: () => undefined };
-    await updateSubagentReportArtifactsFile(unchanged);
+    await step("update reports", () => updateSubagentReportArtifactsFile(unchanged));
     await updateSubagentTranscriptArtifactsFile(unchanged);
     await updateSubagentGitPatchArtifactsFile(unchanged);
     await new TaskHandleStore(new Config(dir)).withWorkspaceTurnPublicationLock("wst_record", () =>
