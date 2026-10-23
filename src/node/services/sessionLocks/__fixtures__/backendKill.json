@@ -57,5 +57,6 @@
     ],
     "partial": null,
     "locks": ["workspace-use/<h64>/<lease0>.turn.lock"]
-  }
+  },
+  "retryTextLength": 17376
 }

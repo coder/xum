@@ -289,8 +289,10 @@ export async function snapshot(root: string, workspaceId: string): Promise<Snaps
       string,
       unknown
     >;
-  } catch {
-    partial = null;
+  } catch (error) {
+    // Only a missing partial.json means "absent". A corrupt or unreadable one
+    // is a recovery regression and must fail the test, not match the fixture.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   return {
     rows: messages.map(shapeOf),
