@@ -744,11 +744,13 @@ test-unit: node_modules/.installed build-main ## Run unit tests
 # not *.test.ts, so `bun test src`, test-unit-ci.sh and Jest never run them. The ./ prefix
 # matters: without it bun reads each path as a name filter and exits 1. HOME and XUM_ROOT
 # are set before bun starts, because Bun caches homedir and the log sink opens at the first
-# log call. The temp dir keeps the proof's writes out of the real home (#7209).
+# log call. The temp dir keeps the proof's writes out of the real home (#7209). The real bun
+# binary is resolved first: a version-manager shim (mise) finds its tools under HOME.
 test-host-proof: node_modules/.installed src/version.ts ## Host trap self-tests and the in-memory loop proof (own process)
 	@T="$$(mktemp -d)" && mkdir -p "$$T/home" "$$T/root" && \
+	  bun_bin="$$(bun -e 'process.stdout.write(process.execPath)')" && \
 	  files="$$(find src -name '*.hostProof.ts' | LC_ALL=C sort | sed 's|^|./|')" && \
-	  HOME="$$T/home" XUM_ROOT="$$T/root" bun --config=./tests/hostProof.bunfig.toml test $$files; \
+	  HOME="$$T/home" XUM_ROOT="$$T/root" "$$bun_bin" --config=./tests/hostProof.bunfig.toml test $$files; \
 	  status=$$?; rm -rf "$$T"; exit $$status
 
 # CI runs this once per shard; SHARD_INDEX/SHARD_TOTAL (env) pick the slice. See the script header.

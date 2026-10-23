@@ -106,6 +106,14 @@ function createTrap(installedBeforeSetup: boolean) {
     }
   }
 
+  /** Opens work that adds no row (a zero-delay timer), or null when the trap is not armed. */
+  function track(what: string): number | null {
+    if (!armed || recording) return null;
+    const id = nextId++;
+    open.set(id, what);
+    return id;
+  }
+
   function openUntil(id: number | null, what: string, done: PromiseLike<unknown>): void {
     if (id === null) return;
     open.set(id, what);
@@ -143,7 +151,7 @@ function createTrap(installedBeforeSetup: boolean) {
     },
     installedBeforeSetup,
   };
-  return { trap, record, openUntil, openUntilEvent, open };
+  return { trap, record, track, openUntil, openUntilEvent, open };
 }
 
 type Recorder = ReturnType<typeof createTrap>;
@@ -168,6 +176,7 @@ function wrapFunction(rec: Recorder, original: AnyFunction, api: string, promise
       }
     }
     const result = original.apply(this, args);
+    if (api === "fs.createWriteStream") wrapStreamWrite(rec, result, args[0]);
     if (id === null) return result;
     if (api === "fsp.open" && isThenable(result)) {
       // A FileHandle stays open until close(), after the open promise settled.
@@ -200,19 +209,7 @@ function wrapFunction(rec: Recorder, original: AnyFunction, api: string, promise
       /^fs\.create(Read|Write)Stream$/.test(api) ||
       (api.startsWith("cp.") && CHILD_FUNCTIONS.has(name))
     ) {
-      const emitter = result as {
-        once(event: string, listener: () => void): unknown;
-        write?: AnyFunction;
-      };
-      if (api === "fs.createWriteStream" && isFunction(emitter.write)) {
-        // The log sink writes through a WriteStream: its fs calls are native, so record write().
-        const write = emitter.write;
-        const path = args[0];
-        emitter.write = function (this: unknown, ...writeArgs: unknown[]) {
-          rec.record("WriteStream.write", path);
-          return write.apply(this, writeArgs);
-        };
-      }
+      const emitter = result as { once(event: string, listener: () => void): unknown };
       rec.openUntilEvent(id, api, emitter);
     }
     return result;
@@ -223,6 +220,20 @@ function wrapFunction(rec: Recorder, original: AnyFunction, api: string, promise
     Reflect.set(wrapped, symbol, Reflect.get(original, symbol));
   }
   return wrapped;
+}
+
+/**
+ * The log sink writes through a WriteStream, whose fs calls are native, so the trap records
+ * write(). It wraps every stream, also one opened before arm() (the log sink can open first),
+ * and record() decides at each write whether the trap is armed.
+ */
+function wrapStreamWrite(rec: Recorder, stream: unknown, path: unknown): void {
+  const write = (stream as { write?: unknown } | null)?.write;
+  if (!isFunction(write)) return;
+  (stream as { write: AnyFunction }).write = function (this: unknown, ...writeArgs: unknown[]) {
+    rec.record("WriteStream.write", path);
+    return write.apply(this, writeArgs);
+  };
 }
 
 function wrapModule(rec: Recorder, mod: object, prefix: string, promiseApi: boolean): void {
@@ -278,9 +289,11 @@ function wrapTimers(rec: Recorder): void {
       delay?: unknown,
       ...rest: unknown[]
     ) {
-      // A delay under 1 ms is a yield, not a wait: phase 3 lets it pass.
+      // A delay under 1 ms is a yield, not a wait: phase 3 lets it pass, so it adds no row. It
+      // still stays open until its callback runs, so drain() cannot end the window before a
+      // host call in that callback.
       const ms = typeof delay === "number" ? delay : 0;
-      const id = ms >= 1 ? rec.record(setName, String(ms)) : null;
+      const id = ms >= 1 ? rec.record(setName, String(ms)) : rec.track(`${setName} ${ms}`);
       let run = callback;
       if (id !== null && setName === "setTimeout" && isFunction(callback)) {
         run = function (this: unknown, ...args: unknown[]) {
@@ -306,6 +319,34 @@ function wrapTimers(rec: Recorder): void {
     Reflect.set(globalThis, setName, Object.assign(wrappedSet, set));
     Reflect.set(globalThis, clearName, wrappedClear);
   }
+  // setImmediate is a yield too: no row, but open until its callback runs or it is cleared.
+  const setImmediateReal = globalThis.setImmediate as unknown as AnyFunction;
+  const clearImmediateReal = globalThis.clearImmediate as unknown as AnyFunction;
+  const immediates = new Map<unknown, number>();
+  const wrappedSetImmediate = function (this: unknown, callback: unknown, ...rest: unknown[]) {
+    const id = isFunction(callback) ? rec.track("setImmediate") : null;
+    const run =
+      id === null
+        ? callback
+        : function (this: unknown, ...args: unknown[]) {
+            rec.open.delete(id);
+            immediates.delete(handle);
+            return (callback as AnyFunction).apply(this, args);
+          };
+    const handle = setImmediateReal.call(this, run, ...rest);
+    if (id !== null) immediates.set(handle, id);
+    return handle;
+  };
+  const wrappedClearImmediate = function (this: unknown, handle: unknown) {
+    const id = immediates.get(handle);
+    if (id !== undefined) {
+      rec.open.delete(id);
+      immediates.delete(handle);
+    }
+    return clearImmediateReal.call(this, handle);
+  };
+  Reflect.set(globalThis, "setImmediate", Object.assign(wrappedSetImmediate, setImmediateReal));
+  Reflect.set(globalThis, "clearImmediate", wrappedClearImmediate);
 }
 
 /** Installs the trap once per process. Only tests/hostTrap.preload.ts calls this. */

@@ -226,6 +226,30 @@ test("a WriteStream write, the shape of the log sink", async () => {
   expect(apis).toContain("WriteStream.write");
 });
 
+test("drain() waits for the callback of a zero-delay timer or setImmediate", async () => {
+  // Not awaited: drain() alone must keep the window open until both callbacks ran.
+  const apis = await within(() => {
+    setTimeout(() => Bun.spawnSync(["true"]), 0);
+    setImmediate(() => fsNs.statSync(FILE));
+  });
+  // A zero delay is a yield, so the timer itself adds no row. The two callbacks run in either order.
+  expect(apis.toSorted()).toEqual(["Bun.spawnSync", "fs.statSync"]);
+});
+
+test("a WriteStream opened before arm() still records its writes", async () => {
+  const out = path.join(os.tmpdir(), `host-trap-early-${process.pid}.log`);
+  // The log sink can open its stream before the proof arms the trap.
+  const stream = fsNs.createWriteStream(out, { flags: "a" });
+  await new Promise<void>((resolve) => stream.once("open", () => resolve()));
+  const apis = await within(() => {
+    stream.write("line\n");
+  });
+  await new Promise<void>((resolve) => stream.end(() => resolve()));
+  fsNs.rmSync(out, { force: true });
+  // The stream then writes through fs.write, which adds a row too.
+  expect(apis).toContain("WriteStream.write");
+});
+
 test("drain() waits for a void promise and names open work", async () => {
   trap.arm();
   try {
