@@ -21,13 +21,12 @@ import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { discoverAgentPluginsIn, type AgentPluginInfo, type PluginFs } from "./discovery";
 import { createMemoryPluginFs } from "./memoryPluginFs";
-import { MAX_REMOTE_PLUGIN_ENTRIES, parseRemotePluginListing } from "./remotePluginListing";
+import {
+  MAX_LISTING_OUTPUT_BYTES,
+  MAX_REMOTE_PLUGIN_ENTRIES,
+  parseRemotePluginListing,
+} from "./remotePluginListing";
 
-/**
- * Encoded listing output (base64 lines plus the entry lines). It holds about 12 MiB of tar, and
- * tar adds 512 to 1023 bytes per file (header and padding).
- */
-export const MAX_LISTING_OUTPUT_BYTES = 16 * 1024 * 1024;
 const LISTING_TIMEOUT_SECONDS = 10;
 
 /** The skills and agents part of AgentPluginInfo, with remote paths. */
@@ -210,11 +209,20 @@ function cachedBytes(): number {
   return total;
 }
 
+function settledCount(): number {
+  let count = 0;
+  for (const entry of snapshots.values()) count += entry.settled === undefined ? 0 : 1;
+  return count;
+}
+
+/** Evicts settled snapshots, least recently used first, until both caps hold. */
 function evictOverCap(): void {
-  for (const [key] of snapshots) {
-    if (snapshots.size <= MAX_CACHED_SNAPSHOTS && cachedBytes() <= MAX_CACHED_SNAPSHOT_BYTES)
+  for (const [key, entry] of snapshots) {
+    if (settledCount() <= MAX_CACHED_SNAPSHOTS && cachedBytes() <= MAX_CACHED_SNAPSHOT_BYTES) {
       return;
-    snapshots.delete(key);
+    }
+    // An in-flight read stays: dropping it would let a second caller start the same read.
+    if (entry.settled !== undefined) snapshots.delete(key);
   }
 }
 
@@ -226,8 +234,10 @@ function isExpiredFailure(entry: SnapshotEntry): boolean {
 /** The usable cached entry of `key`, now the most recently used one. */
 function freshEntry(key: string): SnapshotEntry | undefined {
   const cached = snapshots.get(key);
-  if (cached === undefined || isExpiredFailure(cached)) return undefined;
+  if (cached === undefined) return undefined;
+  // Re-inserted at the tail; an expired failure is dropped, so its retry lands at the tail too.
   snapshots.delete(key);
+  if (isExpiredFailure(cached)) return undefined;
   snapshots.set(key, cached);
   return cached;
 }

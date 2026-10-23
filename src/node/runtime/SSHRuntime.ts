@@ -510,6 +510,14 @@ async function fastReadGitHeadsRefs(projectPath: string): Promise<string | null>
 /** Trunk-like names SSH cleanups never `branch -D`, even when they look orphaned. */
 const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
 
+/**
+ * #6426: how often this process made or removed a checkout on each SSH host. Module level, because
+ * a runtime object is made per call. It is part of getAgentHostKey, so a checkout that Xum removed
+ * and made again at the same path never reuses the old one's cached plugin snapshot. Bumped AFTER
+ * the change: a snapshot is keyed when its read starts, so a read that raced it keeps the old key.
+ */
+const checkoutGenerations = new Map<string, number>();
+
 export class SSHRuntime extends RemoteRuntime {
   private readonly config: SSHRuntimeConfig;
   private readonly transport: SSHTransport;
@@ -1104,7 +1112,14 @@ export class SSHRuntime extends RemoteRuntime {
   protected readonly commandPrefix: string = "SSH";
 
   override getAgentHostKey(): string {
-    return makeAgentHostKey(this.config);
+    const host = makeAgentHostKey(this.config);
+    return JSON.stringify([host, checkoutGenerations.get(host) ?? 0]);
+  }
+
+  /** After a checkout on this host is made or removed (see checkoutGenerations). */
+  private bumpCheckoutGeneration(): void {
+    const host = makeAgentHostKey(this.config);
+    checkoutGenerations.set(host, (checkoutGenerations.get(host) ?? 0) + 1);
   }
 
   protected getBasePath(): string {
@@ -2551,7 +2566,7 @@ export class SSHRuntime extends RemoteRuntime {
     // Disable git hooks for untrusted projects (prevents post-checkout execution)
     const nhp = gitNoHooksPrefix(params.trusted);
 
-    return runWorkspaceInitHook({
+    const result = await runWorkspaceInitHook({
       params,
       runtimeType: "ssh",
       findHookRelativePath: () => findInitHookRelativePath(this, params.workspacePath),
@@ -2571,6 +2586,9 @@ export class SSHRuntime extends RemoteRuntime {
         );
       },
     });
+    // The checkout now exists (or changed); see checkoutGenerations.
+    this.bumpCheckoutGeneration();
+    return result;
   }
 
   /**
@@ -3332,6 +3350,7 @@ export class SSHRuntime extends RemoteRuntime {
       // Handle check results
       if (checkExitCode === 3) {
         // Directory doesn't exist - deletion is idempotent (success).
+        this.bumpCheckoutGeneration();
         return { success: true, deletedPath };
       }
 
@@ -3466,6 +3485,7 @@ export class SSHRuntime extends RemoteRuntime {
         }
       }
 
+      this.bumpCheckoutGeneration();
       return { success: true, deletedPath };
     } catch (error) {
       return { success: false, error: `Failed to delete directory: ${getErrorMessage(error)}` };
@@ -3856,6 +3876,7 @@ export class SSHRuntime extends RemoteRuntime {
       // `worktree add -b` refuses an existing branch, so only the worktree path demonstrably made
       // the fork's branch; the copy fallback may have checked out an existing one. Rollbacks
       // delete the branch only when this is true (#5119).
+      this.bumpCheckoutGeneration();
       return {
         success: true,
         workspacePath: newWorkspacePath,

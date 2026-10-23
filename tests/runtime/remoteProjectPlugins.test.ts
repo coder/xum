@@ -10,6 +10,7 @@ import {
 } from "./test-fixtures/ssh-fixture";
 import { createTestRuntime } from "./test-fixtures/test-helpers";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { createRemoteProjectPluginSnapshot } from "@/node/services/agentPlugins/remoteProjectPlugins";
 
@@ -69,6 +70,13 @@ describeIntegration("remote project plugins over SSH (BusyBox)", () => {
         `${await runtime.resolvePath(root)}/.xum/plugins/kit`,
       ]);
     }
+  }, 60000);
+
+  test("removing a checkout on the host gives it a new agent host key", async () => {
+    const before = (runtime as SSHRuntime).getAgentHostKey();
+    const result = await runtime.deleteWorkspace("/projects/p6426", "gone", true);
+    expect(result.success).toBe(true);
+    expect((runtime as SSHRuntime).getAgentHostKey()).not.toBe(before);
   }, 60000);
 
   test("cold listing times: small, a 100k-entry subtree, near the output cap", async () => {

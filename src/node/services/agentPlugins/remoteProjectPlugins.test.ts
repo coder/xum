@@ -235,6 +235,9 @@ describe("getRemoteProjectPluginSnapshot", () => {
     await getRemoteProjectPluginSnapshot(runtimes[2], root, [container]);
     expect(runtimes.slice(0, 3).map((runtime) => runtime.execs)).toEqual([2, 1, 2]);
 
+    // A failure is cached; once its retry delay is over it is read again and becomes the newest
+    // entry. Here it is the oldest of 16, so a new key would evict it if it kept its place.
+    clearRemoteProjectPluginSnapshots();
     const failing = new CountingRemoteRuntime(root, "down");
     failing.exec = () => {
       failing.execs++;
@@ -243,6 +246,36 @@ describe("getRemoteProjectPluginSnapshot", () => {
     expect(await getRemoteProjectPluginSnapshot(failing, root, [container])).toBeNull();
     expect(await getRemoteProjectPluginSnapshot(failing, root, [container])).toBeNull();
     expect(failing.execs).toBe(1);
+    for (const runtime of runtimes.slice(0, MAX_CACHED_SNAPSHOTS - 1)) {
+      await getRemoteProjectPluginSnapshot(runtime, root, [container]);
+    }
+    const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
+    try {
+      failing.exec = CountingRemoteRuntime.prototype.exec.bind(failing);
+      expect(await getRemoteProjectPluginSnapshot(failing, root, [container])).not.toBeNull();
+      await getRemoteProjectPluginSnapshot(runtimes[16], root, [container]);
+      await getRemoteProjectPluginSnapshot(failing, root, [container]);
+      expect(failing.execs).toBe(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  test("concurrent reads past the entry cap stay single-flight", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-inflight-cap");
+    const { root, container } = await checkoutWithKit(checkout.path);
+    const runtimes = Array.from(
+      { length: MAX_CACHED_SNAPSHOTS + 1 },
+      (_, i) => new CountingRemoteRuntime(root, `burst-${i}`)
+    );
+    const reads = runtimes.map((runtime) =>
+      getRemoteProjectPluginSnapshot(runtime, root, [container])
+    );
+    // Still in flight: the same key must join the first read, not start another.
+    const again = getRemoteProjectPluginSnapshot(runtimes[0], root, [container]);
+    expect(await again).toBe(await reads[0]);
+    await Promise.all(reads);
+    expect(runtimes[0].execs).toBe(1);
   });
 
   test("host keys separate SSH users, ports and keys, and recreated Docker containers", async () => {
