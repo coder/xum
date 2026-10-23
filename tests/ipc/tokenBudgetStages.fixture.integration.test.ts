@@ -495,10 +495,11 @@ describeIntegration("Token Budget stages (loopback fixture)", () => {
       });
       try {
         await scenario.send("Turn 0: read 4 files.");
-        await scenario.send("Turn 1: read 4 files.");
+        // One file keeps turn 1's estimate below H, so its settlement opens no stage (#5223).
+        await scenario.send("Turn 1: read 1 files.");
         // Grow the instructions so E ≈ 90.8k: below C (91,808), but E′ + 2,048 ≥ C. The assertions bracket
         // the band: less growth publishes a warning, more is refused and rolls the window over.
-        await scenario.writeInstructions(filler("Instruction", 14_300));
+        await scenario.writeInstructions(filler("Instruction", 26_270));
         await scenario.send("Turn 2: read 0 files.");
         const history = await scenario.history();
         expect(history.filter(isWarning)).toEqual([]);

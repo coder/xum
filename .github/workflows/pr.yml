@@ -37,11 +37,23 @@ jobs:
       browser: ${{ steps.filter.outputs.browser }}
       nix_deps: ${{ steps.filter.outputs.nix_deps }}
       docker: ${{ steps.filter.outputs.docker }}
+      e2e_tests: ${{ steps.filter.outputs.e2e_tests }}
+      vscode: ${{ steps.filter.outputs.vscode }}
       # Shared job gates, computed once instead of repeated in every job.
       # tests: code or CI config changed, and this isn't the merge queue's post-merge
       # push to main (the merge_group run already validated that exact commit).
       tests: ${{ (steps.filter.outputs.src == 'true' || steps.filter.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-      linux-runner: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+      # Depot runner sizes. Depot bills 2x, 4x and 8x the elapsed minutes on 4, 8 and 16 vCPU, so
+      # each job takes the smallest size that keeps its time. Measured on 2026-10-23 with dispatch
+      # runs 39935678316, 39935681840, 39937158652 and 39937162755: Unit, E2E, the bug-bash
+      # sandbox, Storybook, Smoke / Server and the builds ran as fast on 4 vCPU as on 16.
+      # Integration ran 1.7x longer on 4 vCPU (jest.config.js caps it at 4 workers, which 8 vCPU
+      # fits). On 2 vCPU, E2E and the sandbox ran out of heap and unit test hooks timed out.
+      # Static Checks keeps 16: 4 cold ESLint workers need 8 GiB each. Labels go through these
+      # outputs, not literals, because actionlint refuses unknown runner labels.
+      runner-4: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-4' || 'ubuntu-latest' }}
+      runner-8: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-8' || 'ubuntu-latest' }}
+      runner-16: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -79,6 +91,9 @@ jobs:
               - 'scripts/**'
               - 'packages/mux-compat/**'
               - 'jest.config.js'
+              # e2e_tests below lists it too: without it here, `tests` stays false on a
+              # Playwright-config-only change and test-e2e never runs.
+              - 'playwright.config.ts'
               - 'bunfig.toml'
               - 'babel.config.cjs'
               - 'package.json'
@@ -91,6 +106,19 @@ jobs:
               # so the snapshot-budget step (Test / Storybook) must run when they change.
               - 'pixel.jsonc'
               - '.storybook/**'
+            # Queue-only jobs (test-e2e, bugbash-sandbox, build-vscode) still run on a PR that
+            # changes their own tests or sources. This workflow holds their steps, the Makefile
+            # their targets, and bun.lock the playwright-core version that keys the sandbox image.
+            e2e_tests:
+              - 'tests/e2e/**'
+              - 'tests/bugbash/**'
+              - 'playwright.config.ts'
+              - '.github/workflows/pr.yml'
+              - 'Makefile'
+              - 'package.json'
+              - 'bun.lock'
+            vscode:
+              - 'vscode/**'
             nix_deps:
               - 'package.json'
               - 'bun.lock'
@@ -98,9 +126,11 @@ jobs:
               - 'flake.nix'
               - 'nix/**'
               - 'flake.lock'
-            # Server image inputs: everything the Dockerfile copies into the build stage
-            # (keep in sync with its COPY list), plus this workflow. Smoke / Docker runs on
-            # PRs that touch them (#5605), not only in the merge queue.
+            # Server image build setup: the Dockerfile and every input it copies except the app
+            # sources, plus this workflow. Smoke / Docker runs on PRs that touch them (#5605), and in the merge
+            # queue for every change. App sources (src/**, docs/**, public/**, static/**, the
+            # HTML entries) are not here: they matched 272 of 301 PR runs (2026-10-23), so the
+            # 16-vCPU image build ran on almost every PR push for 2 failures.
             docker:
               - 'Dockerfile'
               - '.dockerignore'
@@ -110,7 +140,6 @@ jobs:
               - 'patches/**'
               - 'Makefile'
               - 'fmt.mk'
-              - 'src/**'
               - 'tsconfig.json'
               - 'tsconfig.main.json'
               - 'scripts/generate-version.sh'
@@ -123,20 +152,14 @@ jobs:
               - 'scripts/perf/firstLoadJs.ts'
               - 'scripts/build-row-tree-worker.ts'
               - 'scripts/check-analytics-worker.cjs'
-              - 'docs/**'
-              - 'index.html'
-              - 'terminal.html'
-              - 'desktop.html'
               - 'vite.config.ts'
-              - 'public/**'
-              - 'static/**'
               - '.github/workflows/pr.yml'
 
   static-check:
     name: Static Checks
     needs: [changes]
     if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-16 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -258,7 +281,7 @@ jobs:
     if: needs.changes.outputs.tests == 'true'
     # Bound hung runs while allowing setup, build, coverage, and cleanup to finish.
     timeout-minutes: 20
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     strategy:
       fail-fast: false
       matrix:
@@ -365,7 +388,7 @@ jobs:
     # 32639270365, 32640298486). 20 minutes lets jest fail the hung test with real
     # diagnostics and still bounds a wedged runner.
     timeout-minutes: 20
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-8 }}
     strategy:
       fail-fast: false
       matrix:
@@ -702,7 +725,7 @@ jobs:
     name: Test / Storybook
     needs: [changes]
     if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -731,7 +754,13 @@ jobs:
     # Renders "linux 1/4" for shards and plain "macos" for the unsharded entry.
     name: Test / E2E (${{ matrix.os }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
     needs: [changes]
-    if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
+    # Queue only on PR pushes: in 330 sampled PR runs (2026-10-16..23) the jobs moved here (E2E,
+    # bug-bash sandbox, Smoke / Server, Build / Linux, Build / VS Code) failed 8 times but were
+    # a third of the PR cost. The merge queue still runs them for every merge, and a dispatch of
+    # this workflow on a branch runs them before the queue.
+    if: >-
+      needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == '' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.e2e_tests == 'true')
     strategy:
       fail-fast: false
       matrix:
@@ -743,7 +772,7 @@ jobs:
           - { os: linux, shard: 3/4 }
           - { os: linux, shard: 4/4 }
           - { os: macos }
-    runs-on: ${{ matrix.os == 'macos' && 'macos-latest' || needs.changes.outputs.linux-runner }}
+    runs-on: ${{ matrix.os == 'macos' && 'macos-latest' || needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -817,10 +846,13 @@ jobs:
     # E2E shard 1 still runs the same repros on the host until this job proves stable.
     name: Test / Bug-bash sandbox
     needs: [changes]
-    if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
+    # Queue only on PR pushes, unless the PR changes tests/bugbash (see test-e2e).
+    if: >-
+      needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == '' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.e2e_tests == 'true')
     # 45, not 30: a stale image key adds a local image build of up to 25 minutes (below).
     timeout-minutes: 45
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     # Stale-key local build: only main publishes the image, so a PR that changes its inputs (Dockerfile, build.sh,
     # playwright-core) has a stale image.json. With this opt-in the launcher then builds the image
     # locally with build.sh, for these two jobs only, and prints a warning. Model-driven runs
@@ -888,8 +920,9 @@ jobs:
   smoke-server:
     name: Smoke / Server
     needs: [changes]
-    if: needs.changes.outputs.tests == 'true'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    # Queue only on PR pushes (see test-e2e).
+    if: needs.changes.outputs.tests == 'true' && github.event_name != 'pull_request'
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -929,7 +962,7 @@ jobs:
       github.event_name == 'merge_group' ||
       (github.event_name == 'push' && github.actor != 'github-merge-queue[bot]') ||
       (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true')
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    runs-on: ${{ needs.changes.outputs.runner-16 }}
     permissions:
       contents: read
       id-token: write # Depot OIDC authentication
@@ -1108,8 +1141,9 @@ jobs:
   build-linux:
     name: Build / Linux
     needs: [changes]
-    if: needs.changes.outputs.tests == 'true'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    # Queue only on PR pushes (see test-e2e).
+    if: needs.changes.outputs.tests == 'true' && github.event_name != 'pull_request'
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -1224,8 +1258,11 @@ jobs:
   build-vscode:
     name: Build / VS Code
     needs: [changes]
-    if: needs.changes.outputs.tests == 'true'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    # Queue only on PR pushes, unless the PR changes vscode/ (see test-e2e).
+    if: >-
+      needs.changes.outputs.tests == 'true' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.vscode == 'true')
+    runs-on: ${{ needs.changes.outputs.runner-4 }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -1244,7 +1281,9 @@ jobs:
     name: Codex Comments
     needs: [changes]
     if: github.event_name == 'pull_request'
-    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    # A waiter (it polls Codex for up to 900 s) needs no CPU, and GitHub-hosted standard runners
+    # are free for this public repo, so it does not take a Depot runner.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:

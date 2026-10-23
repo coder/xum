@@ -68,7 +68,9 @@ Xum harness. Where the two differ, follow this skill.
 4. Dry run at $0 with no key: `make bug-bash-sandbox-check` (isolation, proxy and export
    refusals against a fake upstream, about 2 minutes) and `make test-bugbash-repros-sandbox` (the
    repros through the launcher on the mock app AI, about 4 minutes). CI's
-   `Test / Bug-bash sandbox` job runs both.
+   `Test / Bug-bash sandbox` job runs both, in the merge queue and on PRs that change
+   `tests/e2e`, `tests/bugbash`, `playwright.config.ts`, `pr.yml`, `Makefile`, `package.json`
+   or `bun.lock`.
 
 ## 2. Plan charters
 

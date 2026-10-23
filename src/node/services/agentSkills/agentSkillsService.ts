@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import os from "node:os";
+import * as os from "node:os";
 
 import {
   isRuntimeReadFailure,

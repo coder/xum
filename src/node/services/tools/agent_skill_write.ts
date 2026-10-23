@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import * as fsPromises from "fs/promises";
 import * as path from "path";
 import { tool } from "ai";
 
@@ -33,6 +32,7 @@ import {
   migrateLegacyProjectSkill,
   resolveSkillFilePathForRuntime,
 } from "./runtimeSkillPathUtils";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 
 interface AgentSkillWriteToolArgs {
   name: string;
@@ -459,7 +459,7 @@ function makeAgentSkillWriteTool(
         try {
           if (xumScope.type !== "project") {
             // Self-heal a deleted mux home before realpath-based containment validation runs.
-            await fsPromises.mkdir(containmentRoot, { recursive: true });
+            await nodeHostFiles.promises.mkdir(containmentRoot, { recursive: true });
           }
 
           await validateLocalSkillDirectory(containmentRoot, skillDir);
@@ -513,7 +513,7 @@ function makeAgentSkillWriteTool(
             let originalContent = "";
             let fileExisted = false;
             try {
-              const existingStat = await fsPromises.lstat(resolvedTarget.resolvedPath);
+              const existingStat = await nodeHostFiles.promises.lstat(resolvedTarget.resolvedPath);
               if (existingStat.isSymbolicLink()) {
                 return {
                   success: false,
@@ -528,7 +528,10 @@ function makeAgentSkillWriteTool(
                 };
               }
 
-              originalContent = await fsPromises.readFile(resolvedTarget.resolvedPath, "utf-8");
+              originalContent = await nodeHostFiles.promises.readFile(
+                resolvedTarget.resolvedPath,
+                "utf-8"
+              );
               fileExisted = true;
             } catch (error) {
               if (!hasErrorCode(error, "ENOENT")) {
@@ -553,8 +556,14 @@ function makeAgentSkillWriteTool(
               }
             }
 
-            await fsPromises.mkdir(path.dirname(resolvedTarget.resolvedPath), { recursive: true });
-            await fsPromises.writeFile(resolvedTarget.resolvedPath, contentToWrite, "utf-8");
+            await nodeHostFiles.promises.mkdir(path.dirname(resolvedTarget.resolvedPath), {
+              recursive: true,
+            });
+            await nodeHostFiles.promises.writeFile(
+              resolvedTarget.resolvedPath,
+              contentToWrite,
+              "utf-8"
+            );
 
             // Refinement journal (RLM r2): row is appended before the write is
             // acknowledged; failures never fail the tool (self-healing). An
