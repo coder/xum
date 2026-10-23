@@ -503,7 +503,7 @@ function planStableSystem(
 }
 
 /**
- * Whether this request's model or agent differs from the segment's previous turn. The
+ * Whether this request's model, route or agent differs from the segment's previous turn. The
  * instruction blocks then re-freeze instead of sending the new model's or agent's
  * `<model-...>`/`<mode-...>` sections in a row under the old ones: that costs no cache, since
  * each model has its own prompt cache and an agent switch already changes the
@@ -514,11 +514,19 @@ function switchesModelOrAgent(options: AssemblePromptPayloadOptions, history: Mu
     .slice(findLatestContextBoundaryIndex(history) + 1)
     .findLast((message) => message.role === "assistant")?.metadata;
   // Rows record the canonical model (Coder ids raw), so compare both sides canonicalized.
-  const model = previous?.model;
-  if (model != null && normalizeToCanonical(model) !== normalizeToCanonical(options.modelString)) {
-    return true;
-  }
-  return previous?.agentId != null && previous.agentId !== options.effectiveAgentId;
+  const model = previous?.model == null ? undefined : normalizeToCanonical(previous.model);
+  return (
+    differs(model, normalizeToCanonical(options.modelString)) ||
+    // A route switch for the same model (anthropic: to coder:) is one too: the model section
+    // is tagged with the raw model string, and each route has its own cache.
+    differs(previous?.routeProvider, options.routeProvider) ||
+    differs(previous?.agentId, options.effectiveAgentId)
+  );
+}
+
+/** Both set and different: an old row without the field forces no re-freeze. */
+function differs(before: string | undefined, now: string | undefined): boolean {
+  return before != null && now != null && before !== now;
 }
 
 /**

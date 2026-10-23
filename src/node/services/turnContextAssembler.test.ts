@@ -1199,6 +1199,7 @@ describe("assemblePromptPayload", () => {
       const opusRow = createMuxMessage("a1", "assistant", "answer", {
         model: "anthropic:claude-opus-5-5",
         agentId: "exec",
+        routeProvider: "anthropic",
         customInstructions: { text: block("model-opus"), placement: "system" },
       });
       const history = [
@@ -1207,9 +1208,13 @@ describe("assemblePromptPayload", () => {
         createMuxMessage("u2", "user", "second"),
       ];
       const sonnet = { modelString: "anthropic:claude-sonnet-5-5" };
+      // Codex PRRT_kwDOPxxmWM6vjdlK: the same canonical model on another route is a switch too
+      // (the model section's tag holds the raw model string).
+      const coder = { modelString: "coder:anthropic/claude-opus-5-5", routeProvider: "coder" };
       for (const [live, route] of [
         [block("model-sonnet"), sonnet],
         [block("mode-plan"), { effectiveAgentId: "plan" }],
+        [block("model-coder:anthropic/claude-opus-5-5"), coder],
       ] as const) {
         const switched = await send(live, history, route);
         expect(switched.messages[0]).toMatchObject({ role: "system", content: stable + live });
