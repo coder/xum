@@ -13,7 +13,14 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import * as path from "path";
 import * as fs from "fs";
 import { execFileSync } from "child_process";
-import { TestTempDir, createTestToolConfig, getTestDeps, mockToolCallOptions } from "./testHelpers";
+import { randomUUID } from "crypto";
+import {
+  TestTempDir,
+  createTestToolConfig as createBaseToolConfig,
+  getTestDeps,
+  mockToolCallOptions,
+} from "./testHelpers";
+
 // A static import, not a require("...?real=1") copy: Bun's LCOV keeps only the last-loaded copy of
 // a file, so a copy would replace runtimeFactory.test.ts's coverage of runtimeFactory.ts.
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -31,6 +38,18 @@ import {
   SPAWN_NAME_LOCK_FILENAME,
 } from "@/node/services/backgroundProcessManager";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+
+// Unique workspace IDs per run (#7256): spawn records live in the shared
+// /tmp/mux-bashes/<workspaceId>, and the loop-test runner runs several test files at once. A fixed
+// "test-workspace" let one file's cleanup delete another file's records, as #5591 fixed for
+// backgroundProcessManager.test.ts.
+const RUN_ID = randomUUID().slice(0, 12);
+const TEST_WS = `test-workspace-${RUN_ID}`;
+const createTestToolConfig = (
+  tempDir: string,
+  options?: Parameters<typeof createBaseToolConfig>[1]
+): ReturnType<typeof createBaseToolConfig> =>
+  createBaseToolConfig(tempDir, { workspaceId: TEST_WS, ...options });
 
 // Helper to create bash tool with test configuration
 // Returns both tool and disposable temp directory
@@ -2756,7 +2775,7 @@ console.log("ready");
         expect(isAlive(pid)).toBe(false);
       } finally {
         resumeCommand.resolve();
-        await manager.cleanup("test-workspace");
+        await manager.cleanup(TEST_WS);
         if (pid > 1 && isAlive(pid)) process.kill(pid, "SIGKILL");
         tempDir[Symbol.dispose]();
       }
@@ -2808,7 +2827,7 @@ console.log("ready");
       } finally {
         finishTerminate.resolve();
         await otherClaim?.[Symbol.asyncDispose]();
-        await manager.cleanup("test-workspace");
+        await manager.cleanup(TEST_WS);
         if (pid > 1 && isAlive(pid)) process.kill(pid, "SIGKILL");
         tempDir[Symbol.dispose]();
       }
@@ -2848,7 +2867,7 @@ console.log("ready");
       expect(result.success).toBe(true);
       const processId = "backgroundProcessId" in result ? result.backgroundProcessId : undefined;
       expect(processId).toBeDefined();
-      const proc = (await manager.list("test-workspace")).find((p) => p.id === processId);
+      const proc = (await manager.list(TEST_WS)).find((p) => p.id === processId);
       expect(proc).toBeDefined();
       return proc!.outputDir;
     }
@@ -2876,7 +2895,7 @@ console.log("ready");
         const dirs = await Promise.all(managers.map((m, i) => migratedOutputDir(m, settled[i])));
         expect(dirs[0]).not.toBe(dirs[1]);
       } finally {
-        await Promise.all(managers.map((m) => m.cleanup("test-workspace")));
+        await Promise.all(managers.map((m) => m.cleanup(TEST_WS)));
         tempDir[Symbol.dispose]();
       }
     }, 20000);
@@ -2899,7 +2918,7 @@ console.log("ready");
         // Another backend holds the spawn-name lock while this one sends its command to the
         // background; the command exits before the lock frees up.
         const otherBackendLock = await acquireProcessFileLock({
-          lockPath: path.join(bgRoot, "test-workspace", SPAWN_NAME_LOCK_FILENAME),
+          lockPath: path.join(bgRoot, TEST_WS, SPAWN_NAME_LOCK_FILENAME),
           timeoutMs: 5000,
           label: "test: other backend's spawn lock",
         });
@@ -2926,9 +2945,9 @@ console.log("ready");
         const result = await resultPromise;
         expect("backgroundProcessId" in result).toBe(false);
         expect(result.exitCode).toBe(3);
-        expect(await manager.list("test-workspace")).toEqual([]);
+        expect(await manager.list(TEST_WS)).toEqual([]);
       } finally {
-        await manager.cleanup("test-workspace");
+        await manager.cleanup(TEST_WS);
         tempDir[Symbol.dispose]();
       }
     }, 20000);
@@ -2936,7 +2955,7 @@ console.log("ready");
     it("does not inherit a previous session's exit marker", async () => {
       const tempDir = new TestTempDir("test-bash-migrate-stale-marker");
       const bgRoot = path.join(tempDir.path, "bg-root");
-      const staleDir = path.join(bgRoot, "test-workspace", "stale-job");
+      const staleDir = path.join(bgRoot, TEST_WS, "stale-job");
       fs.mkdirSync(staleDir, { recursive: true });
       fs.writeFileSync(path.join(staleDir, "exit_code"), "0");
       fs.writeFileSync(
@@ -2959,7 +2978,7 @@ console.log("ready");
         // backend's name probe and to crash-orphan archive gating.
         expect(fs.existsSync(path.join(outputDir, "exit_code"))).toBe(false);
       } finally {
-        await manager.cleanup("test-workspace");
+        await manager.cleanup(TEST_WS);
         tempDir[Symbol.dispose]();
       }
     }, 20000);
