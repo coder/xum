@@ -85,7 +85,7 @@ function createNames() {
   const nameDigest = (digest: string, name: string) => {
     assert(
       (hashes.get(digest) ?? name) === name,
-      `digest ${digest} named ${hashes.get(digest)} and ${name}`
+      `digest ${digest} named ${hashes.get(digest) ?? name} and ${name}`
     );
     hashes.set(digest, name);
   };
