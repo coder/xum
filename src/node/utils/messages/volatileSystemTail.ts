@@ -278,11 +278,18 @@ export function planCustomInstructions(
   if (replayedTurn) {
     return planSystemSection(CUSTOM_INSTRUCTIONS, messages, "", rowsSupported, replayedTurn);
   }
-  // No blocks now: as before (none sent, nothing recorded) unless the segment froze some.
-  // Then their removal is a change like any other, sent as a row until the next compaction.
   const removed = requestBlock === "";
-  if (removed && (!rowsSupported || restoreFrozenSegment(messages, CUSTOM_INSTRUCTIONS) == null)) {
-    return none;
+  if (removed) {
+    if (!rowsSupported) return none;
+    const restored = restoreFrozenSegment(messages, CUSTOM_INSTRUCTIONS);
+    // No blocks at the segment start: freeze "no blocks" (an empty baseline, one record per
+    // segment start), so a first AGENTS.md (or a first Model:/Mode: section) later in the
+    // segment is a row, not a system-prompt rewrite.
+    if (restored == null) return { ...none, record: { text: "", placement: "system" } };
+    // Still no blocks: nothing changed. Else their removal is a change like any other, sent as
+    // a row until the next compaction.
+    const { appliedTail, ...withRows } = restored;
+    if (appliedTail === "") return withRows;
   }
   const plan = planSystemSection(
     CUSTOM_INSTRUCTIONS,
