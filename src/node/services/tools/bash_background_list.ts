@@ -2,7 +2,7 @@ import { tool } from "ai";
 import type { BashBackgroundListResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
-import { clockOf } from "@/node/utils/hostClock";
+import { nodeClock } from "@/node/utils/hostClock";
 
 /**
  * Tool for listing background processes in the current workspace
@@ -27,7 +27,8 @@ export const createBashBackgroundListTool: ToolFactory = (config: ToolConfigurat
       }
 
       const processes = await config.backgroundProcessManager.list(config.workspaceId);
-      const now = clockOf(config).nowMs();
+      // Wall clock, like the process start times that BackgroundProcessManager stores (#7282).
+      const now = nodeClock.nowMs();
 
       return {
         success: true,
