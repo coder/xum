@@ -38,7 +38,6 @@ import type { MCPWorkspaceStats } from "@/node/services/mcpServerManager";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { getRuntimeTypeForTelemetry, roundToBase2 } from "@/common/telemetry/utils";
-import type { HostClock } from "@/node/utils/hostClock";
 
 // ---------------------------------------------------------------------------
 // PTC Lazy-Loading Singleton
@@ -135,8 +134,6 @@ export interface ApplyToolPolicyAndExperimentsOptions {
    * (ToolBridge stubs/denies non-granted mux.* calls).
    */
   capabilityGrants?: CapabilityGrants;
-  /** The session's HostClock, for code_execution. Absent: nodeClock. */
-  clock?: HostClock;
 }
 
 /** Env opt-in for persistent code_execution mounts (dogfooding/Track 2). */
@@ -427,7 +424,6 @@ export async function applyToolPolicyAndExperiments(
         // mount before honoring it.
         {
           kernelFirst: rlmActive,
-          clock: opts.clock,
           loadFile: kernelFileLoaderAllowedBy(effectiveToolPolicy, sandbox?.kernelFileLoader),
         }
       );

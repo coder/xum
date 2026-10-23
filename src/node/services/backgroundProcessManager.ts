@@ -138,7 +138,7 @@ export function parseSpawnRecordMeta(raw: string): { pid: number; status: string
  * Throws when the directory cannot be probed, so callers fail closed instead of looping over
  * candidates.
  */
-async function recordDirIsFree(recordDir: string, clock: HostClock): Promise<boolean> {
+async function recordDirIsFree(recordDir: string): Promise<boolean> {
   let stat: Stats;
   try {
     stat = await fsPromises.lstat(recordDir);
@@ -146,7 +146,7 @@ async function recordDirIsFree(recordDir: string, clock: HostClock): Promise<boo
     if (isErrnoWithCode(error, "ENOENT")) return true;
     throw error;
   }
-  return stat.isDirectory() && (await pruneOldSettledRecord(recordDir, clock));
+  return stat.isDirectory() && (await pruneOldSettledRecord(recordDir));
 }
 
 // A settled record is pruned only once its exit marker is at least this old (#4893).
@@ -171,7 +171,7 @@ const SETTLED_RECORD_PRUNE_AGE_MS = 24 * 60 * 60 * 1000;
  *   the new command's output past its old offset. Read-only, and only for such old records.
  * Any failure keeps the record (the caller moves on to a suffixed name).
  */
-async function pruneOldSettledRecord(recordDir: string, clock: HostClock): Promise<boolean> {
+async function pruneOldSettledRecord(recordDir: string): Promise<boolean> {
   try {
     // Regular files only (lstat): never follow a symlink planted in the shared temp records
     // root, and never block on a FIFO while holding the spawn-name lock.
@@ -186,7 +186,8 @@ async function pruneOldSettledRecord(recordDir: string, clock: HostClock): Promi
     const marker = await fsPromises.lstat(nodePath.join(recordDir, BG_EXIT_CODE_FILENAME));
     if (!marker.isFile() || !metaStat.isFile()) return false;
     const settledAtMs = Math.max(marker.mtimeMs, metaStat.mtimeMs);
-    if (clock.nowMs() - settledAtMs < SETTLED_RECORD_PRUNE_AGE_MS) return false;
+    // Wall clock: settledAtMs is a file mtime (#7282).
+    if (nodeClock.nowMs() - settledAtMs < SETTLED_RECORD_PRUNE_AGE_MS) return false;
     await fsPromises.rm(recordDir, { recursive: true });
     return true;
   } catch (error) {
@@ -1282,7 +1283,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       ...(update.tailLines !== undefined ? { tailLines: update.tailLines } : {}),
       totalMatches: monitor.matchesCount,
       ...(update.droppedLines > 0 ? { droppedLines: update.droppedLines } : {}),
-      timestamp: this.hostClock.nowMs(),
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      timestamp: nodeClock.nowMs(),
       ...(update.matchedThroughOffset !== undefined
         ? { matchedThroughOffset: update.matchedThroughOffset }
         : {}),
@@ -1524,7 +1526,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     monitor.settlementDisposition = {
       status: terminal.status,
       ...(terminal.exitCode !== undefined ? { exitCode: terminal.exitCode } : {}),
-      settledAt: new Date(this.hostClock.nowMs()).toISOString(),
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      settledAt: new Date(nodeClock.nowMs()).toISOString(),
       wakeOnExit: monitor.wakeOnExit,
       terminalStatusShown: proc.terminalStatusShownToAgent,
       ...(retainedMatchedThroughOffset != null
@@ -1946,7 +1949,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         if (proc.status === "running") {
           proc.status = "exited";
           proc.exitCode = exitCode;
-          proc.exitTime = this.hostClock.nowMs();
+          // Record time: wall clock until #7282 moves its consumers to HostClock.
+          proc.exitTime = nodeClock.nowMs();
           await this.updateMetaFile(proc).catch((err: unknown) => {
             log.debug(
               `BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`
@@ -2201,7 +2205,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     this.reservedProcessIds.add(processId);
     try {
       let suffix = 2;
-      while (!(await recordDirIsFree(nodePath.join(workspaceDir, processId), this.hostClock))) {
+      while (!(await recordDirIsFree(nodePath.join(workspaceDir, processId)))) {
         this.reservedProcessIds.delete(processId);
         do {
           processId = `${displayName} (${suffix})`;
@@ -2325,10 +2329,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       let suffix = 2;
       try {
         while (
-          !(await recordDirIsFree(
-            nodePath.join(localBgWorkspaceDir(workspaceId), processId),
-            this.hostClock
-          ))
+          !(await recordDirIsFree(nodePath.join(localBgWorkspaceDir(workspaceId), processId)))
         ) {
           this.reservedProcessIds.delete(processId);
           do {
@@ -2423,7 +2424,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }
 
     const { handle, pid, outputDir } = result;
-    const startTime = this.hostClock.nowMs();
+    // Process start time: stored in meta.json, shown and compared with wake origins (#7282).
+    const startTime = nodeClock.nowMs();
 
     // Write meta.json with process info
     const meta: BackgroundProcessMeta = {
@@ -2491,7 +2493,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         filter: config.monitor.filter,
         filterExclude: config.monitor.exclude,
         script,
-        createdAt: new Date(this.hostClock.nowMs()).toISOString(),
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        createdAt: new Date(nodeClock.nowMs()).toISOString(),
       };
       proc.monitor = this.createMonitorState(config.monitor, { pollIntervalMs, armMetadata });
       this.startMonitorTail(proc);
@@ -2588,7 +2591,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     outputDir: string,
     displayName?: string
   ): void {
-    const startTime = this.hostClock.nowMs();
+    // Process start time: stored in meta.json, shown and compared with wake origins (#7282).
+    const startTime = nodeClock.nowMs();
 
     const proc: BackgroundProcess = {
       id: processId,
@@ -2706,7 +2710,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         log.debug(`Background process ${proc.id} has exited`);
         proc.status = "exited";
         proc.exitCode = exitCode;
-        proc.exitTime = this.hostClock.nowMs();
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        proc.exitTime = nodeClock.nowMs();
         await this.updateMetaFile(proc).catch((err: unknown) => {
           log.debug(
             `BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`
@@ -3630,7 +3635,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         log.debug(`Background process ${proc.id} has exited`);
         proc.status = "exited";
         proc.exitCode = exitCode;
-        proc.exitTime = this.hostClock.nowMs();
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        proc.exitTime = nodeClock.nowMs();
         await this.updateMetaFile(proc).catch((err: unknown) => {
           log.debug(
             `BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`
@@ -3696,7 +3702,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // Update process status and exit code
       proc.status = "killed";
       proc.exitCode = (await proc.handle.getExitCode()) ?? undefined;
-      proc.exitTime ??= this.hostClock.nowMs();
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      proc.exitTime ??= nodeClock.nowMs();
 
       // Update meta.json
       await this.updateMetaFile(proc).catch((err: unknown) => {
@@ -3727,7 +3734,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       log.debug(`Error terminating process ${processId}: ${errorMessage}`);
       // Mark as killed even if there was an error (process likely already dead)
       proc.status = "killed";
-      proc.exitTime ??= this.hostClock.nowMs();
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      proc.exitTime ??= nodeClock.nowMs();
       // Update meta.json
       await this.updateMetaFile(proc).catch((err: unknown) => {
         log.debug(`BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`);

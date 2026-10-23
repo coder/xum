@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { ARTIFACT_ASSET_LIMITS, createArtifactAssetLoader } from "./artifactAssets";
-import { buildArtifactCsp } from "./artifactCsp";
+import { buildArtifactCsp, isArtifactCdnUrl } from "./artifactCsp";
 import {
   buildSandboxedHtmlDocument,
   buildSandboxedSvgDocument,
@@ -39,6 +39,22 @@ describe("artifact CSP", () => {
     expect(buildArtifactCsp({ allowCdn: false })).toBe(
       "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; font-src data:; img-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-src 'none'"
     );
+  });
+});
+
+describe("isArtifactCdnUrl", () => {
+  // The frame resolves "//host/..." against the parent's base, so the notice must too.
+  test("resolves protocol-relative links against the frame's base URL", () => {
+    const on = { allowCdn: true };
+    expect(isArtifactCdnUrl("//unpkg.com/x.css", "style", on, "https://xum.example/")).toBe(true);
+    expect(isArtifactCdnUrl("//unpkg.com/x.js", "script", on, "https://xum.example/")).toBe(true);
+    expect(isArtifactCdnUrl("//unpkg.com/x.css", "style", on, "file:///app/index.html")).toBe(
+      false
+    );
+    expect(isArtifactCdnUrl("//evil.example/x.css", "style", on, "https://xum.example/")).toBe(
+      false
+    );
+    expect(isArtifactCdnUrl("/x.css", "style", on, "https://xum.example/")).toBe(false);
   });
 });
 

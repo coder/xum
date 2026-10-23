@@ -81,16 +81,16 @@ function parseTimestampMs(value: string | undefined): number | undefined {
   return Number.isFinite(ms) ? ms : undefined;
 }
 
+// Wall clock on purpose: TaskService stamps createdAt/reportedAt with Date.now() (#7282).
 function getAgentTaskElapsedMs(
-  timestamps: AgentTaskTimestamps | null | undefined,
-  clock: HostClock
+  timestamps: AgentTaskTimestamps | null | undefined
 ): number | undefined {
   const createdAtMs = parseTimestampMs(timestamps?.createdAt);
   if (createdAtMs == null) {
     return undefined;
   }
 
-  const endAtMs = parseTimestampMs(timestamps?.reportedAt) ?? clock.nowMs();
+  const endAtMs = parseTimestampMs(timestamps?.reportedAt) ?? nodeClock.nowMs();
   return Math.max(0, endAtMs - createdAtMs);
 }
 
@@ -407,7 +407,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       // Agent task records currently store creation/report timestamps, but not a separate
       // running-start timestamp, so this elapsed value intentionally includes queued time.
       const getAgentTaskElapsedField = (taskId: string) =>
-        withElapsedMs(getAgentTaskElapsedMs(taskService.getAgentTaskTimestamps?.(taskId), clock));
+        withElapsedMs(getAgentTaskElapsedMs(taskService.getAgentTaskTimestamps?.(taskId)));
 
       const descendantAgentTaskIds =
         typeof bulkFilter === "function"

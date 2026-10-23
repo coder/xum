@@ -1,5 +1,5 @@
 import { tool } from "ai";
-import { clockOf } from "@/node/utils/hostClock";
+import { nodeClock } from "@/node/utils/hostClock";
 
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -150,7 +150,8 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
       }
 
       const mode: WorkflowResumeMode = args.mode ?? "resume";
-      const invocationStartedAtMs = clockOf(config).nowMs();
+      // Wall clock: the sidecar stores it as createdAtMs beside WorkflowService times (#7282).
+      const invocationStartedAtMs = nodeClock.nowMs();
 
       // A kernel-nested resume (mux.workflow_resume inside code_execution) leaves no top-level
       // workflow_resume part in history, so the history-walk consumption predicates cannot see

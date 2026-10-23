@@ -151,7 +151,7 @@ export async function inlineArtifactHtmlAssets(
     const ref = link.getAttribute("href") ?? "";
     const kind = classifyArtifactReference(ref);
     if (kind === "external") {
-      if (!isArtifactCdnUrl(ref, "style", cspOptions)) blocked(ref);
+      if (!isArtifactCdnUrl(ref, "style", cspOptions, document.baseURI)) blocked(ref);
       continue;
     }
     if (kind === "data") continue;
@@ -172,7 +172,7 @@ export async function inlineArtifactHtmlAssets(
     const ref = script.getAttribute("src") ?? "";
     const kind = classifyArtifactReference(ref);
     if (kind === "external") {
-      if (!isArtifactCdnUrl(ref, "script", cspOptions)) blocked(ref);
+      if (!isArtifactCdnUrl(ref, "script", cspOptions, document.baseURI)) blocked(ref);
       continue;
     }
     if (kind === "data") continue;

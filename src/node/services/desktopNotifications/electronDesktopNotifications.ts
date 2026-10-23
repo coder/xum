@@ -12,12 +12,40 @@ import {
   type DesktopNotifications,
 } from "./desktopNotifications";
 
-/**
- * Check if we're running in Electron environment
- */
-function isElectronEnvironment(): boolean {
-  return typeof process.versions.electron === "string";
+/** The parts of the electron module that this layer uses. Tests pass a fake one. */
+export interface ElectronNotificationApi {
+  Notification: {
+    isSupported(): boolean;
+    new (options: { title: string; body?: string; silent: boolean }): {
+      on(event: "click", listener: () => void): unknown;
+      show(): void;
+    };
+  };
+  BrowserWindow: {
+    getAllWindows(): Array<{
+      isMinimized(): boolean;
+      restore(): void;
+      focus(): void;
+      webContents: { send(channel: string, payload: { workspaceId: string }): void };
+    }>;
+  };
 }
+
+export interface ElectronHost {
+  /** True when this process runs in Electron. */
+  isElectron(): boolean;
+  /** Imports electron. Called only when isElectron() is true. */
+  loadElectron(): Promise<ElectronNotificationApi>;
+}
+
+const realElectronHost: ElectronHost = {
+  isElectron: () => typeof process.versions.electron === "string",
+  loadElectron: async () => {
+    // eslint-disable-next-line no-restricted-syntax -- Electron is unavailable in `mux server`; avoid top-level import
+    const { Notification, BrowserWindow } = await import("electron");
+    return { Notification, BrowserWindow };
+  },
+};
 
 /**
  * Send a system notification using Electron's Notification API.
@@ -25,11 +53,12 @@ function isElectronEnvironment(): boolean {
  * Returns true if notification was shown, false otherwise.
  */
 async function sendElectronNotification(
+  host: ElectronHost,
   title: string,
   body?: string,
   workspaceId?: string
 ): Promise<{ success: boolean; error?: string }> {
-  if (!isElectronEnvironment()) {
+  if (!host.isElectron()) {
     return {
       success: false,
       error: "System notifications not supported (not running in Electron)",
@@ -37,8 +66,7 @@ async function sendElectronNotification(
   }
 
   try {
-    // eslint-disable-next-line no-restricted-syntax -- Electron is unavailable in `mux server`; avoid top-level import
-    const { Notification, BrowserWindow } = await import("electron");
+    const { Notification, BrowserWindow } = await host.loadElectron();
 
     if (!Notification.isSupported()) {
       return {
@@ -83,6 +111,12 @@ async function sendElectronNotification(
   }
 }
 
-export const electronDesktopNotifications: DesktopNotifications = {
-  show: (request) => sendElectronNotification(request.title, request.body, request.workspaceId),
-};
+/** The Node layer on a given electron host. Tests pass a fake host. */
+export function createElectronDesktopNotifications(host: ElectronHost): DesktopNotifications {
+  return {
+    show: (request) =>
+      sendElectronNotification(host, request.title, request.body, request.workspaceId),
+  };
+}
+
+export const electronDesktopNotifications = createElectronDesktopNotifications(realElectronHost);

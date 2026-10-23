@@ -107,7 +107,6 @@ describe("openaiSupportsNativeMaxEffort", () => {
     expect(openaiSupportsNativeMaxEffort("openai:gpt-5.5-pro")).toBe(false);
     expect(openaiSupportsNativeMaxEffort("openai:gpt-5.61")).toBe(false);
     // Removed tiers no longer carry the native max effort.
-    expect(openaiSupportsNativeMaxEffort("openai:gpt-5.6-sol")).toBe(false);
     expect(openaiSupportsNativeMaxEffort("openai:gpt-6-sol")).toBe(false);
   });
 
@@ -154,7 +153,6 @@ describe("openaiSupportsProMode", () => {
     expect(openaiSupportsProMode("openai:gpt-5.5-pro")).toBe(false);
     expect(openaiSupportsProMode("openai:gpt-5.6-sol-mini")).toBe(false);
     expect(openaiSupportsProMode("openai:gpt-5.61")).toBe(false);
-    expect(openaiSupportsProMode("openai:gpt-5.6-sol")).toBe(false);
     expect(openaiSupportsProMode("openai:gpt-6-sol")).toBe(false);
     expect(openaiSupportsProMode("anthropic:claude-opus-4-7")).toBe(false);
   });
@@ -224,6 +222,52 @@ describe("getOpenAIReasoningEffort", () => {
     // Unpublished variants keep the legacy mapping.
     expect(getOpenAIReasoningEffort("max", "openai:gpt-6-astra-mini")).toBe("xhigh");
     expect(getOpenAIReasoningEffort("off", "openai:gpt-6-astra-mini")).toBeUndefined();
+  });
+});
+
+describe("GPT-5.6 catalogue models", () => {
+  // Not built in since #5258, but Settings → Models still offers them and OpenAI
+  // serves none through native max and Pro mode on the whole family.
+  const GPT_56_IDS = [
+    "openai:gpt-5.6",
+    "openai:gpt-5.6-sol",
+    "openai:gpt-5.6-terra",
+    "openai:gpt-5.6-luna",
+    "openrouter:openai/gpt-5.6-sol",
+    "openai:gpt-5.6-sol-2026-07-09",
+    "openai:gpt-5.6-sol-20260709",
+    // A mappedToModel target written without a provider.
+    "gpt-5.6-sol",
+  ];
+
+  test("get native max, explicit none, Pro mode, and distinct MAX/XHIGH labels", () => {
+    for (const id of GPT_56_IDS) {
+      expect(openaiSupportsNativeMaxEffort(id)).toBe(true);
+      expect(openaiSupportsProMode(id)).toBe(true);
+      expect(getOpenAIReasoningEffort("max", id)).toBe("max");
+      expect(getOpenAIReasoningEffort("xhigh", id)).toBe("xhigh");
+      expect(getOpenAIReasoningEffort("off", id)).toBe("none");
+      expect(getThinkingDisplayLabel("max", id)).toBe("MAX");
+      expect(getThinkingDisplayLabel("xhigh", id)).toBe("XHIGH");
+      expect(getThinkingOptionLabel("max", id)).toBe("max");
+      expect(getThinkingOptionLabel("xhigh", id)).toBe("xhigh");
+    }
+  });
+
+  test("leave Cyber, unannounced variants, and older GPT models on the legacy surface", () => {
+    for (const id of [
+      "openai:gpt-5.6-cyber",
+      "openai:gpt-5.6-sol-mini",
+      "openai:gpt-5.61",
+      "openai:gpt-5.5",
+      "openai:gpt-5.5-pro",
+      "openai:gpt-6-sol",
+    ]) {
+      expect(openaiSupportsNativeMaxEffort(id)).toBe(false);
+      expect(openaiSupportsProMode(id)).toBe(false);
+      expect(getOpenAIReasoningEffort("max", id)).toBe("xhigh");
+      expect(getOpenAIReasoningEffort("off", id)).toBeUndefined();
+    }
   });
 });
 

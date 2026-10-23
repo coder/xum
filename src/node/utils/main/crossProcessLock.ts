@@ -1,3 +1,4 @@
+import { CrossProcessLockTimeoutError } from "@/node/utils/concurrency/lockErrors";
 import { createHash, randomBytes } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -79,10 +80,11 @@ export interface CrossProcessLockOptions {
   signal?: AbortSignal;
 }
 
-/** Thrown when the acquire budget elapses; the message names the blocking holder. */
-export class CrossProcessLockTimeoutError extends Error {}
+// One class for instanceof checks: the pure lockErrors module owns it.
+export { CrossProcessLockTimeoutError };
 
-interface LockHolder {
+/** The record of a lock holder, as the lock file stores it. */
+export interface CrossProcessLockHolder {
   pid: number;
   token: string;
   acquiredAt: number;
@@ -115,10 +117,10 @@ type Observation =
   | { kind: "absent" }
   | { kind: "unreadable"; code: string }
   | { kind: "corrupt"; key: string; mtimeMs: number }
-  | { kind: "holder"; key: string; holder: LockHolder };
+  | { kind: "holder"; key: string; holder: CrossProcessLockHolder };
 type Generation = Extract<Observation, { key: string }>;
 
-function parseHolder(text: string): LockHolder | undefined {
+function parseHolder(text: string): CrossProcessLockHolder | undefined {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -212,12 +214,14 @@ function judge(observation: Generation): Verdict {
 }
 
 /** Why an attempt did not get the lock; reported by the timeout error. */
-interface Blocker {
-  holder?: LockHolder;
+export interface CrossProcessLockBlocker {
+  holder?: CrossProcessLockHolder;
   why: string;
 }
+type Blocker = CrossProcessLockBlocker;
 
-function describeHolder(holder: LockHolder): string {
+/** "pid N (started B on H)": how refusals and probes name a holder. */
+export function describeHolder(holder: CrossProcessLockHolder): string {
   return (
     `pid ${holder.pid} (started ${holder.identity?.birth ?? "at an unknown time"}` +
     `${holder.identity?.hostname ? ` on ${holder.identity.hostname}` : ""})`
@@ -232,6 +236,18 @@ function describeBlocker(lockPath: string, blocker: Blocker | undefined): string
   const who = holder === undefined ? "" : ` by ${describeHolder(holder)}`;
   const hint = holder === undefined ? "" : " Stop that process to free the lock.";
   return `Lock ${lockPath} is held${who} and was not taken over because ${blocker.why}.${hint}`;
+}
+
+/**
+ * The text of a CrossProcessLockTimeoutError. Exported so the SessionLocks test
+ * layers refuse with today's text, byte for byte.
+ */
+export function crossProcessLockTimeoutMessage(
+  timeoutMessage: string,
+  lockPath: string,
+  blocker: CrossProcessLockBlocker | undefined
+): string {
+  return `${timeoutMessage} ${describeBlocker(lockPath, blocker)}`;
 }
 
 /**
@@ -568,7 +584,7 @@ export async function acquireCrossProcessLock(
     // when the failed attempt completed within the deadline's millisecond.
     if (Date.now() >= deadline) {
       throw new CrossProcessLockTimeoutError(
-        `${timeoutMessage} ${describeBlocker(lockPath, blocker)}`
+        crossProcessLockTimeoutMessage(timeoutMessage, lockPath, blocker)
       );
     }
     await sleepWithJitter(250, signal);
