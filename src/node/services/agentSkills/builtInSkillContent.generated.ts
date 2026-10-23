@@ -5788,6 +5788,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "Vertex models are not listed in the model catalog. Add them by ID, for example `google-vertex:gemini-2.5-pro` (see [Add custom models](/config/models#add-custom-models)). They use the same thinking levels as `google` models.",
       "",
+      'The Gemini Cyber models, `gemini-3.8-flash-cyber` and `gemini-4-argon-cyber-permissive`, are available only on Vertex AI, to projects that Google has allowlisted for each model, and only in the `global` and `us` locations. The Gemini API does not serve them: a `google:` Cyber model fails with "not found for API version v1beta". Add them as `google-vertex:gemini-3.8-flash-cyber` or `google-vertex:gemini-4-argon-cyber-permissive`.',
+      "",
       "### Anthropic Fast mode",
       "",
       'Claude Opus 5.5, Opus 5, and Opus 4.8 support Anthropic\'s [Fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode) research preview: up to 2.5× faster output at 2× token pricing. Toggle it from the thinking selector\'s **Fast mode** row, the command palette (**Toggle Fast Mode**), `/fast`, or its keyboard shortcut. Like the thinking level, the choice is saved per chat and stays with the chat when you switch models. Chats without a choice use `"speed": "fast"` under `anthropic` in `providers.jsonc` as their default.',
