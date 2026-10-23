@@ -236,6 +236,8 @@ describe("GPT-5.6 catalogue models", () => {
     "openrouter:openai/gpt-5.6-sol",
     "openai:gpt-5.6-sol-2026-07-09",
     "openai:gpt-5.6-sol-20260709",
+    // A mappedToModel target written without a provider.
+    "gpt-5.6-sol",
   ];
 
   test("get native max, explicit none, Pro mode, and distinct MAX/XHIGH labels", () => {
