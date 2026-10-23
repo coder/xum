@@ -146,7 +146,6 @@ import { countAnthropicInputTransformations } from "@/node/utils/messages/anthro
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
 import { stripAnthropicReasoning } from "@/browser/utils/messages/modelMessageTransform";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
 import { getModelStats, getModelStatsResolved } from "@/common/utils/tokens/modelStats";
 import { withSequentialExecution } from "@/node/services/tools/withSequentialExecution";
 import type { ResolvedCallSettingsOverrides } from "@/common/config/schemas/modelParameters";
@@ -575,7 +574,7 @@ interface PreparedModelFallback {
   headers?: Record<string, string | undefined>;
   callSettingsOverrides?: ResolvedCallSettingsOverrides;
   thinkingLevel?: string;
-  /** Route attribution corrections (routedThroughGateway, routeProvider, costsIncluded). */
+  /** Route attribution corrections (routeProvider, costsIncluded). */
   initialMetadataPatch?: Partial<MuxMetadata>;
   /**
    * Rebuild closure bound to the FALLBACK model so mid-turn thinking changes
@@ -765,24 +764,18 @@ function getProviderRetryAfterMs(error: unknown): number | null {
 }
 
 // Use the resolved SDK model, not the requested prefix: OpenAI Responses can
-// arrive through direct, custom, Coder, or Vercel gateway routes. xAI Responses
-// and OpenRouter chat-completions models must not enter this recovery path.
+// arrive through direct, custom, or Coder routes. xAI Responses and OpenRouter
+// chat-completions models must not enter this recovery path.
 function isOpenAIResponsesModel(model: LanguageModel): boolean {
   if (typeof model === "string") return false;
-  return (
-    model.provider === "openai.responses" ||
-    (model.provider === "gateway" && model.modelId.startsWith("openai/"))
-  );
+  return model.provider === "openai.responses";
 }
 
 // Same idea for the Anthropic Messages wire, whose converter replays thinking
 // from the `anthropic` providerOptions namespace on every route.
 function isAnthropicMessagesModel(model: LanguageModel): boolean {
   if (typeof model === "string") return false;
-  return (
-    model.provider === "anthropic.messages" ||
-    (model.provider === "gateway" && model.modelId.startsWith("anthropic/"))
-  );
+  return model.provider === "anthropic.messages";
 }
 
 // Claude through Bedrock Converse (@ai-sdk/amazon-bedrock), whose converter replays
@@ -4130,9 +4123,6 @@ export class StreamManager {
     const streamStartAgentId = streamInfo.initialMetadata?.agentId;
     const streamStartMode = this.getStreamMode(streamInfo.initialMetadata);
     const canonicalModel = metadataModelIdentity(streamInfo.model);
-    const routedThroughGateway =
-      streamInfo.initialMetadata?.routedThroughGateway ??
-      streamInfo.model.startsWith("mux-gateway:");
     const routeProvider = streamInfo.initialMetadata?.routeProvider;
 
     this.emitTurnEvent({
@@ -4145,7 +4135,6 @@ export class StreamManager {
       // diverge from the backend ledger when a Coder catalog refresh
       // removes/retags the instance mid-stream.
       metadataModel: streamInfo.metadataModel,
-      routedThroughGateway,
       ...(routeProvider != null && { routeProvider }),
       ...(streamInfo.initialMetadata?.autoModelRouting != null && {
         autoModelRouting: streamInfo.initialMetadata.autoModelRouting,
@@ -4311,7 +4300,7 @@ export class StreamManager {
     // The persisted entry carries the ATTRIBUTION key, not the raw stream
     // identity: sidecar refused_stream rows are keyed by
     // recordHeadlessUsageLocked's canonical model, so a raw gateway/Coder
-    // identity here (e.g. mux-gateway:openai/gpt-5 vs openai:gpt-5) would
+    // identity here (e.g. coder:openai/gpt-5 vs openai:gpt-5) would
     // split one model across two analytics buckets when queries group
     // committed hop rows and sidecar rows together.
     streamInfo.toolModelUsages.push({
@@ -4372,9 +4361,6 @@ export class StreamManager {
     options: { metadata?: Partial<MuxMetadata>; parts?: MuxMessage["parts"] } = {}
   ): MuxMessage {
     const canonicalModel = metadataModelIdentity(streamInfo.model);
-    const routedThroughGateway =
-      streamInfo.initialMetadata?.routedThroughGateway ??
-      streamInfo.model.startsWith("mux-gateway:");
 
     return {
       id: streamInfo.messageId,
@@ -4385,7 +4371,6 @@ export class StreamManager {
         ...streamInfo.initialMetadata,
         model: canonicalModel,
         metadataModel: streamInfo.metadataModel,
-        routedThroughGateway,
         ...(streamInfo.thinkingLevel && {
           thinkingLevel: streamInfo.thinkingLevel as ThinkingLevel,
         }),
@@ -5401,7 +5386,7 @@ export class StreamManager {
                   // Cumulative (for live cost display)
                   cumulativeUsage: streamInfo.cumulativeUsage,
                   cumulativeProviderMetadata: streamInfo.cumulativeProviderMetadata,
-                  // Preserve gateway-billed zero-cost behavior throughout the stream.
+                  // Preserve costs-included zero-cost behavior throughout the stream.
                   costsIncluded: streamInfo.initialMetadata?.costsIncluded,
                 });
                 streamInfo.currentStepStartIndex = streamInfo.parts.length;
@@ -5517,9 +5502,6 @@ export class StreamManager {
               streamInfo.initialMetadata?.costsIncluded
             );
             const canonicalModel = metadataModelIdentity(streamInfo.model);
-            const routedThroughGateway =
-              streamInfo.initialMetadata?.routedThroughGateway ??
-              streamInfo.model.startsWith("mux-gateway:");
             const toolModelUsages =
               streamInfo.toolModelUsages.length > 0
                 ? streamInfo.toolModelUsages.map(clonePersistedToolModelUsage)
@@ -5537,7 +5519,6 @@ export class StreamManager {
                 ...streamInfo.initialMetadata, // TurnRequestBuilder-provided metadata (systemMessageTokens, etc)
                 model: canonicalModel,
                 metadataModel: streamInfo.metadataModel,
-                routedThroughGateway,
                 ...(streamInfo.thinkingLevel && {
                   thinkingLevel: streamInfo.thinkingLevel as ThinkingLevel,
                 }),
@@ -5858,19 +5839,6 @@ export class StreamManager {
     if (isAnthropic && isAnthropicOverloadError(actualError)) {
       errorMessage = "Anthropic is temporarily overloaded (HTTP 529). Please try again later.";
       errorType = "server_error";
-    }
-
-    const muxGatewayUnauthorized =
-      streamInfo.model.startsWith("mux-gateway:") &&
-      ((APICallError.isInstance(actualError) && actualError.statusCode === 401) ||
-        (RetryError.isInstance(actualError) &&
-          actualError.lastError &&
-          APICallError.isInstance(actualError.lastError) &&
-          actualError.lastError.statusCode === 401));
-
-    if (muxGatewayUnauthorized) {
-      // Friendly normalization for expired mux-gateway sessions.
-      errorMessage = MUX_GATEWAY_SESSION_EXPIRED_MESSAGE;
     }
 
     const openAIResponsesBaseUrlHint = getOpenAIResponsesBaseUrlHint({
@@ -6372,8 +6340,7 @@ export class StreamManager {
       // the same program. Like a bad key, the user must change provider config
       // or turn Cyber off, so reuse the non-retryable authentication class.
       if (getOpenAIAccessProgramError(error) != null) return "authentication";
-      // 402 (Payment Required) is used by mux gateway for billing/credits issues
-      // (e.g. "Insufficient balance. Please add credits to continue.").
+      // 402 (Payment Required) signals a billing problem on the provider account.
       // Treat as non-retryable quota. Some providers also encode quota failures as
       // 429, so classify 429 by payload intent instead of status code alone.
       if (error.statusCode === 402) return "quota";
@@ -6862,9 +6829,9 @@ export class StreamManager {
     const errorCode = this.extractErrorCode(error);
     const statusCode = this.extractStatusCode(error);
     // Record if: we have the specific error code, OR a likely status code.
-    // mux-gateway currently surfaces OpenAI's "previous_response_not_found" as a 400
-    // (and omits the structured error code), so we treat 400 as eligible once the
-    // responseId regex matched the error payload/message.
+    // Proxies can surface OpenAI's "previous_response_not_found" as a 400 without the
+    // structured error code, so we treat 400 as eligible once the responseId regex
+    // matched the error payload/message.
     const shouldRecord =
       errorCode === "previous_response_not_found" ||
       statusCode === 404 ||
@@ -7295,7 +7262,7 @@ export class StreamManager {
         providerMetadata: streamInfo.lastStepProviderMetadata,
         cumulativeUsage: streamInfo.cumulativeUsage,
         cumulativeProviderMetadata: streamInfo.cumulativeProviderMetadata,
-        // Replays must preserve gateway-billed zero-cost behavior from the original stream.
+        // Replays must preserve costs-included zero-cost behavior from the original stream.
         costsIncluded: streamInfo.initialMetadata?.costsIncluded,
       });
       this.emitTurnEvent(usageEvent);

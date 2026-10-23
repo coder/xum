@@ -16,6 +16,7 @@ const NARROW_PANE_WIDTH = 200;
 /** VS Code's minimum sidebar width: the narrowest pane the webview can get (#5645). */
 const VSCODE_MIN_SIDEBAR_WIDTH = 170;
 
+// The widest header: a repeat count, the Status link and the debug button.
 const OVERLOADED: StreamErrorRow = {
   type: "stream-error",
   id: "error-overloaded",
@@ -25,19 +26,18 @@ const OVERLOADED: StreamErrorRow = {
   historySequence: 2,
   timestamp: STABLE_TIMESTAMP,
   model: "anthropic:claude-sonnet-4-5",
+  errorCount: 3,
 };
 
-// The widest header: a repeat count, the Add credits link and the debug button.
 const REPEATED_QUOTA: StreamErrorRow = {
   type: "stream-error",
   id: "error-quota",
   historyId: "error-quota",
-  error: "Insufficient balance. Please add credits to continue.",
+  error: "You exceeded your current quota. Check your plan and billing details.",
   errorType: "quota",
   historySequence: 3,
   timestamp: STABLE_TIMESTAMP,
-  model: "mux-gateway:anthropic/claude-sonnet-4",
-  routedThroughGateway: true,
+  model: "openai:gpt-5",
   errorCount: 3,
 };
 

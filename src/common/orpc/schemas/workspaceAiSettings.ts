@@ -6,7 +6,7 @@ import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thin
  * Workspace-scoped AI settings that should persist across devices.
  *
  * Notes:
- * - `model` must be canonical "provider:model" (NOT mux-gateway:provider/model).
+ * - `model` must be canonical "provider:model" (NOT openrouter:provider/model).
  * - `thinkingLevel` is workspace-scoped (saved per workspace, not per-model).
  */
 
