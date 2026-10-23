@@ -236,7 +236,6 @@ export const MuxMessageSchema = z.object({
       model: z.string().optional(),
       metadataModel: z.string().optional(),
       thinkingLevel: ThinkingLevelSchema.optional(),
-      routedThroughGateway: z.boolean().optional(),
       routeProvider: z.string().optional(), // Preserve replayed/non-stream route attribution.
       // Self-healing read path (like agentId/compactionEpoch): the badge is purely
       // decorative, so a shape-corrupt persisted record must degrade to "no badge"

@@ -1074,8 +1074,6 @@ export interface MuxMetadata {
   metadataModel?: string;
   /** Effective thinking/reasoning level used for this response (after model policy clamping). */
   thinkingLevel?: ThinkingLevel;
-  /** @deprecated Legacy gateway flag; prefer routeProvider for source attribution. */
-  routedThroughGateway?: boolean;
   routeProvider?: string;
   /**
    * Legacy marker for usage that the app classified as subscription-covered.
@@ -1462,7 +1460,6 @@ export type DisplayedMessage =
       /** True when this assistant row predates the latest Context Boundary. */
       isBeforeLatestContextBoundary?: boolean;
       model?: string;
-      routedThroughGateway?: boolean;
       routeProvider?: string;
       /** Present when a fallback model answered after the requested model refused. */
       modelFallback?: ModelFallbackRecord;
@@ -1557,7 +1554,6 @@ export type DisplayedMessage =
       historySequence: number; // Global ordering across all messages
       timestamp?: number;
       model?: string;
-      routedThroughGateway?: boolean;
       errorCount?: number; // Number of consecutive identical errors merged into this message
     }
   | {

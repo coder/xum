@@ -38,7 +38,7 @@ describe("getThinkingPolicyForModel", () => {
   test.each(["gpt-6-luna"])("preserves off and native max for %s", (model) => {
     for (const id of [
       `openai:${model}`,
-      `mux-gateway:openai/${model}`,
+      `coder:openai/${model}`,
       `openrouter:openai/${model}-2026-09-22`,
     ]) {
       expect(getThinkingPolicyForModel(id)).toEqual([
@@ -60,7 +60,7 @@ describe("getThinkingPolicyForModel", () => {
   test("returns 5 levels (no off) including max for gpt-6-astra (direct, gateway, dated)", () => {
     const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
     expect(getThinkingPolicyForModel("openai:gpt-6-astra")).toEqual(fiveLevels);
-    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-6-astra")).toEqual(fiveLevels);
+    expect(getThinkingPolicyForModel("coder:openai/gpt-6-astra")).toEqual(fiveLevels);
     expect(getThinkingPolicyForModel("openrouter:openai/gpt-6-astra-2026-09-30")).toEqual(
       fiveLevels
     );
@@ -70,7 +70,7 @@ describe("getThinkingPolicyForModel", () => {
 
   test("gpt-6.1-sol follows Astra: 5 levels (no off), off and unset clamp to low", () => {
     const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
-    for (const id of ["openai:gpt-6.1-sol", "mux-gateway:openai/gpt-6.1-sol"]) {
+    for (const id of ["openai:gpt-6.1-sol", "coder:openai/gpt-6.1-sol"]) {
       expect(getThinkingPolicyForModel(id)).toEqual(fiveLevels);
       expect(enforceThinkingPolicy(id, "off")).toBe("low");
       expect(resolveEffectiveThinkingLevel(id, undefined)).toBe("low");
@@ -88,7 +88,7 @@ describe("getThinkingPolicyForModel", () => {
   test("gpt-6-astra clamps unset/off to low (forced thinking, like Mythos/GLM/3.8 Flash)", () => {
     expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", undefined)).toBe("low");
     expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", "off")).toBe("low");
-    expect(resolveEffectiveThinkingLevel("mux-gateway:openai/gpt-6-astra", null)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("coder:openai/gpt-6-astra", null)).toBe("low");
     expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", "max")).toBe("max");
     // Luna keeps a real "off" (wire effort "none"); the clamp is Astra/6.1 Sol-specific.
     expect(resolveEffectiveThinkingLevel("openai:gpt-6-luna", undefined)).toBe("off");
@@ -170,7 +170,7 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
     ]);
     // Behind gateway
-    expect(getThinkingPolicyForModel("mux-gateway:anthropic/claude-opus-4-6")).toEqual([
+    expect(getThinkingPolicyForModel("coder:anthropic/claude-opus-4-6")).toEqual([
       "off",
       "low",
       "medium",
@@ -307,7 +307,7 @@ describe("getThinkingPolicyForModel", () => {
     // Argon has no "off" either; unclamped, it would run at its medium default.
     for (const model of [
       "google:gemini-3.8-flash",
-      "mux-gateway:google/gemini-3.8-flash",
+      "openrouter:google/gemini-3.8-flash",
       "google:gemini-4-argon",
     ]) {
       expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
@@ -391,7 +391,7 @@ describe("getThinkingPolicyForModel", () => {
       "max",
     ]);
     // Behind gateway
-    expect(getThinkingPolicyForModel("mux-gateway:anthropic/claude-sonnet-5")).toEqual([
+    expect(getThinkingPolicyForModel("coder:anthropic/claude-sonnet-5")).toEqual([
       "off",
       "low",
       "medium",
@@ -406,7 +406,7 @@ describe("getThinkingPolicyForModel", () => {
     for (const model of [
       "anthropic:claude-sonnet-5-5",
       "anthropic:claude-sonnet-5-5-20261001",
-      "mux-gateway:anthropic/claude-sonnet-5-5",
+      "coder:anthropic/claude-sonnet-5-5",
       "bedrock:anthropic.claude-sonnet-5-5",
     ]) {
       expect({ model, policy: getThinkingPolicyForModel(model) }).toEqual({
@@ -426,7 +426,7 @@ describe("getThinkingPolicyForModel", () => {
     const allLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
     for (const model of [
       "anthropic:claude-haiku-5-5",
-      "mux-gateway:anthropic/claude-haiku-5-5",
+      "coder:anthropic/claude-haiku-5-5",
       "bedrock:anthropic.claude-haiku-5-5",
     ]) {
       expect({ model, policy: getThinkingPolicyForModel(model) }).toEqual({
@@ -447,7 +447,7 @@ describe("getThinkingPolicyForModel", () => {
     };
     for (const [model, config] of [
       ["anthropic:claude-haiku-5-5", null],
-      ["mux-gateway:anthropic/claude-haiku-5-5", null],
+      ["coder:anthropic/claude-haiku-5-5", null],
       ["bedrock:anthropic.claude-haiku-5-5", null],
       ["anthropic:team-haiku", mapped],
     ] as const) {
@@ -484,7 +484,7 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
     ]);
     // Behind gateway
-    expect(getThinkingPolicyForModel("mux-gateway:anthropic/claude-sonnet-4-6")).toEqual([
+    expect(getThinkingPolicyForModel("coder:anthropic/claude-sonnet-4-6")).toEqual([
       "off",
       "low",
       "medium",
@@ -512,12 +512,6 @@ describe("getThinkingPolicyForModel", () => {
       "medium",
       "high",
     ]);
-    expect(getThinkingPolicyForModel("mux-gateway:google/gemini-3.5-flash")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-    ]);
   });
 
   test("returns off/low/medium/high for versioned stable Gemini 3.5 Flash IDs", () => {
@@ -533,7 +527,7 @@ describe("getThinkingPolicyForModel", () => {
   test("returns off/low/medium/high for stable Gemini 3.6 Flash", () => {
     for (const model of [
       "google:gemini-3.6-flash",
-      "mux-gateway:google/gemini-3.6-flash",
+      "openrouter:google/gemini-3.6-flash",
       "google:gemini-3.6-flash-001",
     ]) {
       expect(getThinkingPolicyForModel(model)).toEqual(["off", "low", "medium", "high"]);
@@ -543,7 +537,7 @@ describe("getThinkingPolicyForModel", () => {
   test("returns off/low/medium/high for stable Gemini 3.7 Flash", () => {
     for (const model of [
       "google:gemini-3.7-flash",
-      "mux-gateway:google/gemini-3.7-flash",
+      "openrouter:google/gemini-3.7-flash",
       "google:gemini-3.7-flash-001",
     ]) {
       expect(getThinkingPolicyForModel(model)).toEqual(["off", "low", "medium", "high"]);
@@ -553,7 +547,6 @@ describe("getThinkingPolicyForModel", () => {
   test("returns low/medium/high (no off) for Gemini 3.8 Flash, which rejects minimal", () => {
     for (const model of [
       "google:gemini-3.8-flash",
-      "mux-gateway:google/gemini-3.8-flash",
       "openrouter:google/gemini-3.8-flash",
       "google:gemini-3.8-flash-001",
     ]) {

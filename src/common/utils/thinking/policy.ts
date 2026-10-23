@@ -146,7 +146,7 @@ const DEFAULT_THINKING_POLICY: ThinkingPolicy = ["off", "low", "medium", "high"]
 function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   // Normalize to be robust to provider prefixes, whitespace, gateway wrappers, and version
   // suffixes. Strips both a `provider:` prefix and any upstream-provider path segment that
-  // proxies encode (e.g. `mux-gateway:openai/gpt-6-astra` -> `gpt-6-astra`).
+  // proxies encode (e.g. `openrouter:openai/gpt-6-astra` -> `gpt-6-astra`).
   const withoutProviderNamespace = stripModelProviderPrefixes(modelString);
 
   // Claude Sonnet 5.5 rejects `disabled` too, but its "off" maps to `between_tools`

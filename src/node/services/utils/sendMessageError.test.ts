@@ -124,7 +124,7 @@ describe("formatSendMessageError", () => {
       provider: "unsupported-provider",
     });
 
-    expect(result.errorType).toBe("unknown");
+    expect(isNonRetryableStreamError({ type: result.errorType })).toBe(true);
     expect(result.message).toContain("unsupported-provider");
     expect(result.message).toContain("not supported");
   });

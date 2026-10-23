@@ -94,11 +94,6 @@ export const XAIProviderConfigSchema = BaseProviderConfigSchema.extend({
   fastModePreviousServiceTier: XAIFastModePreviousServiceTierSchema.optional(),
 });
 
-export const MuxGatewayProviderConfigSchema = BaseProviderConfigSchema.extend({
-  couponCode: z.string().optional(),
-  voucher: z.string().optional(),
-});
-
 export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
   /** Coder deployment access URL (e.g. https://coder.example.com). */
   deploymentUrl: z.string().optional(),
@@ -199,7 +194,6 @@ export const ProvidersConfigSchema = z
     openrouter: OpenRouterProviderConfigSchema.optional(),
     xai: XAIProviderConfigSchema.optional(),
     meta: MetaProviderConfigSchema.optional(),
-    "mux-gateway": MuxGatewayProviderConfigSchema.optional(),
     google: GoogleProviderConfigSchema.optional(),
     "google-vertex": GoogleVertexProviderConfigSchema.optional(),
     deepseek: DeepSeekProviderConfigSchema.optional(),
@@ -215,7 +209,6 @@ export type BaseProviderConfig = z.infer<typeof BaseProviderConfigSchema>;
 export type OpenAIProviderConfig = z.infer<typeof OpenAIProviderConfigSchema>;
 export type BedrockProviderConfig = z.infer<typeof BedrockProviderConfigSchema>;
 export type GoogleVertexProviderConfig = z.infer<typeof GoogleVertexProviderConfigSchema>;
-export type MuxGatewayProviderConfig = z.infer<typeof MuxGatewayProviderConfigSchema>;
 export type CoderProviderConfig = z.infer<typeof CoderProviderConfigSchema>;
 
 export type ProvidersConfig = z.infer<typeof ProvidersConfigSchema>;

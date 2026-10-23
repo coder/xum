@@ -37,10 +37,10 @@
  * its own. cache_control markers move to the newest block on every request,
  * so they are removed before hashing, but only where Anthropic accepts them.
  *
- * The AI SDK prompt form (DevTools records, the mux-gateway wire) carries no
- * call-level options, so its messages sentinel only reflects images. Its
- * leading system messages follow the pinned converter, which sends only their
- * text (see leadingSystemBlocks).
+ * The AI SDK prompt form (DevTools records) carries no call-level options, so
+ * its messages sentinel only reflects images. Its leading system messages
+ * follow the pinned converter, which sends only their text (see
+ * leadingSystemBlocks).
  *
  * Scope: the fingerprint deliberately does not hash the model id (callers
  * compare only requests of one model and route: the runtime monitor's route

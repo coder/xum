@@ -9,8 +9,6 @@ import { createWorkspaceServiceForTest } from "@/node/services/workspaceService.
 import { subscribeWorkspaceChat } from "@/node/orpc/routerSubscriptions";
 import { markSessionTapeReplayEgressBlocked } from "@/common/utils/sessionTapes/sessionTapeReplay";
 import type { ORPCContext } from "@/node/orpc/context";
-import { CUSTOM_EVENTS } from "@/common/constants/events";
-import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
 import { getInterruptionContext } from "@/common/utils/messages/retryEligibility";
 import type { TurnCoordinator, OperationId } from "@/node/services/turnCoordinator";
 import { Ok } from "@/common/types/result";
@@ -1018,12 +1016,10 @@ describe("WorkspaceStore", () => {
   it.each([false, true])(
     "suppresses recorded side effects when the renderer replays a session tape (%p)",
     async (replaying) => {
-      // A replayed tape's events never ran here: no gateway dialog, no git/review refresh.
+      // A replayed tape's events never ran here: no git/review refresh.
       const workspaceId = `tape-side-effects-${String(replaying)}`;
       const api = global.window.api as { isSessionTapeReplay?: boolean };
       api.isSessionTapeReplay = replaying;
-      const dispatchEvent = global.window.dispatchEvent as Mock<(event: Event) => boolean>;
-      dispatchEvent.mockClear();
       try {
         const send = openChat(workspaceId);
         createAndAddWorkspace(store, workspaceId);
@@ -1042,17 +1038,13 @@ describe("WorkspaceStore", () => {
           {
             type: "stream-error",
             messageId,
-            error: MUX_GATEWAY_SESSION_EXPIRED_MESSAGE,
+            error: "Unauthorized",
             errorType: "authentication",
           }
         );
         expect(
           await waitUntil(() => store.getWorkspaceState(workspaceId).messages.length > 0)
         ).toBe(true);
-        const gatewayDialogs = dispatchEvent.mock.calls.filter(
-          ([event]) => event.type === CUSTOM_EVENTS.MUX_GATEWAY_SESSION_EXPIRED
-        );
-        expect(gatewayDialogs.length).toBe(replaying ? 0 : 1);
         expect(store.getFileModifyingToolMs(workspaceId) === undefined).toBe(replaying);
       } finally {
         delete api.isSessionTapeReplay;
@@ -3858,7 +3850,7 @@ describe("WorkspaceStore", () => {
   });
 
   // Loaded session usage is repriced against the current provider config, except for
-  // gateway-billed rows, whose zero costs are real: repricing them would inflate totals.
+  // costs-included rows, whose zero costs are real: repricing them would inflate totals.
   describe("session usage repricing", () => {
     // A flat-priced model: $5/M input and $25/M output tokens.
     const BILLABLE_MODEL = "anthropic:claude-opus-4-5";
@@ -3921,7 +3913,7 @@ describe("WorkspaceStore", () => {
     };
 
     it("reprices recorded costs with the current model pricing", async () => {
-      // One non-zero component is enough to rule out the legacy gateway-billed heuristic.
+      // One non-zero component is enough to rule out the legacy costs-included heuristic.
       const { bucket, lastRequest } = await loadUsage(
         "reprice-stale-costs",
         BILLABLE_MODEL,
@@ -3932,7 +3924,7 @@ describe("WorkspaceStore", () => {
       expectCosts(lastRequest, OPUS_COST_OF_1000_IN_100_OUT);
     });
 
-    it("keeps the zero costs of rows marked as gateway-billed", async () => {
+    it("keeps the zero costs of rows marked as costs-included", async () => {
       const { bucket, lastRequest } = await loadUsage(
         "reprice-costs-included",
         BILLABLE_MODEL,
@@ -3944,7 +3936,7 @@ describe("WorkspaceStore", () => {
       expectCosts(lastRequest, { input: 0, output: 0 });
     });
 
-    it("keeps legacy all-zero costs of a billable model as gateway-billed", async () => {
+    it("keeps legacy all-zero costs of a billable model as costs-included", async () => {
       const { bucket, lastRequest } = await loadUsage(
         "reprice-legacy-zero-costs",
         BILLABLE_MODEL,
@@ -3967,7 +3959,7 @@ describe("WorkspaceStore", () => {
       expectCosts(lastRequest, OPUS_COST_OF_1000_IN_100_OUT);
     });
 
-    it("does not treat all-zero costs of an unpriced model as gateway-billed", async () => {
+    it("does not treat all-zero costs of an unpriced model as costs-included", async () => {
       const { bucket, lastRequest } = await loadUsage(
         "reprice-unpriced-zero-costs",
         CUSTOM_MODEL,
