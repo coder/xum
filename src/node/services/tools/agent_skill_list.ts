@@ -176,7 +176,10 @@ async function readContainedSkillFile(
   }
 
   try {
-    return { content: await nodeHostFiles.promises.readFile(containedPath, "utf-8"), byteSize: stat.size };
+    return {
+      content: await nodeHostFiles.promises.readFile(containedPath, "utf-8"),
+      byteSize: stat.size,
+    };
   } catch (error) {
     log.warn(
       `Skipping ${scope} skill '${directoryName}' because SKILL.md could not be read: ${getErrorMessage(error)}`

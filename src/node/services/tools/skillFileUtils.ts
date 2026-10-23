@@ -97,7 +97,9 @@ export function isPathInsideRoot(rootPath: string, targetPath: string): boolean 
  */
 export async function isSameHostDirectory(a: string, b: string): Promise<boolean> {
   const [realA, realB] = await Promise.all(
-    [a, b].map((target) => nodeHostFiles.promises.realpath(target).catch(() => path.resolve(target)))
+    [a, b].map((target) =>
+      nodeHostFiles.promises.realpath(target).catch(() => path.resolve(target))
+    )
   );
   return realA === realB;
 }
