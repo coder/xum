@@ -77,13 +77,15 @@ Body
     });
   });
 
-  // Tagged YAML parses to Set/Map/Uint8Array, and a recursive alias to a cyclic object.
-  // Neither survives the RPC serializer or the consent fingerprint, so both reject the skill.
+  // Tagged YAML parses to Set/Map/Uint8Array, a recursive alias to a cyclic object, and an
+  // integer beyond 2^53 - 1 to a rounded number. None of them survives the tool card or the
+  // consent fingerprint as written, so each rejects the skill.
   test.each([
     ["!!set", "metadata:\n  tags: !!set\n    ? a\n    ? b\n", "metadata.tags"],
     ["!!omap", "metadata:\n  order: !!omap\n    - a: 1\n", "metadata.order"],
     ["!!binary", "metadata:\n  blob: !!binary aGVsbG8=\n", "metadata.blob"],
     ["a recursive alias", "metadata:\n  loop: &A\n    self: *A\n", "recursive YAML alias"],
+    ["an unsafe integer", "metadata:\n  id: 9007199254740993\n", "beyond 2^53 - 1"],
   ])("rejects metadata with %s", (_label, metadataYaml, expectedError) => {
     const content = `---\nname: foo\ndescription: Hello\n${metadataYaml}---\nBody\n`;
 

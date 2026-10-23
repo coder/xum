@@ -29,19 +29,31 @@ export const SkillLookupNameSchema = z
   .regex(/^(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?:)?[a-z0-9]+(?:-[a-z0-9]+)*$/);
 
 /**
- * True when no object or array in `value` contains itself. A recursive YAML alias
- * (`a: &A { self: *A }`) parses to a cyclic object, which `z.json()` accepts but the
- * oRPC serializer and the consent fingerprint cannot walk. Shared (non-recursive)
- * aliases are fine, so this tracks the current path, not every visited node.
+ * Why a metadata value cannot round-trip as JSON, or undefined when it can.
+ * - A recursive YAML alias (`a: &A { self: *A }`) parses to a cyclic object, which
+ *   `z.json()` accepts but the oRPC serializer and the consent fingerprint cannot walk.
+ *   Shared (non-recursive) aliases are fine, so this tracks the current path only.
+ * - YAML rounds an integer beyond 2^53 - 1 before Xum sees it, so the tool card and the
+ *   consent fingerprint would show a different number than the file holds.
  */
-function isAcyclic(value: unknown, ancestors = new Set<object>()): boolean {
-  if (typeof value !== "object" || value === null) return true;
-  if (ancestors.has(value)) return false;
+function metadataValueProblem(value: unknown, ancestors = new Set<object>()): string | undefined {
+  if (typeof value === "number") return unsafeIntegerProblem(value);
+  if (typeof value !== "object" || value === null) return undefined;
+  if (ancestors.has(value)) return "must not contain a recursive YAML alias";
   ancestors.add(value);
   const children: unknown[] = Array.isArray(value) ? value : Object.values(value);
-  const acyclic = children.every((child) => isAcyclic(child, ancestors));
+  const problem = children.reduce<string | undefined>(
+    (found, child) => found ?? metadataValueProblem(child, ancestors),
+    undefined
+  );
   ancestors.delete(value);
-  return acyclic;
+  return problem;
+}
+
+function unsafeIntegerProblem(value: number): string | undefined {
+  return Number.isInteger(value) && !Number.isSafeInteger(value)
+    ? "must not contain an integer beyond 2^53 - 1 (quote it as a string)"
+    : undefined;
 }
 
 export const AgentSkillFrontmatterSchema = z.object({
@@ -56,7 +68,10 @@ export const AgentSkillFrontmatterSchema = z.object({
   // Set/Map/Uint8Array, which the tool card and the consent fingerprint show as `{}`.
   metadata: z
     .record(z.string(), z.json())
-    .refine((value) => isAcyclic(value), { message: "must not contain a recursive YAML alias" })
+    .superRefine((value, ctx) => {
+      const problem = metadataValueProblem(value);
+      if (problem !== undefined) ctx.addIssue({ code: "custom", message: problem });
+    })
     .optional(),
 
   // When false, skill is NOT listed in the tool description's skill index.

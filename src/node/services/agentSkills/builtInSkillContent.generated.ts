@@ -2552,7 +2552,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "- `license`",
       "- `compatibility`",
-      "- `metadata` (key/value map; values can be strings, numbers, booleans, lists or nested maps, but not tagged YAML such as `!!set` or recursive aliases)",
+      "- `metadata` (key/value map; values can be strings, numbers, booleans, lists or nested maps, but not tagged YAML such as `!!set`, recursive aliases or integers beyond 2^53 - 1)",
       "- `disable-model-invocation` (boolean) — set to `true` to omit a skill from the system prompt index (see [Unadvertised skills](#unadvertised-skills) below). This spelling is shared with other agent tools such as Claude Code, so portable skills work unchanged.",
       "- `advertise` (boolean) — Xum-specific equivalent: `advertise: false` behaves like `disable-model-invocation: true`. If both are set, the opt-out wins.",
       "- `user-invocable` (boolean) — set to `false` to hide a skill from user-facing invocation surfaces (see [Controlling who invokes a skill](#controlling-who-invokes-a-skill)).",
