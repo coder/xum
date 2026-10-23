@@ -723,14 +723,15 @@ describe("staging and activation", () => {
         {},
         { ...deps, "evil@1.0.0": sriOf("evil") }
       );
-      await expectFailure(() =>
+      // The refusal names the dependency; a crash on the malformed entry would not.
+      expect(
         verifyStagedDependencies(
           layout,
           dir,
           pinsOf({ ...deps, "evil@1.0.0": sriOf("evil") }),
           registry.request
         )
-      );
+      ).rejects.toThrow("Dependency evil");
       expect(registry.calls).toHaveLength(0);
     }
     // Redirected metadata can present any published package, or the release tarball itself, as
