@@ -1,4 +1,5 @@
 import type { CompactionHandler } from "../../compactionHandler";
+import { nodeClock } from "@/node/utils/hostClock";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { providerVisibleUserText } from "@/common/utils/messages/pluginHookContext";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
@@ -757,7 +758,8 @@ export class TokenBudgetStrategy {
       id: createUserMessageId(),
       metadata: {
         ...metadata,
-        timestamp: this.host.hostClock.nowMs(),
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        timestamp: nodeClock.nowMs(),
         muxMetadata: { ...muxMetadata, rolloverId: rollover.rolloverId },
       },
     };
