@@ -81,20 +81,35 @@ function createNames() {
   const roots = new Map<string, string>();
   const hashes = new Map<string, string>();
   const unknown = new Set<string>();
+  /** A digest keeps one name: two schemes or ids that make one digest fail here. */
+  const nameDigest = (digest: string, name: string) => {
+    assert(
+      (hashes.get(digest) ?? name) === name,
+      `digest ${digest} named ${hashes.get(digest)} and ${name}`
+    );
+    hashes.set(digest, name);
+  };
+  // The digest schemes of the lock paths: sha256 of UTF-8 cut to 32 characters keys the history
+  // and refine-apply locks, and the full sha256 of UTF-16LE keys the mutation gate and the use
+  // leases. Each scheme has its own name, so a lock built with the other scheme shows it.
+  const schemes = {
+    history: [historyWriteLockPath, refineApplyLockPath],
+    "workspace-use": [workspaceMutationLockPath, workspaceUseLockDir],
+  };
   const names: LockNames = {
     root: (dir, label) => void roots.set(path.resolve(dir), `<root:${label}>`),
     id: (workspaceId) => {
-      for (const file of [
-        historyWriteLockPath("/", workspaceId),
-        refineApplyLockPath("/", workspaceId),
-        workspaceMutationLockPath("/", workspaceId),
-        workspaceUseLockDir("/", workspaceId),
-      ]) {
-        hashes.set(digestOf(file), `<hash:${workspaceId}>`);
+      for (const [scheme, pathFns] of Object.entries(schemes)) {
+        const [digest, ...others] = pathFns.map((pathFn) => digestOf(pathFn("/", workspaceId)));
+        assert(
+          others.every((other) => other === digest),
+          `the ${scheme} paths share one digest`
+        );
+        nameDigest(digest, `<hash:${scheme}:${workspaceId}>`);
       }
     },
     target: (key) =>
-      void hashes.set(digestOf(targetMutationLockFilePath("/", key)), `<hash:${key}>`),
+      nameDigest(digestOf(targetMutationLockFilePath("/", key)), `<hash:target:${key}>`),
   };
   const mask = (text: string) => {
     // Hashes first: a target's name holds its raw path, which the roots mask next.
