@@ -11,6 +11,7 @@ import type { ReactElement, ReactNode } from "react";
 import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 
 // ToolIcon renders a Radix Tooltip, which requires a TooltipProvider in the
 // React tree. Wrap each render so the icon can mount without throwing. The API client is
@@ -122,7 +123,9 @@ void mock.module("@/browser/stores/WorkspaceStore", () => ({
     }),
 }));
 
-import { AskUserQuestionToolCall } from "./AskUserQuestionToolCall";
+import { AskUserQuestionToolCall, PlacedAskUserQuestionToolCall } from "./AskUserQuestionToolCall";
+import { AskUserQuestionPlacementProvider } from "./AskUserQuestion/askUserQuestionPlacement";
+import { findOpenAskUserQuestions } from "@/browser/utils/messages/openAskUserQuestions";
 
 describe("AskUserQuestionToolCall", () => {
   beforeEach(() => {
@@ -342,14 +345,23 @@ describe("AskUserQuestionToolCall", () => {
       },
     };
 
-    function renderAsyncQuestion() {
+    // Accepted answers outlive the card (app session), so each test asks in its own workspace.
+    let asyncWorkspaceId = "";
+    let asyncWorkspaceCount = 0;
+    beforeEach(() => {
+      asyncWorkspaceCount += 1;
+      asyncWorkspaceId = `ws-ask-async-${asyncWorkspaceCount}`;
+    });
+
+    function renderAsyncQuestion(rowId?: string) {
       return renderWithProviders(
         <AskUserQuestionToolCall
           args={{ questions }}
           result={asyncResult}
           status="completed"
           toolCallId="ask-async"
-          workspaceId="ws-ask"
+          workspaceId={asyncWorkspaceId}
+          rowId={rowId}
         />
       );
     }
@@ -368,7 +380,7 @@ describe("AskUserQuestionToolCall", () => {
       const [input] = sendMessage.mock.calls[0] as [
         { workspaceId: string; options: { muxMetadata?: unknown } },
       ];
-      expect(input.workspaceId).toBe("ws-ask");
+      expect(input.workspaceId).toBe(asyncWorkspaceId);
       expect(input.options.muxMetadata).toEqual({
         type: "normal",
         askUserQuestionAnswer: { toolCallId: "ask-async", answers: { "Which option?": "First" } },
@@ -424,7 +436,7 @@ describe("AskUserQuestionToolCall", () => {
           }}
           status="completed"
           toolCallId="ask-parts"
-          workspaceId="ws-ask"
+          workspaceId={asyncWorkspaceId}
         />
       );
 
@@ -487,7 +499,7 @@ describe("AskUserQuestionToolCall", () => {
             result={asyncResult}
             status="completed"
             toolCallId="ask-async"
-            workspaceId="ws-ask"
+            workspaceId={asyncWorkspaceId}
           />
         </TooltipProvider>
       );
@@ -623,6 +635,36 @@ describe("AskUserQuestionToolCall", () => {
       expect(sendMessage).not.toHaveBeenCalled();
     });
 
+    test("an accepted answer without an answer row stays answered for the dock and a remount", async () => {
+      const row = {
+        type: "tool",
+        id: "row-ask-async",
+        historyId: "history-ask-async",
+        toolCallId: "ask-async",
+        toolName: "ask_user_question",
+        args: { questions },
+        result: asyncResult,
+        status: "completed",
+        isPartial: false,
+        historySequence: 1,
+      } as const;
+      expect(findOpenAskUserQuestions(asyncWorkspaceId, [row])).toHaveLength(1);
+
+      const view = renderAsyncQuestion("row-ask-async");
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+      await waitFor(() => expect(view.getByText("User answered")).toBeTruthy());
+
+      // Batched into a queued message, the answer may never land as a row.
+      expect(findOpenAskUserQuestions(asyncWorkspaceId, [row])).toEqual([]);
+      view.unmount();
+      const remounted = renderAsyncQuestion("row-ask-async");
+      // Closed, so it follows the collapsed tool preference: open it to read the answers.
+      fireEvent.click(remounted.getByText("ask_user_question"));
+      expect(remounted.getByText("User answered")).toBeTruthy();
+      expect(remounted.queryByRole("button", { name: "Submit answers" })).toBeNull();
+    });
+
     test("sends from a host that does not feed WorkspaceStore", async () => {
       // The VS Code webview renders this card without registering the workspace in the store.
       workspaceStoreFed = false;
@@ -633,6 +675,97 @@ describe("AskUserQuestionToolCall", () => {
 
       await waitFor(() => expect(view.getByText("User answered")).toBeTruthy());
       expect(sendMessage).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  test("does not answer a blocking question while the transcript is still replaying", async () => {
+    // The dock shows open questions before a replay catches up; a stale copy must not resume.
+    transcriptCaughtUp = false;
+    const view = renderWithProviders(
+      <AskUserQuestionToolCall
+        args={{ questions: [], answers: {} }}
+        result={null}
+        status="executing"
+        toolCallId="ask-replaying"
+        workspaceId="ws-ask"
+      />
+    );
+
+    fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+    await waitFor(() => expect(view.getByText(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE)).toBeTruthy());
+    expect(answerAskUserQuestion).not.toHaveBeenCalled();
+    expect(resumeStream).not.toHaveBeenCalled();
+  });
+
+  describe("docked above the chat input", () => {
+    function renderInTranscript(transcriptWorkspaceId: string) {
+      return renderWithProviders(
+        <AskUserQuestionPlacementProvider
+          value={{
+            kind: "transcript",
+            workspaceId: transcriptWorkspaceId,
+            dockedRowIds: new Set(["row-docked"]),
+          }}
+        >
+          <PlacedAskUserQuestionToolCall
+            args={{ questions: [], answers: {} }}
+            result={null}
+            status="executing"
+            toolCallId="ask-docked"
+            workspaceId="ws-ask"
+            rowId="row-docked"
+          />
+        </AskUserQuestionPlacementProvider>
+      );
+    }
+
+    test("the transcript row leaves the form to the dock", () => {
+      const view = renderInTranscript("ws-ask");
+      expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull();
+    });
+
+    test("another workspace's dock does not take this transcript's form", () => {
+      // A nested transcript (e.g. a sub-agent dialog) inherits the parent's placement.
+      const view = renderInTranscript("ws-parent");
+      expect(view.getByRole("button", { name: "Submit answers" })).toBeTruthy();
+    });
+
+    test("a docked card renders nothing once answered and releases itself after the rollback", async () => {
+      const release = mock((_toolCallId: string) => undefined);
+      const renderDocked = (status: "executing" | "completed") => (
+        <TooltipProvider>
+          <AskUserQuestionPlacementProvider value={{ kind: "dock", release }}>
+            <PlacedAskUserQuestionToolCall
+              args={{ questions: [], answers: {} }}
+              result={null}
+              status={status}
+              toolCallId="ask-docked"
+              workspaceId="ws-ask"
+              rowId="row-docked"
+            />
+          </AskUserQuestionPlacementProvider>
+        </TooltipProvider>
+      );
+      const view = render(renderDocked("executing"), { wrapper: ApiWrapper });
+
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+      await waitFor(() => expect(resumeStream).toHaveBeenCalledTimes(1));
+
+      view.rerender(renderDocked("completed"));
+      expect(view.container.textContent).toBe("");
+      // Still mounted: the temporary auto-retry stays on until the resumed stream settles.
+      expect(setAutoRetryEnabled).toHaveBeenCalledTimes(1);
+      expect(release).not.toHaveBeenCalled();
+
+      // The resumed stream runs, then ends: the rollback runs and the card lets the dock drop it.
+      currentWorkspaceState = { ...currentWorkspaceState, canInterrupt: true };
+      view.rerender(renderDocked("completed"));
+      currentWorkspaceState = { ...currentWorkspaceState, canInterrupt: false };
+      view.rerender(renderDocked("completed"));
+
+      await waitFor(() => expect(setAutoRetryEnabled).toHaveBeenCalledTimes(2));
+      expect(release).toHaveBeenCalledWith("row-docked");
     });
   });
 });
