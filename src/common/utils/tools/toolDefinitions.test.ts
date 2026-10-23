@@ -10,6 +10,7 @@ import {
   TOOL_DEFINITIONS,
   WorkflowRunToolArgsSchema,
 } from "./toolDefinitions";
+import { AskUserQuestionToolArgsSchema as LightAskUserQuestionToolArgsSchema } from "./askUserQuestionSchemas";
 
 describe("TOOL_DEFINITIONS", () => {
   it("accepts custom subagent_type IDs (deprecated alias)", () => {
@@ -576,6 +577,13 @@ describe("TOOL_DEFINITIONS", () => {
       expect(schema.safeParse({ ...validArgs, isolation: "fork" }).success).toBe(true);
       expect(schema.safeParse({ ...validArgs, isolation: "sandbox" }).success).toBe(false);
     });
+  });
+
+  // The renderer's open-question selector (openAskUserQuestions.ts) and the aggregator's
+  // truncation rule parse args with the light module's schema (kept out of the main chunk,
+  // #7363); it must stay the schema the tool itself validates with.
+  it("ask_user_question validates with the light askUserQuestionSchemas module's schema", () => {
+    expect(TOOL_DEFINITIONS.ask_user_question.schema).toBe(LightAskUserQuestionToolArgsSchema);
   });
 
   it("accepts ask_user_question headers longer than 12 characters", () => {
