@@ -578,6 +578,24 @@ const ManageComponentsPanel: React.FC<{
 
 /** Two-phase add flow: source input → consent preview → install. */
 /**
+ * Focus an element when it next mounts, once: `arm()` before the state change that mounts it.
+ * A later rerender or remount does not move focus.
+ */
+function useFocusOnNextMount() {
+  const armedRef = useRef(false);
+  return {
+    arm: () => {
+      armedRef.current = true;
+    },
+    ref: (element: HTMLElement | null) => {
+      if (element === null || !armedRef.current) return;
+      armedRef.current = false;
+      element.focus();
+    },
+  };
+}
+
+/**
  * Callback ref of the preview view (#7121). Opening the preview unmounts the focused source field
  * or Preview button, and focus then fell to the Settings dialog. So the view focuses its first
  * control when it mounts, unless a control inside already took focus (the Back button after a
@@ -587,7 +605,9 @@ const ManageComponentsPanel: React.FC<{
  */
 function focusFirstControlOnMount(view: HTMLDivElement | null): void {
   if (view === null || view.contains(document.activeElement)) return;
-  const controls = view.querySelectorAll<HTMLElement>("button, input, select, textarea, [tabindex]");
+  const controls = view.querySelectorAll<HTMLElement>(
+    "button, input, select, textarea, [tabindex]"
+  );
   const first = Array.from(controls).find(
     (control) => control.tabIndex >= 0 && !control.matches(":disabled")
   );
@@ -1685,10 +1705,10 @@ export const PluginsSettingsSection: React.FC = () => {
 
   // Install and Cancel unmount the Add plugin panel with the focused control in it. The Add plugin
   // button comes back in its place and takes the focus, so it does not fall to the Settings
-  // dialog (#7121). One-shot: a later rerender of the button does not move focus.
-  const focusAddButtonRef = useRef(false);
+  // dialog (#7121).
+  const addButtonFocus = useFocusOnNextMount();
   const closeAddPanel = () => {
-    focusAddButtonRef.current = true;
+    addButtonFocus.arm();
     setAddOpen(false);
   };
   const openAddPanel = () => {
@@ -1936,15 +1956,7 @@ export const PluginsSettingsSection: React.FC = () => {
               Check for updates
             </Button>
             {!addOpen && (
-              <Button
-                size="sm"
-                onClick={openAddPanel}
-                ref={(button) => {
-                  if (button === null || !focusAddButtonRef.current) return;
-                  focusAddButtonRef.current = false;
-                  button.focus();
-                }}
-              >
+              <Button size="sm" onClick={openAddPanel} ref={addButtonFocus.ref}>
                 <Plus className="h-3.5 w-3.5" />
                 Add plugin
               </Button>
