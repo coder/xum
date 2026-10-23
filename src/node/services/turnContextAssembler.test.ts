@@ -773,9 +773,9 @@ describe("assemblePromptPayload", () => {
       expect(sonnet45.volatileSystemTail).toBeUndefined();
       // A route that converts the body on its side: unverified, so the old placement too.
       const gateway = await withTail(hot("B"), history, {
-        modelString: "mux-gateway:anthropic/claude-opus-5-5",
+        modelString: "openrouter:anthropic/claude-opus-5-5",
         providerForMessages: "anthropic",
-        routeProvider: "mux-gateway",
+        routeProvider: "openrouter",
       });
       expect(roles(gateway).slice(0, 2)).toEqual(["system:stable", `system:${hot("B")}`]);
       expect(gateway.volatileSystemTail).toBeUndefined();

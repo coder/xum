@@ -820,11 +820,11 @@ function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
 }
 
 /**
- * Detect gateway-billed (costs-included) usage entries.
+ * Detect costs-included usage entries.
  * `createDisplayUsage` sets `costsIncluded: true` when
  * `providerMetadata.mux.costsIncluded` is true. These entries should
- * not be repriced when model mappings change because the provider
- * gateway already handles billing.
+ * not be repriced when model mappings change because the route
+ * already billed them.
  */
 function isCostsIncludedEntry(
   usage: ChatUsageDisplay,
@@ -835,7 +835,7 @@ function isCostsIncludedEntry(
     return true;
   }
 
-  // Unknown-cost rows are not gateway-billed by definition; they indicate
+  // Unknown-cost rows are not costs-included by definition; they indicate
   // missing pricing metadata and should be eligible for repricing when a
   // mapping is later configured.
   if (usage.hasUnknownCosts === true) {
@@ -843,9 +843,9 @@ function isCostsIncludedEntry(
   }
 
   // Backward-compatibility: older session-usage.json entries may have been
-  // gateway-billed with all costs explicitly zeroed before the costsIncluded
+  // costs-included with all costs explicitly zeroed before the costsIncluded
   // marker was persisted. Treat those all-zero entries as costs-included so
-  // repricing doesn't inflate historical gateway-billed totals after upgrade.
+  // repricing doesn't inflate historical costs-included totals after upgrade.
   //
   // Guardrail: only apply this legacy heuristic for models that have non-zero
   // billable pricing in model stats. Use the resolved metadata model so mapped
@@ -882,7 +882,7 @@ function isCostsIncludedEntry(
  * and last-request costs reflect the current model mapping.
  *
  * Skips non-model aggregate buckets (e.g. "historical" from legacy compaction
- * summaries) and costs-included entries (gateway-billed requests where cost_usd
+ * summaries) and costs-included entries (requests where cost_usd
  * was explicitly zeroed).
  */
 function repriceSessionUsage(
@@ -5553,9 +5553,8 @@ export class WorkspaceStore {
       const transient = this.assertChatTransientState(workspaceId);
 
       // Suppress side effects during buffered replay (we're just hydrating UI state), but allow
-      // live errors to trigger mux-gateway session-expired handling even before we're "caught up".
-      // In particular, mux-gateway 401s can surface as a pre-stream stream-error (before any
-      // stream-start) during startup/reconnect.
+      // them for live errors even before we're "caught up": a pre-stream stream-error (before any
+      // stream-start) can arrive during startup/reconnect.
       const allowSideEffects = !transient.replayingHistory;
 
       applyWorkspaceChatEventToAggregator(aggregator, data, { allowSideEffects });

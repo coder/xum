@@ -46,3 +46,7 @@ required-version = ">=0.11.8"
 # stealer at every Python start (BerriAI/litellm#47826, #7227). Such uploads are usually pulled
 # within days. To take a newer release on purpose (an urgent fix), add it to exclude-newer-package.
 exclude-newer = "7 days"
+# certifi 2026.10.19 drops the emSign root whose intermediate CA keys leaked (GHSA-6q48-6c7w-9gw2,
+# critical); the harbor and bigquery groups send credentials over TLS. The date admits that release
+# and no newer one. Remove the entry after 2026-10-27: before that, uv lock would downgrade certifi.
+exclude-newer-package = { certifi = "2026-10-21T00:00:00Z" }

@@ -146,7 +146,6 @@ const FROZEN_ALLOW_PAIRS = [
   "src/node/services/tools/skillsCatalogFetch.ts os",
   "src/node/services/tools/todo.ts @/node/utils/writeFileAtomic",
   "src/node/services/tools/todo.ts fs/promises",
-  "src/node/services/tools/web_fetch.ts net",
   "src/node/services/tools/xum_agents_path.ts fs/promises",
   "src/node/services/tools/xum_agents_read.ts fs/promises",
   "src/node/services/tools/xum_agents_write.ts fs/promises",

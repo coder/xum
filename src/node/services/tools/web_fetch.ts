@@ -3,7 +3,6 @@ import { clockOf, type HostClock } from "@/node/utils/hostClock";
 import { Window } from "happy-dom";
 import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
-import * as net from "node:net";
 import type { WebFetchToolResult } from "@/common/types/tools";
 import { shellQuote } from "@/common/utils/shell";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -20,6 +19,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { assert } from "@/common/utils/assert";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
+import { isIP } from "@/node/utils/ipAddress";
 import {
   isBlockedHostname,
   isBlockedIpAddress,
@@ -193,7 +193,7 @@ function parseResolvedAddresses(output: string): string[] {
     }
 
     const normalizedAddress = normalizeHostname(value);
-    if (net.isIP(normalizedAddress) === 0) {
+    if (isIP(normalizedAddress) === 0) {
       throw new WebFetchValidationError(WEB_FETCH_RESOLVE_ERROR);
     }
 
@@ -298,7 +298,7 @@ function buildConnectToPin(url: URL, address: string): string {
   if (url.hostname.length === 0 || /[:[\]]/.test(url.hostname) || !/^\d+$/.test(port)) {
     throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
   }
-  const routedAddress = net.isIP(address) === 6 ? `[${address}]` : address;
+  const routedAddress = isIP(address) === 6 ? `[${address}]` : address;
   return `${url.hostname}:${port}:${routedAddress}:${port}`;
 }
 
@@ -322,7 +322,7 @@ async function assertWebFetchTargetAllowed(
     throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
   }
 
-  if (net.isIP(hostname) !== 0) {
+  if (isIP(hostname) !== 0) {
     if (isBlockedIpAddress(hostname)) {
       throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
     }

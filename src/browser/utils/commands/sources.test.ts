@@ -1904,7 +1904,7 @@ test("toggle hide sub-agents command flips the persisted sidebar setting", () =>
   }
 });
 
-test.each(["coder", "mux-gateway", "direct"])(
+test.each(["coder", "openrouter", "direct"])(
   "Pro palette uses the effective %s route instead of stale settings routing",
   async (route) =>
     withTestWindow(() => {
@@ -1928,7 +1928,7 @@ test.each(["coder", "mux-gateway", "direct"])(
         getEffectiveRouteForModel: resolveEffectiveRoute,
       });
       expect(actions.some((action) => action.id === "thinking:toggle-pro-reasoning")).toBe(
-        route !== "mux-gateway"
+        route !== "openrouter"
       );
       expect(resolveEffectiveRoute).toHaveBeenCalled();
     })

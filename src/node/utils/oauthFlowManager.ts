@@ -8,7 +8,7 @@ import { log } from "@/node/services/log";
 /**
  * Shared desktop OAuth flow lifecycle manager.
  *
- * Three OAuth services (Gateway, Codex, MCP) track in-flight desktop
+ * The OAuth services (Codex, Coder, MCP) track in-flight desktop
  * flows with an identical `Map<string, DesktopFlow>` + `waitFor`/`cancel`/
  * `finish`/`shutdownAll` pattern. This class extracts that shared lifecycle
  * so each service can delegate flow bookkeeping here.
@@ -20,7 +20,7 @@ import { log } from "@/node/services/log";
  * registration, shutdownAll, and defects while releasing a sibling resource.
  * The Promise-based public API is preserved as thin `Effect.runPromise`
  * facades so the not-yet-converted OAuth services and existing tests keep
- * working unchanged; Effect-native callers (muxGatewayOauthService) can use
+ * working unchanged; Effect-native callers (codexOauthService) can use
  * the `*Effect` surface directly without runPromise round-trips.
  */
 

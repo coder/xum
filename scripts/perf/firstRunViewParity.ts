@@ -5,9 +5,9 @@
  * Chrome at 390, 744, 1200 and 1900 px, in the light and the dark system theme. Each run holds the
  * app's main chunk, so the static view (#xum-pre) stays alone on screen, measures it, releases the
  * chunk and measures the live wizard's first frame after the handoff.
- * Rule: the static "OSS contributors..." paragraph is within 2 px of the live one in x, y, width and
- * height, and the static phase has exactly one <main>. Shell check (PR 4b's precondition, owner
- * decision 10-14): outside the dialog box and a 4 px margin, no pixel of the static phase's
+ * Rule: the static "Xum is provider-agnostic..." paragraph is within 2 px of the live one in x, y,
+ * width and height, and the static phase has exactly one <main>. Shell check (PR 4b's precondition,
+ * owner decision 10-14): outside the dialog box and a 4 px margin, no pixel of the static phase's
  * screenshot differs from the live first frame's by more than 16 in a color channel.
  * Until PR 4b serves the view, the served "/" has no #xum-pre: the tool then inserts #6444's
  * FIRST_RUN_VIEW_HTML before </body> of the served "/" by hand (Playwright route), as a test page.
@@ -100,7 +100,7 @@ const WIDTHS = [
   { width: 1900, height: 1000, phone: false },
 ];
 const THEMES = ["light", "dark"] as const;
-const TEXT = "OSS contributors with GitHub accounts";
+const TEXT = "Xum is provider-agnostic";
 
 async function startServer(tree: string, root: string, logFile: string) {
   const probePort = net.createServer().listen(0, "127.0.0.1");
