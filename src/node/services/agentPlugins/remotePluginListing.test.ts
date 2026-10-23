@@ -136,6 +136,11 @@ describe("parseRemotePluginListing", () => {
     expect(withPax(record(`path=${a}`))?.has(a)).toBe(true);
     expect(withPax(record(`path=${root}/p/../../etc/x`))).toBeNull();
     expect(withPax("99 comment=x\n")).toBeNull();
+    // A trailing record without a space once looped forever on the same offset.
+    expect(withPax(record(`path=${a}`) + "xyz")).toBeNull();
+    // A zero or short length after a valid record.
+    expect(withPax(record(`path=${a}`) + "0 path=x\n")).toBeNull();
+    expect(withPax(record(`path=${a}`) + "3 path=x\n")).toBeNull();
     expect(withPax(record(`comment=${"c".repeat(70_000)}`))).toBeNull();
   });
 

@@ -82,9 +82,13 @@ function paxRecordAt(
   offset: number
 ): { key: string; value: string; next: number } | null {
   const space = data.indexOf(0x20, offset);
-  const lengthField = space === -1 ? "" : data.toString("latin1", offset, space);
+  // No space means no length field; without this check `next` stayed at `offset` and the caller
+  // looped forever.
+  if (space === -1) return null;
+  const lengthField = data.toString("latin1", offset, space);
   const next = offset + (/^[1-9]\d{0,5}$/.test(lengthField) ? Number(lengthField) : 0);
-  if (next <= space || next > data.length || data[next - 1] !== 0x0a) return null;
+  // Each record must move past its own length field, so no malformed length can stall the loop.
+  if (next <= offset || next <= space || next > data.length || data[next - 1] !== 0x0a) return null;
   const record = data.toString("utf8", space + 1, next - 1);
   const equals = record.indexOf("=");
   return equals < 1
