@@ -127,7 +127,7 @@ import {
   needsTodoTurnEndNudge,
   type TurnStopContinuation,
 } from "@/node/services/agentNotifications/todoTurnEndNudge";
-import { stripLegacyTodoNudgeToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { resolveLegacyTodoNudgeToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
 import {
@@ -1419,26 +1419,25 @@ function stopHookModel(
 }
 
 /** The newest historySequence among `rows`, or -1 when none has one. */
-function newestHistorySequence(rows: readonly MuxMessage[]): number {
-  return rows.reduce((newest, row) => Math.max(newest, row.metadata?.historySequence ?? -1), -1);
+/**
+ * The retried row's tool policy. Only that row and older tail rows can prove that Xum added a
+ * legacy TODO-nudge rule (see resolveLegacyTodoNudgeToolPolicy).
+ */
+function resolveStartupRetryToolPolicy(
+  retryRow: MuxMessage | undefined,
+  historyTail: readonly MuxMessage[],
+  retrySnapshotPolicy: ToolPolicy | undefined
+): ToolPolicy | undefined {
+  const policy = retryRow?.metadata?.toolPolicy ?? retrySnapshotPolicy;
+  const retryRowIndex = retryRow != null ? historyTail.indexOf(retryRow) : -1;
+  return resolveLegacyTodoNudgeToolPolicy(
+    policy,
+    historyTail.slice(0, retryRowIndex + 1).reverse()
+  );
 }
 
-/**
- * A persisted compaction follow-up's tool policy, from raw JSON: a malformed policy is dropped
- * (self-healing doctrine), and the legacy TODO-nudge rule is stripped (see
- * stripLegacyTodoNudgeToolPolicy).
- */
-function readPersistedFollowUpToolPolicy(
-  raw: unknown,
-  workspaceId: string
-): ToolPolicy | undefined {
-  if (raw == null) return undefined;
-  const parsed = ToolPolicySchema.safeParse(raw);
-  if (!parsed.success) {
-    log.warn("Ignoring malformed persisted toolPolicy on compaction follow-up", { workspaceId });
-    return undefined;
-  }
-  return stripLegacyTodoNudgeToolPolicy(parsed.data);
+function newestHistorySequence(rows: readonly MuxMessage[]): number {
+  return rows.reduce((newest, row) => Math.max(newest, row.metadata?.historySequence ?? -1), -1);
 }
 
 export class AgentSession {
@@ -3352,8 +3351,10 @@ export class AgentSession {
       persistedRetrySendOptions?.serviceTier ?? agentSettings?.serviceTier
     ).data;
 
-    const persistedToolPolicy = stripLegacyTodoNudgeToolPolicy(
-      lastUserMessage?.metadata?.toolPolicy ?? persistedRetrySendOptions?.toolPolicy
+    const persistedToolPolicy = resolveStartupRetryToolPolicy(
+      lastUserMessage,
+      params.historyTail,
+      persistedRetrySendOptions?.toolPolicy
     );
     const persistedDisableWorkspaceAgents =
       lastUserMessage?.metadata?.disableWorkspaceAgents ??
@@ -12996,10 +12997,13 @@ export class AgentSession {
     // and restoring it unvalidated would throw during resolution. Invalid values are dropped
     // like any corrupt persisted policy (self-healing doctrine); a restricted turn's
     // follow-up must otherwise keep its policy instead of redispatching allow-all.
-    const followUpToolPolicy = readPersistedFollowUpToolPolicy(
-      followUp.toolPolicy,
-      this.workspaceId
-    );
+    const persistedToolPolicy =
+      followUp.toolPolicy != null ? ToolPolicySchema.safeParse(followUp.toolPolicy) : undefined;
+    if (persistedToolPolicy != null && !persistedToolPolicy.success) {
+      log.warn("Ignoring malformed persisted toolPolicy on compaction follow-up", {
+        workspaceId: this.workspaceId,
+      });
+    }
     const persistedRoutingRecord =
       followUp.autoModelRouting != null
         ? AutoModelRoutingRecordSchema.safeParse(followUp.autoModelRouting)
@@ -13029,7 +13033,7 @@ export class AgentSession {
       additionalSystemInstructions: followUp.additionalSystemInstructions,
       providerOptions: followUp.providerOptions,
       disableWorkspaceAgents: followUp.disableWorkspaceAgents,
-      ...(followUpToolPolicy != null ? { toolPolicy: followUpToolPolicy } : {}),
+      ...(persistedToolPolicy?.success ? { toolPolicy: persistedToolPolicy.data } : {}),
       // Explicit-agent turns stay loud on the resumed turn too: the requested agent
       // may have been removed/hidden/disabled while compaction ran.
       strictAgentResolution: followUp.strictAgentResolution,

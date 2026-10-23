@@ -319,7 +319,7 @@ import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { StartupRecoveryState } from "@/node/services/startupRecovery";
 import { judgeLifecycleMarkerOwner } from "@/node/services/lifecycleMarkerOwners";
-import { stripLegacyTodoNudgeToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { LegacyTodoNudgePolicyTrace, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
@@ -2073,6 +2073,10 @@ function isManualUserSupersessionMessage(message: MuxMessage): boolean {
   );
 }
 
+function withToolPolicy(toolPolicy: ToolPolicy | undefined): { toolPolicy?: ToolPolicy } {
+  return toolPolicy != null ? { toolPolicy } : {};
+}
+
 function isResetBoundaryMessage(message: MuxMessage): boolean {
   return message.metadata?.contextBoundaryKind === CONTEXT_BOUNDARY_KINDS.RESET;
 }
@@ -2296,28 +2300,6 @@ function reportArtifactBelongsToUnreportedRow(
 ): boolean {
   if (artifact.taskAttemptId === row.taskAttemptId) return true;
   return artifact.taskAttemptId == null && row.taskStatus === "interrupted";
-}
-
-/**
- * A persisted user row's tool policy for terminal-wake restrictions. Persisted rows are untrusted
- * disk state: a malformed policy would throw deep inside send resolution and leave the wake blocked
- * on the same corrupt row, so it restores nothing (while the row still defines the restrictions:
- * a valid disable flag still applies). A policy that held only the legacy TODO-nudge rule counts as
- * absent, so that synthetic row no longer defines the wake's restrictions (see
- * stripLegacyTodoNudgeToolPolicy).
- */
-function readPersistedWakeToolPolicy(raw: unknown): {
-  present: boolean;
-  malformed: boolean;
-  policy?: ToolPolicy;
-} {
-  if (raw == null) return { present: false, malformed: false };
-  const parsed = ToolPolicySchema.safeParse(raw);
-  if (!parsed.success) return { present: true, malformed: true };
-  const policy = stripLegacyTodoNudgeToolPolicy(parsed.data);
-  return policy == null
-    ? { present: false, malformed: false }
-    : { present: true, malformed: false, policy };
 }
 
 export class TaskService implements AgentTaskIntegration {
@@ -12880,8 +12862,9 @@ export class TaskService implements AgentTaskIntegration {
     // Manual rows still define both wholesale (absence means lifted).
     const state: {
       pin: { strictAgentResolution?: SendMessageOptions["strictAgentResolution"] } | null;
-      restrictions: { toolPolicy?: ToolPolicy; disableWorkspaceAgents?: boolean } | null;
-    } = { pin: null, restrictions: null };
+      restrictions: { disableWorkspaceAgents?: boolean } | null;
+      trace: LegacyTodoNudgePolicyTrace;
+    } = { pin: null, restrictions: null, trace: new LegacyTodoNudgePolicyTrace(undefined) };
     const historyResult = await this.historyService.iterateFullHistory(
       ownerWorkspaceId,
       "backward",
@@ -12903,6 +12886,9 @@ export class TaskService implements AgentTaskIntegration {
           if (isCompactionRequestMessage(message)) {
             continue;
           }
+          // Rows older than the one that defined the restrictions only prove where its policy
+          // came from (see LegacyTodoNudgePolicyTrace).
+          state.trace.visit(message);
           const metadata = message.metadata;
           // The strict-agent pin lives in the row's retry snapshot: an explicit agent override
           // must stay loud on the wake too, or a vanished/corrupted definition would silently
@@ -12929,27 +12915,35 @@ export class TaskService implements AgentTaskIntegration {
           ) {
             state.pin = strictAgentResolution != null ? { strictAgentResolution } : {};
           }
-          const rowPolicy = readPersistedWakeToolPolicy(metadata?.toolPolicy);
           if (
             state.restrictions == null &&
-            (rowPolicy.present ||
+            (metadata?.toolPolicy != null ||
               metadata?.disableWorkspaceAgents != null ||
               metadata?.synthetic !== true)
           ) {
-            if (rowPolicy.malformed) {
+            // Persisted rows are untrusted disk state: a malformed toolPolicy would throw deep
+            // inside send resolution and leave the wake permanently blocked on the same corrupt
+            // row. Sanitize instead of trusting the JSON shape; an unparseable policy restores
+            // nothing while a valid disable flag still applies (self-healing doctrine).
+            const parsedPolicy =
+              metadata?.toolPolicy != null ? ToolPolicySchema.safeParse(metadata.toolPolicy) : null;
+            if (parsedPolicy != null && !parsedPolicy.success) {
               log.warn("Ignoring malformed persisted toolPolicy on terminal wake", {
                 ownerWorkspaceId,
                 messageId: message.id,
               });
             }
+            // The returned policy is the trace's: it drops a legacy TODO-nudge rule only when
+            // older rows prove that Xum added it.
+            state.trace = new LegacyTodoNudgePolicyTrace(parsedPolicy?.data);
+            state.trace.visit(message);
             state.restrictions = {
-              ...(rowPolicy.policy != null ? { toolPolicy: rowPolicy.policy } : {}),
               ...(typeof metadata?.disableWorkspaceAgents === "boolean"
                 ? { disableWorkspaceAgents: metadata.disableWorkspaceAgents }
                 : {}),
             };
           }
-          if (state.pin != null && state.restrictions != null) {
+          if (state.pin != null && state.restrictions != null && state.trace.finished) {
             return false;
           }
         }
@@ -12959,7 +12953,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!historyResult.success) {
       throw new Error(`history unavailable: ${historyResult.error}`);
     }
-    return { ...(state.restrictions ?? {}), ...(state.pin ?? {}) };
+    return { ...state.restrictions, ...withToolPolicy(state.trace.policy), ...state.pin };
   }
 
   private scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId: string): void {

@@ -2,11 +2,13 @@ import {
   applyToolPolicy,
   applyToolPolicyToNames,
   buildRequiredToolPatterns,
-  isSessionHistoryDisabled,
-  stripLegacyTodoNudgeToolPolicy,
+  resolveLegacyTodoNudgeToolPolicy,
   type ToolPolicy,
 } from "./toolPolicy";
 import { tool } from "ai";
+import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { LEGACY_TODO_TURN_END_NUDGES } from "@/common/utils/machineTurnPrompts";
 import { z } from "zod";
 
 // Create mock tools for testing
@@ -388,27 +390,45 @@ describe("buildRequiredToolPatterns", () => {
   });
 });
 
-describe("stripLegacyTodoNudgeToolPolicy", () => {
+describe("resolveLegacyTodoNudgeToolPolicy", () => {
   const legacy = { regex_match: "(?!todo_write$).*", action: "disable" } as const;
-  const bash = { regex_match: "bash", action: "disable" } as const;
+  const nudge = (toolPolicy: ToolPolicy, extra: { synthetic?: boolean } = {}) =>
+    createMuxMessage("nudge", "user", LEGACY_TODO_TURN_END_NUDGES[0], {
+      synthetic: true,
+      toolPolicy,
+      ...extra,
+    });
 
-  test("drops every copy of the #6720 nudge rule and keeps the rest", () => {
-    const doubled: ToolPolicy = [legacy, legacy];
-    expect(isSessionHistoryDisabled(doubled)).toBe(true);
-    expect(stripLegacyTodoNudgeToolPolicy(doubled)).toBeUndefined();
-    expect(stripLegacyTodoNudgeToolPolicy([bash, legacy, legacy])).toEqual([bash]);
+  test("heals through copied rows, newest first", () => {
+    const rows = [
+      createMuxMessage("wake", "user", "wake", { synthetic: true, toolPolicy: [legacy, legacy] }),
+      nudge([legacy, legacy]),
+      nudge([legacy]),
+    ];
+    expect(resolveLegacyTodoNudgeToolPolicy([legacy, legacy], rows)).toBeUndefined();
   });
 
-  test("keeps a todo-only policy written any other way", () => {
-    const anchored: ToolPolicy = [{ regex_match: "^(?!todo_write$).*$", action: "disable" }];
-    const enableOnly: ToolPolicy = [
-      { regex_match: ".*", action: "disable" },
-      { regex_match: "todo_write", action: "enable" },
+  test("keeps the rule when the chain does not prove a nudge added it", () => {
+    const reset = createMuxMessage("reset", "user", "reset", {
+      synthetic: true,
+      toolPolicy: [legacy],
+      contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+    });
+    const cases: Array<[ToolPolicy, MuxMessage[]]> = [
+      // The row has the nudge text, but a user wrote it (not synthetic).
+      [[legacy], [nudge([legacy], { synthetic: false })]],
+      // A synthetic row with the legacy text but another policy did not add this one.
+      [[legacy], [nudge([{ regex_match: "bash", action: "disable" }, legacy])]],
+      // A nudge appends: a rule that is not last was not its rule.
+      [
+        [legacy, { regex_match: "bash", action: "disable" }],
+        [nudge([legacy, { regex_match: "bash", action: "disable" }])],
+      ],
+      [[legacy], [reset]],
+      [[legacy], []],
     ];
-    const required: ToolPolicy = [{ regex_match: "(?!todo_write$).*", action: "require" }];
-    for (const policy of [anchored, enableOnly, required]) {
-      expect(stripLegacyTodoNudgeToolPolicy(policy)).toBe(policy);
+    for (const [policy, rows] of cases) {
+      expect(resolveLegacyTodoNudgeToolPolicy(policy, rows)).toEqual(policy);
     }
-    expect(stripLegacyTodoNudgeToolPolicy(undefined)).toBeUndefined();
   });
 });

@@ -4,6 +4,7 @@ import type { TurnCoordinator } from "./turnCoordinator";
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { LEGACY_TODO_TURN_END_NUDGES } from "@/common/utils/machineTurnPrompts";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import path from "path";
@@ -359,57 +360,57 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
-  // F49: rows saved before #7027 carry the turn-end TODO nudge's todo-only rule (doubled when
-  // the nudged turn already had it). Reused as-is, it disabled session_history and task_await,
-  // so every resumed turn hit context_budget_blocked.
+  // F49: rows saved before #7027 carry the turn-end TODO nudge's todo-only rule. Reused as-is, it
+  // disabled session_history and task_await, so every resumed turn hit context_budget_blocked. The
+  // rule goes only when the row proves a nudge added it: a caller's identical policy stays.
+  const legacyRule = { regex_match: "(?!todo_write$).*", action: "disable" } as const;
+  const bashRule = { regex_match: "bash", action: "disable" } as const;
   test.each([
-    ["no other rule", [], undefined],
+    ["heals the legacy nudge rule", LEGACY_TODO_TURN_END_NUDGES[0], true, [], undefined],
     [
-      "a real restriction",
-      [{ regex_match: "bash", action: "disable" }],
-      [{ regex_match: "bash", action: "disable" }],
+      "heals the legacy nudge rule and keeps the caller rule",
+      LEGACY_TODO_TURN_END_NUDGES[0],
+      true,
+      [bashRule],
+      [bashRule],
     ],
-  ] as const)(
-    "startup auto-retry drops the legacy TODO-nudge rule from a saved policy with %s",
-    async (_name, ownRules, expected) => {
-      const workspaceId = "startup-retry-legacy-todo-policy";
-      const clock = makeTestEffectRunner();
-      const { session, historyService, events, cleanup } = await createSessionBundle(
-        workspaceId,
-        undefined,
-        { clock }
-      );
-      cleanups.push(() => clock.dispose(), cleanup);
-      const legacy = { regex_match: "(?!todo_write$).*", action: "disable" } as const;
-      const savedPolicy = [...ownRules, legacy, legacy];
-      const appendResult = await historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage("nudge-1", "user", "<notification>TODO nudge</notification>", {
-          timestamp: Date.now(),
-          synthetic: true,
-          uiVisible: true,
+    ["keeps the same rule a manual turn set", "Only todos", false, [], [legacyRule]],
+  ] as const)("startup auto-retry %s", async (_name, text, synthetic, callerRules, expected) => {
+    const workspaceId = "startup-retry-legacy-todo-policy";
+    const clock = makeTestEffectRunner();
+    const { session, historyService, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      undefined,
+      { clock }
+    );
+    cleanups.push(() => clock.dispose(), cleanup);
+    const savedPolicy = [...callerRules, legacyRule];
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("retried-row", "user", text, {
+        timestamp: Date.now(),
+        ...(synthetic ? { synthetic: true, uiVisible: true } : {}),
+        toolPolicy: savedPolicy,
+        retrySendOptions: {
+          model: "anthropic:claude-sonnet-4-5",
+          agentId: "exec",
           toolPolicy: savedPolicy,
-          retrySendOptions: {
-            model: "anthropic:claude-sonnet-4-5",
-            agentId: "exec",
-            toolPolicy: savedPolicy,
-            agentInitiated: true,
-          },
-        })
-      );
-      expect(appendResult.success).toBe(true);
+          ...(synthetic ? { agentInitiated: true } : {}),
+        },
+      })
+    );
+    expect(appendResult.success).toBe(true);
 
-      await session.ensureStartupAutoRetryCheck();
-      expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
-      const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
-      await fireScheduledRetry(clock, events);
-      expect(resumeStream).toHaveBeenCalledTimes(1);
-      const retryPolicy: unknown = resumeStream.mock.calls[0][0].toolPolicy;
-      expect(retryPolicy).toEqual(expected);
+    await session.ensureStartupAutoRetryCheck();
+    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
+    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
+    await fireScheduledRetry(clock, events);
+    expect(resumeStream).toHaveBeenCalledTimes(1);
+    const retryPolicy: unknown = resumeStream.mock.calls[0][0].toolPolicy;
+    expect(retryPolicy).toEqual(expected);
 
-      await session.dispose();
-    }
-  );
+    await session.dispose();
+  });
 
   test("startup auto-retry does not dispatch once the workspace is archived on disk", async () => {
     const workspaceId = "startup-retry-archived";
