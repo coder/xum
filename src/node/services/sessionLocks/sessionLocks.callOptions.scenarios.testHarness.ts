@@ -13,8 +13,6 @@ import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
-import { Config } from "@/node/config";
-import { HistoryService } from "@/node/services/historyService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService } from "@/node/services/memoryService";
 import { RefineService } from "@/node/services/refinement/refineService";
@@ -44,6 +42,7 @@ import {
 import { updateSubagentTranscriptArtifactsFile } from "../subagentTranscriptArtifacts";
 import { TaskHandleStore } from "../taskHandleStore";
 import { createTestConfig, createWorkspaceServiceMocks } from "../taskService.testHarness";
+import { createTestHistoryService } from "../testHistoryService";
 import { setTodosForSessionDir } from "../tools/todo";
 import { createReviewPaneUpdateTool } from "../tools/review_pane";
 import { createTestToolConfig, mockToolCallOptions } from "../tools/testHelpers";
@@ -186,18 +185,17 @@ function finishChunk(): LanguageModelV3StreamPart {
 export async function oneRefineApply(): Promise<void> {
   await withTempDir("refine", async (dir) => {
     const workspaceId = "ws-record-refine";
-    const muxHome = path.join(dir, "mux-home");
     const workspacePath = path.join(dir, "checkout");
-    await fs.mkdir(path.join(muxHome, "memory"), { recursive: true });
     await fs.mkdir(workspacePath, { recursive: true });
-    const config = new Config(muxHome);
+    // The shared HistoryService seam (AGENTS.md): its temp root is the Xum home here.
+    const { historyService, config, tempDir: muxHome, cleanup } = await createTestHistoryService();
+    await fs.mkdir(path.join(muxHome, "memory"), { recursive: true });
     await config.editConfig((cfg) => {
       cfg.projects.set("/projects/demo", {
         workspaces: [{ id: workspaceId, name: workspaceId, path: workspacePath }],
       });
       return cfg;
     });
-    const historyService = new HistoryService(config);
     const metaService = new MemoryMetaService(muxHome);
     const model = new MockLanguageModelV3({
       doStream: () =>
@@ -235,8 +233,12 @@ export async function oneRefineApply(): Promise<void> {
         createMuxMessage(`user-${index}`, "user", text, { timestamp: 1_000 + index })
       );
     }
-    await service.run(workspaceId);
-    await service.apply(workspaceId, "no-proposal-rendered");
+    try {
+      await service.run(workspaceId);
+      await service.apply(workspaceId, "no-proposal-rendered");
+    } finally {
+      await cleanup();
+    }
   });
 }
 
@@ -248,9 +250,8 @@ export async function oneFork(
   /** Resolves at the next lock call on lockPath after this call. */
   nextLockCall: (lockPath: string) => Promise<void>
 ): Promise<void> {
-  await withTempDir("fork", async (dir) => {
-    const config = await createTestConfig(dir);
-    const historyService = new HistoryService(config);
+  const { historyService, config, cleanup } = await createTestHistoryService();
+  try {
     const workspaceId = "ws-record-fork";
     const sessionDir = path.join(config.sessionsDir, workspaceId);
     await fs.mkdir(sessionDir, { recursive: true });
@@ -277,7 +278,9 @@ export async function oneFork(
     await waitCall;
     await marker[Symbol.asyncDispose]();
     await waiting;
-  });
+  } finally {
+    await cleanup();
+  }
 }
 
 /**

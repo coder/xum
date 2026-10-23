@@ -67,18 +67,29 @@ function callSite(): { site: string; caller?: string } {
 const TMP = new RegExp(`${os.tmpdir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/[^/\\s]+`, "g");
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g;
 
-/** Masks temp roots, hashes and backend tokens: <tmp>/locks/history-<h>.lock. */
+/**
+ * Hash -> <h0>, <h1>, ... in order of first use in one record. A hash keys a
+ * lock (one per workspace or target), so two calls that must share a lock show
+ * the same token, and a call that hashes the wrong id shows a new one.
+ */
+const hashTokens = new Map<string, string>();
+
+/** Masks temp roots, hashes and backend tokens: <tmp>/locks/history-<h0>.lock. */
 function mask(text: string): string {
   return text
     .replace(TMP, "<tmp>")
     .replace(UUID, "<uuid>")
-    .replace(/[0-9a-f]{32,64}/g, "<h>");
+    .replace(/[0-9a-f]{32,64}/g, (hash) => {
+      if (!hashTokens.has(hash)) hashTokens.set(hash, `<h${hashTokens.size}>`);
+      return hashTokens.get(hash)!;
+    });
 }
 
 type Row = Record<string, unknown>;
 
 /** Spies on every session lock function and records each distinct call. */
 function recordLockCalls() {
+  hashTokens.clear();
   const rows = new Map<string, Row>();
   const waiters: Array<{ lockPath: string; resolve: () => void }> = [];
   const add = (row: Row, lockPath?: string) => {
@@ -138,7 +149,7 @@ function recordLockCalls() {
     workspaceId,
     kind
   ) {
-    add({ fn: "WorkspaceUseLeases.hold", kind });
+    add({ fn: "WorkspaceUseLeases.hold", workspaceId: mask(workspaceId), kind });
     return hold.call(this, workspaceId, kind);
   });
   // A probe that only reads the lease files: InitStateManager's replay asks it.
