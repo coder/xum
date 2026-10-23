@@ -69,6 +69,7 @@ import type { PTYService } from "@/node/services/ptyService";
 import type { RefineService } from "@/node/services/refinement/refineService";
 import type { ServerAuthService } from "@/node/services/serverAuthService";
 import type { ServerService } from "@/node/services/serverService";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
@@ -98,6 +99,10 @@ export class SessionLocatorTag extends Context.Service<
   SessionLocatorTag,
   WorkspaceSessionLocator
 >()("xum/SessionLocator") {}
+/** The host file calls of the history layer (sessionFiles/sessionFiles.ts). */
+export class SessionFilesTag extends Context.Service<SessionFilesTag, SessionFiles>()(
+  "xum/SessionFiles"
+) {}
 export class ProvidersConfigStoreTag extends Context.Service<
   ProvidersConfigStoreTag,
   ProvidersConfigStore
@@ -312,6 +317,7 @@ export class BashAiProxy extends Context.Service<BashAiProxy, BashAiProxyService
 export type StoreTags =
   | ConfigTag
   | SessionLocatorTag
+  | SessionFilesTag
   | ProvidersConfigStoreTag
   | SecretsStoreTag
   | FileLeaseManagerTag;
