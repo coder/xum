@@ -409,9 +409,8 @@ describe("resolveLegacyTodoNudgeToolPolicy", () => {
   });
 
   test("keeps the rule when the chain does not prove a nudge added it", () => {
-    const reset = createMuxMessage("reset", "user", "reset", {
-      synthetic: true,
-      toolPolicy: [legacy],
+    // Reset markers are assistant rows; the nudge before it is pre-reset history.
+    const reset = createMuxMessage("reset", "assistant", "reset", {
       contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
     });
     const cases: Array<[ToolPolicy, MuxMessage[]]> = [
@@ -424,11 +423,14 @@ describe("resolveLegacyTodoNudgeToolPolicy", () => {
         [legacy, { regex_match: "bash", action: "disable" }],
         [nudge([legacy, { regex_match: "bash", action: "disable" }])],
       ],
-      [[legacy], [reset]],
+      [[legacy], [reset, nudge([legacy])]],
       [[legacy], []],
     ];
     for (const [policy, rows] of cases) {
       expect(resolveLegacyTodoNudgeToolPolicy(policy, rows)).toEqual(policy);
     }
+    // Corrupt persisted metadata passes through instead of throwing.
+    const corrupt = { regex_match: ".*" } as unknown as ToolPolicy;
+    expect(resolveLegacyTodoNudgeToolPolicy(corrupt, [nudge([legacy])])).toBe(corrupt);
   });
 });

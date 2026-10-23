@@ -128,8 +128,12 @@ function endsWithLegacyTodoNudgeRule(policy: ToolPolicy): boolean {
 }
 
 // A compaction request's disable-all policy is for its own summary turn only, so the trace skips it.
+// Reset markers are assistant rows, so they count before the user-row filter.
 function isTraceableRow(row: MuxMessage): boolean {
-  return row.role === "user" && row.metadata?.muxMetadata?.type !== "compaction-request";
+  return (
+    row.metadata?.contextBoundaryKind === CONTEXT_BOUNDARY_KINDS.RESET ||
+    (row.role === "user" && row.metadata?.muxMetadata?.type !== "compaction-request")
+  );
 }
 
 function breaksTrace(row: MuxMessage, pending: ToolPolicy): boolean {
@@ -191,7 +195,8 @@ export function resolveLegacyTodoNudgeToolPolicy(
   policy: ToolPolicy | undefined,
   rowsNewestFirst: Iterable<MuxMessage>
 ): ToolPolicy | undefined {
-  if (policy == null) return policy;
+  // Persisted metadata is unchecked JSON: a value that is not an array goes through unchanged.
+  if (!Array.isArray(policy)) return policy;
   const trace = new LegacyTodoNudgePolicyTrace(policy);
   for (const row of rowsNewestFirst) {
     if (trace.visit(row)) break;
