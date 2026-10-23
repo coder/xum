@@ -87,3 +87,30 @@ export function applyToolPolicy(
 export function isSessionHistoryDisabled(policy?: ToolPolicy): boolean {
   return applyToolPolicyToNames(["session_history"], policy).length === 0;
 }
+
+/**
+ * The turn-end TODO nudge's rule from #6720: it limited the nudged turn to todo_write. #7027
+ * stopped adding it, but rows saved before that still carry it (sometimes twice, because each
+ * nudge appended it to the turn's own policy), and later wakes, retries and continuations copied it
+ * forward. A copied rule also disables session_history and task_await, so every later turn hit
+ * context_budget_blocked until a manual send replaced the policy.
+ */
+const LEGACY_TODO_NUDGE_RULE = { regex_match: "(?!todo_write$).*", action: "disable" } as const;
+
+/**
+ * Self-heal saved history: drop every copy of LEGACY_TODO_NUDGE_RULE from a persisted policy
+ * before reuse. Only that exact rule goes, so a todo-only policy a user wrote differently stays.
+ * Returns undefined when nothing else is left.
+ */
+export function stripLegacyTodoNudgeToolPolicy(
+  policy: ToolPolicy | undefined
+): ToolPolicy | undefined {
+  if (policy == null) return policy;
+  const kept = policy.filter(
+    (rule) =>
+      rule.regex_match !== LEGACY_TODO_NUDGE_RULE.regex_match ||
+      rule.action !== LEGACY_TODO_NUDGE_RULE.action
+  );
+  if (kept.length === policy.length) return policy;
+  return kept.length > 0 ? kept : undefined;
+}

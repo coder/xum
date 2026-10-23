@@ -2,6 +2,8 @@ import {
   applyToolPolicy,
   applyToolPolicyToNames,
   buildRequiredToolPatterns,
+  isSessionHistoryDisabled,
+  stripLegacyTodoNudgeToolPolicy,
   type ToolPolicy,
 } from "./toolPolicy";
 import { tool } from "ai";
@@ -383,5 +385,30 @@ describe("buildRequiredToolPatterns", () => {
   test("returns empty for undefined or require-free policies", () => {
     expect(buildRequiredToolPatterns(undefined)).toEqual([]);
     expect(buildRequiredToolPatterns([{ regex_match: "bash", action: "disable" }])).toEqual([]);
+  });
+});
+
+describe("stripLegacyTodoNudgeToolPolicy", () => {
+  const legacy = { regex_match: "(?!todo_write$).*", action: "disable" } as const;
+  const bash = { regex_match: "bash", action: "disable" } as const;
+
+  test("drops every copy of the #6720 nudge rule and keeps the rest", () => {
+    const doubled: ToolPolicy = [legacy, legacy];
+    expect(isSessionHistoryDisabled(doubled)).toBe(true);
+    expect(stripLegacyTodoNudgeToolPolicy(doubled)).toBeUndefined();
+    expect(stripLegacyTodoNudgeToolPolicy([bash, legacy, legacy])).toEqual([bash]);
+  });
+
+  test("keeps a todo-only policy written any other way", () => {
+    const anchored: ToolPolicy = [{ regex_match: "^(?!todo_write$).*$", action: "disable" }];
+    const enableOnly: ToolPolicy = [
+      { regex_match: ".*", action: "disable" },
+      { regex_match: "todo_write", action: "enable" },
+    ];
+    const required: ToolPolicy = [{ regex_match: "(?!todo_write$).*", action: "require" }];
+    for (const policy of [anchored, enableOnly, required]) {
+      expect(stripLegacyTodoNudgeToolPolicy(policy)).toBe(policy);
+    }
+    expect(stripLegacyTodoNudgeToolPolicy(undefined)).toBeUndefined();
   });
 });

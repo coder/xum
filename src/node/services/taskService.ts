@@ -319,7 +319,7 @@ import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { StartupRecoveryState } from "@/node/services/startupRecovery";
 import { judgeLifecycleMarkerOwner } from "@/node/services/lifecycleMarkerOwners";
-import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { stripLegacyTodoNudgeToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
@@ -2296,6 +2296,28 @@ function reportArtifactBelongsToUnreportedRow(
 ): boolean {
   if (artifact.taskAttemptId === row.taskAttemptId) return true;
   return artifact.taskAttemptId == null && row.taskStatus === "interrupted";
+}
+
+/**
+ * A persisted user row's tool policy for terminal-wake restrictions. Persisted rows are untrusted
+ * disk state: a malformed policy would throw deep inside send resolution and leave the wake blocked
+ * on the same corrupt row, so it restores nothing (while the row still defines the restrictions:
+ * a valid disable flag still applies). A policy that held only the legacy TODO-nudge rule counts as
+ * absent, so that synthetic row no longer defines the wake's restrictions (see
+ * stripLegacyTodoNudgeToolPolicy).
+ */
+function readPersistedWakeToolPolicy(raw: unknown): {
+  present: boolean;
+  malformed: boolean;
+  policy?: ToolPolicy;
+} {
+  if (raw == null) return { present: false, malformed: false };
+  const parsed = ToolPolicySchema.safeParse(raw);
+  if (!parsed.success) return { present: true, malformed: true };
+  const policy = stripLegacyTodoNudgeToolPolicy(parsed.data);
+  return policy == null
+    ? { present: false, malformed: false }
+    : { present: true, malformed: false, policy };
 }
 
 export class TaskService implements AgentTaskIntegration {
@@ -12907,26 +12929,21 @@ export class TaskService implements AgentTaskIntegration {
           ) {
             state.pin = strictAgentResolution != null ? { strictAgentResolution } : {};
           }
+          const rowPolicy = readPersistedWakeToolPolicy(metadata?.toolPolicy);
           if (
             state.restrictions == null &&
-            (metadata?.toolPolicy != null ||
+            (rowPolicy.present ||
               metadata?.disableWorkspaceAgents != null ||
               metadata?.synthetic !== true)
           ) {
-            // Persisted rows are untrusted disk state: a malformed toolPolicy would throw deep
-            // inside send resolution and leave the wake permanently blocked on the same corrupt
-            // row. Sanitize instead of trusting the JSON shape; an unparseable policy restores
-            // nothing while a valid disable flag still applies (self-healing doctrine).
-            const parsedPolicy =
-              metadata?.toolPolicy != null ? ToolPolicySchema.safeParse(metadata.toolPolicy) : null;
-            if (parsedPolicy != null && !parsedPolicy.success) {
+            if (rowPolicy.malformed) {
               log.warn("Ignoring malformed persisted toolPolicy on terminal wake", {
                 ownerWorkspaceId,
                 messageId: message.id,
               });
             }
             state.restrictions = {
-              ...(parsedPolicy?.success ? { toolPolicy: parsedPolicy.data } : {}),
+              ...(rowPolicy.policy != null ? { toolPolicy: rowPolicy.policy } : {}),
               ...(typeof metadata?.disableWorkspaceAgents === "boolean"
                 ? { disableWorkspaceAgents: metadata.disableWorkspaceAgents }
                 : {}),
