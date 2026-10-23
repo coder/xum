@@ -5,6 +5,7 @@ import { InitStateManager } from "./initStateManager";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { Err } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage } from "@/common/types/message";
 import type { StreamEndEvent } from "@/common/types/stream";
@@ -200,7 +201,9 @@ describe("AgentSession post-compaction refresh trigger", () => {
       ),
     };
 
-    const { historyService, config, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService({
+      files: SessionFilesMemory,
+    });
     historyCleanup = cleanup;
 
     const onPostCompactionStateChange = mock(() => undefined);
