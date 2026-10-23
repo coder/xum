@@ -187,10 +187,13 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(remembered?.plan).toBeUndefined();
   });
 
-  test("stamps the turn's recency and authoring time on the runner's clock", async () => {
+  test("stamps the turn's recency on the runner's clock and its authoring time on the wall clock", async () => {
     // Recency must match the user message timestamp that AgentSession stamps on the same
     // HostClock. Both come from one makeTestEffectRunner(), so neither reads real time.
+    // authoredAtMs must stay on the wall clock: its consumers (messageQueue, the goal
+    // acknowledgment gate) compare it with Date.now() times (#7282).
     const clock = makeTestEffectRunner();
+    const wallNowMs = TEST_CLOCK_START_MS + 1_234_567;
     const service = createWorkspaceServiceForTest({
       config: harness.config,
       historyService: harness.historyService,
@@ -204,6 +207,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     service.registerSession("test-workspace", fakeSession as unknown as AgentSession);
     // beforeEach already spies on updateRecency; spyOn returns that same spy.
     const updateRecency = spyOn(harness.extensionMetadata, "updateRecency");
+    const dateNow = spyOn(Date, "now").mockReturnValue(wallNowMs);
     try {
       await clock.adjust(7_000);
       const result = await service.sendMessage("test-workspace", "hello", {
@@ -216,9 +220,10 @@ describe("WorkspaceService sendMessage status clearing", () => {
       expect(fakeSession.queueMessage).toHaveBeenCalledWith(
         "hello",
         expect.anything(),
-        expect.objectContaining({ authoredAtMs: TEST_CLOCK_START_MS + 7_000 })
+        expect.objectContaining({ authoredAtMs: wallNowMs })
       );
     } finally {
+      dateNow.mockRestore();
       await clock.dispose();
     }
   });
