@@ -319,7 +319,7 @@ import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { StartupRecoveryState } from "@/node/services/startupRecovery";
 import { judgeLifecycleMarkerOwner } from "@/node/services/lifecycleMarkerOwners";
-import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { LegacyTodoNudgePolicyTrace, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
@@ -2071,6 +2071,10 @@ function isManualUserSupersessionMessage(message: MuxMessage): boolean {
     message.role === "user" &&
     (message.metadata?.synthetic !== true || isSyntheticManualSupersessionMessage(message))
   );
+}
+
+function withToolPolicy(toolPolicy: ToolPolicy | undefined): { toolPolicy?: ToolPolicy } {
+  return toolPolicy != null ? { toolPolicy } : {};
 }
 
 function isResetBoundaryMessage(message: MuxMessage): boolean {
@@ -12858,8 +12862,9 @@ export class TaskService implements AgentTaskIntegration {
     // Manual rows still define both wholesale (absence means lifted).
     const state: {
       pin: { strictAgentResolution?: SendMessageOptions["strictAgentResolution"] } | null;
-      restrictions: { toolPolicy?: ToolPolicy; disableWorkspaceAgents?: boolean } | null;
-    } = { pin: null, restrictions: null };
+      restrictions: { disableWorkspaceAgents?: boolean } | null;
+      trace: LegacyTodoNudgePolicyTrace;
+    } = { pin: null, restrictions: null, trace: new LegacyTodoNudgePolicyTrace(undefined) };
     const historyResult = await this.historyService.iterateFullHistory(
       ownerWorkspaceId,
       "backward",
@@ -12881,6 +12886,9 @@ export class TaskService implements AgentTaskIntegration {
           if (isCompactionRequestMessage(message)) {
             continue;
           }
+          // Rows older than the one that defined the restrictions only prove where its policy
+          // came from (see LegacyTodoNudgePolicyTrace).
+          state.trace.visit(message);
           const metadata = message.metadata;
           // The strict-agent pin lives in the row's retry snapshot: an explicit agent override
           // must stay loud on the wake too, or a vanished/corrupted definition would silently
@@ -12925,14 +12933,17 @@ export class TaskService implements AgentTaskIntegration {
                 messageId: message.id,
               });
             }
+            // The returned policy is the trace's: it drops a legacy TODO-nudge rule only when
+            // older rows prove that Xum added it.
+            state.trace = new LegacyTodoNudgePolicyTrace(parsedPolicy?.data);
+            state.trace.visit(message);
             state.restrictions = {
-              ...(parsedPolicy?.success ? { toolPolicy: parsedPolicy.data } : {}),
               ...(typeof metadata?.disableWorkspaceAgents === "boolean"
                 ? { disableWorkspaceAgents: metadata.disableWorkspaceAgents }
                 : {}),
             };
           }
-          if (state.pin != null && state.restrictions != null) {
+          if (state.pin != null && state.restrictions != null && state.trace.finished) {
             return false;
           }
         }
@@ -12942,7 +12953,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!historyResult.success) {
       throw new Error(`history unavailable: ${historyResult.error}`);
     }
-    return { ...(state.restrictions ?? {}), ...(state.pin ?? {}) };
+    return { ...state.restrictions, ...withToolPolicy(state.trace.policy), ...state.pin };
   }
 
   private scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId: string): void {
