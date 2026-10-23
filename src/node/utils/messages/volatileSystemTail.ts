@@ -300,8 +300,8 @@ export function planCustomInstructions(
 
 /**
  * planSystemSection for a section that can disappear (an empty `requestSection`). The prompt
- * then sends none and records nothing, as before, unless the segment froze one: then the
- * removal is a change like any other, sent as a row with `channel.removed` until the next
+ * then sends none (a segment start records the empty section), unless the segment froze one:
+ * then the removal is a change like any other, sent as a row with `channel.removed` until the next
  * compaction, while the frozen section stays. Replay sends the recorded request, which
  * already holds the frozen section, so there the records alone decide.
  */
@@ -314,8 +314,17 @@ function planRemovableSection(
 ): VolatileSystemTailPlan {
   if (replayedTurn) return planSystemSection(channel, messages, "", rowsSupported, replayedTurn);
   const removed = requestSection === "";
-  if (removed && (!rowsSupported || restoreFrozenSegment(messages, channel) == null)) {
-    return { systemTail: "", messages, rowsText: "" };
+  if (removed) {
+    const none = { systemTail: "", messages, rowsText: "" };
+    if (!rowsSupported) return none;
+    const restored = restoreFrozenSegment(messages, channel);
+    // None at the segment start: freeze "no section" (an empty baseline, one record per
+    // segment start), so a first section later in the segment (a first AGENTS.md, Model:/Mode:
+    // section or skill) is a row, not a rewrite of the cached prefix.
+    if (restored == null) return { ...none, record: { text: "", placement: "system" } };
+    // Still none: nothing changed.
+    const { appliedTail, ...withRows } = restored;
+    if (appliedTail === "") return withRows;
   }
   const live = removed ? channel.removed : requestSection;
   const plan = planSystemSection(channel, messages, live, rowsSupported, undefined);
