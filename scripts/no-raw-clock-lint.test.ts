@@ -51,6 +51,8 @@ test("reports raw clock reads and global timers", () => {
   expect(rawClock(`const id = setInterval(tick, 10);`)).toEqual(["raw"]);
   expect(rawClock(`globalThis.setTimeout(() => undefined, 10);`)).toEqual(["raw"]);
   expect(rawClock(`globalThis.setInterval(tick, 10);`)).toEqual(["raw"]);
+  expect(rawClock(`const t = globalThis.Date.now();`)).toEqual(["raw"]);
+  expect(rawClock(`const d = new globalThis.Date();`)).toEqual(["raw"]);
 });
 
 test("passes HostClock reads, monotonic durations and date parsing", () => {
