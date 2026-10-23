@@ -16,6 +16,12 @@ import {
   workspaceTurnOwnerLockPath,
   type WorkspaceTurnManager,
 } from "@/node/services/workspaceTurnManager";
+import {
+  makeForeignHolders,
+  withForeignHolders,
+  type ForeignHolders,
+} from "@/node/services/sessionLocks/foreignHolders.testHarness";
+import { SessionLocksNode } from "@/node/services/sessionLocks/nodeSessionLocks";
 import { registerLiveWorkspaceTurnHandle } from "@/node/services/taskService.shared.testHarness";
 import {
   createAIServiceMocks,
@@ -61,6 +67,7 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
     manager as unknown as {
       taskHandleStore: TaskHandleStore;
       countActiveWorkspaceTurns: () => Promise<number>;
+      turnOwnerLocks: Map<string, () => Promise<void>>;
     };
 
   const exists = (file: string) =>
@@ -69,11 +76,33 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
       () => false
     );
 
-  /** The owner process died: its lock record names a token no live process holds. */
-  async function markTurnOwnerDead(handleId: string): Promise<void> {
+  /**
+   * Backend A stops holding the handle's live-owner lock without settling it. Its handle stays
+   * "running" on disk, and no lock file remains: the test puts a fake owner on the path instead.
+   */
+  async function dropOwnerLock(backendA: WorkspaceTurnManager, handleId: string): Promise<string> {
+    const owned = internals(backendA).turnOwnerLocks;
+    const release = owned.get(handleId);
+    expect(release).toBeDefined();
+    owned.delete(handleId);
+    await release!();
     const lockPath = workspaceTurnOwnerLockPath(rootDir, handleId);
-    const record = JSON.parse(await fsPromises.readFile(lockPath, "utf-8")) as object;
-    await fsPromises.writeFile(lockPath, JSON.stringify({ ...record, token: "dead-owner" }));
+    expect(await exists(lockPath)).toBe(false);
+    return lockPath;
+  }
+
+  /**
+   * The owner process died: backend B's locks (phase 4: SessionLocks with foreign holders) see a
+   * dead holder on the owner lock, which B's next acquire reclaims. Writes no lock file.
+   */
+  async function markTurnOwnerDead(
+    backendA: WorkspaceTurnManager,
+    handleId: string
+  ): Promise<{ holders: ForeignHolders; lockPath: string }> {
+    const lockPath = await dropOwnerLock(backendA, handleId);
+    const holders = makeForeignHolders();
+    holders.hold(lockPath, "dead");
+    return { holders, lockPath };
   }
 
   test("another backend's count never settles a handle its live owner runs", async () => {
@@ -96,10 +125,11 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
   });
 
   test("another backend settles a handle whose owner died, as after a restart", async () => {
-    const { parentId } = await startWorkspaceTurnForTest(rootDir);
-    await markTurnOwnerDead("wst_handle");
+    const { parentId, taskService: backendA } = await startWorkspaceTurnForTest(rootDir);
+    const { holders, lockPath } = await markTurnOwnerDead(backendA, "wst_handle");
     const { taskService: backendB } = createWorkspaceTurnManagerHarness(
-      await createTestConfig(rootDir)
+      await createTestConfig(rootDir),
+      { locks: withForeignHolders(SessionLocksNode, holders) }
     );
 
     expect(await internals(backendB).countActiveWorkspaceTurns()).toBe(0);
@@ -108,7 +138,8 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
       status: "interrupted",
       error: "Workspace turn interrupted after restart",
     });
-    expect(await exists(workspaceTurnOwnerLockPath(rootDir, "wst_handle"))).toBe(false);
+    expect(holders.reclaimed).toEqual([lockPath]);
+    expect(await exists(lockPath)).toBe(false);
   });
 
   test("the owner releases its lock once the handle settles", async () => {
@@ -320,11 +351,12 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
     });
 
     test("a dead owner's handle is still skipped, and left for a later settlement", async () => {
-      const { config, parentId } = await startWorkspaceTurnForTest(rootDir);
-      await markTurnOwnerDead("wst_handle");
+      const { config, parentId, taskService: backendA } = await startWorkspaceTurnForTest(rootDir);
+      const { holders } = await markTurnOwnerDead(backendA, "wst_handle");
       const { taskService: backendB } = createWorkspaceTurnManagerHarness(
         await createTestConfig(rootDir),
         {
+          locks: withForeignHolders(SessionLocksNode, holders),
           workspaceService: createWorkspaceServiceMocks({
             acquireIdleTurnExclusion: mock(() => Err(new Error("admission in flight"))),
           }).workspaceService,
@@ -332,6 +364,38 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
       );
 
       // A stale handle must not count as active (a new turn would queue behind it).
+      expect(await internals(backendB).countActiveWorkspaceTurns()).toBe(0);
+      expect(
+        await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+      ).toMatchObject({ status: "running" });
+      // The probe only reads: the dead owner stays for the later settlement to reclaim.
+      expect(holders.reclaimed).toEqual([]);
+    });
+
+    test("a fake live owner on the lock keeps the handle, with no lock file", async () => {
+      const { config, parentId, taskService: backendA } = await startWorkspaceTurnForTest(rootDir);
+      const lockPath = await dropOwnerLock(backendA, "wst_handle");
+      const holders = makeForeignHolders();
+      holders.hold(lockPath, "live");
+      const { taskService: backendB } = createWorkspaceTurnManagerHarness(
+        await createTestConfig(rootDir),
+        {
+          locks: withForeignHolders(SessionLocksNode, holders),
+          workspaceService: createWorkspaceServiceMocks({
+            acquireIdleTurnExclusion: mock(() => Err(new Error("admission in flight"))),
+          }).workspaceService,
+        }
+      );
+
+      // keepIfOwnedElsewhere sees the fake owner as another live backend.
+      expect(await internals(backendB).countActiveWorkspaceTurns()).toBe(1);
+      expect(await backendB.listActiveWorkspaceTurnTaskIdsForOwner(parentId)).toEqual([
+        "wst_handle",
+      ]);
+      expect(await exists(lockPath)).toBe(false);
+
+      // Control: once that owner releases, the same probe no longer keeps the handle.
+      holders.release(lockPath);
       expect(await internals(backendB).countActiveWorkspaceTurns()).toBe(0);
       expect(
         await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
