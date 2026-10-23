@@ -6,6 +6,7 @@
  * its code reached. Outcomes reject like execFileAsync does: an Error whose message is the
  * stderr (or the exit code) and that carries code, signal, stdout and stderr.
  */
+import type { ExecFileAsyncOptions } from "@/node/utils/disposableExec";
 import type { HostProcess, HostProcesses } from "./hostProcesses";
 
 export interface ScriptedCall {
@@ -69,19 +70,52 @@ function execError(
   return error;
 }
 
-/** Runs one call on the table. */
+/**
+ * The scripted layers drop no option that a caller sets. An option either holds for the entry
+ * as it is, or the call is refused with an error that names the option:
+ * - A fixed outcome settles at once and reads no environment, so a timeout, a tree kill and env
+ *   hold for it.
+ * - A function entry can be slow and gets only the call, so a timeout or env is refused there.
+ * - Options that no entry can honor are refused whenever they are set.
+ * Throws for the first of `names` that is set in `options`.
+ */
+export function refuseSetOptions(
+  line: string,
+  options: object | undefined,
+  names: readonly string[]
+): void {
+  const set = names.find(
+    (name) => (options as Record<string, unknown> | undefined)?.[name] !== undefined
+  );
+  if (set !== undefined) {
+    throw new Error(`The scripted layer cannot honor the option ${set} for: ${line}`);
+  }
+}
+
+/** Runs one call on the table, under the option rules of refuseSetOptions. */
 export async function runScriptedCommand(
   table: ScriptTable,
-  call: ScriptedCall
+  call: ScriptedCall,
+  options?: ExecFileAsyncOptions
 ): Promise<{ stdout: string; stderr: string }> {
   const line = commandLine(call.file, call.args);
   const entry = Object.hasOwn(table, line) ? table[line] : undefined;
   if (entry === undefined) {
     throw execError(`No scripted command: ${line}`, null, "", "");
   }
+  refuseSetOptions(line, options, ["onStderrData"]);
+  if (typeof entry === "function") refuseSetOptions(line, options, ["timeoutMs", "env"]);
   const outcome = typeof entry === "function" ? await entry(call) : entry;
   const stdout = outcome.stdout ?? "";
   const stderr = outcome.stderr ?? "";
+  // execFileAsync kills the child once stdout and stderr together pass the cap.
+  const maxOutputBytes = options?.maxOutputBytes;
+  if (
+    maxOutputBytes !== undefined &&
+    Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > maxOutputBytes
+  ) {
+    refuseSetOptions(line, options, ["maxOutputBytes"]);
+  }
   const exitCode = outcome.exitCode ?? 0;
   if (exitCode !== 0) {
     throw execError(
@@ -130,7 +164,7 @@ export function createScriptedHostProcesses(
       const signal = options?.signal;
       const result = signal?.aborted
         ? Promise.reject(execError("Command aborted before execution", null, "", ""))
-        : untilAborted(runScriptedCommand(commands, call), signal);
+        : untilAborted(runScriptedCommand(commands, call, options), signal);
       // As execFileAsync: a caller that disposes without awaiting must not see an unhandled
       // rejection.
       result.catch(() => undefined);

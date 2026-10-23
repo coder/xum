@@ -86,6 +86,42 @@ describe("the scripted layer", () => {
     expect(processes.calls).toEqual([{ file: "git", args: ["--version"], cwd: undefined }]);
   });
 
+  test("an option that the entry cannot honor is refused by name, and one that holds passes", async () => {
+    const processes = createScriptedHostProcesses({
+      "git status": { stdout: "clean", stderr: "!" },
+      "git fetch": () => ({ stdout: "" }),
+    });
+    const run = (args: string[], options: Parameters<HostProcesses["execFile"]>[2]) => {
+      using proc = processes.execFile("git", args, options);
+      return proc.result.then(
+        (output) => output.stdout,
+        (error: Error) => error.message
+      );
+    };
+    // A fixed outcome settles at once and reads no environment.
+    expect(
+      await run(["status"], {
+        timeoutMs: 10,
+        killTreeOnTermination: true,
+        env: {},
+        maxOutputBytes: 6,
+      })
+    ).toBe("clean");
+    expect(await run(["status"], { maxOutputBytes: 5 })).toBe(
+      "The scripted layer cannot honor the option maxOutputBytes for: git status"
+    );
+    expect(await run(["status"], { onStderrData: () => undefined })).toBe(
+      "The scripted layer cannot honor the option onStderrData for: git status"
+    );
+    // A function entry can be slow and gets only the call.
+    expect(await run(["fetch"], { timeoutMs: 10 })).toBe(
+      "The scripted layer cannot honor the option timeoutMs for: git fetch"
+    );
+    expect(await run(["fetch"], { env: {} })).toBe(
+      "The scripted layer cannot honor the option env for: git fetch"
+    );
+  });
+
   test("fetchUrl answers a scripted URL and rejects any other", async () => {
     const processes = createScriptedHostProcesses(
       {},
