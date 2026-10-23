@@ -1,4 +1,5 @@
 import * as net from "node:net";
+import assert from "@/common/utils/assert";
 
 /**
  * The IP version of a literal address: 4, 6, or 0 when `input` is not one.
@@ -9,8 +10,9 @@ import * as net from "node:net";
  */
 export function isIP(input: string): 0 | 4 | 6 {
   const version = net.isIP(input);
-  if (version !== 0 && version !== 4 && version !== 6) {
-    throw new Error(`net.isIP returned an unknown IP version: ${version}`);
-  }
+  assert(
+    version === 0 || version === 4 || version === 6,
+    `net.isIP returned an unknown IP version: ${version}`
+  );
   return version;
 }
