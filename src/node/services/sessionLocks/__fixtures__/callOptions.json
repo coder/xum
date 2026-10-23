@@ -87,7 +87,7 @@
     "fn": "acquireProcessFileLock",
     "args": [
       {
-        "lockPath": "<root:clear>/locks/history-<hash:ws-record-clear>.lock",
+        "lockPath": "<root:clear>/locks/history-<hash:history:ws-record-clear>.lock",
         "timeoutMs": 10000,
         "label": "history write lock"
       }
@@ -151,7 +151,7 @@
     "fn": "acquireCrossProcessLock",
     "args": [
       {
-        "lockPath": "<root:init>/locks/init-record/<hash:ws-record-init>/<uuid>.lock",
+        "lockPath": "<root:init>/locks/init-record/<hash:workspace-use:ws-record-init>/<uuid>.lock",
         "acquireTimeoutMs": 0,
         "staleMs": 300000,
         "timeoutMessage": "The init record lock of ws-record-init is unexpectedly held."
@@ -161,7 +161,7 @@
   {
     "site": "node/services/initStateManager.ts",
     "fn": "inspectCrossProcessLock",
-    "args": ["<root:init>/locks/init-record/<hash:ws-record-init>/<uuid>.lock"]
+    "args": ["<root:init>/locks/init-record/<hash:workspace-use:ws-record-init>/<uuid>.lock"]
   },
   {
     "site": "node/services/initStateManager.ts",
@@ -267,7 +267,7 @@
     "fn": "acquireProcessFileLock",
     "args": [
       {
-        "lockPath": "<root:usage>/locks/target-<hash:<root:usage>/sessions/ws-record-usage>.lock",
+        "lockPath": "<root:usage>/locks/target-<hash:target:<root:usage>/sessions/ws-record-usage>.lock",
         "timeoutMs": 2000,
         "label": "target mutation lock"
       }
@@ -402,7 +402,7 @@
     "fn": "acquireProcessFileLock",
     "args": [
       {
-        "lockPath": "<root:clear>/locks/refine-apply-<hash:ws-record-clear>.lock",
+        "lockPath": "<root:clear>/locks/refine-apply-<hash:history:ws-record-clear>.lock",
         "timeoutMs": 10000,
         "label": "refine serialization lock (clear history)"
       }
