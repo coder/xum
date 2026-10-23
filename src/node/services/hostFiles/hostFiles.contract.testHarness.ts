@@ -108,6 +108,34 @@ export function describeHostFilesContract(name: string, build: () => ContractHos
       { posixOnly: true }
     );
 
+    it(
+      "open with O_NONBLOCK reads through the handle, and its bigint stat names the lstat inode",
+      async ({ files }, dir) => {
+        const file = path.join(dir, "hooks.js");
+        await files.promises.writeFile(file, "export {};\n");
+        const { O_RDONLY, O_NONBLOCK } = files.promises.constants;
+        const handle = await files.promises.open(file, O_RDONLY | O_NONBLOCK);
+        try {
+          const stat = await handle.stat({ bigint: true });
+          const linkStat = await files.promises.lstat(file, { bigint: true });
+          expect([stat.dev === linkStat.dev, stat.ino === linkStat.ino, stat.size]).toEqual([
+            true,
+            true,
+            11n,
+          ]);
+          const buffer = Buffer.alloc(11);
+          const { bytesRead } = await handle.read(buffer, 0, 11, 0);
+          expect([bytesRead, buffer.toString()]).toEqual([11, "export {};\n"]);
+        } finally {
+          await handle.close();
+        }
+        expect(await errorCode(() => files.promises.open(path.join(dir, "missing")))).toBe(
+          "ENOENT"
+        );
+      },
+      { posixOnly: true }
+    );
+
     it("mkdtemp makes a new folder with the prefix on each call", async ({ files }, dir) => {
       const first = await files.promises.mkdtemp(path.join(dir, "clone-"));
       const second = await files.promises.mkdtemp(path.join(dir, "clone-"));

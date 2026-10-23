@@ -1,7 +1,4 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import * as fsPromises from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
 
@@ -42,6 +39,7 @@ import { pluginSkillFileName } from "./claudeCommands";
 import { pluginAgentIdOf } from "./agentFiles";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
+import { nodeHostFiles, nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 
 /**
  * Agent Plugins 1.0.0 discovery (§4, §6).
@@ -155,10 +153,10 @@ export interface PluginFileReadArgs {
 
 /** The host filesystem: one module-level object, so a read costs no wrapper per call. */
 export const nodePluginFs: PluginFs = {
-  realpath: (filePath) => fsPromises.realpath(filePath),
-  stat: (filePath) => fsPromises.stat(filePath),
-  lstat: (filePath) => fsPromises.lstat(filePath),
-  readdir: (dirPath) => fsPromises.readdir(dirPath, { withFileTypes: true }),
+  realpath: (filePath) => nodeHostFiles.promises.realpath(filePath),
+  stat: (filePath) => nodeHostFiles.promises.stat(filePath),
+  lstat: (filePath) => nodeHostFiles.promises.lstat(filePath),
+  readdir: (dirPath) => nodeHostFiles.promises.readdir(dirPath, { withFileTypes: true }),
   ensureContained: ensurePathContained,
   readFileCapped: readPluginFileWithinRootCapped,
 };
@@ -271,15 +269,15 @@ export async function readPluginFileWithinRootCapped(
   // (list(), preview, skill/agent/hook/MCP config loads). Refuse anything but a regular file
   // before the open; O_NONBLOCK covers a swap to a FIFO between this stat and the open (it
   // has no effect on regular files), and the identity check below still runs after the open.
+  const fsPromises = nodeHostFiles.promises;
   const target = await fsPromises.stat(filePath);
   if (!target.isFile()) {
     throw new Error(`${label} is not a regular file: ${filePath}`);
   }
+  const { O_RDONLY, O_NONBLOCK } = fsPromises.constants;
   const handle = await fsPromises.open(
     filePath,
-    process.platform === "win32"
-      ? fsConstants.O_RDONLY
-      : fsConstants.O_RDONLY | fsConstants.O_NONBLOCK
+    process.platform === "win32" ? O_RDONLY : O_RDONLY | O_NONBLOCK
   );
   try {
     const stat = await handle.stat({ bigint: true });
@@ -1266,7 +1264,10 @@ export function computeAgentPluginContainers(args: {
     scope: "global",
     registryPath: path.join(args.xumHome, PLUGIN_REGISTRY_FILE_NAME),
   });
-  containers.push({ path: path.join(os.homedir(), ".agents", "plugins"), scope: "global" });
+  containers.push({
+    path: path.join(nodeHostPaths.userHome(), ".agents", "plugins"),
+    scope: "global",
+  });
   return containers;
 }
 
