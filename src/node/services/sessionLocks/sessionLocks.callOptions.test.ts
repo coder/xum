@@ -53,6 +53,12 @@ function callSite(): string {
 }
 
 const TMP = new RegExp(`${os.tmpdir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/[^/\\s]+`, "g");
+
+/**
+ * Temp root -> <tmp0>, <tmp1>, ... in order of first use, like the hashes: a
+ * lock bound to the wrong backend root shows another token.
+ */
+const tmpTokens = new Map<string, string>();
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g;
 
 /**
@@ -65,7 +71,10 @@ const hashTokens = new Map<string, string>();
 /** Masks temp roots, hashes and backend tokens: <tmp>/locks/history-<h0>.lock. */
 function mask(text: string): string {
   return text
-    .replace(TMP, "<tmp>")
+    .replace(TMP, (root) => {
+      if (!tmpTokens.has(root)) tmpTokens.set(root, `<tmp${tmpTokens.size}>`);
+      return tmpTokens.get(root)!;
+    })
     .replace(UUID, "<uuid>")
     .replace(/[0-9a-f]{32,64}/g, (hash) => {
       if (!hashTokens.has(hash)) hashTokens.set(hash, `<h${hashTokens.size}>`);
@@ -78,13 +87,17 @@ type Row = Record<string, unknown>;
 /** Spies on every session lock function and records each distinct call. */
 function recordLockCalls() {
   hashTokens.clear();
+  tmpTokens.clear();
   const rows = new Map<string, Row>();
+  /** Each recorded call in order, for checks of lock order (the rows are sorted). */
+  const calls: Row[] = [];
   const waiters: Array<{ lockPath: string; resolve: () => void }> = [];
   const add = (row: Row, lockPath?: string) => {
     const site = callSite();
     if (site !== "test") {
       const full = { site, ...row };
       rows.set(JSON.stringify(full), full);
+      calls.push(full);
     }
     if (lockPath === undefined) return;
     for (const waiter of waiters.splice(0)) {
@@ -147,6 +160,9 @@ function recordLockCalls() {
     /** Resolves at the next lock call on lockPath after this call. */
     nextLockCall: (lockPath: string) =>
       new Promise<void>((resolve) => waiters.push({ lockPath, resolve })),
+    /** The number of calls so far, and the calls from index `from` on. */
+    callCount: () => calls.length,
+    callsFrom: (from: number) => calls.slice(from),
     normalized: () =>
       [...rows.values()].sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
   };
@@ -160,7 +176,17 @@ test("moved lock calls keep their options", async () => {
   const record = recordLockCalls();
   await oneTurn(); // history writes, turn use lease, todo_write, review pane, blob lock
   await oneRefusal(); // a live gate: hold() refuses. A live turn owner: inspect says held.
+  const removalFrom = record.callCount();
   await oneRemoval(); // removeSessionDirUnderMemoryLocks: refine, target, history lock
+  // Removal takes refine, then target, then history: another order can deadlock against an
+  // apply that holds refine and waits for history. The sorted rows cannot show the order.
+  const removalLocks = record
+    .callsFrom(removalFrom)
+    .filter((call) => call.fn === "acquireProcessFileLock")
+    .map((call) => /\/([a-z-]+)-<h\d+>\.lock$/.exec(String(call.lockPath))?.[1])
+    // One target lock per memory target: keep the kind once.
+    .filter((kind, index, kinds) => kind !== kinds[index - 1]);
+  expect(removalLocks).toEqual(["refine-apply", "target", "history"]);
   await oneRefineApply(); // the staging lock of a pass, the apply lock
   await oneFork(record.nextLockCall); // the branch summary marker and its wait
 
