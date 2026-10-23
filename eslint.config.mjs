@@ -176,13 +176,11 @@ const HOST_MODULES = [
 ];
 // File -> the host modules it still imports. Phase plans list the pairs they add or remove.
 const HOST_IMPORT_ALLOW = {
-  "src/node/services/agentSession.ts": ["@/node/runtime/runtimeHelpers", "fs/promises"],
+  "src/node/services/agentSession.ts": ["@/node/runtime/runtimeHelpers"],
   "src/node/services/aiService.ts": [
     "@/node/runtime/multiProjectRuntime",
     "@/node/runtime/runtimeFactory",
     "@/node/runtime/runtimeHelpers",
-    "@/node/utils/fs",
-    "fs/promises",
   ],
   "src/node/services/contextManagement/strategies/tokenBudget.ts": [
     "@/node/runtime/runtimeHelpers",

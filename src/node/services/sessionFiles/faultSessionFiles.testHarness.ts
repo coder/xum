@@ -91,6 +91,7 @@ const PROMISE_APIS = Object.keys({
   rmdir: 0,
   stat: 0,
   unlink: 0,
+  writeFile: 0,
 } satisfies Record<keyof SessionFiles["promises"], 0>) as Array<keyof SessionFiles["promises"]>;
 const MEMBER_APIS = {
   fsyncSync: "sync",
