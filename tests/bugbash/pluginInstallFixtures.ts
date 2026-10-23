@@ -154,10 +154,10 @@ function plainSkills(): Files {
       "doc-outline",
       "Outlines a document before you write it"
     ),
-    // Valid: metadata holds a nested map and a number, like warpdotdev/common-skills merge-risk.
+    // Valid: metadata holds a nested map, like warpdotdev/common-skills merge-risk.
     "skills/merge-risk/SKILL.md":
       "---\nname: merge-risk\ndescription: Rates the risk of merging a pull request\n" +
-      "metadata:\n  version: 1.0\n  credits:\n    skill: pr\n    author: Bug Bash\n---\n" +
+      'metadata:\n  version: "1.0"\n  credits:\n    skill: pr\n    author: Bug Bash\n---\n' +
       "Follow these steps.\n",
     // Invalid: the description is longer than the 1024-character limit.
     "skills/writing/too-long/SKILL.md": skillMd(

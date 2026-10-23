@@ -33,11 +33,15 @@ export const SkillLookupNameSchema = z
  * - A recursive YAML alias (`a: &A { self: *A }`) parses to a cyclic object, which
  *   `z.json()` accepts but the oRPC serializer and the consent fingerprint cannot walk.
  *   Shared (non-recursive) aliases are fine, so this tracks the current path only.
- * - YAML rounds an integer beyond 2^53 - 1 before Xum sees it, so the tool card and the
- *   consent fingerprint would show a different number than the file holds.
+ * - YAML rounds numbers before Xum sees them (`9007199254740993`, `1e-400`,
+ *   `0.10000000000000001`), so the tool card and the consent fingerprint would show a
+ *   different value than the file holds. A number must be quoted, as the spec's own
+ *   example does (`version: "1.0"`). Strings, booleans and null round-trip exactly.
  */
 function metadataValueProblem(value: unknown, ancestors = new Set<object>()): string | undefined {
-  if (typeof value === "number") return unsafeIntegerProblem(value);
+  if (typeof value === "number") {
+    return "must not contain an unquoted number (YAML rounds it; quote it as a string)";
+  }
   if (typeof value !== "object" || value === null) return undefined;
   if (ancestors.has(value)) return "must not contain a recursive YAML alias";
   ancestors.add(value);
@@ -48,12 +52,6 @@ function metadataValueProblem(value: unknown, ancestors = new Set<object>()): st
   );
   ancestors.delete(value);
   return problem;
-}
-
-function unsafeIntegerProblem(value: number): string | undefined {
-  return Number.isInteger(value) && !Number.isSafeInteger(value)
-    ? "must not contain an integer beyond 2^53 - 1 (quote it as a string)"
-    : undefined;
 }
 
 export const AgentSkillFrontmatterSchema = z.object({

@@ -51,13 +51,15 @@ Body
     expect(result.frontmatter.description).toBe("Hello");
   });
 
-  test("accepts non-string metadata values (nested maps, numbers)", () => {
-    // Shape from warpdotdev/common-skills merge-risk, plus an unquoted version number.
+  test("accepts non-string metadata values (nested maps, lists, booleans)", () => {
+    // Shape from warpdotdev/common-skills merge-risk, plus a list, a boolean and a quoted version.
     const content = `---
 name: merge-risk
 description: Use when assessing the risk of merging a PR
 metadata:
-  version: 1.0
+  version: "1.0"
+  stable: true
+  tags: [review, risk]
   credits:
     skill: pr
     author: Matt Pocock
@@ -72,20 +74,27 @@ Body
     });
 
     expect(result.frontmatter.metadata).toEqual({
-      version: 1,
+      version: "1.0",
+      stable: true,
+      tags: ["review", "risk"],
       credits: { skill: "pr", author: "Matt Pocock" },
     });
   });
 
   // Tagged YAML parses to Set/Map/Uint8Array, a recursive alias to a cyclic object, and an
-  // integer beyond 2^53 - 1 to a rounded number. None of them survives the tool card or the
-  // consent fingerprint as written, so each rejects the skill.
+  // unquoted number to a rounded one. None of them survives the tool card or the consent
+  // fingerprint as written, so each rejects the skill.
   test.each([
     ["!!set", "metadata:\n  tags: !!set\n    ? a\n    ? b\n", "metadata.tags"],
     ["!!omap", "metadata:\n  order: !!omap\n    - a: 1\n", "metadata.order"],
     ["!!binary", "metadata:\n  blob: !!binary aGVsbG8=\n", "metadata.blob"],
     ["a recursive alias", "metadata:\n  loop: &A\n    self: *A\n", "recursive YAML alias"],
-    ["an unsafe integer", "metadata:\n  id: 9007199254740993\n", "beyond 2^53 - 1"],
+    ["an unquoted number", "metadata:\n  version: 1.0\n", "unquoted number"],
+    [
+      "a number in a nested list",
+      "metadata:\n  ids:\n    - [9007199254740993]\n",
+      "unquoted number",
+    ],
   ])("rejects metadata with %s", (_label, metadataYaml, expectedError) => {
     const content = `---\nname: foo\ndescription: Hello\n${metadataYaml}---\nBody\n`;
 
