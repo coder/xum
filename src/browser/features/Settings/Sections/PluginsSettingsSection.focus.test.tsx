@@ -163,32 +163,38 @@ test.each(["Install", "Cancel"])(
   }
 );
 
-// A new preview for another Install as method rerenders the view without moving the focus.
-test("picking another Install as method keeps the focus on the picked method (#7121)", async () => {
-  const api = createApi();
-  spyOn(api.agentPlugins, "preview").mockImplementation((input) => {
-    const kind = input.method?.kind ?? "agent-plugin";
-    return Promise.resolve({
-      success: true as const,
-      data: {
-        kind: "plugin" as const,
-        preview: {
-          ...pluginPreview,
-          manifest: { name: `tools-${kind}` },
-          method: kind === "claude-plugin" ? { kind } : { kind: "agent-plugin" as const },
-          methods: [{ kind: "agent-plugin" as const }, { kind: "claude-plugin" as const }],
+// Another Install as method (a new preview) or the Skills CLI choice rerenders the view without
+// moving the focus.
+test.each(["Claude Code plugin", "Skills CLI"])(
+  "picking %s as the install method keeps the focus on that choice (#7121)",
+  async (choiceName) => {
+    const api = createApi();
+    spyOn(api.agentPlugins, "preview").mockImplementation((input) => {
+      const kind = input.method?.kind ?? "agent-plugin";
+      return Promise.resolve({
+        success: true as const,
+        data: {
+          kind: "plugin" as const,
+          preview: {
+            ...pluginPreview,
+            manifest: { name: `tools-${kind}` },
+            method: kind === "claude-plugin" ? { kind } : { kind: "agent-plugin" as const },
+            methods: [{ kind: "agent-plugin" as const }, { kind: "claude-plugin" as const }],
+            skillsCliSkills: ["alpha"],
+          },
         },
-      },
+      });
     });
-  });
-  const { view, pressEnter } = await openAddPanel(api);
-  await pressEnter();
-  await view.findByText("tools-agent-plugin");
-  const claude = view.getByRole("radio", { name: "Claude Code plugin" });
-  await userEvent.click(claude);
-  await view.findByText("tools-claude-plugin");
-  expect(document.activeElement).toBe(claude);
-});
+    const { view, pressEnter } = await openAddPanel(api);
+    await pressEnter();
+    await view.findByText("tools-agent-plugin");
+    const choice = view.getByRole("radio", { name: choiceName });
+    await userEvent.click(choice);
+    await waitFor(() => expect(choice.getAttribute("aria-checked")).toBe("true"));
+    if (choiceName === "Claude Code plugin") await view.findByText("tools-claude-plugin");
+    expect(document.activeElement).toBe(choice);
+  }
+);
 
 // Codex round 1 on #7298: a slow preview or install must not take the focus from a control
 // the user moved to while it loaded.

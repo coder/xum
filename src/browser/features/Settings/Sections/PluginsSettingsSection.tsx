@@ -576,7 +576,6 @@ const ManageComponentsPanel: React.FC<{
   );
 };
 
-/** Two-phase add flow: source input → consent preview → install. */
 /**
  * Whether keyboard focus fell out of an unmounted control: to the page body, or to the Settings
  * dialog itself (Radix moves it there). A control the user focused, anywhere, is not lost focus.
@@ -624,6 +623,7 @@ function focusFirstControlOnMount(view: HTMLDivElement | null): void {
   first?.focus();
 }
 
+/** Two-phase add flow: source input → consent preview → install. */
 const AddPluginPanel: React.FC<{
   onInstalled: () => void;
   onClose: () => void;
