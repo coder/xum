@@ -145,7 +145,7 @@ type Row = Record<string, unknown>;
 function recordLockCalls() {
   const { names, mask, unknown } = createNames();
   /** Each call in order, unmasked: the scenarios name their roots while they run. */
-  const calls: Array<{ site: string; step: string; fn: string; args: unknown[] }> = [];
+  const calls: Array<{ site: string; step: string | undefined; fn: string; args: unknown[] }> = [];
   const waiters: Array<{ lockPath: string; resolve: () => void }> = [];
   const add = (fn: string, args: unknown[], lockPath?: string) => {
     const site = callSite();
