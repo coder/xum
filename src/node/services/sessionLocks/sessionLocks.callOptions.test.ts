@@ -81,6 +81,75 @@ function digestOf(file: string): string {
 }
 
 /**
+ * Today's digests of the fixed scenario ids, written out (#7326). The names below come from the
+ * production builders, so a move that changed a hash scheme would change a path and its name
+ * together. These literals do not follow such a change. Each row: id, history, workspace-use.
+ */
+const PINNED_DIGESTS = new Map<string, Record<"history" | "workspace-use", string>>(
+  (
+    [
+      [
+        "ws-record-artifact",
+        "cee4416dafd57ca395f897d0528bd047",
+        "cd309d88c1f28ff3f0535776078be453c6b9e99cef2261985bd0ad2579e8789e",
+      ],
+      [
+        "ws-record-clear",
+        "8075cdbb68f08a4cbeb88a97a61f3d0d",
+        "9630979ba341e82b9b7e9c6f267ea3878c744483d940b58114a916936663ac3c",
+      ],
+      [
+        "ws-record-fork",
+        "e8b6353b596ad5bd7e8ebfc072c8f43e",
+        "c61ce741e9df7ef6e5fa1fbf426fb0f695fa2ac4b5dfa0c608631a025ce5b9d4",
+      ],
+      [
+        "ws-record-fork-foreign",
+        "b35d3c7fd682b06c6f0baed6a5d5759b",
+        "c4a924ae3eda9d7f5173f6613daec4dbd7c913451cd07d1489c66c91fc22c1ec",
+      ],
+      [
+        "ws-record-init",
+        "076f427e535093c738a75c00e7164e33",
+        "8719a815bbd26b1b96bfe518be3ff51242fd5ec982f7a38e7a996d4c73c8953a",
+      ],
+      [
+        "ws-record-parent",
+        "2df50725472d3e74e2e43ade7434ec99",
+        "fde9eb8bba2930086f41a844327a03a56bc119336e1afe3edd88c44be187cadf",
+      ],
+      [
+        "ws-record-refine",
+        "8c8acc3fef553b38854937869d5c5043",
+        "f222ae7e5636cef40763608329abfdd2103d826ccdf35acec8890107b13f309c",
+      ],
+      [
+        "ws-record-refusal",
+        "85274c7a087e3335b159788aeb4f4dd2",
+        "c9c4def9b292ba13028ef2023709591e922e754242e92befbc030db97d5473d7",
+      ],
+      [
+        "ws-record-removal",
+        "a997948f9ad17ddb408331a844d543bf",
+        "bf857055b80efecd9d23fecc30502d76f932ed18204ae4fbae4b0aeb1e2f94bd",
+      ],
+      [
+        "ws-record-turn",
+        "b724a94892c6d6d927e67d5cab593f75",
+        "a3552e9462a3284c4128c7bb23cb364be199d6a738931f34e8098ecf60254ac0",
+      ],
+      [
+        "ws-record-usage",
+        "cfa4ee199b9f043d55107cb999685971",
+        "ed720cf7fbbe7d89d87deccf7c3eaaff776a81e20a9e8a8ba2d2e252e4d070e6",
+      ],
+    ] as const
+  ).map(([id, history, workspaceUse]) => [id, { history, "workspace-use": workspaceUse }])
+);
+/** The target scheme, pinned on a fixed key: the removal's target keys are temp paths. */
+const PINNED_TARGET = { key: "/record/target", digest: "5ed49fff9d07a0e1cc5fcc97ee0dc9a0" };
+
+/**
  * Masks by name, not by order of use: each temp root and workspace id that the
  * scenarios name, and each digest that the code's own path functions make of
  * them. So a lock built from the wrong id or root shows another name, even
@@ -106,6 +175,10 @@ function createNames() {
     history: [historyWriteLockPath, refineApplyLockPath],
     "workspace-use": [workspaceMutationLockPath, workspaceUseLockDir],
   };
+  assert(
+    digestOf(targetMutationLockFilePath("/", PINNED_TARGET.key)) === PINNED_TARGET.digest,
+    "the target lock digest scheme changed"
+  );
   const names: LockNames = {
     root: (dir, label) => void roots.set(path.resolve(dir), `<root:${label}>`),
     id: (workspaceId) => {
@@ -114,6 +187,12 @@ function createNames() {
         assert(
           others.every((other) => other === digest),
           `the ${scheme} paths share one digest`
+        );
+        const pinned = PINNED_DIGESTS.get(workspaceId);
+        assert(pinned !== undefined, `pin the digests of ${workspaceId} in PINNED_DIGESTS`);
+        assert(
+          digest === pinned[scheme as keyof typeof pinned],
+          `the ${scheme} digest of ${workspaceId} changed`
         );
         nameDigest(digest, `<hash:${scheme}:${workspaceId}>`);
       }
@@ -243,6 +322,15 @@ afterEach(() => {
 test("moved lock calls keep their options", async () => {
   const record = recordLockCalls();
   await oneTurn(record.names); // history writes, turn use lease, todo_write, review pane, blob lock
+  // hold() publishes its use-lease file, then inspects the mutation gate (#7326): the other order
+  // lets a mutator's lease scan and the turn's gate probe both pass. The sorted rows cannot show it.
+  const leaseOrder = record
+    .callsFrom(0)
+    .map(
+      (call) => /\/locks\/(workspace-use|workspace-mutation)\//.exec(JSON.stringify(call.args))?.[1]
+    )
+    .filter((kind) => kind !== undefined);
+  expect(leaseOrder).toEqual(["workspace-use", "workspace-mutation"]);
   await oneRefusal(record.names); // a live gate: hold() refuses. A live turn owner: inspect says held.
   const removalFrom = record.callCount();
   await oneRemoval(record.names); // removeSessionDirUnderMemoryLocks: refine, target, history lock
