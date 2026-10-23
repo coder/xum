@@ -205,11 +205,13 @@ export const AutoModelRouterLive = Layer.effect(
   })
 );
 
-export const BackgroundProcessManagerLive = Layer.sync(
+export const BackgroundProcessManagerLive = Layer.effect(
   BackgroundProcessManagerTag,
-  // Same root as local spawns, their name lock, and every gate (localBgRecordsRoot), not
-  // os.tmpdir(): on macOS that is /var/folders/..., where other backends never looked.
-  () => new BackgroundProcessManager(localBgRecordsRoot())
+  Effect.gen(function* () {
+    // Same root as local spawns, their name lock, and every gate (localBgRecordsRoot), not
+    // os.tmpdir(): on macOS that is /var/folders/..., where other backends never looked.
+    return new BackgroundProcessManager(localBgRecordsRoot(), yield* HostClockTag);
+  })
 );
 
 // Headless evaluation (workflow `evaluate()`): no dependencies — the caller

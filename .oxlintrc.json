@@ -1328,7 +1328,6 @@
           "error",
           {
             "allow": {
-              "src/node/services/backgroundProcessManager.ts": 25,
               "src/node/services/tools/bash.ts": 3,
               "src/node/services/tools/bash_background_list.ts": 1,
               "src/node/services/tools/code_execution.ts": 3,
@@ -1360,6 +1359,7 @@
     },
     {
       "files": [
+        "src/node/services/backgroundProcessManager.test.ts",
         "src/node/services/retryManager.test.ts",
         "src/node/services/streamManager.toolEvents.test.ts"
       ],
