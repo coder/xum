@@ -1,7 +1,7 @@
 /**
  * Pure timing wrappers for scripts/perf/loopTests.preload.ts (agent loop refactor, phase 1).
  *
- * The preload replaces the fs functions, setTimeout and Bun.sleep of one `bun test` process with
+ * The preload replaces the fs functions, setTimeout, setInterval and Bun.sleep of one `bun test` process with
  * these wrappers, so the loop test baseline can report how much of a test file's time an fs call or
  * a real timer was open. The numbers are an upper bound on what an Effect service can save: they
  * are tripwire data, never a target. This module installs nothing, so its tests can run in the
@@ -118,18 +118,38 @@ export function timed<F extends AnyFunction>(fn: F, record: RecordInterval, now:
 /**
  * Wraps a promise-returning delay whose first argument is the delay: Bun.sleep(ms | Date) and
  * setTimeout[util.promisify.custom](ms, value). It records until the promise settles, except a
- * delay below 1 ms (an event loop yield), as timedTimeout does.
+ * delay below 1 ms (an event loop yield), as timedTimeout does. It records the promise itself,
+ * without the callback detection of `timed`: the last argument of setTimeout(ms, value) from
+ * timers/promises is the value to resolve with, also when it is a function.
  */
 export function timedDelay<F extends AnyFunction>(
   fn: F,
   record: RecordInterval,
   now: () => number
 ): F {
-  const recorded = timed(fn, record, now);
   const wrapper = function (this: unknown, delay?: unknown, ...rest: unknown[]): unknown {
-    const yields = !(delay instanceof Date) && !(Number(delay) >= 1);
-    const call = (yields ? fn : recorded) as unknown as (...a: unknown[]) => unknown;
-    return call.call(this, delay, ...rest);
+    const call = fn as unknown as (...a: unknown[]) => unknown;
+    if (!(delay instanceof Date) && !(Number(delay) >= 1)) return call.call(this, delay, ...rest);
+    const start = now();
+    let result: unknown;
+    try {
+      result = call.call(this, delay, ...rest);
+    } catch (error) {
+      record([start, now()]);
+      throw error;
+    }
+    assert(isThenable(result), "a timed delay must return a promise");
+    // The chained promise, as in `timed`: an unhandled rejection stays unhandled.
+    return result.then(
+      (value) => {
+        record([start, now()]);
+        return value;
+      },
+      (error: unknown) => {
+        record([start, now()]);
+        throw error;
+      }
+    );
   };
   copyOwnProperties(fn, wrapper as AnyFunction);
   return wrapper as unknown as F;
@@ -157,6 +177,35 @@ export function timedTimeout<F extends AnyFunction>(
     return call.call(this, fire, delay, ...rest);
   };
   copyOwnProperties(setTimeoutFn, wrapper as AnyFunction, (prop) => timedDelay(prop, record, now));
+  return wrapper as unknown as F;
+}
+
+/**
+ * Wraps setInterval. Each fire of an interval of at least 1 ms records from the call, or the fire
+ * before it, to this fire: a test that waits on an interval (the live-output interval of
+ * tools/bash.ts) waits on a real timer. The time after the last fire of a cleared interval and
+ * 0 ms intervals record nothing.
+ */
+export function timedInterval<F extends AnyFunction>(
+  setIntervalFn: F,
+  record: RecordInterval,
+  now: () => number
+): F {
+  const wrapper = function (this: unknown, handler: unknown, delay?: unknown, ...rest: unknown[]) {
+    const call = setIntervalFn as unknown as (...a: unknown[]) => unknown;
+    if (typeof handler !== "function" || !(Number(delay) >= 1)) {
+      return call.call(this, handler, delay, ...rest);
+    }
+    let start = now();
+    const fire = function (this: unknown, ...args: unknown[]): unknown {
+      const end = now();
+      record([start, end]);
+      start = end;
+      return (handler as (...a: unknown[]) => unknown).apply(this, args);
+    };
+    return call.call(this, fire, delay, ...rest);
+  };
+  copyOwnProperties(setIntervalFn, wrapper as AnyFunction);
   return wrapper as unknown as F;
 }
 

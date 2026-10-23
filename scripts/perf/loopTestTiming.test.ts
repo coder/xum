@@ -6,6 +6,7 @@ import {
   isTimedFsName,
   timed,
   timedDelay,
+  timedInterval,
   timedTimeout,
   unionMs,
 } from "./loopTestTiming";
@@ -181,4 +182,33 @@ test("isTempDirCall flags mkdir and mkdtemp under the temp dir only", () => {
   expect(isTempDirCall("mkdir", "/home/x", tmp)).toBe(false);
   expect(isTempDirCall("mkdir", "/tmp-backup/a", tmp)).toBe(false);
   expect(isTempDirCall("writeFile", "/tmp/a", tmp)).toBe(false);
+});
+
+test("timedDelay resolves with a function value, as setTimeout(ms, value) does", async () => {
+  const seen: Interval[] = [];
+  const delay = (_ms: number, value?: unknown) => Promise.resolve(value);
+  const value = () => "the value";
+  expect(await timedDelay(delay, (i) => seen.push(i), clock(3, 8))(5, value)).toBe(value);
+  expect(seen).toEqual([[3, 8]]);
+});
+
+describe("timedInterval", () => {
+  test("each fire of an interval of 1 ms or more records since the call or the fire before", () => {
+    const seen: Interval[] = [];
+    const fired: unknown[][] = [];
+    const handlers: Array<(...args: unknown[]) => void> = [];
+    const fakeSetInterval = (handler: (...args: unknown[]) => void, _ms?: number) =>
+      handlers.push(handler);
+    const wrapped = timedInterval(fakeSetInterval, (i) => seen.push(i), clock(0, 10, 25));
+    wrapped((...args: unknown[]) => fired.push(args), 10);
+    wrapped(() => fired.push(["yield"]), 0);
+    handlers[0]("a");
+    handlers[0]("b");
+    handlers[1]();
+    expect(fired).toEqual([["a"], ["b"], ["yield"]]);
+    expect(seen).toEqual([
+      [0, 10],
+      [10, 25],
+    ]);
+  });
 });
