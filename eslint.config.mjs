@@ -189,16 +189,8 @@ const HOST_IMPORT_ALLOW = {
   "src/node/services/contextManagement/strategies/tokenBudget.ts": [
     "@/node/runtime/runtimeHelpers",
   ],
-  "src/node/services/tools/bash.ts": ["fs"],
   "src/node/services/tools/review_pane.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
-  "src/node/services/tools/shared/configReadWrite.ts": [
-    "@/node/utils/writeFileAtomic",
-    "fs/promises",
-  ],
   "src/node/services/tools/todo.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
-  "src/node/services/tools/xum_agents_path.ts": ["fs/promises"],
-  "src/node/services/tools/xum_agents_read.ts": ["fs/promises"],
-  "src/node/services/tools/xum_agents_write.ts": ["fs/promises"],
 };
 
 const SHARED_RESTRICTED_PATHS = [AI_TOKENIZER_ENCODING_RESTRICTION];

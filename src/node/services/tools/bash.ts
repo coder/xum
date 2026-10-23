@@ -1,8 +1,8 @@
 import { tool } from "ai";
 import { clockOf } from "@/node/utils/hostClock";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import assert from "node:assert/strict";
 // NOTE: We avoid readline; consume Web Streams directly to prevent race conditions
-import * as fs from "fs";
 import * as path from "path";
 import {
   BASH_DEFAULT_TIMEOUT_SECS,
@@ -966,7 +966,7 @@ export function buildBashToolDescription(cwd: string, projects: ProjectRef[]): s
  * instead; remote discovery already fails on a missing cwd.
  */
 async function assertLocalRepoDirectoryExists(repoPath: string): Promise<void> {
-  const stats = await fs.promises.stat(repoPath).catch(() => null);
+  const stats = await nodeHostFiles.promises.stat(repoPath).catch(() => null);
   if (!stats?.isDirectory()) {
     throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, {
       cause: new Error(`Repository directory does not exist: ${repoPath}`),
