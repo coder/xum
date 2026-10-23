@@ -60,7 +60,18 @@
   },
   {
     "site": "node/services/historyService.ts",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-refine"
+  },
+  {
+    "site": "node/services/historyService.ts",
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-refusal"
+  },
+  {
+    "site": "node/services/historyService.ts",
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-turn"
   },
   {
     "site": "node/services/initStateManager.ts",
@@ -160,11 +171,13 @@
   },
   {
     "site": "node/services/tools/review_pane.ts",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-turn"
   },
   {
     "site": "node/services/tools/todo.ts",
-    "fn": "workspaceFiles.withLock"
+    "fn": "workspaceFiles.withLock",
+    "key": "ws-record-turn"
   },
   {
     "site": "node/services/workflows/WorkflowRunStore.ts",

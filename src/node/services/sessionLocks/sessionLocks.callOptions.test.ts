@@ -44,10 +44,12 @@ const TEST_FILE = /\.(test|testHarness)\.ts$/;
  */
 function callSite(): string {
   for (const line of (new Error().stack ?? "").split("\n").slice(1)) {
-    const file = /(\/[^\s():]+\.tsx?):\d+:\d+/.exec(line)?.[1];
+    // A path may hold spaces (and a drive letter), so match up to the last
+    // `.ts:line:col` instead of stopping at whitespace.
+    const file = /((?:[A-Za-z]:)?[\\/][^():]*\.tsx?):\d+:\d+/.exec(line)?.[1];
     // Skip frames outside src and the spies of this file.
     if (file?.startsWith(SRC) !== true || file === import.meta.path) continue;
-    const rel = path.relative(SRC, file);
+    const rel = path.relative(SRC, file).split(path.sep).join("/");
     // The SessionLocks layers only forward a call: the site is their caller.
     if (rel.startsWith("node/services/sessionLocks/") && !TEST_FILE.test(rel)) continue;
     return TEST_FILE.test(rel) ? "test" : rel;
@@ -145,7 +147,8 @@ function recordLockCalls() {
   });
   const withLock = workspaceFileLocks.withLock.bind(workspaceFileLocks);
   spyOn(workspaceFileLocks, "withLock").mockImplementation(((key, fn) => {
-    add({ fn: "workspaceFiles.withLock" });
+    // The key is the invariant of withLock: one FIFO per workspace.
+    add({ fn: "workspaceFiles.withLock", key: mask(String(key)) });
     return withLock(key, fn);
   }) as typeof withLock);
 
