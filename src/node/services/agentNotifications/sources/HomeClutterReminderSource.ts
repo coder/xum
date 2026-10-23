@@ -7,6 +7,7 @@ import {
   type ClutterSnapshot,
 } from "@/node/runtime/homeClutterWatch";
 import { log } from "@/node/services/log";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 
 import type {
   AgentNotification,
@@ -19,15 +20,21 @@ import type {
 const SNAPSHOT_TIMEOUT_MS = 250;
 const MAX_LOGGED_ENTRIES = 5;
 
-async function within<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
+// The timer runs on the session's HostClock, so a test can drive the timeout with the TestClock
+// (agent loop refactor, phase 5).
+async function within<T>(
+  clock: HostClock,
+  promise: Promise<T>,
+  timeoutMs: number
+): Promise<T | null> {
+  let cancel: (() => void) | undefined;
   const timeout = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), timeoutMs);
+    cancel = clock.setTimer(() => resolve(null), timeoutMs);
   });
   try {
     return await Promise.race([promise, timeout]);
   } finally {
-    clearTimeout(timer);
+    cancel?.();
   }
 }
 
@@ -45,6 +52,7 @@ export class HomeClutterReminderSource implements NotificationSource {
   private readonly homeDir: string;
   private readonly workspaceId: string | undefined;
   private readonly scanner: ClutterScanner;
+  private readonly clock: HostClock;
   /** Turn-start snapshot until the first comparison, then the last snapshot compared against. */
   private baseline: ClutterSnapshot | null = null;
   private readonly initialScan: Promise<ClutterSnapshot>;
@@ -52,12 +60,19 @@ export class HomeClutterReminderSource implements NotificationSource {
   private readonly pending = new Set<string>();
   private emitted = false;
 
-  constructor(args: { homeDir: string; workspaceId?: string; scanner?: ClutterScanner }) {
+  constructor(args: {
+    homeDir: string;
+    workspaceId?: string;
+    scanner?: ClutterScanner;
+    /** Absent: nodeClock (sources that tests build by hand). */
+    clock?: HostClock;
+  }) {
     this.homeDir = args.homeDir;
     this.workspaceId = args.workspaceId;
     this.scanner = args.scanner ?? getSharedClutterScanner(args.homeDir);
+    this.clock = args.clock ?? nodeClock;
     // Take the baseline at turn start; keep it even if it completes after a poll timed out.
-    this.initialScan = this.scanner.scan();
+    this.initialScan = this.scanner.scan(this.clock.nowMs());
     const keepBaseline = (snapshot: ClutterSnapshot) => {
       this.baseline ??= snapshot;
     };
@@ -82,12 +97,13 @@ export class HomeClutterReminderSource implements NotificationSource {
     assert(typeof ctx.toolName === "string", "toolName must be a string");
 
     // A scan stuck longer than the timeout (stalled mount) is not waited on again.
-    const waitMs = this.scanner.busyForMs() > SNAPSHOT_TIMEOUT_MS ? 0 : SNAPSHOT_TIMEOUT_MS;
+    const waitMs =
+      this.scanner.busyForMs(this.clock.nowMs()) > SNAPSHOT_TIMEOUT_MS ? 0 : SNAPSHOT_TIMEOUT_MS;
     if (this.baseline == null) {
-      await within(this.initialScan, waitMs);
+      await within(this.clock, this.initialScan, waitMs);
       if (this.baseline == null) return [];
     }
-    const after = await within(this.scanner.scan(), waitMs);
+    const after = await within(this.clock, this.scanner.scan(this.clock.nowMs()), waitMs);
     const before = this.baseline;
     // null: timed out, try again on a later call. Same object: nothing rescanned since.
     if (after != null && after !== before) {
