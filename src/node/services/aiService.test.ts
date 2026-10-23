@@ -1311,7 +1311,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     preparedToolNamesForSentinel: string[][];
     streamSystemContextMuxScopes: XumToolScope[];
     streamSystemContextMemoryToolFlags: Array<boolean | undefined>;
-    streamSystemContextHotMemoriesBlocks: Array<string | undefined>;
     /** Snapshot passed into each system-context build (undefined = load from disk). */
     streamSystemContextInstructionInputs: Array<InstructionSources | undefined>;
     /** Snapshot each system-context build returned. */
@@ -1363,7 +1362,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const preparedToolNamesForSentinel: string[][] = [];
     const streamSystemContextMuxScopes: XumToolScope[] = [];
     const streamSystemContextMemoryToolFlags: Array<boolean | undefined> = [];
-    const streamSystemContextHotMemoriesBlocks: Array<string | undefined> = [];
     const streamSystemContextInstructionInputs: Array<InstructionSources | undefined> = [];
     const streamSystemContextInstructionOutputs: InstructionSources[] = [];
     const toolInstructionSources: InstructionSources[] = [];
@@ -1395,7 +1393,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         }
         streamSystemContextMuxScopes.push(contextArgs.xumScope);
         streamSystemContextMemoryToolFlags.push(contextArgs.memoryToolAvailable);
-        streamSystemContextHotMemoriesBlocks.push(contextArgs.hotMemoriesBlock);
       },
       onPrepareMessagesForProvider: (pipelineArgs) => {
         preparedPayloadMessageIds.push(
@@ -1421,7 +1418,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       preparedToolNamesForSentinel,
       streamSystemContextMuxScopes,
       streamSystemContextMemoryToolFlags,
-      streamSystemContextHotMemoriesBlocks,
       streamSystemContextInstructionInputs,
       streamSystemContextInstructionOutputs,
       toolInstructionSources,
@@ -2344,7 +2340,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       // Agent Memory is turned off while the turn is being prepared.
       resolveMemoryContext: () => {
         memoryEnabled = false;
-        return Promise.resolve({ indexEntries: [], hotMemoriesBlock: null });
+        return Promise.resolve({ indexEntries: [] });
       },
     });
 
@@ -2404,80 +2400,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     } finally {
       fetchSpy.mockRestore();
     }
-  });
-
-  it("prepares fallback system context with the fallback model's hot memories", async () => {
-    using xumHome = new DisposableTempDir("ai-service-fallback-hot-memories");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-fallback-hot-memories";
-    const sourceModel = KNOWN_MODELS.SONNET.id;
-    const fallbackModel = KNOWN_MODELS.GPT.id;
-    await writeMainConfig(xumHome.path, {
-      modelFallbacks: {
-        [sourceModel]: { models: [fallbackModel] },
-      },
-    });
-
-    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    const experimentsService = new ExperimentsService({
-      telemetryService: new TelemetryService(xumHome.path),
-      xumHome: xumHome.path,
-    });
-    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-      (experimentId) =>
-        experimentId === EXPERIMENT_IDS.MEMORY || experimentId === EXPERIMENT_IDS.MEMORY_HOT_SET
-    );
-    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for memory availability gating
-    const stubTool: Tool = {} as never;
-    const harness = createHarness(xumHome.path, metadata, {
-      allTools: { memory: stubTool },
-      useRequestedModelString: true,
-      experimentsService,
-    });
-    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
-      harness.config,
-      new MemoryMetaService(xumHome.path)
-    );
-
-    const memoryCalls: Array<{ modelString: string; includeHotMemories: boolean }> = [];
-    const resolveMemoryContext = mock(
-      (modelString: string, options?: { includeHotMemories?: boolean }) => {
-        const includeHotMemories = options?.includeHotMemories !== false;
-        memoryCalls.push({ modelString, includeHotMemories });
-        return Promise.resolve({
-          indexEntries: [],
-          hotMemoriesBlock: includeHotMemories
-            ? `<hot_memories>${modelString}</hot_memories>`
-            : null,
-        });
-      }
-    );
-
-    const result = await harness.service.streamMessage({
-      messages: [createMuxMessage("latest-user", "user", "fix the issue")],
-      workspaceId,
-      modelString: sourceModel,
-      thinkingLevel: "off",
-      resolveMemoryContext,
-    });
-    expect(result.success).toBe(true);
-
-    const modelFallback = harness.startStreamCalls[0]?.modelFallback;
-    expect(modelFallback).toBeDefined();
-    if (!modelFallback) {
-      throw new Error("Expected modelFallback options on startStream");
-    }
-
-    const prepared = await modelFallback.prepare(fallbackModel);
-    expect(prepared.success).toBe(true);
-    expect(memoryCalls).toContainEqual({ modelString: sourceModel, includeHotMemories: false });
-    expect(memoryCalls).toContainEqual({ modelString: sourceModel, includeHotMemories: true });
-    expect(memoryCalls).toContainEqual({ modelString: fallbackModel, includeHotMemories: true });
-    expect(harness.streamSystemContextHotMemoriesBlocks).toContain(
-      `<hot_memories>${fallbackModel}</hot_memories>`
-    );
   });
 
   it.each([false, true])("pins assembly across attempts (budget=%s)", async (tokenBudget) => {
@@ -3016,31 +2938,30 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       experimentsService: await experimentsServiceWith(xumHome.path, [EXPERIMENT_IDS.MEMORY]),
       allTools: { memory: stubTool },
       // Tool policy strips the memory tool: the final prompt must not claim
-      // the memory tool is enabled (memoryToolAvailable gates the
-      // hot-memories block; the index lives in the stripped tool's
-      // description).
+      // the memory tool is enabled (memoryToolAvailable gates the memory
+      // guidance; the index lives in the stripped tool's description).
       postPolicyTools: {},
     });
     harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
       harness.config,
       new MemoryMetaService(xumHome.path)
     );
-    const memoryCalls: Array<{ includeHotMemories: boolean }> = [];
+    const memoryCalls: string[] = [];
 
     const result = await harness.service.streamMessage({
       messages: [createMuxMessage("latest-user", "user", "hello")],
       workspaceId,
       modelString: "openai:gpt-5.2",
       thinkingLevel: "off",
-      resolveMemoryContext: (_modelString, options) => {
-        memoryCalls.push({ includeHotMemories: options?.includeHotMemories !== false });
-        return Promise.resolve({ indexEntries: [], hotMemoriesBlock: null });
+      resolveMemoryContext: (modelString) => {
+        memoryCalls.push(modelString);
+        return Promise.resolve({ indexEntries: [] });
       },
     });
 
     expect(result.success).toBe(true);
     expect(harness.streamSystemContextMemoryToolFlags).toEqual([true, false]);
-    expect(memoryCalls).toEqual([{ includeHotMemories: false }]);
+    expect(memoryCalls).toEqual(["openai:gpt-5.2"]);
   });
 
   it("sends MCP Apps model context at the start of the newest user message, not in the system prompt", async () => {
@@ -3579,42 +3500,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     }
   });
 
-  it("does not upgrade memory context when the hot-set sub-experiment is disabled", async () => {
-    using xumHome = new DisposableTempDir("ai-service-memory-hot-set-disabled");
-    const projectPath = path.join(xumHome.path, "project");
-    await fs.mkdir(projectPath, { recursive: true });
-
-    const workspaceId = "workspace-memory-hot-set-disabled";
-    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
-    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for memory availability gating
-    const stubTool: Tool = {} as never;
-    const harness = createHarness(xumHome.path, metadata, {
-      experimentsService: await experimentsServiceWith(xumHome.path, [EXPERIMENT_IDS.MEMORY]),
-      allTools: { memory: stubTool },
-    });
-    harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
-      harness.config,
-      new MemoryMetaService(xumHome.path)
-    );
-    const memoryCalls: Array<{ includeHotMemories: boolean }> = [];
-
-    const result = await harness.service.streamMessage({
-      messages: [createMuxMessage("latest-user", "user", "hello")],
-      workspaceId,
-      modelString: "openai:gpt-5.2",
-      thinkingLevel: "off",
-      resolveMemoryContext: (_modelString, options) => {
-        memoryCalls.push({ includeHotMemories: options?.includeHotMemories !== false });
-        return Promise.resolve({ indexEntries: [], hotMemoriesBlock: null });
-      },
-    });
-
-    expect(result.success).toBe(true);
-    expect(harness.streamSystemContextMemoryToolFlags).toEqual([true]);
-    expect(memoryCalls).toEqual([{ includeHotMemories: false }]);
-  });
-
-  it("anchors the memory index by project identity and gates hot preloading on the memory-hot-set experiment", async () => {
+  it("anchors the memory index by project identity", async () => {
     using xumHome = new DisposableTempDir("ai-service-memory-session-context");
     const projectPath = path.join(xumHome.path, "project");
     const checkoutRoot = path.join(xumHome.path, "checkout");
@@ -3632,15 +3518,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     await fs.mkdir(projectMemoryRoot, { recursive: true });
     await fs.writeFile(path.join(projectMemoryRoot, "root-note.md"), "root fact\n");
 
-    let hotSetEnabled = false;
     const experimentsService = new ExperimentsService({
       telemetryService: new TelemetryService(xumHome.path),
       xumHome: xumHome.path,
     });
     spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-      (experimentId) =>
-        experimentId === EXPERIMENT_IDS.MEMORY ||
-        (experimentId === EXPERIMENT_IDS.MEMORY_HOT_SET && hotSetEnabled)
+      (experimentId) => experimentId === EXPERIMENT_IDS.MEMORY
     );
     const { config, service } = createBasicAIService(xumHome.path, { experimentsService });
     const memoryService = new MemoryService(config, new MemoryMetaService(xumHome.path));
@@ -3656,131 +3539,25 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       subProjectPath: "packages/app",
     };
     spyOn(service, "getWorkspaceMetadata").mockResolvedValue({ success: true, data: metadata });
-    // Hot selection needs sidecar usage stats; stub the real instance so the
-    // gating branch (not the ranking) is under test.
-    const listHotSpy = spyOn(memoryService, "listHotMemories").mockResolvedValue([
-      {
-        path: "/memories/project/root-note.md",
-        pinned: true,
-        truncated: false,
-        content: "root fact",
-      },
-    ]);
-
-    const pullOnly = await service.buildMemorySessionContext(workspaceId, "openai:gpt-5.2");
-    expect(pullOnly?.indexEntries.map((entry) => entry.path)).toEqual([
-      "/memories/project/root-note.md",
-    ]);
-    // Sub-experiment off: no preloaded content, memories stay pull-based.
-    expect(pullOnly?.hotMemoriesBlock).toBeNull();
-    expect(listHotSpy).not.toHaveBeenCalled();
-
-    hotSetEnabled = true;
-    const withHotSet = await service.buildMemorySessionContext(workspaceId, "openai:gpt-5.2");
-    expect(withHotSet?.hotMemoriesBlock).toContain("root fact");
-  });
-
-  it("preserves the memory index when hot-memory selection fails", async () => {
-    using xumHome = new DisposableTempDir("ai-service-memory-hot-failure");
-    const projectPath = path.join(xumHome.path, "project");
-    const checkoutRoot = path.join(xumHome.path, "checkout");
-    const projectMemoryRoot = path.join(
-      xumHome.path,
-      "memory",
-      "project",
-      projectMemoryDirName(projectPath)
-    );
-    await fs.mkdir(projectMemoryRoot, { recursive: true });
-    await fs.writeFile(path.join(projectMemoryRoot, "root-note.md"), "root fact\n");
-
-    const experimentsService = new ExperimentsService({
-      telemetryService: new TelemetryService(xumHome.path),
-      xumHome: xumHome.path,
-    });
-    spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-      (experimentId) =>
-        experimentId === EXPERIMENT_IDS.MEMORY || experimentId === EXPERIMENT_IDS.MEMORY_HOT_SET
-    );
-    const { config, service } = createBasicAIService(xumHome.path, { experimentsService });
-    const memoryService = new MemoryService(config, new MemoryMetaService(xumHome.path));
-    service.turnRequestBuilderBindings.memoryService = memoryService;
-
-    const workspaceId = "workspace-memory-hot-failure";
-    const metadata: WorkspaceMetadata & { namedWorkspacePath: string } = {
-      ...createLocalWorkspaceMetadata(workspaceId, projectPath),
-      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
-      namedWorkspacePath: checkoutRoot,
-    };
-    spyOn(service, "getWorkspaceMetadata").mockResolvedValue({ success: true, data: metadata });
-    spyOn(memoryService, "listHotMemories").mockImplementation(() => {
-      throw new Error("selection failed");
-    });
 
     const context = await service.buildMemorySessionContext(workspaceId, "openai:gpt-5.2");
-
     expect(context?.indexEntries.map((entry) => entry.path)).toEqual([
       "/memories/project/root-note.md",
     ]);
-    expect(context?.hotMemoriesBlock).toBeNull();
   });
 
-  it.each([
-    { kind: "root", parentWorkspaceId: undefined, preloadsUsed: true },
-    { kind: "sub-agent", parentWorkspaceId: "parent-workspace", preloadsUsed: false },
-  ])(
-    "preloads hot memories for a $kind workspace",
-    async ({ kind, parentWorkspaceId, preloadsUsed }) => {
-      using xumHome = new DisposableTempDir(`ai-service-hot-memories-${kind}`);
-      const globalRoot = path.join(xumHome.path, "memory", "global");
-      await fs.mkdir(globalRoot, { recursive: true });
-      await fs.writeFile(path.join(globalRoot, "pinned.md"), "pinned facts");
-      await fs.writeFile(path.join(globalRoot, "used.md"), "used facts");
-      const metaService = new MemoryMetaService(xumHome.path);
-      await metaService.setPinned("global:pinned.md", true);
-      await metaService.recordAccess("global:used.md", { write: true });
-
-      const experimentsService = new ExperimentsService({
-        telemetryService: new TelemetryService(xumHome.path),
-        xumHome: xumHome.path,
-      });
-      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-        (experimentId) =>
-          experimentId === EXPERIMENT_IDS.MEMORY || experimentId === EXPERIMENT_IDS.MEMORY_HOT_SET
-      );
-      const { config, service } = createBasicAIService(xumHome.path, { experimentsService });
-      service.turnRequestBuilderBindings.memoryService = new MemoryService(config, metaService);
-      const workspaceId = `workspace-hot-memories-${kind}`;
-      spyOn(service, "getWorkspaceMetadata").mockResolvedValue({
-        success: true,
-        data: createLocalWorkspaceMetadata(workspaceId, path.join(xumHome.path, "project"), {
-          parentWorkspaceId,
-        }),
-      });
-
-      const context = await service.buildMemorySessionContext(workspaceId, "openai:gpt-5.2");
-
-      // Sub-agents keep the full index; only the preloaded block drops auto-hot files.
-      expect(context?.indexEntries.map((entry) => entry.path)).toEqual([
-        "/memories/global/pinned.md",
-        "/memories/global/used.md",
-      ]);
-      expect(context?.hotMemoriesBlock).toContain("pinned facts");
-      expect(context?.hotMemoriesBlock?.includes("used facts")).toBe(preloadsUsed);
-    }
-  );
-
   it("resolves the memory context only after the runtime is ready", async () => {
-    using xumHome = new DisposableTempDir("ai-service-hot-memories-after-ready");
+    using xumHome = new DisposableTempDir("ai-service-memory-after-ready");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
 
-    const workspaceId = "workspace-hot-memories-after-ready";
+    const workspaceId = "workspace-memory-after-ready";
     const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
     const harness = createHarness(xumHome.path, metadata);
 
     // Ordering is the contract under test: AgentSession caches the resolver
     // result per model/session segment, so resolving before ensureReady on a
-    // stopped Docker/remote workspace would pin an empty/partial block.
+    // stopped Docker/remote workspace would pin an empty/partial index.
     const order: string[] = [];
     const realCreateRuntime = runtimeFactory.createRuntime;
     spyOn(runtimeFactory, "createRuntime").mockImplementation((runtimeConfig, options) => {
@@ -3802,7 +3579,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         order.push("resolveMemoryContext");
         return Promise.resolve({
           indexEntries: [{ path: "/memories/global/lesson.md", description: "a lesson" }],
-          hotMemoriesBlock: "<hot_memories>cached</hot_memories>",
         });
       },
     });
@@ -3810,9 +3586,6 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(result.success).toBe(true);
     expect(order.indexOf("ensureReady")).toBeGreaterThanOrEqual(0);
     expect(order.indexOf("resolveMemoryContext")).toBeGreaterThan(order.indexOf("ensureReady"));
-    expect(harness.streamSystemContextHotMemoriesBlocks).toContain(
-      "<hot_memories>cached</hot_memories>"
-    );
     // The index snapshot flows into the tool configuration so the memory tool
     // can advertise it in its description (same disclosure mechanic as skills).
     const toolConfig = harness.getToolsForModelSpy.mock.calls[0]?.[1];
@@ -4085,7 +3858,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       // Memory's description carries the memory index, so an agent denied
       // memory gets no refusal stub.
       expect(shape(toolsByAgent.forgetful)).toBe(shape(execWithoutMemory));
-      // No hot memories or memory guidance for the agent without memory.
+      // No memory guidance for the agent without memory.
       expect(harness.streamSystemContextMemoryToolFlags.at(-1)).toBe(false);
     });
 
@@ -5920,7 +5693,7 @@ describe("AIService.streamMessage volatile system content (#5251)", () => {
     mock.restore();
   });
 
-  it("keeps the cached system row byte-identical while MCP failures and hot memories change", async () => {
+  it("keeps the cached system row byte-identical while MCP failures change", async () => {
     using xumHome = new DisposableTempDir("ai-service-volatile-system");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
@@ -5931,8 +5704,7 @@ describe("AIService.streamMessage volatile system content (#5251)", () => {
       xumHome: xumHome.path,
     });
     spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-      (experimentId) =>
-        experimentId === EXPERIMENT_IDS.MEMORY || experimentId === EXPERIMENT_IDS.MEMORY_HOT_SET
+      (experimentId) => experimentId === EXPERIMENT_IDS.MEMORY
     );
     const { config, historyService, initStateManager, streamManager, service } =
       createBasicAIService(xumHome.path, { experimentsService });
@@ -5954,19 +5726,12 @@ describe("AIService.streamMessage volatile system content (#5251)", () => {
       config,
       new MemoryMetaService(xumHome.path)
     );
-    // Mirrors buildStreamSystemContext's contract: hot memories are appended
-    // after the stable prompt and reported as the exact appended section.
     const stableSystem = "stable-system-prompt";
     spyOn(turnContextAssembler, "buildStreamSystemContext").mockImplementation((contextArgs) => {
-      const hotMemoriesSection =
-        contextArgs.memoryToolAvailable && contextArgs.hotMemoriesBlock
-          ? `\n\n${contextArgs.hotMemoriesBlock}`
-          : undefined;
       return Promise.resolve({
         instructionSources: contextArgs.instructionSources ?? { global: [], context: [] },
         agentSystemPromptSections: ["test-agent-prompt"],
-        systemMessage: stableSystem + (hotMemoriesSection ?? ""),
-        hotMemoriesSection,
+        systemMessage: stableSystem,
         systemMessageTokens: 1,
         agentDefinitions: undefined,
         availableSkills: undefined,
@@ -5989,11 +5754,11 @@ describe("AIService.streamMessage volatile system content (#5251)", () => {
         }),
     } as unknown as MCPServerManager;
 
-    const turns: Array<{ failed: string[]; hot: string | null }> = [
-      { failed: ["alpha-server"], hot: "<hot_memories>note v1</hot_memories>" },
-      { failed: [], hot: "<hot_memories>note v2</hot_memories>" },
-      { failed: ["beta-server"], hot: "<hot_memories>note v2</hot_memories>" },
-      { failed: [], hot: null },
+    const turns: Array<{ failed: string[] }> = [
+      { failed: ["alpha-server"] },
+      { failed: [] },
+      { failed: ["beta-server", "gamma-server"] },
+      { failed: [] },
     ];
     for (const turn of turns) {
       failedServerNames = turn.failed;
@@ -6002,8 +5767,7 @@ describe("AIService.streamMessage volatile system content (#5251)", () => {
         workspaceId,
         modelString: KNOWN_MODELS.SONNET.id,
         thinkingLevel: "off",
-        resolveMemoryContext: () =>
-          Promise.resolve({ indexEntries: [], hotMemoriesBlock: turn.hot }),
+        resolveMemoryContext: () => Promise.resolve({ indexEntries: [] }),
       });
       expect(result.success).toBe(true);
     }
@@ -6028,15 +5792,13 @@ describe("AIService.streamMessage volatile system content (#5251)", () => {
       // byte-identical across turns and keeps the only system cache marker.
       expect(stableRow?.content).toBe(stableSystem);
       expect(stableRow?.providerOptions?.anthropic?.cacheControl).toBeDefined();
-      const hasVolatile = turn.failed.length > 0 || turn.hot != null;
+      const hasVolatile = turn.failed.length > 0;
       expect(rows).toHaveLength(hasVolatile ? 2 : 1);
       if (!hasVolatile) continue;
       const tailRow = rows[1];
       expect(tailRow?.providerOptions?.anthropic?.cacheControl).toBeUndefined();
       const tail = textOf(tailRow);
       for (const name of turn.failed) expect(tail).toContain(name);
-      if (turn.hot != null) expect(tail).toContain(turn.hot);
-      if (turn.failed.length === 0) expect(tail).not.toContain("MCP server");
       // The model sees the same text: the rows join back to the logged prompt.
       const envelope = envelopes[index];
       if (envelope?.kind !== "turn-envelope") throw new Error("expected a turn envelope");
@@ -6076,7 +5838,7 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
     return { system: body.system, messages: body.messages };
   }
 
-  /** A real TurnRequestBuilder and request pipeline on Opus 5.5 with a hot-memories tail. */
+  /** A real TurnRequestBuilder and request pipeline on Opus 5.5 with an MCP-warning tail. */
   async function setup(xumHome: DisposableTempDir) {
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
@@ -6087,8 +5849,7 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
       xumHome: xumHome.path,
     });
     spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
-      (experimentId) =>
-        experimentId === EXPERIMENT_IDS.MEMORY || experimentId === EXPERIMENT_IDS.MEMORY_HOT_SET
+      (experimentId) => experimentId === EXPERIMENT_IDS.MEMORY
     );
     const { config, historyService, initStateManager, streamManager, service } =
       createBasicAIService(xumHome.path, { experimentsService });
@@ -6117,14 +5878,10 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
     );
     const stableSystem = "stable-system-prompt";
     spyOn(turnContextAssembler, "buildStreamSystemContext").mockImplementation((contextArgs) => {
-      const hotMemoriesSection = contextArgs.hotMemoriesBlock
-        ? `\n\n${contextArgs.hotMemoriesBlock}`
-        : undefined;
       return Promise.resolve({
         instructionSources: contextArgs.instructionSources ?? { global: [], context: [] },
         agentSystemPromptSections: ["test-agent-prompt"],
-        systemMessage: stableSystem + (hotMemoriesSection ?? ""),
-        hotMemoriesSection,
+        systemMessage: stableSystem,
         systemMessageTokens: 1,
         agentDefinitions: undefined,
         availableSkills: undefined,
@@ -6147,21 +5904,19 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
           },
         }),
     } as unknown as MCPServerManager;
+    /** Sends with one failed MCP server, `failed`: its warning is the volatile tail. */
     const send = async (
       messages: MuxMessage[],
-      hot: string,
+      failed: string,
       extra: Partial<Parameters<typeof service.streamMessage>[0]> = {}
     ) => {
+      mcp.failedServerNames = [failed];
       const result = await service.streamMessage({
         messages,
         workspaceId,
         modelString: KNOWN_MODELS.OPUS.id,
         thinkingLevel: "high",
-        resolveMemoryContext: () =>
-          Promise.resolve({
-            indexEntries: [],
-            hotMemoriesBlock: `<hot_memories>${hot}</hot_memories>`,
-          }),
+        resolveMemoryContext: () => Promise.resolve({ indexEntries: [] }),
         ...extra,
       });
       expect(result.success).toBe(true);
@@ -6170,18 +5925,22 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
     return { workspaceId, mcp, send, service, config, historyService };
   }
 
-  const hotTail = (text: string) => `\n\n<hot_memories>${text}</hot_memories>`;
+  const warningTail = (failed: string): string => {
+    const section = turnContextAssembler.formatMcpWarningSection(1, [failed]);
+    if (section == null) throw new Error("expected an MCP warning section");
+    return section;
+  };
   const systemRows = (call: TurnExecutionOptions) =>
     call.messages.filter((message) => message.role === "system");
 
-  it("sends a hot-memory change as a row that extends the previous request byte for byte", async () => {
+  it("sends a tail change as a row that extends the previous request byte for byte", async () => {
     using xumHome = new DisposableTempDir("ai-service-volatile-tail-row");
     const { send } = await setup(xumHome);
     // Each turn sends the persisted history; the previous answer carries its stream's record.
     const history: MuxMessage[] = [];
-    const runTurn = async (user: string, hot: string) => {
+    const runTurn = async (user: string, failed: string) => {
       history.push(createMuxMessage(`u-${history.length}`, "user", user));
-      const call = await send([...history], hot);
+      const call = await send([...history], failed);
       history.push(
         createMuxMessage(`a-${history.length}`, "assistant", `answer to ${user}`, {
           ...(call.initialMetadata?.volatileSystemTail != null
@@ -6196,11 +5955,11 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
       JSON.stringify(next.messages.slice(0, previous.messages.length)) ===
       JSON.stringify(previous.messages);
 
-    const first = await runTurn("first", "note v1");
+    const first = await runTurn("first", "server-v1");
     expect(first.call.initialMetadata?.volatileSystemTail?.placement).toBe("system");
-    expect(JSON.stringify(first.body.system)).toContain("note v1");
+    expect(JSON.stringify(first.body.system)).toContain("server-v1");
 
-    const second = await runTurn("second", "note v2");
+    const second = await runTurn("second", "server-v2");
     // System is unchanged, the history extends, and v2 goes after the newest user message.
     expect(second.body.system).toEqual(first.body.system);
     expect(extends_(first.body, second.body)).toBe(true);
@@ -6209,12 +5968,12 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
         .slice(first.body.messages.length)
         .map((m) => (m as { role: string }).role)
     ).toEqual(["assistant", "user", "system"]);
-    expect(lastText(second.body)).toContain("note v2");
+    expect(lastText(second.body)).toContain("server-v2");
     expect(JSON.stringify(second.body.messages.at(-2))).toContain("second");
     expect(second.call.initialMetadata?.volatileSystemTail?.placement).toBe("row");
 
     // An unchanged tail adds no row, and the next request still extends this one.
-    const third = await runTurn("third", "note v2");
+    const third = await runTurn("third", "server-v2");
     expect(third.body.system).toEqual(first.body.system);
     expect(extends_(second.body, third.body)).toBe(true);
     expect((third.body.messages.at(-1) as { role: string }).role).toBe("user");
@@ -6230,11 +5989,11 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
     const history = [
       createMuxMessage("u1", "user", "first"),
       createMuxMessage("a1", "assistant", "answer", {
-        volatileSystemTail: { text: hotTail("note v1"), placement: "system" },
+        volatileSystemTail: { text: warningTail("server-v1"), placement: "system" },
       }),
       createMuxMessage("u2", "user", "second"),
     ];
-    const call = await send(history, "note v2");
+    const call = await send(history, "server-v2");
     expect(call.initialMetadata?.volatileSystemTail?.placement).toBe("row");
     const leading = call.messages.slice(
       0,
@@ -6245,9 +6004,9 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
       return message.content;
     };
     const sentSystem = leading.map(textOf).join("");
-    expect(sentSystem).toBe(`stable-system-prompt${hotTail("note v1")}`);
+    expect(sentSystem).toBe(`stable-system-prompt${warningTail("server-v1")}`);
     const row = textOf(call.messages.at(-1));
-    expect(row).toContain("note v2");
+    expect(row).toContain("server-v2");
 
     const journal = new DurableEventJournal(path.join(config.sessionsDir, workspaceId));
     const envelope = (await journal.read()).findLast((event) => event.kind === "turn-envelope");
@@ -6290,14 +6049,14 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
     const history = [
       createMuxMessage("u1", "user", "first"),
       createMuxMessage("a1", "assistant", "answer", {
-        volatileSystemTail: { text: hotTail("A"), placement: "system" },
+        volatileSystemTail: { text: warningTail("A"), placement: "system" },
       }),
       createMuxMessage("u2", "user", "second"),
       createMuxMessage(
         "r0",
         "assistant",
         "",
-        { volatileSystemTail: { text: hotTail("B"), placement: "row" } },
+        { volatileSystemTail: { text: warningTail("B"), placement: "row" } },
         [{ type: "reasoning", text: "thinking", signature: "sig-r0" }]
       ),
       createMuxMessage("u3", "user", "third"),
@@ -6310,13 +6069,13 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
     });
     expect(folded.messages.at(-1)?.role).toBe("system");
     expect(folded.initialMetadata?.volatileSystemTail).toEqual({
-      text: hotTail("B"),
+      text: warningTail("B"),
       placement: "row",
     });
     // The step-0 rebuild returns its record too, for StreamManager to apply.
     const rebuilt = await unfolded.rebuildFirstStepForThinkingLevel!("off", {});
     expect(rebuilt.systemRecords?.volatileSystemTail).toEqual({
-      text: hotTail("B"),
+      text: warningTail("B"),
       placement: "row",
     });
   });
@@ -6329,14 +6088,14 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
     const history = [
       createMuxMessage("u1", "user", "first"),
       createMuxMessage("a1", "assistant", "answer", {
-        volatileSystemTail: { text: hotTail("A"), placement: "system" },
+        volatileSystemTail: { text: warningTail("A"), placement: "system" },
       }),
       createMuxMessage("u2", "user", "second"),
       createMuxMessage(
         "r0",
         "assistant",
         "",
-        { volatileSystemTail: { text: hotTail("B"), placement: "row" } },
+        { volatileSystemTail: { text: warningTail("B"), placement: "row" } },
         [{ type: "reasoning", text: "thinking", signature: "sig-r0" }]
       ),
       createMuxMessage("u3", "user", "third"),
@@ -6433,32 +6192,29 @@ describe("AIService.streamMessage volatile tail rows (mechanism 10)", () => {
   });
 
   it("sends as before when middleware edited a volatile section", async () => {
-    // Codex P2 (PRRT_kwDOPxxmWM6sqhpD): the edited hot memories end up in the stable part, and
-    // only the MCP warning still ends the prompt. A row with just the warning would tell the
-    // model the hot memories are gone.
+    // Codex P2 (PRRT_kwDOPxxmWM6sqhpD): an edited section ends up in the stable part. A row
+    // with only the unedited rest would tell the model the edited section is gone.
     using xumHome = new DisposableTempDir("ai-service-volatile-tail-middleware");
-    const { send, mcp, workspaceId } = await setup(xumHome);
+    const { send, workspaceId } = await setup(xumHome);
     const history = [
       createMuxMessage("u1", "user", "first"),
       createMuxMessage("a1", "assistant", "answer", {
-        volatileSystemTail: { text: hotTail("A"), placement: "system" },
+        volatileSystemTail: { text: warningTail("A"), placement: "system" },
       }),
       createMuxMessage("u2", "user", "second"),
     ];
-    mcp.failedServerNames = ["alpha-server"];
     const remove = eventSpine.useBefore(
       "request.assemble",
       (ctx: RequestAssembleContext) => {
-        ctx.systemMessage = ctx.systemMessage.replace("note v2", "note v2 (edited)");
+        ctx.systemMessage = ctx.systemMessage.replace("server-v2", "server-v2 (edited)");
       },
       { workspaceId }
     );
     try {
-      const call = await send(history, "note v2");
+      const call = await send(history, "server-v2");
       expect(systemRows(call)).toHaveLength(1);
       const prompt = JSON.stringify(systemRows(call)[0]);
-      expect(prompt).toContain("note v2 (edited)");
-      expect(prompt).toContain("alpha-server");
+      expect(prompt).toContain("server-v2 (edited)");
       expect(call.initialMetadata?.volatileSystemTail).toBeUndefined();
     } finally {
       remove();

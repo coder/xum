@@ -109,7 +109,6 @@ async function buildSystemContextForTest(args: {
   memoryToolAvailable?: boolean;
   tokenBudgetEnabled?: boolean;
   workspaceMemoryWritable?: boolean;
-  hotMemoriesBlock?: string;
   instructionSources?: Parameters<typeof buildStreamSystemContext>[0]["instructionSources"];
 }) {
   return buildStreamSystemContext({
@@ -131,7 +130,6 @@ async function buildSystemContextForTest(args: {
     memoryToolAvailable: args.memoryToolAvailable,
     tokenBudgetEnabled: args.tokenBudgetEnabled,
     workspaceMemoryWritable: args.workspaceMemoryWritable,
-    hotMemoriesBlock: args.hotMemoriesBlock,
     instructionSources: args.instructionSources,
   });
 }
@@ -650,7 +648,7 @@ describe("assemblePromptPayload", () => {
       routeProvider: "openai",
       providersConfig: { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } },
     };
-    const tails = ["\n\n[Warning: a]", "\n\n<hot_memories>b</hot_memories>"];
+    const tails = ["\n\n[Warning: a]", "\n\n<context_window>b</context_window>"];
 
     // The stable (cached) block is byte-identical whatever the tail says,
     // and the tail block is delivered uncached right after it.
@@ -686,7 +684,7 @@ describe("assemblePromptPayload", () => {
 
   describe("volatile tail changes inside a context segment (mechanism 10)", () => {
     const stable = "stable instructions";
-    const hot = (text: string) => `\n\n<hot_memories>${text}</hot_memories>`;
+    const warning = (text: string) => `\n\n[Warning: ${text}]`;
     const opus = {
       modelString: "anthropic:claude-opus-5-5",
       providerForMessages: "anthropic",
@@ -723,26 +721,30 @@ describe("assemblePromptPayload", () => {
     test("freezes the system tail and sends a change as a row the next turn repeats", async () => {
       const u1 = createMuxMessage("u1", "user", "first");
       const u2 = createMuxMessage("u2", "user", "second");
-      const start = await withTail(hot("A"), [u1]);
-      expect(start.volatileSystemTail).toEqual({ text: hot("A"), placement: "system" });
+      const start = await withTail(warning("A"), [u1]);
+      expect(start.volatileSystemTail).toEqual({ text: warning("A"), placement: "system" });
 
-      const history = [u1, answer("a1", "system", hot("A")), u2];
-      const changed = await withTail(hot("B"), history);
+      const history = [u1, answer("a1", "system", warning("A")), u2];
+      const changed = await withTail(warning("B"), history);
       // The system tail stays A; B goes after the newest user row.
       expect(roles(changed)).toEqual([
         "system:stable",
-        `system:${hot("A")}`,
+        `system:${warning("A")}`,
         "user",
         "assistant",
         "user",
         "system-row",
       ]);
-      expect(JSON.stringify(changed.messages.at(-1))).toContain("<hot_memories>B</hot_memories>");
-      expect(changed.volatileSystemTail).toEqual({ text: hot("B"), placement: "row" });
+      expect(JSON.stringify(changed.messages.at(-1))).toContain("[Warning: B]");
+      expect(changed.volatileSystemTail).toEqual({ text: warning("B"), placement: "row" });
 
       // The next turn rebuilds the row in place and adds none for an unchanged tail.
       const u3 = createMuxMessage("u3", "user", "third");
-      const next = await withTail(hot("B"), [...history, answer("a2", "row", hot("B")), u3]);
+      const next = await withTail(warning("B"), [
+        ...history,
+        answer("a2", "row", warning("B")),
+        u3,
+      ]);
       expect(next.volatileSystemTail).toBeUndefined();
       expect(roles(next).filter((role) => role.startsWith("system")).length).toBe(3);
       expect(withoutMarkers(next.messages.slice(0, changed.messages.length - 1))).toBe(
@@ -756,43 +758,43 @@ describe("assemblePromptPayload", () => {
     test("other models and an assistant-last history keep the old placement", async () => {
       const history = [
         createMuxMessage("u1", "user", "first"),
-        answer("a1", "system", hot("A")),
+        answer("a1", "system", warning("A")),
         createMuxMessage("u2", "user", "second"),
       ];
       // A model without mid-conversation system rows: the records change nothing.
-      const sonnet45 = await withTail(hot("B"), history, {
+      const sonnet45 = await withTail(warning("B"), history, {
         modelString: "anthropic:claude-sonnet-4-5",
         providerForMessages: "anthropic",
         routeProvider: "anthropic",
       });
       expect(roles(sonnet45)).toEqual([
         "system:stable",
-        `system:${hot("B")}`,
+        `system:${warning("B")}`,
         "user",
         "assistant",
         "user",
       ]);
       expect(sonnet45.volatileSystemTail).toBeUndefined();
       // A route that converts the body on its side: unverified, so the old placement too.
-      const gateway = await withTail(hot("B"), history, {
+      const gateway = await withTail(warning("B"), history, {
         modelString: "openrouter:anthropic/claude-opus-5-5",
         providerForMessages: "anthropic",
         routeProvider: "openrouter",
       });
-      expect(roles(gateway).slice(0, 2)).toEqual(["system:stable", `system:${hot("B")}`]);
+      expect(roles(gateway).slice(0, 2)).toEqual(["system:stable", `system:${warning("B")}`]);
       expect(gateway.volatileSystemTail).toBeUndefined();
-      const gemini = await withTail(hot("B"), history, {});
-      expect(gemini.system).toBe(stable + hot("B"));
+      const gemini = await withTail(warning("B"), history, {});
+      expect(gemini.system).toBe(stable + warning("B"));
       expect(gemini.volatileSystemTail).toBeUndefined();
 
       // Anthropic rejects a system row after an assistant row: send B as before and refreeze.
-      const resumed = await withTail(hot("B"), [
+      const resumed = await withTail(warning("B"), [
         ...history,
         createMuxMessage("a2", "assistant", "partial", { partial: true }),
       ]);
-      expect(roles(resumed).slice(0, 2)).toEqual(["system:stable", `system:${hot("B")}`]);
+      expect(roles(resumed).slice(0, 2)).toEqual(["system:stable", `system:${warning("B")}`]);
       expect(roles(resumed).filter((role) => role.startsWith("system")).length).toBe(2);
-      expect(resumed.volatileSystemTail).toEqual({ text: hot("B"), placement: "system" });
+      expect(resumed.volatileSystemTail).toEqual({ text: warning("B"), placement: "system" });
     });
 
     test("a re-freeze after an assistant-last resume drops the rows before it", async () => {
@@ -800,29 +802,29 @@ describe("assemblePromptPayload", () => {
       // it stayed after a re-freeze at C, the model would read B as the newer tail.
       const history = [
         createMuxMessage("u1", "user", "first"),
-        answer("a1", "system", hot("A")),
+        answer("a1", "system", warning("A")),
         createMuxMessage("u2", "user", "second"),
-        answer("a2", "row", hot("B")),
+        answer("a2", "row", warning("B")),
         createMuxMessage("u3", "user", "third"),
         createMuxMessage("a3", "assistant", "partial", { partial: true }),
       ];
-      const resumed = await withTail(hot("C"), history);
-      expect(resumed.volatileSystemTail).toEqual({ text: hot("C"), placement: "system" });
+      const resumed = await withTail(warning("C"), history);
+      expect(resumed.volatileSystemTail).toEqual({ text: warning("C"), placement: "system" });
       expect(roles(resumed).filter((role) => role.startsWith("system"))).toEqual([
         "system:stable",
-        `system:${hot("C")}`,
+        `system:${warning("C")}`,
       ]);
 
       // The next turn keeps the re-freeze: C stays in the system prompt and B does not return.
-      const next = await withTail(hot("C"), [
+      const next = await withTail(warning("C"), [
         ...history.slice(0, -1),
-        answer("a3", "system", hot("C"), { partial: true }),
+        answer("a3", "system", warning("C"), { partial: true }),
         createMuxMessage("u4", "user", "fourth"),
       ]);
       expect(next.volatileSystemTail).toBeUndefined();
       expect(roles(next).filter((role) => role.startsWith("system"))).toEqual([
         "system:stable",
-        `system:${hot("C")}`,
+        `system:${warning("C")}`,
       ]);
     });
 
@@ -832,8 +834,8 @@ describe("assemblePromptPayload", () => {
       // request the assembler builds and records what it returns, as a turn does.
       const thinking = { ...opus, effectiveThinkingLevel: "high" as const };
       const u1 = createMuxMessage("u1", "user", "first");
-      const first = await withTail(hot("A"), [u1], thinking);
-      const a1 = answer("a1", "system", hot("A"));
+      const first = await withTail(warning("A"), [u1], thinking);
+      const a1 = answer("a1", "system", warning("A"));
       expect(first.volatileSystemTail).toEqual(a1.metadata?.volatileSystemTail);
       // The user stops the next turn while the model still thinks: a reasoning-only partial.
       const u2 = createMuxMessage("u2", "user", "second");
@@ -843,23 +845,23 @@ describe("assemblePromptPayload", () => {
         parts: [{ type: "reasoning", text: "thinking" }],
         metadata: { partial: true },
       };
-      // With thinking off and new hot memories, the user resumes. The filter drops a2, so
+      // With thinking off and a new warning, the user resumes. The filter drops a2, so
       // the request ends with u2 and B goes into a row that a3 records.
-      const resumed = await withTail(hot("B"), [u1, a1, u2, a2], opus);
-      expect(resumed.volatileSystemTail).toEqual({ text: hot("B"), placement: "row" });
-      const a3 = answer("a3", "row", hot("B"));
+      const resumed = await withTail(warning("B"), [u1, a1, u2, a2], opus);
+      expect(resumed.volatileSystemTail).toEqual({ text: warning("B"), placement: "row" });
+      const a3 = answer("a3", "row", warning("B"));
       // Thinking on again: a2 comes back between u2 and a3, so a3's row is skipped. The live
       // tail is still B and must reach the model (before the fix it saw only A).
       const u3 = createMuxMessage("u3", "user", "third");
-      const next = await withTail(hot("B"), [u1, a1, u2, a2, a3, u3], thinking);
+      const next = await withTail(warning("B"), [u1, a1, u2, a2, a3, u3], thinking);
       expect(roles(next).at(-1)).toBe("system-row");
-      expect(JSON.stringify(next.messages.at(-1))).toContain("<hot_memories>B</hot_memories>");
-      expect(next.volatileSystemTail).toEqual({ text: hot("B"), placement: "row" });
+      expect(JSON.stringify(next.messages.at(-1))).toContain("[Warning: B]");
+      expect(next.volatileSystemTail).toEqual({ text: warning("B"), placement: "row" });
 
       // A replay derives the live tail by the same rule. The planner sends this request for
       // live A, and an older build sent it for live B: frozen A, no row, no record.
       const history = [u1, a1, u2, a2, a3, u3];
-      const stale = await withTail(hot("A"), history, thinking);
+      const stale = await withTail(warning("A"), history, thinking);
       expect(stale.volatileSystemTail).toBeUndefined();
       for (const sent of [next, stale]) {
         const replayed = await assemble({
@@ -878,17 +880,17 @@ describe("assemblePromptPayload", () => {
       // replay derives the live tail from the turn's record, or from the segment's last tail.
       const base = [
         createMuxMessage("u1", "user", "first"),
-        answer("a1", "system", hot("A")),
+        answer("a1", "system", warning("A")),
         createMuxMessage("u2", "user", "second"),
       ];
       const unchanged = [
         ...base,
-        answer("a2", "row", hot("B")),
+        answer("a2", "row", warning("B")),
         createMuxMessage("u3", "user", "x"),
       ];
       const cases = [
-        { history: base, live: hot("B") },
-        { history: unchanged, live: hot("B") },
+        { history: base, live: warning("B") },
+        { history: unchanged, live: warning("B") },
       ];
       for (const { history, live } of cases) {
         const sent = await withTail(live, history);
@@ -899,7 +901,7 @@ describe("assemblePromptPayload", () => {
           volatileSystemSuffixLength: sent.sentSystem.volatileSuffixLength,
           replayedTurn: { record: sent.volatileSystemTail },
         });
-        expect(sent.sentSystem.message).toBe(stable + hot("A"));
+        expect(sent.sentSystem.message).toBe(stable + warning("A"));
         expect(JSON.stringify(replayed.messages)).toBe(JSON.stringify(sent.messages));
       }
     });
@@ -909,14 +911,14 @@ describe("assemblePromptPayload", () => {
       // before the tail is planned, so rebuilt rows would add tokens the trim never counted.
       const history = [
         createMuxMessage("u1", "user", "first"),
-        answer("a1", "system", hot("A")),
+        answer("a1", "system", warning("A")),
         createMuxMessage("u2", "user", "second"),
-        answer("a2", "row", hot("B")),
+        answer("a2", "row", warning("B")),
         createMuxMessage("u3", "user", "third"),
-        answer("a3", "row", hot("C")),
+        answer("a3", "row", warning("C")),
         createMuxMessage("u4", "user", "summarize"),
       ];
-      const tail = hot("D");
+      const tail = warning("D");
       const payload = await assemble({
         ...opus,
         history,
@@ -937,12 +939,12 @@ describe("assemblePromptPayload", () => {
       // row there would claim the frozen sections are gone while they are still present.
       const history = [
         createMuxMessage("u1", "user", "first"),
-        answer("a1", "system", hot("A")),
+        answer("a1", "system", warning("A")),
         createMuxMessage("u2", "user", "second"),
-        answer("a2", "row", hot("B")),
+        answer("a2", "row", warning("B")),
         createMuxMessage("u3", "user", "third"),
       ];
-      const prompt = `${stable}${hot("C")}\nappended by middleware`;
+      const prompt = `${stable}${warning("C")}\nappended by middleware`;
       const payload = await assemble({
         ...opus,
         history,
@@ -983,11 +985,11 @@ describe("assemblePromptPayload", () => {
       const [u1, u2, u3] = ["first", "second", "third"].map((text, index) =>
         createMuxMessage(`u${index + 1}`, "user", text)
       );
-      const start = await send("v1", hot("A"), [u1]);
+      const start = await send("v1", warning("A"), [u1]);
       expect(start.customInstructions).toEqual({ text: block("v1"), placement: "system" });
 
       const history = [u1, turnRow("a1", start), u2];
-      const changed = await send("v2", hot("B"), history);
+      const changed = await send("v2", warning("B"), history);
       // The cached system block keeps v1; v2 and B go after the newest user row, in that order.
       expect(changed.messages[0]).toMatchObject({ role: "system", content: stable + block("v1") });
       expect(changed.messages.slice(-3).map((message) => message.role)).toEqual([
@@ -996,18 +998,18 @@ describe("assemblePromptPayload", () => {
         "system",
       ]);
       expect(JSON.stringify(changed.messages.at(-2))).toContain("v2");
-      expect(JSON.stringify(changed.messages.at(-1))).toContain("<hot_memories>B</hot_memories>");
+      expect(JSON.stringify(changed.messages.at(-1))).toContain("[Warning: B]");
       expect(changed.customInstructions).toEqual({ text: block("v2"), placement: "row" });
 
       // The replay verifier rebuilds the same request from the sent system and the records.
-      const replayed = await send("v1", hot("A"), history, {
+      const replayed = await send("v1", warning("A"), history, {
         record: changed.volatileSystemTail,
         customInstructions: changed.customInstructions,
       });
       expect(withoutMarkers(replayed.messages)).toBe(withoutMarkers(changed.messages));
 
       // The next turn puts both rows back in place and adds none: it extends the request.
-      const next = await send("v2", hot("B"), [...history, turnRow("a2", changed), u3]);
+      const next = await send("v2", warning("B"), [...history, turnRow("a2", changed), u3]);
       expect(next.customInstructions).toBeUndefined();
       expect(next.volatileSystemTail).toBeUndefined();
       expect(withoutMarkers(next.messages.slice(0, changed.messages.length))).toBe(
@@ -1364,19 +1366,24 @@ describe("assemblePromptPayload", () => {
         compactionBoundary: true,
         compactionEpoch: 1,
         // A record on the boundary row belongs to the request that compacted, not the segment.
-        volatileSystemTail: { text: hot("A"), placement: "system" },
+        volatileSystemTail: { text: warning("A"), placement: "system" },
       });
-      const payload = await withTail(hot("B"), [
+      const payload = await withTail(warning("B"), [
         createMuxMessage("u1", "user", "first"),
-        answer("a1", "system", hot("A")),
+        answer("a1", "system", warning("A")),
         createMuxMessage("u2", "user", "second"),
-        answer("a2", "row", hot("B")),
+        answer("a2", "row", warning("B")),
         boundary,
         createMuxMessage("u3", "user", "third"),
       ]);
       // Without the reset, B was the last tail sent: the request would keep A and add nothing.
-      expect(roles(payload)).toEqual(["system:stable", `system:${hot("B")}`, "assistant", "user"]);
-      expect(payload.volatileSystemTail).toEqual({ text: hot("B"), placement: "system" });
+      expect(roles(payload)).toEqual([
+        "system:stable",
+        `system:${warning("B")}`,
+        "assistant",
+        "user",
+      ]);
+      expect(payload.volatileSystemTail).toEqual({ text: warning("B"), placement: "system" });
     });
   });
 
@@ -1495,29 +1502,34 @@ describe("assemblePromptPayload", () => {
 });
 
 describe("measureVolatileSystemSuffix", () => {
-  const hot = "\n\n<hot_memories>h</hot_memories>";
+  // The function is generic over the section list; "first" stands for any section before the warning.
+  const first = "\n\n<first>f</first>";
   const warning = "\n\n[Warning: w]";
   const windowIds = "\n\n<context_window>c</context_window>";
 
   test("covers the trailing run of known sections, skipping absent ones", () => {
     expect(
-      measureVolatileSystemSuffix("base" + hot + warning + windowIds, [hot, warning, windowIds])
-    ).toBe((hot + warning + windowIds).length);
-    expect(measureVolatileSystemSuffix("base" + hot + windowIds, [hot, undefined, windowIds])).toBe(
-      (hot + windowIds).length
-    );
+      measureVolatileSystemSuffix("base" + first + warning + windowIds, [first, warning, windowIds])
+    ).toBe((first + warning + windowIds).length);
+    expect(
+      measureVolatileSystemSuffix("base" + first + windowIds, [first, undefined, windowIds])
+    ).toBe((first + windowIds).length);
     expect(measureVolatileSystemSuffix("base", [undefined, null, undefined])).toBe(0);
   });
 
   test("keeps sections that middleware moved or stripped in the stable part", () => {
     // Middleware appended text after the warning: nothing trails any more.
-    expect(measureVolatileSystemSuffix("base" + hot + warning + " extra", [hot, warning])).toBe(0);
-    // The hot block was stripped (its separator stays): only the warning trails.
-    expect(measureVolatileSystemSuffix("base\n\n" + warning, [hot, warning])).toBe(warning.length);
+    expect(measureVolatileSystemSuffix("base" + first + warning + " extra", [first, warning])).toBe(
+      0
+    );
+    // The first section was stripped (its separator stays): only the warning trails.
+    expect(measureVolatileSystemSuffix("base\n\n" + warning, [first, warning])).toBe(
+      warning.length
+    );
   });
 
   test("never leaves an empty stable part", () => {
-    expect(measureVolatileSystemSuffix(hot + warning, [hot, warning])).toBe(0);
+    expect(measureVolatileSystemSuffix(first + warning, [first, warning])).toBe(0);
   });
 });
 
@@ -1982,27 +1994,23 @@ describe("buildStreamSystemContext", () => {
     // not steer the agent toward a tool the toolset does not have.
     const withoutMemory = await buildSystemContextForTest(buildArgs);
     expect(withoutMemory.systemMessage).not.toContain("<memory-tool-guidance>");
-    const hotBlock = "<hot_memories>preloaded evidence</hot_memories>";
     const writable = await buildSystemContextForTest({
       ...buildArgs,
       memoryToolAvailable: true,
       tokenBudgetEnabled: true,
       workspaceMemoryWritable: true,
-      hotMemoriesBlock: hotBlock,
     });
     const readOnly = await buildSystemContextForTest({
       ...buildArgs,
       memoryToolAvailable: true,
       tokenBudgetEnabled: true,
       workspaceMemoryWritable: false,
-      hotMemoriesBlock: hotBlock,
     });
     const noMemory = await buildSystemContextForTest({
       ...buildArgs,
       memoryToolAvailable: false,
       tokenBudgetEnabled: true,
       workspaceMemoryWritable: true,
-      hotMemoriesBlock: hotBlock,
     });
     const guidanceSection = (text: string) =>
       text.split("<context-window-guidance>")[1]?.split("</context-window-guidance>")[0];
@@ -2016,11 +2024,8 @@ describe("buildStreamSystemContext", () => {
     expect(memorySection(readOnly.systemMessage)).not.toEqual(
       memorySection(writable.systemMessage)
     );
-    expect(writable.systemMessage).toContain(hotBlock);
-    expect(noMemory.systemMessage).not.toContain(hotBlock);
     for (const systemMessage of [readOnly.systemMessage, writable.systemMessage]) {
-      const filtered = removeMemoryGuidance(systemMessage + pluginContext, false, hotBlock);
-      expect(filtered).not.toContain(hotBlock);
+      const filtered = removeMemoryGuidance(systemMessage + pluginContext, false);
       expect(filtered).not.toContain("<memory-tool-guidance>");
       expect(guidanceSection(filtered)).toBeUndefined();
       expect(filtered).toContain(pluginContext);

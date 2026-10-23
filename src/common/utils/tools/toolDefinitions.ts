@@ -2514,7 +2514,7 @@ export const TOOL_DEFINITIONS = {
   },
   memory: {
     resultSchema: MemoryToolResultSchema,
-    ptcExcluded: "Top-level presence supplies the memory index and hot-set context",
+    ptcExcluded: "Top-level presence supplies the memory index and memory guidance",
     description: buildMemoryToolDescription({ sessionScope: false }),
     schema: z.preprocess(
       (value) => {

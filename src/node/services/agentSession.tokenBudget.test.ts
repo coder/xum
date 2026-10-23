@@ -3452,8 +3452,11 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("memory tool writes keep the window's cached notes until the next window", async () => {
     const h = await setup();
-    const oldContext = { indexEntries: [], hotMemoriesBlock: "Old task notes" };
-    const newContext = { indexEntries: [], hotMemoriesBlock: "Updated task notes" };
+    const notes = (description: string) => ({
+      indexEntries: [{ path: "/memories/workspace/context-notes.md", description }],
+    });
+    const oldContext = notes("Old task notes");
+    const newContext = notes("Updated task notes");
     const buildMemory = spyOn(h.aiService, "buildMemorySessionContext")
       .mockResolvedValueOnce(oldContext)
       .mockResolvedValue(newContext);

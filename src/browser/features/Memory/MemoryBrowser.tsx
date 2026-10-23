@@ -116,9 +116,7 @@ export function MemoryBrowser(props: MemoryBrowserProps) {
             continue;
           }
           if (!scopes.includes(event.scope)) continue;
-          // A read-side re-ranking (view/recall) leaves the file unchanged:
-          // refresh the list, but do not label the note as agent-edited.
-          if (event.actor === "agent" && event.reason !== "access") {
+          if (event.actor === "agent") {
             setAgentEditedPaths((prev) => {
               if (prev.has(event.path)) return prev;
               const next = new Set(prev);
