@@ -1,5 +1,5 @@
 import * as fs from "node:fs/promises";
-import os from "node:os";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { describe, it, expect, spyOn } from "bun:test";
