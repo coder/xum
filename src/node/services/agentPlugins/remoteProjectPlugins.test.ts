@@ -14,6 +14,7 @@ import {
   createRemoteProjectPluginSnapshot,
   getRemoteProjectPluginSnapshot,
   MAX_CACHED_SNAPSHOTS,
+  MAX_COLD_READS,
 } from "./remoteProjectPlugins";
 import { MAX_REMOTE_PLUGIN_ENTRIES } from "./remotePluginListing";
 
@@ -118,6 +119,12 @@ describe("createRemoteProjectPluginSnapshot", () => {
     }
     await writeFile(path.join(bin, "tar"), "#!/bin/sh\nexit 2\n");
     await fs.chmod(path.join(bin, "tar"), 0o755);
+    expect(await snapshotWith(`PATH=${bin}\n`)).toBeNull();
+    // A whole archive with exit 1, as GNU tar does for "file changed as we read it".
+    await writeFile(
+      path.join(bin, "tar"),
+      `#!/bin/sh\n${Bun.which("tar") ?? "tar"} "$@"\nexit 1\n`
+    );
     expect(await snapshotWith(`PATH=${bin}\n`)).toBeNull();
     await fs.rm(bin, { recursive: true });
     const crowded = path.join(container, "kit", "skills", "crowded");
@@ -276,6 +283,63 @@ describe("getRemoteProjectPluginSnapshot", () => {
     expect(await again).toBe(await reads[0]);
     await Promise.all(reads);
     expect(runtimes[0].execs).toBe(1);
+  });
+
+  test("at most MAX_COLD_READS distinct reads run at once; a clear drops queued ones", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-cold-bound");
+    const { root, container } = await checkoutWithKit(checkout.path);
+    let active = 0;
+    let peak = 0;
+    class TrackingRuntime extends CountingRemoteRuntime {
+      override async exec(command: string, options: ExecOptions): Promise<ExecStream> {
+        const stream = await super.exec(command, options);
+        peak = Math.max(peak, ++active);
+        return { ...stream, exitCode: stream.exitCode.finally(() => active--) };
+      }
+    }
+    const burst = (name: string) =>
+      Array.from(
+        { length: MAX_COLD_READS + 2 },
+        (_, i) => new TrackingRuntime(root, `${name}-${i}`)
+      );
+    const runtimes = burst("cold");
+    const snapshots = await Promise.all(
+      runtimes.map((runtime) => getRemoteProjectPluginSnapshot(runtime, root, [container]))
+    );
+    expect(snapshots.every((snapshot) => snapshot !== null)).toBe(true);
+    expect(peak).toBeLessThanOrEqual(MAX_COLD_READS);
+    // A trust change: the running reads are dropped, and the queued ones never run a command.
+    const late = burst("late");
+    const reads = late.map((runtime) => getRemoteProjectPluginSnapshot(runtime, root, [container]));
+    clearRemoteProjectPluginSnapshots();
+    expect(await Promise.all(reads)).toEqual(late.map(() => null));
+    expect(late.reduce((sum, runtime) => sum + runtime.execs, 0)).toBe(MAX_COLD_READS);
+  });
+
+  test("a host key that throws or a failed read never throws, and a failed read is retried", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-throws");
+    const { root, container } = await checkoutWithKit(checkout.path);
+    class ThrowingKeyRuntime extends CountingRemoteRuntime {
+      override getAgentHostKey(): string {
+        throw new Error("no passwd entry");
+      }
+    }
+    expect(
+      await getRemoteProjectPluginSnapshot(new ThrowingKeyRuntime(root, "x"), root, [container])
+    ).toBeNull();
+    // An empty checkout root fails its read; the failure does not stay in flight forever.
+    const runtime = new CountingRemoteRuntime(root, "empty-root");
+    const debug = spyOn(log, "debug");
+    try {
+      expect(await getRemoteProjectPluginSnapshot(runtime, "", [container])).toBeNull();
+      expect(await getRemoteProjectPluginSnapshot(runtime, "", [container])).toBeNull();
+      const failures = debug.mock.calls.filter(
+        ([message]) => typeof message === "string" && message.includes("read failed")
+      );
+      expect(failures).toHaveLength(2);
+    } finally {
+      debug.mockRestore();
+    }
   });
 
   test("host keys separate SSH users, ports and keys, and recreated Docker containers", async () => {

@@ -73,5 +73,10 @@ describe("createMemoryPluginFs", () => {
     expect(
       await fs.ensureContained(pluginRoot, `${pluginRoot}/new/x.md`, { allowMissing: true })
     ).toBe(`${pluginRoot}/new/x.md`);
+    // A relative path once looped forever (dirname(".") is ".").
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types `rejects` as void
+    await expect(
+      fs.ensureContained(pluginRoot, "rel/x", { allowMissing: true })
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

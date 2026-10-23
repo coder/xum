@@ -145,6 +145,8 @@ class MemoryPluginFs implements PluginFs {
 
   /** resolveRealPathAllowMissing: the realpath of the longest existing prefix, plus the rest. */
   private resolveAllowMissing(remote: string): string {
+    // A relative path never reaches "/" below (dirname(".") is "."), so it would loop forever.
+    if (!remote.startsWith("/")) throw fsError("ENOENT", remote);
     const missing: string[] = [];
     for (let current = remote; ; current = path.posix.dirname(current)) {
       try {

@@ -104,9 +104,14 @@ export function buildRemotePluginListingScript(checkoutRoot: string, containers:
     `  done`,
     `done`,
     `printf 'ROOT\\t\\t%s\\nT\\n' "$root"`,
-    // tar exits non-zero on a vanished file; the host then sees a member set that differs.
+    // A pipeline's status is base64's, so tar's status goes out on fd 3 and the archive on fd 4
+    // (stdout). Any tar failure, e.g. GNU tar's exit 1 for "file changed as we read it" with a
+    // whole archive, exits 8 before the END frame, so the host refuses the listing.
     // COPYFILE_DISABLE: macOS bsdtar would add `._name` metadata members, which the host refuses.
-    `[ -z "$files" ] || printf '%s' "$files" | COPYFILE_DISABLE=1 tar -cf - -T - | base64`,
+    `if [ -n "$files" ]; then`,
+    `  { s=$( { { printf '%s' "$files" | COPYFILE_DISABLE=1 tar -cf - -T -; echo $? >&3; } | base64 >&4; } 3>&1 ); } 4>&1`,
+    `  [ "$s" = 0 ] || exit 8`,
+    `fi`,
     `printf '.\\nEND\\n'`,
   ].join("\n");
 }
@@ -192,6 +197,27 @@ export const MAX_CACHED_SNAPSHOTS = 16;
 export const MAX_CACHED_SNAPSHOT_BYTES = 32 * 1024 * 1024;
 /** A failed snapshot is not retried for this long, so a down host costs no exec per turn. */
 const FAILURE_RETRY_MS = 60_000;
+/**
+ * Distinct cold reads that run at once. Each one can buffer MAX_LISTING_OUTPUT_BYTES, and the
+ * cache caps count settled entries only, so this bounds the memory of a burst of new keys.
+ * Callers of a pending key still share its read.
+ */
+export const MAX_COLD_READS = 4;
+let coldReads = 0;
+const waitingColdReads: Array<() => void> = [];
+
+/** Runs `read` when a cold-read slot is free; a waiter takes over the slot of a finished read. */
+async function withColdReadSlot<T>(read: () => Promise<T>): Promise<T> {
+  if (coldReads < MAX_COLD_READS) coldReads++;
+  else await new Promise<void>((resolve) => waitingColdReads.push(resolve));
+  try {
+    return await read();
+  } finally {
+    const next = waitingColdReads.shift();
+    if (next === undefined) coldReads--;
+    else next();
+  }
+}
 
 interface SnapshotEntry {
   promise: Promise<RemoteProjectPluginSnapshot | null>;
@@ -245,15 +271,27 @@ function freshEntry(key: string): SnapshotEntry | undefined {
 /** Starts a read for `key`; it is published only if no trust change overtook it. */
 function startRead(key: string, args: RemotePluginArgs): SnapshotEntry {
   const generation = trustGeneration;
+  const read = withColdReadSlot(() =>
+    // A trust change while this read waited for a slot: it never runs a command.
+    generation === trustGeneration ? createRemoteProjectPluginSnapshot(args) : Promise.resolve(null)
+  );
   const entry: SnapshotEntry = {
-    promise: createRemoteProjectPluginSnapshot(args).then((snapshot) => {
-      // Read under an old trust: drop it.
-      if (generation !== trustGeneration) return null;
-      entry.settled = { snapshot, at: Date.now() };
-      // Evicted or replaced meanwhile: the caller still gets it, the cache does not.
-      if (snapshots.get(key) === entry) evictOverCap();
-      return snapshot;
-    }),
+    promise: read.then(
+      (snapshot) => {
+        // Read under an old trust: drop it.
+        if (generation !== trustGeneration) return null;
+        entry.settled = { snapshot, at: Date.now() };
+        // Evicted or replaced meanwhile: the caller still gets it, the cache does not.
+        if (snapshots.get(key) === entry) evictOverCap();
+        return snapshot;
+      },
+      (error: unknown) => {
+        // Never throws to the caller. The entry goes, so the next call reads again.
+        log.debug(`Remote project plugins: read failed: ${getErrorMessage(error)}`);
+        if (snapshots.get(key) === entry) snapshots.delete(key);
+        return null;
+      }
+    ),
   };
   snapshots.set(key, entry);
   evictOverCap();
@@ -272,7 +310,14 @@ export function getRemoteProjectPluginSnapshot(
   checkoutRoot: string,
   containers: string[]
 ): Promise<RemoteProjectPluginSnapshot | null> {
-  const hostKey = runtime instanceof RemoteRuntime ? runtime.getAgentHostKey() : undefined;
+  let hostKey: string | undefined;
+  try {
+    hostKey = runtime instanceof RemoteRuntime ? runtime.getAgentHostKey() : undefined;
+  } catch (error) {
+    // E.g. SSH's os.userInfo() for a uid without a passwd entry.
+    log.debug(`Remote project plugins: no host key: ${getErrorMessage(error)}`);
+    return Promise.resolve(null);
+  }
   if (hostKey === undefined) return Promise.resolve(null);
   const key = JSON.stringify([hostKey, checkoutRoot, containers]);
   const entry = freshEntry(key) ?? startRead(key, { runtime, checkoutRoot, containers });

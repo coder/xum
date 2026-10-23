@@ -576,7 +576,7 @@ export class DockerRuntime extends RemoteRuntime {
     }
 
     // Do NOT delete container on hook failure - user can debug.
-    return runWorkspaceInitHook({
+    const result = await runWorkspaceInitHook({
       params,
       runtimeType: "docker",
       findHookRelativePath: () => findInitHookRelativePath(this, params.workspacePath),
@@ -592,6 +592,9 @@ export class DockerRuntime extends RemoteRuntime {
         );
       },
     });
+    // #6426: the checkout is populated now; a snapshot read while it was being made is stale.
+    bumpContainerGeneration(this.containerName);
+    return result;
   }
 
   /**
@@ -1321,6 +1324,8 @@ export class DockerRuntime extends RemoteRuntime {
       forkSucceeded = true;
       // Update containerName so subsequent initWorkspace() targets the forked container
       this.containerName = destContainerName;
+      // #6426: the clone is complete; a snapshot read while it was cloning is stale.
+      bumpContainerGeneration(destContainerName);
       return { success: true, workspacePath: CONTAINER_SRC_DIR, sourceBranch };
     } catch (error) {
       return { success: false, error: getErrorMessage(error) };

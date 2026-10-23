@@ -515,6 +515,8 @@ const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
  * a runtime object is made per call. It is part of getAgentHostKey, so a checkout that Xum removed
  * and made again at the same path never reuses the old one's cached plugin snapshot. Bumped AFTER
  * the change: a snapshot is keyed when its read starts, so a read that raced it keeps the old key.
+ * Keyed by the host string only, so every spelling of a host (port unset or 22, another identity
+ * file) sees the change. An extra bump only costs one cold listing.
  */
 const checkoutGenerations = new Map<string, number>();
 
@@ -1112,13 +1114,13 @@ export class SSHRuntime extends RemoteRuntime {
   protected readonly commandPrefix: string = "SSH";
 
   override getAgentHostKey(): string {
-    const host = makeAgentHostKey(this.config);
-    return JSON.stringify([host, checkoutGenerations.get(host) ?? 0]);
+    const generation = checkoutGenerations.get(this.config.host) ?? 0;
+    return JSON.stringify([makeAgentHostKey(this.config), generation]);
   }
 
   /** After a checkout on this host is made or removed (see checkoutGenerations). */
   private bumpCheckoutGeneration(): void {
-    const host = makeAgentHostKey(this.config);
+    const host = this.config.host;
     checkoutGenerations.set(host, (checkoutGenerations.get(host) ?? 0) + 1);
   }
 
