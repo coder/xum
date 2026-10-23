@@ -8,6 +8,7 @@ import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider } from "@/browser/contexts/API";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import type { AgentPluginGitSource } from "@/common/config/schemas/agentPluginInstalls";
+import type { AgentPluginInstallPreview } from "@/common/orpc/schemas/agentPlugins";
 import { PluginsSettingsSection } from "./PluginsSettingsSection";
 
 let cleanupDom: (() => void) | null = null;
@@ -41,27 +42,29 @@ function createApi() {
           mcpServerCount: 0,
         },
       ],
-      preview: {
-        source,
-        lockedSha: "b".repeat(40),
-        manifest: { name: "tools-next" },
-        skills: [{ name: "alpha" }],
-        mcpServers: [],
-        agents: [],
-        workflows: [],
-        slashCommands: [],
-        reviewedComponents: [],
-        codexHooks: [],
-        warnings: [],
-        targetPath: "~/.mux/plugins/tools-next",
-        consentDigest: "c".repeat(64),
-        method: { kind: "agent-plugin" },
-        methods: [{ kind: "agent-plugin" }],
-        skillsCliSkills: [],
-      },
+      preview: pluginPreview,
     },
   });
 }
+
+const pluginPreview: AgentPluginInstallPreview = {
+  source,
+  lockedSha: "b".repeat(40),
+  manifest: { name: "tools-next" },
+  skills: [{ name: "alpha" }],
+  mcpServers: [],
+  agents: [],
+  workflows: [],
+  slashCommands: [],
+  reviewedComponents: [],
+  codexHooks: [],
+  warnings: [],
+  targetPath: "~/.mux/plugins/tools-next",
+  consentDigest: "c".repeat(64),
+  method: { kind: "agent-plugin" },
+  methods: [{ kind: "agent-plugin" }],
+  skillsCliSkills: [],
+};
 
 /** The section inside a dialog configured like Settings (SettingsPage.tsx). */
 function renderInSettings(
@@ -123,24 +126,66 @@ test("Escape outside Manage components still closes Settings (#7122)", async () 
   expect(onOpenChange).toHaveBeenCalledWith(false);
 });
 
-/** Focus that falls out of an unmounted control lands on the Settings dialog (or the body). */
-function focusFellOut(): boolean {
-  const active = document.activeElement;
-  return !(active instanceof HTMLElement) || active === document.body || active.role === "dialog";
+/** Settings with the Add plugin panel open and the source typed, ready for Enter. */
+async function openAddPanel(api: ReturnType<typeof createApi>) {
+  const view = renderInSettings(api, () => undefined);
+  fireEvent.click(await view.findByRole("button", { name: "Add plugin" }));
+  const sourceField = await view.findByLabelText(/Git URL or owner\/repo/);
+  await userEvent.type(sourceField, "acme/tools");
+  // userEvent.keyboard has no document in this harness, so Enter goes through type().
+  const pressEnter = () => userEvent.type(sourceField, "{Enter}");
+  return { view, pressEnter };
 }
 
-// #7121: the source form unmounts when the preview opens, and the preview unmounts on Install.
-test("Preview on Enter and Install keep focus on a control of the new view (#7121)", async () => {
-  const view = renderInSettings(createApi(), () => undefined);
-  fireEvent.click(await view.findByRole("button", { name: "Add plugin" }));
-  await userEvent.type(await view.findByLabelText(/Git URL or owner\/repo/), "acme/tools{Enter}");
+// #7121: the source form unmounts when the preview opens. Its first control takes the focus.
+test("Enter in the source field focuses the first control of the preview (#7121)", async () => {
+  const { view, pressEnter } = await openAddPanel(createApi());
+  await pressEnter();
   await view.findByText("tools-next");
-  const afterPreview = focusFellOut();
+  // "Select all" is disabled (every component starts selected), so "Clear" comes first.
+  await waitFor(() =>
+    expect(document.activeElement).toBe(view.getAllByRole("button", { name: "Clear" })[0])
+  );
+});
 
-  await userEvent.click(view.getByRole("button", { name: "Install" }));
-  await view.findByText("Plugin installed.");
-  expect({ afterPreview, afterInstall: focusFellOut() }).toEqual({
-    afterPreview: false,
-    afterInstall: false,
+// #7121: Install and Cancel unmount the panel. The Add plugin button comes back with the focus.
+test.each(["Install", "Cancel"])(
+  "%s gives the focus to the Add plugin button (#7121)",
+  async (action) => {
+    const { view, pressEnter } = await openAddPanel(createApi());
+    if (action === "Install") {
+      await pressEnter();
+      await view.findByText("tools-next");
+    }
+    await userEvent.click(view.getByRole("button", { name: action }));
+    const addPlugin = await view.findByRole("button", { name: "Add plugin" });
+    expect(document.activeElement).toBe(addPlugin);
+  }
+);
+
+// A new preview for another Install as method rerenders the view without moving the focus.
+test("picking another Install as method keeps the focus on the picked method (#7121)", async () => {
+  const api = createApi();
+  spyOn(api.agentPlugins, "preview").mockImplementation((input) => {
+    const kind = input.method?.kind ?? "agent-plugin";
+    return Promise.resolve({
+      success: true as const,
+      data: {
+        kind: "plugin" as const,
+        preview: {
+          ...pluginPreview,
+          manifest: { name: `tools-${kind}` },
+          method: kind === "claude-plugin" ? { kind } : { kind: "agent-plugin" as const },
+          methods: [{ kind: "agent-plugin" as const }, { kind: "claude-plugin" as const }],
+        },
+      },
+    });
   });
+  const { view, pressEnter } = await openAddPanel(api);
+  await pressEnter();
+  await view.findByText("tools-agent-plugin");
+  const claude = view.getByRole("radio", { name: "Claude Code plugin" });
+  await userEvent.click(claude);
+  await view.findByText("tools-claude-plugin");
+  expect(document.activeElement).toBe(claude);
 });

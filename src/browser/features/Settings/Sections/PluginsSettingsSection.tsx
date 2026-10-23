@@ -577,6 +577,23 @@ const ManageComponentsPanel: React.FC<{
 };
 
 /** Two-phase add flow: source input → consent preview → install. */
+/**
+ * Callback ref of the preview view (#7121). Opening the preview unmounts the focused source field
+ * or Preview button, and focus then fell to the Settings dialog. So the view focuses its first
+ * control when it mounts, unless a control inside already took focus (the Back button after a
+ * marketplace entry, #7134). The function is module-level, so React calls it only on mount and
+ * unmount: a changed Install as method or the Skills CLI choice rerenders the view without
+ * moving focus.
+ */
+function focusFirstControlOnMount(view: HTMLDivElement | null): void {
+  if (view === null || view.contains(document.activeElement)) return;
+  const controls = view.querySelectorAll<HTMLElement>("button, input, select, textarea, [tabindex]");
+  const first = Array.from(controls).find(
+    (control) => control.tabIndex >= 0 && !control.matches(":disabled")
+  );
+  first?.focus();
+}
+
 const AddPluginPanel: React.FC<{
   onInstalled: () => void;
   onClose: () => void;
@@ -765,7 +782,7 @@ const AddPluginPanel: React.FC<{
           </div>
         </>
       ) : (
-        <>
+        <div ref={focusFirstControlOnMount} className="space-y-3">
           <InstallMethodPicker
             preview={preview}
             cliOffered={
@@ -806,7 +823,7 @@ const AddPluginPanel: React.FC<{
               focusBack={previewedEntry !== null}
             />
           )}
-        </>
+        </div>
       )}
     </div>
   );
@@ -1666,6 +1683,14 @@ export const PluginsSettingsSection: React.FC = () => {
     refresh: () => refresh(),
   });
 
+  // Install and Cancel unmount the Add plugin panel with the focused control in it. The Add plugin
+  // button comes back in its place and takes the focus, so it does not fall to the Settings
+  // dialog (#7121). One-shot: a later rerender of the button does not move focus.
+  const focusAddButtonRef = useRef(false);
+  const closeAddPanel = () => {
+    focusAddButtonRef.current = true;
+    setAddOpen(false);
+  };
   const openAddPanel = () => {
     // Feedback belongs to the completed install, not the next attempt from any entry point.
     setInstallSucceeded(false);
@@ -1911,7 +1936,15 @@ export const PluginsSettingsSection: React.FC = () => {
               Check for updates
             </Button>
             {!addOpen && (
-              <Button size="sm" onClick={openAddPanel}>
+              <Button
+                size="sm"
+                onClick={openAddPanel}
+                ref={(button) => {
+                  if (button === null || !focusAddButtonRef.current) return;
+                  focusAddButtonRef.current = false;
+                  button.focus();
+                }}
+              >
                 <Plus className="h-3.5 w-3.5" />
                 Add plugin
               </Button>
@@ -1923,12 +1956,12 @@ export const PluginsSettingsSection: React.FC = () => {
           <div className="mb-4">
             <AddPluginPanel
               onInstalled={() => {
-                setAddOpen(false);
+                closeAddPanel();
                 setInstallSucceeded(true);
                 void refresh();
                 void checkForUpdates();
               }}
-              onClose={() => setAddOpen(false)}
+              onClose={closeAddPanel}
             />
           </div>
         )}
