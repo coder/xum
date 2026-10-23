@@ -128,8 +128,8 @@ describe("resolveProviderOptionsNamespaceKey", () => {
     expect(resolveProviderOptionsNamespaceKey("openai", "openai")).toBe("openai");
   });
 
-  test("returns the canonical provider for passthrough gateways", () => {
-    expect(resolveProviderOptionsNamespaceKey("openai", "mux-gateway")).toBe("openai");
+  test("returns the canonical provider for the passthrough Coder gateway", () => {
+    expect(resolveProviderOptionsNamespaceKey("openai", "coder")).toBe("openai");
   });
 
   test("returns the route provider for non-passthrough OpenRouter routing", () => {
@@ -369,7 +369,6 @@ describe("buildProviderOptions - Anthropic", () => {
       const ineligible: Array<
         [string, string, ProvidersConfigMap | null | undefined, Parameters<typeof optionsFor>[3]]
       > = [
-        ["Xum gateway", "mux-gateway:anthropic/claude-sonnet-5-5", directConfig(), "mux-gateway"],
         ["no resolved route", sonnet55, directConfig(), undefined],
         ["no providers config", sonnet55, null, "anthropic"],
         [
@@ -655,7 +654,6 @@ describe("buildProviderOptions - Anthropic", () => {
     test("fails closed on routes that may not forward the beta header", () => {
       const cases: Array<[string, Parameters<typeof thinkingFor>[1]]> = [
         ["no resolved route", { route: undefined }],
-        ["gateway route", { route: "mux-gateway" }],
         ["no providers config", { config: null }],
         ["config base URL", { config: directConfig({ baseUrl: "https://llm.example.com/v1" }) }],
         [
@@ -677,9 +675,6 @@ describe("buildProviderOptions - Anthropic", () => {
           thinking: { type: "adaptive", display: "summarized" },
         });
       }
-      expect(
-        thinkingFor("mux-gateway:anthropic/claude-opus-5-5", { route: "mux-gateway" })
-      ).not.toHaveProperty("blockBinding");
     });
 
     test("the SDK sends block_binding with its beta header only when eligible", async () => {
@@ -712,7 +707,7 @@ describe("buildProviderOptions - Anthropic", () => {
         { preconnect: fetch.preconnect.bind(fetch) }
       );
       const model = createAnthropic({ apiKey: "test", fetch: captureFetch })("claude-opus-5-5");
-      for (const route of ["anthropic", "mux-gateway"] as const) {
+      for (const route of ["anthropic", undefined] as const) {
         await generateText({
           model,
           prompt: "Return ok.",
@@ -1401,7 +1396,6 @@ describe("anthropicNativeWebFetchRouteAvailable", () => {
         anthropic({ baseUrl: "https://api.anthropic.com/v1" })
       )
     ).toBe(true);
-    expect(anthropicNativeWebFetchRouteAvailable(opus, "mux-gateway", anthropic())).toBe(true);
     expect(
       anthropicNativeWebFetchRouteAvailable(
         "coder:anthropic/claude-opus-4-6",
@@ -1750,9 +1744,9 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(openai).toBeDefined();
       expect(openai!.truncation).toBe("auto");
     });
-    test("should derive promptCacheKey for gateway OpenAI model with promptCacheScope", () => {
+    test("should derive promptCacheKey for Coder-routed OpenAI model with promptCacheScope", () => {
       const result = buildProviderOptions(
-        "mux-gateway:openai/gpt-5.2",
+        "coder:openai/gpt-5.2",
         "off",
         undefined,
         undefined,
@@ -1846,7 +1840,7 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(buildChatOptions("openai:gpt-6-luna")?.promptCacheKey).toBeUndefined();
       // Passthrough gateway route fails closed.
       expect(
-        buildChatOptions("openai:gpt-6-luna", { routeProvider: "mux-gateway" })?.promptCacheKey
+        buildChatOptions("openai:gpt-6-luna", { routeProvider: "coder" })?.promptCacheKey
       ).toBeUndefined();
       // Codex OAuth wins the auth path.
       expect(
@@ -1894,7 +1888,7 @@ describe("buildProviderOptions - OpenAI", () => {
       // Passthrough gateway Responses request: legacy behavior still applies.
       const passthrough = getOpenAIOptions(
         buildProviderOptions(
-          "mux-gateway:openai/gpt-6-luna",
+          "coder:openai/gpt-6-luna",
           "medium",
           undefined,
           undefined,
@@ -1902,7 +1896,7 @@ describe("buildProviderOptions - OpenAI", () => {
           "workspace-1",
           undefined,
           undefined,
-          "mux-gateway",
+          "coder",
           "project-scope"
         )
       );
@@ -1913,7 +1907,7 @@ describe("buildProviderOptions - OpenAI", () => {
   describe("route provider format selection", () => {
     test("uses the transforming route provider format for gateway-routed OpenAI models", () => {
       const result = buildProviderOptions(
-        "mux-gateway:openai/gpt-5.2",
+        "openrouter:openai/gpt-5.2",
         "medium",
         undefined,
         undefined,
@@ -1936,7 +1930,7 @@ describe("buildProviderOptions - OpenAI", () => {
     });
 
     test("falls back to the canonical origin provider format when routeProvider is absent", () => {
-      const result = buildProviderOptions("mux-gateway:openai/gpt-5.2", "medium");
+      const result = buildProviderOptions("openrouter:openai/gpt-5.2", "medium");
       const openai = getOpenAIOptions(result);
 
       expect(openai).toBeDefined();
@@ -2328,7 +2322,7 @@ describe("buildProviderOptions - OpenAI", () => {
         expect(
           openaiProModeAvailable(model, {
             providersConfig: config,
-            resolvedRouteProvider: "mux-gateway",
+            resolvedRouteProvider: "openrouter",
           })
         ).toBe(false);
         expect(
@@ -2460,17 +2454,15 @@ describe("buildProviderOptions - OpenAI", () => {
       }
     });
 
-    test("omits pro mode for standard mode, unsupported models, gateways, and Chat Completions", () => {
+    test("omits pro mode for standard mode, unsupported models, and Chat Completions", () => {
       const cases = [
         buildWithMode("openai:gpt-6.1-sol", "standard"),
         buildWithMode("openai:gpt-6-astra", "standard"),
         buildWithMode("openai:gpt-6-astra", undefined),
-        buildWithMode("openai:gpt-6-astra", "pro", { routeProvider: "mux-gateway" }),
         buildWithMode("openai:gpt-6-astra", "pro", {
           muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
         }),
         buildWithMode("openai:gpt-5.5-pro", "pro"),
-        buildWithMode("openai:gpt-6.1-sol", "pro", { routeProvider: "mux-gateway" }),
         buildWithMode("openai:gpt-6.1-sol", "pro", {
           muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
         }),
@@ -2634,7 +2626,7 @@ describe("buildProviderOptions - OpenAI", () => {
       ["the setting off", { openai: { cyberModelEnabled: false } }],
       ["an unmapped model", { model: "openai:gpt-6-luna" }],
       ["Chat Completions", { wireFormat: "chatCompletions" as const }],
-      ["a gateway route", { routeProvider: "mux-gateway" as const }],
+      ["a gateway route", { routeProvider: "coder" as const }],
       ["Codex OAuth", { openai: { apiKeySet: false, codexOauthSet: true } }],
     ])("omits the program for %s", (_name, options) => {
       expect(buildCyber(options)).not.toHaveProperty("cyberAccessProgram");
@@ -2920,11 +2912,11 @@ describe("buildProviderOptions - OpenAI", () => {
     test("does not reuse previousResponseId when Xum already sends explicit GPT-5.5 history", () => {
       const messages = [
         createMuxMessage("assistant-1", "assistant", "", {
-          model: "mux-gateway:openai/gpt-5.5",
+          model: "coder:openai/gpt-5.5",
           providerMetadata: { openai: { responseId: "resp_123" } },
         }),
       ];
-      const result = buildProviderOptions("mux-gateway:openai/gpt-5.5", "medium", messages);
+      const result = buildProviderOptions("coder:openai/gpt-5.5", "medium", messages);
       const openai = getOpenAIOptions(result);
 
       expect(openai).toBeDefined();
@@ -3025,16 +3017,6 @@ describe("buildProviderOptions - Google", () => {
     });
   });
 
-  test("maps gateway Gemini 3.5 Flash off to minimal thinking without thoughts", () => {
-    expect(buildProviderOptions("mux-gateway:google/gemini-3.5-flash", "off")).toEqual({
-      google: {
-        thinkingConfig: {
-          thinkingLevel: "minimal",
-        },
-      },
-    });
-  });
-
   test("maps namespaced Gemini 3.5 Flash off to minimal thinking without thoughts", () => {
     expect(buildProviderOptions("google:models/gemini-3.5-flash", "off")).toEqual({
       google: {
@@ -3126,8 +3108,8 @@ describe("buildProviderOptions - Google", () => {
     }
   });
 
-  test("maps gateway-routed Gemini 3.8 Flash to thinkingLevel config", () => {
-    expect(buildProviderOptions("mux-gateway:google/gemini-3.8-flash", "high")).toEqual({
+  test("maps gateway-prefixed Gemini 3.8 Flash to thinkingLevel config", () => {
+    expect(buildProviderOptions("openrouter:google/gemini-3.8-flash", "high")).toEqual({
       google: {
         thinkingConfig: {
           includeThoughts: true,
@@ -3138,7 +3120,7 @@ describe("buildProviderOptions - Google", () => {
   });
 
   test("maps Gemini 3.5 Flash medium to thinkingLevel medium with thoughts", () => {
-    expect(buildProviderOptions("mux-gateway:google/gemini-3.5-flash", "medium")).toEqual({
+    expect(buildProviderOptions("google:gemini-3.5-flash", "medium")).toEqual({
       google: {
         thinkingConfig: {
           includeThoughts: true,
@@ -3581,8 +3563,8 @@ describe("buildRequestHeaders", () => {
       expected: { "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER },
     },
     {
-      name: "should return anthropic-beta header for gateway-routed beta Anthropic model",
-      model: "mux-gateway:anthropic/claude-sonnet-4-5",
+      name: "should return anthropic-beta header for Coder-routed beta Anthropic model",
+      model: "coder:anthropic/claude-sonnet-4-5",
       options: { anthropic: { use1MContext: true } },
       expected: { "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER },
     },
@@ -3697,10 +3679,8 @@ describe("buildRequestHeaders", () => {
       ["openai:gpt-6-luna", true],
       ["openai:gpt-6-astra", true],
       ["openai:gpt-6-astra-2026-09-03", true],
-      ["mux-gateway:openai/gpt-6-astra", false],
       ["openai:gpt-6-astra-mini", false],
-      // Other gateways fail closed — mux-gateway drops the field server-side.
-      ["mux-gateway:openai/gpt-6.1-sol", false],
+      // Non-passthrough gateways fail closed.
       ["openrouter:openai/gpt-6.1-sol", false],
       ["github-copilot:gpt-6.1-sol", false],
       // Non-pro-capable models.
@@ -3768,7 +3748,7 @@ describe("buildRequestHeaders", () => {
         expect(
           openaiProModeAvailable("openrouter:openai/gpt-6.1-sol", {
             providersConfig,
-            resolvedRouteProvider: "mux-gateway",
+            resolvedRouteProvider: "github-copilot",
           })
         ).toBe(false);
       });
@@ -3808,8 +3788,6 @@ describe("buildRequestHeaders", () => {
       const route = (r: string) =>
         openaiProModeAvailable("openai:gpt-6.1-sol", { resolvedRouteProvider: r });
       expect(route("direct")).toBe(true);
-      // mux-gateway drops the field server-side today — fail closed.
-      expect(route("mux-gateway")).toBe(false);
       expect(route("openrouter")).toBe(false);
       expect(route("github-copilot")).toBe(false);
       // Unknown route names fail closed.
@@ -3844,13 +3822,6 @@ describe("buildRequestHeaders", () => {
     {
       name: "should include X-Mux-Workspace-Id for non-Anthropic provider when workspaceId provided",
       model: "openai:gpt-5.2",
-      options: undefined,
-      workspaceId: "a1b2c3d4e5",
-      expected: { [MUX_WORKSPACE_ID_HEADER]: "a1b2c3d4e5" },
-    },
-    {
-      name: "should include X-Mux-Workspace-Id for mux-gateway routes",
-      model: "mux-gateway:openai/gpt-5.2",
       options: undefined,
       workspaceId: "a1b2c3d4e5",
       expected: { [MUX_WORKSPACE_ID_HEADER]: "a1b2c3d4e5" },

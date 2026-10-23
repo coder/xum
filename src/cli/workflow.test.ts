@@ -272,7 +272,7 @@ AgentSession.prototype.ensureMetadata = () => Promise.reject(new Error("setup fa
     await seedEvaluationDefault(muxRoot, "nope:settings-model");
     expect((await probe()).stdout).toContain("evaluation failed: unsupported/unsupported-provider");
 
-    expect((await probe("--evaluation-model", "mux-gateway:openai:gpt-5")).stdout).toContain(
+    expect((await probe("--evaluation-model", "openrouter:openai/gpt-5")).stdout).toContain(
       "evaluation failed: unsupported/unsupported-route"
     );
 
@@ -280,7 +280,7 @@ AgentSession.prototype.ensureMetadata = () => Promise.reject(new Error("setup fa
       (
         await probe(
           "--evaluation-model",
-          "mux-gateway:openai:gpt-5",
+          "openrouter:openai/gpt-5",
           "--args-json",
           '{"model":"nope:per-call"}'
         )

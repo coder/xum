@@ -18,7 +18,7 @@ describe("fast mode service tier", () => {
     expect(getFastModeUnavailableReason("anthropic:claude-haiku-4-5", null)).toBe("model");
     expect(getFastModeUnavailableReason("xai:grok-code-fast-1", null)).toBe("model");
     // These models have fast mode, so a null provider means the route cannot send it.
-    expect(getFastModeUnavailableReason("mux-gateway:anthropic/claude-opus-5-5", null)).toBe(
+    expect(getFastModeUnavailableReason("openrouter:anthropic/claude-opus-5-5", null)).toBe(
       "route"
     );
     expect(getFastModeUnavailableReason("openrouter:openai/gpt-6-astra", null)).toBe("route");
@@ -89,7 +89,7 @@ describe("fast mode service tier", () => {
   });
 
   test("offers the shared OpenAI tier on explicit and preference-routed gateways", () => {
-    for (const route of ["coder", "openrouter", "mux-gateway", "github-copilot"]) {
+    for (const route of ["coder", "openrouter", "github-copilot"]) {
       const providersConfig = {
         [route]: { apiKeySet: true, isConfigured: true, isEnabled: true },
         openai: { apiKeySet: false, isEnabled: true, isConfigured: false, codexOauthSet: true },
@@ -204,7 +204,7 @@ describe("fast mode service tier", () => {
     expect(viaCoder("openai")).toBe(true);
     expect(viaCoder("openai-compat")).toBe(false);
     // Gateways with their own adapters forward Fast but not Ultrafast: the gate fails closed.
-    for (const route of ["github-copilot", "openrouter", "mux-gateway"]) {
+    for (const route of ["github-copilot", "openrouter"]) {
       const gatewayOptions = { resolvedRouteProvider: route, providersConfig: config({}) };
       gatewayOptions.providersConfig[route] = {
         apiKeySet: true,
@@ -251,7 +251,7 @@ describe("fast mode service tier", () => {
   test("hides Anthropic Fast mode on gateways, ZDR configs, and configs without Anthropic", () => {
     const anthropic = { apiKeySet: true, isEnabled: true, isConfigured: true };
     const gateway = { apiKeySet: true, isEnabled: true, isConfigured: true };
-    for (const route of ["mux-gateway", "openrouter", "bedrock", "coder"]) {
+    for (const route of ["openrouter", "bedrock", "coder"]) {
       expect(
         getFastModeProvider("anthropic:claude-opus-5-5", {
           resolvedRouteProvider: route,
@@ -260,8 +260,8 @@ describe("fast mode service tier", () => {
       ).toBeNull();
     }
     expect(
-      getFastModeProvider("mux-gateway:anthropic/claude-opus-5-5", {
-        providersConfig: { anthropic, "mux-gateway": gateway },
+      getFastModeProvider("openrouter:anthropic/claude-opus-5-5", {
+        providersConfig: { anthropic, openrouter: gateway },
       })
     ).toBeNull();
     expect(

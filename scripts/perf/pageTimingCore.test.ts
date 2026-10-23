@@ -161,7 +161,7 @@ test("p1 and p2 keep today's root, route and target", () => {
   expect(setup("p1")).toEqual({
     seeded: false,
     route: "/",
-    target: { selector: "p", text: "OSS contributors with GitHub accounts" },
+    target: { selector: "p", text: "Xum is provider-agnostic" },
   });
   expect(setup("p2")).toEqual({
     seeded: true,

@@ -578,8 +578,8 @@ function anthropicBlockBindingRouteAvailable(
  * It needs no beta header but must reach the API verbatim, which only
  * @ai-sdk/anthropic 4.0.67+ does: the direct `anthropic` route (a base URL proxy
  * forwards the body) and the `coder` route (Coder AI gateway, anthropic type).
- * Everything else fails closed: mux-gateway's server SDK is outside Xum's control,
- * Bedrock pins an older @ai-sdk/anthropic, and custom providers may validate the enum.
+ * Everything else fails closed: Bedrock pins an older @ai-sdk/anthropic, and custom providers
+ * may validate the enum.
  * On the coder route only an instance whose type is exactly "anthropic" qualifies:
  * a bedrock-typed instance also speaks the Anthropic wire, but its upstream is
  * Bedrock, and any other or unknown type may reject the enum.
@@ -608,8 +608,8 @@ export function anthropicBetweenToolsRouteAvailable(
  * first-party API runs it: Vertex, Bedrock and Anthropic-compatible proxies (LiteLLM and
  * others) reject the whole request on the unknown tool type. Unlike between_tools, a proxy
  * that forwards fields verbatim is not enough, so a non-first-party base URL withholds it, and
- * the model gets Xum's own web_fetch instead. Gateways that forward to the first-party API keep
- * it: mux-gateway, and a `coder` instance typed exactly "anthropic".
+ * the model gets Xum's own web_fetch instead. A `coder` instance typed exactly "anthropic"
+ * forwards to the first-party API, so it keeps it.
  */
 export function anthropicNativeWebFetchRouteAvailable(
   modelString: string,
@@ -618,7 +618,6 @@ export function anthropicNativeWebFetchRouteAvailable(
 ): boolean {
   const prefix = modelString.split(":", 1)[0];
   if (isCustomProviderConfig(providersConfig?.[prefix])) return false;
-  if (routeProvider === "mux-gateway") return true;
   if (routeProvider === "coder") return anthropicTypedCoderRoute(modelString, providersConfig);
   // No resolved route is the built-in provider; any other gateway transforms the request.
   return isBuiltInAnthropicRoute(routeProvider) && anthropicBaseUrlIsFirstParty(providersConfig);
@@ -919,8 +918,7 @@ export function buildProviderOptions(
           // Default to disabled; allow auto truncation for compaction to avoid context errors
           truncation: truncationMode,
           // Pro mode is a native Responses option in @ai-sdk/openai 4.0.11.
-          // Direct OpenAI and Coder Responses forward it; mux-gateway drops
-          // this provider option and Codex OAuth strips it.
+          // Direct OpenAI and Coder Responses forward it; Codex OAuth strips it.
           ...(shouldUseProMode && { reasoningMode: "pro" as const }),
           // Private per-call key the SDK ignores; providerModelFactory serializes
           // it as access_programs.cyber on direct OpenAI only.
@@ -1186,7 +1184,7 @@ export const ANTHROPIC_1M_CONTEXT_HEADER = "context-1m-2025-08-07";
 /**
  * HTTP header sent on AI requests for workspace-level observability.
  * The JS symbol can stay Xum-branded; the wire value remains X-Mux-Workspace-Id
- * so mux-gateway and existing correlation pipelines keep matching.
+ * so existing correlation pipelines keep matching.
  */
 export const MUX_WORKSPACE_ID_HEADER = "X-Mux-Workspace-Id";
 

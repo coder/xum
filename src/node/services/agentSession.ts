@@ -2890,7 +2890,7 @@ export class AgentSession {
       return undefined;
     }
 
-    // Preserve explicit gateway identities (coder:, mux-gateway:, ...) just
+    // Preserve explicit gateway identities (coder:, openrouter:, ...) just
     // like normal send-option normalization: normalizeToCanonical would
     // rewrite a cross-typed canonical-name instance such as
     // coder:openai/<claude> (type anthropic) to openai:<claude>, sending the
