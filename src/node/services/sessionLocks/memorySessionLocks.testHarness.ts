@@ -194,6 +194,9 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
       // The same argument checks as fileLock.ts acquireProcessFileLock.
       assert(lockPath.length > 0, "acquireProcessFileLock requires a lock path");
       assert(timeoutMs > 0, "acquireProcessFileLock timeoutMs must be positive");
+      // As fileLock.ts does first: a caller may write into the folder once it holds the lock
+      // (branchSummary and refinementRollback lock inside the session folder). No lock file.
+      await fs.mkdir(path.dirname(lockPath), { recursive: true });
       const entry = await acquireInMemory(table, lockPath, timeoutMs, clock, (blocker) => {
         const { why, ...holder } = blocker;
         return new Error(fileLockTimeoutMessage(label, lockPath, timeoutMs, { holder, why }));
