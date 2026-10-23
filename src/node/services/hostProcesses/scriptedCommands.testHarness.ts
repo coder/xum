@@ -50,17 +50,26 @@ function execError(message: string, code: number | null, stdout: string, stderr:
   return error;
 }
 
-/** Runs one call on the table. */
+/** The outcome of one call on the table, or undefined when the table has no entry for it. */
+export async function lookupScriptedCommand(
+  table: ScriptTable,
+  call: ScriptedCall
+): Promise<ScriptedOutcome | undefined> {
+  const line = commandLine(call.file, call.args);
+  const entry = Object.hasOwn(table, line) ? table[line] : undefined;
+  if (entry === undefined) return undefined;
+  return typeof entry === "function" ? await entry(call) : entry;
+}
+
+/** Runs one call on the table, and rejects like execFileAsync on a non-zero exit. */
 export async function runScriptedCommand(
   table: ScriptTable,
   call: ScriptedCall
 ): Promise<{ stdout: string; stderr: string }> {
-  const line = commandLine(call.file, call.args);
-  const entry = Object.hasOwn(table, line) ? table[line] : undefined;
-  if (entry === undefined) {
-    throw execError(`No scripted command: ${line}`, null, "", "");
+  const outcome = await lookupScriptedCommand(table, call);
+  if (outcome === undefined) {
+    throw execError(`No scripted command: ${commandLine(call.file, call.args)}`, null, "", "");
   }
-  const outcome = typeof entry === "function" ? await entry(call) : entry;
   const stdout = outcome.stdout ?? "";
   const stderr = outcome.stderr ?? "";
   const exitCode = outcome.exitCode ?? 0;
