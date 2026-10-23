@@ -60,6 +60,7 @@ async function createPreparationHarness(
     workspaceMcpOverridesService: new WorkspaceMcpOverridesService(config),
     lastLlmRequestByWorkspace: new Map(),
     bindings: {},
+    hostServices: {},
     emit: () => false,
     createAbortedTurnHandle: (messageId) => ({
       messageId,

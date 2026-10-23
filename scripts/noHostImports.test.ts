@@ -129,7 +129,6 @@ const FROZEN_ALLOW_PAIRS = [
   "src/node/services/aiService.ts fs/promises",
   "src/node/services/contextManagement/strategies/tokenBudget.ts @/node/runtime/runtimeHelpers",
   "src/node/services/tools/bash.ts fs",
-  "src/node/services/tools/notify.ts electron",
   "src/node/services/tools/review_pane.ts @/node/utils/writeFileAtomic",
   "src/node/services/tools/review_pane.ts fs/promises",
   "src/node/services/tools/shared/configReadWrite.ts @/node/utils/writeFileAtomic",

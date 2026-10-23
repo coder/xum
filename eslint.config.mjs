@@ -188,7 +188,6 @@ const HOST_IMPORT_ALLOW = {
     "@/node/runtime/runtimeHelpers",
   ],
   "src/node/services/tools/bash.ts": ["fs"],
-  "src/node/services/tools/notify.ts": ["electron"],
   "src/node/services/tools/review_pane.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
   "src/node/services/tools/shared/configReadWrite.ts": [
     "@/node/utils/writeFileAtomic",

@@ -92,6 +92,7 @@ import { listAvailableModels } from "@/common/utils/ai/selectableModels";
 import { DEFAULT_ROUTE_PRIORITY } from "@/common/routing";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { DesktopNotifications } from "@/node/services/desktopNotifications/desktopNotifications";
 import type { BashAiProxyService } from "@/node/services/bashAiProxy/bashAiProxyService";
 import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { DevToolsService } from "@/node/services/devToolsService";
@@ -937,6 +938,15 @@ function requireWorkflowArchiveAdmission(
   return guard;
 }
 
+/**
+ * Host services that tools read through ToolConfiguration instead of importing host modules
+ * (local/no-host-imports). AILive passes the Node layers; an absent member means the tool's
+ * own Node default.
+ */
+export interface LoopHostServices {
+  desktopNotifications?: DesktopNotifications;
+}
+
 interface TurnRequestBuilderDependencies {
   config: Config;
   providersConfigStore: ProvidersConfigStore;
@@ -957,6 +967,7 @@ interface TurnRequestBuilderDependencies {
     set(workspaceId: string, snapshot: DebugLlmRequestSnapshot): unknown;
   };
   bindings: TurnRequestBuilderBindings;
+  hostServices: LoopHostServices;
   emit: (event: string, ...args: unknown[]) => boolean;
   createAbortedTurnHandle: (messageId: string, signal?: AbortSignal) => TurnStreamHandle;
   createSettledTurnHandle: (messageId: string, completion: TurnCompletion) => TurnStreamHandle;
@@ -2797,6 +2808,7 @@ export class TurnRequestBuilder {
       strictAgentResolution,
       xumScope,
       timelineService: this.dependencies.bindings.timelineService,
+      desktopNotifications: this.dependencies.hostServices.desktopNotifications,
       // Agent-scheduled heartbeats start paid turns unattended, so they are user opt-in.
       workspaceHeartbeatService:
         this.dependencies.config.loadConfigOrDefault().agentHeartbeatsEnabled === true
