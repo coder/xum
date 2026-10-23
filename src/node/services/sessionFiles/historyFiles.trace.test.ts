@@ -28,19 +28,20 @@ test("today's code makes the golden fs call trace", async () => {
   // copies into a chmod) comes from the umask. Pin a common umask so every machine records the
   // same modes.
   const umask = process.umask(0o022);
-  // The steps run without runGoldenScript's snapshots, whose reads would enter the trace.
-  const trace = startCallTrace(tempDir, context.sessionDir);
+  // The outer finally removes the temp root even when a step fails.
   try {
-    for (const step of STEPS) {
-      const start = trace.rows.length;
-      await step.run(context);
-      steps.push({ step: step.name, rows: trace.rows.slice(start) });
+    // The steps run without runGoldenScript's snapshots, whose reads would enter the trace.
+    const trace = startCallTrace(tempDir, context.sessionDir);
+    try {
+      for (const step of STEPS) {
+        const start = trace.rows.length;
+        await step.run(context);
+        steps.push({ step: step.name, rows: trace.rows.slice(start) });
+      }
+    } finally {
+      trace.stop();
+      process.umask(umask);
     }
-  } finally {
-    trace.stop();
-    process.umask(umask);
-  }
-  try {
     if (process.env.UPDATE_GOLDEN === "1") {
       // Format like `make fmt` does, so fmt-check accepts the recorded fixture as is.
       const options = await prettier.resolveConfig(FIXTURE);
