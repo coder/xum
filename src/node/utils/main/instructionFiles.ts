@@ -1,4 +1,3 @@
-import * as fs from "fs/promises";
 import * as path from "path";
 import {
   INSTRUCTION_SCOPE,
@@ -8,6 +7,7 @@ import {
 } from "@/common/types/instructions";
 import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { readFileString } from "@/node/utils/runtime/helpers";
 
 export const CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY = ".claude";
@@ -51,7 +51,7 @@ interface FileReader {
  */
 function createLocalFileReader(): FileReader {
   return {
-    readFile: (filePath: string) => fs.readFile(filePath, "utf-8"),
+    readFile: (filePath: string) => nodeHostFiles.promises.readFile(filePath, "utf-8"),
   };
 }
 

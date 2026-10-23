@@ -1,6 +1,6 @@
-import * as fsPromises from "fs/promises";
 import * as path from "path";
 import { assert } from "@/common/utils/assert";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 
 /**
  * Warn (never block) when agent commands or file writes create new entries directly in the
@@ -41,7 +41,7 @@ export type ClutterSnapshot = ReadonlyMap<string, ReadonlySet<string>>;
 
 export type ReadDir = (dir: string) => Promise<string[]>;
 
-const defaultReadDir: ReadDir = (dir) => fsPromises.readdir(dir);
+const defaultReadDir: ReadDir = (dir) => nodeHostFiles.promises.readdir(dir);
 
 function isMissingDirError(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code;
