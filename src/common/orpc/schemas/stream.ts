@@ -230,7 +230,6 @@ export const StreamStartEventSchema = z.object({
         "frontends must prefer it over re-resolving the raw model against a " +
         "possibly refreshed providers config",
     }),
-  routedThroughGateway: z.boolean().optional(),
   routeProvider: z.string().optional(),
   autoModelRouting: AutoModelRoutingRecordSchema.optional().meta({
     description: "Auto-model-routing provenance, present when the turn was routed by difficulty",
@@ -322,7 +321,6 @@ export const StreamEndEventSchema = z.object({
       agentId: AgentIdSchema.optional().catch(undefined),
       mode: AgentModeSchema.optional().catch(undefined),
       thinkingLevel: ThinkingLevelSchema.optional(),
-      routedThroughGateway: z.boolean().optional(),
       routeProvider: z.string().optional(),
       // Present when a fallback model answered after the requested model refused.
       modelFallback: ModelFallbackRecordSchema.optional(),

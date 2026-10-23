@@ -102,7 +102,6 @@ describeIntegration("Calling-chat Exec inheritance", () => {
                 canonicalProviderName: "anthropic",
                 canonicalModelId: modelString.split(":")[1],
                 wireProviderName: "anthropic",
-                routedThroughGateway: false,
                 model: new MockLanguageModelV3({
                   provider: "anthropic",
                   modelId: modelString.split(":")[1],
@@ -221,7 +220,6 @@ describeIntegration("Calling-chat Exec inheritance", () => {
                 canonicalProviderName: "anthropic",
                 canonicalModelId: modelString.split(":")[1],
                 wireProviderName: "anthropic",
-                routedThroughGateway: false,
                 model: new MockLanguageModelV3({
                   provider: "anthropic",
                   modelId: modelString.split(":")[1],

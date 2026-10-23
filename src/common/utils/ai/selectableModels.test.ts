@@ -88,12 +88,11 @@ describe("computeSelectableModels", () => {
   });
 
   describe("custom models", () => {
-    test("surfaces custom models of enabled providers before built-ins; skips disabled, mux-gateway and github-copilot entries", () => {
+    test("surfaces custom models of enabled providers before built-ins; skips disabled and github-copilot entries", () => {
       const providersConfig: ProvidersConfigMap = {
         anthropic: provider(),
         fixture: customProvider(["fixture-a", { id: "fixture-mapped", mappedToModel: SONNET }]),
         "fixture-off": customProvider(["never"], { isEnabled: false }),
-        "mux-gateway": provider({ models: ["anthropic/claude-sonnet-5"] }),
         "github-copilot": provider({ models: ["gpt-6.1-sol"] }),
       };
 

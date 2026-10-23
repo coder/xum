@@ -107,8 +107,8 @@ export interface ChatUsageDisplay {
   // True if any model in the sum had unknown pricing (costs are partial/incomplete)
   hasUnknownCosts?: boolean;
 
-  // True when costs were explicitly zeroed because the provider gateway includes
-  // billing (providerMetadata.mux.costsIncluded). These entries should not be
+  // True when costs were explicitly zeroed because the route billed them
+  // (providerMetadata.mux.costsIncluded). These entries should not be
   // repriced when model mappings change.
   costsIncluded?: boolean;
 
@@ -166,10 +166,10 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
 
   // Track if any entry already knows its costs are incomplete/approximate.
   let hasIncompleteCosts = false;
-  // Track if any entry is gateway-billed (costs explicitly zeroed).
+  // Track if any entry is costs-included (costs explicitly zeroed).
   // If even one entry was costsIncluded, the aggregated bucket should not be
   // repriced during mapping changes — we can't separate which tokens were billed
-  // by the gateway vs. which were priced from model metadata.
+  // by the route vs. which were priced from model metadata.
   let anyCostsIncluded = false;
   const serviceTiers = new Set<ChatUsageServiceTier | "standard">();
   let cacheCreate1hTokens = 0;
@@ -218,9 +218,9 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
   if (hasIncompleteCosts) {
     sum.hasUnknownCosts = true;
   }
-  // Preserve costsIncluded when any entry in the sum was gateway-billed.
+  // Preserve costsIncluded when any entry in the sum was costs-included.
   // Mixed buckets (some costsIncluded, some not) cannot be safely repriced
-  // because we can't separate which tokens were billed by the gateway.
+  // because we can't separate which tokens were billed by the route.
   if (anyCostsIncluded) {
     sum.costsIncluded = true;
   }

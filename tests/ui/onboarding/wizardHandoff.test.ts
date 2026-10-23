@@ -1,7 +1,7 @@
 /**
  * The onboarding wizard and the static first-run view (T3 #5971, C step 2, plan section 5.6).
- * The server will put a static copy of the wizard's gateway step in #xum-pre before the app JS runs.
- * The live wizard takes over in one commit. Without #xum-pre, the wizard must render exactly as before.
+ * The server will put a static copy of the wizard's providers step in #xum-pre before the app JS
+ * runs. The live wizard takes over in one commit. Without #xum-pre, the wizard must render exactly as before.
  */
 import "../dom";
 import React from "react";
@@ -33,26 +33,12 @@ jest.mock("@/browser/contexts/API", () => ({
   useAPI: () => ({ api: null }),
   useLiveAPI: () => null,
 }));
-jest.mock("@/browser/hooks/useRouting", () => ({
-  useRouting: () => ({ navigateToProject: jest.fn() }),
-}));
-jest.mock("@/browser/hooks/useMuxGatewayAccountStatus", () => ({
-  ...jest.requireActual<typeof import("@/browser/hooks/useMuxGatewayAccountStatus")>(
-    "@/browser/hooks/useMuxGatewayAccountStatus"
-  ),
-  useMuxGatewayAccountStatus: () => ({
-    data: null,
-    error: null,
-    isLoading: false,
-    refresh: jest.fn(),
-  }),
-}));
 
 import { OnboardingWizardSplash } from "@/browser/features/SplashScreens/OnboardingWizardSplash";
 
 // Steps are found by their key (data-onboarding-step), so rewording the copy does not break these tests.
 const LOADING_STEP = "loading";
-const GATEWAY_STEP = "mux-gateway";
+const PROVIDERS_STEP = "providers";
 
 const dialog = () => document.body.querySelector<HTMLElement>("[role=dialog]");
 const overlay = () => document.body.querySelector<HTMLElement>("[data-modal-dialog-overlay]");
@@ -71,7 +57,7 @@ afterEach(() => {
 });
 
 describe("the onboarding wizard without a static first-run view", () => {
-  test("shows its loading step, then the gateway step, with the dialog's entry animation", () => {
+  test("shows its loading step, then the providers step, with the dialog's entry animation", () => {
     mockProviders = { config: null, loading: true };
     const view = renderWizard();
     expect(shows(LOADING_STEP)).toBe(true);
@@ -83,7 +69,7 @@ describe("the onboarding wizard without a static first-run view", () => {
     mockProviders = { config: {}, loading: false };
     act(() => view.rerender(React.createElement(OnboardingWizardSplash, { onDismiss: jest.fn() })));
     expect(shows(LOADING_STEP)).toBe(false);
-    expect(shows(GATEWAY_STEP)).toBe(true);
+    expect(shows(PROVIDERS_STEP)).toBe(true);
     expect(animatesIn()).toBe(true);
     expect(dialog()?.style.animation).toBe("");
   });
@@ -94,7 +80,7 @@ describe("the onboarding wizard without a static first-run view", () => {
     fireEvent.click(
       Array.from(dialog()!.querySelectorAll("button")).find((b) => b.textContent === "Next")!
     );
-    expect(shows(GATEWAY_STEP)).toBe(false);
+    expect(shows(PROVIDERS_STEP)).toBe(false);
     expect(animatesIn()).toBe(true);
   });
 });
@@ -112,12 +98,12 @@ describe("the onboarding wizard under the static first-run view (#xum-pre)", () 
     document.body.append(view);
   });
 
-  test("never paints its loading step, and no commit shows the gateway step and the static view together", () => {
+  test("never paints its loading step, and no commit shows the providers step and the static view together", () => {
     // A Profiler's onRender runs in each commit of the wizard, after its layout effects and
     // before passive effects: the point where the browser would paint.
-    const viewAtGatewayCommit: boolean[] = [];
+    const viewAtProvidersCommit: boolean[] = [];
     const onRender = () => {
-      if (shows(GATEWAY_STEP)) viewAtGatewayCommit.push(firstRunView() != null);
+      if (shows(PROVIDERS_STEP)) viewAtProvidersCommit.push(firstRunView() != null);
     };
     const tree = () =>
       React.createElement(
@@ -132,8 +118,8 @@ describe("the onboarding wizard under the static first-run view (#xum-pre)", () 
 
     mockProviders = { config: {}, loading: false };
     act(() => view.rerender(tree()));
-    expect(viewAtGatewayCommit.length).toBeGreaterThan(0);
-    expect(viewAtGatewayCommit).not.toContain(true);
+    expect(viewAtProvidersCommit.length).toBeGreaterThan(0);
+    expect(viewAtProvidersCommit).not.toContain(true);
     expect(firstRunView()).toBeNull();
     // The static view showed this frame, so nothing animates in, until the user moves on.
     expect(dialog()?.style.animation).toBe("none");
@@ -144,12 +130,5 @@ describe("the onboarding wizard under the static first-run view (#xum-pre)", () 
     // The dialog and overlay stay open, so dropping their override would replay their entry.
     expect(dialog()?.style.animation).toBe("none");
     expect(overlay()?.style.animation).toBe("none");
-  });
-
-  test("removes the static view when it opens past the gateway step", () => {
-    mockProviders = { config: { anthropic: { isConfigured: true } }, loading: false };
-    renderWizard();
-    expect(shows(GATEWAY_STEP)).toBe(false);
-    expect(firstRunView()).toBeNull();
   });
 });

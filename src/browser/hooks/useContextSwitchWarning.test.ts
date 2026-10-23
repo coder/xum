@@ -386,7 +386,7 @@ describe("useContextSwitchWarning", () => {
   test("warns when gateway model strings are normalized for explicit switches", async () => {
     const previousModel = "anthropic:claude-sonnet-4-5";
     const nextModel = "openai:gpt-5.2-codex";
-    const gatewayModel = "mux-gateway:openai/gpt-5.2-codex";
+    const gatewayModel = "openrouter:openai/gpt-5.2-codex";
     const limit = getEffectiveContextLimit(nextModel, false);
     expect(limit).not.toBeNull();
     if (!limit) return;

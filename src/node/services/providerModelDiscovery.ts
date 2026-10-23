@@ -8,14 +8,10 @@ import {
   normalizeOpenAICompatibleBaseURL,
 } from "@/common/utils/providers/baseUrl";
 import type { CustomProviderType } from "@/common/utils/providers/customProviders";
-import {
-  COPILOT_MODEL_DISCOVERY_INTENT,
-  GATEWAY_MODEL_DISCOVERY_HEADERS,
-  MODEL_DISCOVERY_LIMITS,
-} from "@/constants/modelDiscovery";
+import { COPILOT_MODEL_DISCOVERY_INTENT, MODEL_DISCOVERY_LIMITS } from "@/constants/modelDiscovery";
 
 type Unavailable = Exclude<ProviderModelDiscoveryResult, { status: "ok" }>;
-type ModelListFormat = "openai" | "anthropic" | "google" | "ollama" | "openrouter" | "gateway";
+type ModelListFormat = "openai" | "anthropic" | "google" | "ollama" | "openrouter";
 export interface ModelDiscoveryRequest {
   readonly provider: string;
   readonly providerType?: CustomProviderType;
@@ -49,21 +45,7 @@ const OllamaPage = z.object({
   models: z.array(z.union([z.object({ name: ModelId }), z.object({ model: ModelId })])),
 });
 
-const GatewayPage = PageSchema.pick({ has_more: true, links: true }).extend({
-  models: z.array(z.object({ id: ModelId })),
-});
-
 function parsePage(body: unknown, format: ModelListFormat) {
-  if (format === "gateway") {
-    const page = GatewayPage.parse(body);
-    // SDK metadata has no pagination contract; never advertise a known partial catalog.
-    if (page.has_more || page.links?.next) throw new Error();
-    return {
-      count: page.models.length,
-      cursor: undefined,
-      ids: page.models.map((model) => model.id),
-    };
-  }
   if (format === "google") {
     const page = GooglePage.parse(body);
     return {
@@ -138,8 +120,7 @@ export async function discoverProviderModels(
         (request.provider === "openai" && /\/deployments(?:\/|$)/i.test(url.pathname)))
     )
       return { status: "unsupported" };
-    const resource =
-      request.format === "ollama" ? "tags" : request.format === "gateway" ? "config" : "models";
+    const resource = request.format === "ollama" ? "tags" : "models";
     url.pathname = `${url.pathname.replace(/\/+$/, "")}/${resource}`;
     // A cursor carried in the configured base would skip catalog pages and still
     // look complete; start from the first page and set cursors only from replies.
@@ -161,11 +142,6 @@ export async function discoverProviderModels(
       );
     if (request.provider === "openai" && request.organization)
       headers.set("OpenAI-Organization", request.organization);
-    if (request.format === "gateway") {
-      // Match SDK metadata header precedence without its cache or inference auto-logout wrapper.
-      for (const [key, value] of Object.entries(GATEWAY_MODEL_DISCOVERY_HEADERS))
-        headers.set(key, value);
-    }
     if (request.provider === "github-copilot") headers.set("accept", "application/json");
     for (const [key, value] of Object.entries(request.headers ?? {})) headers.set(key, value);
     if (request.provider === "github-copilot") {
