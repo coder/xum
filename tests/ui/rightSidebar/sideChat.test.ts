@@ -749,6 +749,9 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await Promise.all(
         refresh.mock.results.flatMap((result) => (result.type === "return" ? [result.value] : []))
       );
+      // More refreshes can start after that wait. The chats stay in the backend, so one that lands
+      // after the drop below re-emits a chat and its tab comes back (#7293). Stop them here.
+      refresh.mockImplementation(async () => undefined);
       // The close waits on its discard while one update (a reconnect's snapshot, say) drops both
       // chats. The chats stay in the backend: only the sidebar is under test.
       remove.mockImplementation(() => new Promise<never>(() => undefined));
@@ -788,6 +791,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await Promise.all(
         refresh.mock.results.flatMap((result) => (result.type === "return" ? [result.value] : []))
       );
+      // As above: no refresh starts after that wait (#7293).
+      refresh.mockImplementation(async () => undefined);
       // The real discard drops the chat's metadata, which unmounts its composer, and its reply
       // waits: focus has already left the sidebar when the close resolves.
       remove.mockImplementation(async (...args) => {
