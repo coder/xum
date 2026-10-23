@@ -14,7 +14,6 @@ import type { InitStateManager } from "@/node/services/initStateManager";
 import type { StreamManager } from "@/node/services/streamManager";
 import type { ProjectService } from "@/node/services/projectService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
-import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
 import type { CopilotOauthService } from "@/node/services/copilotOauthService";
@@ -91,7 +90,6 @@ export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
   workspaceService: WorkspaceService;
   taskService: TaskService;
   providerService: ProviderService;
-  muxGatewayOauthService: MuxGatewayOauthService;
   codexOauthService: CodexOauthService;
   coderOauthService: CoderOauthService;
   copilotOauthService: CopilotOauthService;

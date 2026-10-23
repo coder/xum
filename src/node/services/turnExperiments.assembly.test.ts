@@ -70,7 +70,6 @@ describe("turn experiments", () => {
           canonicalProviderName: "anthropic",
           canonicalModelId: HAIKU_MODEL.slice(HAIKU_MODEL.indexOf(":") + 1),
           wireProviderName: "anthropic",
-          routedThroughGateway: false,
         } satisfies ResolveAndCreateModelResult)
       );
       collector = createStreamCollector(env.orpc, workspaceId);

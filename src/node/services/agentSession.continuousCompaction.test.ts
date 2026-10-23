@@ -1714,7 +1714,7 @@ describe("AgentSession continuous compaction wiring", () => {
 
   test.each([
     { route: "coder", alias: true, wire: "responses", pro: true },
-    { route: "mux-gateway", alias: false, wire: "responses", pro: false },
+    { route: "openrouter", alias: false, wire: "responses", pro: false },
     { route: "openai", alias: false, wire: "responses", pro: true },
     { route: "openai", alias: false, wire: "chatCompletions", pro: false },
   ] as const)(

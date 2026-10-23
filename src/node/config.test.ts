@@ -90,7 +90,7 @@ describe("Config", () => {
         [""],
         ["  "],
         ["invalid"],
-        ["mux-gateway:openai"],
+        ["openai:"],
         [42, false, {}],
       ].map((hiddenModels) => ({ hiddenModels }))
     )("reopens preference recovery for malformed hides: %j", async ({ hiddenModels }) => {
@@ -5416,7 +5416,7 @@ describe("Config", () => {
         cfg.agentAiDefaults = {
           exec: { modelString: " openrouter:openai/gpt-5 ", thinkingLevel: "high" },
           worker: {
-            modelString: " mux-gateway:anthropic/claude-haiku-4-5 ",
+            modelString: " github-copilot:claude-haiku-4.5 ",
             thinkingLevel: "low",
           },
         };
@@ -5431,7 +5431,7 @@ describe("Config", () => {
       expect(raw.agentAiDefaults).toEqual({
         exec: { modelString: "openrouter:openai/gpt-5", thinkingLevel: "high" },
         worker: {
-          modelString: "mux-gateway:anthropic/claude-haiku-4-5",
+          modelString: "github-copilot:claude-haiku-4.5",
           thinkingLevel: "low",
         },
       });
@@ -5439,16 +5439,14 @@ describe("Config", () => {
       // non-built-in agents so old builds keep resolving delegated runs.
       expect(raw.subagentAiDefaults).toEqual({
         worker: {
-          modelString: "mux-gateway:anthropic/claude-haiku-4-5",
+          modelString: "github-copilot:claude-haiku-4.5",
           thinkingLevel: "low",
         },
       });
 
       const loaded = config.loadConfigOrDefault();
       expect(loaded.agentAiDefaults?.exec?.modelString).toBe("openrouter:openai/gpt-5");
-      expect(loaded.agentAiDefaults?.worker?.modelString).toBe(
-        "mux-gateway:anthropic/claude-haiku-4-5"
-      );
+      expect(loaded.agentAiDefaults?.worker?.modelString).toBe("github-copilot:claude-haiku-4.5");
       // The mirrored projection folds back into nothing: equal delegated
       // fields are pruned rather than frozen as overrides.
       expect(loaded.agentAiDefaults?.worker?.subagent).toBeUndefined();
@@ -5808,7 +5806,7 @@ describe("Config", () => {
           projects: [],
           routeOverrides: {
             "openrouter:anthropic/claude-opus-4-6": "direct",
-            "mux-gateway:anthropic/claude-opus-4-6": "openrouter",
+            "coder:anthropic/claude-opus-4-6": "openrouter",
           },
         })
       );
@@ -5842,191 +5840,6 @@ describe("Config", () => {
       expect(loaded.routePriority).toEqual(expectedPriority);
       expect(loaded.routeOverrides).toEqual(expectedOverrides);
       expect(loaded.apiServerPort).toBe(4000);
-    });
-  });
-
-  describe("legacy gateway migration preserves downgrade compatibility", () => {
-    const writeRawConfig = (value: Record<string, unknown>) => {
-      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(value));
-    };
-
-    const writeProvidersConfig = (value: Record<string, unknown>) => {
-      fs.writeFileSync(path.join(tempDir, "providers.jsonc"), JSON.stringify(value, null, 2));
-    };
-
-    const readRawConfig = () =>
-      JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        muxGatewayEnabled?: boolean;
-        muxGatewayModels?: string[];
-        routePriority?: string[];
-        routeOverrides?: Record<string, string>;
-      };
-
-    for (const { name, rawConfig, expectedOverrides } of [
-      {
-        name: "translates a single legacy allowlisted model into a mux-gateway routeOverride",
-        rawConfig: {
-          muxGatewayEnabled: true,
-          muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-        },
-        expectedOverrides: { "anthropic:claude-sonnet-4-6": "mux-gateway" },
-      },
-      {
-        name: "translates multiple legacy models and merges them with existing routeOverrides",
-        rawConfig: {
-          muxGatewayEnabled: true,
-          muxGatewayModels: ["anthropic:claude-sonnet-4-6", "openrouter:anthropic/claude-opus-4-6"],
-          routeOverrides: { "openai:gpt-4o": "direct" },
-        },
-        expectedOverrides: {
-          "openai:gpt-4o": "direct",
-          "anthropic:claude-sonnet-4-6": "mux-gateway",
-          "anthropic:claude-opus-4-6": "mux-gateway",
-        },
-      },
-      {
-        name: "keeps existing routeOverrides when a legacy model normalizes to the same canonical key",
-        rawConfig: {
-          muxGatewayEnabled: true,
-          muxGatewayModels: ["openrouter:anthropic/claude-opus-4-6"],
-          routeOverrides: { "anthropic:claude-opus-4-6": "openrouter" },
-        },
-        expectedOverrides: { "anthropic:claude-opus-4-6": "openrouter" },
-      },
-      {
-        name: "synthesizes direct-only priority when the legacy allowlist is empty",
-        rawConfig: { muxGatewayEnabled: true, muxGatewayModels: [] },
-        expectedOverrides: undefined,
-      },
-      {
-        name: "synthesizes direct-only priority when the legacy gateway flag is disabled",
-        rawConfig: {
-          muxGatewayEnabled: false,
-          muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-        },
-        expectedOverrides: undefined,
-      },
-    ] as const) {
-      it(name, () => {
-        writeRawConfig(rawConfig);
-
-        const loaded = config.loadConfigOrDefault();
-
-        expect(loaded.routePriority).toEqual(["direct"]);
-        if (expectedOverrides === undefined) {
-          expect(loaded.routeOverrides).toBeUndefined();
-        } else {
-          expect(loaded.routeOverrides).toEqual(expectedOverrides);
-        }
-      });
-    }
-
-    it("preserves legacy fields on disk alongside synthesized modern routing state", async () => {
-      writeRawConfig({
-        muxGatewayEnabled: true,
-        muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-      });
-      writeProvidersConfig({
-        "mux-gateway": { couponCode: "test-coupon" },
-      });
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.routePriority).toEqual(["mux-gateway", "direct"]);
-      expect(loaded.routeOverrides).toEqual({
-        "anthropic:claude-sonnet-4-6": "mux-gateway",
-      });
-
-      await flushConfigEdits();
-      expect(readRawConfig()).toMatchObject({
-        muxGatewayEnabled: true,
-        muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-        routePriority: ["mux-gateway", "direct"],
-        routeOverrides: {
-          "anthropic:claude-sonnet-4-6": "mux-gateway",
-        },
-      });
-    });
-
-    it("seeds routePriority from other configured gateways for legacy configs", () => {
-      writeRawConfig({
-        muxGatewayEnabled: true,
-        muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-      });
-      writeProvidersConfig({
-        openrouter: { apiKey: "test-openrouter-key" },
-      });
-
-      const loaded = config.loadConfigOrDefault();
-
-      expect(loaded.routePriority).toEqual(["openrouter", "direct"]);
-      expect(loaded.routeOverrides).toEqual({
-        "anthropic:claude-sonnet-4-6": "mux-gateway",
-      });
-    });
-
-    it("excludes mux-gateway from seeded priority when legacy muxGatewayEnabled is false", () => {
-      writeRawConfig({
-        muxGatewayEnabled: false,
-        muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-      });
-      writeProvidersConfig({
-        "mux-gateway": { couponCode: "test-coupon" },
-        openrouter: { apiKey: "test-openrouter-key" },
-      });
-
-      const loaded = config.loadConfigOrDefault();
-
-      expect(loaded.routePriority).toEqual(["openrouter", "direct"]);
-      expect(loaded.routeOverrides).toBeUndefined();
-    });
-
-    it("clears stale muxGatewayEnabled disables when routePriority already includes mux-gateway", async () => {
-      writeRawConfig({
-        muxGatewayEnabled: false,
-        routePriority: ["mux-gateway", "direct"],
-      });
-
-      const loaded = config.loadConfigOrDefault();
-
-      expect(loaded.routePriority).toEqual(["mux-gateway", "direct"]);
-      expect(loaded.muxGatewayEnabled).toBeUndefined();
-      await flushConfigEdits();
-      expect(readRawConfig().muxGatewayEnabled).toBeUndefined();
-      expect(new Config(tempDir).loadConfigOrDefault().muxGatewayEnabled).toBeUndefined();
-    });
-
-    it("does not rewrite configs that already include routePriority", () => {
-      const configFile = path.join(tempDir, "config.json");
-      fs.writeFileSync(
-        configFile,
-        JSON.stringify({
-          muxGatewayEnabled: true,
-          muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-          routePriority: ["openrouter", "direct"],
-          routeOverrides: {
-            "openai:gpt-4o": "direct",
-          },
-          // Without these flags the one-time default-fallbacks seeds would
-          // write the file, which is not the rewrite this test guards against.
-          migrations: {
-            defaultModelFallbacksSeeded: true,
-            defaultModelFallbacksSeededFable51: true,
-          },
-        })
-      );
-
-      const preservedTime = new Date("2000-01-01T00:00:00.000Z");
-      fs.utimesSync(configFile, preservedTime, preservedTime);
-      const beforeMtimeMs = fs.statSync(configFile).mtimeMs;
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.routePriority).toEqual(["openrouter", "direct"]);
-      expect(loaded.routeOverrides).toEqual({
-        "openai:gpt-4o": "direct",
-      });
-
-      const afterMtimeMs = fs.statSync(configFile).mtimeMs;
-      expect(afterMtimeMs).toBe(beforeMtimeMs);
     });
   });
 
@@ -6073,21 +5886,20 @@ describe("Config", () => {
 
     it("seeds routePriority on fresh installs when a gateway is configured", () => {
       writeProvidersConfig({
-        // mux-gateway is configured by couponCode/voucher rather than apiKey.
-        "mux-gateway": { couponCode: "test-coupon" },
+        openrouter: { apiKey: "test-openrouter-key" },
       });
 
       const loaded = config.loadConfigOrDefault();
-      const muxGatewayIndex = loaded.routePriority?.indexOf("mux-gateway") ?? -1;
+      const openrouterIndex = loaded.routePriority?.indexOf("openrouter") ?? -1;
       const directIndex = loaded.routePriority?.indexOf("direct") ?? -1;
 
-      expect(muxGatewayIndex).toBeGreaterThanOrEqual(0);
-      expect(directIndex).toBeGreaterThan(muxGatewayIndex);
+      expect(openrouterIndex).toBeGreaterThanOrEqual(0);
+      expect(directIndex).toBeGreaterThan(openrouterIndex);
     });
 
     it("does not seed routePriority when a configured gateway is disabled", () => {
       writeProvidersConfig({
-        "mux-gateway": { couponCode: "test-coupon", enabled: false },
+        openrouter: { apiKey: "test-openrouter-key", enabled: false },
       });
 
       const loaded = config.loadConfigOrDefault();
@@ -6115,8 +5927,7 @@ describe("Config", () => {
         JSON.stringify({ routePriority: ["direct"] })
       );
       writeProvidersConfig({
-        // mux-gateway is configured by couponCode/voucher rather than apiKey.
-        "mux-gateway": { couponCode: "test-coupon" },
+        openrouter: { apiKey: "test-openrouter-key" },
       });
 
       const loaded = config.loadConfigOrDefault();

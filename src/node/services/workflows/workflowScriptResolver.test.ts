@@ -7,6 +7,8 @@ import { describe, expect, spyOn, test } from "bun:test";
 
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
   createTestPluginInstallEntry,
@@ -138,6 +140,37 @@ describe("resolveWorkflowScript", () => {
     expect(resolved.resolvedPath).toBe(
       path.join(checkoutRoot, ".xum", "skills", "parent-flow", "workflow.js")
     );
+  });
+
+  test("a remote checkout's plugin skill runs its workflow script only in a trusted project (#6426)", async () => {
+    using tempDir = new TestTempDir("workflow-script-remote-plugin-skill");
+    const checkout = await fs.realpath(tempDir.path);
+    const pluginRoot = path.join(checkout, ".xum", "plugins", "kit");
+    const skillDir = path.join(pluginRoot, "skills", "flow");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(pluginRoot, "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "kit" })
+    );
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: flow\ndescription: d\n---\n");
+    await fs.writeFile(
+      path.join(skillDir, "workflow.js"),
+      "export default function RemoteFlow() {}\n"
+    );
+    const resolve = (projectTrusted: boolean) =>
+      resolveWorkflowScript({
+        scriptPath: "skill://flow/workflow.js",
+        runtime: new HostKeyShellRemoteRuntime(checkout, `workflow-remote-${projectTrusted}`),
+        workspacePath: checkout,
+        projectTrusted,
+      });
+
+    // Same rules as a plain remote .xum/skills workflow: project trust, then a live remote read.
+    const resolved = await resolve(true);
+    expect(resolved.source).toContain("RemoteFlow");
+    expect(resolved.resolvedPath).toBe(path.join(skillDir, "workflow.js"));
+    // Untrusted: the project's plugins are not even listed, so the skill does not exist.
+    await expect(resolve(false)).rejects.toThrow("not found");
   });
 
   test("blocks project skill workflow scripts when the project is untrusted", async () => {

@@ -179,7 +179,6 @@ export const AppConfigOnDiskSchema = z
     /** Apply agentResourceLimits. Absent = off; the limits stay saved while off. */
     agentResourceLimitsEnabled: z.boolean().optional(),
     chatTranscriptFullWidth: z.boolean().optional(),
-    muxGatewayEnabled: z.boolean().optional(),
     llmDebugLogs: z.boolean().optional(),
     /** Desktop only: hold a display-sleep blocker while any local agent is working. */
     keepScreenAwake: z.boolean().optional(),
@@ -198,7 +197,6 @@ export const AppConfigOnDiskSchema = z
       .optional(),
     goalDefaults: GoalDefaultsSchema.optional(),
     evaluationDefaults: EvaluationDefaultsSchema.optional(),
-    muxGatewayModels: z.array(z.string()).optional(),
     routePriority: z.array(z.string()).optional(),
     routeOverrides: z.record(z.string(), z.string()).optional(),
     /**

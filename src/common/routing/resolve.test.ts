@@ -50,17 +50,17 @@ function isModelAvailableForRoutes(options: {
 }
 
 describe("resolveRoute", () => {
-  test("walks route priority: mux-gateway, then openrouter, then direct", () => {
-    const routePriority = ["mux-gateway", "openrouter", "direct"];
+  test("walks route priority: bedrock, then openrouter, then direct", () => {
+    const routePriority = ["bedrock", "openrouter", "direct"];
 
     const firstConfigured = resolveRoute(
       MODEL,
       routePriority,
       {},
-      createIsConfigured(["mux-gateway", "openrouter", "anthropic"])
+      createIsConfigured(["bedrock", "openrouter", "anthropic"])
     );
-    expect(firstConfigured.routeProvider).toBe("mux-gateway");
-    expect(firstConfigured.routeModelId).toBe("anthropic/claude-opus-4-6");
+    expect(firstConfigured.routeProvider).toBe("bedrock");
+    expect(firstConfigured.routeModelId).toBe("anthropic.claude-opus-4-6");
 
     const secondConfigured = resolveRoute(
       MODEL,
@@ -144,15 +144,15 @@ describe("resolveRoute", () => {
     expect(resolved.routeModelId).toBe("openai/gpt-5");
   });
 
-  test("falls back from explicit gateway to mux-gateway when explicit is unconfigured", () => {
+  test("falls back from explicit gateway to another gateway when explicit is unconfigured", () => {
     const resolved = resolveRoute(
       EXPLICIT_GATEWAY_MODEL,
-      ["openrouter", "mux-gateway", "direct"],
+      ["openrouter", "coder", "direct"],
       {},
-      createIsConfigured(["mux-gateway"])
+      createIsConfigured(["coder"])
     );
 
-    expect(resolved.routeProvider).toBe("mux-gateway");
+    expect(resolved.routeProvider).toBe("coder");
     expect(resolved.routeModelId).toBe("openai/gpt-5");
   });
 
@@ -160,19 +160,19 @@ describe("resolveRoute", () => {
     const route = resolveRoute(
       EXPLICIT_GATEWAY_MODEL,
       ["direct"],
-      { "openai:gpt-5": "mux-gateway" },
-      createIsConfigured(["mux-gateway"])
+      { "openai:gpt-5": "coder" },
+      createIsConfigured(["coder"])
     );
 
     expect(route).not.toBeNull();
-    expect(route.routeProvider).toBe("mux-gateway");
+    expect(route.routeProvider).toBe("coder");
     expect(route.canonical).toBe("openai:gpt-5");
   });
 
   test("falls back to direct for explicit gateway when nothing is configured", () => {
     const resolved = resolveRoute(
       EXPLICIT_GATEWAY_MODEL,
-      ["openrouter", "mux-gateway", "direct"],
+      ["openrouter", "coder", "direct"],
       {},
       () => false
     );
@@ -197,9 +197,9 @@ describe("resolveRoute", () => {
   test("supports per-model override to specific gateway", () => {
     const resolved = resolveRoute(
       MODEL,
-      ["mux-gateway", "direct"],
+      ["bedrock", "direct"],
       { [MODEL]: "openrouter" },
-      createIsConfigured(["openrouter", "mux-gateway", "anthropic"])
+      createIsConfigured(["openrouter", "bedrock", "anthropic"])
     );
 
     expect(resolved.routeProvider).toBe("openrouter");
@@ -221,9 +221,9 @@ describe("resolveRoute", () => {
   test("direct override still resolves directly when origin is configured", () => {
     const resolved = resolveRoute(
       MODEL,
-      ["mux-gateway", "openrouter"],
+      ["bedrock", "openrouter"],
       { [MODEL]: "direct" },
-      createIsConfigured(["mux-gateway", "openrouter", "anthropic"])
+      createIsConfigured(["bedrock", "openrouter", "anthropic"])
     );
 
     expect(resolved.routeProvider).toBe("anthropic");
@@ -233,13 +233,13 @@ describe("resolveRoute", () => {
   test("direct override falls through when origin is not configured", () => {
     const resolved = resolveRoute(
       MODEL,
-      ["mux-gateway", "openrouter", "direct"],
+      ["bedrock", "openrouter", "direct"],
       { [MODEL]: "direct" },
-      createIsConfigured(["mux-gateway", "openrouter"])
+      createIsConfigured(["bedrock", "openrouter"])
     );
 
-    expect(resolved.routeProvider).toBe("mux-gateway");
-    expect(resolved.routeModelId).toBe("anthropic/claude-opus-4-6");
+    expect(resolved.routeProvider).toBe("bedrock");
+    expect(resolved.routeModelId).toBe("anthropic.claude-opus-4-6");
   });
 
   test("origin-name override falls through when origin is not configured", () => {
@@ -257,12 +257,12 @@ describe("resolveRoute", () => {
   test("falls through priority list when override gateway is unconfigured", () => {
     const resolved = resolveRoute(
       MODEL,
-      ["mux-gateway", "direct"],
+      ["bedrock", "direct"],
       { [MODEL]: "openrouter" },
-      createIsConfigured(["mux-gateway", "anthropic"])
+      createIsConfigured(["bedrock", "anthropic"])
     );
 
-    expect(resolved.routeProvider).toBe("mux-gateway");
+    expect(resolved.routeProvider).toBe("bedrock");
   });
 
   test("empty overrides ignores per-model override and walks priority list", () => {
@@ -312,7 +312,7 @@ describe("resolveRoute", () => {
   });
 
   test("falls back to direct when nothing is configured", () => {
-    const resolved = resolveRoute(MODEL, ["mux-gateway", "openrouter", "direct"], {}, () => false);
+    const resolved = resolveRoute(MODEL, ["bedrock", "openrouter", "direct"], {}, () => false);
 
     expect(resolved.routeProvider).toBe("anthropic");
     expect(resolved.routeModelId).toBe("claude-opus-4-6");
@@ -366,8 +366,8 @@ describe("isModelAvailable", () => {
     expect(
       isModelAvailableForRoutes({
         modelId: EXPLICIT_GATEWAY_MODEL,
-        configuredProviders: ["mux-gateway"],
-        routePriority: ["openrouter", "mux-gateway", "direct"],
+        configuredProviders: ["coder"],
+        routePriority: ["openrouter", "coder", "direct"],
       })
     ).toBe(true);
   });
@@ -461,7 +461,7 @@ describe("isModelAvailable", () => {
       isModelAvailableForRoutes({
         modelId: MODEL,
         configuredProviders: [],
-        routePriority: ["mux-gateway", "openrouter", "direct"],
+        routePriority: ["bedrock", "openrouter", "direct"],
       })
     ).toBe(false);
   });
@@ -469,9 +469,9 @@ describe("isModelAvailable", () => {
     expect(
       isModelAvailableForRoutes({
         modelId: EXPLICIT_GATEWAY_MODEL,
-        configuredProviders: ["mux-gateway"],
+        configuredProviders: ["coder"],
         routePriority: ["direct"],
-        routeOverrides: { "openai:gpt-5": "mux-gateway" },
+        routeOverrides: { "openai:gpt-5": "coder" },
       })
     ).toBe(true);
   });
@@ -486,12 +486,12 @@ describe("isModelAvailable", () => {
     ).toBe(true);
   });
 
-  test("explicit bedrock model falls back to mux-gateway when bedrock is unconfigured", () => {
+  test("explicit bedrock model falls back to another gateway when bedrock is unconfigured", () => {
     expect(
       isModelAvailableForRoutes({
         modelId: "bedrock:anthropic.claude-opus-4-6",
-        configuredProviders: ["mux-gateway"],
-        routePriority: ["mux-gateway", "direct"],
+        configuredProviders: ["openrouter"],
+        routePriority: ["openrouter", "direct"],
       })
     ).toBe(true);
   });
@@ -502,11 +502,6 @@ describe("availableRoutes", () => {
     const routes = availableRoutes(OPENAI_MODEL, createIsConfigured(["github-copilot"]));
 
     expect(routes).toEqual([
-      {
-        route: "mux-gateway",
-        displayName: "Xum Gateway",
-        isConfigured: false,
-      },
       {
         route: "openrouter",
         displayName: "OpenRouter",
@@ -569,11 +564,6 @@ describe("availableRoutes", () => {
 
     expect(routes).toEqual([
       {
-        route: "mux-gateway",
-        displayName: "Xum Gateway",
-        isConfigured: false,
-      },
-      {
         route: "openrouter",
         displayName: "OpenRouter",
         isConfigured: true,
@@ -624,11 +614,6 @@ describe("availableRoutes", () => {
     );
 
     expect(routes).toEqual([
-      {
-        route: "mux-gateway",
-        displayName: "Xum Gateway",
-        isConfigured: false,
-      },
       {
         route: "openrouter",
         displayName: "OpenRouter",
