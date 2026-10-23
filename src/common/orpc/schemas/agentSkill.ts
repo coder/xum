@@ -33,7 +33,10 @@ export const AgentSkillFrontmatterSchema = z.object({
   description: z.string().min(1).max(1024),
   license: z.string().optional(),
   compatibility: z.string().min(1).max(500).optional(),
-  metadata: z.record(z.string(), z.string()).optional(),
+  // agentskills.io says string values, but skills-ref (the spec's own validator)
+  // accepts any value. Xum only displays metadata, so a nested value must not
+  // hide the skill (warpdotdev/common-skills merge-risk uses metadata.credits).
+  metadata: z.record(z.string(), z.unknown()).optional(),
 
   // When false, skill is NOT listed in the tool description's skill index.
   // Unadvertised skills can still be invoked via /skill-name or agent_skill_read({ name: "skill-name" }).

@@ -51,6 +51,32 @@ Body
     expect(result.frontmatter.description).toBe("Hello");
   });
 
+  test("accepts non-string metadata values (nested maps, numbers)", () => {
+    // Shape from warpdotdev/common-skills merge-risk, plus an unquoted version number.
+    const content = `---
+name: merge-risk
+description: Use when assessing the risk of merging a PR
+metadata:
+  version: 1.0
+  credits:
+    skill: pr
+    author: Matt Pocock
+---
+Body
+`;
+
+    const result = parseSkillMarkdown({
+      content,
+      byteSize: Buffer.byteLength(content, "utf-8"),
+      directoryName: SkillNameSchema.parse("merge-risk"),
+    });
+
+    expect(result.frontmatter.metadata).toEqual({
+      version: 1,
+      credits: { skill: "pr", author: "Matt Pocock" },
+    });
+  });
+
   test("parses advertise field in frontmatter", () => {
     const content = `---
 name: internal-skill
