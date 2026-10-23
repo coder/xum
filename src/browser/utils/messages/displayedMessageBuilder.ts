@@ -58,32 +58,6 @@ export function hasFailureResult(result: unknown): boolean {
   return false;
 }
 
-export function resolveRouteProvider(
-  routeProvider: string | undefined,
-  routedThroughGateway: boolean | undefined
-): string | undefined {
-  return routeProvider ?? (routedThroughGateway === true ? "mux-gateway" : undefined);
-}
-
-export function normalizeMessageRouteProvider(message: MuxMessage): MuxMessage {
-  const routeProvider = resolveRouteProvider(
-    message.metadata?.routeProvider,
-    message.metadata?.routedThroughGateway
-  );
-
-  if (!message.metadata || routeProvider === message.metadata.routeProvider) {
-    return message;
-  }
-
-  return {
-    ...message,
-    metadata: {
-      ...message.metadata,
-      routeProvider,
-    },
-  };
-}
-
 /**
  * Merge adjacent text/reasoning parts using array accumulation + join().
  * Avoids O(n²) string allocations from repeated concatenation.
@@ -570,11 +544,7 @@ function appendAssistantTextRow(
     isCompacted: !!message.metadata?.compacted,
     isIdleCompacted: message.metadata?.compacted === "idle",
     model: message.metadata?.model,
-    routedThroughGateway: message.metadata?.routedThroughGateway,
-    routeProvider: resolveRouteProvider(
-      message.metadata?.routeProvider,
-      message.metadata?.routedThroughGateway
-    ),
+    routeProvider: message.metadata?.routeProvider,
     modelFallback: message.metadata?.modelFallback,
     autoModelRouting: message.metadata?.autoModelRouting,
     mode: message.metadata?.mode,
@@ -762,7 +732,6 @@ function appendStreamErrorRows(
       errorType,
       historySequence: options.historySequence,
       model: options.message.metadata?.model,
-      routedThroughGateway: options.message.metadata?.routedThroughGateway,
       timestamp: options.baseTimestamp,
     });
   };

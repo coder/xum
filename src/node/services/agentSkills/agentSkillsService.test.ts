@@ -17,6 +17,7 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
+import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
@@ -2177,6 +2178,60 @@ describe("agentSkillsService agent plugins", () => {
         readAgentSkill(runtime, checkout.path, SkillNameSchema.parse("checkout-plugin-skill"))
       ).rejects.toThrow("not found");
     });
+  });
+
+  test("a trusted remote checkout's plugin skills load from one cached listing, with remote paths", async () => {
+    using checkoutDir = new DisposableTempDir("agent-skills-remote-checkout-plugins");
+    const checkout = await fs.realpath(checkoutDir.path);
+    const pluginDir = await writePlugin(path.join(checkout, ".xum", "plugins"), "kit", [
+      { name: "kit-skill", description: "from the remote checkout" },
+    ]);
+    // A skill folder that links outside its plugin (still inside the checkout) is refused.
+    await writeSkill(path.join(checkout, "outside"), "evil", "escapes the plugin");
+    await fs.symlink(
+      path.join(checkout, "outside", "evil"),
+      path.join(pluginDir, "skills", "evil")
+    );
+    const runtime = new HostKeyShellRemoteRuntime(checkout, "skills-remote-plugins");
+    const trusted = { projectPluginsTrusted: true } as const;
+
+    const first = await discoverAgentSkills(runtime, checkout, trusted);
+    expect(first.skills.find((skill) => skill.name === "kit-skill")).toMatchObject({
+      scope: "project",
+      pluginName: "kit",
+      description: "from the remote checkout",
+    });
+    expect(first.skills.some((skill) => skill.name === "evil")).toBe(false);
+    await discoverAgentSkills(runtime, checkout, trusted);
+    const resolved = await readAgentSkill(
+      runtime,
+      checkout,
+      SkillNameSchema.parse("kit-skill"),
+      trusted
+    );
+    expect(resolved).toMatchObject({
+      skillDir: path.join(pluginDir, "skills", "kit-skill"),
+      pluginRoot: pluginDir,
+      sourceRuntime: runtime,
+    });
+    expect(resolved.pluginFs).toBeDefined();
+    // Discovery twice and a read by name cost one listing: later reads use the snapshot.
+    expect(runtime.pluginListings).toBe(1);
+
+    // Untrusted, or trusted with the kill switch on: no remote plugin skills and no listing.
+    const untrusted = new HostKeyShellRemoteRuntime(checkout, "skills-remote-untrusted");
+    const { skills } = await discoverAgentSkills(untrusted, checkout);
+    expect(skills.some((skill) => skill.name === "kit-skill")).toBe(false);
+    const previous = process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+    process.env[DISABLE_PROJECT_AUTOMATION_ENV] = "1";
+    try {
+      const killed = await discoverAgentSkills(untrusted, checkout, trusted);
+      expect(killed.skills.some((skill) => skill.name === "kit-skill")).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+      else process.env[DISABLE_PROJECT_AUTOMATION_ENV] = previous;
+    }
+    expect(untrusted.pluginListings).toBe(0);
   });
 
   test("remote runtimes with an in-runtime global root honor host plugin import receipts", async () => {

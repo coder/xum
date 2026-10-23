@@ -1578,10 +1578,10 @@ export class TurnRequestBuilder {
         return { modelString: raw };
       }
       if (!effective.startsWith("coder:")) {
-        // Fallback away from Coder. A PASSTHROUGH gateway fallback
-        // (mux-gateway:anthropic/x) must normalize to the canonical wire
-        // identity: getToolsForModel only runs Anthropic/OpenAI-specific
-        // assembly (native web tools, MCP schema sanitization) for direct
+        // Fallback away from Coder. A PASSTHROUGH gateway fallback must
+        // normalize to the canonical wire identity: getToolsForModel only runs
+        // Anthropic/OpenAI-specific assembly (native web tools, MCP schema
+        // sanitization) for direct
         // provider prefixes, and passthrough gateways forward origin-shaped
         // payloads. Transforming gateways (openrouter) keep their own
         // identity, same as a direct selection of that gateway.
@@ -1813,7 +1813,6 @@ export class TurnRequestBuilder {
       canonicalModelString,
       canonicalProviderName,
       wireProviderName,
-      routedThroughGateway,
       routeProvider,
       providersConfig: requestProvidersConfig,
       effectiveThinkingLevel,
@@ -3753,7 +3752,6 @@ export class TurnRequestBuilder {
         ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
         timestamp: Date.now(),
         model: canonicalModelString,
-        routedThroughGateway,
         systemMessageTokens,
         agentId: effectiveAgentId,
       });
@@ -3827,7 +3825,6 @@ export class TurnRequestBuilder {
           workspaceId,
           assistantMessageId,
           canonicalModelString,
-          routedThroughGateway,
           ...(routeProvider != null ? { routeProvider } : {}),
           historySequence,
           systemMessageTokens,
@@ -4080,7 +4077,6 @@ export class TurnRequestBuilder {
                     nextRequest.rebuildProviderOptionsForThinkingLevel,
                   providersConfig: nextRequest.providersConfig,
                   initialMetadataPatch: {
-                    routedThroughGateway: nextRequest.routedThroughGateway,
                     ...(nextRequest.routeProvider != null
                       ? { routeProvider: nextRequest.routeProvider }
                       : {}),
@@ -4118,7 +4114,6 @@ export class TurnRequestBuilder {
           // Where this request sent the volatile system tail, so the next rebuild repeats it.
           ...volatileSystemTailMetadata(streamVolatileSystemTail),
           ...(legacyModeForMetadata != null ? { mode: legacyModeForMetadata } : {}),
-          routedThroughGateway,
           ...(routeProvider != null ? { routeProvider } : {}),
           ...(muxMetadata !== undefined ? { muxMetadata } : {}),
           ...(acpPromptId != null ? { acpPromptId } : {}),

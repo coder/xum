@@ -722,8 +722,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
   let agentAiDefaults = normalizeAgentAiDefaults(initialAgentAiDefaults ?? {});
 
-  let muxGatewayEnabled: boolean | undefined = undefined;
-  let muxGatewayModels: string[] | undefined = undefined;
   let coderWorkspaceArchiveBehavior = initialCoderWorkspaceArchiveBehavior;
   let worktreeArchiveBehavior = initialWorktreeArchiveBehavior;
   let chatTranscriptFullWidth = initialChatTranscriptFullWidth;
@@ -961,8 +959,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         Promise.resolve({
           userPreferences,
           taskSettings,
-          muxGatewayEnabled,
-          muxGatewayModels,
           routePriority,
           routeOverrides,
           coderWorkspaceArchiveBehavior,
@@ -1060,15 +1056,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             ...(chosen.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
           },
         });
-      },
-      updateMuxGatewayPrefs: (input: {
-        muxGatewayEnabled: boolean;
-        muxGatewayModels: string[];
-      }) => {
-        muxGatewayEnabled = input.muxGatewayEnabled ? undefined : false;
-        muxGatewayModels = input.muxGatewayModels.length > 0 ? input.muxGatewayModels : undefined;
-        notifyConfigChanged();
-        return Promise.resolve(undefined);
       },
       updateRoutePreferences: (input: {
         routePriority: string[];
@@ -1274,16 +1261,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         Promise.resolve(searchModelCatalog(input)),
       setProviderConfig: () => Promise.resolve({ success: true, data: undefined }),
       setModels: () => Promise.resolve({ success: true, data: undefined }),
-    },
-    muxGateway: {
-      getAccountStatus: () =>
-        Promise.resolve({
-          success: true,
-          data: {
-            remaining_microdollars: 134_598_127,
-            ai_gateway_concurrent_requests_per_user: 20,
-          },
-        }),
     },
     analytics: {
       getDelegationSummary: (_input: {

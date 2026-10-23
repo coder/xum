@@ -25,7 +25,6 @@ import type {
   BedrockProviderConfig,
   CoderProviderConfig,
   GoogleVertexProviderConfig,
-  MuxGatewayProviderConfig,
   OpenAIProviderConfig,
 } from "@/common/config/schemas/providersConfig";
 import type { ProviderConfig, ProvidersConfig } from "@/node/config";
@@ -180,7 +179,6 @@ type ProviderSpecificCredentialFields = Partial<
     BedrockProviderConfig,
     "region" | "profile" | "bearerToken" | "accessKeyId" | "secretAccessKey"
   > &
-    Pick<MuxGatewayProviderConfig, "couponCode" | "voucher"> &
     Pick<OpenAIProviderConfig, "organization"> &
     Pick<CoderProviderConfig, "deploymentUrl"> &
     Pick<GoogleVertexProviderConfig, "project" | "location" | "keyFilename"> & {
@@ -202,7 +200,7 @@ export type ProviderConfigRaw = Omit<ProviderConfig, "enabled" | "models"> & {
 export interface ResolvedCredentials {
   isConfigured: boolean;
   /** What's missing, if not configured (for error messages) */
-  missingRequirement?: "api_key" | "region" | "coupon_code" | "coder_login" | "project";
+  missingRequirement?: "api_key" | "region" | "coder_login" | "project";
 
   // Resolved credential values - aiService uses these directly
   apiKey?: string; // anthropic, openai, etc.
@@ -211,7 +209,6 @@ export interface ResolvedCredentials {
   location?: string; // google-vertex
   keyFilename?: string; // google-vertex ADC key file (config path home-expanded, else env), ADC mode only
   keyFilenameSource?: "config" | "env";
-  couponCode?: string; // mux-gateway
   deploymentUrl?: string; // coder
   baseUrl?: string; // runtime value from config or env when API-key auth is active
   baseUrlResolved?: string; // display-only metadata, including when API key auth is missing
@@ -420,14 +417,6 @@ export function resolveProviderCredentials(
 
   if (provider === "google-vertex") {
     return resolveGoogleVertexCredentials(config, env);
-  }
-
-  // Xum Gateway: coupon code required (no env var support)
-  if (provider === "mux-gateway") {
-    const couponCode = config.couponCode ?? config.voucher;
-    return couponCode
-      ? { isConfigured: true, couponCode }
-      : { isConfigured: false, missingRequirement: "coupon_code" };
   }
 
   // Coder: deployment URL + OAuth tokens from "Login with Coder" required
