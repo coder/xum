@@ -1197,6 +1197,7 @@
         "src/browser/stories/**",
         "src/**/*StoryUtils.tsx",
         "**/*.testHarness.ts",
+        "**/*.hostProof.ts",
         "src/**/test[A-Z]*.ts"
       ],
       "rules": {
@@ -1358,6 +1359,7 @@
         "**/*.stories.tsx",
         "src/browser/stories/**",
         "**/*.testHarness.ts",
+        "**/*.hostProof.ts",
         "src/**/test[A-Z]*.ts"
       ],
       "jsPlugins": [
@@ -1401,6 +1403,7 @@
         "**/*.test.tsx",
         "tests/**/*.{ts,tsx}",
         "src/**/*.testHarness.{ts,tsx}",
+        "src/**/*.hostProof.ts",
         "src/**/*.testUtils.{ts,tsx}",
         "src/**/test[A-Z]*.{ts,tsx}"
       ],
