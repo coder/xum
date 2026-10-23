@@ -794,6 +794,56 @@ describe("replayVerifySession pairing", () => {
     );
   });
 
+  test("a Tool: section change replays from the toolInstructions record", async () => {
+    // F31: inside a segment the tool descriptions keep the frozen Tool: text and a row sends
+    // the change. Replay has no tools, so it must rebuild that row from the record alone.
+    using tmp = new DisposableTempDir("replay-verify-tool-instructions");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    const bashTools = (rule: string): Record<string, Tool> => ({
+      bash: tool({
+        description: `Run a command\n\n${rule}`,
+        inputSchema: z.object({ script: z.string() }),
+      }),
+    });
+    for (const [index, rule] of ["Use rg.", "Use fd.", "Use fd."].entries()) {
+      await appendReplayFixtureTurn(ctx, {
+        userText: `Turn ${index + 1}.`,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: bashTools(rule),
+        liveToolInstructions: { bash: rule },
+      });
+    }
+
+    const result = await verify(ctx);
+    expect(
+      result.turns.map((turn) => ({ status: turn.status, messagesMatch: turn.messagesMatch }))
+    ).toEqual([
+      { status: "PASS", messagesMatch: true },
+      { status: "PASS", messagesMatch: true },
+      { status: "PASS", messagesMatch: true },
+    ]);
+
+    // Guard against a vacuous pass: turn 2 recorded a row with the new text, and its wire
+    // tool description kept the frozen one.
+    const history = await collectFullHistory(ctx.historyService, ctx.workspaceId);
+    if (!history.success) throw new Error(history.error);
+    expect(
+      history.data.find((row) => row.id === "assistant-2")?.metadata?.toolInstructions
+    ).toMatchObject({ placement: "row" });
+    const devtoolsRaw = await fs.readFile(`${tmp.path}/devtools.jsonl`, "utf-8");
+    const second = devtoolsRaw
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as { type?: string; step?: DevToolsStep })
+      .find((entry) => entry.type === "step" && entry.step?.runId === "run-2")?.step;
+    expect(JSON.stringify(second?.input?.prompt)).toContain(
+      '<tool-instructions tool=\\"bash\\">\\nUse fd.'
+    );
+    expect(JSON.stringify(second?.input?.tools)).toContain("Run a command\\n\\nUse rg.");
+    expect(JSON.stringify(second?.input?.tools)).not.toContain("Use fd.");
+  });
+
   test("a split volatile system tail is log-derivable", async () => {
     using tmp = new DisposableTempDir("replay-verify-volatile-system");
     const ctx = createReplayFixtureSessionContext(tmp.path);
