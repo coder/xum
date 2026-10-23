@@ -94,7 +94,8 @@ window.xum.openWorkspace("a1b2c3d4e5"); // switches Xum to that workspace
 ```
 
 - Call `send` from a click or key handler. Then Xum sends the message at once. If the send fails, Xum shows the text and the error above the artifact, with **Send** and **Dismiss**.
-- A `send` with no click, or a second `send` within 5 seconds of the first, does not send on its own. Xum shows the text above the artifact with **Send** and **Dismiss**. Only your click or the Send shortcut sends it, and Send waits a moment after the message appears.
+- A `send` that comes within a few seconds of your click or key in the artifact, also from a timer, counts as a click. Only one such `send` goes out at once in 5 seconds.
+- A `send` with no recent click or key in the artifact, or the second `send` within those 5 seconds, does not send on its own. Xum shows the text above the artifact with **Send** and **Dismiss**. Only your click or the Send shortcut sends it, and Send waits a moment after the message appears.
 - A sent message arrives as your message, labeled "from artifact". If the agent is busy, it arrives at the next tool step. A message you sent survives an app restart, even if it was still waiting for the agent. A message you have not sent yet does not.
 - `setState` saves a small JSON value for the artifact. A new version keeps it. The agent sees it in `artifact_list`.
 - `openWorkspace` switches Xum to the workspace with that ID. A task ID from the `task` tool works too, for a sub-agent or a workspace task. Call it from a click or key handler: Xum ignores it unless you just clicked or typed inside the artifact. For an unknown or archived workspace, nothing switches and Xum shows a short notice above the artifact. The artifact never gets an answer, and no workspace list or title reaches it. Pinned files and shelf copies cannot switch workspaces.
