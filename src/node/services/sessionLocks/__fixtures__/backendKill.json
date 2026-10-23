@@ -1,0 +1,62 @@
+{
+  "atKill": {
+    "rows": [
+      {
+        "role": "user",
+        "id": "id0",
+        "historySequence": 0,
+        "partial": false,
+        "error": false,
+        "parts": ["text"]
+      },
+      {
+        "role": "assistant",
+        "id": "id1",
+        "historySequence": 1,
+        "partial": false,
+        "error": false,
+        "parts": []
+      }
+    ],
+    "partial": {
+      "role": "assistant",
+      "id": "id1",
+      "historySequence": 1,
+      "partial": true,
+      "error": false,
+      "parts": ["text"]
+    },
+    "locks": ["history-<h32>.lock", "workspace-use/<h64>/<lease0>.turn.lock"]
+  },
+  "recovered": {
+    "rows": [
+      {
+        "role": "user",
+        "id": "id0",
+        "historySequence": 0,
+        "partial": false,
+        "error": false,
+        "parts": ["text"]
+      },
+      {
+        "role": "assistant",
+        "id": "id1",
+        "historySequence": 1,
+        "partial": true,
+        "error": false,
+        "parts": ["text"]
+      },
+      {
+        "role": "assistant",
+        "id": "id1",
+        "historySequence": 2,
+        "partial": false,
+        "error": false,
+        "parts": []
+      }
+    ],
+    "partial": null,
+    "locks": ["workspace-use/<h64>/<lease0>.turn.lock"]
+  },
+  "retryTextLength": 17376
+}

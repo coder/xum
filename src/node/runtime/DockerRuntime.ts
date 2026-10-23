@@ -200,6 +200,19 @@ function buildCredentialArgs(): string[] {
 }
 
 /**
+ * #6426: how often this process created or deleted each container name. Module level, because a
+ * runtime object is made per call. It is part of getAgentHostKey, so a container that Xum created
+ * again under the same name never reuses the cached plugin snapshot of the old one, and no docker
+ * process runs to tell them apart. Bumped AFTER each create attempt and removal: a snapshot is
+ * keyed when its read starts, so a read that raced the change keeps the old key.
+ */
+const containerGenerations = new Map<string, number>();
+
+function bumpContainerGeneration(containerName: string): void {
+  containerGenerations.set(containerName, (containerGenerations.get(containerName) ?? 0) + 1);
+}
+
+/**
  * Run docker run with streaming output (for image pull progress).
  * Streams stdout/stderr to initLogger for visibility during image pulls.
  */
@@ -345,6 +358,17 @@ export class DockerRuntime extends RemoteRuntime {
   // ===== RemoteRuntime abstract method implementations =====
 
   protected readonly commandPrefix = "Docker";
+
+  override getAgentHostKey(): string | undefined {
+    // Without a name the container is not known yet.
+    return this.containerName !== undefined
+      ? JSON.stringify([
+          "docker",
+          this.containerName,
+          containerGenerations.get(this.containerName) ?? 0,
+        ])
+      : undefined;
+  }
 
   protected getBasePath(): string {
     return CONTAINER_SRC_DIR;
@@ -552,7 +576,7 @@ export class DockerRuntime extends RemoteRuntime {
     }
 
     // Do NOT delete container on hook failure - user can debug.
-    return runWorkspaceInitHook({
+    const result = await runWorkspaceInitHook({
       params,
       runtimeType: "docker",
       findHookRelativePath: () => findInitHookRelativePath(this, params.workspacePath),
@@ -568,6 +592,9 @@ export class DockerRuntime extends RemoteRuntime {
         );
       },
     });
+    // #6426: the checkout is populated now; a snapshot read while it was being made is stale.
+    bumpContainerGeneration(this.containerName);
+    return result;
   }
 
   /**
@@ -750,6 +777,8 @@ export class DockerRuntime extends RemoteRuntime {
       abortSignal,
       shareCredentials: this.config.shareCredentials,
     });
+    // #6426: after the attempt (even a failed run can leave a container under this name).
+    bumpContainerGeneration(containerName);
     if (runResult.exitCode !== 0) {
       await runDockerCommand(`rm -f ${containerName}`, 10000);
       throw new Error(`Failed to create container: ${runResult.stderr}`);
@@ -972,6 +1001,7 @@ export class DockerRuntime extends RemoteRuntime {
       if (inspectResult.exitCode !== 0) {
         // Only treat as "doesn't exist" if Docker says so
         if (inspectResult.stderr.toLowerCase().includes("no such object")) {
+          bumpContainerGeneration(containerName);
           return { success: true, deletedPath };
         }
         return {
@@ -1040,6 +1070,7 @@ export class DockerRuntime extends RemoteRuntime {
 
       // Stop and remove container
       const rmResult = await runDockerCommand(`rm -f ${containerName}`, 30000);
+      bumpContainerGeneration(containerName);
 
       if (rmResult.exitCode !== 0) {
         return {
@@ -1137,6 +1168,7 @@ export class DockerRuntime extends RemoteRuntime {
       dockerArgs.push(this.config.image, "sleep", "infinity");
       throwIfAborted();
       const runResult = await runContainerSpawnCommand(dockerArgs, 60000, abortSignal);
+      bumpContainerGeneration(destContainerName);
       if (runResult.exitCode !== 0) {
         // Handle TOCTOU race - container may have been created between check and run
         if (runResult.stderr.includes("already in use")) {
@@ -1292,6 +1324,8 @@ export class DockerRuntime extends RemoteRuntime {
       forkSucceeded = true;
       // Update containerName so subsequent initWorkspace() targets the forked container
       this.containerName = destContainerName;
+      // #6426: the clone is complete; a snapshot read while it was cloning is stale.
+      bumpContainerGeneration(destContainerName);
       return { success: true, workspacePath: CONTAINER_SRC_DIR, sourceBranch };
     } catch (error) {
       return { success: false, error: getErrorMessage(error) };

@@ -251,7 +251,7 @@ describe("turn.stop", () => {
     // Tool events send the raw provider-qualified string (gateway prefix kept): Stop matches it.
     const calls: StopCall[] = [];
     addConsumer(() => undefined, calls);
-    const gateway = "mux-gateway:anthropic/claude-haiku-4-5";
+    const gateway = "openrouter:anthropic/claude-haiku-4-5";
     const { h } = await setup();
 
     await h.session.sendMessage("fix the tests", { ...options, model: gateway });

@@ -1047,15 +1047,18 @@ describe("createOrpcServer", () => {
   });
 
   test("includes app-proxy base paths in OAuth redirect and callback return URLs", async () => {
-    let muxGatewayRedirectUri = "";
+    const redirectUris: string[] = [];
     const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
+      coderOauthService: {
         startServerFlow: (input: { redirectUri: string }) => {
-          muxGatewayRedirectUri = input.redirectUri;
-          return { authorizeUrl: "https://gateway.example.com/auth", state: "state-gateway" };
+          redirectUris.push(input.redirectUri);
+          return Promise.resolve({
+            success: true,
+            data: { flowId: "flow", authorizeUrl: "https://coder.test/authorize" },
+          });
         },
-        handleServerCallbackAndExchange: () => Promise.resolve({ success: true, data: undefined }),
-      } as unknown as ORPCContext["muxGatewayOauthService"],
+        handleServerCallback: () => Promise.resolve({ success: true, data: undefined }),
+      } as unknown as ORPCContext["coderOauthService"],
     };
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
 
@@ -1067,19 +1070,20 @@ describe("createOrpcServer", () => {
         authToken: "test-token",
       });
 
-      const startResponse = await fetch(`${server.baseUrl}/auth/mux-gateway/start`, {
-        headers: {
-          Authorization: "Bearer test-token",
-          "X-Forwarded-Prefix": APP_PROXY_BASE_PATH,
-        },
-      });
-      expect(startResponse.status).toBe(200);
-      expect(muxGatewayRedirectUri).toBe(
-        `${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/mux-gateway/callback`
+      const startResponse = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test`,
+        {
+          headers: {
+            Authorization: "Bearer test-token",
+            "X-Forwarded-Prefix": APP_PROXY_BASE_PATH,
+          },
+        }
       );
+      expect(startResponse.status).toBe(200);
+      expect(redirectUris).toEqual([`${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/coder/callback`]);
 
       const callbackResponse = await fetch(
-        `${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/mux-gateway/callback?state=test&code=test`
+        `${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/coder/callback?state=test&code=test`
       );
       expect(callbackResponse.status).toBe(200);
       const callbackHtml = await callbackResponse.text();
@@ -1296,15 +1300,17 @@ describe("createOrpcServer", () => {
   });
 
   test("uses HTTPS redirect URIs for OAuth start routes when allowHttpOrigin is enabled", async () => {
-    let muxGatewayRedirectUri = "";
-
+    const redirectUris: string[] = [];
     const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
+      coderOauthService: {
         startServerFlow: (input: { redirectUri: string }) => {
-          muxGatewayRedirectUri = input.redirectUri;
-          return { authorizeUrl: "https://gateway.example.com/auth", state: "state-gateway" };
+          redirectUris.push(input.redirectUri);
+          return Promise.resolve({
+            success: true,
+            data: { flowId: "flow", authorizeUrl: "https://coder.test/authorize" },
+          });
         },
-      } as unknown as ORPCContext["muxGatewayOauthService"],
+      } as unknown as ORPCContext["coderOauthService"],
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1325,29 +1331,30 @@ describe("createOrpcServer", () => {
         "X-Forwarded-Proto": "http",
       };
 
-      const muxGatewayResponse = await fetch(`${server.baseUrl}/auth/mux-gateway/start`, {
-        headers: sharedHeaders,
-      });
-      expect(muxGatewayResponse.status).toBe(200);
-
-      expect(muxGatewayRedirectUri).toBe(
-        "https://mux-public.example.com/auth/mux-gateway/callback"
+      const response = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test`,
+        { headers: sharedHeaders }
       );
+      expect(response.status).toBe(200);
+
+      expect(redirectUris).toEqual(["https://mux-public.example.com/auth/coder/callback"]);
     } finally {
       await server?.close();
     }
   });
 
   test("uses HTTP redirect URIs for OAuth start routes when client-facing proto is HTTP", async () => {
-    let muxGatewayRedirectUri = "";
-
+    const redirectUris: string[] = [];
     const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
+      coderOauthService: {
         startServerFlow: (input: { redirectUri: string }) => {
-          muxGatewayRedirectUri = input.redirectUri;
-          return { authorizeUrl: "https://gateway.example.com/auth", state: "state-gateway-http" };
+          redirectUris.push(input.redirectUri);
+          return Promise.resolve({
+            success: true,
+            data: { flowId: "flow", authorizeUrl: "https://coder.test/authorize" },
+          });
         },
-      } as unknown as ORPCContext["muxGatewayOauthService"],
+      } as unknown as ORPCContext["coderOauthService"],
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1360,16 +1367,19 @@ describe("createOrpcServer", () => {
         authToken: "test-token",
       });
 
-      const response = await fetch(`${server.baseUrl}/auth/mux-gateway/start`, {
-        headers: {
-          Authorization: "Bearer test-token",
-          Origin: server.baseUrl,
-          "X-Forwarded-Proto": "http,https",
-        },
-      });
+      const response = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test`,
+        {
+          headers: {
+            Authorization: "Bearer test-token",
+            Origin: server.baseUrl,
+            "X-Forwarded-Proto": "http,https",
+          },
+        }
+      );
 
       expect(response.status).toBe(200);
-      expect(muxGatewayRedirectUri).toBe(`${server.baseUrl}/auth/mux-gateway/callback`);
+      expect(redirectUris).toEqual([`${server.baseUrl}/auth/coder/callback`]);
     } finally {
       await server?.close();
     }
@@ -1612,9 +1622,9 @@ describe("createOrpcServer", () => {
 
   test("OAuth callback routes accept POST redirects (query + form_post)", async () => {
     const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
-        handleServerCallbackAndExchange: () => Promise.resolve({ success: true, data: undefined }),
-      } as unknown as ORPCContext["muxGatewayOauthService"],
+      coderOauthService: {
+        handleServerCallback: () => Promise.resolve({ success: true, data: undefined }),
+      } as unknown as ORPCContext["coderOauthService"],
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1628,7 +1638,7 @@ describe("createOrpcServer", () => {
 
       // Some OAuth providers issue 307/308 redirects which preserve POST.
       const queryRes = await fetch(
-        `${server.baseUrl}/auth/mux-gateway/callback?state=test-state&code=test-code`,
+        `${server.baseUrl}/auth/coder/callback?state=test-state&code=test-code`,
         { method: "POST" }
       );
       expect(queryRes.status).toBe(200);
@@ -1636,7 +1646,7 @@ describe("createOrpcServer", () => {
       expect(queryText).toContain("Login complete");
 
       // response_mode=form_post delivers params in the request body.
-      const formRes = await fetch(`${server.baseUrl}/auth/mux-gateway/callback`, {
+      const formRes = await fetch(`${server.baseUrl}/auth/coder/callback`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "state=test-state&code=test-code",
@@ -1700,9 +1710,6 @@ describe("createOrpcServer", () => {
   test("allows cross-origin POST requests on OAuth callback routes", async () => {
     const handleSuccessfulCallback = () => Promise.resolve({ success: true, data: undefined });
     const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
-        handleServerCallbackAndExchange: handleSuccessfulCallback,
-      } as unknown as ORPCContext["muxGatewayOauthService"],
       mcpOauthService: {
         handleServerCallbackAndExchange: handleSuccessfulCallback,
       } as unknown as ORPCContext["mcpOauthService"],
@@ -1732,14 +1739,6 @@ describe("createOrpcServer", () => {
       });
       expect(coderOauthResponse.status).toBe(200);
       expect(coderOauthResponse.headers.get("access-control-allow-origin")).toBeNull();
-
-      const muxGatewayResponse = await fetch(`${server.baseUrl}/auth/mux-gateway/callback`, {
-        method: "POST",
-        headers: callbackHeaders,
-        body: "state=test-state&code=test-code",
-      });
-      expect(muxGatewayResponse.status).toBe(200);
-      expect(muxGatewayResponse.headers.get("access-control-allow-origin")).toBeNull();
 
       const mcpOauthResponse = await fetch(`${server.baseUrl}/auth/mcp-oauth/callback`, {
         method: "POST",
