@@ -11,6 +11,7 @@ import * as path from "node:path";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import { SESSION_MEMORY_DIR_NAME } from "@/common/constants/memory";
 import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
@@ -36,6 +37,16 @@ import {
 import { removeSessionDirUnderMemoryLocks } from "../workspaceRemoval";
 import { workspaceUseLeasesFor } from "../workspaceUseLeases";
 
+/**
+ * Each scenario names the temp roots and workspace ids that it creates, and
+ * the memory target keys of the removal, so the record masks them by name.
+ */
+export interface LockNames {
+  root(dir: string, label: string): void;
+  id(workspaceId: string): void;
+  target(key: string): void;
+}
+
 const sendOptions = { model: "openai:gpt-4o", agentId: "exec" };
 const idle = { hasRunningBackgroundProcesses: () => Promise.resolve(false) };
 
@@ -53,12 +64,14 @@ async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): 
  * history locks and the turn takes its use lease. The provider then fails.
  * Then the session-dir writes of the loop tools and the journal blob lock.
  */
-export async function oneTurn(): Promise<void> {
+export async function oneTurn(names: LockNames): Promise<void> {
   const workspaceId = "ws-record-turn";
+  names.id(workspaceId);
   const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
     Promise.resolve(Err({ type: "unknown", raw: "provider down" }))
   );
   const b = await createAgentSessionHarness({ workspaceId, aiServiceOverrides: { streamMessage } });
+  names.root(b.config.rootDir, "turn");
   try {
     await b.session.sendMessage("hello", sendOptions);
     const sessionDir = path.join(b.config.sessionsDir, workspaceId);
@@ -87,12 +100,14 @@ export async function oneTurn(): Promise<void> {
  * (agentSession.useLease.test.ts), and a turn handle that another live
  * backend owns (workspaceTurnManager.foreignOwner.test.ts).
  */
-export async function oneRefusal(): Promise<void> {
+export async function oneRefusal(names: LockNames): Promise<void> {
   const workspaceId = "ws-record-refusal";
+  names.id(workspaceId);
   const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
     Promise.resolve(Err({ type: "unknown", raw: "must not be reached" }))
   );
   const b = await createAgentSessionHarness({ workspaceId, aiServiceOverrides: { streamMessage } });
+  names.root(b.config.rootDir, "refusal");
   const leasesA = workspaceUseLeasesFor(await createTestConfig(b.config.rootDir));
   try {
     const finished = Promise.withResolvers<void>();
@@ -111,6 +126,7 @@ export async function oneRefusal(): Promise<void> {
   }
 
   await withTempDir("owner", async (rootDir) => {
+    names.root(rootDir, "owner");
     await startWorkspaceTurnForTest(rootDir);
     // B refuses idle admission, so it only probes the owner lock (#4801).
     const { taskService: backendB } = createWorkspaceTurnManagerHarness(
@@ -127,11 +143,18 @@ export async function oneRefusal(): Promise<void> {
 }
 
 /** One removal (workspaceRemoval.test.ts): refine, target and history locks. */
-export async function oneRemoval(): Promise<void> {
+export async function oneRemoval(names: LockNames): Promise<void> {
   await withTempDir("removal", async (dir) => {
+    names.root(dir, "removal");
     const rootDir = path.join(dir, "xum-home");
     const workspaceId = "ws-record-removal";
+    names.id(workspaceId);
     const sessionDir = path.join(rootDir, "sessions", workspaceId);
+    // The memory stores that removal locks (workspaceRemoval.ts), and the session dir.
+    for (const key of ["", "memory", SESSION_MEMORY_DIR_NAME]) {
+      names.target(path.join(sessionDir, key));
+    }
+    names.target(path.join(rootDir, "memory"));
     await fs.mkdir(sessionDir, { recursive: true });
     await removeSessionDirUnderMemoryLocks({
       rootDir,
@@ -157,13 +180,16 @@ function finishChunk(): LanguageModelV3StreamPart {
  * One refine pass and one apply (refineService.test.ts): the pass takes the
  * staging lock, and the apply takes the apply lock.
  */
-export async function oneRefineApply(): Promise<void> {
+export async function oneRefineApply(names: LockNames): Promise<void> {
   await withTempDir("refine", async (dir) => {
+    names.root(dir, "refine-checkout");
     const workspaceId = "ws-record-refine";
+    names.id(workspaceId);
     const workspacePath = path.join(dir, "checkout");
     await fs.mkdir(workspacePath, { recursive: true });
     // The shared HistoryService seam (AGENTS.md): its temp root is the Xum home here.
     const { historyService, config, tempDir: muxHome, cleanup } = await createTestHistoryService();
+    names.root(muxHome, "refine");
     await fs.mkdir(path.join(muxHome, "memory"), { recursive: true });
     await config.editConfig((cfg) => {
       cfg.projects.set("/projects/demo", {
@@ -222,12 +248,16 @@ export async function oneRefineApply(): Promise<void> {
  * a send of another backend waits on it while it exists.
  */
 export async function oneFork(
+  names: LockNames,
   /** Resolves at the next lock call on lockPath after this call. */
   nextLockCall: (lockPath: string) => Promise<void>
 ): Promise<void> {
   const { historyService, config, cleanup } = await createTestHistoryService();
+  names.root(config.rootDir, "fork");
   try {
     const workspaceId = "ws-record-fork";
+    names.id(workspaceId);
+    names.id("ws-record-fork-foreign");
     const sessionDir = path.join(config.sessionsDir, workspaceId);
     await fs.mkdir(sessionDir, { recursive: true });
     await startAbandonedBranchSummaryInBackground({
