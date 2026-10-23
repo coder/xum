@@ -60,16 +60,22 @@ export function buildArtifactCsp(options: ArtifactCspOptions): string {
  * True when the CSP built with `options` lets the frame load `url` as a script or stylesheet.
  * Used only to decide which absolute URLs get an "External asset blocked" notice; the CSP
  * itself is what enforces the rule.
+ *
+ * `baseUrl` is the frame's base URL. A srcdoc frame inherits the parent document's base (the
+ * CSP's `base-uri 'none'` blocks a <base> override), so a protocol-relative `//unpkg.com/x.css`
+ * loads over https: in server mode over HTTPS and not under a file:// base. Parsing without a
+ * base threw on those links and showed a false "blocked" notice.
  */
 export function isArtifactCdnUrl(
   url: string,
   type: "script" | "style",
-  options: ArtifactCspOptions
+  options: ArtifactCspOptions,
+  baseUrl: string
 ): boolean {
   if (!options.allowCdn) return false;
   let parsed: URL;
   try {
-    parsed = new URL(url);
+    parsed = new URL(url, baseUrl);
   } catch {
     return false;
   }
