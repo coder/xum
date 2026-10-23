@@ -1279,7 +1279,6 @@
                 "@/node/runtime/runtimeHelpers"
               ],
               "src/node/services/tools/agent_skill_delete.ts": ["fs/promises"],
-              "src/node/services/tools/agent_skill_list.ts": ["fs/promises", "os"],
               "src/node/services/tools/agent_skill_read_file.ts": ["@/node/runtime/RemoteRuntime"],
               "src/node/services/tools/agent_skill_write.ts": ["fs/promises"],
               "src/node/services/tools/bash.ts": ["@/node/runtime/LocalBaseRuntime", "fs"],
@@ -1293,7 +1292,6 @@
                 "fs/promises"
               ],
               "src/node/services/tools/skillFileHint.ts": ["@/node/runtime/RemoteRuntime"],
-              "src/node/services/tools/skillFileUtils.ts": ["fs/promises"],
               "src/node/services/tools/skillsCatalogFetch.ts": ["fs/promises", "os"],
               "src/node/services/tools/todo.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
               "src/node/services/tools/xum_agents_path.ts": ["fs/promises"],
