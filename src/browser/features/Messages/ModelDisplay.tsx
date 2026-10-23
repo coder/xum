@@ -12,17 +12,8 @@ interface ModelDisplayProps {
   modelString: string;
   /** Whether to show the tooltip on hover (default: true, set to false when used within another tooltip) */
   showTooltip?: boolean;
-  /** @deprecated Legacy signal; prefer routeProvider for source attribution. */
-  routedThroughGateway?: boolean;
   /** Route provider used by backend routing for this response (if different from origin provider). */
   routeProvider?: string;
-}
-
-function resolveRouteProvider(
-  routeProvider: string | undefined,
-  routedThroughGateway: boolean | undefined
-): string | undefined {
-  return routeProvider ?? (routedThroughGateway ? "mux-gateway" : undefined);
 }
 
 function getRouteDisplayName(
@@ -48,11 +39,7 @@ export const ModelDisplay: React.FC<ModelDisplayProps> = (props) => {
   const canonicalModel = normalizeToCanonical(props.modelString);
   const originProvider = getModelProvider(canonicalModel);
   const displayName = formatModelStringForDisplay(canonicalModel);
-  const resolvedRouteProvider = resolveRouteProvider(
-    props.routeProvider,
-    props.routedThroughGateway
-  );
-  const routeDisplayName = getRouteDisplayName(resolvedRouteProvider, originProvider);
+  const routeDisplayName = getRouteDisplayName(props.routeProvider, originProvider);
   const showTooltip = props.showTooltip ?? true;
 
   const iconClass =

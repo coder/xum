@@ -297,20 +297,17 @@ describe("StreamManager - TTFT metadata persistence", () => {
       options: {
         initialMetadata: {
           routeProvider: "openrouter",
-          routedThroughGateway: true,
         },
       },
     });
 
     expect(events.find((event) => event.type === "stream-start")).toMatchObject({
       routeProvider: "openrouter",
-      routedThroughGateway: true,
     });
     expect(events.find((event) => event.type === "stream-end")).toMatchObject({
-      metadata: { routeProvider: "openrouter", routedThroughGateway: true },
+      metadata: { routeProvider: "openrouter" },
     });
     expect(updatedMessage.metadata?.routeProvider).toBe("openrouter");
-    expect(updatedMessage.metadata?.routedThroughGateway).toBe(true);
   });
 
   test("persists per-invocation tool model usages on the final assistant message", async () => {

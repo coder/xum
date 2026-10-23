@@ -91,11 +91,9 @@ describe("tool schema compaction", () => {
       }),
     };
     const anthropic = await sentSchemas("anthropic.messages", "claude-opus-5-5", tools);
-    const gateway = await sentSchemas("gateway", "anthropic/claude-opus-5-5", tools);
-    const openai = await sentSchemas("gateway", "openai/gpt-6", tools);
+    const openai = await sentSchemas("openai.responses", "gpt-6", tools);
 
     expect(nullPaths(anthropic.task_await)).toEqual([]);
-    expect(nullPaths(gateway.task_await)).toEqual([]);
     expect(nullPaths(openai.task_await)).not.toEqual([]);
     expect(anthropic.task_await.properties?.timeout_secs).toMatchObject({ type: "number" });
     // An MCP tool's null may mean "clear the field".

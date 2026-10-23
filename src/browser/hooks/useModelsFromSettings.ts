@@ -45,8 +45,6 @@ function getAllCustomModels(config: ProvidersConfigMap | null): string[] {
 
   const models: string[] = [];
   for (const [provider, info] of Object.entries(config)) {
-    // Skip mux-gateway - those models are accessed via the cloud toggle, not listed separately
-    if (provider === "mux-gateway") continue;
     // Keep github-copilot's persisted catalog for authoritative model gating, not direct selector entries.
     if (provider === "github-copilot") continue;
     if (!info.models) continue;

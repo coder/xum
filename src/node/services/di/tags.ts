@@ -62,7 +62,6 @@ import type { MemoryConsolidationService } from "@/node/services/memoryConsolida
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { MemoryService } from "@/node/services/memoryService";
 import type { MenuEventService } from "@/node/services/menuEventService";
-import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
 import type { ProjectService } from "@/node/services/projectService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
@@ -281,9 +280,6 @@ export class WorktreeArchiveSnapshot extends Context.Service<
 >()("xum/WorktreeArchiveSnapshot") {}
 // OAuth flows (all need the WindowService for the browser hand-off).
 export class McpOauth extends Context.Service<McpOauth, McpOauthService>()("xum/McpOauth") {}
-export class MuxGatewayOauth extends Context.Service<MuxGatewayOauth, MuxGatewayOauthService>()(
-  "xum/MuxGatewayOauth"
-) {}
 export class CodexOauth extends Context.Service<CodexOauth, CodexOauthService>()(
   "xum/CodexOauth"
 ) {}
@@ -406,7 +402,7 @@ export type MiscDesktopTags =
   | ServerAuth
   | WorkspaceLifecycleHooksTag
   | WorktreeArchiveSnapshot;
-export type OauthTags = McpOauth | MuxGatewayOauth | CodexOauth | CoderOauth | CopilotOauth;
+export type OauthTags = McpOauth | CodexOauth | CoderOauth | CopilotOauth;
 export type WorkerTags = IdleCompaction | Heartbeat | Timeline | Refine | AgentStatus | BashAiProxy;
 export type DesktopTags =
   | BrowserTags

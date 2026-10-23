@@ -451,10 +451,6 @@ export const ProviderConfigInfoSchema = z.object({
   aws: AWSCredentialStatusSchema.optional(),
   /** Google Vertex AI-specific fields (only present for google-vertex provider) */
   googleVertex: GoogleVertexCredentialStatusSchema.optional(),
-  /** Xum Gateway-specific fields */
-  couponCodeSet: z.boolean().optional(),
-  /** Xum Gateway-specific: which models are enabled for gateway routing */
-  gatewayModels: z.array(z.string()).optional(),
   /** Coder-only: deployment access URL (e.g. https://coder.example.com) */
   deploymentUrl: z.string().optional(),
   /** Coder-only: whether Coder OAuth tokens are present in providers.jsonc */
@@ -638,34 +634,6 @@ export const providers = {
   },
 };
 
-// Xum Gateway OAuth (desktop login flow)
-export const muxGatewayOauth = {
-  startDesktopFlow: {
-    input: z.void(),
-    output: ResultSchema(
-      z.object({
-        flowId: z.string(),
-        authorizeUrl: z.string(),
-        redirectUri: z.string(),
-      }),
-      z.string()
-    ),
-  },
-  waitForDesktopFlow: {
-    input: z
-      .object({
-        flowId: z.string(),
-        timeoutMs: z.number().int().positive().optional(),
-      })
-      .strict(),
-    output: ResultSchema(z.void(), z.string()),
-  },
-  cancelDesktopFlow: {
-    input: z.object({ flowId: z.string() }).strict(),
-    output: z.void(),
-  },
-};
-
 // GitHub Copilot OAuth (Device Code Flow)
 export const copilotOauth = {
   startDeviceFlow: {
@@ -781,20 +749,6 @@ export const coderOauth = {
   refreshProviders: {
     input: z.void(),
     output: ResultSchema(z.void(), z.string()),
-  },
-};
-
-// Xum Gateway
-export const muxGateway = {
-  getAccountStatus: {
-    input: z.void(),
-    output: ResultSchema(
-      z.object({
-        remaining_microdollars: z.number().int().nonnegative(),
-        ai_gateway_concurrent_requests_per_user: z.number().int().nonnegative(),
-      }),
-      z.string()
-    ),
   },
 };
 
@@ -3420,8 +3374,6 @@ export const config = {
     output: z.object({
       userPreferences: UserPreferencesSchema.optional(),
       taskSettings: ResolvedTaskSettingsSchema,
-      muxGatewayEnabled: z.boolean().optional(),
-      muxGatewayModels: z.array(z.string()).optional(),
       routePriority: z.array(z.string()).optional(),
       routeOverrides: z.record(z.string(), z.string()).optional(),
       minThinkingLevelByModel: z.record(z.string(), ThinkingLevelSchema).optional(),
@@ -3469,13 +3421,6 @@ export const config = {
   updateAgentAiDefaults: {
     input: z.object({
       agentAiDefaults: AgentAiDefaultsSchema,
-    }),
-    output: z.void(),
-  },
-  updateMuxGatewayPrefs: {
-    input: z.object({
-      muxGatewayEnabled: z.boolean(),
-      muxGatewayModels: z.array(z.string()),
     }),
     output: z.void(),
   },

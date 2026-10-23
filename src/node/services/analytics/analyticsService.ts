@@ -132,8 +132,8 @@ function normalizeProviderName(model: string): string {
 
 /**
  * Roll model-level cache metrics into provider buckets using the same provider
- * parser as the rest of the app (handles mux-gateway prefixes and malformed
- * model strings consistently).
+ * parser as the rest of the app (handles gateway prefixes and malformed model
+ * strings consistently).
  */
 export function aggregateProviderCacheHitRows(
   rows: ProviderCacheHitModelRow[]
