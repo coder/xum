@@ -96,6 +96,7 @@ import {
   acceptsVolatileSystemTailRow,
   planCustomInstructions,
   planVolatileSystemTail,
+  type VolatileSystemTailPlan,
 } from "@/node/utils/messages/volatileSystemTail";
 import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
@@ -465,6 +466,29 @@ function planStableSystem(
 }
 
 /**
+ * Whether this request can send system-section rows. A compaction request (it has a budget)
+ * sends as before and records nothing: the trim already fitted `history` to its budget, so
+ * rows added now could exceed it. Its system prompt is the compact agent's, so no cached
+ * prefix is lost, and its summary starts a new segment anyway.
+ */
+function acceptsSystemSectionRows(options: AssemblePromptPayloadOptions, liveStable: string) {
+  return (
+    options.compactionInputBudgetTokens == null &&
+    createCachedSystemMessage(
+      liveStable,
+      options.modelString,
+      options.anthropicCacheTtl,
+      options.providersConfig
+    ) != null &&
+    acceptsVolatileSystemTailRow(
+      options.modelString,
+      options.routeProvider,
+      options.providersConfig
+    )
+  );
+}
+
+/**
  * The system prompt split into its cached stable block and the volatile tail, and where the
  * tail goes: a tail change inside a segment becomes a system row instead of a system edit
  * (prompt-cache mechanism 10, volatileSystemTail.ts). The custom-instructions block inside
@@ -479,23 +503,7 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
     "volatileSystemSuffixLength must leave a non-empty stable system prefix"
   );
   const liveStable = options.systemMessage.slice(0, options.systemMessage.length - volatileLength);
-  // A compaction request (it has a budget) sends as before and records nothing: the trim
-  // already fitted `history` to its budget, so rows added now could exceed it. Its system
-  // prompt is the compact agent's, so no cached prefix is lost, and its summary starts a new
-  // segment anyway.
-  const rowsSupported =
-    options.compactionInputBudgetTokens == null &&
-    createCachedSystemMessage(
-      liveStable,
-      options.modelString,
-      options.anthropicCacheTtl,
-      options.providersConfig
-    ) != null &&
-    acceptsVolatileSystemTailRow(
-      options.modelString,
-      options.routeProvider,
-      options.providersConfig
-    );
+  const rowsSupported = acceptsSystemSectionRows(options, liveStable);
   const { stableSystem, plan: instructionsPlan } = planStableSystem(
     liveStable,
     history,
@@ -517,7 +525,29 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
     volatileLength > 0 && rowsSupported,
     options.replayedTurn
   );
-  return { stableSystem, cachedSystemMessage, instructionsPlan, tailPlan };
+  return {
+    stableSystem,
+    cachedSystemMessage,
+    tailPlan,
+    sentVolatileLength: volatileLength === 0 ? 0 : tailPlan.systemTail.length,
+    ...combineSectionPlans(instructionsPlan, tailPlan),
+  };
+}
+
+/** The rows and records of both section plans, the instructions first. */
+function combineSectionPlans(instructions: VolatileSystemTailPlan, tail: VolatileSystemTailPlan) {
+  return {
+    // The new rows go last, after the newest user row and its request context: the
+    // instructions row first, as the recorded rows were put back.
+    appendedRows: [instructions.appendedRow, tail.appendedRow].filter(
+      (row): row is MuxMessage => row != null
+    ),
+    records: {
+      ...(tail.record != null && { volatileSystemTail: tail.record }),
+      ...(instructions.record != null && { customInstructions: instructions.record }),
+    },
+    rowsText: instructions.rowsText + tail.rowsText,
+  };
 }
 
 export async function assemblePromptPayload(
@@ -543,14 +573,9 @@ export async function assemblePromptPayload(
     options.modelString,
     options.requestContextMessage
   );
-  const { stableSystem, cachedSystemMessage, instructionsPlan, tailPlan } = planSystemPrompt(
+  const { stableSystem, cachedSystemMessage, tailPlan, appendedRows, ...sent } = planSystemPrompt(
     options,
     providerRequestMessages
-  );
-  // The new rows go last, after the newest user row and its request context: the
-  // instructions row first, as planSystemPrompt put the recorded rows back.
-  const appendedRows = [instructionsPlan.appendedRow, tailPlan.appendedRow].filter(
-    (row): row is MuxMessage => row != null
   );
   const historyWithSentinel = addInterruptedSentinel(
     insertRequestContextMessage(
@@ -561,8 +586,7 @@ export async function assemblePromptPayload(
     )
   );
   let messages = await prepareMessagesForProvider({
-    messagesWithSentinel:
-      appendedRows.length > 0 ? [...historyWithSentinel, ...appendedRows] : historyWithSentinel,
+    messagesWithSentinel: [...historyWithSentinel, ...appendedRows],
     replayReceiptMessages: prepared.activeContextMessages,
     effectiveAgentId: options.effectiveAgentId,
     toolNamesForSentinel: options.toolNamesForSentinel,
@@ -610,13 +634,11 @@ export async function assemblePromptPayload(
     providerRequestMessages,
     messages,
     system,
-    ...(tailPlan.record != null ? { volatileSystemTail: tailPlan.record } : {}),
-    ...(instructionsPlan.record != null ? { customInstructions: instructionsPlan.record } : {}),
+    ...sent.records,
     sentSystem: {
       message: stableSystem + tailPlan.systemTail,
-      volatileSuffixLength:
-        (options.volatileSystemSuffixLength ?? 0) === 0 ? 0 : tailPlan.systemTail.length,
-      rowsText: instructionsPlan.rowsText + tailPlan.rowsText,
+      volatileSuffixLength: sent.sentVolatileLength,
+      rowsText: sent.rowsText,
     },
     tools: options.tools
       ? applyCacheControlToTools(
