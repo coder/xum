@@ -13,6 +13,9 @@ import { SshPromptService } from "@/node/services/sshPromptService";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { CreationDraftService } from "./creationDraftService";
 import { ProjectService, type CloneEvent } from "./projectService";
+import type { ExecOptions, ExecStream } from "@/node/runtime/Runtime";
+import { ShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { getRemoteProjectPluginSnapshot } from "@/node/services/agentPlugins/remoteProjectPlugins";
 import {
   projectRegistrationLockFilePath,
   withProjectRegistrationLock,
@@ -2421,6 +2424,35 @@ exit 1
           { projectPath: childPath, trusted: true },
         ],
       ]);
+    });
+
+    it("setTrust drops remote plugin snapshots even when the MCP update throws (#6426)", async () => {
+      // A remote host whose listing runs in a local shell; each exec is one cold read.
+      let execs = 0;
+      class CountingRuntime extends ShellRemoteRuntime {
+        override getAgentHostKey(): string {
+          return "trust-test";
+        }
+        override exec(command: string, options: ExecOptions): Promise<ExecStream> {
+          execs++;
+          return super.exec(command, options);
+        }
+      }
+      const runtime = new CountingRuntime(tempDir);
+      const containers = [path.join(tempDir, ".xum", "plugins")];
+      await getRemoteProjectPluginSnapshot(runtime, tempDir, containers);
+      service.setMcpServerManager({
+        applyProjectTrust: () => {
+          throw new Error("MCP update failed");
+        },
+        forgetProjectTrust: () => undefined,
+      });
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types `rejects` as void
+      await expect(service.setTrust(path.join(tempDir, "project"), true)).rejects.toThrow(
+        "MCP update failed"
+      );
+      await getRemoteProjectPluginSnapshot(runtime, tempDir, containers);
+      expect(execs).toBe(2);
     });
 
     it("setIcon stores an icon name and null clears it", async () => {

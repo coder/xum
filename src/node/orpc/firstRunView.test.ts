@@ -139,10 +139,6 @@ describe("the early script", () => {
   test.each([
     ["the wizard was viewed", (p: Page) => p.answer(["onboarding-wizard-v1"], {})],
     ["a provider is configured", (p: Page) => p.answer([], { openai: { isConfigured: true } })],
-    [
-      "a gateway coupon is set",
-      (p: Page) => p.answer([], { "mux-gateway": { couponCodeSet: true } }),
-    ],
     ["a POST returns 401", (p: Page) => (p.calls[0].settle(401), p.settled())],
     ["a POST fails", (p: Page) => (p.calls[1].fail(), p.settled())],
     ["the POSTs take over 1,000 ms", (p: Page) => (p.timers[0].fn(), p.settled())],

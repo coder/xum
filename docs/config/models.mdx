@@ -41,7 +41,7 @@ GPT-6.1 Sol (the `gpt` and `sol` aliases) and GPT-6 Astra support thinking from 
 
 ### OpenAI Ultrafast
 
-To use OpenAI's fastest processing tier, turn on the thinking selector's **Ultrafast mode** row (it sits next to **Fast mode**), run **Toggle Ultrafast Mode** from the command palette, or use its keyboard shortcut. You can also choose **ultrafast** as the service tier in **Settings → Providers → OpenAI**. Fast and Ultrafast are mutually exclusive, and turning either off switches the chat to Standard. Like the thinking level, the choice is saved per chat and stays with the chat when you switch models; chats without a choice use the provider's service tier. Xum sends it only to models that OpenAI serves Ultrafast for: GPT-6.1 Sol and GPT-6 Astra. It also needs a route that sends OpenAI's own Responses API: direct OpenAI on the default wire format, Coder instances of type OpenAI, or custom OpenAI Responses providers. Direct OpenAI set to Chat Completions, Coder OpenAI-compatible instances, OpenRouter, Xum Gateway, and GitHub Copilot do not accept the tier. Elsewhere the request runs without a service tier instead of falling back to Fast. Ultrafast costs 6× the Standard price, and Xum's cost tracking uses that rate.
+To use OpenAI's fastest processing tier, turn on the thinking selector's **Ultrafast mode** row (it sits next to **Fast mode**), run **Toggle Ultrafast Mode** from the command palette, or use its keyboard shortcut. You can also choose **ultrafast** as the service tier in **Settings → Providers → OpenAI**. Fast and Ultrafast are mutually exclusive, and turning either off switches the chat to Standard. Like the thinking level, the choice is saved per chat and stays with the chat when you switch models; chats without a choice use the provider's service tier. Xum sends it only to models that OpenAI serves Ultrafast for: GPT-6.1 Sol and GPT-6 Astra. It also needs a route that sends OpenAI's own Responses API: direct OpenAI on the default wire format, Coder instances of type OpenAI, or custom OpenAI Responses providers. Direct OpenAI set to Chat Completions, Coder OpenAI-compatible instances, OpenRouter, and GitHub Copilot do not accept the tier. Elsewhere the request runs without a service tier instead of falling back to Fast. Ultrafast costs 6× the Standard price, and Xum's cost tracking uses that rate.
 
 ### Pro reasoning mode (GPT-6)
 
@@ -95,9 +95,6 @@ regional endpoints. Profile-based authentication, SSO, role assumption, credenti
 processes, metadata credentials, and custom endpoints are not supported for
 suggestions; enter model IDs manually for those configurations. These limits apply
 to discovery, not to inference.
-
-Xum Gateway remains a routing option, not a provider in this field. Configure it
-through the **Route** column instead.
 
 A catalog entry does not guarantee account access, tool support, or availability
 through every route. Adding a model is separate from choosing its route; see

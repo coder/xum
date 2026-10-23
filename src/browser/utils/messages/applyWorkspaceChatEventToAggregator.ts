@@ -1,6 +1,5 @@
 import assert from "@/common/utils/assert";
-import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
+import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { publishChatError } from "@/browser/utils/chatErrorToasts";
 import type { DeleteMessage, StreamErrorMessage, WorkspaceChatMessage } from "@/common/orpc/types";
 import {
@@ -94,8 +93,8 @@ export interface WorkspaceChatEventAggregator {
 
 /**
  * Desktop perf harness (XUM_REPLAY_TAPES, exposed by preload): chat events come from a recorded
- * session tape, so they must not trigger app side effects (gateway dialogs, skill refreshes,
- * child-goal toasts, git/review refreshes).
+ * session tape, so they must not trigger app side effects (skill refreshes, child-goal toasts,
+ * git/review refreshes).
  */
 export function isSessionTapeReplayRenderer(): boolean {
   return typeof window !== "undefined" && window.api?.isSessionTapeReplay === true;
@@ -104,11 +103,6 @@ export function isSessionTapeReplayRenderer(): boolean {
 function dispatchSkillsRefreshRequested(): void {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED));
-}
-
-function dispatchMuxGatewaySessionExpired(): void {
-  if (typeof window === "undefined") return;
-  window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.MUX_GATEWAY_SESSION_EXPIRED));
 }
 
 /**
@@ -169,12 +163,6 @@ export function applyWorkspaceChatEventToAggregator(
   }
 
   if (isStreamError(event)) {
-    if (allowSideEffects && event.error === MUX_GATEWAY_SESSION_EXPIRED_MESSAGE) {
-      // Dispatch session-expired event; useGateway() listens for it and
-      // optimistically marks the gateway as unconfigured to stop routing.
-      dispatchMuxGatewaySessionExpired();
-    }
-
     aggregator.handleStreamError(event);
     // Match stream-end / stream-abort: drop the per-message deltaHistory entry
     // so a subsequent stream isn't influenced by leaked TPS/token state from

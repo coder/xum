@@ -113,7 +113,6 @@ import { confirmAndRemoveSubagent } from "@/browser/utils/subagentRemoval";
 import { AboutDialog } from "./features/About/AboutDialog";
 import { LazySettingsPage } from "@/browser/features/Settings/LazySettingsPage";
 import { LazyAnalyticsDashboard } from "@/browser/features/Analytics/LazyAnalyticsDashboard";
-import { MuxGatewaySessionExpiredDialog } from "./components/MuxGatewaySessionExpiredDialog/MuxGatewaySessionExpiredDialog";
 import { SshPromptDialog } from "./components/SshPromptDialog/SshPromptDialog";
 import { TerminalDialog } from "./components/TerminalView/TerminalDialog";
 import { SplashScreenProvider } from "./features/SplashScreens/SplashScreenProvider";
@@ -1638,7 +1637,6 @@ function AppInner() {
           />
         )}
         <AboutDialog />
-        <MuxGatewaySessionExpiredDialog />
         <SshPromptDialog />
         <TerminalDialog />
       </div>
