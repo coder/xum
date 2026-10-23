@@ -26,6 +26,7 @@ import { BackgroundProcessManager } from "@/node/services/backgroundProcessManag
 import type { CoreOptions, CoreServices, CoreServicesOptions } from "@/node/services/coreServices";
 import { AppFiberScopeLive, AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import { EffectRunnerLive, EffectRunnerTag } from "@/node/services/di/effectRunner";
+import { HostClockLive } from "@/node/services/di/hostClockLive";
 import {
   AI,
   AutoModelRouterTag,
@@ -802,8 +803,10 @@ export function CoreRootLive(opts: CoreServicesOptions): Layer.Layer<CoreRootTag
     fileLeaseManager,
     ...coreOptions
   } = opts;
+  const runner = EffectRunnerLive.pipe(Layer.provideMerge(StoresFromCoreOptionsLive(opts)));
+  // HostClockLive reads the Clock that the runner captured: one clock for both.
   const runtimeSeams = AppFiberScopeLive.pipe(
-    Layer.provideMerge(EffectRunnerLive.pipe(Layer.provideMerge(StoresFromCoreOptionsLive(opts))))
+    Layer.provideMerge(HostClockLive.pipe(Layer.provideMerge(runner)))
   );
   return CoreLive.pipe(
     // True siblings: both derive from the config alone.
