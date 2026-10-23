@@ -21,6 +21,7 @@ import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { DevToolsLogEntry } from "@/common/types/devtools";
 import {
   createMuxMessage,
+  filterOrphanedMcpPromptSnapshots,
   type MuxMessage,
   type PluginHookContextEntry,
   type SystemSectionRecords,
@@ -28,6 +29,7 @@ import {
 import { applyCacheControlToTools, type AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import assert from "@/common/utils/assert";
 import { collectDeferLoadingToolNames } from "@/common/utils/tools/toolCatalog";
+import { replaceOrAppendMessageById } from "@/node/services/aiService";
 import { HistoryService } from "@/node/services/historyService";
 import { assemblePromptPayload } from "@/node/services/turnContextAssembler";
 import { emitTurnEnvelope } from "@/node/services/turnEnvelope";
@@ -186,6 +188,10 @@ export async function appendReplayFixtureTurn(
   const historyResult = await ctx.historyService.getHistoryFromLatestBoundary(ctx.workspaceId);
   assert(historyResult.success, "fixture history read failed");
 
+  // Built whatever recordDevtools is: production writes the row's records either way, and the
+  // envelope logs the system content the request sent.
+  const recorded = await buildFixtureRequest(ctx, spec, historyResult.data, agentId);
+
   // Retries re-emit an envelope per attempt; only the final attempt streams
   // the surviving assistant row, so 1 + extraEnvelopeAttempts rows share one
   // requestHistorySequence.
@@ -193,8 +199,8 @@ export async function appendReplayFixtureTurn(
     await emitTurnEnvelope({
       journal: ctx.journal,
       workspaceId: ctx.workspaceId,
-      systemMessage: spec.systemPrompt,
-      systemVolatileSuffixLength: spec.systemVolatileSuffixLength,
+      systemMessage: recorded.sentSystem.message,
+      systemVolatileSuffixLength: recorded.sentSystem.volatileSuffixLength,
       tools: spec.tools,
       modelString,
       thinkingLevel: "off",
@@ -211,11 +217,7 @@ export async function appendReplayFixtureTurn(
     });
   }
 
-  let rowMetadata: MuxMessage["metadata"] = {};
   if (spec.recordDevtools !== false) {
-    const recorded = await buildFixtureRequest(ctx, spec, historyResult.data, agentId);
-    rowMetadata = recorded.rowMetadata;
-
     const runEntry: DevToolsLogEntry = {
       type: "run",
       run: {
@@ -267,7 +269,7 @@ export async function appendReplayFixtureTurn(
         agentId,
         thinkingLevel: "off",
         requestHistorySequence,
-        ...rowMetadata,
+        ...recorded.rowMetadata,
         ...(spec.usage !== undefined ? { usage: spec.usage } : {}),
         ...(spec.providerMetadata !== undefined ? { providerMetadata: spec.providerMetadata } : {}),
       },
@@ -327,7 +329,15 @@ async function buildReplayedFixtureRequest(
     modelId: REPLAY_FIXTURE_MODEL,
     tools: applyCacheControlToTools(spec.tools, REPLAY_FIXTURE_MODEL, spec.anthropicCacheTtl, null),
   });
-  return { prompt: rebuilt.lmPrompt, tools, rowMetadata: {} };
+  return {
+    prompt: rebuilt.lmPrompt,
+    tools,
+    sentSystem: {
+      message: spec.systemPrompt,
+      volatileSuffixLength: spec.systemVolatileSuffixLength,
+    },
+    rowMetadata: {},
+  };
 }
 
 /** The recorded request of a live fixture turn (see liveToolInstructions) and its records. */
@@ -337,11 +347,24 @@ async function buildLiveFixtureRequest(
   history: MuxMessage[],
   agentId: string
 ) {
+  // The same request-time inputs and history preparation as buildReplayRequest, so a live
+  // turn differs from its replay only by what the records must restore.
+  const filtered = filterOrphanedMcpPromptSnapshots(history);
   const payload = await assemblePromptPayload({
-    history,
+    history:
+      spec.partialContinuation == null
+        ? filtered
+        : replaceOrAppendMessageById(filtered, spec.partialContinuation),
     systemMessage: spec.systemPrompt,
+    volatileSystemSuffixLength: spec.systemVolatileSuffixLength,
     tools: spec.tools,
     toolInstructions: spec.liveToolInstructions,
+    anthropicCacheTtl: spec.anthropicCacheTtl,
+    planContentForTransition: spec.planContentForTransition,
+    planFilePath: spec.planFilePath,
+    postCompactionAttachments: spec.postCompactionAttachments,
+    requestContextMessage: spec.mcpAppModelContext,
+    compactionInputBudgetTokens: spec.compactionInputBudgetTokens,
     modelString: REPLAY_FIXTURE_ROWS_MODEL,
     routeProvider: REPLAY_FIXTURE_WIRE_PROVIDER,
     providerForMessages: REPLAY_FIXTURE_WIRE_PROVIDER,
@@ -365,6 +388,11 @@ async function buildLiveFixtureRequest(
   return {
     prompt,
     tools,
+    // Production's envelope logs the sent system content (frozen inside a segment).
+    sentSystem: {
+      message: payload.sentSystem.message,
+      volatileSuffixLength: payload.sentSystem.volatileSuffixLength || undefined,
+    },
     rowMetadata: { routeProvider: REPLAY_FIXTURE_WIRE_PROVIDER, ...records },
   };
 }

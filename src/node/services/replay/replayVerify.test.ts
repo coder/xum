@@ -844,6 +844,51 @@ describe("replayVerifySession pairing", () => {
     expect(JSON.stringify(second?.input?.tools)).not.toContain("Use fd.");
   });
 
+  test("a Tool: change on an unrecorded turn and a split tail still replay", async () => {
+    // Codex PRRT_kwDOPxxmWM6vksx- and PRRT_kwDOPxxmWM6vksyK: the live fixture request honors
+    // the volatile tail split, and a turn without DevTools still records on its row.
+    using tmp = new DisposableTempDir("replay-verify-tool-instructions-unrecorded");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    const tail = (note: string) => `\n\n<hot_memories>${note}</hot_memories>`;
+    const turns = [
+      { rule: "Use rg.", note: "A", recordDevtools: true },
+      { rule: "Use fd.", note: "A", recordDevtools: false },
+      { rule: "Use fd.", note: "B", recordDevtools: true },
+    ];
+    for (const [index, turn] of turns.entries()) {
+      await appendReplayFixtureTurn(ctx, {
+        userText: `Turn ${index + 1}.`,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT + tail(turn.note),
+        systemVolatileSuffixLength: tail(turn.note).length,
+        tools: {
+          bash: tool({
+            description: `Run a command\n\n${turn.rule}`,
+            inputSchema: z.object({ script: z.string() }),
+          }),
+        },
+        liveToolInstructions: { bash: turn.rule },
+        recordDevtools: turn.recordDevtools,
+      });
+    }
+
+    const result = await verify(ctx);
+    expect(
+      result.turns.map((turn) => ({ status: turn.status, messagesMatch: turn.messagesMatch }))
+    ).toEqual([
+      { status: "PASS", messagesMatch: true },
+      { status: "SKIPPED", messagesMatch: undefined },
+      { status: "PASS", messagesMatch: true },
+    ]);
+    const history = await collectFullHistory(ctx.historyService, ctx.workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const record = (id: string) => history.data.find((row) => row.id === id)?.metadata;
+    expect(record("assistant-2")?.toolInstructions).toMatchObject({ placement: "row" });
+    // Turn 3 puts turn 2's row back and adds none; only its tail changed.
+    expect(record("assistant-3")?.toolInstructions).toBeUndefined();
+    expect(record("assistant-3")?.volatileSystemTail).toMatchObject({ placement: "row" });
+  });
+
   test("a split volatile system tail is log-derivable", async () => {
     using tmp = new DisposableTempDir("replay-verify-volatile-system");
     const ctx = createReplayFixtureSessionContext(tmp.path);
