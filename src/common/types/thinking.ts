@@ -320,7 +320,7 @@ export function isGpt6FamilyModel(modelString: string): boolean {
  * reasoning surface) and unannounced variants (`gpt-5.6-sol-mini`, `gpt-5.61`)
  * stay outside it.
  */
-export function isGpt56FamilyModel(modelString: string): boolean {
+function isGpt56FamilyModel(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
   return /^gpt-5\.6(?:-(?:sol|terra|luna))?(?:-\d{4}-\d{2}-\d{2}|-\d{8})?$/.test(withoutPrefix);
 }
@@ -518,12 +518,14 @@ export const OPENAI_REASONING_EFFORT: Record<ThinkingLevel, string | undefined> 
  *
  * Most OpenAI models top out at "xhigh", so the ThinkingLevel "max" downgrades to
  * "xhigh" (see OPENAI_REASONING_EFFORT). The GPT-6 tiers and the GPT-5.6 family
- * ship a distinct native effort above xhigh with the wire value "max" on the Responses API (live-verified
- * on GPT-5.6: the response echoes `effort: max`; not yet in the SDK's typed union).
+ * ship a distinct native effort above xhigh with the wire value "max" on the
+ * Responses API (live-verified on GPT-5.6: the response echoes `effort: max`;
+ * not yet in the SDK's typed union).
  *
- * GPT-6 Luna and GPT-5.6 "off" map to the explicit "none" effort: omitting the field defaults
- * the request to medium (live-verified 2026-07-10 — an effort-less request echoed
- * `effort: medium`), which would silently ignore the user's off selection.
+ * GPT-6 Luna and GPT-5.6 "off" map to the explicit "none" effort: omitting the
+ * field defaults the request to medium (live-verified 2026-07-10 — an
+ * effort-less request echoed `effort: medium`), which would silently ignore the
+ * user's off selection.
  *
  * GPT-6 Astra and GPT-6.1 Sol reject "none" with a 400 (see
  * openaiRejectsDisabledReasoning). The thinking policy already excludes "off" for
