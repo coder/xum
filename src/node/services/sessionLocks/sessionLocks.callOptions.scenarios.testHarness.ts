@@ -4,7 +4,7 @@
  * the call record sees each call with its options before and after the move.
  * They reuse the recipes of the tests that own each lock (named per scenario).
  */
-import { mock } from "bun:test";
+import { mock, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -383,6 +383,11 @@ export async function oneWorkspaceRefine(): Promise<void> {
   const harness = await createWorkspaceServiceHarness({
     aiService: createMockAIService({ isStreaming: mock(() => false) }),
   });
+  // A full clear deletes the plan files under the local Xum home (expandTilde ->
+  // getXumHome). Point that home at the temp root, or the test deletes a real
+  // ~/.xum plan of the same name.
+  const previousRoot = process.env.XUM_ROOT;
+  process.env.XUM_ROOT = harness.config.rootDir;
   try {
     const workspaceId = "ws-record-clear";
     const projectPath = "/tmp/xum-lock-record/project";
@@ -400,6 +405,8 @@ export async function oneWorkspaceRefine(): Promise<void> {
     const cleared = await harness.service.truncateHistory(workspaceId, 1.0);
     if (!cleared.success) throw new Error(`full clear failed: ${cleared.error}`);
   } finally {
+    if (previousRoot === undefined) delete process.env.XUM_ROOT;
+    else process.env.XUM_ROOT = previousRoot;
     await harness.cleanup();
   }
 }
@@ -419,20 +426,18 @@ export async function oneArtifactAndRun(): Promise<void> {
       relPath: "report.md",
       bytes: Buffer.from("# Report\n"),
       label: null,
+      abortSignal: new AbortController().signal,
     });
     const runs = new WorkflowRunStore({ sessionDir });
-    // createRun and acquireLease: the deadline-based locks (createRunIfAbsent, releaseLease)
-    // pass the time left as acquireTimeoutMs, which differs by a millisecond from run to run.
-    await runs.createRun({
-      id: "wfr_record",
-      workspaceId,
-      workflow: { name: "record", description: "Record", scope: "built-in", executable: true },
-      source: "export default function workflow() { return {}; }\n",
-      args: {},
-      now: "2026-06-19T00:00:00.000Z",
-    });
-    if (!(await runs.acquireLease("wfr_record", "record-owner"))) {
-      throw new Error("the lease of a new run must be free");
+    // createRunIfAbsent and releaseLease pass the time left of a deadline as acquireTimeoutMs.
+    // Date.now stands still during them, so the record holds the whole budget in every run.
+    // acquireLease takes the zero-timeout path.
+    const now = Date.now();
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    try {
+      await createAndReleaseRun(runs, workspaceId);
+    } finally {
+      clock.mockRestore();
     }
     const rollback = await acquireRollbackFileLock(sessionDir);
     await rollback[Symbol.asyncDispose]();
@@ -444,4 +449,20 @@ export async function oneArtifactAndRun(): Promise<void> {
       data: { handle: "vars.__h1", preview: "p", blobHash: ref, size },
     });
   });
+}
+
+/** One run created under its create lock, its lease taken, then released. */
+async function createAndReleaseRun(runs: WorkflowRunStore, workspaceId: string): Promise<void> {
+  await runs.createRunIfAbsent({
+    id: "wfr_record",
+    workspaceId,
+    workflow: { name: "record", description: "Record", scope: "built-in", executable: true },
+    source: "export default function workflow() { return {}; }\n",
+    args: {},
+    now: "2026-06-19T00:00:00.000Z",
+  });
+  if (!(await runs.acquireLease("wfr_record", "record-owner"))) {
+    throw new Error("the lease of a new run must be free");
+  }
+  await runs.releaseLease("wfr_record", "record-owner");
 }

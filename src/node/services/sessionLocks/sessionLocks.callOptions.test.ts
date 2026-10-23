@@ -39,10 +39,11 @@ const SRC = path.resolve(import.meta.dir, "../../..");
 const TEST_FILE = /\.(test|testHarness)\.ts$/;
 
 /**
- * The first source file on the stack below the spies of this file, or "test"
- * when a test file makes the call itself.
+ * The first source file on the stack below the spies of this file, and the
+ * function in it that makes the call ("test" when a test file makes it). The
+ * function name tells two lock calls of one file apart.
  */
-function callSite(): string {
+function callSite(): { site: string; caller?: string } {
   for (const line of (new Error().stack ?? "").split("\n").slice(1)) {
     // A path may hold spaces (and a drive letter), so match up to the last
     // `.ts:line:col` instead of stopping at whitespace.
@@ -52,13 +53,15 @@ function callSite(): string {
     const rel = path.relative(SRC, file).split(path.sep).join("/");
     // The SessionLocks layers only forward a call: the site is their caller.
     if (rel.startsWith("node/services/sessionLocks/") && !TEST_FILE.test(rel)) continue;
-    return TEST_FILE.test(rel) ? "test" : rel;
+    if (TEST_FILE.test(rel)) return { site: "test" };
+    const caller = /^\s*at (?:async )?([^\s(]+) \(/.exec(line)?.[1];
+    return { site: rel, caller };
   }
   // JSC makes proper tail calls, so a caller that returns the lock call from a
   // non-async function leaves no frame. A full clear has one such row:
   // compactionPendingState's queued `() => this.history.withLock(op)` reaches
   // historyService's `withLock: (operation) => this.fileLocks.withLock(...)`.
-  return "unknown";
+  return { site: "unknown" };
 }
 
 const TMP = new RegExp(`${os.tmpdir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/[^/\\s]+`, "g");
@@ -79,9 +82,9 @@ function recordLockCalls() {
   const rows = new Map<string, Row>();
   const waiters: Array<{ lockPath: string; resolve: () => void }> = [];
   const add = (row: Row, lockPath?: string) => {
-    const site = callSite();
-    if (site !== "test") {
-      const full = { site, ...row };
+    const at = callSite();
+    if (at.site !== "test") {
+      const full = { ...at, ...row };
       rows.set(JSON.stringify(full), full);
     }
     if (lockPath === undefined) return;
@@ -114,6 +117,10 @@ function recordLockCalls() {
         staleMs: options.staleMs,
         timeoutMessage:
           options.timeoutMessage === undefined ? undefined : mask(options.timeoutMessage),
+        // Workflow locks pass false: a late operation must not recreate a removed run dir.
+        createParentDirectory: options.createParentDirectory,
+        // A canceled artifact publish wakes its wait through this signal.
+        signal: options.signal === undefined ? undefined : "set",
       },
       options.lockPath
     );
@@ -142,7 +149,7 @@ function recordLockCalls() {
     workspaceId,
     kind
   ) {
-    add({ fn: "WorkspaceUseLeases.isHeld", kind });
+    add({ fn: "WorkspaceUseLeases.isHeld", workspaceId: mask(workspaceId), kind });
     return isHeld.call(this, workspaceId, kind);
   });
   const withLock = workspaceFileLocks.withLock.bind(workspaceFileLocks);
