@@ -7,7 +7,7 @@
  */
 
 import { tool } from "ai";
-import { clockOf, type HostClock } from "@/node/utils/hostClock";
+import { clockOf, nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { Tool } from "ai";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
@@ -578,7 +578,8 @@ ${xumTypes}
       { code, timeout_secs },
       { abortSignal, toolCallId }
     ): Promise<PTCExecutionResult> => {
-      const execStartTime = clock.nowMs();
+      // Wall clock on purpose: QuickJSRuntime measures duration_ms with Date.now() (#7282).
+      const execStartTime = nodeClock.nowMs();
 
       const { toolBridge: activeBridge, withMount: activeMount, loadFile: activeLoadFile } = state;
 
@@ -605,7 +606,7 @@ ${xumTypes}
           error: `Code analysis failed:\n${errorMessages.join("\n")}`,
           toolCalls: [],
           consoleOutput: [],
-          duration_ms: clock.nowMs() - execStartTime,
+          duration_ms: nodeClock.nowMs() - execStartTime,
         };
       }
 

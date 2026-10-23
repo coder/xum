@@ -1,5 +1,5 @@
 import assert from "@/common/utils/assert";
-import { clockOf, type HostClock } from "@/node/utils/hostClock";
+import { clockOf, nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { tool } from "ai";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -144,14 +144,15 @@ function isPageableReport<T extends { status: string; taskId: string }>(
   return "reportMarkdown" in result && typeof result.reportMarkdown === "string";
 }
 
-function getWorkflowRunElapsedMs(run: WorkflowRunRecord, clock: HostClock): number | undefined {
+// Wall clock on purpose: WorkflowService stamps createdAt/updatedAt with Date.now() (#7282).
+function getWorkflowRunElapsedMs(run: WorkflowRunRecord): number | undefined {
   const createdAtMs = parseTimestampMs(run.createdAt);
   if (createdAtMs == null) {
     return undefined;
   }
   const updatedAtMs = parseTimestampMs(run.updatedAt);
-  const endAtMs = isTerminalWorkflowRunStatus(run.status) ? updatedAtMs : clock.nowMs();
-  return Math.max(0, (endAtMs ?? clock.nowMs()) - createdAtMs);
+  const endAtMs = isTerminalWorkflowRunStatus(run.status) ? updatedAtMs : nodeClock.nowMs();
+  return Math.max(0, (endAtMs ?? nodeClock.nowMs()) - createdAtMs);
 }
 
 function getWorkflowRunReport(run: WorkflowRunRecord): {
@@ -192,13 +193,13 @@ function buildWorkflowFailureState(run: WorkflowRunRecord) {
   };
 }
 
-function buildWorkflowAwaitResult(run: WorkflowRunRecord, clock: HostClock) {
+function buildWorkflowAwaitResult(run: WorkflowRunRecord) {
   // Deliberately omit the full run record (script source, event log, step snapshots):
   // it is huge and model-facing only. In-progress events may never materialize in the final
   // result, so the model only needs the status plus the final report/error.
   const base = {
     taskId: run.id,
-    ...withElapsedMs(getWorkflowRunElapsedMs(run, clock)),
+    ...withElapsedMs(getWorkflowRunElapsedMs(run)),
   };
   const workflowProgress = buildWorkflowProgressSummary(run);
   const workflowProgressField = workflowProgress == null ? {} : { workflowProgress };
@@ -469,7 +470,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         }
         if (timeoutMs === 0 || isTerminalWorkflowRunStatus(run.status)) {
           await markWorkflowTerminalAttentionConsumed(run);
-          return buildWorkflowAwaitResult(run, clock);
+          return buildWorkflowAwaitResult(run);
         }
 
         const deadline = clock.nowMs() + (timeoutMs ?? DEFAULT_TASK_AWAIT_TIMEOUT_MS);
@@ -478,7 +479,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             return { status: "error" as const, taskId: runId, error: "Interrupted" };
           }
           if (taskSignal.aborted || clock.nowMs() >= deadline) {
-            return buildWorkflowAwaitResult(run, clock);
+            return buildWorkflowAwaitResult(run);
           }
 
           const remainingMs = Math.max(1, deadline - clock.nowMs());
@@ -488,7 +489,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             taskSignal
           );
           if (taskSignal.aborted) {
-            return buildWorkflowAwaitResult(run, clock);
+            return buildWorkflowAwaitResult(run);
           }
 
           const nextRun = await getWorkflowRun(runId);
@@ -499,7 +500,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         }
 
         await markWorkflowTerminalAttentionConsumed(run);
-        return buildWorkflowAwaitResult(run, clock);
+        return buildWorkflowAwaitResult(run);
       };
 
       // task_await resolves once `min_completed` tasks have completed (default 1 = return on the
