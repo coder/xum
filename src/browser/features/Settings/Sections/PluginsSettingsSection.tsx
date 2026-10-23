@@ -578,8 +578,18 @@ const ManageComponentsPanel: React.FC<{
 
 /** Two-phase add flow: source input → consent preview → install. */
 /**
- * Focus an element when it next mounts, once: `arm()` before the state change that mounts it.
- * A later rerender or remount does not move focus.
+ * Whether keyboard focus fell out of an unmounted control: to the page body, or to the Settings
+ * dialog itself (Radix moves it there). A control the user focused, anywhere, is not lost focus.
+ * A slow preview or install must not take the focus from a control the user moved to meanwhile.
+ */
+function focusFellOut(near: HTMLElement): boolean {
+  const active = document.activeElement;
+  return active === null || active === document.body || active === near.closest('[role="dialog"]');
+}
+
+/**
+ * Focus an element when it next mounts, once, if focus fell out meanwhile: `arm()` before the
+ * state change that mounts it. A later rerender or remount does not move focus.
  */
 function useFocusOnNextMount() {
   const armedRef = useRef(false);
@@ -590,7 +600,7 @@ function useFocusOnNextMount() {
     ref: (element: HTMLElement | null) => {
       if (element === null || !armedRef.current) return;
       armedRef.current = false;
-      element.focus();
+      if (focusFellOut(element)) element.focus();
     },
   };
 }
@@ -598,13 +608,13 @@ function useFocusOnNextMount() {
 /**
  * Callback ref of the preview view (#7121). Opening the preview unmounts the focused source field
  * or Preview button, and focus then fell to the Settings dialog. So the view focuses its first
- * control when it mounts, unless a control inside already took focus (the Back button after a
- * marketplace entry, #7134). The function is module-level, so React calls it only on mount and
- * unmount: a changed Install as method or the Skills CLI choice rerenders the view without
- * moving focus.
+ * control when it mounts, if focus fell out. It does not when a control inside already took focus
+ * (the Back button after a marketplace entry, #7134) or the user focused another control while
+ * the preview loaded. The function is module-level, so React calls it only on mount and unmount:
+ * a changed Install as method or the Skills CLI choice rerenders the view without moving focus.
  */
 function focusFirstControlOnMount(view: HTMLDivElement | null): void {
-  if (view === null || view.contains(document.activeElement)) return;
+  if (view === null || !focusFellOut(view)) return;
   const controls = view.querySelectorAll<HTMLElement>(
     "button, input, select, textarea, [tabindex]"
   );

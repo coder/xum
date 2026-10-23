@@ -189,3 +189,34 @@ test("picking another Install as method keeps the focus on the picked method (#7
   await view.findByText("tools-claude-plugin");
   expect(document.activeElement).toBe(claude);
 });
+
+// Codex round 1 on #7298: a slow preview or install must not take the focus from a control
+// the user moved to while it loaded.
+test.each(["preview", "install"] as const)(
+  "a slow %s keeps the focus on a control the user moved to (#7121)",
+  async (slow) => {
+    const api = createApi();
+    let finish = () => undefined as void;
+    const gate = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const real = api.agentPlugins[slow].bind(api.agentPlugins) as (input: never) => Promise<never>;
+    spyOn(api.agentPlugins, slow).mockImplementation(async (input: never) => {
+      await gate;
+      return real(input);
+    });
+    const { view, pressEnter } = await openAddPanel(api);
+    const manage = view.getByRole("button", { name: "Manage components for tools" });
+    if (slow === "install") {
+      await pressEnter();
+      await view.findByText("tools-next");
+      await userEvent.click(view.getByRole("button", { name: "Install" }));
+    } else {
+      await pressEnter();
+    }
+    manage.focus();
+    finish();
+    await view.findByText(slow === "install" ? "Plugin installed." : "tools-next");
+    expect(document.activeElement).toBe(manage);
+  }
+);
