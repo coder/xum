@@ -36,6 +36,17 @@ function clockOnEffect(runner: EffectRunner, clock: Clock.Clock): HostClock {
           fn();
         }
       };
+      // On the runner fiber a throw would become a defect of a discarded fiber and
+      // vanish. Rethrow it outside the fiber, where it is uncaught as with setTimeout.
+      const fireOnFiber = () => {
+        try {
+          fire();
+        } catch (error) {
+          queueMicrotask(() => {
+            throw error;
+          });
+        }
+      };
       const fiber = runner.runFork(
         Effect.sleep(Duration.millis(Math.max(0, ms))).pipe(
           Effect.andThen(
@@ -43,7 +54,7 @@ function clockOnEffect(runner: EffectRunner, clock: Clock.Clock): HostClock {
               // A sleep that is already due (0 ms on a TestClock) completes
               // inside runFork. Keep the setTimeout contract: fn never runs
               // before setTimer returns.
-              if (returned) fire();
+              if (returned) fireOnFiber();
               else dueBeforeReturn = true;
             })
           )
@@ -51,7 +62,10 @@ function clockOnEffect(runner: EffectRunner, clock: Clock.Clock): HostClock {
       );
       returned = true;
       if (dueBeforeReturn) {
-        queueMicrotask(fire);
+        // A real 0 ms timer: like setTimeout, fn runs as a timer task, after the
+        // caller's pending microtasks (a microtask here could win a race it loses
+        // in production).
+        setImmediate(fire);
       }
       return () => {
         cancelled = true;
