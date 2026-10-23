@@ -629,6 +629,13 @@ export interface BuildSystemMessageFromSourcesOptions {
 }
 
 /**
+ * Open and close the `<custom-instructions>` block. The request assembler finds the block by
+ * them to keep it frozen inside a context segment (planCustomInstructions).
+ */
+export const CUSTOM_INSTRUCTIONS_OPEN = "\n<custom-instructions>\n";
+export const CUSTOM_INSTRUCTIONS_CLOSE = "\n</custom-instructions>";
+
+/**
  * Builds a system message for the AI model by combining instruction sources.
  *
  * Instruction layers:
@@ -771,7 +778,7 @@ export function buildSystemMessageFromSources(
       : null;
 
   if (customInstructions) {
-    systemMessage += `\n<custom-instructions>\n${customInstructions}\n</custom-instructions>`;
+    systemMessage += `${CUSTOM_INSTRUCTIONS_OPEN}${customInstructions}${CUSTOM_INSTRUCTIONS_CLOSE}`;
   }
 
   if (modelContent && modelString) {

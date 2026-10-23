@@ -75,7 +75,12 @@ import {
   requireReachableSkills,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
-import { buildSystemMessageFromSources, loadWorkspaceInstructionSources } from "./systemMessage";
+import {
+  buildSystemMessageFromSources,
+  CUSTOM_INSTRUCTIONS_CLOSE,
+  CUSTOM_INSTRUCTIONS_OPEN,
+  loadWorkspaceInstructionSources,
+} from "./systemMessage";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "./log";
@@ -89,6 +94,7 @@ import {
 import { prepareMessagesForProvider } from "./messagePipeline";
 import {
   acceptsVolatileSystemTailRow,
+  planCustomInstructions,
   planVolatileSystemTail,
 } from "@/node/utils/messages/volatileSystemTail";
 import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
@@ -263,6 +269,8 @@ export interface PromptPayload {
   tools: Record<string, Tool> | undefined;
   /** For this turn's assistant row (MuxMetadata.volatileSystemTail); undefined records nothing. */
   volatileSystemTail?: VolatileSystemTailRecord;
+  /** The same for the custom-instructions block (MuxMetadata.customInstructions). */
+  customInstructions?: VolatileSystemTailRecord;
   /**
    * The system content this request sends (prompt-cache mechanism 10): the stable part plus
    * the tail it actually carries (frozen inside a segment), its volatile length, and the text of
@@ -320,8 +328,12 @@ export interface AssemblePromptPayloadOptions {
   /**
    * Replay only: `systemMessage` is the system content the turn sent (its envelope), and this
    * holds the turn's own MuxMetadata.volatileSystemTail, so the planner can derive the live tail.
+   * `customInstructions` is the turn's MuxMetadata.customInstructions, for the same purpose.
    */
-  replayedTurn?: { record?: VolatileSystemTailRecord };
+  replayedTurn?: {
+    record?: VolatileSystemTailRecord;
+    customInstructions?: VolatileSystemTailRecord;
+  };
 }
 
 /**
@@ -424,9 +436,39 @@ async function historyShareOfBudget(
 }
 
 /**
+ * The stable system prompt with its `<custom-instructions>` block frozen inside a segment: a
+ * change of the block (an AGENTS.md edit merged into the worktree) becomes a system row, so
+ * the cached system block and the history after it stay byte-identical. Without a block (no
+ * instructions, or none found) the prompt is sent as is and nothing is recorded.
+ */
+function planStableSystem(
+  liveStable: string,
+  history: MuxMessage[],
+  rowsSupported: boolean,
+  /** Replay only (see AssemblePromptPayloadOptions.replayedTurn). */
+  replayedTurn: { record?: VolatileSystemTailRecord } | undefined
+) {
+  const start = liveStable.indexOf(CUSTOM_INSTRUCTIONS_OPEN);
+  const close = liveStable.lastIndexOf(CUSTOM_INSTRUCTIONS_CLOSE);
+  const end = close + CUSTOM_INSTRUCTIONS_CLOSE.length;
+  const found = start >= 0 && close > start;
+  const plan = planCustomInstructions(
+    history,
+    found ? liveStable.slice(start, end) : "",
+    found && rowsSupported,
+    replayedTurn
+  );
+  const stableSystem = found
+    ? liveStable.slice(0, start) + plan.systemTail + liveStable.slice(end)
+    : liveStable;
+  return { stableSystem, plan };
+}
+
+/**
  * The system prompt split into its cached stable block and the volatile tail, and where the
  * tail goes: a tail change inside a segment becomes a system row instead of a system edit
- * (prompt-cache mechanism 10, volatileSystemTail.ts).
+ * (prompt-cache mechanism 10, volatileSystemTail.ts). The custom-instructions block inside
+ * the stable block follows the same rule (planStableSystem).
  */
 function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMessage[]) {
   const volatileLength = options.volatileSystemSuffixLength ?? 0;
@@ -436,9 +478,29 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
       (volatileLength === 0 || volatileLength < options.systemMessage.length),
     "volatileSystemSuffixLength must leave a non-empty stable system prefix"
   );
-  const stableSystem = options.systemMessage.slice(
-    0,
-    options.systemMessage.length - volatileLength
+  const liveStable = options.systemMessage.slice(0, options.systemMessage.length - volatileLength);
+  // A compaction request (it has a budget) sends as before and records nothing: the trim
+  // already fitted `history` to its budget, so rows added now could exceed it. Its system
+  // prompt is the compact agent's, so no cached prefix is lost, and its summary starts a new
+  // segment anyway.
+  const rowsSupported =
+    options.compactionInputBudgetTokens == null &&
+    createCachedSystemMessage(
+      liveStable,
+      options.modelString,
+      options.anthropicCacheTtl,
+      options.providersConfig
+    ) != null &&
+    acceptsVolatileSystemTailRow(
+      options.modelString,
+      options.routeProvider,
+      options.providersConfig
+    );
+  const { stableSystem, plan: instructionsPlan } = planStableSystem(
+    liveStable,
+    history,
+    rowsSupported,
+    options.replayedTurn && { record: options.replayedTurn.customInstructions }
   );
   const cachedSystemMessage = createCachedSystemMessage(
     stableSystem,
@@ -449,23 +511,13 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
   // Length 0 means no volatile sections, or a tail the caller could not split off (middleware
   // edited it; turnRequestBuilder passes 0 then). Either way this request sends as before and
   // records nothing: a row could only claim that sections still in the prompt are gone.
-  // A compaction request (it has a budget) does the same: the trim already fitted `history`
-  // to its budget, so rows added now could exceed it. Its system prompt is the compact
-  // agent's, so no cached prefix is lost, and its summary starts a new segment anyway.
   const tailPlan = planVolatileSystemTail(
-    history,
-    options.systemMessage.slice(stableSystem.length),
-    volatileLength > 0 &&
-      options.compactionInputBudgetTokens == null &&
-      cachedSystemMessage != null &&
-      acceptsVolatileSystemTailRow(
-        options.modelString,
-        options.routeProvider,
-        options.providersConfig
-      ),
+    instructionsPlan.messages,
+    options.systemMessage.slice(liveStable.length),
+    volatileLength > 0 && rowsSupported,
     options.replayedTurn
   );
-  return { stableSystem, cachedSystemMessage, tailPlan };
+  return { stableSystem, cachedSystemMessage, instructionsPlan, tailPlan };
 }
 
 export async function assemblePromptPayload(
@@ -491,9 +543,14 @@ export async function assemblePromptPayload(
     options.modelString,
     options.requestContextMessage
   );
-  const { stableSystem, cachedSystemMessage, tailPlan } = planSystemPrompt(
+  const { stableSystem, cachedSystemMessage, instructionsPlan, tailPlan } = planSystemPrompt(
     options,
     providerRequestMessages
+  );
+  // The new rows go last, after the newest user row and its request context: the
+  // instructions row first, as planSystemPrompt put the recorded rows back.
+  const appendedRows = [instructionsPlan.appendedRow, tailPlan.appendedRow].filter(
+    (row): row is MuxMessage => row != null
   );
   const historyWithSentinel = addInterruptedSentinel(
     insertRequestContextMessage(
@@ -504,10 +561,8 @@ export async function assemblePromptPayload(
     )
   );
   let messages = await prepareMessagesForProvider({
-    // The new row goes last, after the newest user row and its request context.
-    messagesWithSentinel: tailPlan.appendedRow
-      ? [...historyWithSentinel, tailPlan.appendedRow]
-      : historyWithSentinel,
+    messagesWithSentinel:
+      appendedRows.length > 0 ? [...historyWithSentinel, ...appendedRows] : historyWithSentinel,
     replayReceiptMessages: prepared.activeContextMessages,
     effectiveAgentId: options.effectiveAgentId,
     toolNamesForSentinel: options.toolNamesForSentinel,
@@ -524,6 +579,7 @@ export async function assemblePromptPayload(
       ? collectDeferLoadingToolNames(options.tools)
       : options.deferLoadingToolNames,
   });
+  // Without a cached system row nothing is frozen (rowsSupported), so this is also the sent one.
   let system: Instructions | undefined = options.systemMessage;
   // Uncached trailing block: the stable block keeps the cache breakpoint.
   const volatileRows: SystemModelMessage[] =
@@ -555,10 +611,12 @@ export async function assemblePromptPayload(
     messages,
     system,
     ...(tailPlan.record != null ? { volatileSystemTail: tailPlan.record } : {}),
+    ...(instructionsPlan.record != null ? { customInstructions: instructionsPlan.record } : {}),
     sentSystem: {
       message: stableSystem + tailPlan.systemTail,
-      volatileSuffixLength: stableSystem === options.systemMessage ? 0 : tailPlan.systemTail.length,
-      rowsText: tailPlan.rowsText,
+      volatileSuffixLength:
+        (options.volatileSystemSuffixLength ?? 0) === 0 ? 0 : tailPlan.systemTail.length,
+      rowsText: instructionsPlan.rowsText + tailPlan.rowsText,
     },
     tools: options.tools
       ? applyCacheControlToTools(

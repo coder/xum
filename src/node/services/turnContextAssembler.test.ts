@@ -6,7 +6,11 @@ import { describe, expect, test } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { sliceMessagesFromLatestCompactionBoundary } from "@/common/utils/messages/compactionBoundary";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  type MuxMessage,
+  type VolatileSystemTailRecord,
+} from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectsConfig } from "@/common/types/project";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
@@ -950,6 +954,66 @@ describe("assemblePromptPayload", () => {
       expect(payload.messages[0]).toMatchObject({ role: "system", content: prompt });
       expect(payload.messages.filter((message) => message.role === "system")).toHaveLength(1);
       expect(payload.volatileSystemTail).toBeUndefined();
+    });
+
+    test("an instructions change and a tail change in one turn keep both rows in place", async () => {
+      // D9: the <custom-instructions> block (AGENTS.md) follows the tail's rule. Its row comes
+      // first, so the tail row after it still follows the user row on every rebuild.
+      const block = (rules: string) => `\n<custom-instructions>\n${rules}\n</custom-instructions>`;
+      const send = (
+        rules: string,
+        tail: string,
+        history: MuxMessage[],
+        replayedTurn?: {
+          record?: VolatileSystemTailRecord;
+          customInstructions?: VolatileSystemTailRecord;
+        }
+      ) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable + block(rules) + tail,
+          volatileSystemSuffixLength: tail.length,
+          replayedTurn,
+        });
+      const turnRow = (id: string, payload: Awaited<ReturnType<typeof send>>) =>
+        createMuxMessage(id, "assistant", `answer ${id}`, {
+          volatileSystemTail: payload.volatileSystemTail,
+          customInstructions: payload.customInstructions,
+        });
+      const [u1, u2, u3] = ["first", "second", "third"].map((text, index) =>
+        createMuxMessage(`u${index + 1}`, "user", text)
+      );
+      const start = await send("v1", hot("A"), [u1]);
+      expect(start.customInstructions).toEqual({ text: block("v1"), placement: "system" });
+
+      const history = [u1, turnRow("a1", start), u2];
+      const changed = await send("v2", hot("B"), history);
+      // The cached system block keeps v1; v2 and B go after the newest user row, in that order.
+      expect(changed.messages[0]).toMatchObject({ role: "system", content: stable + block("v1") });
+      expect(changed.messages.slice(-3).map((message) => message.role)).toEqual([
+        "user",
+        "system",
+        "system",
+      ]);
+      expect(JSON.stringify(changed.messages.at(-2))).toContain("v2");
+      expect(JSON.stringify(changed.messages.at(-1))).toContain("<hot_memories>B</hot_memories>");
+      expect(changed.customInstructions).toEqual({ text: block("v2"), placement: "row" });
+
+      // The replay verifier rebuilds the same request from the sent system and the records.
+      const replayed = await send("v1", hot("A"), history, {
+        record: changed.volatileSystemTail,
+        customInstructions: changed.customInstructions,
+      });
+      expect(withoutMarkers(replayed.messages)).toBe(withoutMarkers(changed.messages));
+
+      // The next turn puts both rows back in place and adds none: it extends the request.
+      const next = await send("v2", hot("B"), [...history, turnRow("a2", changed), u3]);
+      expect(next.customInstructions).toBeUndefined();
+      expect(next.volatileSystemTail).toBeUndefined();
+      expect(withoutMarkers(next.messages.slice(0, changed.messages.length))).toBe(
+        withoutMarkers(changed.messages)
+      );
     });
 
     test("a compaction boundary starts a new segment with the live tail", async () => {
