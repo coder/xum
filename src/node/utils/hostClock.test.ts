@@ -67,6 +67,17 @@ describe.each([
     expect(fired).toBe(1);
   });
 
+  test("a 0 ms timer runs after the microtasks queued behind it", async () => {
+    // setTimeout(fn, 0) is a timer task: a promise continuation queued after it
+    // wins a race against it. The TestClock must not invert that order.
+    subject = makeSubject();
+    const order: string[] = [];
+    subject.clock.setTimer(() => order.push("timer"), 0);
+    void Promise.resolve().then(() => order.push("microtask"));
+    await subject.advance(1);
+    expect(order).toEqual(["microtask", "timer"]);
+  });
+
   test("cancel before a 0 ms timer runs stops it", async () => {
     subject = makeSubject();
     let fired = 0;

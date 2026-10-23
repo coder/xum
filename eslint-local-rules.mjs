@@ -796,10 +796,19 @@ const localPlugin = {
           !node.computed &&
           node.object.type === "Identifier" &&
           node.object.name === object;
+        // `Date` or `globalThis.Date`: both name the host clock.
+        const isDate = (node) =>
+          (node.type === "Identifier" && node.name === "Date") ||
+          (memberOf(node, "globalThis") && node.property.name === "Date");
         return {
           CallExpression(node) {
             const callee = node.callee;
-            if (memberOf(callee, "Date") && callee.property.name === "now") {
+            if (
+              callee.type === "MemberExpression" &&
+              !callee.computed &&
+              isDate(callee.object) &&
+              callee.property.name === "now"
+            ) {
               found.push({ node, what: "Date.now()" });
             } else if (isTimer(callee)) {
               found.push({ node, what: `${callee.name}()` });
@@ -808,11 +817,7 @@ const localPlugin = {
             }
           },
           NewExpression(node) {
-            if (
-              node.callee.type === "Identifier" &&
-              node.callee.name === "Date" &&
-              node.arguments.length === 0
-            ) {
+            if (isDate(node.callee) && node.arguments.length === 0) {
               found.push({ node, what: "new Date()" });
             }
           },
