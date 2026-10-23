@@ -8,7 +8,9 @@
 # the published digest fixes the bytes after the build.
 FROM oven/bun:1.4.3-slim@sha256:14a223fa35747ec728bce300ef85888bc5f7958164d15bbba6a54b22b52a3288 AS bun
 
-FROM node:22-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
+# Node 22.23.4 or newer: older releases have CVE-2026-111497 (crafted Brotli data runs code), and
+# the sandbox runs the app server on this Node.
+FROM node:22.23.4-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
 # The playwright-core version of the checkout's @e2e-dev/web (build.sh reads it from bun.lock).
 ARG PLAYWRIGHT_CORE_VERSION
 # The inputs key (build.sh --key). The runner refuses an image whose label differs from the
