@@ -68,6 +68,8 @@ interface SystemSectionChannel {
   header: string;
   /** Suffix of a put-back row's id, and the id of the appended row. */
   rowId: string;
+  /** The row's section for a record's text, when the text is not model-readable as is. */
+  render?: (text: string) => string;
 }
 
 const VOLATILE_TAIL: SystemSectionChannel = {
@@ -105,6 +107,51 @@ const SKILL_INDEX: SystemSectionChannel = {
 /** The skill-index row's text when no skill is listed any more (see INSTRUCTIONS_REMOVED). */
 const SKILL_INDEX_REMOVED = "\n(None: no skills are listed now.)";
 
+/**
+ * The `Tool: <name>` sections of the instruction files, which getToolsForModel appends to
+ * their tool descriptions (the cached tool block). Its record text is the map of each tool in
+ * the request to its instructions, as JSON sorted by tool ("" for none), so the request can
+ * put the frozen ones back in each description; rows show it as tagged blocks.
+ */
+const TOOL_INSTRUCTIONS: SystemSectionChannel = {
+  field: "toolInstructions",
+  header:
+    "The Tool: sections of the workspace custom instructions (AGENTS.md) changed during this session. The blocks below are the current version from Xum, not from the user. Each one replaces the instructions at the end of that tool's description, and a tool not listed has none now: follow them from now on.",
+  rowId: "tool-instructions",
+  render: (text) => {
+    const instructions = parseToolInstructions(text);
+    // The removal marker (or a corrupt record) is sent as is.
+    if (instructions == null) return text;
+    return Object.entries(instructions)
+      .map(([tool, body]) => `\n<tool-instructions tool="${tool}">\n${body}\n</tool-instructions>`)
+      .join("");
+  },
+};
+
+/** The tool-instructions row's text when no tool has instructions any more. */
+const TOOL_INSTRUCTIONS_REMOVED = "\n(None: no tool has Tool: instructions now.)";
+
+/** The record text of a tool-instructions map (see TOOL_INSTRUCTIONS). */
+function serializeToolInstructions(instructions: Record<string, string>): string {
+  const entries = Object.entries(instructions).sort(([a], [b]) => a.localeCompare(b));
+  return entries.length === 0 ? "" : JSON.stringify(Object.fromEntries(entries));
+}
+
+/** The map a tool-instructions text holds; undefined for the removal marker or a corrupt one. */
+export function parseToolInstructions(text: string): Record<string, string> | undefined {
+  if (text === "") return {};
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (!entries.every(([, body]) => typeof body === "string")) return undefined;
+  return Object.fromEntries(entries) as Record<string, string>;
+}
+
 /** The record, or undefined when absent or corrupt (self-healing: a bad record is ignored). */
 function readSectionRecord(
   message: MuxMessage,
@@ -133,12 +180,18 @@ export function readSkillIndexRecord(message: MuxMessage): VolatileSystemTailRec
   return readSectionRecord(message, SKILL_INDEX.field);
 }
 
+export function readToolInstructionsRecord(
+  message: MuxMessage
+): VolatileSystemTailRecord | undefined {
+  return readSectionRecord(message, TOOL_INSTRUCTIONS.field);
+}
+
 function systemRow(id: string, channel: SystemSectionChannel, section: string): MuxMessage {
   return {
     id,
     role: "system",
     // The section starts with its own newline separator (never empty: see planSystemSection).
-    parts: [{ type: "text", text: channel.header + section }],
+    parts: [{ type: "text", text: channel.header + (channel.render?.(section) ?? section) }],
   };
 }
 
@@ -356,6 +409,26 @@ export function planSkillIndex(
     { ...SKILL_INDEX, removed: SKILL_INDEX_REMOVED },
     messages,
     requestIndex,
+    rowsSupported,
+    replayedTurn
+  );
+}
+
+/**
+ * planSkillIndex for the `Tool: <name>` instructions at the end of the tool descriptions:
+ * `systemTail` is the frozen map's text (parseToolInstructions reads it). Runs after
+ * planSkillIndex and before planVolatileSystemTail, in their row order.
+ */
+export function planToolInstructions(
+  messages: MuxMessage[],
+  requestInstructions: Record<string, string>,
+  rowsSupported: boolean,
+  replayedTurn?: { record?: VolatileSystemTailRecord }
+): VolatileSystemTailPlan {
+  return planRemovableSection(
+    { ...TOOL_INSTRUCTIONS, removed: TOOL_INSTRUCTIONS_REMOVED },
+    messages,
+    serializeToolInstructions(requestInstructions),
     rowsSupported,
     replayedTurn
   );

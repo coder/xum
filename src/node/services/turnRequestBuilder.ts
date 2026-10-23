@@ -3461,6 +3461,7 @@ export class TurnRequestBuilder {
               instructionsSection: systemContext.instructionsSection,
               tools: attemptTools,
               skillIndexSection,
+              toolInstructions,
               modelString: seed.rawModelString,
               routeProvider: seed.routeProvider,
               openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,

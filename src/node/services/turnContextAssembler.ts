@@ -101,6 +101,8 @@ import {
   acceptsVolatileSystemTailRow,
   planCustomInstructions,
   planSkillIndex,
+  planToolInstructions,
+  parseToolInstructions,
   planVolatileSystemTail,
   type VolatileSystemTailPlan,
 } from "@/node/utils/messages/volatileSystemTail";
@@ -280,6 +282,8 @@ export interface PromptPayload {
   customInstructions?: VolatileSystemTailRecord;
   /** The same for the agent_skill_read skill index (MuxMetadata.skillIndex). */
   skillIndex?: VolatileSystemTailRecord;
+  /** The same for the `Tool: <name>` instructions (MuxMetadata.toolInstructions). */
+  toolInstructions?: VolatileSystemTailRecord;
   /**
    * The system content this request sends (prompt-cache mechanism 10): the stable part plus
    * the tail it actually carries (frozen inside a segment), its volatile length, and the text of
@@ -311,6 +315,11 @@ export interface AssemblePromptPayloadOptions {
    * (skillIndexSectionFor), kept frozen inside a segment like the custom instructions.
    */
   skillIndexSection?: { prefix: string; block: string };
+  /**
+   * The `Tool: <name>` instructions that `tools` were built with (extractToolInstructions,
+   * appended to each description), kept frozen inside a segment like the skill index.
+   */
+  toolInstructions?: Record<string, string>;
   /**
    * Native deferred tool names for tool_catalog_search replay when `tools` is absent: the
    * replay verifier rebuilds prompts without tools and reads these from the recorded request.
@@ -348,13 +357,14 @@ export interface AssemblePromptPayloadOptions {
   /**
    * Replay only: `systemMessage` is the system content the turn sent (its envelope), and this
    * holds the turn's own MuxMetadata.volatileSystemTail, so the planner can derive the live tail.
-   * `customInstructions` and `skillIndex` are the turn's records of the same name, for the
-   * same purpose.
+   * `customInstructions`, `skillIndex` and `toolInstructions` are the turn's records of the
+   * same name, for the same purpose.
    */
   replayedTurn?: {
     record?: VolatileSystemTailRecord;
     customInstructions?: VolatileSystemTailRecord;
     skillIndex?: VolatileSystemTailRecord;
+    toolInstructions?: VolatileSystemTailRecord;
   };
 }
 
@@ -549,6 +559,62 @@ function locateSkillIndex(options: AssemblePromptPayloadOptions) {
     : undefined;
 }
 
+/**
+ * `tools` with the `Tool: <name>` instructions frozen inside a segment (Codex
+ * PRRT_kwDOPxxmWM6vgBAW): an edited Tool: section becomes a system row, so the cached tool
+ * block stays byte-identical. Replay has no tools, so the records alone decide its rows.
+ */
+function planToolInstructionsTools(
+  options: AssemblePromptPayloadOptions,
+  tools: Record<string, Tool> | undefined,
+  history: MuxMessage[],
+  rowsSupported: boolean
+) {
+  if (options.replayedTurn) {
+    const record = options.replayedTurn.toolInstructions;
+    return { tools, plan: planToolInstructions(history, {}, rowsSupported, { record }) };
+  }
+  const live = locateToolInstructions(options);
+  const plan = planToolInstructions(history, live ?? {}, live != null && rowsSupported);
+  // A corrupt frozen record keeps the live descriptions (its rows still name the change).
+  const frozen = parseToolInstructions(plan.systemTail);
+  if (live == null || frozen == null || tools == null) return { tools, plan };
+  const withFrozen = { ...tools };
+  for (const [name, tool] of Object.entries(tools)) {
+    withFrozen[name] = withInstructions(tool, live[name], frozen[name]);
+  }
+  return { tools: withFrozen, plan };
+}
+
+/** `tool` with `frozen` instead of the `live` instructions at the end of its description. */
+function withInstructions(tool: Tool, live: string | undefined, frozen: string | undefined) {
+  if (frozen === live) return tool;
+  // locateToolInstructions checked that the description ends with "\n\n" + live.
+  const description = descriptionOf(tool);
+  const base = live == null ? description : description.slice(0, -live.length - 2);
+  return withDescription(tool, frozen == null ? base : `${base}\n\n${frozen}`);
+}
+
+/**
+ * The instructions each tool of `options.tools` carries, only while every one of them still
+ * ends its description (getToolsForModel appends them): else the request sends as before.
+ */
+function locateToolInstructions(options: AssemblePromptPayloadOptions) {
+  if (options.toolInstructions == null || options.tools == null) return undefined;
+  const live: Record<string, string> = {};
+  for (const [name, tool] of Object.entries(options.tools)) {
+    const instructions = options.toolInstructions[name];
+    if (!instructions) continue;
+    if (!descriptionOf(tool).endsWith(`\n\n${instructions}`)) return undefined;
+    live[name] = instructions;
+  }
+  return live;
+}
+
+function descriptionOf(tool: Tool): string {
+  return typeof tool.description === "string" ? tool.description : "";
+}
+
 /** A copy of `tool` with another description (its other properties and markers kept). */
 function withDescription(tool: Tool, description: string): Tool {
   const copy = cloneToolPreservingDescriptors(tool);
@@ -612,16 +678,18 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
     options.anthropicCacheTtl,
     options.providersConfig
   );
-  const { tools, plan: skillsPlan } = planSkillIndexTool(
+  const skills = planSkillIndexTool(options, instructionsPlan.messages, rowsSupported);
+  const { tools, plan: toolInstructionsPlan } = planToolInstructionsTools(
     options,
-    instructionsPlan.messages,
+    skills.tools,
+    skills.plan.messages,
     rowsSupported
   );
   // Length 0 means no volatile sections, or a tail the caller could not split off (middleware
   // edited it; turnRequestBuilder passes 0 then). Either way this request sends as before and
   // records nothing: a row could only claim that sections still in the prompt are gone.
   const tailPlan = planVolatileSystemTail(
-    skillsPlan.messages,
+    toolInstructionsPlan.messages,
     options.systemMessage.slice(liveStable.length),
     volatileLength > 0 && rowsSupported,
     options.replayedTurn
@@ -634,7 +702,8 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
     sentVolatileLength: volatileLength === 0 ? 0 : tailPlan.systemTail.length,
     ...combineSectionPlans([
       ["customInstructions", instructionsPlan],
-      ["skillIndex", skillsPlan],
+      ["skillIndex", skills.plan],
+      ["toolInstructions", toolInstructionsPlan],
       ["volatileSystemTail", tailPlan],
     ]),
   };

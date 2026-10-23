@@ -39,7 +39,7 @@ const SAFE_KEYS = {
     "duration ttftMs usage contextUsage providerMetadata contextProviderMetadata systemMessageTokens",
     "costsIncluded toolModelUsages stepStartPartIndices streamFinalized finishReason stopCause",
     "volatileSystemTail customInstructions anthropicThinkingReplay anthropicThinkingReplayFromStep",
-    "routeProvider skillIndex"
+    "routeProvider skillIndex toolInstructions"
   ),
 };
 

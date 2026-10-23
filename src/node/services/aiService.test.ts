@@ -4836,6 +4836,42 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(lastRow(changed)).not.toContain("custom instructions (AGENTS.md) changed");
     });
 
+    it("keeps the tool block across an AGENTS.md Tool: section change", async () => {
+      // Codex PRRT_kwDOPxxmWM6vgBAW: a Tool: section lands in its tool's description, inside
+      // the cached tool block. Inside a segment the description keeps it; a row sends the change.
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const ledger = (requests: TurnExecutionOptions[]) =>
+        requests.flatMap((request, index) => [
+          createMuxMessage(`u${index}`, "user", "hello"),
+          createMuxMessage(`a${index}`, "assistant", `answer ${index}`, {
+            volatileSystemTail: request.initialMetadata?.volatileSystemTail,
+            customInstructions: request.initialMetadata?.customInstructions,
+            toolInstructions: request.initialMetadata?.toolInstructions,
+          }),
+        ]);
+      const agentsMd = (rule: string) => `Plain rule.\n\n## Tool: bash\n${rule}\n`;
+      const {
+        requests: [first, changed, next],
+      } = await streamPair(
+        xumHome.path,
+        [
+          { agentsMd: agentsMd("Bash rule v1") },
+          { agentsMd: agentsMd("Bash rule v2"), history: ledger },
+          { agentsMd: agentsMd("Bash rule v2"), history: ledger },
+        ],
+        undefined,
+        "anthropic"
+      );
+      expect(first.tools?.bash?.description).toContain("Bash rule v1");
+      for (const request of [changed, next]) {
+        expect(toolBlock(request)).toBe(toolBlock(first));
+        expect(stableSystemRow(request)).toBe(stableSystemRow(first));
+      }
+      expect(lastRow(changed)).toContain("Bash rule v2");
+      expect(changed.initialMetadata?.toolInstructions?.placement).toBe("row");
+      expect(next.initialMetadata?.toolInstructions).toBeUndefined();
+    });
+
     it("keeps the tool block across a skill added mid-segment", async () => {
       // D9: a skill commit merged into the worktree grew the agent_skill_read description and
       // rewrote the cached tool block. Inside a segment the description now keeps its list,

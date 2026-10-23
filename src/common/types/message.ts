@@ -1047,6 +1047,7 @@ export const SYSTEM_SECTION_RECORD_FIELDS = [
   "volatileSystemTail",
   "customInstructions",
   "skillIndex",
+  "toolInstructions",
 ] as const;
 export type SystemSectionRecords = Pick<MuxMetadata, (typeof SYSTEM_SECTION_RECORD_FIELDS)[number]>;
 
@@ -1143,6 +1144,11 @@ export interface MuxMetadata {
    * "row" sent a changed index as a system row right before this row.
    */
   skillIndex?: VolatileSystemTailRecord;
+  /**
+   * The `Tool: <name>` instructions the tool descriptions of this turn's request sent (text: the
+   * JSON map of tool to instructions, "" for none), with the same rule as skillIndex.
+   */
+  toolInstructions?: VolatileSystemTailRecord;
   // Last step's provider metadata (for context window cache display)
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
