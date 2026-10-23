@@ -107,11 +107,16 @@ jobs:
               - 'pixel.jsonc'
               - '.storybook/**'
             # Queue-only jobs (test-e2e, bugbash-sandbox, build-vscode) still run on a PR that
-            # changes their own tests or sources.
+            # changes their own tests or sources. This workflow holds their steps, the Makefile
+            # their targets, and bun.lock the playwright-core version that keys the sandbox image.
             e2e_tests:
               - 'tests/e2e/**'
               - 'tests/bugbash/**'
               - 'playwright.config.ts'
+              - '.github/workflows/pr.yml'
+              - 'Makefile'
+              - 'package.json'
+              - 'bun.lock'
             vscode:
               - 'vscode/**'
             nix_deps:
@@ -121,8 +126,8 @@ jobs:
               - 'flake.nix'
               - 'nix/**'
               - 'flake.lock'
-            # Server image inputs: the Dockerfile and the build setup it copies, plus this
-            # workflow. Smoke / Docker runs on PRs that touch them (#5605), and in the merge
+            # Server image build setup: the Dockerfile and every input it copies except the app
+            # sources, plus this workflow. Smoke / Docker runs on PRs that touch them (#5605), and in the merge
             # queue for every change. App sources (src/**, docs/**, public/**, static/**, the
             # HTML entries) are not here: they matched 272 of 301 PR runs (2026-10-23), so the
             # 16-vCPU image build ran on almost every PR push for 2 failures.
