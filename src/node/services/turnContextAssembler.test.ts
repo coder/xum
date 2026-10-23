@@ -1104,6 +1104,45 @@ describe("assemblePromptPayload", () => {
       expect(JSON.stringify(removed.messages.at(-1))).toContain("no skills are listed now");
     });
 
+    test("a first skill added mid-segment is a row, not a tool-block rewrite", async () => {
+      // Same gap as PRRT_kwDOPxxmWM6vgBAc for the skill index: the segment starts with no skill
+      // listed, then one appears. The cached tool description stays byte-identical.
+      const index = "\n\nAvailable skills:\n- a";
+      const send = (block: string, history: MuxMessage[]) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable,
+          tools: {
+            agent_skill_read: tool({
+              description: `Read a skill.${block}\n\nTool instructions.`,
+              inputSchema: jsonSchema({ type: "object" }),
+            }),
+          },
+          skillIndexSection: { prefix: "Read a skill.", block },
+        });
+      const turnRow = (id: string, payload: Awaited<ReturnType<typeof send>>) =>
+        createMuxMessage(id, "assistant", `answer ${id}`, { skillIndex: payload.skillIndex });
+      const [u1, u2, u3] = ["first", "second", "third"].map((text, index) =>
+        createMuxMessage(`u${index + 1}`, "user", text)
+      );
+      const start = await send("", [u1]);
+      expect(start.skillIndex).toEqual({ text: "", placement: "system" });
+      const history = [u1, turnRow("a1", start), u2];
+      const added = await send(index, history);
+      expect(added.tools?.agent_skill_read?.description).toBe(
+        "Read a skill.\n\nTool instructions."
+      );
+      expect(JSON.stringify(added.messages.at(-1))).toContain("- a");
+      expect(added.skillIndex).toEqual({ text: index, placement: "row" });
+      // The next turn repeats the row in place and adds none.
+      const next = await send(index, [...history, turnRow("a2", added), u3]);
+      expect(next.skillIndex).toBeUndefined();
+      expect(withoutMarkers(next.messages.slice(0, added.messages.length))).toBe(
+        withoutMarkers(added.messages)
+      );
+    });
+
     test("a first AGENTS.md added mid-segment is a row, not a system-prompt rewrite", async () => {
       // Codex P2 PRRT_kwDOPxxmWM6vgBAc: the segment starts with no instruction blocks, then an
       // AGENTS.md (or a first Model:/Mode: section) appears. The cached system block stays.
