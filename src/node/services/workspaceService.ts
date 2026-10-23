@@ -16537,7 +16537,9 @@ export class WorkspaceService
     // sampling later — at enqueue or dispatch — would misclassify a message
     // the user authored before a goal became visible as an intervention
     // against it, pausing the fresh goal.
-    const authoredAtMs = this.hostClock.nowMs();
+    // Wall clock on purpose: messageQueue folds it with Date.now() and
+    // WorkspaceGoalService.acknowledgeUser compares it with its wall-clock gate (#7282).
+    const authoredAtMs = nodeClock.nowMs();
     // Deliberate picker intent pins agent-task AI fields; only a person's own send may carry
     // it. Strip it here so it never reaches the queue, AgentSession, or persisted options.
     const { aiSelectionIntent, ...optionsWithoutAiSelectionIntent } = options;
