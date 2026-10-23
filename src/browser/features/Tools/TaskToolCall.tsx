@@ -67,8 +67,8 @@ import {
 import { resolvePersistedAgentId } from "@/common/utils/agentIds";
 import { formatDuration } from "@/common/utils/formatDuration";
 import { ElapsedTimeDisplay } from "./Shared/ElapsedTimeDisplay";
-import { ModelDisplay } from "../Messages/ModelDisplay";
-import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
+import { ModelDisplay, ThinkingLevelLabel } from "../Messages/ModelDisplay";
+import type { ThinkingLevel } from "@/common/types/thinking";
 
 /**
  * Clean SVG icon for task tools - represents spawning/branching work
@@ -563,7 +563,8 @@ const TaskAiSettingsDisplay: React.FC<TaskAiSettingsInfo & { className?: string 
       )}
       {props.thinkingLevel != null && (
         <span className="rounded bg-[var(--color-bg-tertiary)] px-1 py-0.5 font-mono leading-none">
-          thinking: {getThinkingOptionLabel(props.thinkingLevel, props.modelString)}
+          thinking:{" "}
+          <ThinkingLevelLabel level={props.thinkingLevel} modelString={props.modelString} />
         </span>
       )}
     </span>

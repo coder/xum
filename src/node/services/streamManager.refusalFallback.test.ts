@@ -378,8 +378,8 @@ describe("StreamManager - fallback volatile-tail record (mechanism 10)", () => {
     // Codex P2 (PRRT_kwDOPxxmWM6srL1S): the fallback stream may prepare its first step before
     // activation finishes. A thinking change consumed there rebuilds the request and records
     // its own tail plan, which the prepared baseline must not overwrite afterwards.
-    const baseline = { text: "\n\n<hot_memories>A</hot_memories>", placement: "system" as const };
-    const rebuiltTail = { text: "\n\n<hot_memories>B</hot_memories>", placement: "row" as const };
+    const baseline = { text: "\n\n[Warning: A]", placement: "system" as const };
+    const rebuiltTail = { text: "\n\n[Warning: B]", placement: "row" as const };
     let firstStep: unknown;
     const attempts: ScriptedAttempt[] = [
       { chunks: [REFUSAL_FINISH], usage: NO_USAGE },

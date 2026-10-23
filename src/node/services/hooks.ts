@@ -775,8 +775,7 @@ function logHookFailure(
   err: unknown,
   abortSignal: AbortSignal | undefined
 ): void {
-  // A cancelled tool call (user interrupt, memory intuition deadline) aborts its
-  // hook before or during exec. That is expected, so it is not an error.
+  // A cancelled tool call (user interrupt) aborts its hook before or during exec. That is expected, so it is not an error.
   if (abortSignal?.aborted) {
     log.debug(`[hooks] ${phase} skipped: tool call aborted`, { hookPath, error: err });
   } else {

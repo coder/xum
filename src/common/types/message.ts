@@ -1124,7 +1124,7 @@ export interface MuxMetadata {
    */
   anthropicThinkingReplayFromStep?: number | "end";
   /**
-   * The volatile system-prompt tail (hot memories, MCP warning, context-window ids) this
+   * The volatile system-prompt tail (MCP warning, context-window ids) this
    * turn's request sent (prompt-cache mechanism 10). "system": at the end of the system
    * prompt, where it stays frozen for the rest of the context segment. "row": as a
    * mid-conversation system row right before this row, because the tail changed inside the
