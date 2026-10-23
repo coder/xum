@@ -1813,7 +1813,8 @@ async function collectReferencedStagedAttachmentPaths(input: {
       try {
         // Streamed: every snapshot archive scans the full append-only history.
         for (const stagedPath of await extractStagedAttachmentPathsFromFile(
-          path.join(input.sessionDir, fileName)
+          path.join(input.sessionDir, fileName),
+          input.historyService.files
         )) {
           paths.add(stagedPath);
         }
@@ -6026,7 +6027,8 @@ export class WorkspaceService
       return null;
     const pending = new CompactionPendingState(
       pendingPath,
-      this.historyService.getCompactionPendingHistory(workspaceId)
+      this.historyService.getCompactionPendingHistory(workspaceId),
+      this.historyService.files
     );
     const receipt = await pending.load(() => true).catch(() => undefined);
     return receipt?.attachments.diffs.map((diff) => diff.path) ?? null;
@@ -14776,7 +14778,9 @@ export class WorkspaceService
 
           // Forking from a prior assistant response intentionally discards any later in-flight
           // state so the new workspace resumes cleanly at the chosen branch point.
-          await fsPromises.rm(path.join(newSessionDir, "partial.json"), { force: true });
+          await this.historyService.files.promises.rm(path.join(newSessionDir, "partial.json"), {
+            force: true,
+          });
           if (this.sessionTimingService) {
             await this.sessionTimingService.clearTimingFile(newWorkspaceId);
           } else {

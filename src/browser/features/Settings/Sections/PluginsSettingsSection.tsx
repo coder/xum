@@ -576,6 +576,53 @@ const ManageComponentsPanel: React.FC<{
   );
 };
 
+/**
+ * Whether keyboard focus fell out of an unmounted control: to the page body, or to the Settings
+ * dialog itself (Radix moves it there). A control the user focused, anywhere, is not lost focus.
+ * A slow preview or install must not take the focus from a control the user moved to meanwhile.
+ */
+function focusFellOut(near: HTMLElement): boolean {
+  const active = document.activeElement;
+  return active === null || active === document.body || active === near.closest('[role="dialog"]');
+}
+
+/**
+ * Focus an element when it next mounts, once, if focus fell out meanwhile: `arm()` before the
+ * state change that mounts it. A later rerender or remount does not move focus.
+ */
+function useFocusOnNextMount() {
+  const armedRef = useRef(false);
+  return {
+    arm: () => {
+      armedRef.current = true;
+    },
+    ref: (element: HTMLElement | null) => {
+      if (element === null || !armedRef.current) return;
+      armedRef.current = false;
+      if (focusFellOut(element)) element.focus();
+    },
+  };
+}
+
+/**
+ * Callback ref of the preview view (#7121). Opening the preview unmounts the focused source field
+ * or Preview button, and focus then fell to the Settings dialog. So the view focuses its first
+ * control when it mounts, if focus fell out. It does not when a control inside already took focus
+ * (the Back button after a marketplace entry, #7134) or the user focused another control while
+ * the preview loaded. The function is module-level, so React calls it only on mount and unmount:
+ * a changed Install as method or the Skills CLI choice rerenders the view without moving focus.
+ */
+function focusFirstControlOnMount(view: HTMLDivElement | null): void {
+  if (view === null || !focusFellOut(view)) return;
+  const controls = view.querySelectorAll<HTMLElement>(
+    "button, input, select, textarea, [tabindex]"
+  );
+  const first = Array.from(controls).find(
+    (control) => control.tabIndex >= 0 && !control.matches(":disabled")
+  );
+  first?.focus();
+}
+
 /** Two-phase add flow: source input → consent preview → install. */
 const AddPluginPanel: React.FC<{
   onInstalled: () => void;
@@ -765,7 +812,7 @@ const AddPluginPanel: React.FC<{
           </div>
         </>
       ) : (
-        <>
+        <div ref={focusFirstControlOnMount} className="space-y-3">
           <InstallMethodPicker
             preview={preview}
             cliOffered={
@@ -806,7 +853,7 @@ const AddPluginPanel: React.FC<{
               focusBack={previewedEntry !== null}
             />
           )}
-        </>
+        </div>
       )}
     </div>
   );
@@ -1666,6 +1713,14 @@ export const PluginsSettingsSection: React.FC = () => {
     refresh: () => refresh(),
   });
 
+  // Install and Cancel unmount the Add plugin panel with the focused control in it. The Add plugin
+  // button comes back in its place and takes the focus, so it does not fall to the Settings
+  // dialog (#7121).
+  const addButtonFocus = useFocusOnNextMount();
+  const closeAddPanel = () => {
+    addButtonFocus.arm();
+    setAddOpen(false);
+  };
   const openAddPanel = () => {
     // Feedback belongs to the completed install, not the next attempt from any entry point.
     setInstallSucceeded(false);
@@ -1911,7 +1966,7 @@ export const PluginsSettingsSection: React.FC = () => {
               Check for updates
             </Button>
             {!addOpen && (
-              <Button size="sm" onClick={openAddPanel}>
+              <Button size="sm" onClick={openAddPanel} ref={addButtonFocus.ref}>
                 <Plus className="h-3.5 w-3.5" />
                 Add plugin
               </Button>
@@ -1923,12 +1978,12 @@ export const PluginsSettingsSection: React.FC = () => {
           <div className="mb-4">
             <AddPluginPanel
               onInstalled={() => {
-                setAddOpen(false);
+                closeAddPanel();
                 setInstallSucceeded(true);
                 void refresh();
                 void checkForUpdates();
               }}
-              onClose={() => setAddOpen(false)}
+              onClose={closeAddPanel}
             />
           </div>
         )}

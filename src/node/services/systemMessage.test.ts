@@ -54,7 +54,7 @@ async function buildSystemMessage(
     modelString,
     mcpServers,
     options
-  );
+  ).systemMessage;
 }
 
 async function readToolInstructions(

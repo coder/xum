@@ -280,7 +280,8 @@ export class CompactionHandler {
     this.pendingLifecycle = new CompactionPreparationLifecycle(
       new CompactionPendingState(
         path.join(trimmedSessionDir, POST_COMPACTION_STATE_FILENAME),
-        this.historyService.getCompactionPendingHistory(this.workspaceId)
+        this.historyService.getCompactionPendingHistory(this.workspaceId),
+        this.historyService.files
       )
     );
     this.telemetryService = options.telemetryService;

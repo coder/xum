@@ -319,6 +319,12 @@ jobs:
           PATH="$dir:$PATH"
           curl -q --version
           bun test src/node/services/tools/web_fetch.pinning.test.ts
+      # The host trap and the in-memory agent-loop proof run in their own bun process, with
+      # the trap loaded before tests/setup.ts (make test-host-proof). The normal suite above
+      # never loads the trap. Required needs test-unit, so it covers this step.
+      - name: Host proof (own process)
+        if: matrix.shard == 1 && github.event.inputs.test_filter == ''
+        run: make test-host-proof
       # A shard writes one report per process: coverage/lcov.info for the shared
       # process, plus coverage/isolated/<n>/ and coverage/tooling/ (see
       # scripts/test-unit-ci.sh). Upload them all.

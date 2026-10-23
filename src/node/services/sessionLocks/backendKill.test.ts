@@ -24,6 +24,7 @@ import {
   snapshot,
   startBackend,
   waitForPartial,
+  waitForTurnReleased,
   writeDeadHistoryToken,
   type Backend,
 } from "./backendKill.testHarness";
@@ -56,6 +57,8 @@ test("a SIGKILL in a turn recovers as today", async () => {
 
   const b = await startBackend(root, project, live); // startup recovery runs here
   await b.waitForStreamStartThenEnd(ws, 60_000);
+  // The stream ends before B releases its turn use lease and history write lock.
+  await waitForTurnReleased(root, ws, b.pid, 30_000);
   const recovered = await snapshot(root, ws);
   await b.stop();
 

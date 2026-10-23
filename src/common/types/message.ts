@@ -1042,6 +1042,15 @@ export interface VolatileSystemTailRecord {
   placement: "system" | "row";
 }
 
+/** A turn's system-section records (prompt-cache mechanism 10), as its assistant row holds them. */
+export const SYSTEM_SECTION_RECORD_FIELDS = [
+  "volatileSystemTail",
+  "customInstructions",
+  "skillIndex",
+  "toolInstructions",
+] as const;
+export type SystemSectionRecords = Pick<MuxMetadata, (typeof SYSTEM_SECTION_RECORD_FIELDS)[number]>;
+
 export interface ModelFallbackRecord {
   requestedModel: string;
   refusedModels: string[];
@@ -1122,6 +1131,24 @@ export interface MuxMetadata {
    * segment. See src/node/utils/messages/volatileSystemTail.ts.
    */
   volatileSystemTail?: VolatileSystemTailRecord;
+  /**
+   * The `<custom-instructions>` block (AGENTS.md files, project instructions) this turn's
+   * request sent, with the same rule as volatileSystemTail: "system" freezes it in the cached
+   * system prompt for the rest of the segment, "row" sent a changed block as a system row
+   * right before this row. Without it an AGENTS.md change rewrote the whole cached history.
+   */
+  customInstructions?: VolatileSystemTailRecord;
+  /**
+   * The "Available skills" index of the agent_skill_read tool description this turn's request
+   * sent, with the same rule: "system" freezes it in the cached tool block for the segment,
+   * "row" sent a changed index as a system row right before this row.
+   */
+  skillIndex?: VolatileSystemTailRecord;
+  /**
+   * The `Tool: <name>` instructions the tool descriptions of this turn's request sent (text: the
+   * JSON map of tool to instructions, "" for none), with the same rule as skillIndex.
+   */
+  toolInstructions?: VolatileSystemTailRecord;
   // Last step's provider metadata (for context window cache display)
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
