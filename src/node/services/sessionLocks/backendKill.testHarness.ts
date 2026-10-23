@@ -221,6 +221,55 @@ export async function turnLeaseFiles(root: string): Promise<string[]> {
   return (await listFiles(path.join(root, "locks"))).filter((file) => file.endsWith(".turn.lock"));
 }
 
+/** The pid that a turn use lease record names, or null while the record is unreadable. */
+async function leasePid(file: string): Promise<number | null> {
+  try {
+    const record = JSON.parse(await fs.readFile(file, "utf-8")) as { pid?: unknown };
+    return typeof record.pid === "number" ? record.pid : null;
+  } catch {
+    // Deleted or caught between writes: the next poll looks again.
+    return null;
+  }
+}
+
+/**
+ * Waits until the backend with pid has released its turn: no turn use lease of
+ * that pid and no history write lock remain on disk. activity/list reports
+ * `streaming: false` before AgentSession goes idle and releases its turn use
+ * lease (releaseTurnUseLeaseIfIdle runs after the idle transition, and the
+ * release is async), and the last history write can still hold its lock. A
+ * snapshot taken then lists the backend's own locks, which dropped merge groups.
+ * The removal of the lock files is the signal that the turn is over.
+ */
+export async function waitForTurnReleased(
+  root: string,
+  workspaceId: string,
+  pid: number,
+  timeoutMs: number
+): Promise<void> {
+  const historyLock = historyWriteLockPath(root, workspaceId);
+  const deadline = Date.now() + timeoutMs;
+  let held: string[] = [];
+  while (Date.now() < deadline) {
+    held = [];
+    for (const lease of await turnLeaseFiles(root)) {
+      const file = path.join(root, "locks", lease);
+      const owner = await leasePid(file);
+      // An unreadable record can be this backend's: count it as held.
+      if (owner === null || owner === pid) held.push(lease);
+    }
+    try {
+      await fs.access(historyLock);
+      held.push(path.relative(path.join(root, "locks"), historyLock));
+    } catch {
+      // No history write lock: released.
+    }
+    if (held.length === 0) return;
+    await sleep(POLL_MS);
+  }
+  throw new Error(`backend ${pid} still held ${held.join(", ")} after ${timeoutMs} ms`);
+}
+
 /**
  * Writes the history write lock of a dead backend, as fileLock.ts:172 builds
  * its token (`pid:nonce:birthHex:identityHex`), from that backend's turn use

@@ -70,6 +70,7 @@ import type { RefineService } from "@/node/services/refinement/refineService";
 import type { ServerAuthService } from "@/node/services/serverAuthService";
 import type { ServerService } from "@/node/services/serverService";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
+import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
@@ -103,6 +104,10 @@ export class SessionLocatorTag extends Context.Service<
 export class SessionFilesTag extends Context.Service<SessionFilesTag, SessionFiles>()(
   "xum/SessionFiles"
 ) {}
+/** Host files outside the session dirs (hostFiles/hostFiles.ts). */
+export class HostFilesTag extends Context.Service<HostFilesTag, HostFiles>()("xum/HostFiles") {}
+/** The Xum home, the user home and the temp folder (hostFiles/hostFiles.ts). */
+export class HostPathsTag extends Context.Service<HostPathsTag, HostPaths>()("xum/HostPaths") {}
 export class ProvidersConfigStoreTag extends Context.Service<
   ProvidersConfigStoreTag,
   ProvidersConfigStore
@@ -318,6 +323,8 @@ export type StoreTags =
   | ConfigTag
   | SessionLocatorTag
   | SessionFilesTag
+  | HostFilesTag
+  | HostPathsTag
   | ProvidersConfigStoreTag
   | SecretsStoreTag
   | FileLeaseManagerTag;

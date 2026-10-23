@@ -40,7 +40,7 @@ You ended your turn, but your TODO list still has pending or in-progress items. 
  * The nudge text that #6720 shipped (todo_write-only turns). Histories still hold it, so the
  * transcript keeps rendering those rows as the compact nudge row.
  */
-const LEGACY_TODO_TURN_END_NUDGES: readonly string[] = [
+export const LEGACY_TODO_TURN_END_NUDGES: readonly string[] = [
   `<notification>
 You ended your turn, but your TODO list still has pending or in-progress items. Update it now with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. If an item is still open on purpose, keep it and say why in one sentence. Do not start new work.
 </notification>`,

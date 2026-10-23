@@ -8,6 +8,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { Effect, type Layer } from "effect";
+import { randomUUID } from "node:crypto";
 import * as hostFs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -29,9 +30,13 @@ async function stamps(files: SessionFiles, file: string): Promise<string> {
   return JSON.stringify([s.dev, s.ino, s.size, s.mtimeNs, s.ctimeNs].map(String));
 }
 
+/** Creates a symlink in the layer's files; SessionFiles itself has no symlink member. */
+export type SymlinkHook = (files: SessionFiles, target: string, link: string) => Promise<void>;
+
 export function describeSessionFilesContract(
   name: string,
-  layer: Layer.Layer<SessionFilesTag>
+  layer: Layer.Layer<SessionFilesTag>,
+  symlink: SymlinkHook = (_files, target, link) => hostFs.symlink(target, link)
 ): void {
   describe(`SessionFiles contract: ${name}`, () => {
     function it(
@@ -47,12 +52,13 @@ export function describeSessionFilesContract(
             return yield* SessionFilesTag;
           }).pipe(Effect.provide(layer))
         );
-        const dir = await hostFs.mkdtemp(path.join(os.tmpdir(), "xum-session-files-"));
+        // A unique root that exists in the layer under test (on the host for the Node layer).
+        const dir = path.join(os.tmpdir(), `xum-session-files-${randomUUID()}`);
+        await files.promises.mkdir(dir, { recursive: true });
         try {
-          await files.promises.mkdir(dir, { recursive: true });
           await body(files, dir);
         } finally {
-          await hostFs.rm(dir, { recursive: true, force: true });
+          await files.promises.rm(dir, { recursive: true, force: true });
         }
       });
     }
@@ -100,7 +106,7 @@ export function describeSessionFilesContract(
         const target = path.join(dir, "target.json");
         await files.promises.appendFile(target, "{}");
         const link = path.join(dir, "link.json");
-        await hostFs.symlink(target, link);
+        await symlink(files, target, link);
         const flags = O_RDONLY | (O_NOFOLLOW ?? 0) | (O_NONBLOCK ?? 0);
         expect(await errorCode(() => files.promises.open(link, flags))).toBe("ELOOP");
         await (await files.promises.open(target, flags)).close();
@@ -213,6 +219,19 @@ export function describeSessionFilesContract(
       files.renameSync(`${target}.b`, target);
       expect(await files.promises.readFile(target, "utf8")).toBe("sync");
       expect(await errorCode(() => files.renameSync(`${target}.b`, target))).toBe("ENOENT");
+    });
+
+    it("rename onto the same path does nothing and keeps the stamps", async (files, dir) => {
+      const file = path.join(dir, "chat.jsonl");
+      await files.promises.appendFile(file, "row");
+      const sub = path.join(dir, "sub");
+      await files.promises.mkdir(sub);
+      await files.promises.appendFile(path.join(sub, "file"), "x");
+      const before = [await stamps(files, file), await stamps(files, sub)];
+      await files.promises.rename(file, file);
+      files.renameSync(sub, sub);
+      expect([await stamps(files, file), await stamps(files, sub)]).toEqual(before);
+      expect(await files.promises.readFile(file, "utf8")).toBe("row");
     });
 
     it("readdir withFileTypes tells files from directories", async (files, dir) => {

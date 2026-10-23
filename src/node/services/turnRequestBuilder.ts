@@ -52,13 +52,9 @@ import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { SendMessageError } from "@/common/types/errors";
 import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
-import type {
-  MuxMessage,
-  MuxMessageMetadata,
-  VolatileSystemTailRecord,
-} from "@/common/types/message";
+import type { MuxMessage, MuxMessageMetadata, SystemSectionRecords } from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, SYSTEM_SECTION_RECORD_FIELDS } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
 import type { XumToolScope } from "@/common/types/toolScope";
@@ -155,6 +151,7 @@ import {
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
 import type { TaskService } from "@/node/services/taskService";
 import { resolveMemoryAccessPolicy, resolveMemoryScopes } from "@/node/services/tools/memory";
+import { skillIndexSectionFor } from "@/node/services/tools/agent_skill_read";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import {
   MCP_OVERRIDES_READ_TIMEOUT_MS,
@@ -587,7 +584,7 @@ interface FoldedStreamState<TMessages, TTail> {
   thinkingLevel: ThinkingLevel;
   providerOptions: Record<string, unknown>;
   messages: TMessages;
-  volatileSystemTail: TTail;
+  systemRecords: TTail;
   systemMessageTokens: number;
   /** The full estimate of `messages`, the stage decision's E (#5286). */
   contextBudgetEstimate?: number;
@@ -614,7 +611,7 @@ async function foldPendingThinkingOverrides<TMessages, TTail>(
     ) => { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null;
     rebuild: (level: ThinkingLevel) => Promise<{
       messages: TMessages;
-      volatileSystemTail: TTail;
+      systemRecords: TTail;
       systemMessageTokens: number;
       contextBudgetEstimate?: number;
     }>;
@@ -644,7 +641,7 @@ async function foldPendingThinkingOverrides<TMessages, TTail>(
         thinkingLevel: folded.effectiveLevel,
         providerOptions: folded.providerOptions,
         messages: rebuilt.messages,
-        volatileSystemTail: rebuilt.volatileSystemTail,
+        systemRecords: rebuilt.systemRecords,
         systemMessageTokens: rebuilt.systemMessageTokens,
         contextBudgetEstimate: rebuilt.contextBudgetEstimate,
       };
@@ -684,7 +681,7 @@ export interface TurnStartStage {
 /** What a primary start dispatches: the built request, or the counted candidate with a stage. */
 interface TurnStartPayload<TMessages, TTail> {
   messages: TMessages;
-  volatileSystemTail: TTail;
+  systemRecords: TTail;
   systemMessageTokens: number;
   requestHistorySequence: number;
 }
@@ -703,7 +700,7 @@ async function applyTurnStartStage<TMessages, TTail>(input: {
   messages: MuxMessage[];
   rebuild: () => Promise<{
     messages: TMessages;
-    volatileSystemTail: TTail;
+    systemRecords: TTail;
     systemMessageTokens: number;
     contextBudgetEstimate?: number;
   }>;
@@ -725,7 +722,7 @@ async function applyTurnStartStage<TMessages, TTail>(input: {
   holdThinkingChanges(input.thinkingOverride);
   return {
     messages: candidate.messages,
-    volatileSystemTail: candidate.volatileSystemTail,
+    systemRecords: candidate.systemRecords,
     systemMessageTokens: candidate.systemMessageTokens,
     requestHistorySequence: stage.row.metadata?.historySequence ?? current.requestHistorySequence,
   };
@@ -832,22 +829,30 @@ async function measureSentSystem(
 }
 
 /**
- * The tail record for the turn's assistant row: what this request sent, or, when a refusal
- * fallback continues this turn's row and sends nothing new, the record the row already holds
- * (the rows of its earlier request stay in place before it).
+ * The system-section records for the turn's assistant row (volatile tail, custom
+ * instructions): what this request sent, or, when a refusal fallback continues this turn's
+ * row and sends nothing new, the record the row already holds (the rows of its earlier
+ * request stay in place before it). Both keys are always present, so spreading the result
+ * over metadata replaces an older record.
  */
-function rowVolatileSystemTail(
-  payload: { volatileSystemTail?: VolatileSystemTailRecord },
+function rowSystemRecords(
+  payload: SystemSectionRecords,
   continuation: MuxMessage | undefined
-): VolatileSystemTailRecord | undefined {
-  return payload.volatileSystemTail ?? continuation?.metadata?.volatileSystemTail;
+): SystemSectionRecords {
+  const records: SystemSectionRecords = {};
+  for (const field of SYSTEM_SECTION_RECORD_FIELDS) {
+    records[field] = payload[field] ?? continuation?.metadata?.[field];
+  }
+  return records;
 }
 
-/** The assistant row's tail record (MuxMetadata.volatileSystemTail); absent records nothing. */
-function volatileSystemTailMetadata(record: VolatileSystemTailRecord | undefined): {
-  volatileSystemTail?: VolatileSystemTailRecord;
-} {
-  return record != null ? { volatileSystemTail: record } : {};
+/** The assistant row's records (MuxMetadata.volatileSystemTail etc.); absent records nothing. */
+function systemRecordsMetadata(records: SystemSectionRecords): SystemSectionRecords {
+  const present: SystemSectionRecords = {};
+  for (const field of SYSTEM_SECTION_RECORD_FIELDS) {
+    if (records[field] != null) present[field] = records[field];
+  }
+  return present;
 }
 
 function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
@@ -2435,6 +2440,8 @@ export class TurnRequestBuilder {
       instructionSources,
     } = prePolicyStreamSystemContext;
     turnInstructionSources.current = instructionSources;
+    // The agent_skill_read index the tools are built with, found again by the assembler.
+    const skillIndexSection = skillIndexSectionFor(availableSkills);
     let systemMessageTokens = prePolicyStreamSystemContext.systemMessageTokens;
     let systemMessage = prePolicyStreamSystemContext.systemMessage;
 
@@ -3451,7 +3458,9 @@ export class TurnRequestBuilder {
               history: options.sourceMessages,
               systemMessage: attemptSystem,
               volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
+              instructionsSection: systemContext.instructionsSection,
               tools: attemptTools,
+              skillIndexSection,
               modelString: seed.rawModelString,
               routeProvider: seed.routeProvider,
               openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
@@ -3529,10 +3538,7 @@ export class TurnRequestBuilder {
             messages: rebuiltPayload.messages,
             contextBudgetEstimate: rebuiltPayload.contextBudgetEstimate,
             systemMessageTokens: sent.tokens,
-            volatileSystemTail: rowVolatileSystemTail(
-              rebuiltPayload,
-              options.partialContinuationMessage
-            ),
+            systemRecords: rowSystemRecords(rebuiltPayload, options.partialContinuationMessage),
           };
         };
         const rebuildFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel = async (
@@ -3550,10 +3556,7 @@ export class TurnRequestBuilder {
           messages: finalMessages,
           system: sent.system,
           engineSystem: attemptPayload.system,
-          volatileSystemTail: rowVolatileSystemTail(
-            attemptPayload,
-            options.partialContinuationMessage
-          ),
+          systemRecords: rowSystemRecords(attemptPayload, options.partialContinuationMessage),
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
           contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
           ...compactionInputBudget,
@@ -3581,10 +3584,7 @@ export class TurnRequestBuilder {
               system: sent.system,
               systemMessageTokens: sent.tokens,
               engineSystem: payload.system,
-              volatileSystemTail: rowVolatileSystemTail(
-                payload,
-                options.partialContinuationMessage
-              ),
+              systemRecords: rowSystemRecords(payload, options.partialContinuationMessage),
               messages: payload.messages,
               contextBudgetLimit: payload.contextBudgetLimit,
               contextBudgetEstimate: payload.contextBudgetEstimate,
@@ -3704,7 +3704,7 @@ export class TurnRequestBuilder {
         thinkingLevel: effectiveThinkingLevel,
         providerOptions: mergedProviderOptions,
         messages: finalMessages,
-        volatileSystemTail: primaryRequest.volatileSystemTail,
+        systemRecords: primaryRequest.systemRecords,
         systemMessageTokens,
         contextBudgetEstimate: primaryRequest.contextBudgetEstimate,
       });
@@ -3717,7 +3717,7 @@ export class TurnRequestBuilder {
       const foldedLevel = streamState.thinkingLevel;
       const unstaged = {
         messages: streamState.messages,
-        volatileSystemTail: streamState.volatileSystemTail,
+        systemRecords: streamState.systemRecords,
         systemMessageTokens: streamState.systemMessageTokens,
         requestHistorySequence,
       };
@@ -3737,7 +3737,7 @@ export class TurnRequestBuilder {
       streamState = {
         ...streamState,
         messages: staged.messages,
-        volatileSystemTail: staged.volatileSystemTail,
+        systemRecords: staged.systemRecords,
         systemMessageTokens: staged.systemMessageTokens,
       };
       ({ systemMessageTokens } = streamState);
@@ -3791,7 +3791,7 @@ export class TurnRequestBuilder {
         thinkingLevel: streamThinkingLevel,
         providerOptions: streamProviderOptions,
         messages: streamFinalMessages,
-        volatileSystemTail: streamVolatileSystemTail,
+        systemRecords: streamSystemRecords,
       } = streamState;
       ({ systemMessageTokens } = streamState);
       // Debug sinks pair systemMessage with the message list, so when the
@@ -4082,7 +4082,7 @@ export class TurnRequestBuilder {
                       : {}),
                     systemMessageTokens: nextRequest.systemMessageTokens,
                     // Exact: the fallback's request decides what the row recorded.
-                    volatileSystemTail: nextRequest.volatileSystemTail,
+                    ...nextRequest.systemRecords,
                   },
                 });
               },
@@ -4112,7 +4112,7 @@ export class TurnRequestBuilder {
           timestamp: Date.now(),
           agentId: effectiveAgentId,
           // Where this request sent the volatile system tail, so the next rebuild repeats it.
-          ...volatileSystemTailMetadata(streamVolatileSystemTail),
+          ...systemRecordsMetadata(streamSystemRecords),
           ...(legacyModeForMetadata != null ? { mode: legacyModeForMetadata } : {}),
           ...(routeProvider != null ? { routeProvider } : {}),
           ...(muxMetadata !== undefined ? { muxMetadata } : {}),

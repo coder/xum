@@ -978,7 +978,7 @@ describe("StreamManager - empty stream completions", () => {
       runtime,
       stepTracker: {
         latestMessages: [{ role: "user", content: "stale source-step transcript" }],
-        recordVolatileSystemTail: () => undefined,
+        recordSystemSections: () => undefined,
       },
       modelFallback: {
         options: { chain: [fallbackModel], prepare },

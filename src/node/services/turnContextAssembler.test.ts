@@ -6,7 +6,11 @@ import { describe, expect, test } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { sliceMessagesFromLatestCompactionBoundary } from "@/common/utils/messages/compactionBoundary";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  type MuxMessage,
+  type VolatileSystemTailRecord,
+} from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectsConfig } from "@/common/types/project";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
@@ -950,6 +954,232 @@ describe("assemblePromptPayload", () => {
       expect(payload.messages[0]).toMatchObject({ role: "system", content: prompt });
       expect(payload.messages.filter((message) => message.role === "system")).toHaveLength(1);
       expect(payload.volatileSystemTail).toBeUndefined();
+    });
+
+    test("an instructions change and a tail change in one turn keep both rows in place", async () => {
+      // D9: the <custom-instructions> block (AGENTS.md) follows the tail's rule. Its row comes
+      // first, so the tail row after it still follows the user row on every rebuild.
+      const block = (rules: string) => `\n<custom-instructions>\n${rules}\n</custom-instructions>`;
+      const send = (
+        rules: string,
+        tail: string,
+        history: MuxMessage[],
+        replayedTurn?: {
+          record?: VolatileSystemTailRecord;
+          customInstructions?: VolatileSystemTailRecord;
+        }
+      ) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable + block(rules) + tail,
+          volatileSystemSuffixLength: tail.length,
+          instructionsSection: { prefix: stable, block: block(rules) },
+          replayedTurn,
+        });
+      const turnRow = (id: string, payload: Awaited<ReturnType<typeof send>>) =>
+        createMuxMessage(id, "assistant", `answer ${id}`, {
+          volatileSystemTail: payload.volatileSystemTail,
+          customInstructions: payload.customInstructions,
+        });
+      const [u1, u2, u3] = ["first", "second", "third"].map((text, index) =>
+        createMuxMessage(`u${index + 1}`, "user", text)
+      );
+      const start = await send("v1", hot("A"), [u1]);
+      expect(start.customInstructions).toEqual({ text: block("v1"), placement: "system" });
+
+      const history = [u1, turnRow("a1", start), u2];
+      const changed = await send("v2", hot("B"), history);
+      // The cached system block keeps v1; v2 and B go after the newest user row, in that order.
+      expect(changed.messages[0]).toMatchObject({ role: "system", content: stable + block("v1") });
+      expect(changed.messages.slice(-3).map((message) => message.role)).toEqual([
+        "user",
+        "system",
+        "system",
+      ]);
+      expect(JSON.stringify(changed.messages.at(-2))).toContain("v2");
+      expect(JSON.stringify(changed.messages.at(-1))).toContain("<hot_memories>B</hot_memories>");
+      expect(changed.customInstructions).toEqual({ text: block("v2"), placement: "row" });
+
+      // The replay verifier rebuilds the same request from the sent system and the records.
+      const replayed = await send("v1", hot("A"), history, {
+        record: changed.volatileSystemTail,
+        customInstructions: changed.customInstructions,
+      });
+      expect(withoutMarkers(replayed.messages)).toBe(withoutMarkers(changed.messages));
+
+      // The next turn puts both rows back in place and adds none: it extends the request.
+      const next = await send("v2", hot("B"), [...history, turnRow("a2", changed), u3]);
+      expect(next.customInstructions).toBeUndefined();
+      expect(next.volatileSystemTail).toBeUndefined();
+      expect(withoutMarkers(next.messages.slice(0, changed.messages.length))).toBe(
+        withoutMarkers(changed.messages)
+      );
+    });
+
+    test("a removed AGENTS.md keeps the frozen block and sends the removal as a row", async () => {
+      // Codex P2 PRRT_kwDOPxxmWM6vffU2: the only instruction file is deleted mid-segment. The
+      // system prompt keeps the frozen block (no rewrite), and a row says it is gone.
+      const block = "\n<custom-instructions>\nRule v1\n</custom-instructions>";
+      const send = (live: string, history: MuxMessage[]) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage:
+            stable + live + "\n\n<additional-instructions>\nx\n</additional-instructions>",
+          instructionsSection: { prefix: stable, block: live },
+        });
+      const turnRow = (id: string, payload: Awaited<ReturnType<typeof send>>) =>
+        createMuxMessage(id, "assistant", `answer ${id}`, {
+          customInstructions: payload.customInstructions,
+        });
+      const [u1, u2, u3] = ["first", "second", "third"].map((text, index) =>
+        createMuxMessage(`u${index + 1}`, "user", text)
+      );
+      // A segment start (or old data) without blocks sends none and freezes "no blocks".
+      const oldData = await send("", [u1]);
+      expect(oldData.customInstructions).toEqual({ text: "", placement: "system" });
+      expect(JSON.stringify(oldData.messages)).not.toContain("custom instructions were removed");
+
+      const start = await send(block, [u1]);
+      const history = [u1, turnRow("a1", start), u2];
+      const removed = await send("", history);
+      expect(withoutMarkers([removed.messages[0]])).toBe(withoutMarkers([start.messages[0]]));
+      expect(JSON.stringify(removed.messages.at(-1))).toContain("custom instructions were removed");
+      expect(removed.customInstructions?.placement).toBe("row");
+      // The next turn repeats the row in place and adds none.
+      const next = await send("", [...history, turnRow("a2", removed), u3]);
+      expect(next.customInstructions).toBeUndefined();
+      expect(withoutMarkers(next.messages.slice(0, removed.messages.length))).toBe(
+        withoutMarkers(removed.messages)
+      );
+    });
+
+    test("a skill index change keeps the frozen tool description and replays from the records", async () => {
+      const index = (skills: string) => `\n\nAvailable skills:\n${skills}`;
+      const send = (
+        skills: string,
+        history: MuxMessage[],
+        replayedTurn?: { skillIndex?: VolatileSystemTailRecord }
+      ) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable,
+          // Replay rebuilds without tools: the records alone decide its rows.
+          ...(replayedTurn == null && {
+            tools: {
+              agent_skill_read: tool({
+                description: `Read a skill.${skills && index(skills)}\n\nTool instructions.`,
+                inputSchema: jsonSchema({ type: "object" }),
+              }),
+            },
+            skillIndexSection: { prefix: "Read a skill.", block: skills && index(skills) },
+          }),
+          replayedTurn,
+        });
+      const u1 = createMuxMessage("u1", "user", "first");
+      const u2 = createMuxMessage("u2", "user", "second");
+      const start = await send("- a", [u1]);
+      expect(start.skillIndex).toEqual({ text: index("- a"), placement: "system" });
+      const history = [
+        u1,
+        createMuxMessage("a1", "assistant", "answer", { skillIndex: start.skillIndex }),
+        u2,
+      ];
+      const changed = await send("- a\n- b", history);
+      // The description keeps "- a" (and what follows it); the new list goes in a row.
+      expect(changed.tools?.agent_skill_read?.description).toBe(
+        `Read a skill.${index("- a")}\n\nTool instructions.`
+      );
+      expect(JSON.stringify(changed.messages.at(-1))).toContain("- b");
+      expect(changed.skillIndex).toEqual({ text: index("- a\n- b"), placement: "row" });
+      const replayed = await send("", history, { skillIndex: changed.skillIndex });
+      expect(withoutMarkers(replayed.messages)).toBe(withoutMarkers(changed.messages));
+      // No skill listed any more: the description keeps the frozen list, a row says so.
+      const removed = await send("", history);
+      expect(removed.tools?.agent_skill_read?.description).toBe(
+        `Read a skill.${index("- a")}\n\nTool instructions.`
+      );
+      expect(JSON.stringify(removed.messages.at(-1))).toContain("no skills are listed now");
+    });
+
+    test("a first skill added mid-segment is a row, not a tool-block rewrite", async () => {
+      // Same gap as PRRT_kwDOPxxmWM6vgBAc for the skill index: the segment starts with no skill
+      // listed, then one appears. The cached tool description stays byte-identical.
+      const index = "\n\nAvailable skills:\n- a";
+      const send = (block: string, history: MuxMessage[]) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable,
+          tools: {
+            agent_skill_read: tool({
+              description: `Read a skill.${block}\n\nTool instructions.`,
+              inputSchema: jsonSchema({ type: "object" }),
+            }),
+          },
+          skillIndexSection: { prefix: "Read a skill.", block },
+        });
+      const turnRow = (id: string, payload: Awaited<ReturnType<typeof send>>) =>
+        createMuxMessage(id, "assistant", `answer ${id}`, { skillIndex: payload.skillIndex });
+      const [u1, u2, u3] = ["first", "second", "third"].map((text, index) =>
+        createMuxMessage(`u${index + 1}`, "user", text)
+      );
+      const start = await send("", [u1]);
+      expect(start.skillIndex).toEqual({ text: "", placement: "system" });
+      const history = [u1, turnRow("a1", start), u2];
+      const added = await send(index, history);
+      expect(added.tools?.agent_skill_read?.description).toBe(
+        "Read a skill.\n\nTool instructions."
+      );
+      expect(JSON.stringify(added.messages.at(-1))).toContain("- a");
+      expect(added.skillIndex).toEqual({ text: index, placement: "row" });
+      // The next turn repeats the row in place and adds none.
+      const next = await send(index, [...history, turnRow("a2", added), u3]);
+      expect(next.skillIndex).toBeUndefined();
+      expect(withoutMarkers(next.messages.slice(0, added.messages.length))).toBe(
+        withoutMarkers(added.messages)
+      );
+    });
+
+    test("a first AGENTS.md added mid-segment is a row, not a system-prompt rewrite", async () => {
+      // Codex P2 PRRT_kwDOPxxmWM6vgBAc: the segment starts with no instruction blocks, then an
+      // AGENTS.md (or a first Model:/Mode: section) appears. The cached system block stays.
+      const block = "\n<custom-instructions>\nRule v1\n</custom-instructions>";
+      const send = (live: string, history: MuxMessage[]) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage:
+            stable + live + "\n\n<additional-instructions>\nx\n</additional-instructions>",
+          instructionsSection: { prefix: stable, block: live },
+        });
+      const turnRow = (id: string, payload: Awaited<ReturnType<typeof send>>) =>
+        createMuxMessage(id, "assistant", `answer ${id}`, {
+          customInstructions: payload.customInstructions,
+        });
+      const [u1, u2, u3, u4] = ["first", "second", "third", "fourth"].map((text, index) =>
+        createMuxMessage(`u${index + 1}`, "user", text)
+      );
+      const start = await send("", [u1]);
+      // Still none on the next turn: no change, so no row and no record (no removal row).
+      const same = await send("", [u1, turnRow("a1", start), u2]);
+      expect(same.customInstructions).toBeUndefined();
+      expect(same.messages.filter((message) => message.role === "system")).toHaveLength(1);
+
+      const history = [u1, turnRow("a1", start), u2, turnRow("a2", same), u3];
+      const added = await send(block, history);
+      expect(withoutMarkers([added.messages[0]])).toBe(withoutMarkers([start.messages[0]]));
+      expect(added.messages.at(-1)?.role).toBe("system");
+      expect(JSON.stringify(added.messages.at(-1))).toContain("Rule v1");
+      expect(added.customInstructions).toEqual({ text: block, placement: "row" });
+      // The next turn repeats the row in place and adds none.
+      const next = await send(block, [...history, turnRow("a3", added), u4]);
+      expect(next.customInstructions).toBeUndefined();
+      expect(withoutMarkers(next.messages.slice(0, added.messages.length))).toBe(
+        withoutMarkers(added.messages)
+      );
     });
 
     test("a compaction boundary starts a new segment with the live tail", async () => {

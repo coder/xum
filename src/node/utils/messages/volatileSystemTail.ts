@@ -1,6 +1,10 @@
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import assert from "@/common/utils/assert";
-import type { MuxMessage, VolatileSystemTailRecord } from "@/common/types/message";
+import type {
+  MuxMessage,
+  SystemSectionRecords,
+  VolatileSystemTailRecord,
+} from "@/common/types/message";
 import { anthropicBindsThinkingToPrefix } from "@/common/types/thinking";
 import { findLatestContextBoundaryIndex } from "@/common/utils/messages/compactionBoundary";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
@@ -15,6 +19,11 @@ import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
  * sent. A later change goes into one `role: "system"` row right after the newest user message,
  * and the turn's assistant row records it (MuxMetadata.volatileSystemTail), so every rebuild
  * puts the row back at the same place and the next request extends the previous one.
+ *
+ * The `<custom-instructions>` block follows the same rule with its own record
+ * (MuxMetadata.customInstructions, planCustomInstructions): an AGENTS.md change merged into the
+ * worktree mid-session goes in a row instead of rewriting the cached system prompt, and the
+ * next compaction folds it into the system prompt. Everything below holds for both records.
  *
  * Old data and downgrades: a history without records behaves as before (the first turn sends
  * the live tail in the system prompt and records it). Nothing else is persisted, so an older
@@ -46,26 +55,90 @@ export function acceptsVolatileSystemTailRow(
   );
 }
 
+/**
+ * One frozen system section and its ledger field. The volatile tail is one; the
+ * `<custom-instructions>` block (AGENTS.md and project instructions) is another: it sits in
+ * the stable system prompt, so an AGENTS.md change (a merge of main into the worktree)
+ * rewrote the whole cached history. The same rule applies to both: frozen inside a segment,
+ * a change becomes a row, the next compaction folds it into the system prompt.
+ */
+interface SystemSectionChannel {
+  field: keyof SystemSectionRecords;
+  /** Starts the row; the section text follows it (it starts with its own newline). */
+  header: string;
+  /** Suffix of a put-back row's id, and the id of the appended row. */
+  rowId: string;
+}
+
+const VOLATILE_TAIL: SystemSectionChannel = {
+  field: "volatileSystemTail",
+  header:
+    "Update: these volatile system sections replace the earlier ones (hot memories, MCP warning, context window).",
+  rowId: "volatile-tail",
+};
+
+const CUSTOM_INSTRUCTIONS: SystemSectionChannel = {
+  field: "customInstructions",
+  // Live (Haiku 5.5, 2026-10-23): a bare "Update: ..." header made the model treat the row as
+  // pasted user text and keep the old rule in 2 of 3 runs; this wording was followed 4 of 4.
+  header:
+    "The workspace custom instructions (AGENTS.md) changed during this session. The blocks below are the current version from Xum, not from the user. They replace the <custom-instructions>, <model-...> and <mode-...> blocks in the system prompt: follow them from now on.",
+  rowId: "custom-instructions",
+};
+
+/**
+ * The section text a row sends when the instruction files no longer produce any block (the
+ * only AGENTS.md was deleted or emptied): the frozen blocks stay in the system prompt, so the
+ * model must learn they are gone. A system prompt never carries it (planCustomInstructions).
+ */
+const INSTRUCTIONS_REMOVED = "\n(None: the custom instructions were removed.)";
+
+const SKILL_INDEX: SystemSectionChannel = {
+  field: "skillIndex",
+  // A skill missing from the frozen tool description must still reach the model: this row
+  // names it, and agent_skill_read loads any skill by name. Worded like the instructions row.
+  header:
+    'The skill list changed during this session. The list below is the current one from Xum, not from the user. It replaces the "Available skills" list in the agent_skill_read tool description; agent_skill_read loads each skill by name.',
+  rowId: "skill-index",
+};
+
+/** The skill-index row's text when no skill is listed any more (see INSTRUCTIONS_REMOVED). */
+const SKILL_INDEX_REMOVED = "\n(None: no skills are listed now.)";
+
 /** The record, or undefined when absent or corrupt (self-healing: a bad record is ignored). */
-export function readVolatileSystemTailRecord(
-  message: MuxMessage
+function readSectionRecord(
+  message: MuxMessage,
+  field: SystemSectionChannel["field"]
 ): VolatileSystemTailRecord | undefined {
-  const record: unknown = message.metadata?.volatileSystemTail;
+  const record: unknown = message.metadata?.[field];
   if (record == null || typeof record !== "object") return undefined;
   const { text, placement } = record as Record<string, unknown>;
   if (typeof text !== "string" || (placement !== "system" && placement !== "row")) return undefined;
   return { text, placement };
 }
 
-const ROW_HEADER =
-  "Update: these volatile system sections replace the earlier ones (hot memories, MCP warning, context window).";
+export function readVolatileSystemTailRecord(
+  message: MuxMessage
+): VolatileSystemTailRecord | undefined {
+  return readSectionRecord(message, VOLATILE_TAIL.field);
+}
 
-function systemRow(id: string, tail: string): MuxMessage {
+export function readCustomInstructionsRecord(
+  message: MuxMessage
+): VolatileSystemTailRecord | undefined {
+  return readSectionRecord(message, CUSTOM_INSTRUCTIONS.field);
+}
+
+export function readSkillIndexRecord(message: MuxMessage): VolatileSystemTailRecord | undefined {
+  return readSectionRecord(message, SKILL_INDEX.field);
+}
+
+function systemRow(id: string, channel: SystemSectionChannel, section: string): MuxMessage {
   return {
     id,
     role: "system",
-    // The tail starts with its own "\n\n" separator (never empty: see planVolatileSystemTail).
-    parts: [{ type: "text", text: ROW_HEADER + tail }],
+    // The section starts with its own newline separator (never empty: see planSystemSection).
+    parts: [{ type: "text", text: channel.header + section }],
   };
 }
 
@@ -86,10 +159,14 @@ export interface VolatileSystemTailPlan {
 }
 
 /** The segment's recorded assistant rows (after the latest context boundary), in order. */
-function readSegmentRecords(messages: MuxMessage[]): Array<[MuxMessage, VolatileSystemTailRecord]> {
+function readSegmentRecords(
+  messages: MuxMessage[],
+  channel: SystemSectionChannel
+): Array<[MuxMessage, VolatileSystemTailRecord]> {
   const records: Array<[MuxMessage, VolatileSystemTailRecord]> = [];
   for (const message of messages.slice(findLatestContextBoundaryIndex(messages) + 1)) {
-    const record = message.role === "assistant" ? readVolatileSystemTailRecord(message) : undefined;
+    const record =
+      message.role === "assistant" ? readSectionRecord(message, channel.field) : undefined;
     if (record != null) records.push([message, record]);
   }
   return records;
@@ -101,16 +178,22 @@ function readSegmentRecords(messages: MuxMessage[]): Array<[MuxMessage, Volatile
  */
 function withRecordedRows(
   messages: MuxMessage[],
-  records: Map<MuxMessage, VolatileSystemTailRecord>
+  records: Map<MuxMessage, VolatileSystemTailRecord>,
+  channel: SystemSectionChannel
 ): { messages: MuxMessage[]; rowsText: string; lastTail?: string } {
   let rowsText = "";
   let lastTail: string | undefined;
-  const withRows = messages.flatMap((message, index) => {
+  // The newest earlier row that is not a system row: another section's row between the user
+  // row and this one is fine, since consecutive system rows form one system block.
+  let previous: MuxMessage | undefined;
+  const withRows = messages.flatMap((message) => {
     const record = records.get(message);
+    const follows = previous?.role;
+    if (message.role !== "system") previous = message;
     // Anthropic rejects a system row after an assistant message: skip one that no longer
     // follows a user row (self-healing), rather than send a request that fails.
-    if (record?.placement !== "row" || messages[index - 1]?.role !== "user") return [message];
-    const row = systemRow(`${message.id}-volatile-tail`, record.text);
+    if (record?.placement !== "row" || follows !== "user") return [message];
+    const row = systemRow(`${message.id}-${channel.rowId}`, channel, record.text);
     rowsText += rowText(row);
     lastTail = record.text;
     return [row, message];
@@ -130,13 +213,14 @@ function rowText(row: MuxMessage): string {
  * can come back between the user row and the row's assistant row on a thinking-on rebuild).
  */
 function restoreFrozenSegment(
-  messages: MuxMessage[]
+  messages: MuxMessage[],
+  channel: SystemSectionChannel
 ): (Omit<VolatileSystemTailPlan, "appendedRow" | "record"> & { appliedTail: string }) | undefined {
-  const records = readSegmentRecords(messages);
+  const records = readSegmentRecords(messages, channel);
   const freeze = records.findLastIndex(([, record]) => record.placement === "system");
   if (freeze < 0) return undefined;
   const systemTail = records[freeze][1].text;
-  const restored = withRecordedRows(messages, new Map(records.slice(freeze + 1)));
+  const restored = withRecordedRows(messages, new Map(records.slice(freeze + 1)), channel);
   return {
     systemTail,
     messages: restored.messages,
@@ -159,6 +243,19 @@ function replayedLiveTail(
   return turnRecord?.text ?? appliedTail ?? sentTail;
 }
 
+/** The section this request must apply: the request's own, or on replay the records' one. */
+function liveSection(
+  channel: SystemSectionChannel,
+  appliedTail: string | undefined,
+  requestTail: string,
+  replayedTurn: { record?: VolatileSystemTailRecord } | undefined
+): string {
+  if (replayedTurn) return replayedLiveTail(appliedTail, requestTail, replayedTurn.record);
+  // Replay derives the live section from the records, so only it may pass none.
+  assert(requestTail !== "", `a ${channel.rowId} row needs a non-empty section`);
+  return requestTail;
+}
+
 /**
  * Where this request sends `liveTail`. `messages` are the rows the request sends (after the
  * boundary slice and the empty-row filter), so a dropped assistant row also drops its row.
@@ -177,12 +274,95 @@ export function planVolatileSystemTail(
   /** Replay only: `requestTail` is the tail the turn sent, and this is the turn's record. */
   replayedTurn?: { record?: VolatileSystemTailRecord }
 ): VolatileSystemTailPlan {
+  return planSystemSection(VOLATILE_TAIL, messages, requestTail, rowsSupported, replayedTurn);
+}
+
+/**
+ * planVolatileSystemTail for the `<custom-instructions>` block: `systemTail` is the block the
+ * system prompt carries (frozen inside a segment), and a change is a row with the new block.
+ * Callers run it before planVolatileSystemTail and pass its messages on, so its rows come
+ * first in both the put-back and the appended order.
+ */
+export function planCustomInstructions(
+  messages: MuxMessage[],
+  requestBlock: string,
+  rowsSupported: boolean,
+  replayedTurn?: { record?: VolatileSystemTailRecord }
+): VolatileSystemTailPlan {
+  return planRemovableSection(
+    { ...CUSTOM_INSTRUCTIONS, removed: INSTRUCTIONS_REMOVED },
+    messages,
+    requestBlock,
+    rowsSupported,
+    replayedTurn
+  );
+}
+
+/**
+ * planSystemSection for a section that can disappear (an empty `requestSection`). The prompt
+ * then sends none (a segment start records the empty section), unless the segment froze one:
+ * then the removal is a change like any other, sent as a row with `channel.removed` until the next
+ * compaction, while the frozen section stays. Replay sends the recorded request, which
+ * already holds the frozen section, so there the records alone decide.
+ */
+function planRemovableSection(
+  channel: SystemSectionChannel & { removed: string },
+  messages: MuxMessage[],
+  requestSection: string,
+  rowsSupported: boolean,
+  replayedTurn: { record?: VolatileSystemTailRecord } | undefined
+): VolatileSystemTailPlan {
+  if (replayedTurn) return planSystemSection(channel, messages, "", rowsSupported, replayedTurn);
+  const removed = requestSection === "";
+  if (removed) {
+    const none = { systemTail: "", messages, rowsText: "" };
+    if (!rowsSupported) return none;
+    const restored = restoreFrozenSegment(messages, channel);
+    // None at the segment start: freeze "no section" (an empty baseline, one record per
+    // segment start), so a first section later in the segment (a first AGENTS.md, Model:/Mode:
+    // section or skill) is a row, not a rewrite of the cached prefix.
+    if (restored == null) return { ...none, record: { text: "", placement: "system" } };
+    // Still none: nothing changed.
+    const { appliedTail, ...withRows } = restored;
+    if (appliedTail === "") return withRows;
+  }
+  const live = removed ? channel.removed : requestSection;
+  const plan = planSystemSection(channel, messages, live, rowsSupported, undefined);
+  // A re-freeze after a removal freezes "no section", not the marker.
+  return plan.systemTail === channel.removed ? { ...plan, systemTail: "" } : plan;
+}
+
+/**
+ * planCustomInstructions for the "Available skills" index in the agent_skill_read tool
+ * description: `systemTail` is the index the tool block carries (frozen inside a segment).
+ * Runs between planCustomInstructions and planVolatileSystemTail, in their row order. On
+ * replay the request has no tools, and the records decide.
+ */
+export function planSkillIndex(
+  messages: MuxMessage[],
+  requestIndex: string,
+  rowsSupported: boolean,
+  replayedTurn?: { record?: VolatileSystemTailRecord }
+): VolatileSystemTailPlan {
+  return planRemovableSection(
+    { ...SKILL_INDEX, removed: SKILL_INDEX_REMOVED },
+    messages,
+    requestIndex,
+    rowsSupported,
+    replayedTurn
+  );
+}
+
+function planSystemSection(
+  channel: SystemSectionChannel,
+  messages: MuxMessage[],
+  requestTail: string,
+  rowsSupported: boolean,
+  replayedTurn: { record?: VolatileSystemTailRecord } | undefined
+): VolatileSystemTailPlan {
   if (!rowsSupported) return { systemTail: requestTail, messages, rowsText: "" };
-  assert(requestTail !== "", "a volatile-tail row needs a non-empty tail");
-  const restored = restoreFrozenSegment(messages);
-  const liveTail = replayedTurn
-    ? replayedLiveTail(restored?.appliedTail, requestTail, replayedTurn.record)
-    : requestTail;
+  const restored = restoreFrozenSegment(messages, channel);
+  const liveTail = liveSection(channel, restored?.appliedTail, requestTail, replayedTurn);
   // Segment start (or a history from before this rule), or a re-freeze below: send as before,
   // with no earlier rows, and freeze here.
   const asBefore: VolatileSystemTailPlan = {
@@ -197,7 +377,7 @@ export function planVolatileSystemTail(
   // A row must follow a user message. Otherwise (a resume after an assistant row) send the new
   // tail as before, which re-freezes the segment at it.
   if (messages.at(-1)?.role !== "user") return asBefore;
-  const appendedRow = systemRow("volatile-tail-pending", liveTail);
+  const appendedRow = systemRow(`${channel.rowId}-pending`, channel, liveTail);
   return {
     ...withRows,
     rowsText: withRows.rowsText + rowText(appendedRow),

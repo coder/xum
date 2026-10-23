@@ -93,7 +93,7 @@ include fmt.mk
 .PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config typecheck static-check static-check-full
 .PHONY: crap crap-check test-crap-scripts tree-sitter-grammars dry-check test-dry-scripts mutate-check test-mutate-scripts
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
-.PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
+.PHONY: test test-unit test-unit-ci test-host-proof test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
@@ -735,9 +735,28 @@ test-integration: node_modules/.installed build-main ## Run all tests (unit + in
 	@bun test src
 	@TEST_INTEGRATION=1 bun x jest tests
 
+# The files in test-unit-ci.sh's isolated list fail when another test file shares their process
+# (#7297), so they run one per process here too, as in CI. The two shared runs skip them.
 test-unit: node_modules/.installed build-main ## Run unit tests
-	@bun test src
-	@bun test ./tests/ui/storybook/ ./tests/ui/domIsolation.test.ts ./vscode/src/ ./scripts/
+	@set -e; isolated="$$(./scripts/test-unit-ci.sh --list-isolated)"; ignores=(); \
+	for f in $$isolated; do ignores+=("--path-ignore-patterns=$${f#./}"); done; \
+	bun test src "$${ignores[@]}"; \
+	bun test ./tests/ui/storybook/ ./tests/ui/domIsolation.test.ts ./vscode/src/ ./scripts/ "$${ignores[@]}"; \
+	for f in $$isolated; do bun test "./$${f#./}"; done
+
+# The host trap self-tests and the in-memory agent-loop proof, in their own bun process.
+# tests/hostProof.bunfig.toml loads the trap before tests/setup.ts. *.hostProof.ts files are
+# not *.test.ts, so `bun test src`, test-unit-ci.sh and Jest never run them. The ./ prefix
+# matters: without it bun reads each path as a name filter and exits 1. HOME and XUM_ROOT
+# are set before bun starts, because Bun caches homedir and the log sink opens at the first
+# log call. The temp dir keeps the proof's writes out of the real home (#7209). The real bun
+# binary is resolved first: a version-manager shim (mise) finds its tools under HOME.
+test-host-proof: node_modules/.installed src/version.ts ## Host trap self-tests and the in-memory loop proof (own process)
+	@T="$$(mktemp -d)" && mkdir -p "$$T/home" "$$T/root" && \
+	  bun_bin="$$(bun -e 'process.stdout.write(process.execPath)')" && \
+	  files="$$(find src -name '*.hostProof.ts' | LC_ALL=C sort | sed 's|^|./|')" && \
+	  HOME="$$T/home" XUM_ROOT="$$T/root" "$$bun_bin" --config=./tests/hostProof.bunfig.toml test $$files; \
+	  status=$$?; rm -rf "$$T"; exit $$status
 
 # CI runs this once per shard; SHARD_INDEX/SHARD_TOTAL (env) pick the slice. See the script header.
 test-unit-ci: node_modules/.installed build-main ## Run the CI unit suite with coverage (sharded via SHARD_INDEX/SHARD_TOTAL)

@@ -146,10 +146,13 @@ function startServer(initialToken: string, workspaces: unknown[] = [WORKSPACE]) 
           notify();
         });
         yield { type: "snapshot", workspaces };
-        for (;;) {
+        // Stop once the client closes the subscription: a loop that outlives it re-arms until()'s
+        // 5 s timer for the rest of the process, which stalled later test files (#7297).
+        while (!signal?.aborted) {
           const update = state.metadata.shift();
           if (update) yield update;
-          else await until(() => state.metadata.length > 0, "a metadata update").catch(() => undefined);
+          // The abort listener above notifies waiters, so the close also ends this wait and its timer.
+          else await until(() => state.metadata.length > 0 || signal?.aborted === true, "a metadata update").catch(() => undefined);
         }
       }),
       onChat: authed.handler(async function* () {

@@ -38,7 +38,8 @@ const SAFE_KEYS = {
     "historySequence requestHistorySequence timestamp model metadataModel agentId mode thinkingLevel",
     "duration ttftMs usage contextUsage providerMetadata contextProviderMetadata systemMessageTokens",
     "costsIncluded toolModelUsages stepStartPartIndices streamFinalized finishReason stopCause",
-    "volatileSystemTail anthropicThinkingReplay anthropicThinkingReplayFromStep routeProvider"
+    "volatileSystemTail customInstructions anthropicThinkingReplay anthropicThinkingReplayFromStep",
+    "routeProvider skillIndex"
   ),
 };
 

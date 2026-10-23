@@ -82,6 +82,16 @@ const AGENT_LOOP_FILES = [
   "src/node/services/turn*.ts",
   "src/node/services/contextManagement/**/*.ts",
   "src/node/services/tools/**/*.ts",
+  // Phase 2: the history layer, whose fs calls move behind SessionFiles.
+  "src/node/services/compactionCancellation.ts",
+  "src/node/services/compactionPendingState.ts",
+  "src/node/services/continuousCompactionJournal.ts",
+  "src/node/services/historyAppendProvenance.ts",
+  "src/node/services/historyReplacementRows.ts",
+  "src/node/services/historyRowScanner.ts",
+  "src/node/services/historyScanner.ts",
+  "src/node/services/historyService.ts",
+  "src/node/services/sendIds.ts",
 ];
 const AGENT_LOOP_IGNORES = [
   "**/*.test.ts",
@@ -166,6 +176,14 @@ const HOST_IMPORT_ALLOW = {
   "src/node/services/tools/xum_agents_path.ts": ["fs/promises"],
   "src/node/services/tools/xum_agents_read.ts": ["fs/promises"],
   "src/node/services/tools/xum_agents_write.ts": ["fs/promises"],
+  // Phase 2: each move PR removes its own pairs.
+  "src/node/services/compactionCancellation.ts": ["fs"],
+  "src/node/services/compactionPendingState.ts": ["fs/promises"],
+  "src/node/services/continuousCompactionJournal.ts": ["@/node/utils/writeFileAtomic", "fs"],
+  "src/node/services/historyAppendProvenance.ts": ["@/node/utils/fs", "@/node/utils/writeFileAtomic", "fs", "fs/promises"],
+  "src/node/services/historyReplacementRows.ts": ["fs/promises"],
+  "src/node/services/historyScanner.ts": ["fs/promises"],
+  "src/node/services/sendIds.ts": ["fs/promises"],
 };
 
 const SHARED_RESTRICTED_PATHS = [AI_TOKENIZER_ENCODING_RESTRICTION];
@@ -490,6 +508,7 @@ export default defineConfig([
       "src/browser/stories/**",
       "src/**/*StoryUtils.tsx",
       "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
       "src/**/test[A-Z]*.ts",
     ],
     rules: {
@@ -510,7 +529,13 @@ export default defineConfig([
     // Backend production code: required-member typeof guards only exist to tolerate partial
     // test doubles; tests must complete the doubles instead (see the rule's docs).
     files: ["src/node/services/**/*.ts"],
-    ignores: ["**/*.test.ts", "**/*.testHarness.ts", "**/*.testUtils.ts", "**/test*/**"],
+    ignores: [
+      "**/*.test.ts",
+      "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
+      "**/*.testUtils.ts",
+      "**/test*/**",
+    ],
     rules: {
       "local/no-required-member-typeof-guard": "error",
     },
@@ -817,6 +842,7 @@ export default defineConfig([
       "**/*.stories.tsx",
       "src/browser/stories/**",
       "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
       "src/**/test[A-Z]*.ts",
     ],
     rules: {
@@ -915,6 +941,7 @@ export default defineConfig([
       "**/*.test.tsx",
       "tests/**/*.{ts,tsx}",
       "src/**/*.testHarness.{ts,tsx}",
+      "src/**/*.hostProof.ts",
       "src/**/*.testUtils.{ts,tsx}",
       "src/**/test[A-Z]*.{ts,tsx}",
     ],
