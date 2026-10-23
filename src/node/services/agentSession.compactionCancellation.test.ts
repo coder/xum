@@ -1930,8 +1930,13 @@ describe("compaction cancellation runtime", () => {
         spyOn(fresh.historyService, "cleanupCompactionFollowUp").mockImplementationOnce(
           async (...args) => {
             const result = await cleanup(...args);
+            const foreignHistory = new HistoryService(h.config);
             const foreign = new CompactionCancellation(
-              new FileCompactionCancellationStorage(new HistoryService(h.config), workspaceId)
+              new FileCompactionCancellationStorage(
+                foreignHistory,
+                workspaceId,
+                foreignHistory.files
+              )
             );
             await foreign.cancel();
             successorNonce = (await foreign.read())?.nonce;
