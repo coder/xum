@@ -2494,6 +2494,9 @@ describe("buildProviderOptions - OpenAI", () => {
       ["gpt-6.1-sol", "openai"],
       ["gpt-6-astra", "openai"],
       ["gpt-6-astra", "coder"],
+      // The SDK's effort allowlist covers only GPT-6+ ids, so catalogue GPT-5.6
+      // relies on the SDK passing "max" through unchanged.
+      ["gpt-5.6-sol", "openai"],
     ] as const)(
       "serializes native max and pro for %s via %s through the OpenAI SDK",
       async (model, routeProvider) => {
