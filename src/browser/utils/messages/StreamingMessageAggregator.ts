@@ -46,6 +46,7 @@ import {
   isCompletedSubagentReportEnvelope,
   parseSubagentReportEnvelope,
 } from "@/common/utils/subagentReportEnvelope";
+import { findOpenAskUserQuestions } from "@/browser/utils/messages/openAskUserQuestions";
 import { completeInProgressTodoItems } from "@/common/utils/todoList";
 import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/agentSkillReadToolResult";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
@@ -280,6 +281,35 @@ const ALWAYS_KEEP_MESSAGE_TYPES = new Set<DisplayedMessage["type"]>([
   "plan-display",
   "workspace-init",
 ]);
+
+/**
+ * Rows truncation keeps beyond the always-kept types: the reveal target, and every question the
+ * chat docks above the input (the dock reads this list, so those rows must stay reachable). It is
+ * the dock's own selector, so truncation never keeps a row the dock would not show.
+ */
+function buildAlwaysKeepMessage(
+  workspaceId: string | undefined,
+  messages: readonly DisplayedMessage[],
+  revealTarget: TranscriptRevealTarget | null
+): (message: DisplayedMessage) => boolean {
+  const openQuestionRowIds = new Set(
+    findOpenAskUserQuestions(workspaceId, messages).map((question) => question.id)
+  );
+  return (message) => {
+    if (openQuestionRowIds.has(message.id)) return true;
+    if (revealTarget == null) return false;
+    const matchesToolCall =
+      revealTarget.toolCallId != null &&
+      message.type === "tool" &&
+      message.toolCallId === revealTarget.toolCallId;
+    return (
+      matchesToolCall ||
+      (revealTarget.messageId != null &&
+        "historyId" in message &&
+        message.historyId === revealTarget.messageId)
+    );
+  };
+}
 
 interface StreamingContext {
   /** Backend timestamp when stream started (Date.now()) */
@@ -4008,15 +4038,11 @@ export class StreamingMessageAggregator {
           displayedMessages,
           maxDisplayedMessages: MAX_DISPLAYED_MESSAGES,
           alwaysKeepMessageTypes: ALWAYS_KEEP_MESSAGE_TYPES,
-          shouldAlwaysKeepMessage: revealTarget
-            ? (message) =>
-                (revealTarget.toolCallId != null &&
-                  message.type === "tool" &&
-                  message.toolCallId === revealTarget.toolCallId) ||
-                (revealTarget.messageId != null &&
-                  "historyId" in message &&
-                  message.historyId === revealTarget.messageId)
-            : undefined,
+          shouldAlwaysKeepMessage: buildAlwaysKeepMessage(
+            this.workspaceId,
+            displayedMessages,
+            revealTarget
+          ),
         });
 
         resultMessages =
