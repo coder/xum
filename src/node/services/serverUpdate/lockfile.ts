@@ -141,14 +141,29 @@ const isLocal = (resolved: string) =>
   /^(file:|\.\.?\/)/.test(resolved) || path.isAbsolute(resolved);
 
 /**
+ * The digests a staged lockfile entry records for a registry release; undefined for the staged
+ * release itself. Throws for any other kind of entry.
+ */
+function recordedDigests(pkg: LockedPackage): string[] | undefined {
+  if (pkg.resolved !== undefined && isLocal(pkg.resolved)) {
+    // The release tarball itself was digest-checked before the install.
+    if (pkg.root) return undefined;
+    throw new Error(`Dependency ${pkg.name} was installed from a local path`);
+  }
+  if (pkg.resolved !== undefined && !pkg.resolved.startsWith("https://"))
+    throw new Error(`Dependency ${pkg.name} was not resolved over HTTPS`);
+  if (!isExactVersion(pkg.version) || !pkg.integrity)
+    throw new Error(`Dependency ${pkg.name} is not a digest-pinned registry release`);
+  return pkg.integrity.trim().split(/\s+/);
+}
+
+/**
  * Holds the staged dependency tree to the release's pins (`name@version` to digests, from its
- * npm-shrinkwrap.json) and anchors it to the configured registry. A version the release does not
- * pin is one the manager resolved at update time, as a release compromised an hour earlier would
- * be. Managers follow redirects (also to plaintext) while fetching and record whatever digest
- * they were served, so the lockfile alone proves nothing; every recorded digest must also be one
- * the registry publishes over verified HTTPS without redirects. Managers do verify every tarball
- * against its recorded digest, which makes that digest the only link that needs anchoring.
- * Returns the verified count.
+ * npm-shrinkwrap.json) and anchors it to the configured registry. Managers follow redirects
+ * (also to plaintext) while fetching and record whatever digest they were served, so the
+ * lockfile alone proves nothing; every recorded digest must also be one the registry publishes
+ * over verified HTTPS without redirects. Managers do verify every tarball against its recorded
+ * digest, which makes that digest the only link that needs anchoring. Returns the verified count.
  */
 export async function verifyStagedDependencies(
   layout: InstallLayout,
@@ -160,18 +175,12 @@ export async function verifyStagedDependencies(
   const lockfile = path.join(dir, SERVER_UPDATE_LOCKFILES[layout.packageManager]);
   const queue: Array<{ name: string; version: string; recorded: string[] }> = [];
   for (const pkg of lockfileParsers[layout.packageManager](await fs.readFile(lockfile, "utf8"))) {
-    if (pkg.resolved !== undefined && isLocal(pkg.resolved)) {
-      // The release tarball itself was digest-checked before the install.
-      if (pkg.root) continue;
-      throw new Error(`Dependency ${pkg.name} was installed from a local path`);
-    }
-    if (pkg.resolved !== undefined && !pkg.resolved.startsWith("https://"))
-      throw new Error(`Dependency ${pkg.name} was not resolved over HTTPS`);
-    if (!isExactVersion(pkg.version) || !pkg.integrity)
-      throw new Error(`Dependency ${pkg.name} is not a digest-pinned registry release`);
-    // A manager accepts a tarball matching any recorded digest of its strongest algorithm, so
-    // one trusted digest cannot vouch for a foreign one listed beside it.
-    const recorded = pkg.integrity.trim().split(/\s+/);
+    const recorded = recordedDigests(pkg);
+    if (!recorded) continue;
+    // A version the release does not pin is one the manager resolved at update time, as a
+    // release compromised an hour earlier would be. A manager accepts a tarball matching any
+    // recorded digest of its strongest algorithm, so one trusted digest cannot vouch for a
+    // foreign one listed beside it.
     const pinned = pins.get(`${pkg.name}@${pkg.version}`);
     if (!pinned || !recorded.every((sri) => pinned.includes(sri)))
       throw new Error(
