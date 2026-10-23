@@ -72,6 +72,7 @@ import type { ServerAuthService } from "@/node/services/serverAuthService";
 import type { ServerService } from "@/node/services/serverService";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
+import type { HostProcesses } from "@/node/services/hostProcesses/hostProcesses";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
@@ -111,6 +112,10 @@ export class SessionFilesTag extends Context.Service<SessionFilesTag, SessionFil
 export class HostFilesTag extends Context.Service<HostFilesTag, HostFiles>()("xum/HostFiles") {}
 /** The Xum home, the user home and the temp folder (hostFiles/hostFiles.ts). */
 export class HostPathsTag extends Context.Service<HostPathsTag, HostPaths>()("xum/HostPaths") {}
+/** Host git spawns and network calls of loop code (hostProcesses/hostProcesses.ts). */
+export class HostProcessesTag extends Context.Service<HostProcessesTag, HostProcesses>()(
+  "xum/HostProcesses"
+) {}
 /** Every lock that guards a session write (phase 4); StoresLive gives the Node layer. */
 export class SessionLocksTag extends Context.Service<SessionLocksTag, SessionLocks>()(
   "xum/SessionLocks"
@@ -340,6 +345,7 @@ export type StoreTags =
   | SessionFilesTag
   | HostFilesTag
   | HostPathsTag
+  | HostProcessesTag
   | SessionLocksTag
   | ProvidersConfigStoreTag
   | SecretsStoreTag
