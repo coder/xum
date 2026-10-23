@@ -13,6 +13,7 @@ import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
+import { Config } from "@/node/config";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
 import { MemoryService } from "@/node/services/memoryService";
 import { RefineService } from "@/node/services/refinement/refineService";
@@ -42,7 +43,6 @@ import {
 import { updateSubagentTranscriptArtifactsFile } from "../subagentTranscriptArtifacts";
 import { TaskHandleStore } from "../taskHandleStore";
 import { createTestConfig, createWorkspaceServiceMocks } from "../taskService.testHarness";
-import { createTestHistoryService } from "../testHistoryService";
 import { setTodosForSessionDir } from "../tools/todo";
 import { createReviewPaneUpdateTool } from "../tools/review_pane";
 import { createTestToolConfig, mockToolCallOptions } from "../tools/testHelpers";
