@@ -224,7 +224,11 @@ test("memory: a release hands the file lock to the waiters in FIFO order", () =>
     await first[Symbol.asyncDispose]();
     await both;
     expect(order).toEqual(["b", "c"]);
-    await expect(first.assertStillOwned()).rejects.toThrow("is no longer owned by this holder");
+    const stale = await first.assertStillOwned().then(
+      () => null,
+      (error: unknown) => error
+    );
+    expect((stale as Error).message).toContain("is no longer owned by this holder");
   }));
 
 test("memory: an init-record lock makes a real file, and inspect sees it", () =>
@@ -333,9 +337,11 @@ test("foreign: hold() publishes its lease before it probes the gate", async () =
       },
     };
     const leases = wrapWithForeignHolders(inner, holders).useLeasesFor({ rootDir: t.dir });
-    await expect(leases.hold("ws-order", "turn")).rejects.toBeInstanceOf(
-      WorkspaceMutationInProgressError
+    const refused = await leases.hold("ws-order", "turn").then(
+      () => null,
+      (error: unknown) => error
     );
+    expect(refused).toBeInstanceOf(WorkspaceMutationInProgressError);
     expect(await leases.isHeld("ws-order", "turn")).toBe(false);
   } finally {
     await t.cleanup();
