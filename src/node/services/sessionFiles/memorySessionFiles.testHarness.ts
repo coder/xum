@@ -43,7 +43,7 @@ interface MemCore {
   getLinkOrThrow(filename: string): { getNode(): MemNode };
 }
 
-type MemFs = ReturnType<typeof createFsFromVolume>;
+export type MemFs = ReturnType<typeof createFsFromVolume>;
 
 function systemError(code: string, text: string, syscall: string, target: string): Error {
   return Object.assign(new Error(`${code}: ${text}, ${syscall} '${target}'`), {
@@ -118,6 +118,14 @@ function fixSuperblock(core: MemCore, fs: MemFs): void {
 }
 /* eslint-enable local/no-sync-fs-methods */
 
+/** A fresh memfs volume with the three fixes above (also the base of the HostFiles memory layer). */
+export function createFixedMemfs(): MemFs {
+  const volume = new Volume();
+  const fs = createFsFromVolume(volume);
+  fixSuperblock(volume._core as unknown as MemCore, fs);
+  return fs;
+}
+
 /** Each build's memfs fs, so a contract hook can reach what SessionFiles does not expose. */
 const volumes = new WeakMap<SessionFiles, MemFs>();
 
@@ -131,9 +139,7 @@ export async function symlinkInMemory(files: SessionFiles, target: string, link:
 // Layer.sync runs the function at each build of the layer, so each build gets a fresh volume and
 // no module-level instance exists.
 export const SessionFilesMemory = Layer.sync(SessionFilesTag, () => {
-  const volume = new Volume();
-  const fs = createFsFromVolume(volume);
-  fixSuperblock(volume._core as unknown as MemCore, fs);
+  const fs = createFixedMemfs();
   // memfs declares its own types for the same node:fs signatures.
   const atomicFs = fs as unknown as WriteFileAtomicFs;
   const privateDirFs = fs.promises as unknown as Pick<typeof nodeFsPromises, "mkdir" | "chmod">;
