@@ -1055,6 +1055,94 @@ describe("assemblePromptPayload", () => {
       );
     });
 
+    test("a skill index change keeps the frozen tool description and replays from the records", async () => {
+      const index = (skills: string) => `\n\nAvailable skills:\n${skills}`;
+      const send = (
+        skills: string,
+        history: MuxMessage[],
+        replayedTurn?: { skillIndex?: VolatileSystemTailRecord }
+      ) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable,
+          // Replay rebuilds without tools: the records alone decide its rows.
+          ...(replayedTurn == null && {
+            tools: {
+              agent_skill_read: tool({
+                description: `Read a skill.${skills && index(skills)}\n\nTool instructions.`,
+                inputSchema: jsonSchema({ type: "object" }),
+              }),
+            },
+            skillIndexSection: { prefix: "Read a skill.", block: skills && index(skills) },
+          }),
+          replayedTurn,
+        });
+      const u1 = createMuxMessage("u1", "user", "first");
+      const u2 = createMuxMessage("u2", "user", "second");
+      const start = await send("- a", [u1]);
+      expect(start.skillIndex).toEqual({ text: index("- a"), placement: "system" });
+      const history = [
+        u1,
+        createMuxMessage("a1", "assistant", "answer", { skillIndex: start.skillIndex }),
+        u2,
+      ];
+      const changed = await send("- a\n- b", history);
+      // The description keeps "- a" (and what follows it); the new list goes in a row.
+      expect(changed.tools?.agent_skill_read?.description).toBe(
+        `Read a skill.${index("- a")}\n\nTool instructions.`
+      );
+      expect(JSON.stringify(changed.messages.at(-1))).toContain("- b");
+      expect(changed.skillIndex).toEqual({ text: index("- a\n- b"), placement: "row" });
+      const replayed = await send("", history, { skillIndex: changed.skillIndex });
+      expect(withoutMarkers(replayed.messages)).toBe(withoutMarkers(changed.messages));
+      // No skill listed any more: the description keeps the frozen list, a row says so.
+      const removed = await send("", history);
+      expect(removed.tools?.agent_skill_read?.description).toBe(
+        `Read a skill.${index("- a")}\n\nTool instructions.`
+      );
+      expect(JSON.stringify(removed.messages.at(-1))).toContain("no skills are listed now");
+    });
+
+    test("a first skill added mid-segment is a row, not a tool-block rewrite", async () => {
+      // Same gap as PRRT_kwDOPxxmWM6vgBAc for the skill index: the segment starts with no skill
+      // listed, then one appears. The cached tool description stays byte-identical.
+      const index = "\n\nAvailable skills:\n- a";
+      const send = (block: string, history: MuxMessage[]) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable,
+          tools: {
+            agent_skill_read: tool({
+              description: `Read a skill.${block}\n\nTool instructions.`,
+              inputSchema: jsonSchema({ type: "object" }),
+            }),
+          },
+          skillIndexSection: { prefix: "Read a skill.", block },
+        });
+      const turnRow = (id: string, payload: Awaited<ReturnType<typeof send>>) =>
+        createMuxMessage(id, "assistant", `answer ${id}`, { skillIndex: payload.skillIndex });
+      const [u1, u2, u3] = ["first", "second", "third"].map((text, index) =>
+        createMuxMessage(`u${index + 1}`, "user", text)
+      );
+      const start = await send("", [u1]);
+      expect(start.skillIndex).toEqual({ text: "", placement: "system" });
+      const history = [u1, turnRow("a1", start), u2];
+      const added = await send(index, history);
+      expect(added.tools?.agent_skill_read?.description).toBe(
+        "Read a skill.\n\nTool instructions."
+      );
+      expect(JSON.stringify(added.messages.at(-1))).toContain("- a");
+      expect(added.skillIndex).toEqual({ text: index, placement: "row" });
+      // The next turn repeats the row in place and adds none.
+      const next = await send(index, [...history, turnRow("a2", added), u3]);
+      expect(next.skillIndex).toBeUndefined();
+      expect(withoutMarkers(next.messages.slice(0, added.messages.length))).toBe(
+        withoutMarkers(added.messages)
+      );
+    });
+
     test("a first AGENTS.md added mid-segment is a row, not a system-prompt rewrite", async () => {
       // Codex P2 PRRT_kwDOPxxmWM6vgBAc: the segment starts with no instruction blocks, then an
       // AGENTS.md (or a first Model:/Mode: section) appears. The cached system block stays.

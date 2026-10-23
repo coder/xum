@@ -54,7 +54,7 @@ import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
 import type { MuxMessage, MuxMessageMetadata, SystemSectionRecords } from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, SYSTEM_SECTION_RECORD_FIELDS } from "@/common/types/message";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { secretsToRecord } from "@/common/types/secrets";
 import type { XumToolScope } from "@/common/types/toolScope";
@@ -151,6 +151,7 @@ import {
 import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
 import type { TaskService } from "@/node/services/taskService";
 import { resolveMemoryAccessPolicy, resolveMemoryScopes } from "@/node/services/tools/memory";
+import { skillIndexSectionFor } from "@/node/services/tools/agent_skill_read";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import {
   MCP_OVERRIDES_READ_TIMEOUT_MS,
@@ -838,18 +839,20 @@ function rowSystemRecords(
   payload: SystemSectionRecords,
   continuation: MuxMessage | undefined
 ): SystemSectionRecords {
-  return {
-    volatileSystemTail: payload.volatileSystemTail ?? continuation?.metadata?.volatileSystemTail,
-    customInstructions: payload.customInstructions ?? continuation?.metadata?.customInstructions,
-  };
+  const records: SystemSectionRecords = {};
+  for (const field of SYSTEM_SECTION_RECORD_FIELDS) {
+    records[field] = payload[field] ?? continuation?.metadata?.[field];
+  }
+  return records;
 }
 
 /** The assistant row's records (MuxMetadata.volatileSystemTail etc.); absent records nothing. */
 function systemRecordsMetadata(records: SystemSectionRecords): SystemSectionRecords {
-  return {
-    ...(records.volatileSystemTail != null && { volatileSystemTail: records.volatileSystemTail }),
-    ...(records.customInstructions != null && { customInstructions: records.customInstructions }),
-  };
+  const present: SystemSectionRecords = {};
+  for (const field of SYSTEM_SECTION_RECORD_FIELDS) {
+    if (records[field] != null) present[field] = records[field];
+  }
+  return present;
 }
 
 function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
@@ -2437,6 +2440,8 @@ export class TurnRequestBuilder {
       instructionSources,
     } = prePolicyStreamSystemContext;
     turnInstructionSources.current = instructionSources;
+    // The agent_skill_read index the tools are built with, found again by the assembler.
+    const skillIndexSection = skillIndexSectionFor(availableSkills);
     let systemMessageTokens = prePolicyStreamSystemContext.systemMessageTokens;
     let systemMessage = prePolicyStreamSystemContext.systemMessage;
 
@@ -3455,6 +3460,7 @@ export class TurnRequestBuilder {
               volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
               instructionsSection: systemContext.instructionsSection,
               tools: attemptTools,
+              skillIndexSection,
               modelString: seed.rawModelString,
               routeProvider: seed.routeProvider,
               openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,

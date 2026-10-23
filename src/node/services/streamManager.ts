@@ -64,7 +64,11 @@ import type {
   PersistedToolModelUsage,
   SystemSectionRecords,
 } from "@/common/types/message";
-import { hasTokenUsage, MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
+import {
+  hasTokenUsage,
+  MODEL_FALLBACK_REFUSAL_TOOL_NAME,
+  SYSTEM_SECTION_RECORD_FIELDS,
+} from "@/common/types/message";
 import {
   findFirstReasoningPartIndexInTrailingRun,
   mergeReasoningProviderOptions,
@@ -489,12 +493,13 @@ function withRebuiltSystemMetadata(
   metadata: Partial<MuxMetadata> | undefined,
   rebuilt: { systemRecords?: SystemSectionRecords; systemMessageTokens?: number }
 ): Partial<MuxMetadata> {
-  return {
+  const next: Partial<MuxMetadata> = {
     ...metadata,
-    volatileSystemTail: rebuilt.systemRecords?.volatileSystemTail,
-    customInstructions: rebuilt.systemRecords?.customInstructions,
     systemMessageTokens: rebuilt.systemMessageTokens ?? metadata?.systemMessageTokens,
   };
+  // Every record follows the rebuild, an absent one included (it replaces an older one).
+  for (const field of SYSTEM_SECTION_RECORD_FIELDS) next[field] = rebuilt.systemRecords?.[field];
+  return next;
 }
 
 interface StreamRequestConfig {
