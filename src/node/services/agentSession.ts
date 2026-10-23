@@ -285,7 +285,7 @@ import {
 } from "./retryManager";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import { hostClockFor } from "./di/hostClockLive";
-import type { HostClock } from "@/node/utils/hostClock";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import type { Scope } from "effect";
 import type { TelemetryService } from "./telemetryService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
@@ -5763,7 +5763,8 @@ export class AgentSession {
       "user",
       message,
       {
-        timestamp: this.hostClock.nowMs(),
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        timestamp: nodeClock.nowMs(),
         toolPolicy: typedToolPolicy,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         retrySendOptions: pickStartupRetrySendOptions(
@@ -5938,7 +5939,8 @@ export class AgentSession {
           "user",
           autoCompactionRequest.messageText,
           {
-            timestamp: this.hostClock.nowMs(),
+            // Record time: wall clock until #7282 moves its consumers to HostClock.
+            timestamp: nodeClock.nowMs(),
             toolPolicy: autoCompactionRequest.sendOptions.toolPolicy,
             disableWorkspaceAgents: optionsForStream.disableWorkspaceAgents,
             retrySendOptions: pickStartupRetrySendOptions(
@@ -7516,7 +7518,8 @@ export class AgentSession {
           // pre-goal (queued before the goal existed) vs a real intervention.
           // Without it a rejected queued send would pause a never-driven goal
           // on the next getGoal.
-          timestamp: this.hostClock.nowMs(),
+          // Record time on the wall clock: goal reconciliation compares it with goal times (#7282).
+          timestamp: nodeClock.nowMs(),
           ...(enqueuedAtMs != null ? { enqueuedAtMs } : {}),
         },
         additionalParts.length > 0 ? additionalParts : undefined
@@ -9037,7 +9040,8 @@ export class AgentSession {
           }
         );
         const sentinelMessage = createMuxMessage(createUserMessageId(), "user", "[CONTINUE]", {
-          timestamp: this.hostClock.nowMs(),
+          // Record time: wall clock until #7282 moves its consumers to HostClock.
+          timestamp: nodeClock.nowMs(),
           synthetic: true,
         });
         if (leaseRefusal != null) {
@@ -10679,7 +10683,8 @@ export class AgentSession {
 
           goalContinuationRequest = {
             sendOptions,
-            streamEndedAtMs: this.hostClock.nowMs(),
+            // Wall clock: WorkspaceGoalService compares it with its own Date.now() times (#7282).
+            streamEndedAtMs: nodeClock.nowMs(),
           };
         }
       }
@@ -13466,7 +13471,8 @@ export class AgentSession {
         // model-visible in RLM mode, keeping RLM-off prompts byte-identical.
         readFilePaths: includeReadFiles ? pendingState.readFiles : [],
         // Compaction just completed, so every already-completed report predates the boundary.
-        reportsCompletedBeforeMs: this.hostClock.nowMs(),
+        // Wall clock: TaskService and WorkflowService stamp report completion with Date.now() (#7282).
+        reportsCompletedBeforeMs: nodeClock.nowMs(),
       });
     }
 
@@ -13519,7 +13525,8 @@ export class AgentSession {
       diffs: fileDiffs,
       loadedSkills,
       readFilePaths,
-      reportsCompletedBeforeMs: boundaryTimestampMs ?? this.hostClock.nowMs(),
+      // Wall clock, like the boundary timestamp: report times come from Date.now() (#7282).
+      reportsCompletedBeforeMs: boundaryTimestampMs ?? nodeClock.nowMs(),
     });
   }
 
@@ -13689,7 +13696,8 @@ export class AgentSession {
 
     const snapshotId = createFileSnapshotMessageId();
     const snapshotMessage = createMuxMessage(snapshotId, "user", blocks, {
-      timestamp: this.hostClock.nowMs(),
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      timestamp: nodeClock.nowMs(),
       synthetic: true,
       fileAtMentionSnapshot: tokens,
     });
@@ -13724,7 +13732,8 @@ export class AgentSession {
             cancelSignal !== undefined ? { signal: cancelSignal } : undefined
           );
           return createMuxMessage(createMcpPromptSnapshotMessageId(), "user", prompt.text, {
-            timestamp: this.hostClock.nowMs(),
+            // Record time: wall clock until #7282 moves its consumers to HostClock.
+            timestamp: nodeClock.nowMs(),
             synthetic: true,
             mcpPromptSnapshot: {
               serverName: ref.serverName,
@@ -13956,7 +13965,8 @@ export class AgentSession {
       const snapshotId = createAgentSkillSnapshotMessageId();
       snapshotMessages.push(
         createMuxMessage(snapshotId, "user", snapshotText, {
-          timestamp: this.hostClock.nowMs(),
+          // Record time: wall clock until #7282 moves its consumers to HostClock.
+          timestamp: nodeClock.nowMs(),
           synthetic: true,
           agentSkillSnapshot: {
             skillName: ref.skillName,

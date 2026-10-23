@@ -6,7 +6,9 @@ import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
 import type { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import type { EffectRunner } from "./di/effectRunner";
+import { makeTestEffectRunner } from "./di/testEffectRunner";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 // Registers a no-op goal-continuation consumer so the in-AS pricing gate
 // path runs end-to-end (DEREM-52). Bridge registration alone is now
@@ -43,7 +45,10 @@ async function setGoalOk(
   return result.data;
 }
 
-async function createSessionHarness(workspaceId: string): Promise<SessionHarness> {
+async function createSessionHarness(
+  workspaceId: string,
+  runner?: EffectRunner
+): Promise<SessionHarness> {
   const { historyService, config, cleanup } = await createTestHistoryService();
   await config.addWorkspace(PROJECT_PATH, {
     id: workspaceId,
@@ -88,6 +93,7 @@ async function createSessionHarness(workspaceId: string): Promise<SessionHarness
     initStateManager,
     backgroundProcessManager,
     workspaceGoalService: goalService,
+    ...(runner ? { streamManager: { ...createStreamLifecycleMocks(), effectRunner: runner } } : {}),
   });
 
   return { historyService, session, goalService, cleanup };
@@ -247,6 +253,36 @@ describe("AgentSession.sendMessage budget gate", () => {
     // intervened (Codex P1 PRRT_kwDOPxxmWM5_tOFt).
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "paused" });
 
+    await session.dispose();
+  });
+
+  test("stamps a rejected send's persisted row on the wall clock while the session runs on a TestClock", async () => {
+    // Goal-safety reconciliation compares the persisted row timestamp with the goal's
+    // Date.now() times after a restart, so the row reads the wall clock (#7282). The TestClock
+    // starts months before wall time, so a row stamped on it falls outside the bounds.
+    const workspaceId = "as-budget-gate-row-wall-clock";
+    const clock = makeTestEffectRunner();
+    const { historyService, session, goalService, cleanup } = await createSessionHarness(
+      workspaceId,
+      clock.runner
+    );
+    cleanups.push(async () => {
+      await cleanup();
+      await clock.dispose();
+    });
+
+    // A budgeted goal makes the pricing gate reject the unpriced send after it persists the row.
+    await setGoalOk(goalService, { workspaceId, objective: "Stay under budget", budgetCents: 500 });
+    const before = Date.now();
+    const result = await session.sendMessage("Typed on a TestClock", UNPRICED_OPTIONS);
+    const after = Date.now();
+    expect(result.success).toBe(false);
+
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const stamp = history.data.find((m) => m.role === "user")?.metadata?.timestamp;
+    expect(stamp).toBeGreaterThanOrEqual(before);
+    expect(stamp).toBeLessThanOrEqual(after);
     await session.dispose();
   });
 

@@ -12,7 +12,7 @@ import {
 } from "@/common/utils/messages/retryEligibility";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import { hostClockFor } from "./di/hostClockLive";
-import type { HostClock } from "@/node/utils/hostClock";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 
 export interface RetryFailureError {
   type: string;
@@ -124,7 +124,8 @@ export class RetryManager {
       type: "auto-retry-scheduled",
       attempt: this.state.attempt,
       delayMs: delay,
-      scheduledAt: this.hostClock.nowMs(),
+      // Wall clock: the renderer counts down from it with Date.now() (#7282).
+      scheduledAt: nodeClock.nowMs(),
     };
     this.pendingScheduledEvent = scheduledEvent;
     this.retryPending = true;

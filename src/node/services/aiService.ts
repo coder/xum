@@ -76,6 +76,7 @@ import {
 } from "@/node/utils/journal/durableEventJournal";
 import type { InitStateManager } from "./initStateManager";
 import { log } from "./log";
+import { nodeClock } from "@/node/utils/hostClock";
 import { resolveAgentForStream } from "./agentResolution";
 import { formatSendMessageError } from "./utils/sendMessageError";
 import {
@@ -419,7 +420,8 @@ export class AIService extends EventEmitter {
       // copy and measure only the response. Re-cloning and re-serializing the whole request
       // here doubled the per-turn event-loop cost at a full context (#6912).
       const response = structuredClone({
-        capturedAt: this.streamManager.hostClock.nowMs(),
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        capturedAt: nodeClock.nowMs(),
         metadata: event.metadata,
         parts: event.parts,
       });

@@ -4,11 +4,7 @@ import {
   calculateBackoffDelay,
   MAX_RETRY_AFTER_DELAY_MS,
 } from "@/common/utils/messages/retryState";
-import {
-  makeTestEffectRunner,
-  TEST_CLOCK_START_MS,
-  type TestEffectRunner,
-} from "./di/testEffectRunner";
+import { makeTestEffectRunner, type TestEffectRunner } from "./di/testEffectRunner";
 import { RetryManager, type RetryStatusEvent } from "./retryManager";
 
 /**
@@ -119,7 +115,7 @@ describe("RetryManager", () => {
         type: "auto-retry-scheduled",
         attempt: 1,
         delayMs: expectedDelay,
-        scheduledAt: clock.hostClock.nowMs(),
+        scheduledAt: expect.any(Number),
       },
     ]);
     expect(manager.isRetryPending).toBe(true);
@@ -134,18 +130,19 @@ describe("RetryManager", () => {
     expect(manager.isRetryPending).toBe(false);
   });
 
-  it("stamps scheduledAt with the runner's clock, the clock of the backoff sleep", async () => {
+  it("stamps scheduledAt on the wall clock, the clock of the client's countdown", async () => {
     const { manager, events } = createRetryManager();
     await clock.adjust(Duration.millis(5_000));
+    const before = Date.now();
 
     manager.handleStreamFailure({ type: "unknown", message: "transient" });
 
-    // The client derives the countdown end from scheduledAt + delayMs; the sleep that ends it
-    // runs on the runner's clock, so the stamp must come from that clock too.
-    expect(events[0]).toMatchObject({
-      type: "auto-retry-scheduled",
-      scheduledAt: TEST_CLOCK_START_MS + 5_000,
-    });
+    // The client derives the countdown end from scheduledAt + delayMs against Date.now(), so
+    // the stamp reads the wall clock, not the runner's TestClock, until #7282.
+    const event = events[0];
+    if (event?.type !== "auto-retry-scheduled") throw new Error("expected auto-retry-scheduled");
+    expect(event.scheduledAt).toBeGreaterThanOrEqual(before);
+    expect(event.scheduledAt).toBeLessThanOrEqual(Date.now());
   });
 
   it("exposes pending scheduled retry for reconnect snapshots", async () => {
@@ -158,7 +155,7 @@ describe("RetryManager", () => {
       type: "auto-retry-scheduled",
       attempt: 1,
       delayMs: calculateBackoffDelay(1),
-      scheduledAt: clock.hostClock.nowMs(),
+      scheduledAt: expect.any(Number),
     });
 
     // Snapshot should be defensive-copied.
@@ -171,7 +168,7 @@ describe("RetryManager", () => {
       type: "auto-retry-scheduled",
       attempt: 1,
       delayMs: calculateBackoffDelay(1),
-      scheduledAt: clock.hostClock.nowMs(),
+      scheduledAt: expect.any(Number),
     });
 
     await clock.adjust(Duration.millis(calculateBackoffDelay(1)));
