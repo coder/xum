@@ -1,8 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { Clock, Context, Duration, Effect, Exit, Fiber, Schedule, Scope } from "effect";
-import { makeAppRuntime } from "./appRuntime";
+import { Clock, Context, Duration, Effect, Exit, Fiber, Layer, Schedule, Scope } from "effect";
+import { nodeClock } from "@/node/utils/hostClock";
+import { disposeAppRuntime, makeAppRuntime } from "./appRuntime";
 import { defaultEffectRunner, EffectRunnerLive, EffectRunnerTag } from "./effectRunner";
-import { makeTestEffectRunner } from "./testEffectRunner";
+import { HostClockLive, HostClockTag, hostClockFor } from "./hostClockLive";
+import { makeTestEffectRunner, TEST_CLOCK_START_MS } from "./testEffectRunner";
 
 /**
  * Pins the runtime facts the clock-driven workers rely on when they run
@@ -28,9 +30,9 @@ describe("EffectRunner", () => {
   it("EffectRunnerLive captures the upstream Clock (a TestClock when provided)", async () => {
     const clock = makeTestEffectRunner();
     try {
-      expect(clock.runner.runSync(Clock.currentTimeMillis)).toBe(0);
+      expect(clock.runner.runSync(Clock.currentTimeMillis)).toBe(TEST_CLOCK_START_MS);
       await clock.adjust(Duration.millis(1_500));
-      expect(clock.runner.runSync(Clock.currentTimeMillis)).toBe(1_500);
+      expect(clock.runner.runSync(Clock.currentTimeMillis)).toBe(TEST_CLOCK_START_MS + 1_500);
     } finally {
       await clock.dispose();
     }
@@ -152,6 +154,39 @@ describe("makeTestEffectRunner", () => {
 
       expect(interrupted).toBe(true);
       expect(fiber.pollUnsafe()).toBeDefined();
+    } finally {
+      await clock.dispose();
+    }
+  });
+});
+
+describe("HostClockLive", () => {
+  it("gives nodeClock over the default Clock, as in production", async () => {
+    expect(hostClockFor(defaultEffectRunner)).toBe(nodeClock);
+    const app = makeAppRuntime(HostClockLive.pipe(Layer.provideMerge(EffectRunnerLive)));
+    try {
+      expect(app.get(HostClockTag)).toBe(nodeClock);
+    } finally {
+      await disposeAppRuntime(app.managed);
+    }
+  });
+
+  it("gives the runner and the HostClock of makeTestEffectRunner one TestClock", async () => {
+    const clock = makeTestEffectRunner();
+    try {
+      const fired: string[] = [];
+      clock.hostClock.setTimer(() => fired.push("timer"), 500);
+      const sleep = Effect.sync(() => fired.push("sleep"));
+      clock.runner.runFork(Effect.sleep(Duration.millis(500)).pipe(Effect.andThen(sleep)));
+
+      await clock.adjust(Duration.millis(499));
+      expect(fired).toEqual([]);
+      // One adjust fires both: the HostClock timer and the runner's sleep.
+      await clock.adjust(Duration.millis(1));
+      expect(fired.sort()).toEqual(["sleep", "timer"]);
+      expect(clock.hostClock.nowMs()).toBe(clock.runner.runSync(Clock.currentTimeMillis));
+      // A service hand-built with only the runner derives the same clock.
+      expect(hostClockFor(clock.runner).nowMs()).toBe(clock.hostClock.nowMs());
     } finally {
       await clock.dispose();
     }

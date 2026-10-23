@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { describe, it, expect, beforeEach, afterEach, spyOn, mock, jest } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import { Ok } from "@/common/types/result";
 import {
   BackgroundProcessManager,
@@ -14,6 +14,7 @@ import {
 } from "./backgroundProcessManager";
 import { localBgWorkspaceDir, spawnProcess } from "./backgroundProcessExecutor";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { makeTestEffectRunner } from "./di/testEffectRunner";
 import type { BackgroundHandle, Runtime } from "@/node/runtime/Runtime";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -3069,15 +3070,17 @@ describe("BackgroundProcessManager", () => {
             : value;
         },
       });
-      const spawned = manager.spawn(hungRuntime, testWorkspaceId, "true", {
+      // The drain deadline runs on a TestClock: only the adjust below can reach it.
+      const clock = makeTestEffectRunner();
+      const clocked = new BackgroundProcessManager(bgOutputDir, clock.hostClock);
+      const spawned = clocked.spawn(hungRuntime, testWorkspaceId, "true", {
         cwd: process.cwd(),
         displayName: "hung-spawn",
       });
 
-      jest.useFakeTimers();
       let outcome: "pending" | "resolved" | Error = "pending";
       try {
-        const cleanupDone = manager
+        const cleanupDone = clocked
           .cleanup(testWorkspaceId, { failClosedAfterDrainTimeout: true })
           .then(
             () => {
@@ -3087,17 +3090,14 @@ describe("BackgroundProcessManager", () => {
               outcome = error instanceof Error ? error : new Error(String(error));
             }
           );
-        (jest as unknown as { advanceTimersByTime: (ms: number) => void }).advanceTimersByTime(
-          10 * 60_000
-        );
-        for (let i = 0; i < 10; i++) await Promise.resolve();
-        expect(outcome).toBeInstanceOf(Error);
+        await clock.adjust(10 * 60_000);
         await cleanupDone;
+        expect(outcome).toBeInstanceOf(Error);
       } finally {
-        jest.useRealTimers();
         hang.resolve();
         await spawned;
-        await manager.cleanup(testWorkspaceId);
+        await clocked.cleanup(testWorkspaceId);
+        await clock.dispose();
       }
     });
 
@@ -3120,31 +3120,30 @@ describe("BackgroundProcessManager", () => {
             : value;
         },
       });
-      const spawned = manager.spawn(hungRuntime, testWorkspaceId, "true", {
+      const clock = makeTestEffectRunner();
+      const clocked = new BackgroundProcessManager(bgOutputDir, clock.hostClock);
+      const spawned = clocked.spawn(hungRuntime, testWorkspaceId, "true", {
         cwd: process.cwd(),
         displayName: "hung-dispose",
       });
 
-      jest.useFakeTimers();
       let settled = false;
       let cleanupDone: Promise<void> | undefined;
       try {
-        cleanupDone = manager.cleanup(testWorkspaceId).finally(() => {
+        cleanupDone = clocked.cleanup(testWorkspaceId).finally(() => {
           settled = true;
         });
-        (jest as unknown as { advanceTimersByTime: (ms: number) => void }).advanceTimersByTime(
-          10 * 60_000
-        );
+        await clock.adjust(10 * 60_000);
         for (let i = 0; i < 10; i++) await Promise.resolve();
         expect(settled).toBe(false);
       } finally {
-        jest.useRealTimers();
         hang.resolve();
         await spawned;
         await cleanupDone;
+        await clock.dispose();
       }
       // The spawn settled before cleanup() returned, so nothing is left running.
-      expect((await manager.list(testWorkspaceId)).length).toBe(0);
+      expect((await clocked.list(testWorkspaceId)).length).toBe(0);
     });
   });
 

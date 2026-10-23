@@ -960,8 +960,8 @@ describe("inactive compaction history transactions", () => {
       const publication = { generation: await journal.captureGeneration() };
       let committed = false;
       let cleanupObserved = false;
-      const rm = syncFs.promises.rm;
-      spyOn(syncFs.promises, "rm").mockImplementation(async (file, options) => {
+      const rm = fs.rm;
+      const removing = spyOn(fs, "rm").mockImplementation(async (file, options) => {
         if (String(file).startsWith(`${chatPath}.continuous-`)) {
           expect(committed).toBe(true);
           cleanupObserved = true;
@@ -987,6 +987,7 @@ describe("inactive compaction history transactions", () => {
         ).success
       ).toBe(true);
       expect(cleanupObserved).toBe(true);
+      expect(removing).toHaveBeenCalled();
       const rows = await foreign.getHistoryFromLatestBoundary(workspaceId);
       assert(rows.success);
       expect(rows.data.map((row) => row.id)).toEqual([summary.id]);

@@ -149,7 +149,7 @@ export function createStreamInfoForTests(overrides: StreamInfoFixture = {}): Str
     receivedTerminalEvent: false,
     currentStepStartIndex: 0,
     stepStartIndices: [0],
-    stepTracker: { recordVolatileSystemTail: () => undefined },
+    stepTracker: { recordSystemSections: () => undefined },
   } satisfies StreamInfoFixture;
   return { ...defaults, ...overrides };
 }

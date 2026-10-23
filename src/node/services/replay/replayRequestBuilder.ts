@@ -73,6 +73,10 @@ export interface ReplayRequestInputs {
    * request sent (frozen inside a segment), so the rebuild derives the live tail from this.
    */
   volatileSystemTail?: VolatileSystemTailRecord;
+  /** The turn's MuxMetadata.customInstructions, skillIndex and toolInstructions, likewise. */
+  customInstructions?: VolatileSystemTailRecord;
+  skillIndex?: VolatileSystemTailRecord;
+  toolInstructions?: VolatileSystemTailRecord;
   /**
    * Resolved wire provider name from the turn-envelope row. Falls back to
    * name-canonicalization of the model string when absent (legacy envelopes) —
@@ -234,7 +238,12 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
     history: requestMessages,
     systemMessage: inputs.systemPrompt,
     volatileSystemSuffixLength: inputs.systemPromptVolatileSuffixLength,
-    replayedTurn: { record: inputs.volatileSystemTail },
+    replayedTurn: {
+      record: inputs.volatileSystemTail,
+      customInstructions: inputs.customInstructions,
+      skillIndex: inputs.skillIndex,
+      toolInstructions: inputs.toolInstructions,
+    },
     modelString: inputs.modelString,
     routeProvider: inputs.routeProvider,
     providerForMessages: wireProviderName,

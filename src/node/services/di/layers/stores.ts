@@ -15,6 +15,7 @@ import {
   SessionLocatorTag,
   type StoreTags,
 } from "@/node/services/di/tags";
+import { HostFilesNode, HostPathsNode } from "@/node/services/hostFiles/nodeHostFiles";
 import { SessionFilesNode } from "@/node/services/sessionFiles/nodeSessionFiles";
 
 /**
@@ -29,6 +30,9 @@ export function StoresLive(stores: ConfigStores): Layer.Layer<StoreTags> {
     Layer.succeed(SessionLocatorTag)(stores.sessionLocator),
     // Not a config store, but every graph needs the same host files: the app always gets node:fs.
     SessionFilesNode,
+    // The same for the host files and paths outside the session dirs.
+    HostFilesNode,
+    HostPathsNode,
     Layer.succeed(ProvidersConfigStoreTag)(stores.providersConfigStore),
     Layer.succeed(SecretsStoreTag)(stores.secretsStore),
     Layer.succeed(FileLeaseManagerTag)(stores.fileLeaseManager)

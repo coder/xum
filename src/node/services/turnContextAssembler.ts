@@ -12,6 +12,7 @@ import assert from "@/common/utils/assert";
 import {
   isTokenBudgetInternalMessage,
   type MuxMessage,
+  type SystemSectionRecords,
   type VolatileSystemTailRecord,
 } from "@/common/types/message";
 import {
@@ -25,7 +26,11 @@ import {
   filterEmptyAssistantMessages,
 } from "@/browser/utils/messages/modelMessageTransform";
 import type { Instructions, ModelMessage, SystemModelMessage, Tool } from "ai";
-import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
+import {
+  findLatestContextBoundaryIndex,
+  sliceMessagesForProviderFromLatestContextBoundary,
+} from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
 import type { CountCompactionRowTokens } from "@/common/utils/messages/compactionRowSizing";
 import { trimCompactionInput } from "@/common/utils/messages/trimCompactionInput";
@@ -49,6 +54,7 @@ import {
 } from "@/node/runtime/Runtime";
 import { isPlanLikeInResolvedChain } from "@/common/utils/agentTools";
 import { collectDeferLoadingToolNames } from "@/common/utils/tools/toolCatalog";
+import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import {
   getInstallationScopedPlanFilePath,
   getPlanFilePath,
@@ -75,7 +81,11 @@ import {
   requireReachableSkills,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
-import { buildSystemMessageFromSources, loadWorkspaceInstructionSources } from "./systemMessage";
+import {
+  buildSystemMessageFromSources,
+  loadWorkspaceInstructionSources,
+  type BuiltSystemMessage,
+} from "./systemMessage";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "./log";
@@ -89,7 +99,12 @@ import {
 import { prepareMessagesForProvider } from "./messagePipeline";
 import {
   acceptsVolatileSystemTailRow,
+  planCustomInstructions,
+  planSkillIndex,
+  planToolInstructions,
+  parseToolInstructions,
   planVolatileSystemTail,
+  type VolatileSystemTailPlan,
 } from "@/node/utils/messages/volatileSystemTail";
 import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
@@ -263,6 +278,12 @@ export interface PromptPayload {
   tools: Record<string, Tool> | undefined;
   /** For this turn's assistant row (MuxMetadata.volatileSystemTail); undefined records nothing. */
   volatileSystemTail?: VolatileSystemTailRecord;
+  /** The same for the custom-instructions block (MuxMetadata.customInstructions). */
+  customInstructions?: VolatileSystemTailRecord;
+  /** The same for the agent_skill_read skill index (MuxMetadata.skillIndex). */
+  skillIndex?: VolatileSystemTailRecord;
+  /** The same for the `Tool: <name>` instructions (MuxMetadata.toolInstructions). */
+  toolInstructions?: VolatileSystemTailRecord;
   /**
    * The system content this request sends (prompt-cache mechanism 10): the stable part plus
    * the tail it actually carries (frozen inside a segment), its volatile length, and the text of
@@ -282,7 +303,23 @@ export interface AssemblePromptPayloadOptions {
    * block, so a tail change leaves the stable prefix cached (#5251).
    */
   volatileSystemSuffixLength?: number;
+  /**
+   * Where the instruction-file blocks are in systemMessage (StreamSystemContextResult). Used
+   * only while systemMessage still starts with prefix + block: middleware that edited that part
+   * leaves the prompt as sent, with no instructions record.
+   */
+  instructionsSection?: BuiltSystemMessage["instructionsSection"];
   tools?: Record<string, Tool>;
+  /**
+   * Where the "Available skills" index is in the agent_skill_read description of `tools`
+   * (skillIndexSectionFor), kept frozen inside a segment like the custom instructions.
+   */
+  skillIndexSection?: { prefix: string; block: string };
+  /**
+   * The `Tool: <name>` instructions that `tools` were built with (extractToolInstructions,
+   * appended to each description), kept frozen inside a segment like the skill index.
+   */
+  toolInstructions?: Record<string, string>;
   /**
    * Native deferred tool names for tool_catalog_search replay when `tools` is absent: the
    * replay verifier rebuilds prompts without tools and reads these from the recorded request.
@@ -320,8 +357,15 @@ export interface AssemblePromptPayloadOptions {
   /**
    * Replay only: `systemMessage` is the system content the turn sent (its envelope), and this
    * holds the turn's own MuxMetadata.volatileSystemTail, so the planner can derive the live tail.
+   * `customInstructions`, `skillIndex` and `toolInstructions` are the turn's records of the
+   * same name, for the same purpose.
    */
-  replayedTurn?: { record?: VolatileSystemTailRecord };
+  replayedTurn?: {
+    record?: VolatileSystemTailRecord;
+    customInstructions?: VolatileSystemTailRecord;
+    skillIndex?: VolatileSystemTailRecord;
+    toolInstructions?: VolatileSystemTailRecord;
+  };
 }
 
 /**
@@ -424,9 +468,201 @@ async function historyShareOfBudget(
 }
 
 /**
+ * The stable system prompt with its instruction-file blocks (`<custom-instructions>` and the
+ * `<model-...>`/`<mode-...>` sections from those files) frozen inside a segment: a change (an
+ * AGENTS.md edit merged into the worktree) becomes a system row, so the cached system block
+ * and the history after it stay byte-identical. Replay sends the recorded prompt, which
+ * already holds the frozen blocks, so there the records alone decide the rows.
+ */
+function planStableSystem(
+  options: AssemblePromptPayloadOptions,
+  liveStable: string,
+  history: MuxMessage[],
+  rowsSupported: boolean
+) {
+  if (options.replayedTurn) {
+    const record = options.replayedTurn.customInstructions;
+    const plan = planCustomInstructions(history, "", rowsSupported, { record });
+    return { stableSystem: liveStable, plan };
+  }
+  const section = options.instructionsSection;
+  const valid = section != null && liveStable.startsWith(section.prefix + section.block);
+  const plan = planCustomInstructions(
+    history,
+    section?.block ?? "",
+    valid && rowsSupported,
+    undefined,
+    switchesModelOrAgent(options, history)
+  );
+  const stableSystem = valid
+    ? section.prefix +
+      plan.systemTail +
+      liveStable.slice(section.prefix.length + section.block.length)
+    : liveStable;
+  return { stableSystem, plan };
+}
+
+/**
+ * Whether this request's model, route or agent differs from the segment's previous turn. The
+ * instruction blocks then re-freeze instead of sending the new model's or agent's
+ * `<model-...>`/`<mode-...>` sections in a row under the old ones: that costs no cache, since
+ * each model has its own prompt cache and an agent switch already changes the
+ * `<agent-instructions>` before the blocks (buildSystemMessageFromSources).
+ */
+function switchesModelOrAgent(options: AssemblePromptPayloadOptions, history: MuxMessage[]) {
+  const previous = history
+    .slice(findLatestContextBoundaryIndex(history) + 1)
+    .findLast((message) => message.role === "assistant")?.metadata;
+  // Rows record the canonical model (Coder ids raw), so compare both sides canonicalized.
+  const model = previous?.model == null ? undefined : normalizeToCanonical(previous.model);
+  return (
+    differs(model, normalizeToCanonical(options.modelString)) ||
+    // A route switch for the same model (anthropic: to coder:) is one too: the model section
+    // is tagged with the raw model string, and each route has its own cache.
+    differs(previous?.routeProvider, options.routeProvider) ||
+    differs(previous?.agentId, options.effectiveAgentId)
+  );
+}
+
+/** Both set and different: an old row without the field forces no re-freeze. */
+function differs(before: string | undefined, now: string | undefined): boolean {
+  return before != null && now != null && before !== now;
+}
+
+/**
+ * `options.tools` with the agent_skill_read skill index frozen inside a segment: a skill added
+ * mid-session (a skill commit merged into the worktree) becomes a system row naming the new
+ * list, so the cached tool block stays byte-identical. The model can still load a skill the
+ * frozen description lacks: agent_skill_read reads any skill by name. Replay has no tools,
+ * so the records alone decide its rows.
+ */
+function planSkillIndexTool(
+  options: AssemblePromptPayloadOptions,
+  history: MuxMessage[],
+  rowsSupported: boolean
+) {
+  if (options.replayedTurn) {
+    const record = options.replayedTurn.skillIndex;
+    return { tools: options.tools, plan: planSkillIndex(history, "", rowsSupported, { record }) };
+  }
+  const live = locateSkillIndex(options);
+  const plan = planSkillIndex(history, live?.block ?? "", live != null && rowsSupported);
+  if (live == null || plan.systemTail === live.block) return { tools: options.tools, plan };
+  const frozen = withDescription(live.tool, live.prefix + plan.systemTail + live.rest);
+  return { tools: { ...options.tools, agent_skill_read: frozen }, plan };
+}
+
+/**
+ * The agent_skill_read tool split at its skill index, only while its description still
+ * starts with the section the tools were built with (skillIndexSection).
+ */
+function locateSkillIndex(options: AssemblePromptPayloadOptions) {
+  const section = options.skillIndexSection;
+  const tool = options.tools?.agent_skill_read;
+  const description = typeof tool?.description === "string" ? tool.description : "";
+  if (section == null || tool == null) return undefined;
+  const head = section.prefix + section.block;
+  return description.startsWith(head)
+    ? { ...section, tool, rest: description.slice(head.length) }
+    : undefined;
+}
+
+/**
+ * `tools` with the `Tool: <name>` instructions frozen inside a segment (Codex
+ * PRRT_kwDOPxxmWM6vgBAW): an edited Tool: section becomes a system row, so the cached tool
+ * block stays byte-identical. Replay has no tools, so the records alone decide its rows.
+ */
+function planToolInstructionsTools(
+  options: AssemblePromptPayloadOptions,
+  tools: Record<string, Tool> | undefined,
+  history: MuxMessage[],
+  rowsSupported: boolean
+) {
+  if (options.replayedTurn) {
+    const record = options.replayedTurn.toolInstructions;
+    return { tools, plan: planToolInstructions(history, {}, rowsSupported, { record }) };
+  }
+  const live = locateToolInstructions(options);
+  const plan = planToolInstructions(history, live ?? {}, live != null && rowsSupported);
+  // A corrupt frozen record keeps the live descriptions (its rows still name the change).
+  const frozen = parseToolInstructions(plan.systemTail);
+  if (live == null || frozen == null || tools == null) return { tools, plan };
+  const withFrozen = { ...tools };
+  for (const [name, tool] of Object.entries(tools)) {
+    withFrozen[name] = withInstructions(tool, live[name], frozen[name]);
+  }
+  return { tools: withFrozen, plan };
+}
+
+/** `tool` with `frozen` instead of the `live` instructions at the end of its description. */
+function withInstructions(tool: Tool, live: string | undefined, frozen: string | undefined) {
+  if (frozen === live) return tool;
+  // locateToolInstructions checked that the description ends with "\n\n" + live.
+  const description = descriptionOf(tool);
+  const base = live == null ? description : description.slice(0, -live.length - 2);
+  return withDescription(tool, frozen == null ? base : `${base}\n\n${frozen}`);
+}
+
+/**
+ * The instructions each tool of `options.tools` carries, only while every one of them still
+ * ends its description (getToolsForModel appends them): else the request sends as before.
+ */
+function locateToolInstructions(options: AssemblePromptPayloadOptions) {
+  if (options.toolInstructions == null || options.tools == null) return undefined;
+  const live: Record<string, string> = {};
+  for (const [name, tool] of Object.entries(options.tools)) {
+    const instructions = options.toolInstructions[name];
+    if (!instructions) continue;
+    if (!descriptionOf(tool).endsWith(`\n\n${instructions}`)) return undefined;
+    live[name] = instructions;
+  }
+  return live;
+}
+
+function descriptionOf(tool: Tool): string {
+  return typeof tool.description === "string" ? tool.description : "";
+}
+
+/** A copy of `tool` with another description (its other properties and markers kept). */
+function withDescription(tool: Tool, description: string): Tool {
+  const copy = cloneToolPreservingDescriptors(tool);
+  Object.defineProperty(copy, "description", {
+    value: description,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+  return copy;
+}
+
+/**
+ * Whether this request can send system-section rows. A compaction request (it has a budget)
+ * sends as before and records nothing: the trim already fitted `history` to its budget, so
+ * rows added now could exceed it. Its system prompt is the compact agent's, so no cached
+ * prefix is lost, and its summary starts a new segment anyway.
+ */
+function acceptsSystemSectionRows(options: AssemblePromptPayloadOptions, liveStable: string) {
+  return (
+    options.compactionInputBudgetTokens == null &&
+    createCachedSystemMessage(
+      liveStable,
+      options.modelString,
+      options.anthropicCacheTtl,
+      options.providersConfig
+    ) != null &&
+    acceptsVolatileSystemTailRow(
+      options.modelString,
+      options.routeProvider,
+      options.providersConfig
+    )
+  );
+}
+
+/**
  * The system prompt split into its cached stable block and the volatile tail, and where the
  * tail goes: a tail change inside a segment becomes a system row instead of a system edit
- * (prompt-cache mechanism 10, volatileSystemTail.ts).
+ * (prompt-cache mechanism 10, volatileSystemTail.ts). The custom-instructions block inside
+ * the stable block follows the same rule (planStableSystem).
  */
 function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMessage[]) {
   const volatileLength = options.volatileSystemSuffixLength ?? 0;
@@ -436,9 +672,13 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
       (volatileLength === 0 || volatileLength < options.systemMessage.length),
     "volatileSystemSuffixLength must leave a non-empty stable system prefix"
   );
-  const stableSystem = options.systemMessage.slice(
-    0,
-    options.systemMessage.length - volatileLength
+  const liveStable = options.systemMessage.slice(0, options.systemMessage.length - volatileLength);
+  const rowsSupported = acceptsSystemSectionRows(options, liveStable);
+  const { stableSystem, plan: instructionsPlan } = planStableSystem(
+    options,
+    liveStable,
+    history,
+    rowsSupported
   );
   const cachedSystemMessage = createCachedSystemMessage(
     stableSystem,
@@ -446,26 +686,49 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
     options.anthropicCacheTtl,
     options.providersConfig
   );
+  const skills = planSkillIndexTool(options, instructionsPlan.messages, rowsSupported);
+  const { tools, plan: toolInstructionsPlan } = planToolInstructionsTools(
+    options,
+    skills.tools,
+    skills.plan.messages,
+    rowsSupported
+  );
   // Length 0 means no volatile sections, or a tail the caller could not split off (middleware
   // edited it; turnRequestBuilder passes 0 then). Either way this request sends as before and
   // records nothing: a row could only claim that sections still in the prompt are gone.
-  // A compaction request (it has a budget) does the same: the trim already fitted `history`
-  // to its budget, so rows added now could exceed it. Its system prompt is the compact
-  // agent's, so no cached prefix is lost, and its summary starts a new segment anyway.
   const tailPlan = planVolatileSystemTail(
-    history,
-    options.systemMessage.slice(stableSystem.length),
-    volatileLength > 0 &&
-      options.compactionInputBudgetTokens == null &&
-      cachedSystemMessage != null &&
-      acceptsVolatileSystemTailRow(
-        options.modelString,
-        options.routeProvider,
-        options.providersConfig
-      ),
+    toolInstructionsPlan.messages,
+    options.systemMessage.slice(liveStable.length),
+    volatileLength > 0 && rowsSupported,
     options.replayedTurn
   );
-  return { stableSystem, cachedSystemMessage, tailPlan };
+  return {
+    stableSystem,
+    cachedSystemMessage,
+    tailPlan,
+    tools,
+    sentVolatileLength: volatileLength === 0 ? 0 : tailPlan.systemTail.length,
+    ...combineSectionPlans([
+      ["customInstructions", instructionsPlan],
+      ["skillIndex", skills.plan],
+      ["toolInstructions", toolInstructionsPlan],
+      ["volatileSystemTail", tailPlan],
+    ]),
+  };
+}
+
+/** The rows and records of the section plans, in the order the plans put their rows back. */
+function combineSectionPlans(plans: Array<[keyof SystemSectionRecords, VolatileSystemTailPlan]>) {
+  const records: SystemSectionRecords = {};
+  for (const [field, plan] of plans) {
+    if (plan.record != null) records[field] = plan.record;
+  }
+  return {
+    // The new rows go last, after the newest user row and its request context.
+    appendedRows: plans.flatMap(([, plan]) => plan.appendedRow ?? []),
+    records,
+    rowsText: plans.map(([, plan]) => plan.rowsText).join(""),
+  };
 }
 
 export async function assemblePromptPayload(
@@ -491,10 +754,8 @@ export async function assemblePromptPayload(
     options.modelString,
     options.requestContextMessage
   );
-  const { stableSystem, cachedSystemMessage, tailPlan } = planSystemPrompt(
-    options,
-    providerRequestMessages
-  );
+  const { stableSystem, cachedSystemMessage, tailPlan, appendedRows, tools, ...sent } =
+    planSystemPrompt(options, providerRequestMessages);
   const historyWithSentinel = addInterruptedSentinel(
     insertRequestContextMessage(
       options.tagHistoryItemIds === true
@@ -504,10 +765,7 @@ export async function assemblePromptPayload(
     )
   );
   let messages = await prepareMessagesForProvider({
-    // The new row goes last, after the newest user row and its request context.
-    messagesWithSentinel: tailPlan.appendedRow
-      ? [...historyWithSentinel, tailPlan.appendedRow]
-      : historyWithSentinel,
+    messagesWithSentinel: [...historyWithSentinel, ...appendedRows],
     replayReceiptMessages: prepared.activeContextMessages,
     effectiveAgentId: options.effectiveAgentId,
     toolNamesForSentinel: options.toolNamesForSentinel,
@@ -524,6 +782,7 @@ export async function assemblePromptPayload(
       ? collectDeferLoadingToolNames(options.tools)
       : options.deferLoadingToolNames,
   });
+  // Without a cached system row nothing is frozen (rowsSupported), so this is also the sent one.
   let system: Instructions | undefined = options.systemMessage;
   // Uncached trailing block: the stable block keeps the cache breakpoint.
   const volatileRows: SystemModelMessage[] =
@@ -554,15 +813,15 @@ export async function assemblePromptPayload(
     providerRequestMessages,
     messages,
     system,
-    ...(tailPlan.record != null ? { volatileSystemTail: tailPlan.record } : {}),
+    ...sent.records,
     sentSystem: {
       message: stableSystem + tailPlan.systemTail,
-      volatileSuffixLength: stableSystem === options.systemMessage ? 0 : tailPlan.systemTail.length,
-      rowsText: tailPlan.rowsText,
+      volatileSuffixLength: sent.sentVolatileLength,
+      rowsText: sent.rowsText,
     },
-    tools: options.tools
+    tools: tools
       ? applyCacheControlToTools(
-          options.tools,
+          tools,
           options.modelString,
           options.anthropicCacheTtl,
           options.providersConfig
@@ -845,6 +1104,8 @@ export interface StreamSystemContextResult {
   hotMemoriesSection?: string;
   /** Token count of the system message. */
   systemMessageTokens: number;
+  /** Where the instruction-file blocks are in systemMessage (BuiltSystemMessage). */
+  instructionsSection?: BuiltSystemMessage["instructionsSection"];
   /** Available subagent definitions for tool descriptions (undefined for subagent workspaces). */
   agentDefinitions: Awaited<ReturnType<typeof discoverAgentDefinitions>> | undefined;
   /** Available skills for tool descriptions. */
@@ -1309,7 +1570,7 @@ export async function buildStreamSystemContext(
   );
 
   // Build system message from workspace metadata
-  let systemMessage = buildSystemMessageFromSources(
+  const built = buildSystemMessageFromSources(
     metadata,
     instructionSources,
     workspacePath,
@@ -1327,6 +1588,7 @@ export async function buildStreamSystemContext(
       scratchDirSet: opts.scratchDirSet,
     }
   );
+  let systemMessage = built.systemMessage;
 
   // Append the hot-memories block (memory-hot-set sub-experiment). Placed at
   // the end of the system message so the most recent stable prompt prefix
@@ -1348,6 +1610,7 @@ export async function buildStreamSystemContext(
     systemMessage,
     ...(hotMemoriesSection != null ? { hotMemoriesSection } : {}),
     systemMessageTokens,
+    instructionsSection: built.instructionsSection,
     agentDefinitions,
     availableSkills,
     ancestorPlanFilePaths: ancestorPlanContext.ancestorPlanFilePaths,

@@ -197,6 +197,8 @@ describe("StreamManager - stream resource scope", () => {
     tail: "finish" | "open";
     runner?: EffectRunner;
     aroundSecondDelta?: { before: () => void; after: () => void };
+    /** Awaited right before "second" streams (after the first write stamped the clock). */
+    beforeSecondDelta?: () => Promise<void>;
   }) {
     const secondDeltaProcessed = Promise.withResolvers<number>();
     const writePartial = historyService.writePartial.bind(historyService);
@@ -226,6 +228,7 @@ describe("StreamManager - stream resource scope", () => {
             // flushPartialWrite stamps the throttle clock in a microtask
             // continuation of that write; one macrotask hop drains it.
             await new Promise((resolve) => setImmediate(resolve));
+            await input.beforeSecondDelta?.();
             input.aroundSecondDelta?.before();
             yield { type: "text-delta", text: "second" };
             // The consumer fully processed "second" before pulling the next part.
@@ -355,6 +358,26 @@ describe("StreamManager - stream resource scope", () => {
     } finally {
       setTimeoutSpy.mockRestore();
       await streamManager.stopStream(workspaceId);
+    }
+  });
+
+  test("measures the partial-write throttle window on the stream's HostClock", async () => {
+    // The throttle window must end on the clock that the debounce sleeps on. Here only
+    // virtual time passes between the two deltas: a raw Date.now() for the last write and
+    // the throttle check would see no time pass and debounce "second" instead of writing it.
+    const testRunner = makeTestEffectRunner();
+    try {
+      const { handle, writesAfterSecondDelta } = await startDebouncedPartialStream({
+        workspaceId: "host-clock-throttle-workspace",
+        tail: "finish",
+        runner: testRunner.runner,
+        beforeSecondDelta: () => testRunner.adjust(PAST_THROTTLE_WINDOW_MS),
+      });
+
+      expect(await writesAfterSecondDelta).toBe(2);
+      expect(await handle.completion).toMatchObject({ status: "completed" });
+    } finally {
+      await testRunner.dispose();
     }
   });
 

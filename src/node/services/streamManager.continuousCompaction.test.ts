@@ -5,7 +5,7 @@ import { prepareMessagesForProvider } from "./messagePipeline";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as ai from "ai";
 import * as atomicWrite from "@/node/utils/writeFileAtomic";
-import { promises as journalFs } from "node:fs";
+import * as journalFs from "node:fs/promises";
 import * as fileLock from "@/node/utils/concurrency/fileLock";
 import * as path from "node:path";
 import { HistoryService } from "./historyService";

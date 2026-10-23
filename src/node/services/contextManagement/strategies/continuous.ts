@@ -8,6 +8,7 @@ import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelM
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { extractEditedFileDiffs } from "@/common/utils/messages/extractEditedFiles";
 import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
+import { nodeClock } from "@/node/utils/hostClock";
 import {
   extractLoadedSkillSnapshotsFromMessages,
   mergeLoadedSkillSnapshots,
@@ -131,7 +132,9 @@ export class ContinuousStrategy {
         ...(pending?.readFiles ?? []),
         ...extractReadFilePaths(head),
       ]),
-      reportsCompletedBeforeMs: Date.now(),
+      // Wall clock on purpose: TaskService and WorkflowService stamp report
+      // completion with Date.now() (#7282).
+      reportsCompletedBeforeMs: nodeClock.nowMs(),
     });
   }
 

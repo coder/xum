@@ -1,4 +1,5 @@
 import type { EventEmitter } from "events";
+import type { HostClock } from "@/node/utils/hostClock";
 import type {
   WorkspaceChatMessage,
   SendMessageOptions,
@@ -22,6 +23,8 @@ import type {
 /** Session-owned authority, kept separate from the app-scoped factory's dependencies. */
 export interface SessionContextHost {
   readonly workspaceId: string;
+  /** The session's HostClock: record timestamps and report cutoffs read it. */
+  readonly hostClock: HostClock;
   readonly sessionDir: string;
   readonly emitter: EventEmitter;
   readonly coordinator: Pick<

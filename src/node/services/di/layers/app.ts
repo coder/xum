@@ -2,6 +2,7 @@ import { Layer } from "effect";
 import type { ConfigStores } from "@/node/config";
 import { AppFiberScopeLive } from "@/node/services/di/appFiberScope";
 import { EffectRunnerLive } from "@/node/services/di/effectRunner";
+import { HostClockLive } from "@/node/services/di/hostClockLive";
 import type { AppTags } from "@/node/services/di/tags";
 import { CoreLive, MemoryMetaLive } from "./core";
 import { CoreOptionsFromDesktopLive, CrossCuttingLive, DesktopLive } from "./desktop";
@@ -25,8 +26,10 @@ import { StoresLive } from "./stores";
  * finally the desktop group layers with their wiring.
  */
 export function AppLive(stores: ConfigStores): Layer.Layer<AppTags> {
+  const runner = EffectRunnerLive.pipe(Layer.provideMerge(StoresLive(stores)));
+  // HostClockLive reads the Clock that the runner captured: one clock for both.
   const runtimeSeams = AppFiberScopeLive.pipe(
-    Layer.provideMerge(EffectRunnerLive.pipe(Layer.provideMerge(StoresLive(stores))))
+    Layer.provideMerge(HostClockLive.pipe(Layer.provideMerge(runner)))
   );
   return DesktopLive.pipe(
     Layer.provideMerge(CoreLive),

@@ -12,7 +12,12 @@
  * silently passing.
  */
 
-import { readVolatileSystemTailRecord } from "@/node/utils/messages/volatileSystemTail";
+import {
+  readCustomInstructionsRecord,
+  readSkillIndexRecord,
+  readToolInstructionsRecord,
+  readVolatileSystemTailRecord,
+} from "@/node/utils/messages/volatileSystemTail";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { asSchema } from "ai";
@@ -853,6 +858,9 @@ export async function replayVerifySession(params: {
         anthropicCacheTtl: parseAnthropicCacheTtl(envelope.data.anthropicCacheTtl),
         systemPromptVolatileSuffixLength: envelope.data.systemPromptVolatileSuffixLength,
         volatileSystemTail: readVolatileSystemTailRecord(turn.message),
+        customInstructions: readCustomInstructionsRecord(turn.message),
+        skillIndex: readSkillIndexRecord(turn.message),
+        toolInstructions: readToolInstructionsRecord(turn.message),
         planContentForTransition,
         planFilePath: envelope.data.planTransitionFilePath,
         postCompactionAttachments,
