@@ -349,17 +349,14 @@ export interface StreamMessageOptions {
   postCompactionAttachments?: PostCompactionAttachment[] | null;
   /**
    * Resolver for the session-segment memory context (memory experiment):
-   * index snapshot for the memory tool description + hot-memories block.
+   * index snapshot for the memory tool description.
    * AgentSession caches the result per model/session segment. A callback
    * (not a pre-resolved value) because it must be computed after
    * runtime.ensureReady(): project-scope listing on a
    * stopped Docker/remote workspace would otherwise cache an empty/partial
    * context for the whole segment.
    */
-  resolveMemoryContext?: (
-    modelString: string,
-    options?: { includeHotMemories?: boolean }
-  ) => Promise<MemorySessionContext | undefined>;
+  resolveMemoryContext?: (modelString: string) => Promise<MemorySessionContext | undefined>;
   workspaceGoalService?: WorkspaceGoalService;
   /** Backend-owned kind of an automatic goal turn; gates set_goal (see GoalToolContext). */
   goalTurnKind?: GoalSyntheticMessageKind;
@@ -2011,7 +2008,7 @@ export class TurnRequestBuilder {
     // workspace would yield an empty/partial context, and AgentSession caches
     // the result per model/session segment).
     const memoryContext = resolveMemoryContext
-      ? await resolveMemoryContext(modelString, { includeHotMemories: false })
+      ? await resolveMemoryContext(modelString)
       : undefined;
 
     const cfg = this.dependencies.config.loadConfigOrDefault();
@@ -2021,23 +2018,7 @@ export class TurnRequestBuilder {
     // runs follow the same config.
     const toolSearchEnabled = cfg.toolSearchEnabled !== false;
     const artifactsExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS);
-    const memoryHotSetExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
     const claudeSkillsCompatExperimentEnabled = this.dependencies.isClaudeSkillsCompatEnabled();
-    // Once final tool policy keeps the memory tool, upgrade the index-only
-    // memory context (resolved pre-policy with includeHotMemories: false) to
-    // the byte-budgeted hot block for the model that will actually stream.
-    // Returns the unchanged pre-policy `memoryContext` reference when hot
-    // preloading is off or the memory tool was stripped, so callers can use
-    // identity comparison to decide whether the system prompt must be rebuilt.
-    const upgradeMemoryContextForModel = async (
-      memoryToolAvailableForModel: boolean,
-      modelStringForContext: string
-    ): Promise<MemorySessionContext | undefined> =>
-      memoryToolAvailableForModel &&
-      memoryHotSetExperimentEnabled &&
-      resolveMemoryContext !== undefined
-        ? await resolveMemoryContext(modelStringForContext, { includeHotMemories: true })
-        : memoryContext;
     emitStartupBreadcrumb("loading_workspace_context");
     // One cache per request: resolution, plan handoff, prompt body, and
     // sub-agent discovery share definition reads; the next turn starts fresh.
@@ -2356,8 +2337,7 @@ export class TurnRequestBuilder {
       toolset: {
         memoryToolAvailable: boolean;
       },
-      modelStringForSystem: string = modelString,
-      contextForModel: MemorySessionContext | undefined = memoryContext
+      modelStringForSystem: string = modelString
     ) =>
       buildStreamSystemContext({
         runtime,
@@ -2381,7 +2361,6 @@ export class TurnRequestBuilder {
         memoryToolAvailable: toolset.memoryToolAvailable,
         tokenBudgetEnabled,
         workspaceMemoryWritable: memoryAccess.workspace === "readwrite",
-        hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
         instructionSources: turnInstructionSources.current,
         agentDefinitionCache,
@@ -3098,30 +3077,21 @@ export class TurnRequestBuilder {
         }
 
         const memoryToolAvailable = attemptTools.memory !== undefined;
-        const memoryContextForModel = await upgradeMemoryContextForModel(
-          memoryToolAvailable,
-          seed.rawModelString
-        );
         const canReuseSystemContext =
           options.reusePrePolicySystemContext &&
           mcpServers === mcpServersAtPrePolicy &&
-          memoryToolAvailable === memoryToolEligible &&
-          memoryContextForModel === memoryContext;
+          memoryToolAvailable === memoryToolEligible;
         const rebuildSystemStartedAt = this.hostClock.nowMs();
         const systemContext = canReuseSystemContext
           ? prePolicyStreamSystemContext
-          : await buildStreamSystemContextForToolset(
-              { memoryToolAvailable },
-              seed.rawModelString,
-              memoryContextForModel
-            );
+          : await buildStreamSystemContextForToolset({ memoryToolAvailable }, seed.rawModelString);
         if (options.recordTimings && !canReuseSystemContext) {
           recordStartupPhaseTiming("rebuildStreamSystemContextMs", rebuildSystemStartedAt);
         }
         let attemptSystem = systemContext.systemMessage;
         let attemptSystemTokens = systemContext.systemMessageTokens;
-        // Volatile sections (hot memories, this warning, the context-window
-        // ids) go last so the stable prefix stays cacheable (#5251).
+        // Volatile sections (this warning, the context-window ids) go last so
+        // the stable prefix stays cacheable (#5251).
         if (mcpWarningSection != null) {
           attemptSystem = attemptSystem + mcpWarningSection;
           const tokenizer = await getTokenizerForModel(
@@ -3157,8 +3127,7 @@ export class TurnRequestBuilder {
           // describing a removed memory tool.
           assembleCtx.systemMessage = removeMemoryGuidance(
             assembleCtx.systemMessage,
-            attemptTools.memory !== undefined,
-            memoryContextForModel?.hotMemoriesBlock
+            attemptTools.memory !== undefined
           );
           if (assembleCtx.systemMessage !== attemptSystem) {
             attemptSystem = assembleCtx.systemMessage;
@@ -3202,7 +3171,6 @@ export class TurnRequestBuilder {
           // Re-measured on every render: the window section can change length. A tail that
           // middleware edited is not split at all (no rows either, see planSystemPrompt).
           attemptVolatileSystemSuffixLength = measureWholeVolatileSystemSuffix(attemptSystem, [
-            systemContext.hotMemoriesSection,
             mcpWarningSection,
             section,
           ]);

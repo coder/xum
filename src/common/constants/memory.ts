@@ -72,29 +72,6 @@ export const MEMORY_INDEX_DESCRIPTION_PREFIX_BYTES = 4 * 1024;
 export const MEMORY_VIEW_MAX_DEPTH = 2;
 
 /**
- * Hot-set budgets: user-pinned + frequently-used memory files are preloaded
- * into context (the second tier between the always-present index and
- * tool-call cold reads). The hot set is recomputed on first use of a model in
- * a session segment and at compaction boundaries so repeated turns keep
- * prompt-cache-stable bytes.
- */
-/** Maximum bytes of a single preloaded memory file (longer files are truncated). */
-export const MEMORY_HOT_SET_MAX_ITEM_BYTES = 4 * 1024;
-/**
- * Maximum UTF-8 bytes of the rendered <hot_memories> block. Bytes, not a
- * stand-in tokenizer count: the densest current tokenizers (Opus/Haiku 5.5)
- * bill ~2.5 bytes per token on memory text (44,805 chars billed 17,802
- * tokens), so 10 KiB stays within ~4k billed tokens on every supported model.
- */
-export const MEMORY_HOT_SET_MAX_BLOCK_BYTES = 10 * 1024;
-/** Maximum number of memory files preloaded into the system prompt. */
-export const MEMORY_HOT_SET_MAX_ITEMS = 8;
-/** Maximum ranked candidates to read while filling the hot set. */
-export const MEMORY_HOT_SET_MAX_SELECTION_ATTEMPTS = 64;
-/** Half-life of the recency decay applied to access counts when ranking auto-hot files. */
-export const MEMORY_HOT_SET_DECAY_HALF_LIFE_MS = 7 * 24 * 60 * 60 * 1000;
-
-/**
  * Memory consolidation ("dream" agent, issue #3534): maximum mutating memory
  * commands per consolidation run. Reads are unlimited; the budget bounds churn
  * from a misbehaving model.

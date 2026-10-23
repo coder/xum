@@ -156,8 +156,8 @@ describe("applyToolPolicyAndExperiments", () => {
   });
 
   test("context-coupled tools stay model-visible under PTC; media tools bridge", async () => {
-    // memory: AIService keys system-prompt context (memory index /
-    // hot set) off their top-level presence. attach_file /
+    // memory: AIService keys system-prompt context (memory index and
+    // guidance) off their top-level presence. attach_file /
     // desktop_screenshot are bridgeable instead: the ToolBridge strips their
     // base64 from sandbox-visible values and the code_execution attachments
     // carrier delivers the real bytes to request-time extraction, so nested

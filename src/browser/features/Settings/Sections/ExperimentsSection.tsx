@@ -32,10 +32,7 @@ const PORTABLE_DESKTOP_INSTALL_URL = "https://github.com/coder/portabledesktop";
 
 // Sub-experiments of Agent Memory: hidden from the flat list and rendered in a
 // nested panel under the parent toggle, since they are no-ops while memory is off.
-const MEMORY_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
-  EXPERIMENT_IDS.MEMORY_HOT_SET,
-  EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
-];
+const MEMORY_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [EXPERIMENT_IDS.MEMORY_CONSOLIDATION];
 
 // Sub-experiments of Programmatic Tool Calling: same nesting treatment — RLM
 // mode is a no-op while PTC is off (code_execution is never assembled).

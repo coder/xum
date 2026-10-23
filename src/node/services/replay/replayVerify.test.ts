@@ -849,7 +849,7 @@ describe("replayVerifySession pairing", () => {
     // the volatile tail split, and a turn without DevTools still records on its row.
     using tmp = new DisposableTempDir("replay-verify-tool-instructions-unrecorded");
     const ctx = createReplayFixtureSessionContext(tmp.path);
-    const tail = (note: string) => `\n\n<hot_memories>${note}</hot_memories>`;
+    const tail = (note: string) => `\n\n[Warning: ${note}]`;
     const turns = [
       { rule: "Use rg.", note: "A", recordDevtools: true },
       { rule: "Use fd.", note: "A", recordDevtools: false },
@@ -892,7 +892,7 @@ describe("replayVerifySession pairing", () => {
   test("a split volatile system tail is log-derivable", async () => {
     using tmp = new DisposableTempDir("replay-verify-volatile-system");
     const ctx = createReplayFixtureSessionContext(tmp.path);
-    const volatileTail = "\n\n<hot_memories>note</hot_memories>";
+    const volatileTail = "\n\n[Warning: note]";
 
     await appendReplayFixtureTurn(ctx, {
       userText: "Use the notes.",

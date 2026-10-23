@@ -9,7 +9,7 @@ description: Each agent keeps its own rollover checkpoint in the /memories/sessi
 
 Accepted. Supersedes the `context-notes.md` handoff of [ADR 0005](./0005-token-budget-context-windows.md) and the "no last-chance notes step" limitation of [ADR 0006](./0006-agent-led-context-handoff.md). The handoff target, forced rollover at the usable limit, retrieval, admission, receipts, and privacy floors are unchanged.
 
-Note: Xum later removed the Memory Intuition experiment. The intuition recall that the Decision section excludes the session scope from no longer exists.
+Note: Xum later removed the Memory Intuition and Memory Hot Set experiments. The intuition recall and the memory hot set that the Decision section excludes the session scope from no longer exist, and neither do the hot-set rules that the Consequences section names.
 
 ## Context
 

@@ -297,8 +297,8 @@ export interface AssemblePromptPayloadOptions {
   history: MuxMessage[];
   systemMessage: string;
   /**
-   * Length of the volatile tail of systemMessage (MCP warning, hot memories,
-   * context-window ids; see measureVolatileSystemSuffix). Cache-marking
+   * Length of the volatile tail of systemMessage (MCP warning, context-window
+   * ids; see measureVolatileSystemSuffix). Cache-marking
    * providers get it as a separate system block after the cached stable
    * block, so a tail change leaves the stable prefix cached (#5251).
    */
@@ -1065,13 +1065,6 @@ export interface BuildStreamSystemContextOptions {
   tokenBudgetEnabled?: boolean;
   /** Effective workspace-scope permission, not merely memory tool visibility. */
   workspaceMemoryWritable?: boolean;
-  /**
-   * Pre-rendered hot-memories block (pinned + frequently used memory files;
-   * memory-hot-set sub-experiment). Computed and cached by AgentSession per
-   * model/session segment, so repeated turns stay byte-identical
-   * (prompt-cache-stable).
-   */
-  hotMemoriesBlock?: string;
   /** claude-skills-compat experiment: read Claude skills and global instructions (read-only). */
   claudeSkillsCompatEnabled?: boolean;
   /**
@@ -1094,12 +1087,6 @@ export interface StreamSystemContextResult {
   agentSystemPromptSections: string[];
   /** Full system message string. */
   systemMessage: string;
-  /**
-   * The exact hot-memories text appended to the end of systemMessage, when
-   * present. Callers use it to move that volatile section out of the cached
-   * system block (#5251).
-   */
-  hotMemoriesSection?: string;
   /** Token count of the system message. */
   systemMessageTokens: number;
   /** Where the instruction-file blocks are in systemMessage (BuiltSystemMessage). */
@@ -1359,14 +1346,9 @@ export function buildContextWindowSection(ids: ContextWindowIds): string {
 }
 
 /** Remove only our generated guidance when late middleware filters tools; preserve its context additions. */
-export function removeMemoryGuidance(
-  systemMessage: string,
-  memoryToolAvailable: boolean,
-  hotMemoriesBlock?: string | null
-): string {
+export function removeMemoryGuidance(systemMessage: string, memoryToolAvailable: boolean): string {
   if (memoryToolAvailable) return systemMessage;
   let result = systemMessage;
-  if (hotMemoriesBlock) result = result.replace(hotMemoriesBlock, "");
   for (const writable of [true, false]) {
     result = result.replace(buildMemoryGuidanceSection(writable), "");
   }
@@ -1555,17 +1537,7 @@ export async function buildStreamSystemContext(
       scratchDirSet: opts.scratchDirSet,
     }
   );
-  let systemMessage = built.systemMessage;
-
-  // Append the hot-memories block (memory-hot-set sub-experiment). Placed at
-  // the end of the system message so the most recent stable prompt prefix
-  // stays byte-identical for provider prompt caching. The memory index lives
-  // in the memory tool description (same disclosure mechanic as skills).
-  const hotMemoriesSection =
-    opts.memoryToolAvailable && opts.hotMemoriesBlock ? `\n\n${opts.hotMemoriesBlock}` : undefined;
-  if (hotMemoriesSection != null) {
-    systemMessage = `${systemMessage}${hotMemoriesSection}`;
-  }
+  const systemMessage = built.systemMessage;
 
   // Count system message tokens for cost tracking
   const metadataModel = resolveModelForMetadata(modelString, providersConfig ?? null);
@@ -1575,7 +1547,6 @@ export async function buildStreamSystemContext(
   return {
     agentSystemPromptSections,
     systemMessage,
-    ...(hotMemoriesSection != null ? { hotMemoriesSection } : {}),
     systemMessageTokens,
     instructionsSection: built.instructionsSection,
     agentDefinitions,
