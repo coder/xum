@@ -419,7 +419,7 @@ export class AIService extends EventEmitter {
       // copy and measure only the response. Re-cloning and re-serializing the whole request
       // here doubled the per-turn event-loop cost at a full context (#6912).
       const response = structuredClone({
-        capturedAt: Date.now(),
+        capturedAt: this.streamManager.hostClock.nowMs(),
         metadata: event.metadata,
         parts: event.parts,
       });
@@ -1049,11 +1049,11 @@ export class AIService extends EventEmitter {
         ? AbortSignal.any([opts.abortSignal, controller.signal])
         : controller.signal,
       syntheticMessageId: createAssistantMessageId(),
-      startTime: Date.now(),
+      startTime: this.streamManager.hostClock.nowMs(),
       startupPhaseTimingsMs,
       startupState: { pendingRunMetadataId: null },
       recordStartupPhaseTiming: (phase, started) => {
-        startupPhaseTimingsMs[phase] = Date.now() - started;
+        startupPhaseTimingsMs[phase] = this.streamManager.hostClock.nowMs() - started;
       },
       admissionOnly: true,
     };
@@ -1095,7 +1095,7 @@ export class AIService extends EventEmitter {
       abortSignal,
       acpPromptId: opts.acpPromptId,
     });
-    const startTime = prepared?.context.startTime ?? Date.now();
+    const startTime = prepared?.context.startTime ?? this.streamManager.hostClock.nowMs();
     const syntheticMessageId = pendingStart.syntheticMessageId;
     opts.onStreamStarting?.(syntheticMessageId);
     const combinedAbortSignal = pendingStart.abortSignal;
@@ -1105,7 +1105,7 @@ export class AIService extends EventEmitter {
     if (combinedAbortSignal.aborted) forwardCancellation();
     else combinedAbortSignal.addEventListener("abort", forwardCancellation, { once: true });
     const recordStartupPhaseTiming = (phase: string, phaseStartedAt: number): void => {
-      startupPhaseTimingsMs[phase] = Date.now() - phaseStartedAt;
+      startupPhaseTimingsMs[phase] = this.streamManager.hostClock.nowMs() - phaseStartedAt;
     };
     const startupState = prepared?.context.startupState ?? {
       pendingRunMetadataId: null as string | null,
@@ -1146,7 +1146,7 @@ export class AIService extends EventEmitter {
           lastMessage?.role
       );
 
-      const commitPartialStartedAt = Date.now();
+      const commitPartialStartedAt = this.streamManager.hostClock.nowMs();
       await this.historyService.commitPartial(workspaceId);
       recordStartupPhaseTiming("commitPartialMs", commitPartialStartedAt);
 
@@ -1182,7 +1182,7 @@ export class AIService extends EventEmitter {
         buildOutcome.logStartOutcome("stream_start_failed", "stop_in_progress");
         pendingStart.abort("startup");
       }
-      const startStreamStartedAt = Date.now();
+      const startStreamStartedAt = this.streamManager.hostClock.nowMs();
       const streamResult = await this.streamManager.startStream(buildOutcome.turnExecutionOptions);
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);
 

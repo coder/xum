@@ -1,4 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
+import { nodeClock } from "@/node/utils/hostClock";
 import type { ToolExecutionOptions } from "ai";
 
 const GLOBAL_WORKSPACE_ID = "workspace-global";
@@ -110,6 +111,8 @@ describe("skills_catalog_read", () => {
       const tempDir = new TestTempDir("test-skills-catalog-read-pinned");
       const config = createTestToolConfig(tempDir.path, { workspaceId: GLOBAL_WORKSPACE_ID });
       const state = { revision: "rev-1", now: 1_000_000 };
+      // The tool reads the config's clock, so the test moves time without patching Date.now.
+      config.clock = { ...nodeClock, nowMs: () => state.now };
       const fetchSpy = spyOn(catalogFetch, "fetchSkillContent").mockImplementation(() =>
         Promise.resolve({
           content: skillMd(state.revision),
@@ -117,7 +120,6 @@ describe("skills_catalog_read", () => {
           branch: "main",
         })
       );
-      const nowSpy = spyOn(Date, "now").mockImplementation(() => state.now);
       const read = async (page?: { nextCharOffset?: number; snapshot?: string }) => {
         const result = (await createSkillsCatalogReadTool(config).execute!(
           {
@@ -138,7 +140,6 @@ describe("skills_catalog_read", () => {
         read,
         [Symbol.dispose]: () => {
           fetchSpy.mockRestore();
-          nowSpy.mockRestore();
           tempDir[Symbol.dispose]();
         },
       };

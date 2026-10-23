@@ -28,12 +28,49 @@ export const SkillLookupNameSchema = z
   .max(129)
   .regex(/^(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?:)?[a-z0-9]+(?:-[a-z0-9]+)*$/);
 
+/**
+ * Why a metadata value cannot round-trip as JSON, or undefined when it can.
+ * - A recursive YAML alias (`a: &A { self: *A }`) parses to a cyclic object, which
+ *   `z.json()` accepts but the oRPC serializer and the consent fingerprint cannot walk.
+ *   Shared (non-recursive) aliases are fine, so this tracks the current path only.
+ * - YAML rounds numbers before Xum sees them (`9007199254740993`, `1e-400`,
+ *   `0.10000000000000001`), so the tool card and the consent fingerprint would show a
+ *   different value than the file holds. A number must be quoted, as the spec's own
+ *   example does (`version: "1.0"`). Strings, booleans and null round-trip exactly.
+ */
+function metadataValueProblem(value: unknown, ancestors = new Set<object>()): string | undefined {
+  if (typeof value === "number") {
+    return "must not contain an unquoted number (YAML rounds it; quote it as a string)";
+  }
+  if (typeof value !== "object" || value === null) return undefined;
+  if (ancestors.has(value)) return "must not contain a recursive YAML alias";
+  ancestors.add(value);
+  const children: unknown[] = Array.isArray(value) ? value : Object.values(value);
+  const problem = children.reduce<string | undefined>(
+    (found, child) => found ?? metadataValueProblem(child, ancestors),
+    undefined
+  );
+  ancestors.delete(value);
+  return problem;
+}
+
 export const AgentSkillFrontmatterSchema = z.object({
   name: SkillNameSchema,
   description: z.string().min(1).max(1024),
   license: z.string().optional(),
   compatibility: z.string().min(1).max(500).optional(),
-  metadata: z.record(z.string(), z.string()).optional(),
+  // agentskills.io says string values, but skills-ref (the spec's own validator)
+  // accepts any value. Xum only displays metadata, so a nested value must not
+  // hide the skill (warpdotdev/common-skills merge-risk uses metadata.credits).
+  // Values must stay JSON: tagged YAML (`!!set`, `!!omap`, `!!binary`) parses to
+  // Set/Map/Uint8Array, which the tool card and the consent fingerprint show as `{}`.
+  metadata: z
+    .record(z.string(), z.json())
+    .superRefine((value, ctx) => {
+      const problem = metadataValueProblem(value);
+      if (problem !== undefined) ctx.addIssue({ code: "custom", message: problem });
+    })
+    .optional(),
 
   // When false, skill is NOT listed in the tool description's skill index.
   // Unadvertised skills can still be invoked via /skill-name or agent_skill_read({ name: "skill-name" }).

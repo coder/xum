@@ -1,29 +1,32 @@
-import { afterEach, beforeEach, describe, expect, it, setSystemTime, spyOn, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import { Duration } from "effect";
 import {
   calculateBackoffDelay,
   MAX_RETRY_AFTER_DELAY_MS,
 } from "@/common/utils/messages/retryState";
-import { makeTestEffectRunner, type TestEffectRunner } from "./di/testEffectRunner";
+import {
+  makeTestEffectRunner,
+  TEST_CLOCK_START_MS,
+  type TestEffectRunner,
+} from "./di/testEffectRunner";
 import { RetryManager, type RetryStatusEvent } from "./retryManager";
 
 /**
  * The backoff sleep runs on the injected `EffectRunner`'s clock, so the suite
  * drives it with a `TestClock` (`clock.adjust`) instead of intercepting
- * `setTimeout`. `setSystemTime` only pins `Date.now()` for the `scheduledAt`
- * stamp; it never drove timing. One default-runner smoke at the bottom keeps
- * the production path (Effect's default clock → real `setTimeout`) covered.
+ * `setTimeout`. The `scheduledAt` stamp reads the HostClock of the same
+ * TestClock, so it needs no `setSystemTime`. One default-runner smoke at the
+ * bottom keeps the production path (Effect's default clock → real
+ * `setTimeout`) covered.
  */
 describe("RetryManager", () => {
   let clock: TestEffectRunner;
 
   beforeEach(() => {
-    setSystemTime(new Date("2026-01-01T00:00:00Z"));
     clock = makeTestEffectRunner();
   });
 
   afterEach(async () => {
-    setSystemTime();
     await clock.dispose();
   });
 
@@ -116,7 +119,7 @@ describe("RetryManager", () => {
         type: "auto-retry-scheduled",
         attempt: 1,
         delayMs: expectedDelay,
-        scheduledAt: Date.now(),
+        scheduledAt: clock.hostClock.nowMs(),
       },
     ]);
     expect(manager.isRetryPending).toBe(true);
@@ -131,6 +134,20 @@ describe("RetryManager", () => {
     expect(manager.isRetryPending).toBe(false);
   });
 
+  it("stamps scheduledAt with the runner's clock, the clock of the backoff sleep", async () => {
+    const { manager, events } = createRetryManager();
+    await clock.adjust(Duration.millis(5_000));
+
+    manager.handleStreamFailure({ type: "unknown", message: "transient" });
+
+    // The client derives the countdown end from scheduledAt + delayMs; the sleep that ends it
+    // runs on the runner's clock, so the stamp must come from that clock too.
+    expect(events[0]).toMatchObject({
+      type: "auto-retry-scheduled",
+      scheduledAt: TEST_CLOCK_START_MS + 5_000,
+    });
+  });
+
   it("exposes pending scheduled retry for reconnect snapshots", async () => {
     const { manager } = createRetryManager();
 
@@ -141,7 +158,7 @@ describe("RetryManager", () => {
       type: "auto-retry-scheduled",
       attempt: 1,
       delayMs: calculateBackoffDelay(1),
-      scheduledAt: Date.now(),
+      scheduledAt: clock.hostClock.nowMs(),
     });
 
     // Snapshot should be defensive-copied.
@@ -154,7 +171,7 @@ describe("RetryManager", () => {
       type: "auto-retry-scheduled",
       attempt: 1,
       delayMs: calculateBackoffDelay(1),
-      scheduledAt: Date.now(),
+      scheduledAt: clock.hostClock.nowMs(),
     });
 
     await clock.adjust(Duration.millis(calculateBackoffDelay(1)));

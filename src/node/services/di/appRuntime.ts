@@ -7,7 +7,7 @@
  * tests/ipc), `CoreLive` alone for the headless CLI roots (`xum run`,
  * `xum workflow`, via `coreServicesRoot.ts`). It owns the app-lifetime
  * `Scope`, its built `Context<AppTags>` is what oRPC Effect-native handlers
- * receive as `"effect/context"`, and it is the source of the two runtime seams
+ * receive as `"effect/context"`, and it is the source of the runtime seams
  * described below. Subscription streams run on this context, so heartbeat
  * sleeps use the runtime's Clock without inheriting build-fiber artifacts.
  * Service classes were not rewritten for this: Layers are
@@ -69,8 +69,8 @@
  *
  * **R6 firewall.** In production code `Layer`, `ManagedRuntime` and
  * `TestClock` are imported only under `src/node/services/di/`, and every
- * `Context.Service` tag is declared there (`di/tags.ts`, plus the two seam
- * tags in `effectRunner.ts`/`appFiberScope.ts`; `orpc/effectContext.ts`
+ * `Context.Service` tag is declared there (`di/tags.ts`, plus the seam
+ * tags in `effectRunner.ts`/`hostClockLive.ts`/`appFiberScope.ts`; `orpc/effectContext.ts`
  * re-exports `MemoryMeta` and builds a narrow test-only context), so an effect
  * RC rename touches one directory. Tests may inject a `TestClock` beneath the
  * real graph (`serviceContainer.test.ts`) but go through `di/` helpers.
@@ -84,7 +84,7 @@
  * can drain it. The factory adds no Effect forks or layer finalizers; strategy
  * internals remain Promise-based.
  *
- * ## Two seams, deliberately asymmetric
+ * ## Runtime seams: two deliberately asymmetric fiber seams and the clock
  *
  * - `EffectRunner` is **unsupervised**: fibers forked through it belong to the
  *   worker's own `Scope` (explicit `start()`/`stop()`, which stay synchronous
@@ -106,6 +106,10 @@
  *   tolerate interruption at any suspension point, do not depend on resources
  *   torn down before step 2 below, and never fork long-lived I/O work through
  *   `EffectRunner` expecting shutdown to await it.
+ * - `HostClock` (`./hostClockLive.ts`) is derived from the Clock that
+ *   `EffectRunner` captured: `nodeClock` (`Date.now()`/`setTimeout()`) on the
+ *   default Clock, a clock over the same TestClock in tests. It forks no
+ *   supervised work; its TestClock timers are `EffectRunner` fibers.
  *
  * ## Startup (`ServiceContainer.initializeCore()`, Wave 4 PR 3)
  *

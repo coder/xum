@@ -1,6 +1,7 @@
 import * as fs from "fs";
 
-import { describe, it, expect, mock, spyOn } from "bun:test";
+import { describe, it, expect, mock } from "bun:test";
+import { nodeClock } from "@/node/utils/hostClock";
 import type { ToolExecutionOptions } from "ai";
 
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
@@ -901,35 +902,32 @@ describe("task_await tool", () => {
     using tempDir = new TestTempDir("test-task-await-tool-agent-elapsed-active");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
     const nowMs = Date.parse("2026-01-01T00:00:05.000Z");
-    const dateNowSpy = spyOn(Date, "now").mockReturnValue(nowMs);
+    // The tool reads the config's clock, so the test fixes "now" without patching Date.now.
+    baseConfig.clock = { ...nodeClock, nowMs: () => nowMs };
 
-    try {
-      const waitForAgentReport = mock(() => {
-        throw new Error("waitForAgentReport should not be called for timeout_secs=0");
-      });
-      const taskServices = createFakeTaskServices({
-        listActiveDescendantAgentTaskIds: mock(() => ["t1"]),
-        isDescendantAgentTask: mock(() => Promise.resolve(true)),
-        getAgentTaskStatus: mock(() => "running" as const),
-        getAgentTaskTimestamps: mock(() => ({
-          createdAt: "2026-01-01T00:00:02.000Z",
-        })),
-        waitForAgentReport,
-      });
+    const waitForAgentReport = mock(() => {
+      throw new Error("waitForAgentReport should not be called for timeout_secs=0");
+    });
+    const taskServices = createFakeTaskServices({
+      listActiveDescendantAgentTaskIds: mock(() => ["t1"]),
+      isDescendantAgentTask: mock(() => Promise.resolve(true)),
+      getAgentTaskStatus: mock(() => "running" as const),
+      getAgentTaskTimestamps: mock(() => ({
+        createdAt: "2026-01-01T00:00:02.000Z",
+      })),
+      waitForAgentReport,
+    });
 
-      const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
+    const tool = createTaskAwaitTool({ ...baseConfig, ...taskServices });
 
-      const result: unknown = await Promise.resolve(
-        tool.execute!({ timeout_secs: 0 }, mockToolCallOptions)
-      );
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ timeout_secs: 0 }, mockToolCallOptions)
+    );
 
-      expect(result).toEqual({
-        results: [{ status: "running", taskId: "t1", elapsed_ms: 3000 }],
-      });
-      expect(waitForAgentReport).toHaveBeenCalledTimes(0);
-    } finally {
-      dateNowSpy.mockRestore();
-    }
+    expect(result).toEqual({
+      results: [{ status: "running", taskId: "t1", elapsed_ms: 3000 }],
+    });
+    expect(waitForAgentReport).toHaveBeenCalledTimes(0);
   });
 
   it("does not list background bash tasks when explicit agent task IDs are valid", async () => {

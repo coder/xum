@@ -1306,13 +1306,63 @@
     },
     {
       "files": [
+        "src/node/services/agentSession.ts",
+        "src/node/services/aiService.ts",
+        "src/node/services/aiServiceEventGuards.ts",
+        "src/node/services/messagePipeline.ts",
+        "src/node/services/retryManager.ts",
+        "src/node/services/streamManager.ts",
+        "src/node/services/turn*.ts",
+        "src/node/services/contextManagement/**/*.ts",
+        "src/node/services/tools/**/*.ts",
+        "src/node/services/backgroundProcessManager.ts"
+      ],
+      "jsPlugins": [
+        {
+          "name": "local",
+          "specifier": "./eslint-local-rules.mjs"
+        }
+      ],
+      "rules": {
+        "local/no-raw-clock": [
+          "error",
+          {
+            "allow": {
+              "src/node/services/tools/bash.ts": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "files": [
         "**/*.test.ts",
         "**/*.testHarness.ts",
         "**/*.bench.ts",
         "src/node/services/tools/testHelpers.ts"
       ],
       "rules": {
-        "local/no-host-imports": "off"
+        "local/no-host-imports": "off",
+        "local/no-raw-clock": "off"
+      }
+    },
+    {
+      "files": [
+        "src/node/services/backgroundProcessManager.test.ts",
+        "src/node/services/retryManager.test.ts",
+        "src/node/services/streamManager.toolEvents.test.ts",
+        "src/node/services/tools/skills_catalog_read.test.ts",
+        "src/node/services/tools/task_await.test.ts",
+        "src/node/services/tools/web_fetch.test.ts"
+      ],
+      "jsPlugins": [
+        {
+          "name": "local",
+          "specifier": "./eslint-local-rules.mjs"
+        }
+      ],
+      "rules": {
+        "local/no-global-clock-patch": "error"
       }
     },
     {
