@@ -1,14 +1,13 @@
 import * as path from "path";
-import * as fs from "fs/promises";
 import { randomUUID } from "crypto";
 import { z } from "zod";
-import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -164,11 +163,12 @@ interface InFlightUsageEntry {
  * stream.
  */
 async function readInFlightUsageFile(
+  files: SessionFiles,
   filePath: string
 ): Promise<InFlightUsageFile | undefined | "missing" | "unreadable"> {
   let raw: string;
   try {
-    raw = await fs.readFile(filePath, "utf-8");
+    raw = await files.promises.readFile(filePath, "utf-8");
   } catch (error) {
     if (isErrnoWithCode(error, "ENOENT")) return "missing";
     log.warn("Failed to read an in-flight usage file; leaving it for a later read", {
@@ -234,6 +234,14 @@ export class SessionUsageService {
    */
   private get fileLocks(): SessionLocks["workspaceFiles"] {
     return this.historyService.locks.workspaceFiles;
+  }
+  /**
+   * The session-usage files live in the session dir, so they go through the HistoryService's
+   * SessionFiles (phase 5), like its locks: a memory layer keeps them off the disk too. Read
+   * at each use for the same reason as fileLocks.
+   */
+  private get files(): SessionFiles {
+    return this.historyService.files;
   }
   private readonly config: Config;
   private readonly historyService: HistoryService;
@@ -309,7 +317,7 @@ export class SessionUsageService {
     const dir = path.join(this.config.sessionsDir, workspaceId, IN_FLIGHT_USAGE_DIR);
     let names: string[];
     try {
-      names = await fs.readdir(dir);
+      names = await this.files.promises.readdir(dir);
     } catch (error) {
       if (isErrnoWithCode(error, "ENOENT")) return [];
       log.warn("Failed to list in-flight usage files; retrying on a later read", {
@@ -324,7 +332,7 @@ export class SessionUsageService {
       const key = name.endsWith(".json") ? name.slice(0, -".json".length) : "";
       if (!IN_FLIGHT_KEY_PATTERN.test(key)) continue;
       const filePath = path.join(dir, name);
-      const file = await readInFlightUsageFile(filePath);
+      const file = await readInFlightUsageFile(this.files, filePath);
       // "missing": settled or discarded since the readdir.
       if (file === "missing") continue;
       entries.push(
@@ -409,7 +417,7 @@ export class SessionUsageService {
   private async deleteFiles(filePaths: string[]): Promise<void> {
     for (const filePath of filePaths) {
       try {
-        await fs.rm(filePath, { force: true });
+        await this.files.promises.rm(filePath, { force: true });
       } catch (error) {
         log.warn("Failed to delete a settled in-flight usage file", { filePath, error });
       }
@@ -422,7 +430,7 @@ export class SessionUsageService {
 
   private async readFile(workspaceId: string): Promise<SessionUsageFile> {
     try {
-      const data = await fs.readFile(this.getFilePath(workspaceId), "utf-8");
+      const data = await this.files.promises.readFile(this.getFilePath(workspaceId), "utf-8");
       return JSON.parse(data) as SessionUsageFile;
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
@@ -434,8 +442,8 @@ export class SessionUsageService {
 
   private async writeFile(workspaceId: string, data: SessionUsageFile): Promise<void> {
     const filePath = this.getFilePath(workspaceId);
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await writeFileAtomic(filePath, JSON.stringify(data, null, 2));
+    await this.files.promises.mkdir(path.dirname(filePath), { recursive: true });
+    await this.files.writeFileAtomic(filePath, JSON.stringify(data, null, 2));
   }
 
   /**
@@ -517,8 +525,8 @@ export class SessionUsageService {
         updatedAt: Date.now(),
       };
       try {
-        await fs.mkdir(path.dirname(filePath), { recursive: true });
-        await writeFileAtomic(filePath, JSON.stringify(file));
+        await this.files.promises.mkdir(path.dirname(filePath), { recursive: true });
+        await this.files.writeFileAtomic(filePath, JSON.stringify(file));
       } catch (error) {
         // A failed first write leaves no file, and the caller keeps no key to release.
         if (!wasLive) this.forgetLiveKey(workspaceId, key);
@@ -533,7 +541,7 @@ export class SessionUsageService {
     return this.fileLocks.withLock(workspaceId, async () => {
       // Disk first: if the delete fails, the key stays live, so no read in this process folds
       // usage that was meant to be dropped (a restart then counts it: it was billed).
-      await fs.rm(filePath, { force: true });
+      await this.files.promises.rm(filePath, { force: true });
       this.forgetLiveKey(workspaceId, key);
     });
   }
@@ -712,8 +720,8 @@ export class SessionUsageService {
           path.dirname(this.getFilePath(workspaceId)),
           HEADLESS_USAGE_FILE_NAME
         );
-        await fs.mkdir(path.dirname(sidecarPath), { recursive: true });
-        await fs.appendFile(sidecarPath, `${line}\n`);
+        await this.files.promises.mkdir(path.dirname(sidecarPath), { recursive: true });
+        await this.files.promises.appendFile(sidecarPath, `${line}\n`);
       }
       // Ledger update is isolated: a corrupt session-usage.json (readFile
       // throws on bad JSON) must not fail the whole call once the sidecar
@@ -804,7 +812,7 @@ export class SessionUsageService {
     workspaceId: string
   ): Promise<SessionUsageTokenStatsCacheV1 | undefined> {
     try {
-      const raw = await fs.readFile(this.getFilePath(workspaceId), "utf-8");
+      const raw = await this.files.promises.readFile(this.getFilePath(workspaceId), "utf-8");
       const file = JSON.parse(raw) as Partial<SessionUsageFile>;
       return SessionUsageTokenStatsCacheSchema.safeParse(file.tokenStatsCache).data;
     } catch {
@@ -984,7 +992,7 @@ export class SessionUsageService {
   ): Promise<SessionUsageFile | undefined> {
     try {
       const filePath = this.getFilePath(workspaceId);
-      const data = await fs.readFile(filePath, "utf-8");
+      const data = await this.files.promises.readFile(filePath, "utf-8");
       return JSON.parse(data) as SessionUsageFile;
     } catch (error) {
       // File missing or corrupted - try to rebuild from messages
@@ -1035,7 +1043,7 @@ export class SessionUsageService {
         let settled: SessionUsageFile | undefined;
         try {
           const filePath = this.getFilePath(workspaceId);
-          const data = await fs.readFile(filePath, "utf-8");
+          const data = await this.files.promises.readFile(filePath, "utf-8");
           settled = JSON.parse(data) as SessionUsageFile;
         } catch {
           settled = undefined;
