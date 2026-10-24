@@ -23,13 +23,13 @@ import {
   AskUserQuestionHeader,
 } from "@/browser/features/Tools/AskUserQuestion/AskUserQuestionForm";
 import {
+  applyDraftEdit,
   buildAnswerSelections,
   buildAnswersRecord,
   createInitialDrafts,
   deleteCachedDraftState,
   type DraftAnswer,
   type DraftAnswers,
-  EMPTY_DRAFT,
   getCachedDraftState,
   getDescriptionsForLabels,
   getDraftStateKey,
@@ -583,7 +583,7 @@ export function AskUserQuestionToolCall(
     question: string,
     update: (draft: DraftAnswer) => DraftAnswer
   ) => {
-    setDraftAnswers((prev) => ({ ...prev, [question]: update(prev[question] ?? EMPTY_DRAFT) }));
+    setDraftAnswers((prev) => applyDraftEdit(prev, question, update));
   };
 
   return (

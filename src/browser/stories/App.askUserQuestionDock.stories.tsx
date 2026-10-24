@@ -117,13 +117,6 @@ function setupChainedDockStory(workspaceId: string) {
   });
 }
 
-async function assertChainedQuestionsDocked(canvasElement: HTMLElement) {
-  const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
-  await waitForScrollStabilization(storyRoot);
-  blurActiveElement();
-  await waitFor(() => checkChainedQuestionsDocked(storyRoot), { timeout: 10_000 });
-}
-
 function checkChainedQuestionsDocked(storyRoot: HTMLElement) {
   // One form (a single Next, inside the dock) and a horizontal-overflow check.
   checkQuestionDocked(storyRoot);
@@ -149,11 +142,14 @@ function checkChainedQuestionsDocked(storyRoot: HTMLElement) {
   }
 }
 
-async function assertQuestionDocked(canvasElement: HTMLElement) {
+async function assertQuestionDocked(
+  canvasElement: HTMLElement,
+  check: (storyRoot: HTMLElement) => void = checkQuestionDocked
+) {
   const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
   await waitForScrollStabilization(storyRoot);
   blurActiveElement();
-  await waitFor(() => checkQuestionDocked(storyRoot), { timeout: 10_000 });
+  await waitFor(() => check(storyRoot), { timeout: 10_000 });
 }
 
 function checkQuestionDocked(storyRoot: HTMLElement) {
@@ -221,7 +217,7 @@ export const ChainedDesktop: AppStory = {
     pixel: PIXEL_DISABLED,
   },
   play: async ({ canvasElement }) => {
-    await assertChainedQuestionsDocked(canvasElement);
+    await assertQuestionDocked(canvasElement, checkChainedQuestionsDocked);
   },
 };
 
@@ -236,7 +232,7 @@ export const ChainedPhone: AppStory = {
     pixel: PIXEL_DISABLED,
   },
   play: async ({ canvasElement }) => {
-    await assertChainedQuestionsDocked(canvasElement);
+    await assertQuestionDocked(canvasElement, checkChainedQuestionsDocked);
   },
 };
 
@@ -247,7 +243,7 @@ export const ChainedSubmit: AppStory = {
     pixel: PIXEL_DISABLED,
   },
   play: async ({ canvasElement }) => {
-    await assertChainedQuestionsDocked(canvasElement);
+    await assertQuestionDocked(canvasElement, checkChainedQuestionsDocked);
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
     const questionDock = within(
       storyRoot.querySelector<HTMLElement>('[data-component="AskUserQuestionDock"]') ?? storyRoot

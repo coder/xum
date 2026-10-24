@@ -15,13 +15,13 @@ import {
   type AskUserQuestionFormGroup,
 } from "./AskUserQuestionForm";
 import {
+  applyDraftEdit,
   buildAnswerSelections,
   buildAnswersRecord,
   createInitialDrafts,
   deleteCachedDraftState,
   type DraftAnswer,
   type DraftAnswers,
-  EMPTY_DRAFT,
   getCachedDraftState,
   getDraftStateKey,
   setCachedDraftState,
@@ -104,27 +104,12 @@ function syncDraftCache(props: AskUserQuestionChainProps, groups: readonly Chain
   }
 }
 
-function applyDraftEdit(
-  current: DraftAnswers,
-  question: string,
-  update: (draft: DraftAnswer) => DraftAnswer
-): DraftAnswers {
-  return { ...current, [question]: update(current[question] ?? EMPTY_DRAFT) };
-}
-
 /**
  * Each open row's drafts: edited here, else the draft cache (a workspace switch and back), else
  * the call's prefilled answers, exactly like the single card. Written back to the cache while
  * open, so a remount (and the single card) finds them.
  */
-function useChainGroups(props: AskUserQuestionChainProps): {
-  groups: ChainGroup[];
-  changeDraft: (
-    rowId: string,
-    question: string,
-    update: (draft: DraftAnswer) => DraftAnswer
-  ) => void;
-} {
+function useChainGroups(props: AskUserQuestionChainProps) {
   const [edited, setEdited] = useState<Record<string, DraftAnswers>>({});
   const groups = getOpenChainRows(props).map((chainRow) => toChainGroup(chainRow, edited));
 
@@ -183,10 +168,7 @@ function getActiveEntryKey(index: number, groups: readonly ChainGroup[]): Active
  * The active tab, stored by row and question rather than by position: a row appended while the
  * user answers adds tabs after the current one without moving it.
  */
-function useChainActiveIndex(
-  workspaceId: string,
-  groups: readonly ChainGroup[]
-): { activeIndex: number; activate: (index: number) => void } {
+function useChainActiveIndex(workspaceId: string, groups: readonly ChainGroup[]) {
   const [activeKey, setActiveKey] = useState<ActiveEntryKey>(
     () => activeEntryByWorkspace.get(workspaceId) ?? null
   );
@@ -206,15 +188,12 @@ function useChainActiveIndex(
 
   return {
     activeIndex: resolveActiveIndex(activeKey, groups),
-    activate: (index) => setActiveKey(getActiveEntryKey(index, groups)),
+    activate: (index: number) => setActiveKey(getActiveEntryKey(index, groups)),
   };
 }
 
 /** Submit: one message for every open call, through the non-blocking send path. */
-function useChainSubmit(
-  workspaceId: string,
-  groups: readonly ChainGroup[]
-): { submit: () => void; isSubmitting: boolean; submitError: string | null } {
+function useChainSubmit(workspaceId: string, groups: readonly ChainGroup[]) {
   const sendAnswers = useNonBlockingAnswerSender(workspaceId);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -264,10 +243,7 @@ function useReleaseClosedRows(props: AskUserQuestionChainProps, isSubmitting: bo
  * collapses the form. A call that arrives after the user collapsed it re-opens the form, as a new
  * card did before the chain: otherwise its questions would stay hidden with no hint.
  */
-function useChainExpansion(openRowIds: readonly string[]): {
-  expanded: boolean;
-  toggle: () => void;
-} {
+function useChainExpansion(openRowIds: readonly string[]) {
   const { expanded, setExpanded } = useToolExpansion(false, { forceExpanded: true });
   // The open rows the user collapsed the form over; null unless they collapsed it.
   const [collapsedOver, setCollapsedOver] = useState<readonly string[] | null>(null);

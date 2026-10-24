@@ -178,6 +178,14 @@ export function getDescriptionsForLabels(
     .filter((d): d is string => d !== undefined);
 }
 
+export function applyDraftEdit(
+  current: DraftAnswers,
+  question: string,
+  update: (draft: DraftAnswer) => DraftAnswer
+): DraftAnswers {
+  return { ...current, [question]: update(current[question] ?? EMPTY_DRAFT) };
+}
+
 /**
  * Clicking an option: multi-select toggles it; single-select replaces the pick (clearing the
  * Other text unless Other was picked), and clicking the picked option clears it.
