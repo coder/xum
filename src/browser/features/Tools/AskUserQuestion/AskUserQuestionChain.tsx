@@ -259,14 +259,39 @@ function useReleaseClosedRows(props: AskUserQuestionChainProps, isSubmitting: bo
   }, [rows, openRowIds, release, isSubmitting]);
 }
 
+/**
+ * Open questions must never hide behind a collapsed "tools" preference, and the header still
+ * collapses the form. A call that arrives after the user collapsed it re-opens the form, as a new
+ * card did before the chain: otherwise its questions would stay hidden with no hint.
+ */
+function useChainExpansion(openRowIds: readonly string[]): {
+  expanded: boolean;
+  toggle: () => void;
+} {
+  const { expanded, setExpanded } = useToolExpansion(false, { forceExpanded: true });
+  // The open rows the user collapsed the form over; null unless they collapsed it.
+  const [collapsedOver, setCollapsedOver] = useState<readonly string[] | null>(null);
+  const hasNewRow = collapsedOver !== null && hasRowOutside(openRowIds, collapsedOver);
+  const effectiveExpanded = expanded || hasNewRow;
+  return {
+    expanded: effectiveExpanded,
+    toggle: () => {
+      setExpanded(!effectiveExpanded);
+      setCollapsedOver(effectiveExpanded ? openRowIds : null);
+    },
+  };
+}
+
+function hasRowOutside(rowIds: readonly string[], known: readonly string[]): boolean {
+  return rowIds.some((rowId) => !known.includes(rowId));
+}
+
 function AskUserQuestionChainCard(props: AskUserQuestionChainProps): JSX.Element | null {
   const { groups, changeDraft } = useChainGroups(props);
   const { activeIndex, activate } = useChainActiveIndex(props.workspaceId, groups);
   const { submit, isSubmitting, submitError } = useChainSubmit(props.workspaceId, groups);
   useReleaseClosedRows(props, isSubmitting);
-  // Open questions must never hide behind a collapsed "tools" preference; the header still
-  // collapses the form.
-  const { expanded, toggleExpanded } = useToolExpansion(false, { forceExpanded: true });
+  const { expanded, toggle } = useChainExpansion(groups.map((group) => group.key));
 
   if (groups.length === 0) {
     return null;
@@ -276,7 +301,7 @@ function AskUserQuestionChainCard(props: AskUserQuestionChainProps): JSX.Element
     <ToolContainer expanded={expanded}>
       <AskUserQuestionHeader
         expanded={expanded}
-        onToggle={toggleExpanded}
+        onToggle={toggle}
         hint={ASK_USER_QUESTION_HINTS.nonBlocking.header}
         status={groups[0].row.status}
       />

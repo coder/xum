@@ -16,8 +16,23 @@ import {
   type AskUserQuestionToolMessage,
 } from "@/browser/utils/messages/openAskUserQuestions";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import type { DisplayedMessage } from "@/common/types/message";
 import { isAsyncAskUserQuestionOutput } from "@/common/utils/tools/askUserQuestionSummary";
 import { ChatDockSurface } from "./chatDockColumn";
+
+/**
+ * The rows that still take answers. React Compiler memoizes this call on its arguments alone, so
+ * the accepted-answers version must be one: without it an answer accepted while the agent streams
+ * (a queued message) would leave the chained form open, with Submit enabled, until the transcript
+ * changes.
+ */
+function getOpenRowIds(
+  workspaceId: string,
+  messages: readonly DisplayedMessage[],
+  _acceptedAnswersVersion: number
+): Set<string> {
+  return new Set(findOpenAskUserQuestions(workspaceId, messages).map((question) => question.id));
+}
 
 /**
  * Open ask_user_question forms, docked above the chat input so they stay sticky to the bottom of
@@ -40,11 +55,9 @@ export function AskUserQuestionDock(props: { workspaceId: string }) {
   );
 
   // An accepted non-blocking answer closes its question without any transcript change.
-  useAcceptedAnswersVersion();
+  const acceptedAnswersVersion = useAcceptedAnswersVersion();
   const [dockState, setDockState] = useState<DockedQuestionIds>(NO_DOCKED_QUESTIONS);
-  const openRowIds = new Set(
-    findOpenAskUserQuestions(props.workspaceId, messages).map((question) => question.id)
-  );
+  const openRowIds = getOpenRowIds(props.workspaceId, messages, acceptedAnswersVersion);
   const nextDockState = reconcileDockedQuestionIds(dockState, [...openRowIds]);
   if (nextDockState !== dockState) {
     // Adjust state during render (no effect): dock every question that opened in this visit.

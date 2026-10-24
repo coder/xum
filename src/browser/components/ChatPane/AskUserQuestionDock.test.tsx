@@ -227,6 +227,18 @@ describe("AskUserQuestionDock", () => {
     expect(view.getByText("1/2 answered")).toBeTruthy();
   });
 
+  test("a question set that arrives after the user collapsed the form re-opens it", () => {
+    messages = [ROW_A];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(view.getByText("ask_user_question"));
+    expect(view.queryByText(STORAGE.question)).toBeNull();
+
+    messages = [ROW_A, ROW_B];
+    view.rerender(dock(workspaceId));
+
+    expect(view.getByRole("button", { name: "Platforms" })).toBeTruthy();
+  });
+
   test("the active question stays put when an earlier question set closes", () => {
     messages = [ROW_A, ROW_B];
     const view = render(dock(workspaceId), { wrapper: Wrapper });

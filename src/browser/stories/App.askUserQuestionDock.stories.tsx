@@ -6,13 +6,14 @@
  * that the transcript row is a stub, and that the dock does not overflow horizontally.
  *
  * Several open question sets chain into one form (one tab strip, one Summary, one Submit), with a
- * divider between calls' tabs.
+ * divider between calls' tabs. Submit closes the form as soon as the send is accepted, even when
+ * no answer row lands yet (a message queued behind a running stream; the mock never appends one).
  *
  * Play-only: the Pixel snapshot budget is full, and the plays (not a snapshot) carry the behavior.
  */
 
 import type { ComponentType } from "react";
-import { waitFor } from "storybook/test";
+import { userEvent, waitFor, within } from "storybook/test";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
@@ -236,5 +237,31 @@ export const ChainedPhone: AppStory = {
   },
   play: async ({ canvasElement }) => {
     await assertChainedQuestionsDocked(canvasElement);
+  },
+};
+
+export const ChainedSubmit: AppStory = {
+  render: () => <AppWithMocks setup={() => setupChainedDockStory("ws-ask-dock-chained-submit")} />,
+  parameters: {
+    ...appMeta.parameters,
+    pixel: PIXEL_DISABLED,
+  },
+  play: async ({ canvasElement }) => {
+    await assertChainedQuestionsDocked(canvasElement);
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const questionDock = within(
+      storyRoot.querySelector<HTMLElement>('[data-component="AskUserQuestionDock"]') ?? storyRoot
+    );
+    await userEvent.click(questionDock.getByRole("button", { name: "Summary" }));
+    await userEvent.click(questionDock.getByRole("button", { name: "Submit answers" }));
+    // A form left open here could send the same answers again.
+    await waitFor(
+      () => {
+        if (storyRoot.querySelector('[data-component="AskUserQuestionDock"]')) {
+          throw new Error("The chained form stayed open after its answers were accepted");
+        }
+      },
+      { timeout: 10_000 }
+    );
   },
 };
