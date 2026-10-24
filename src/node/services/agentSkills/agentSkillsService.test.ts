@@ -1827,7 +1827,10 @@ describe("agentSkillsService agent plugins", () => {
       globalPluginRoots: [container],
     };
 
-    const { skills, invalidSkills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+    const { skills, invalidSkills } = await discoverAgentSkills(runtime, tmp.path, {
+      roots,
+      runtimeFactory,
+    });
 
     expect(skills.filter((skill) => skill.pluginName === "egm").map((skill) => skill.name)).toEqual(
       ["both-ways", "dangling-twin", "egm-review-loop", "solo-skill"]
@@ -1839,7 +1842,7 @@ describe("agentSkillsService agent plugins", () => {
       "user_skill",
     ]);
     const read = async (name: string) =>
-      readAgentSkill(runtime, tmp.path, SkillNameSchema.parse(name), { roots });
+      readAgentSkill(runtime, tmp.path, SkillNameSchema.parse(name), { roots, runtimeFactory });
     const realSkillsDir = await fs.realpath(skillsDir);
     expect((await read("egm-review-loop")).skillDir).toBe(
       path.join(realSkillsDir, "egm_review_loop")

@@ -3335,6 +3335,7 @@ describe("AgentPluginInstallService", () => {
         universalRoot: "",
         globalPluginRoots: [pluginsDir()],
       },
+      runtimeFactory: nodeRuntimeFactory,
     };
     const { skills } = await discoverAgentSkills(runtime, muxRoot, options);
     expect(skills.some((skill) => skill.name === "egm-bootstrap")).toBe(true);
