@@ -297,7 +297,12 @@ export class MockAiStreamPlayer {
     if (sessionsDir === undefined) return;
     const todos = writtenTodoList(active.parts, event);
     if (todos === null) return;
-    await setTodosForSessionDir(workspaceId, path.join(sessionsDir, workspaceId), todos);
+    await setTodosForSessionDir(
+      workspaceId,
+      path.join(sessionsDir, workspaceId),
+      todos,
+      this.deps.historyService.locks
+    );
   }
 
   private async waitForStreamStartGate(
