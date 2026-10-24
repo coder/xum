@@ -284,13 +284,14 @@ async function migrateRemotePlan(
 export async function findImportableLegacyPlanPath(
   config: PlanLocationConfig,
   runtime: Runtime,
-  owner: PlanOwner
+  owner: PlanOwner,
+  locks: SessionLocks = nodeSessionLocks
 ): Promise<string | undefined> {
   if (!usesInstallationScopedPlans(owner.runtimeConfig) || config.isRemotePlanMigrated(owner.id)) {
     return undefined;
   }
   const planPath = await resolvePlanFilePath(config, runtime, owner);
-  const outcome = await migrateRemotePlan(config, runtime, owner, planPath, false);
+  const outcome = await migrateRemotePlan(config, runtime, owner, planPath, false, locks);
   return outcome === "sharedOnly"
     ? getPlanFilePath(owner.name, owner.projectName, runtime.getXumHome())
     : undefined;
