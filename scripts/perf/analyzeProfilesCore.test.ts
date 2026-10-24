@@ -655,6 +655,44 @@ test("CLI maps scrubbed file://~ script URLs from a report bundle against the ho
   }
 });
 
+test("CLI maps <xum> script paths from a report bundle against --app-root only", () => {
+  const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
+  try {
+    const root = join(dir, "app");
+    mkdirSync(join(root, "dist", "node"), { recursive: true });
+    mkdirSync(join(dir, "maps"));
+    for (const [script, source] of [
+      [join(root, "dist", "node", "main.js"), "orig.ts"],
+      [join(dir, "outside.js"), "outside.ts"],
+    ]) {
+      writeFileSync(script, "function a(){}\n");
+      writeFileSync(`${script}.map`, mapTo(source));
+    }
+    const run = (url: string, args: string[], side: "candidate" | "baseline" = "candidate") => {
+      const profile = join(dir, "p.cpuprofile");
+      writeFileSync(profile, JSON.stringify(oneFrame(url)));
+      const proc = runCli(["--format", "json", ...args, profile]);
+      expect(proc.exitCode).toBe(0);
+      return locations(proc.stdout, side);
+    };
+    for (const url of ["file://<xum>/dist/node/main.js", "<xum>/dist/node/main.js"]) {
+      expect(run(url, ["--app-root", root])).toEqual(["orig.ts"]);
+      expect(run(url, [])).toEqual([url]);
+    }
+    // Diff mode: a baseline with its own maps never reads the candidate's --app-root.
+    const [app, base] = ["<xum>/dist/node/main.js", join(dir, "base.cpuprofile")];
+    writeFileSync(base, JSON.stringify(oneFrame(app)));
+    const maps = ["--baseline-map-dir", join(dir, "maps")];
+    expect(run(app, ["--app-root", root, "--baseline", base, ...maps], "baseline")).toEqual([app]);
+    // Profiles are input data: a path must not climb out of --app-root.
+    for (const url of ["<xum>/../outside.js", "<xum>/%2e%2e%2foutside.js"]) {
+      expect(run(url, ["--app-root", root])).toEqual([url]);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("CLI never looks up --map-dir maps outside the directory", () => {
   const dir = mkdtempSync(join(tmpdir(), "analyze-profiles-"));
   try {
