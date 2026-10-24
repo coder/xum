@@ -39,6 +39,8 @@ export const nodeRuntimeFactory: RuntimeFactory = {
  * A tool config's runtime builders: the session's (ToolConfiguration.runtimeFactory), or this
  * Node layer for configs that tests build by hand.
  */
+// dry-duplicate-ok: toolSessionFiles (todo.ts) has the same shape for another service, and each
+// falls back to its own service's Node layer, so the two change apart.
 export function toolRuntimeFactory(config: { runtimeFactory?: RuntimeFactory }): RuntimeFactory {
   // mutation-equivalent: runtimeFactory is a RuntimeFactory object or undefined, so ?? and || agree
   return config.runtimeFactory ?? nodeRuntimeFactory;
