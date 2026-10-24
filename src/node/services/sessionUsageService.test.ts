@@ -1156,6 +1156,37 @@ describe("SessionUsageService", () => {
 });
 
 describe("SessionUsageService on the HistoryService's SessionFiles", () => {
+  it("refuses a headless write when the tombstone exists only in its memory volume", async () => {
+    const memory = await createTestHistoryService({ files: SessionFilesMemory });
+    try {
+      const service = new SessionUsageService(memory.config, memory.historyService);
+      const workspaceId = "removed-in-memory";
+      const tombstonePath = workspaceRemovalTombstonePath(memory.config.rootDir, workspaceId);
+      await memory.files.promises.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await memory.files.promises.writeFile(
+        tombstonePath,
+        JSON.stringify({ workspaceId, removedAt: Date.now() })
+      );
+
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        "anthropic:claude-haiku-4-5",
+        { inputTokens: 40, outputTokens: 4, totalTokens: 44 },
+        undefined,
+        { analyticsSource: "memory_consolidation" }
+      );
+      expect(recorded).toBeUndefined();
+      expect(
+        await memory.files.promises.access(path.join(memory.config.sessionsDir, workspaceId)).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    } finally {
+      await memory.cleanup();
+    }
+  });
+
   it("keeps the ledger, the in-flight files and the headless sidecar in its memory volume", async () => {
     // The session-usage files are session files: with memory SessionFiles they live in the
     // memory volume, and the session dir on disk is never created.

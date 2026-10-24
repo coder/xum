@@ -615,7 +615,8 @@ export class SessionUsageService {
         this.config.rootDir,
         path.join(this.config.sessionsDir, workspaceId),
         async () => {
-          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+          // The same files as the usage writes below, like HistoryService's own check.
+          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId, this.files)) {
             log.debug("Skipping headless usage write for removed workspace", { workspaceId });
             return undefined;
           }
