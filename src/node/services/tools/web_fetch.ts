@@ -102,13 +102,13 @@ export function stripHeavyTags(html: string): string {
 // process rather than in the bun test runner.
 export function parseHtmlDocument(html: string, url: string): Document {
   // SECURITY: the HTML is untrusted. Parsing must never trigger network
-  // fetches from the Mux backend (subresources like iframes, external
-  // stylesheets or preload links would bypass the SSRF checks in
-  // assertWebFetchTargetAllowed). JavaScript evaluation is already disabled
-  // by default in happy-dom. The settings below turn off the loaders we know
-  // about, and the fetch interceptor enforces the guarantee for every request
-  // type: happy-dom sends all of its requests (fetch, XMLHttpRequest, preload,
-  // stylesheets, scripts, frames) through Fetch/SyncFetch, which call the
+  // fetches from the Mux backend (subresources like iframes or external
+  // stylesheets would bypass the SSRF checks in assertWebFetchTargetAllowed).
+  // JavaScript evaluation is already disabled by default in happy-dom. The
+  // settings below turn off the loaders we know about, and the fetch
+  // interceptor enforces the guarantee for every request type: happy-dom sends
+  // all of its requests (fetch, XMLHttpRequest, <link> elements, stylesheets,
+  // scripts, frames) through Fetch/SyncFetch, which call the
   // interceptor before they open a connection, so a refused request never
   // reaches the network and never follows a redirect.
   const window = new Window({
