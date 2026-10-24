@@ -75,6 +75,8 @@ function stripElementBlocks(html: string, tagName: string): string {
   for (let open = opener.exec(html); open !== null; open = opener.exec(html)) {
     const openerEnd = html.indexOf(">", opener.lastIndex);
     if (openerEnd === -1) break;
+    // mutation-equivalent: a closer starts with "</", and html[openerEnd] is ">",
+    // so a search from openerEnd - 1 or openerEnd finds the same closer.
     closer.lastIndex = openerEnd + 1;
     if (closer.exec(html) === null) break;
     kept.push(html.slice(keptFrom, open.index));

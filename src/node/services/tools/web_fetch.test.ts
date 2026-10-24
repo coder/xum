@@ -550,6 +550,7 @@ describe("stripHeavyTags", () => {
       "<script>a</script><script>unclosed<style>x</style>tail",
       "<style><script>x</style></script>after",
       "</style><style>a</style   ><style>b</STYLE>",
+      "a</style>b<style c",
     ];
     for (const input of inputs) {
       expect(stripHeavyTags(input)).toBe(referenceStrip(input));
