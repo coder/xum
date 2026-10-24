@@ -30,6 +30,11 @@ import {
 // The Node layer: these tests read through host runtimes.
 import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
+import { fakeRuntimeFactory } from "@/node/services/runtimeFactory/fakeRuntimeFactory.testHarness";
+import {
+  createMemoryHost,
+  MEMORY_USER_HOME,
+} from "@/node/services/hostFiles/memoryHostFiles.testHarness";
 
 /** The Node layer, except that its host-local runtimes read `~/` as `home`: shows which runtime a scan used. */
 function runtimeFactoryWithHome(home: string): RuntimeFactory {
@@ -2938,5 +2943,47 @@ describe("agent skills transport failures", () => {
       runtimeFactory,
     });
     expect(resolved.package.frontmatter.description).toBe("from global");
+  });
+});
+
+describe("agentSkillsService host filesystem", () => {
+  test("lists, contains and reads skills on the host filesystem of its RuntimeFactory", async () => {
+    // Phase 5: the reads beside the runtime (listing, containment, plugin discovery and the
+    // plugin SKILL.md read) go through the factory's HostFiles. These skills exist only on the
+    // memory host, so the Node filesystem finds neither.
+    const host = createMemoryHost();
+    const write = async (filePath: string, text: string): Promise<void> => {
+      await host.files.promises.mkdir(path.dirname(filePath), { recursive: true });
+      await host.files.promises.writeFile(filePath, text);
+    };
+    const skill = (name: string) => `---\nname: ${name}\ndescription: memory ${name}\n---\nBody\n`;
+    await write("/ws/.xum/skills/demo/SKILL.md", skill("demo"));
+    const plugin = path.join(MEMORY_USER_HOME, ".agents", "plugins", "kit");
+    await write(
+      path.join(plugin, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "kit",
+      })
+    );
+    await write(path.join(plugin, "skills", "helper", "SKILL.md"), skill("helper"));
+    const options = {
+      containment: { kind: "local" as const, root: "/ws" },
+      runtimeFactory: fakeRuntimeFactory(host),
+    };
+
+    const { skills } = await discoverAgentSkills(host.runtime, "/ws", options);
+    const helper = await readAgentSkill(
+      host.runtime,
+      "/ws",
+      SkillNameSchema.parse("helper"),
+      options
+    );
+
+    expect(skills.map((descriptor) => descriptor.name)).toEqual(
+      expect.arrayContaining(["demo", "helper"])
+    );
+    expect(helper.pluginRoot).toBe(plugin);
+    expect(helper.package.body).toContain("Body");
   });
 });

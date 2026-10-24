@@ -29,6 +29,11 @@ import { resolveAgentInheritanceChain } from "./resolveAgentInheritanceChain";
 // The Node layer: these tests read through host runtimes.
 import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
+import { fakeRuntimeFactory } from "@/node/services/runtimeFactory/fakeRuntimeFactory.testHarness";
+import {
+  createMemoryHost,
+  MEMORY_USER_HOME,
+} from "@/node/services/hostFiles/memoryHostFiles.testHarness";
 
 /** The Node layer, except that its host-local runtimes read `~/` as `home`: shows which runtime a scan used. */
 function runtimeFactoryWithHome(home: string): RuntimeFactory {
@@ -1532,4 +1537,44 @@ test("an unreadable project agent or base neither falls back nor truncates the c
     runtimeFactory,
   });
   expect(await chain.catch((error: unknown) => error)).toMatchObject({ type: "file_io" });
+});
+
+describe("agentDefinitionsService host filesystem", () => {
+  test("lists, contains and reads agents on the host filesystem of its RuntimeFactory", async () => {
+    // Phase 5: the reads beside the runtime (listing, plugin discovery, containment and the
+    // plugin agent read) go through the factory's HostFiles. These agents exist only on the
+    // memory host, so the Node filesystem finds neither.
+    const host = createMemoryHost();
+    const write = async (filePath: string, text: string): Promise<void> => {
+      await host.files.promises.mkdir(path.dirname(filePath), { recursive: true });
+      await host.files.promises.writeFile(filePath, text);
+    };
+    await write("/ws/.xum/agents/helper.md", "---\nname: Helper\n---\nHelp.\n");
+    const plugin = path.join(MEMORY_USER_HOME, ".agents", "plugins", "kit");
+    await write(
+      path.join(plugin, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "kit",
+      })
+    );
+    await write(path.join(plugin, "agents", "reviewer.md"), "---\nname: Reviewer\n---\nReview.\n");
+    const options = { runtimeFactory: fakeRuntimeFactory(host) };
+
+    const agents = await discoverAgentDefinitions(host.runtime, "/ws", options);
+    const reviewer = await readAgentDefinition(
+      host.runtime,
+      "/ws",
+      AgentIdSchema.parse("reviewer"),
+      options
+    );
+
+    expect(agents.map((agent) => [agent.id, agent.scope])).toEqual(
+      expect.arrayContaining([
+        ["helper", "project"],
+        ["reviewer", "global"],
+      ])
+    );
+    expect(reviewer.body).toContain("Review.");
+  });
 });
