@@ -7,9 +7,7 @@ import {
 } from "./contextBudgetCounting";
 import { applyCacheControl, getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { stripMessageCacheControl, type ContinuousPrefixSwap } from "./continuousCompactionJournal";
-import * as path from "path";
-import { Effect, Exit, Scope } from "effect";
-import { PlatformPaths } from "@/common/utils/paths";
+import type { Scope } from "effect";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import {
   type streamText,
@@ -72,7 +70,6 @@ import {
   normalizeUsage,
   withCacheWriteMetadata,
 } from "@/common/utils/tokens/usageHelpers";
-import { linkAbortSignal } from "@/node/utils/abort";
 import { modelOnlyNotificationsField } from "@/common/utils/tools/internalToolResultFields";
 import { buildRequiredToolPatterns } from "@/common/utils/tools/toolPolicy";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
@@ -167,7 +164,7 @@ import {
   type PendingStreamStartHandle,
   type StreamToken,
 } from "@/node/services/turnEngine/TurnRegistry";
-import { shellQuote } from "@/common/utils/shell";
+import { TurnResources } from "@/node/services/turnEngine/TurnResources";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
@@ -876,12 +873,16 @@ export class StreamManager {
   private readonly workspaceStreams: Map<WorkspaceId, WorkspaceStreamInfo>;
   // Owns the slot, the start lock, the completion fence and stop (turnEngine/TurnRegistry.ts).
   private readonly turnRegistry: TurnRegistry;
+  // Owns the temp dir, the startup abort controller and scope, stream resource
+  // teardown and the MCP lease (turnEngine/TurnResources.ts).
+  private readonly turnResources: TurnResources;
+  // Read by TurnResources at call time; coreServicesRoot.test.ts reads this field.
+  private mcpServerManager?: MCPServerManager;
   private mockStreamLifecycle?: MockStreamLifecycle;
   private readonly PARTIAL_WRITE_THROTTLE_MS = 500;
   private readonly historyService: HistoryService;
   // Owns this manager's partial.json and final-message writes (turnEngine/PartialJournal.ts).
   private readonly partialJournal: PartialJournal;
-  private mcpServerManager?: MCPServerManager;
   // Owns the turn's usage accounting and session-usage writes (turnEngine/UsageLedger.ts).
   private readonly usageLedger: UsageLedger;
   // Owns turn event delivery and workflow-run attachments (turnEngine/TurnEvents.ts).
@@ -955,6 +956,16 @@ export class StreamManager {
         this.cleanupAbortedStream(id, info, abortReason, abandonPartial),
     });
     this.workspaceStreams = this.turnRegistry.workspaceStreams;
+    this.turnResources = new TurnResources({
+      effectRunner: runner,
+      toolCallDisplayRegistry: this.toolCallDisplayRegistry,
+      partialJournal: this.partialJournal,
+      mcpServerManager: () => this.mcpServerManager,
+      // Forward at call time: tests spy on and Reflect.set these StreamManager methods.
+      createTempDirForStream: (streamToken, runtime) =>
+        this.createTempDirForStream(streamToken, runtime),
+      cleanupStreamTempDir: (runtime, dir) => this.cleanupStreamTempDir(runtime, dir),
+    });
     this.tokenTracker = options.tokenTracker ?? new StreamingTokenTracker();
     this.streamTextOverride = options.streamText;
     this.stepPreparation = new StepPreparation({
@@ -1141,60 +1152,14 @@ export class StreamManager {
     return this.turnRegistry.generateStreamToken();
   }
 
-  /**
-   * Create a temporary directory for a stream token
-   * Use ~/.xum-tmp instead of system temp directory (e.g., /var/folders/...)
-   * because macOS user-scoped temp paths are extremely long, which leads to:
-   * - Agent mistakes when copying/manipulating paths
-   * - Harder to read in tool outputs
-   * - Potential path length issues on some systems
-   *
-   * Uses the Runtime abstraction so temp directories work for both local and SSH runtimes.
-   */
+  /** TurnResources.createTempDirForStream. Tests spy on this method; startStream calls it. */
   public async createTempDirForStream(streamToken: StreamToken, runtime: Runtime): Promise<string> {
-    const tempDir = `~/.xum-tmp/${streamToken}`;
-
-    // Resolve ~ in the runtime's context: callers need the canonical absolute
-    // path as a value, and reusing it for ensureDir avoids a second remote
-    // resolution round trip per stream on SSH runtimes.
-    let resolvedPath = (await runtime.resolvePath(tempDir)).trim();
-
-    // In the main process, PlatformPaths defaults to POSIX behavior (no navigator),
-    // so we normalize Windows paths to forward slashes.
-    if (process.platform === "win32") {
-      resolvedPath = resolvedPath.replace(/\\/g, "/");
-    }
-
-    try {
-      await runtime.ensureDir(resolvedPath);
-    } catch (err) {
-      const msg = getErrorMessage(err);
-      throw new Error(`Failed to create temp directory ${resolvedPath}: ${msg}`);
-    }
-
-    return resolvedPath;
+    return this.turnResources.createTempDirForStream(streamToken, runtime);
   }
 
+  /** TurnResources.cleanupStreamTempDir. Tests replace this method; the release calls it. */
   private cleanupStreamTempDir(runtime: Runtime, runtimeTempDir: string): void {
-    // Use parent directory as cwd for safety - if runtimeTempDir is malformed,
-    // we won't accidentally run rm -rf from root.
-    const tempDirBasename = PlatformPaths.basename(runtimeTempDir);
-    const tempDirParent = path.dirname(runtimeTempDir);
-
-    // Fire-and-forget: don't block stream completion waiting for directory deletion.
-    // This is especially important for SSH where rm -rf can take 500ms-2s.
-    void runtime
-      .exec(`rm -rf ${shellQuote(tempDirBasename)}`, {
-        cwd: tempDirParent,
-        timeout: 10,
-      })
-      .then(async (result) => {
-        await result.exitCode;
-        log.debug(`Cleaned up temp dir: ${runtimeTempDir}`);
-      })
-      .catch((error) => {
-        log.error(`Failed to cleanup temp dir ${runtimeTempDir}:`, error);
-      });
+    this.turnResources.cleanupStreamTempDir(runtime, runtimeTempDir);
   }
 
   /**
@@ -1777,39 +1742,6 @@ export class StreamManager {
     return true;
   }
 
-  private closeStreamResources(streamInfo: WorkspaceStreamInfo): Promise<void> {
-    if (streamInfo.executionScope) this.toolCallDisplayRegistry.close(streamInfo.executionScope);
-    if (streamInfo.resourceCleanup) return streamInfo.resourceCleanup;
-    const closed = Promise.withResolvers<void>();
-    streamInfo.resourceCleanup = closed.promise;
-    (async () => {
-      // Retire scheduled writes before joining their original Promise I/O. Scope close
-      // interrupts debounce fibers; remote temp-directory removal remains best effort
-      // (its registered finalizer only initiates removal, never awaits SSH).
-      this.partialJournal.retire(streamInfo);
-      try {
-        if (streamInfo.resourceScope) {
-          await this.effectRunner.runPromise(Scope.close(streamInfo.resourceScope, Exit.void));
-        }
-      } catch (error) {
-        log.error("Stream resource cleanup failed", { error });
-      }
-      try {
-        this.partialJournal.interruptScheduled(streamInfo);
-        await this.partialJournal.awaitPending(streamInfo);
-      } catch (error) {
-        // A cleanup defect must not orphan a completed/failed handle or skip raw teardown.
-        log.error("Pending partial write cleanup failed", { error });
-      }
-
-      runLanguageModelCleanup(streamInfo.request?.model);
-
-      streamInfo.unlinkAbortSignal?.();
-      streamInfo.unlinkAbortSignal = undefined;
-    })().then(closed.resolve, closed.reject);
-    return closed.promise;
-  }
-
   private async cleanupAbortedStream(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
@@ -1843,7 +1775,7 @@ export class StreamManager {
     // stopStream, so join owned resources here without joining that callback back into itself.
     // The envelope only journals; its original callback/mutex lifetime stays independently
     // leased. Canceled engine model/temp/debounce resources retire before raw terminal delivery.
-    await this.closeStreamResources(streamInfo);
+    await this.turnResources.closeStreamResources(streamInfo);
 
     // For aborts, use our tracked cumulativeUsage directly instead of AI SDK's totalUsage.
     // cumulativeUsage is updated on each finish-step event (before tool execution),
@@ -3343,7 +3275,7 @@ export class StreamManager {
     streamInfo: WorkspaceStreamInfo,
     historySequence: number
   ): Promise<void> {
-    this.mcpServerManager?.acquireLease(workspaceId as string);
+    this.turnResources.acquireMcpLease(workspaceId);
 
     try {
       // Update state to streaming
@@ -3429,9 +3361,9 @@ export class StreamManager {
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo
   ): Promise<void> {
-    this.mcpServerManager?.releaseLease(workspaceId as string);
+    this.turnResources.releaseMcpLease(workspaceId);
 
-    await this.closeStreamResources(streamInfo);
+    await this.turnResources.closeStreamResources(streamInfo);
 
     // Aborts keep their registration until cleanupAbortedStream completes its disk
     // transaction and raw delivery. A stale finally must never remove a replacement.
@@ -4318,28 +4250,14 @@ export class StreamManager {
         `[STREAM START] workspaceId=${workspaceId} historySequence=${historySequence} model=${modelString}`
       );
 
-      const streamAbortController = new AbortController();
-      const unlinkAbortSignal = linkAbortSignal(abortSignal, streamAbortController);
-
-      // Owns this stream's Effect-managed resources (temp dir, debounce
-      // fiber). Ownership transfers to processStreamWithCleanup once the
-      // stream registers; otherwise the finally below closes it.
-      const resourceScope = Scope.makeUnsafe();
+      // Owns this stream's abort controller and Effect-managed resources (temp dir,
+      // debounce fiber) until the stream registers (TurnResources.openStartup).
+      const startup = this.turnResources.openStartup(abortSignal);
+      const { abortController: streamAbortController, unlinkAbortSignal, resourceScope } = startup;
       let processingStarted = false;
-      const cleanupStartup = async (): Promise<void> => {
-        // streamText may already have invoked the provider while the envelope awaited I/O.
-        // A refused startup must cancel that request before releasing its owned resources.
-        if (!streamAbortController.signal.aborted)
-          streamAbortController.abort(new Error("Stream startup did not complete"));
-        if (registeredStream) return this.closeStreamResources(registeredStream);
-        runLanguageModelCleanup(model);
-        unlinkAbortSignal();
-        try {
-          await this.effectRunner.runPromise(Scope.close(resourceScope, Exit.void));
-        } catch (error) {
-          log.error("Startup resource cleanup failed", { error });
-        }
-      };
+      // Reads registeredStream when called: once registered, the stream owns the resources.
+      const cleanupStartup = (): Promise<void> =>
+        this.turnResources.releaseStartup(startup, model, registeredStream);
 
       try {
         // Step 1: Cancel any existing stream before proceeding
@@ -4356,36 +4274,12 @@ export class StreamManager {
           return settleStartupAbort();
         }
 
-        // Step 3: Acquire the temp directory for this stream as a scoped
-        // resource. The release finalizer registers only after acquisition
-        // succeeds, and Scope.close runs it exactly once across both cleanup
-        // paths (startup failure in the finally below, stream teardown in
-        // processStreamWithCleanup). TurnRequestBuilder pre-creates this dir
-        // so tool configuration can reference the same stable path; once
-        // startStream receives it, StreamManager owns cleanup for both
-        // success and abort paths.
-        const runtimeTempDir = await Effect.runPromise(
-          Scope.provide(resourceScope)(
-            Effect.acquireRelease(
-              Effect.tryPromise({
-                // Async thunk: createTempDirForStream failures follow the same
-                // rejection path into this method's catch as the previous
-                // plain await.
-                try: async () =>
-                  providedRuntimeTempDir ??
-                  (await this.createTempDirForStream(streamToken, runtime)),
-                catch: (error) => error,
-              }),
-              (dir) =>
-                Effect.sync(() => {
-                  // Whitebox tests pass providedRuntimeTempDir: "" to skip
-                  // cleanup; mirror the previous falsy guard.
-                  if (dir) {
-                    this.cleanupStreamTempDir(runtime, dir);
-                  }
-                })
-            )
-          )
+        // Step 3: Acquire the temp directory for this stream as a scoped resource.
+        const runtimeTempDir = await this.turnResources.acquireTempDir(
+          resourceScope,
+          streamToken,
+          runtime,
+          providedRuntimeTempDir
         );
 
         if (streamAbortController.signal.aborted) {
