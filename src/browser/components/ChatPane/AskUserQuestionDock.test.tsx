@@ -237,6 +237,27 @@ describe("AskUserQuestionDock", () => {
     expect(second.getByText("1/2 answered")).toBeTruthy();
   });
 
+  test("drafts and the active tab survive the call returning without waiting", () => {
+    // While the call still executes it has no result, so it renders as its own card.
+    messages = [
+      {
+        ...questionRow("row-x", "ask-x", [STORAGE, PLATFORMS]),
+        result: undefined,
+        status: "executing",
+      },
+    ];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(view.getByText("SQLite"));
+    expect(view.getByText(PLATFORMS.question)).toBeTruthy();
+
+    // It returned without waiting: the row moves into the chained form.
+    messages = [questionRow("row-x", "ask-x", [STORAGE, PLATFORMS])];
+    view.rerender(dock(workspaceId));
+
+    expect(view.getByText(PLATFORMS.question)).toBeTruthy();
+    expect(view.getByText("1/2 answered")).toBeTruthy();
+  });
+
   test("a question set that arrives while answering joins the mounted form", () => {
     // Prefilled Other text (typing does not reach React state in this happy-dom setup).
     messages = [questionRow("row-a", "ask-a", [STORAGE], { [STORAGE.question]: "use redis" })];

@@ -165,12 +165,31 @@ function getActiveEntryKey(index: number, groups: readonly ChainGroup[]): Active
 }
 
 /**
+ * The tab a single card left its row on. A non-blocking call has no result while it executes, so
+ * it renders as its own card until it returns, then moves into the chain; that card cached its
+ * tab with its drafts.
+ */
+function getCardActiveKey(groups: readonly ChainGroup[]): ActiveEntryKey {
+  for (const group of groups) {
+    const cardIndex = getCachedDraftState(group.draftKey)?.activeIndex ?? 0;
+    if (cardIndex > 0) {
+      // The card's Summary comes right after its last question.
+      return cardIndex < group.questions.length
+        ? { rowId: group.key, questionIndex: cardIndex }
+        : "summary";
+    }
+  }
+  return null;
+}
+
+/**
  * The active tab, stored by row and question rather than by position: a row appended while the
- * user answers adds tabs after the current one without moving it.
+ * user answers adds tabs after the current one without moving it. A new chain starts where the
+ * user left the card its row came from; a mounted chain keeps its own tab.
  */
 function useChainActiveIndex(workspaceId: string, groups: readonly ChainGroup[]) {
   const [activeKey, setActiveKey] = useState<ActiveEntryKey>(
-    () => activeEntryByWorkspace.get(workspaceId) ?? null
+    () => activeEntryByWorkspace.get(workspaceId) ?? getCardActiveKey(groups)
   );
   if (groups.length === 0 && activeKey !== null) {
     // Adjust state during render (no effect): every question set closed, so the next one starts
