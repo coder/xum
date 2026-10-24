@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import type { ExecResult } from "@/node/utils/runtime/helpers";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
-import { createWebFetchTool, stripHeavyTags } from "./web_fetch";
+import { createWebFetchTool, parseHtmlDocument, stripHeavyTags } from "./web_fetch";
 import type { WebFetchToolResult } from "@/common/types/tools";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import type { ToolExecutionOptions } from "ai";
@@ -386,6 +386,35 @@ describe("web_fetch tool", () => {
     }
   });
 
+  it("keeps content that follows tag-like text inside a quoted attribute", async () => {
+    using testEnv = createTestWebFetchTool();
+    const articleHtml = `<!DOCTYPE html><html><head><title>Quoted Markup</title></head><body>
+      <article>
+        <h1>Quoted markup</h1>
+        <p><img alt="literal <link rel=preload">First paragraph.</p>
+        <p>Second paragraph after the image.</p>
+      </article></body></html>`;
+    mockRuntimeExec(() =>
+      Promise.resolve(
+        createExecResult({
+          stdout:
+            "HTTP/1.1 200 OK\r\n" + "Content-Type: text/html; charset=utf-8\r\n\r\n" + articleHtml,
+        })
+      )
+    );
+
+    const result = (await testEnv.tool.execute!(
+      { url: "https://93.184.216.34/quoted" },
+      toolCallOptions
+    )) as WebFetchToolResult;
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.content).toContain("First paragraph.");
+      expect(result.content).toContain("Second paragraph after the image.");
+    }
+  });
+
   it("follows validated public redirects and returns the final content", async () => {
     using testEnv = createTestWebFetchTool();
 
@@ -566,5 +595,19 @@ describe("stripHeavyTags", () => {
       expect(stripHeavyTags(html)).toBe(html);
     }
     expect(performance.now() - started).toBeLessThan(1000);
+  });
+});
+
+describe("parseHtmlDocument", () => {
+  it("does not run inline scripts or event handler attributes", () => {
+    // happy-dom's WebSocket connects outside the fetch interceptor, and only
+    // script can open one, so parsing must never evaluate script.
+    const document = parseHtmlDocument(
+      '<body onload="document.title = \'handler ran\'"><p id="target">original</p>' +
+        "<script>document.getElementById('target').textContent = 'script ran';</script></body>",
+      "http://127.0.0.1/page"
+    );
+    expect(document.getElementById("target")?.textContent).toBe("original");
+    expect(document.title).not.toBe("handler ran");
   });
 });

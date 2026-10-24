@@ -44,18 +44,6 @@ class WebFetchValidationError extends Error {}
 // status instead of sending it.
 const WEB_FETCH_REFUSED_STATUS = 403;
 const WEB_FETCH_REFUSED_STATUS_TEXT = "Forbidden";
-// A <link> tag that names a preload-type hint anywhere in it. This can strip a
-// few extra <link> tags (for example a link whose href contains the word), which
-// is harmless: <link> tags carry no text, and Readability removes them from the
-// article. LINK_TAG_PATTERN excludes "<" from the tag body so each match attempt
-// stops at the next tag: a single pattern with two [^>]* runs takes quadratic
-// time on 5MB of unclosed "<link" text.
-const LINK_TAG_PATTERN = /<link\b[^<>]*>/gi;
-const PRELOAD_HINT_PATTERN = /\b(?:preload|prefetch|modulepreload)\b/i;
-
-function stripPreloadLinks(html: string): string {
-  return html.replace(LINK_TAG_PATTERN, (tag) => (PRELOAD_HINT_PATTERN.test(tag) ? "" : tag));
-}
 
 /**
  * Remove every `<tagName ...>...</tagName>` block, with the same matches as
@@ -145,9 +133,11 @@ export function parseHtmlDocument(html: string, url: string): Document {
       },
     },
   });
-  // Preload hints only ask for network requests and carry no readable content.
-  // Dropping them is defense in depth behind the interceptor above.
-  window.document.write(stripPreloadLinks(html));
+  // Do not strip preload links from the raw HTML before this write: a regex
+  // cannot tell a tag from text inside a quoted attribute, so it would cut
+  // into the containing tag and drop the page content after it. The
+  // interceptor above already refuses their requests.
+  window.document.write(html);
   // happy-dom's Document is structurally DOM-compatible but uses its own type declarations.
   const document: unknown = window.document;
   return document as Document;
