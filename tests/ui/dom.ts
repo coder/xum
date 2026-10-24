@@ -50,6 +50,9 @@ export function installDom(): () => void {
   globalThis.navigator = domWindow.navigator;
   globalThis.getComputedStyle = domWindow.getComputedStyle.bind(domWindow);
   globalThis.localStorage = domWindow.localStorage;
+  // happy-dom 21 dispatches only its own Event instances, so `new Event()` and
+  // createCustomEvent() must build them from this window.
+  globalThis.Event = domWindow.Event;
   globalThis.CustomEvent = domWindow.CustomEvent;
   (globalThis as unknown as { Element: unknown }).Element = domWindow.Element;
   (globalThis as unknown as { DocumentFragment: unknown }).DocumentFragment =

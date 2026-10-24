@@ -204,6 +204,7 @@ function renderAgentHarness(props: {
 
 describe("AgentContext", () => {
   let originalWindow: typeof globalThis.window;
+  let originalCustomEvent: typeof globalThis.CustomEvent;
   let originalDocument: typeof globalThis.document;
   let originalLocalStorage: typeof globalThis.localStorage;
 
@@ -217,10 +218,14 @@ describe("AgentContext", () => {
     originalDocument = globalThis.document;
     originalLocalStorage = globalThis.localStorage;
 
+    originalCustomEvent = globalThis.CustomEvent;
+
     const dom = new GlobalWindow();
     globalThis.window = dom as unknown as Window & typeof globalThis;
     globalThis.document = dom.document as unknown as Document;
     globalThis.localStorage = dom.localStorage as unknown as Storage;
+    // happy-dom 21 dispatches only its own Event instances; createCustomEvent uses the global.
+    globalThis.CustomEvent = dom.CustomEvent as unknown as typeof CustomEvent;
     window.api = {
       platform: "darwin",
       versions: {},
@@ -240,6 +245,7 @@ describe("AgentContext", () => {
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
     globalThis.localStorage = originalLocalStorage;
+    globalThis.CustomEvent = originalCustomEvent;
   });
 
   test("project-scoped agent falls back to global default when project preference is unset", async () => {

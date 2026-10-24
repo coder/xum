@@ -18,6 +18,7 @@ const DOM_GLOBAL_KEYS = [
   "document",
   "navigator",
   "localStorage",
+  "Event",
   "CustomEvent",
   "DocumentFragment",
   "Element",
