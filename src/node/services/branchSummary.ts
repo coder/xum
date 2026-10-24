@@ -34,8 +34,7 @@ import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { pluginHookContextTexts } from "@/common/utils/messages/pluginHookContext";
-import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
-import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import {
   BRANCH_SUMMARY_MAX_ACCUMULATED_CHARS,
   BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
@@ -954,12 +953,7 @@ export async function runInlineAbandonedBranchSummary(
  * observe the marker (r55).
  */
 export async function startAbandonedBranchSummaryInBackground(
-  input: AbandonedBranchSummaryInput & {
-    guardTailMessageId: string;
-    sessionDir?: string;
-    /** The pending marker's lock (phase 4: SessionLocks). Absent: the Node layer. */
-    locks?: SessionLocks;
-  }
+  input: AbandonedBranchSummaryInput & { guardTailMessageId: string; sessionDir?: string }
 ): Promise<void> {
   const controller = new AbortController();
   // r55: the returned promise resolves only after the cross-process pending
@@ -986,8 +980,7 @@ export async function startAbandonedBranchSummaryInBackground(
     let lock: AsyncDisposable | null = null;
     if (input.sessionDir !== undefined) {
       try {
-        // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
-        lock = await (input.locks ?? nodeSessionLocks).acquireProcessFileLock({
+        lock = await acquireProcessFileLock({
           lockPath: path.join(input.sessionDir, BRANCH_SUMMARY_LOCK_FILENAME),
           timeoutMs: BRANCH_SUMMARY_LOCK_ACQUIRE_TIMEOUT_MS,
           label: "branch summary pending marker",
@@ -1040,9 +1033,7 @@ export async function startAbandonedBranchSummaryInBackground(
  */
 export async function awaitPendingBranchSummary(
   workspaceId: string,
-  sessionDir?: string,
-  /** The pending marker's lock (phase 4: SessionLocks). */
-  locks: SessionLocks = nodeSessionLocks
+  sessionDir?: string
 ): Promise<MuxMessage | null> {
   const entry = pendingBranchSummaries.get(workspaceId);
   if (!entry) {
@@ -1065,7 +1056,7 @@ export async function awaitPendingBranchSummary(
       );
       if (markerExists) {
         try {
-          const lock = await locks.acquireProcessFileLock({
+          const lock = await acquireProcessFileLock({
             lockPath,
             timeoutMs: BRANCH_SUMMARY_LOCK_WAIT_TIMEOUT_MS,
             label: "branch summary pending marker",

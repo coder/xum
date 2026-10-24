@@ -15257,7 +15257,6 @@ export class WorkspaceService
           // Cross-process pending marker home (r48): lets a first send served
           // by another backend wait for the in-flight summary.
           sessionDir: path.join(this.config.sessionsDir, newWorkspaceId),
-          locks: this.historyService.locks,
           abandonedMessages: abandonedBranchMessages,
           isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
           guardTailMessageId: sourceMessageId,
