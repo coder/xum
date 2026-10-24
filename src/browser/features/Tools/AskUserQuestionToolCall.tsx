@@ -1,6 +1,5 @@
 import assert from "@/common/utils/assert";
 
-import { AlertTriangle, Check } from "lucide-react";
 import {
   type RefObject,
   useCallback,
@@ -18,16 +17,29 @@ import {
   useNonBlockingQuestionAnswers,
 } from "@/browser/features/Tools/AskUserQuestion/useNonBlockingQuestionAnswers";
 import { useAskUserQuestionPlacement } from "@/browser/features/Tools/AskUserQuestion/askUserQuestionPlacement";
+import {
+  ASK_USER_QUESTION_HINTS,
+  AskUserQuestionForm,
+  AskUserQuestionHeader,
+} from "@/browser/features/Tools/AskUserQuestion/AskUserQuestionForm";
+import {
+  applyDraftEdit,
+  buildAnswerSelections,
+  buildAnswersRecord,
+  createInitialDrafts,
+  deleteCachedDraftState,
+  type DraftAnswer,
+  type DraftAnswers,
+  getCachedDraftState,
+  getDescriptionsForLabels,
+  getDraftStateKey,
+  setCachedDraftState,
+} from "@/browser/features/Tools/AskUserQuestion/askUserQuestionDrafts";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
-import { useAutoResizeTextarea } from "@/browser/hooks/useAutoResizeTextarea";
-import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
-import { cn } from "@/common/lib/utils";
-import { Button } from "@/browser/components/Button/Button";
 import {
   ErrorBox,
-  ExpandIcon,
   StatusIndicator,
   ToolContainer,
   ToolDetails,
@@ -48,38 +60,11 @@ import type {
   ToolErrorResult,
 } from "@/common/types/tools";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
-import {
-  type AskUserQuestionSelection,
-  isAsyncAskUserQuestionOutput,
-} from "@/common/utils/tools/askUserQuestionSummary";
+import { isAsyncAskUserQuestionOutput } from "@/common/utils/tools/askUserQuestionSummary";
 import { getErrorMessage } from "@/common/utils/errors";
 import { useHostTranscriptMutationCheck } from "@/browser/utils/transcriptBarrier";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
-
-const OTHER_VALUE = "__other__";
-
-interface DraftAnswer {
-  selected: string[];
-  otherText: string;
-}
-
-interface CachedState {
-  draftAnswers: Record<string, DraftAnswer>;
-  activeIndex: number;
-}
-
-// Cache draft state per question row so it survives workspace switches. Keyed by workspace and
-// row, not by tool call id alone: forks copy rows, and providers may reuse a tool call id.
-const draftStateCache = new Map<string, CachedState>();
-
-function getDraftStateKey(props: {
-  workspaceId?: string;
-  rowId?: string;
-  toolCallId: string;
-}): string {
-  return JSON.stringify([props.workspaceId ?? null, props.rowId ?? null, props.toolCallId]);
-}
 
 function unwrapJsonContainer(value: unknown): unknown {
   if (!value || typeof value !== "object") {
@@ -126,160 +111,6 @@ function isToolErrorResult(val: unknown): val is ToolErrorResult {
   return record.success === false && typeof record.error === "string";
 }
 
-function parsePrefilledAnswer(question: AskUserQuestionQuestion, answer: string): DraftAnswer {
-  const trimmed = answer.trim();
-  if (trimmed.length === 0) {
-    return { selected: [], otherText: "" };
-  }
-
-  const optionLabels = new Set(question.options.map((o) => o.label));
-
-  if (!question.multiSelect) {
-    if (optionLabels.has(trimmed)) {
-      return { selected: [trimmed], otherText: "" };
-    }
-
-    return { selected: [OTHER_VALUE], otherText: trimmed };
-  }
-
-  const tokens = trimmed
-    .split(",")
-    .map((t) => t.trim())
-    .filter((t) => t.length > 0);
-
-  const selected: string[] = [];
-  const otherParts: string[] = [];
-
-  for (const token of tokens) {
-    if (optionLabels.has(token)) {
-      selected.push(token);
-    } else {
-      otherParts.push(token);
-    }
-  }
-
-  if (otherParts.length > 0) {
-    selected.push(OTHER_VALUE);
-  }
-
-  return { selected, otherText: otherParts.join(", ") };
-}
-
-/**
- * The card's picks as 1-based option numbers plus the user's own text. A non-blocking answer is
- * built from these, never from the flattened answer string, where a label plus Other text can
- * read like another label.
- */
-function buildAnswerSelections(
-  questions: readonly AskUserQuestionQuestion[],
-  draftAnswers: Record<string, DraftAnswer>
-): AskUserQuestionSelection[] {
-  return questions.map((q) => {
-    const draft = draftAnswers[q.question];
-    if (!draft || !isQuestionAnswered(q, draft)) {
-      return { optionNumbers: [], otherText: "" };
-    }
-    return {
-      optionNumbers: draft.selected
-        .map((label) => q.options.findIndex((option) => option.label === label) + 1)
-        .filter((optionNumber) => optionNumber > 0),
-      otherText: draft.selected.includes(OTHER_VALUE) ? draft.otherText : "",
-    };
-  });
-}
-
-function isQuestionAnswered(_question: AskUserQuestionQuestion, draft: DraftAnswer): boolean {
-  if (draft.selected.length === 0) {
-    return false;
-  }
-
-  if (draft.selected.includes(OTHER_VALUE)) {
-    return draft.otherText.trim().length > 0;
-  }
-
-  return true;
-}
-
-function draftToAnswerString(question: AskUserQuestionQuestion, draft: DraftAnswer): string {
-  assert(isQuestionAnswered(question, draft), "draftToAnswerString requires a complete answer");
-
-  const parts: string[] = [];
-  for (const label of draft.selected) {
-    if (label === OTHER_VALUE) {
-      parts.push(draft.otherText.trim());
-    } else {
-      parts.push(label);
-    }
-  }
-
-  if (!question.multiSelect) {
-    assert(parts.length === 1, "Single-select questions must have exactly one answer");
-    return parts[0];
-  }
-
-  return parts.join(", ");
-}
-
-/**
- * Get descriptions for selected answer labels from a question's options.
- * Filters out "Other" and labels not found in options.
- */
-function getDescriptionsForLabels(question: AskUserQuestionQuestion, labels: string[]): string[] {
-  return labels
-    .filter((label) => label !== OTHER_VALUE)
-    .map((label) => question.options.find((o) => o.label === label)?.description)
-    .filter((d): d is string => d !== undefined);
-}
-
-/** A question (or Summary) tab: the active tab, a finished one, or one still to do. */
-function getQuestionTabClassName(active: boolean, done: boolean): string {
-  return cn(
-    "inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors",
-    active
-      ? "border-accent bg-accent text-accent-foreground shadow-sm"
-      : done
-        ? "border-success/40 bg-success/10 text-success-text hover:bg-success/20"
-        : "border-white/10 bg-white/5 text-secondary hover:border-white/20 hover:text-foreground"
-  );
-}
-
-/** Auto-resizing textarea for "Other" text input. */
-function AutoResizeTextarea(props: {
-  value: string;
-  onChange: (value: string) => void;
-  onSubmit: () => void;
-  placeholder?: string;
-}): JSX.Element {
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
-  useAutoResizeTextarea(textareaRef, props.value, 30);
-
-  return (
-    <textarea
-      ref={textareaRef}
-      // Keep the empty natural height at one line (textareas default to rows=2) so
-      // useAutoResizeTextarea can leave empty drafts to CSS sizing without measuring.
-      rows={1}
-      placeholder={props.placeholder}
-      value={props.value}
-      onChange={(e) => props.onChange(e.target.value)}
-      onKeyDown={(e) => {
-        // Submit on Enter without shift (shift+Enter for newline)
-        if (e.key === "Enter" && !e.shiftKey && props.value.trim().length > 0) {
-          e.preventDefault();
-          props.onSubmit();
-        }
-      }}
-      className={cn(
-        "border border-white/10 bg-code-bg text-foreground placeholder:text-muted",
-        "w-full rounded-md px-3 py-2 text-sm",
-        "transition-colors hover:border-white/20",
-        "focus-visible:border-accent focus-visible:ring-1 focus-visible:ring-accent/50 focus-visible:outline-none",
-        "resize-none min-h-[2.5rem] max-h-[30vh] overflow-y-auto"
-      )}
-    />
-  );
-}
-
 /**
  * A finished question: the submitted answers, one row per question with the picked options'
  * descriptions, or a note when a non-blocking question closed unanswered.
@@ -324,18 +155,6 @@ function AnsweredQuestions(props: {
     </div>
   );
 }
-
-/** Copy that differs between blocking (Plan) and non-blocking (Exec) questions. */
-const ANSWERING_HINTS = {
-  blocking: {
-    header: "Answer below, or type a message in chat to cancel.",
-    footer: "Tip: type a message in chat to cancel these questions.",
-  },
-  nonBlocking: {
-    header: "The agent keeps working; your answers reach it after its current step.",
-    footer: "Your answers are sent to the agent as a message.",
-  },
-} as const;
 
 /**
  * A docked card stays mounted after its questions close until nothing is left to finish: no
@@ -420,11 +239,10 @@ export function AskUserQuestionToolCall(
     docked?: boolean;
   }
 ): JSX.Element | null {
-  const argsAnswers = props.args.answers ?? {};
   const draftStateKey = getDraftStateKey(props);
 
   // Restore from cache if available (survives workspace switches)
-  const cachedState = draftStateCache.get(draftStateKey);
+  const cachedState = getCachedDraftState(draftStateKey);
 
   const [activeIndex, setActiveIndex] = useState(() => cachedState?.activeIndex ?? 0);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -466,7 +284,9 @@ export function AskUserQuestionToolCall(
     transcript: workspaceState?.messages,
   });
   const isAnswering = props.status === "executing" || nonBlocking.isOpen;
-  const answeringHints = isAsyncQuestion ? ANSWERING_HINTS.nonBlocking : ANSWERING_HINTS.blocking;
+  const answeringHints = isAsyncQuestion
+    ? ASK_USER_QUESTION_HINTS.nonBlocking
+    : ASK_USER_QUESTION_HINTS.blocking;
 
   // A question awaiting answers must never be hidden behind a collapsed "tools"
   // preference, so force it open while answerable. forceExpanded only overrides the
@@ -474,7 +294,6 @@ export function AskUserQuestionToolCall(
   const { expanded, toggleExpanded } = useToolExpansion(false, {
     forceExpanded: isAnswering,
   });
-  const statusDisplay = getStatusDisplay(props.status);
 
   const autoRetryRollbackWorkspaceIdRef = useRef<string | null>(null);
   const autoRetryRollbackPendingRef = useRef(false);
@@ -595,30 +414,17 @@ export function AskUserQuestionToolCall(
     workspaceState,
   });
 
-  const [draftAnswers, setDraftAnswers] = useState<Record<string, DraftAnswer>>(() => {
-    if (cachedState) {
-      return cachedState.draftAnswers;
-    }
-
-    const initial: Record<string, DraftAnswer> = {};
-    for (const q of props.args.questions) {
-      const prefilled = argsAnswers[q.question];
-      if (typeof prefilled === "string") {
-        initial[q.question] = parsePrefilledAnswer(q, prefilled);
-      } else {
-        initial[q.question] = { selected: [], otherText: "" };
-      }
-    }
-    return initial;
-  });
+  const [draftAnswers, setDraftAnswers] = useState<DraftAnswers>(
+    () => cachedState?.draftAnswers ?? createInitialDrafts(props.args.questions, props.args.answers)
+  );
 
   // Sync draft state to cache so it survives workspace switches
   useEffect(() => {
     if (isAnswering) {
-      draftStateCache.set(draftStateKey, { draftAnswers, activeIndex });
+      setCachedDraftState(draftStateKey, { draftAnswers, activeIndex });
     } else {
       // Clean up cache once the questions are answered (or the tool failed)
-      draftStateCache.delete(draftStateKey);
+      deleteCachedDraftState(draftStateKey);
     }
   }, [draftStateKey, isAnswering, draftAnswers, activeIndex]);
 
@@ -641,37 +447,6 @@ export function AskUserQuestionToolCall(
   const errorResult =
     resultUnwrapped && isToolErrorResult(resultUnwrapped) ? resultUnwrapped : null;
 
-  const isComplete = useMemo(() => {
-    return props.args.questions.every((q) => {
-      const draft = draftAnswers[q.question];
-      return draft ? isQuestionAnswered(q, draft) : false;
-    });
-  }, [draftAnswers, props.args.questions]);
-
-  const submitButtonRef = useRef<HTMLButtonElement>(null);
-
-  const summaryIndex = props.args.questions.length;
-  const isOnSummary = activeIndex === summaryIndex;
-
-  // Focus submit button when reaching summary so Enter submits
-  useEffect(() => {
-    if (isAnswering && isOnSummary) {
-      submitButtonRef.current?.focus();
-    }
-  }, [isOnSummary, isAnswering]);
-
-  const currentQuestion = isOnSummary
-    ? null
-    : props.args.questions[Math.min(activeIndex, props.args.questions.length - 1)];
-  const currentDraft = currentQuestion ? draftAnswers[currentQuestion.question] : undefined;
-
-  const unansweredCount = useMemo(() => {
-    return props.args.questions.filter((q) => {
-      const draft = draftAnswers[q.question];
-      return !draft || !isQuestionAnswered(q, draft);
-    }).length;
-  }, [draftAnswers, props.args.questions]);
-
   const handleSubmit = (): void => {
     setIsSubmitting(true);
     setSubmitError(null);
@@ -680,16 +455,7 @@ export function AskUserQuestionToolCall(
     let workspaceId: string;
 
     try {
-      answers = {};
-      for (const q of props.args.questions) {
-        const draft = draftAnswers[q.question];
-        if (draft && isQuestionAnswered(q, draft)) {
-          answers[q.question] = draftToAnswerString(q, draft);
-        } else {
-          // Unanswered questions get empty string
-          answers[q.question] = "";
-        }
-      }
+      answers = buildAnswersRecord(props.args.questions, draftAnswers);
 
       assert(liveApi, "API not connected");
       assert(props.workspaceId, "workspaceId is required");
@@ -805,10 +571,6 @@ export function AskUserQuestionToolCall(
         setIsSubmitting(false);
       });
   };
-  const title = "ask_user_question";
-  const totalCount = props.args.questions.length;
-  const answeredCount = totalCount - unansweredCount;
-
   // The dock only holds questions that take answers; the transcript row shows the outcome. The
   // dock keeps a closed card mounted (rendering nothing) so the auto-retry rollback above still
   // sees the resumed stream settle, as the transcript card did when it owned the form.
@@ -816,269 +578,40 @@ export function AskUserQuestionToolCall(
     return null;
   }
 
+  const changeDraft = (
+    _groupKey: string,
+    question: string,
+    update: (draft: DraftAnswer) => DraftAnswer
+  ) => {
+    setDraftAnswers((prev) => applyDraftEdit(prev, question, update));
+  };
+
   return (
     <ToolContainer expanded={expanded}>
-      <ToolHeader onClick={toggleExpanded}>
-        <ExpandIcon expanded={expanded}>▶</ExpandIcon>
-        <ToolIcon toolName="ask_user_question" />
-        <div className="flex min-w-0 flex-1 flex-col">
-          <ToolName>{title}</ToolName>
-          {isAnswering && (
-            <div className="text-secondary text-[10px] leading-tight">{answeringHints.header}</div>
-          )}
-        </div>
-        <StatusIndicator status={props.status}>{statusDisplay}</StatusIndicator>
-      </ToolHeader>
+      <AskUserQuestionHeader
+        expanded={expanded}
+        onToggle={toggleExpanded}
+        hint={isAnswering ? answeringHints.header : null}
+        status={props.status}
+      />
 
       {expanded && (
         <ToolDetails>
           <div className="flex flex-col gap-3">
-            {isAnswering && (
-              <div className="flex flex-col gap-3">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {props.args.questions.map((q, idx) => {
-                    const draft = draftAnswers[q.question];
-                    const answered = draft ? isQuestionAnswered(q, draft) : false;
-                    const isActive = idx === activeIndex;
-                    return (
-                      <button
-                        key={q.question}
-                        type="button"
-                        className={getQuestionTabClassName(isActive, answered)}
-                        onClick={() => setActiveIndex(idx)}
-                      >
-                        {q.header}
-                        {answered && !isActive && <Check aria-hidden="true" className="h-3 w-3" />}
-                      </button>
-                    );
-                  })}
-                  <button
-                    type="button"
-                    className={getQuestionTabClassName(isOnSummary, isComplete)}
-                    onClick={() => setActiveIndex(summaryIndex)}
-                  >
-                    Summary
-                    {isComplete && !isOnSummary && <Check aria-hidden="true" className="h-3 w-3" />}
-                  </button>
-                  {totalCount > 0 && (
-                    <span className="text-muted counter-nums ml-auto text-[10px]">
-                      {answeredCount}/{totalCount} answered
-                    </span>
-                  )}
-                </div>
-
-                {!isOnSummary && currentQuestion && currentDraft && (
-                  <>
-                    <div className="flex flex-col gap-0.5">
-                      <div className="text-foreground text-sm leading-snug font-medium">
-                        {currentQuestion.question}
-                      </div>
-                      <div className="text-secondary text-[10px] tracking-wide uppercase">
-                        {currentQuestion.multiSelect ? "Select one or more" : "Select one"}
-                      </div>
-                    </div>
-
-                    <div className="-mx-2 flex flex-col gap-0.5">
-                      {/* Render option checkboxes */}
-                      {[
-                        ...currentQuestion.options.map((opt) => ({
-                          label: opt.label,
-                          displayLabel: opt.label,
-                          description: opt.description,
-                        })),
-                        {
-                          label: OTHER_VALUE,
-                          displayLabel: "Other",
-                          description: "Provide a custom answer.",
-                        },
-                      ].map((opt) => {
-                        const checked = currentDraft.selected.includes(opt.label);
-
-                        const toggle = () => {
-                          const isSelecting = !checked;
-
-                          setDraftAnswers((prev) => {
-                            const draft = prev[currentQuestion.question] ?? {
-                              selected: [],
-                              otherText: "",
-                            };
-
-                            if (currentQuestion.multiSelect) {
-                              // Multi-select: toggle this option
-                              const selected = new Set(draft.selected);
-                              if (selected.has(opt.label)) {
-                                selected.delete(opt.label);
-                              } else {
-                                selected.add(opt.label);
-                              }
-                              return {
-                                ...prev,
-                                [currentQuestion.question]: {
-                                  ...draft,
-                                  selected: Array.from(selected),
-                                },
-                              };
-                            } else {
-                              // Single-select: replace selection (clear otherText if not Other)
-                              return {
-                                ...prev,
-                                [currentQuestion.question]: {
-                                  selected: checked ? [] : [opt.label],
-                                  otherText: opt.label === OTHER_VALUE ? draft.otherText : "",
-                                },
-                              };
-                            }
-                          });
-
-                          // For single-select questions, auto-advance *only* when the user selects
-                          // a non-Other option (avoid useEffect auto-advance that breaks back-nav).
-                          if (
-                            !currentQuestion.multiSelect &&
-                            isSelecting &&
-                            opt.label !== OTHER_VALUE
-                          ) {
-                            setActiveIndex((idx) => idx + 1);
-                          }
-                        };
-
-                        return (
-                          <div
-                            key={opt.label}
-                            role="button"
-                            tabIndex={0}
-                            className={cn(
-                              "flex cursor-pointer items-start gap-2.5 rounded px-2 py-1.5 transition-colors select-none",
-                              checked ? "bg-accent/10 hover:bg-accent/15" : "hover:bg-white/5"
-                            )}
-                            onClick={toggle}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" || e.key === " ") {
-                                e.preventDefault();
-                                toggle();
-                              }
-                            }}
-                          >
-                            <Checkbox
-                              checked={checked}
-                              onCheckedChange={toggle}
-                              onClick={(e) => e.stopPropagation()}
-                              className="mt-0.5"
-                            />
-                            <div className="flex min-w-0 flex-col">
-                              <div
-                                className={cn(
-                                  "text-sm leading-snug",
-                                  checked ? "text-foreground font-medium" : "text-foreground"
-                                )}
-                              >
-                                {opt.displayLabel}
-                              </div>
-                              <div className="text-muted-foreground text-[11px] leading-snug">
-                                {opt.description}
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
-
-                      {currentDraft.selected.includes(OTHER_VALUE) && (
-                        <div className="mt-1.5 px-2">
-                          <AutoResizeTextarea
-                            placeholder="Type your answer"
-                            value={currentDraft.otherText}
-                            onChange={(value) => {
-                              setDraftAnswers((prev) => ({
-                                ...prev,
-                                [currentQuestion.question]: {
-                                  ...(prev[currentQuestion.question] ?? {
-                                    selected: [],
-                                    otherText: "",
-                                  }),
-                                  otherText: value,
-                                },
-                              }));
-                            }}
-                            onSubmit={() => setActiveIndex(activeIndex + 1)}
-                          />
-                        </div>
-                      )}
-                    </div>
-                  </>
-                )}
-
-                {isOnSummary && (
-                  <div className="flex flex-col gap-2">
-                    <div className="text-foreground text-sm font-medium">Review your answers</div>
-                    {unansweredCount > 0 && (
-                      <div className="border-warning/30 bg-warning/10 text-warning flex items-center gap-1.5 rounded border px-2 py-1 text-[11px]">
-                        <AlertTriangle aria-hidden="true" className="h-3 w-3 shrink-0" />
-                        <span>
-                          {unansweredCount} question{unansweredCount > 1 ? "s" : ""} not answered
-                        </span>
-                      </div>
-                    )}
-                    <div className="flex flex-col gap-1">
-                      {props.args.questions.map((q, idx) => {
-                        const draft = draftAnswers[q.question];
-                        const answered = draft ? isQuestionAnswered(q, draft) : false;
-                        const answerText = answered ? draftToAnswerString(q, draft) : null;
-                        const descriptions = answered
-                          ? getDescriptionsForLabels(q, draft.selected)
-                          : [];
-                        return (
-                          <div
-                            key={q.question}
-                            role="button"
-                            tabIndex={0}
-                            className="bg-code-bg flex cursor-pointer items-start gap-2 rounded border border-white/5 px-2.5 py-1.5 transition-colors hover:border-white/15 hover:bg-white/5"
-                            onClick={() => setActiveIndex(idx)}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" || e.key === " ") {
-                                e.preventDefault();
-                                setActiveIndex(idx);
-                              }
-                            }}
-                          >
-                            {answered ? (
-                              <Check
-                                aria-hidden="true"
-                                className="text-success-text mt-0.5 h-3 w-3 shrink-0"
-                              />
-                            ) : (
-                              <AlertTriangle
-                                aria-hidden="true"
-                                className="text-warning mt-0.5 h-3 w-3 shrink-0"
-                              />
-                            )}
-                            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                              <div className="text-secondary text-[10px] tracking-wide uppercase">
-                                {q.header}
-                              </div>
-                              <div className="text-sm leading-snug">
-                                {answered ? (
-                                  <span className="text-foreground">{answerText}</span>
-                                ) : (
-                                  <span className="text-muted italic">Not answered</span>
-                                )}
-                              </div>
-                              {descriptions.length > 0 && (
-                                <div className="text-muted-foreground text-[11px] italic">
-                                  {descriptions.join("; ")}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-
-                {submitError && <ErrorBox>{submitError}</ErrorBox>}
-              </div>
-            )}
-
-            {!isAnswering && (
+            {isAnswering ? (
+              <AskUserQuestionForm
+                groups={[
+                  { key: "questions", questions: props.args.questions, drafts: draftAnswers },
+                ]}
+                activeIndex={activeIndex}
+                onActivate={setActiveIndex}
+                onDraftChange={changeDraft}
+                onSubmit={handleSubmit}
+                isSubmitting={isSubmitting}
+                submitError={submitError}
+                footerHint={answeringHints.footer}
+              />
+            ) : (
               <div className="flex flex-col gap-2">
                 <AnsweredQuestions
                   result={successResult}
@@ -1086,32 +619,6 @@ export function AskUserQuestionToolCall(
                 />
 
                 {errorResult && <ErrorBox>{errorResult.error}</ErrorBox>}
-              </div>
-            )}
-
-            {isAnswering && (
-              <div className="flex items-center justify-between gap-3 border-t border-white/5 pt-2">
-                <div className="text-muted min-w-0 flex-1 text-[10px] italic">
-                  {answeringHints.footer}
-                </div>
-                {isOnSummary ? (
-                  <Button
-                    ref={submitButtonRef}
-                    disabled={isSubmitting}
-                    onClick={handleSubmit}
-                    size="sm"
-                  >
-                    {isSubmitting ? "Submitting…" : "Submit answers"}
-                  </Button>
-                ) : (
-                  <Button
-                    onClick={() => setActiveIndex(activeIndex + 1)}
-                    size="sm"
-                    variant="outline"
-                  >
-                    Next
-                  </Button>
-                )}
               </div>
             )}
           </div>

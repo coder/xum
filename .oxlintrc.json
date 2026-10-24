@@ -1282,7 +1282,10 @@
               "@/node/services/workspaceUseLeases"
             ],
             "allow": {
-              "src/node/services/agentSession.ts": ["@/node/runtime/runtimeHelpers"],
+              "src/node/services/agentSession.ts": [
+                "@/node/runtime/runtimeHelpers",
+                "@/node/services/workspaceUseLeases"
+              ],
               "src/node/services/aiService.ts": [
                 "@/node/runtime/multiProjectRuntime",
                 "@/node/runtime/runtimeFactory",

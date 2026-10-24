@@ -6054,7 +6054,12 @@ export class WorkspaceService
     try {
       const runtime = createRuntimeForWorkspace(metadata);
       const owner = { ...metadata, id: workspaceId };
-      const legacyPath = await findImportableLegacyPlanPath(this.config, runtime, owner);
+      const legacyPath = await findImportableLegacyPlanPath(
+        this.config,
+        runtime,
+        owner,
+        this.historyService.locks
+      );
       return Ok(legacyPath === undefined ? null : await runtime.resolvePath(legacyPath));
     } catch (error) {
       return Err(`Failed to check for a plan from an older Xum: ${getErrorMessage(error)}`);
@@ -6079,10 +6084,12 @@ export class WorkspaceService
     }
     try {
       const runtime = createRuntimeForWorkspace(metadata);
-      const result = await importLegacyRemotePlan(this.config, runtime, {
-        ...metadata,
-        id: workspaceId,
-      });
+      const result = await importLegacyRemotePlan(
+        this.config,
+        runtime,
+        { ...metadata, id: workspaceId },
+        this.historyService.locks
+      );
       return Ok({ status: result.status, planPath: await runtime.resolvePath(result.planPath) });
     } catch (error) {
       return Err(`Failed to import the plan: ${getErrorMessage(error)}`);
@@ -9015,7 +9022,7 @@ export class WorkspaceService
       });
     }
     try {
-      await markRemotePlanMigratedForDeletion(this.config, owner);
+      await markRemotePlanMigratedForDeletion(this.config, owner, this.historyService.locks);
     } catch (error) {
       log.warn("Failed to mark the plan of a removed workspace migrated", {
         workspaceId,
@@ -10607,10 +10614,12 @@ export class WorkspaceService
         // A row whose only legacy plan is the shared basename file stays unmigrated until the
         // user imports it (Option B). That file is named after the workspace, so after a rename
         // the offer would look at another path and the plan would be orphaned: refuse instead.
-        const importable = await findImportableLegacyPlanPath(this.config, runtimeForPlanFile, {
-          ...oldMetadata,
-          id: workspaceId,
-        });
+        const importable = await findImportableLegacyPlanPath(
+          this.config,
+          runtimeForPlanFile,
+          { ...oldMetadata, id: workspaceId },
+          this.historyService.locks
+        );
         if (importable !== undefined) {
           const shownPath = await runtimeForPlanFile.resolvePath(importable);
           await revertMove();
@@ -18768,7 +18777,7 @@ export class WorkspaceService
       await resolvePlanFilePath(this.config, runtime, owner);
       if (options.markMigrated === true) {
         try {
-          await markRemotePlanMigratedForDeletion(this.config, owner);
+          await markRemotePlanMigratedForDeletion(this.config, owner, this.historyService.locks);
         } catch (error) {
           return Err({
             type: "delete_failed",
@@ -18797,7 +18806,7 @@ export class WorkspaceService
     >,
     runtime: Runtime
   ): Promise<PlanFileLocation> {
-    return resolvePlanFileLocation(this.config, runtime, metadata);
+    return resolvePlanFileLocation(this.config, runtime, metadata, this.historyService.locks);
   }
 
   /**
