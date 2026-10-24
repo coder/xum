@@ -3157,10 +3157,13 @@ export class AgentPluginInstallService {
     const skills: CollectedPluginSkill[] = [];
     // Includes symlinked skill dirs, matching runtime discovery: a symlinked
     // skill activates after install, so it MUST appear in the consent preview.
-    for (const { name: dirName, dir: skillDir, file: skillPath } of await listPluginSkillFolders(
-      skillsRoot
-    )) {
-      const label = skillReviewLabel(pluginRoot, skillsRoot, dirName);
+    for (const {
+      name: skillName,
+      folder,
+      dir: skillDir,
+      file: skillPath,
+    } of await listPluginSkillFolders(skillsRoot)) {
+      const label = skillReviewLabel(pluginRoot, skillsRoot, folder);
       // Spec §4.1 containment anchored at the plugin root, mirroring runtime
       // component checks: a symlink escaping the plugin is surfaced as a
       // warning instead of silently ignored.
@@ -3194,8 +3197,8 @@ export class AgentPluginInstallService {
       // preview (and the update capability surface built from it) would
       // promise a skill that disappears after installation — or classify a
       // never-loading skill as a capability addition.
-      const dirNameParsed = SkillNameSchema.safeParse(dirName);
-      if (!dirNameParsed.success) {
+      const skillNameParsed = SkillNameSchema.safeParse(skillName);
+      if (!skillNameParsed.success) {
         warnings.push(`${label}: invalid skill directory name; it will not load`);
         continue;
       }
@@ -3212,18 +3215,18 @@ export class AgentPluginInstallService {
         // A Claude command becomes SKILL.md text first, so its review, fingerprint and approved
         // copy are a skill's (the copy is that text, which the runtime check parses as is).
         const content = pluginSkillMarkdown(
-          dirName,
+          skillName,
           await fsPromises.readFile(containedSkillPath, "utf8"),
           skillsRoot.command
         );
         const parsed = parseSkillMarkdown({
           content,
           byteSize: stat.size,
-          directoryName: dirNameParsed.data,
+          directoryName: skillNameParsed.data,
           // Mirror runtime discovery: a display name loads under the dir name.
           allowDisplayName: true,
         });
-        warnings.push(...displayNameWarnings(label, dirName, parsed.displayName));
+        warnings.push(...displayNameWarnings(label, skillName, parsed.displayName));
         const relativeDir = path.relative(pluginRoot, skillDir);
         skills.push({
           name: parsed.frontmatter.name,

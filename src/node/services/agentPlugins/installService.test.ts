@@ -45,7 +45,10 @@ import {
 } from "./mcpConfig";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { skillConsentFingerprint } from "./componentConsent";
-import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import {
+  discoverAgentSkills,
+  readAgentSkill,
+} from "@/node/services/agentSkills/agentSkillsService";
 import {
   assertStoredPluginWorkflowReviewed,
   resolveWorkflowScript,
@@ -56,6 +59,7 @@ import {
   WorkflowService,
 } from "@/node/services/workflows/WorkflowService";
 import { WorkflowScriptDescriptorSchema } from "@/common/orpc/schemas/workflow";
+import { SkillNameSchema } from "@/common/orpc/schemas/agentSkill";
 import type { WorkflowScriptDescriptor } from "@/common/types/workflow";
 import { writeGlobalSkill } from "@/node/services/tools/testHelpers";
 import { z } from "zod";
@@ -3291,6 +3295,41 @@ describe("AgentPluginInstallService", () => {
       expect(listed !== "blocked" && listed[0].interface?.logoDataUrl).toBeUndefined();
     }
   );
+
+  test("a snake_case skill folder is previewed, installed and read under its kebab-case name", async () => {
+    // google/elephant-goldfish-model: skills/egm_bootstrap/SKILL.md has `name: egm-bootstrap`.
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "egm_bootstrap"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "egm_bootstrap", "SKILL.md"),
+      "---\nname: egm-bootstrap\ndescription: Bootstrap\n---\n\nBody.\n"
+    );
+    await commitAll(remoteDir, "adds a snake_case skill folder");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.skills.map((skill) => skill.name).sort()).toEqual(["egm-bootstrap", "greet"]);
+    expect(preview.warnings).toEqual([]);
+
+    // The consent recorded for the folder covers the kebab-case name (#6498).
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const runtime = new LocalRuntime(muxRoot);
+    const options = {
+      roots: {
+        projectRoot: "",
+        globalRoot: path.join(muxRoot, "skills"),
+        universalRoot: "",
+        globalPluginRoots: [pluginsDir()],
+      },
+    };
+    const { skills } = await discoverAgentSkills(runtime, muxRoot, options);
+    expect(skills.some((skill) => skill.name === "egm-bootstrap")).toBe(true);
+    const read = await readAgentSkill(
+      runtime,
+      muxRoot,
+      SkillNameSchema.parse("egm-bootstrap"),
+      options
+    );
+    expect(path.basename(read.skillDir)).toBe("egm_bootstrap");
+  });
 
   test("preview lists a display-name skill under its directory name like runtime discovery", async () => {
     // pstack ships `name: Poteto Mode` in skills/poteto-mode: runtime discovery
