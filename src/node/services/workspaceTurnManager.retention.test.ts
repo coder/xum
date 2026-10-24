@@ -13,10 +13,15 @@ import {
   stubStableIds,
 } from "@/node/services/taskService.testHarness";
 
-/** Full GCs until the target is collected; a few rounds absorb stale conservative stack slots. */
+/**
+ * Full GCs until the target is collected; a few rounds absorb stale conservative stack slots.
+ * Under coverage in CI's shared unit lane, Bun needed up to 30 full GCs before the records were
+ * collected, so 20 failed now and then (#7401, probe run 40097463511): hence the bound of 100.
+ * After 20 rounds each round also waits 5 ms, so timers get a turn between collections too.
+ */
 async function collected(ref: WeakRef<object>): Promise<boolean> {
-  for (let round = 0; round < 20 && ref.deref() !== undefined; round++) {
-    await Bun.sleep(0);
+  for (let round = 0; round < 100 && ref.deref() !== undefined; round++) {
+    await Bun.sleep(round < 20 ? 0 : 5);
     Bun.gc(true);
   }
   return ref.deref() === undefined;
@@ -83,5 +88,6 @@ describe("WorkspaceTurnManager.createWorkspaceTurn retention", () => {
     } finally {
       listSpy.mockRestore();
     }
-  });
+    // One full GC takes about 55 ms under coverage in CI, so 100 rounds need about 6 s.
+  }, 20_000);
 });
