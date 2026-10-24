@@ -17,7 +17,7 @@ import {
 import { stripMessageCacheControl, type ContinuousPrefixSwap } from "./continuousCompactionJournal";
 import type { PrefixSwapInvalidatedEvent } from "@/common/types/stream";
 import * as path from "path";
-import { Duration, Effect, Exit, Fiber, Scope } from "effect";
+import { Effect, Exit, type Fiber, Scope } from "effect";
 import { PlatformPaths } from "@/common/utils/paths";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import {
@@ -148,6 +148,11 @@ import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import { hostClockFor } from "./di/hostClockLive";
+import {
+  PartialJournal,
+  type PartialJournalState,
+  type PartialTarget,
+} from "@/node/services/turnEngine/PartialJournal";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { shellQuote } from "@/common/utils/shell";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
@@ -976,7 +981,7 @@ type DynamicToolCompletedMessagePart = Extract<CompletedMessagePart, { type: "dy
 type WorkflowRunToolAttachment = NonNullable<DynamicToolCompletedMessagePart["workflowRun"]>;
 
 // Comprehensive stream info
-interface WorkspaceStreamInfo {
+interface WorkspaceStreamInfo extends PartialJournalState {
   state: StreamState;
   streamResult: Awaited<ReturnType<typeof streamText>>;
   unlinkAbortSignal?: () => void;
@@ -1079,28 +1084,12 @@ interface WorkspaceStreamInfo {
   // usage was already attributed separately; stream-end backfill must not bill
   // them again under the answering model.
   reasoningBackfillStartIndex?: number;
-  // Track last partial write time for throttling
-  lastPartialWriteTime: number;
-  // Debounce fiber for throttled partial writes (Effect migration Phase 10).
-  // Non-null exactly while a delayed flush is scheduled; interrupted on re-arm,
-  // on explicit flush, and with resourceScope when the stream ends. Effect's
-  // clock registers a plain setTimeout under the hood, so scheduling semantics
-  // match the previous timer.
-  partialWriteFiber?: Fiber.Fiber<void>;
-  // Track in-flight write to serialize writes
-  partialWritePromise?: Promise<void>;
   // Track background processing promise for guaranteed cleanup
   processingPromise: Promise<void>;
   // Latched by the first cancelStreamSafely call (synchronously, before its
   // first await) so concurrent cancellers — a user stop racing shutdown's
   // engine supervisor — join one cleanup: exactly one stream-abort, one settle.
   cancelPromise?: Promise<void>;
-  // Set by the completion path right before it writes the final message to
-  // chat.jsonl and deletes partial.json. From then on no partial may be written for
-  // this stream: a cancel landing between deletePartial and COMPLETED (the
-  // state flips late, see processStreamWithCleanup) would otherwise resurrect
-  // partial.json through its pre-abort flush.
-  partialRetired?: boolean;
   // Supervisor fiber in the app's AppFiberScope (superviseEngine); set only when
   // the manager was constructed with an engine scope.
   engineFiber?: Fiber.Fiber<void>;
@@ -1296,6 +1285,8 @@ export class StreamManager {
   private streamLocks = new Map<WorkspaceId, AsyncMutex>();
   private readonly PARTIAL_WRITE_THROTTLE_MS = 500;
   private readonly historyService: HistoryService;
+  // Owns this manager's partial.json and final-message writes (turnEngine/PartialJournal.ts).
+  private readonly partialJournal: PartialJournal;
   private mcpServerManager?: MCPServerManager;
   private readonly sessionUsageService?: SessionUsageService;
   private readonly getProvidersConfig: () => ProvidersConfigMap | null;
@@ -1356,6 +1347,12 @@ export class StreamManager {
     this.eventSink = eventSink;
     this.effectRunner = runner;
     this.hostClock = options.hostClock ?? hostClockFor(runner);
+    this.partialJournal = new PartialJournal({
+      historyService,
+      runner,
+      clock: this.hostClock,
+      throttleMs: this.PARTIAL_WRITE_THROTTLE_MS,
+    });
     this.engineScope = engineScope;
     this.tokenTracker = options.tokenTracker ?? new StreamingTokenTracker();
     this.streamTextOverride = options.streamText;
@@ -1661,122 +1658,32 @@ export class StreamManager {
     }
   }
 
-  /**
-   * Write the current partial message to disk (throttled by mtime)
-   * Ensures writes happen during rapid streaming (crash-resilient)
-   */
+  private partialTarget(workspaceId: WorkspaceId, streamInfo: WorkspaceStreamInfo): PartialTarget {
+    return {
+      workspaceId: workspaceId as string,
+      state: streamInfo,
+      snapshot: () => this.buildPartialAssistantMessage(streamInfo),
+    };
+  }
+
+  /** Throttled partial write (PartialJournal.schedule). */
   private async schedulePartialWrite(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo
   ): Promise<void> {
-    const now = this.hostClock.nowMs();
-    const timeSinceLastWrite = now - streamInfo.lastPartialWriteTime;
-
-    // If enough time has passed, write immediately
-    if (timeSinceLastWrite >= this.PARTIAL_WRITE_THROTTLE_MS) {
-      await this.flushPartialWrite(workspaceId, streamInfo);
-      return;
-    }
-
-    // Otherwise, schedule a delayed flush (fire-and-forget for scheduled
-    // writes). Re-arming replaces the previous debounce fiber, mirroring the
-    // previous clearTimeout.
-    this.interruptPartialWriteFiber(streamInfo);
-
-    const remainingTime = this.PARTIAL_WRITE_THROTTLE_MS - timeSinceLastWrite;
-    const delayedFlush = Effect.sleep(Duration.millis(remainingTime)).pipe(
-      // Clear the self-reference before flushing so flushPartialWrite's re-arm
-      // cancellation cannot interrupt the very fiber performing the flush.
-      Effect.flatMap(() =>
-        Effect.sync(() => {
-          streamInfo.partialWriteFiber = undefined;
-        })
-      ),
-      // Async thunk: flush errors are contained inside flushPartialWrite, so
-      // this mirrors the previous `void this.flushPartialWrite(...)` callback.
-      Effect.flatMap(() =>
-        Effect.promise(async () => this.flushPartialWrite(workspaceId, streamInfo))
-      )
+    await this.partialJournal.schedule(
+      this.partialTarget(workspaceId, streamInfo),
+      streamInfo.resourceScope
     );
-
-    // Fork into the stream's resource scope so a pending flush is interrupted
-    // with the stream — a debounced write must never fire after the stream
-    // ends and resurrect partial.json. runFork/forkIn execute synchronously up
-    // to the sleep, so the debounce delay is registered before this method
-    // returns (same observable ordering as the previous setTimeout call).
-    streamInfo.partialWriteFiber = streamInfo.resourceScope
-      ? this.effectRunner.runSync(Effect.forkIn(delayedFlush, streamInfo.resourceScope))
-      : // Whitebox test fixtures register stream infos without a resource scope.
-        this.effectRunner.runFork(delayedFlush);
   }
 
-  /**
-   * Interrupt a scheduled (not yet flushed) partial-write debounce fiber, if
-   * any. The interrupt is fire-and-forget: the signal lands synchronously for
-   * a fiber sleeping on Effect's clock (house pattern: retryManager), which
-   * mirrors the previous clearTimeout semantics.
-   */
-  private interruptPartialWriteFiber(streamInfo: WorkspaceStreamInfo): void {
-    const fiber = streamInfo.partialWriteFiber;
-    if (fiber == null) {
-      return;
-    }
-    streamInfo.partialWriteFiber = undefined;
-    this.effectRunner.runFork(Fiber.interrupt(fiber));
-  }
-
-  private async awaitPendingPartialWrite(streamInfo: WorkspaceStreamInfo): Promise<void> {
-    if (streamInfo.partialWritePromise) {
-      await streamInfo.partialWritePromise;
-    }
-  }
-
-  /**
-   * Flush any pending partial write and write immediately
-   * Serializes writes to prevent races - waits for any in-flight write before starting new one
-   */
+  /** Immediate partial write after any in-flight one (PartialJournal.flush). */
   private async flushPartialWrite(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
-    /**
-     * The stream's terminal snapshot (the error partial). It is written through this same
-     * tracked write, and it retires later flushes: a cancel racing the error path would
-     * otherwise write a pre-error snapshot after it and drop the error (#5344).
-     */
     terminalPartial?: MuxMessage
   ): Promise<void> {
-    // Wait for any in-flight write to complete first (serialization)
-    await this.awaitPendingPartialWrite(streamInfo);
-
-    // Cancel any scheduled debounce flush — we're writing now
-    this.interruptPartialWriteFiber(streamInfo);
-
-    // The final message owns chat.jsonl now; re-creating partial.json here (a
-    // cancel racing the completion path) would be committed over it on next load.
-    if (streamInfo.partialRetired) {
-      return;
-    }
-    // Retire synchronously, before the write starts, so a flush that resumes during it is a no-op.
-    if (terminalPartial) streamInfo.partialRetired = true;
-
-    // Start new write and track the promise
-    streamInfo.partialWritePromise = (async () => {
-      try {
-        await this.historyService.writePartial(
-          workspaceId as string,
-          terminalPartial ?? this.buildPartialAssistantMessage(streamInfo)
-        );
-        streamInfo.lastPartialWriteTime = this.hostClock.nowMs();
-      } catch (error) {
-        log.error("Failed to write partial message:", error);
-      } finally {
-        // Clear promise when write completes
-        streamInfo.partialWritePromise = undefined;
-      }
-    })();
-
-    // Wait for this write to complete
-    await streamInfo.partialWritePromise;
+    await this.partialJournal.flush(this.partialTarget(workspaceId, streamInfo), terminalPartial);
   }
 
   /**
@@ -2803,7 +2710,7 @@ export class StreamManager {
       // Retire scheduled writes before joining their original Promise I/O. Scope close
       // interrupts debounce fibers; remote temp-directory removal remains best effort
       // (its registered finalizer only initiates removal, never awaits SSH).
-      streamInfo.partialRetired = true;
+      this.partialJournal.retire(streamInfo);
       try {
         if (streamInfo.resourceScope) {
           await this.effectRunner.runPromise(Scope.close(streamInfo.resourceScope, Exit.void));
@@ -2812,8 +2719,8 @@ export class StreamManager {
         log.error("Stream resource cleanup failed", { error });
       }
       try {
-        this.interruptPartialWriteFiber(streamInfo);
-        await this.awaitPendingPartialWrite(streamInfo);
+        this.partialJournal.interruptScheduled(streamInfo);
+        await this.partialJournal.awaitPending(streamInfo);
       } catch (error) {
         // A cleanup defect must not orphan a completed/failed handle or skip raw teardown.
         log.error("Pending partial write cleanup failed", { error });
@@ -2930,7 +2837,7 @@ export class StreamManager {
       // would ingest as $0 even though the provider billed all completed steps.
       if (!abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
         try {
-          await this.awaitPendingPartialWrite(streamInfo);
+          await this.partialJournal.awaitPending(streamInfo);
           const partialMessage = this.buildPartialAssistantMessage(streamInfo, {
             metadata: {
               ...(usage !== undefined ? { usage: cloneUsage(usage) } : {}),
@@ -2943,7 +2850,7 @@ export class StreamManager {
                 : {}),
             },
           });
-          await this.historyService.writePartial(workspaceId as string, partialMessage);
+          await this.partialJournal.writeAbortPartial(workspaceId as string, partialMessage);
 
           // Tool-only aborts (Esc while a tool is still running): commitPartial
           // refuses to commit partials whose only parts are input-available tool
@@ -2986,12 +2893,11 @@ export class StreamManager {
       try {
         // Cancellation owns this attempt through disk cleanup and raw delivery. Keeping
         // the registration until then makes replacement startup join the same fence.
-        const result = abandonPartial
-          ? await this.historyService.deletePartialIfMessageIdMatches(
-              workspaceId,
-              streamInfo.messageId
-            )
-          : await this.historyService.commitPartial(workspaceId, streamInfo.messageId);
+        const result = await this.partialJournal.settleAbort(
+          workspaceId,
+          streamInfo.messageId,
+          abandonPartial === true
+        );
         // commitPartial already deletes on success. On failure retain recovery data;
         // an unconditional delete here would silently discard an uncommitted answer.
         if (!result.success)
@@ -4086,8 +3992,7 @@ export class StreamManager {
       request,
       historySequence,
       parts: [], // Initialize empty parts array
-      lastPartialWriteTime: 0, // Initialize to 0 to allow immediate first write
-      partialWritePromise: undefined, // No write in flight initially
+      ...PartialJournal.initialState(), // Never written: the first write is immediate
       processingPromise: Promise.resolve(), // Placeholder, overwritten in startStream
       softInterrupt: { pending: false },
       completionController: ctx.completionController,
@@ -5443,58 +5348,12 @@ export class StreamManager {
                 parts: streamInfo.parts,
               };
 
-              // Retire partial writes first: a cancel (user stop, shutdown) landing
-              // between here and COMPLETED must not flush partial.json back to disk.
-              streamInfo.partialRetired = true;
-
-              // CRITICAL: Persist the final message to chat.jsonl BEFORE deleting
-              // partial.json (same order as commitPartial). Deleting first left a window
-              // (a crash, or an updateHistory failure such as the history-lock timeout)
-              // with an empty placeholder row and no partial: the completed reply was
-              // lost for good. partial.json already holds the final parts (flushed
-              // above), so on failure keep it for commitPartial recovery.
-              const updateResult = await this.historyService.updateHistory(
-                workspaceId as string,
-                finalAssistantMessage
+              await this.partialJournal.commitFinal(
+                workspaceId,
+                streamInfo,
+                finalAssistantMessage,
+                workspaceLog
               );
-              if (!updateResult.success) {
-                workspaceLog.warn("Failed to update history on stream end; keeping partial", {
-                  error: updateResult.error,
-                });
-                // The provider finished this turn: keep the final message as the partial, marked
-                // finalized, so startup recovery commits it instead of treating the turn as
-                // interrupted and auto-retrying an extra continuation (#5322). Only this stream's
-                // own partial. If this write fails too, the partial stays unmarked: today's
-                // interrupted-turn recovery, which loses nothing.
-                const markResult = await this.historyService.updatePartialIfMessageIdMatches(
-                  workspaceId,
-                  streamInfo.messageId,
-                  () => ({
-                    ...finalAssistantMessage,
-                    metadata: { ...finalAssistantMessage.metadata, streamFinalized: true },
-                  })
-                );
-                if (!markResult.success || !markResult.data) {
-                  workspaceLog.warn("Failed to mark the kept partial finalized", {
-                    error: markResult.success
-                      ? "partial belongs to another message"
-                      : markResult.error,
-                  });
-                }
-              } else {
-                // On successful completion, partial.json becomes stale and must be removed.
-                // Only this stream's own partial: the row just written covers nothing else
-                // (row first, then the partial delete: the crash-safe order).
-                const deleteResult = await this.historyService.deletePartialIfMessageIdMatches(
-                  workspaceId,
-                  streamInfo.messageId
-                );
-                if (!deleteResult.success) {
-                  workspaceLog.warn("Failed to delete partial on stream end", {
-                    error: deleteResult.error,
-                  });
-                }
-              }
 
               // Update cumulative session usage (if service is available)
               // Wrapped in try-catch: usage recording is non-critical and shouldn't block stream completion
@@ -5896,10 +5755,7 @@ export class StreamManager {
     const preserveParts = options?.preserveParts ?? false;
     const preserveUsage = options?.preserveUsage ?? false;
 
-    this.interruptPartialWriteFiber(streamInfo);
-
-    await this.awaitPendingPartialWrite(streamInfo);
-    streamInfo.partialWritePromise = undefined;
+    await this.partialJournal.resetForRetry(streamInfo);
 
     if (!preserveParts) {
       streamInfo.parts = [];
@@ -5913,7 +5769,6 @@ export class StreamManager {
     streamInfo.receivedTerminalEvent = false;
     streamInfo.terminalFinishReason = undefined;
     streamInfo.terminalRawFinishReason = undefined;
-    streamInfo.lastPartialWriteTime = 0;
 
     if (!preserveUsage) {
       // The dropped attempt's usage is not recorded (refused attempts settled their own).
@@ -5928,7 +5783,7 @@ export class StreamManager {
 
     if (!preserveParts) {
       try {
-        await this.historyService.deletePartial(workspaceId as string);
+        await this.partialJournal.deleteForRetry(workspaceId as string);
       } catch (deleteError) {
         const logger = options?.workspaceLog ?? this.getWorkspaceLogger(workspaceId, streamInfo);
         logger.warn("Failed to clear partial state before retry", { error: deleteError });
