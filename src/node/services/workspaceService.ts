@@ -452,7 +452,6 @@ import {
   type BashMonitorRegistryRecord,
 } from "@/node/services/bashMonitorRegistryStore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { getSelfIdentity } from "@/node/utils/concurrency/processLiveness";
 import {
   judgeLifecycleMarkerOwner,
@@ -4484,7 +4483,7 @@ export class WorkspaceService
   ): Promise<Result<AsyncDisposable>> {
     try {
       return Ok(
-        await acquireProcessFileLock({
+        await this.historyService.locks.acquireProcessFileLock({
           // r66: session-dir-external (see refineApplyLockPath) — acquiring
           // the old in-session lockfile after removal recreated the deleted
           // directory via the lock's own mkdir.
@@ -8311,6 +8310,7 @@ export class WorkspaceService
             ),
             beforeTombstone: () =>
               this.lockedSharedMemoryHandover(workspaceId, sharedMemoryOwnerId, force),
+            locks: this.historyService.locks,
           });
           sealedForRemoval = true;
           tombstonePublished = true;
@@ -8780,6 +8780,7 @@ export class WorkspaceService
             ownerSessionDir === undefined || sealedForRemoval
               ? undefined
               : () => this.lockedSharedMemoryHandover(workspaceId, memoryOwnerId, force),
+          locks: this.historyService.locks,
         });
         tombstonePublished = true;
       } catch (error) {

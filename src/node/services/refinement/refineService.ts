@@ -54,7 +54,7 @@ import {
   isDurableContextResetBoundaryMarker,
   sliceMessagesForProviderFromLatestContextBoundary,
 } from "@/common/utils/messages/compactionBoundary";
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import type { ProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import {
   isWorkspaceRemovalTombstoned,
   refineApplyLockPath,
@@ -432,9 +432,10 @@ export class RefineService {
     // two processes could both capture an empty attempted set and double-
     // apply a non-idempotent edit. Short acquisition timeout: a held lock
     // means another apply is running, mirror the in-process rejection.
-    let applyLock: Awaited<ReturnType<typeof acquireProcessFileLock>>;
+    let applyLock: ProcessFileLock;
     try {
-      applyLock = await acquireProcessFileLock({
+      // The history service's SessionLocks (phase 4): the same layer as removal's refine lock.
+      applyLock = await this.historyService.locks.acquireProcessFileLock({
         // r66: session-dir-external (see refineApplyLockPath) — removal holds
         // this same lock across its tombstone+delete critical section, so an
         // in-flight apply completes before the deletion and a late one
@@ -1097,9 +1098,9 @@ export class RefineService {
       // overwritten by that stale spread — the new proposal row would remain
       // in chat with a hash that no longer matches the file, losing the new
       // edits and failing later applies closed.
-      let stagingLock: Awaited<ReturnType<typeof acquireProcessFileLock>>;
+      let stagingLock: ProcessFileLock;
       try {
-        stagingLock = await acquireProcessFileLock({
+        stagingLock = await this.historyService.locks.acquireProcessFileLock({
           // r66: session-dir-external (see refineApplyLockPath).
           lockPath: refineApplyLockPath(this.config.rootDir, workspaceId),
           timeoutMs: this.options.applyLockTimeoutMs ?? REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS,

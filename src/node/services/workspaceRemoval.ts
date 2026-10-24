@@ -40,7 +40,8 @@ import {
 } from "@/node/services/refinement/targetMutationLocks";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { SESSION_MEMORY_DIR_NAME } from "@/common/constants/memory";
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 /**
  * Removal failed WITHOUT a durable tombstone (r63). Callers must abort
@@ -189,6 +190,8 @@ export async function removeSessionDirUnderMemoryLocks(args: {
    * (see SharedMemoryRemovalAbortedError).
    */
   beforeTombstone?: () => Promise<void>;
+  /** The refine and history locks (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
 }): Promise<void> {
   assert(args.sessionDir.length > 0, "removeSessionDirUnderMemoryLocks requires a session dir");
   // Crash clearly on a malformed config (test stubs, future refactors): an
@@ -264,6 +267,8 @@ export async function sealSubAgentForRemovalUnderMemoryLocks(args: {
   attemptId: string;
   sharedWorkspaceMemorySessionDir: string;
   beforeTombstone: () => Promise<void>;
+  /** The refine and history locks (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
 }): Promise<void> {
   try {
     await withRemovalLocks(args, async () => {
@@ -300,9 +305,12 @@ async function withRemovalLocks(
     sessionDir: string;
     workspaceId: string;
     sharedWorkspaceMemorySessionDir?: string;
+    locks?: SessionLocks;
   },
   body: () => Promise<void>
 ): Promise<void> {
+  // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
+  const locks = args.locks ?? nodeSessionLocks;
   // Same key derivations as MemoryService.storeLockKey: the workspace store
   // root lives inside the session directory; global/project mutations hold
   // the coarse `<rootDir>/memory` key while journaling into this session dir.
@@ -346,7 +354,7 @@ async function withRemovalLocks(
     // RefineService. Fail-closed like the other locks: a long apply blocks
     // removal into the orphan path rather than having the directory deleted
     // out from under its writes.
-    await using _refineLock = await acquireProcessFileLock({
+    await using _refineLock = await locks.acquireProcessFileLock({
       lockPath: refineApplyLockPath(args.rootDir, args.workspaceId),
       timeoutMs: 10_000,
       label: "refine serialization lock (removal)",
@@ -360,7 +368,7 @@ async function withRemovalLocks(
         // that same (session-dir-external) lock here means the append either
         // commits before the deletion below or starts afterwards and hits
         // HistoryService's in-lock tombstone gate.
-        await using _historyLock = await acquireProcessFileLock({
+        await using _historyLock = await locks.acquireProcessFileLock({
           lockPath: historyWriteLockPath(args.rootDir, args.workspaceId),
           timeoutMs: 10_000,
           label: "history write lock (removal)",

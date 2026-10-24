@@ -24,7 +24,9 @@ import {
   type DurableEventDraft,
 } from "@/common/types/durableEvent";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import { acquireProcessFileLock, type ProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import type { ProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { Journal } from "./journal";
 import { BlobStore } from "./blobStore";
 
@@ -141,11 +143,20 @@ export class DurableEventJournal {
    */
   private mentionEpoch = 0;
 
-  constructor(sessionDir: string) {
+  /**
+   * `locks` takes the blob lock and the journal's append lock (phase 4: SessionLocks). Callers with
+   * a history service pass its locks. The process-wide registry (sharedDurableEventJournal) and
+   * replayVerifySession have none, so they keep the Node default.
+   */
+  constructor(
+    sessionDir: string,
+    private readonly locks: SessionLocks = nodeSessionLocks
+  ) {
     this.journalFilePath = path.join(sessionDir, DURABLE_EVENTS_FILE_NAME);
     this.blobLockPath = path.join(sessionDir, BLOB_LOCK_FILE_NAME);
     this.journal = new Journal<DurableEvent>({
       filePath: this.journalFilePath,
+      locks,
       schema: DurableEventSchema,
       getSeq: (row) => row.seq,
       getId: (row) => row.id,
@@ -210,7 +221,7 @@ export class DurableEventJournal {
    */
   async withBlobLock<T>(fn: () => Promise<T>): Promise<T> {
     await using _mutex = await this.blobLock.acquire();
-    await using fileLock = await acquireProcessFileLock({
+    await using fileLock = await this.locks.acquireProcessFileLock({
       lockPath: this.blobLockPath,
       timeoutMs: BLOB_LOCK_TIMEOUT_MS,
       label: "blob lock",
