@@ -12,6 +12,10 @@ import {
   advanceReasoningReplayBoundary,
   buildContextBudgetRequest,
   buildPrepareStepResult,
+  dropVoidedPrefixSwap,
+  isFirstTurnRequest,
+  prefixSwapInvalidationReason,
+  recordStepMessages,
   selectStepActiveTools,
   settleAutoThinkingEscalation,
   stageAutoThinkingEscalation,
@@ -468,5 +472,63 @@ describe("startFirstStepRebuild", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+describe("dropVoidedPrefixSwap", () => {
+  test("clears only a swap that a thinking change voids", () => {
+    const voided = {
+      recordSystemSections: () => undefined,
+      pendingPrefixSwap: swapPreparedAt("low"),
+    };
+    dropVoidedPrefixSwap({ thinkingOverrideState: { applied: "high" } }, voided);
+    expect(voided.pendingPrefixSwap).toBeUndefined();
+
+    const swap = swapPreparedAt("low");
+    const kept = { recordSystemSections: () => undefined, pendingPrefixSwap: swap };
+    dropVoidedPrefixSwap({ thinkingOverrideState: { applied: "low" } }, kept);
+    expect(kept.pendingPrefixSwap).toBe(swap);
+    // No tracker: nothing to clear, and no throw.
+    dropVoidedPrefixSwap({ thinkingOverrideState: { pending: "high" } }, undefined);
+  });
+});
+
+describe("recordStepMessages", () => {
+  test("records the step's messages on the tracker and notifies the listener", () => {
+    const messages: ModelMessage[] = [{ role: "user", content: "go" }];
+    const notified: ModelMessage[][] = [];
+    const stepTracker: { latestMessages?: ModelMessage[]; recordSystemSections: () => undefined } =
+      {
+        recordSystemSections: () => undefined,
+      };
+    recordStepMessages({ onStepMessages: (sent) => notified.push(sent) }, stepTracker, messages);
+    expect(stepTracker.latestMessages).toBe(messages);
+    expect(notified).toEqual([messages]);
+    // Neither a tracker nor a listener is required.
+    recordStepMessages({}, undefined, messages);
+  });
+});
+
+describe("isFirstTurnRequest", () => {
+  test("only step zero of a tracked turn that has not prepared a request yet", () => {
+    const fresh = { recordSystemSections: () => undefined };
+    expect(isFirstTurnRequest(fresh, 0)).toBe(true);
+    expect(isFirstTurnRequest(fresh, 1)).toBe(false);
+    expect(isFirstTurnRequest({ ...fresh, providerRequestPrepared: true }, 0)).toBe(false);
+    // Without a tracker, assume a step ran.
+    expect(isFirstTurnRequest(undefined, 0)).toBe(false);
+  });
+});
+
+describe("prefixSwapInvalidationReason", () => {
+  test("is the stop's own reason, else a prefix-swap error", () => {
+    const stopped = new AbortController();
+    const reason = new Error("stopped by the session");
+    stopped.abort(reason);
+    expect(prefixSwapInvalidationReason(stopped.signal)).toBe(reason);
+    const running = new AbortController();
+    expect(prefixSwapInvalidationReason(running.signal)).toEqual(
+      new Error("Prefix swap invalidated")
+    );
   });
 });
