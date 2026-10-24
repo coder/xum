@@ -258,6 +258,33 @@ describe("AskUserQuestionDock", () => {
     expect(view.getByText("1/2 answered")).toBeTruthy();
   });
 
+  test("a retry after a lost response resends only the sent question sets, with the same id", async () => {
+    messages = [ROW_A, ROW_B];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    // The backend took the first send, but its response never arrived.
+    sendMessage.mockImplementationOnce(() => Promise.reject(new Error("connection lost")));
+    fireEvent.click(view.getByRole("button", { name: "Summary" }));
+    fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+    await waitFor(() => expect(view.getByText(/connection lost/)).toBeTruthy());
+
+    messages = [ROW_A, ROW_B, questionRow("row-c", "ask-c", [STORAGE])];
+    view.rerender(dock(workspaceId));
+    fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(2));
+    const [sent, retried] = sendMessage.mock.calls.map(
+      (call) => (call as [{ message: string; options: { sendId?: string } }])[0]
+    );
+    expect(retried.message).toBe(sent.message);
+    expect(retried.options.sendId).toBe(sent.options.sendId);
+    // ask-c joined after that send: it stays open for the next Submit.
+    await waitFor(() =>
+      expect(findOpenAskUserQuestions(workspaceId, messages).map((row) => row.id)).toEqual([
+        "row-c",
+      ])
+    );
+  });
+
   test("a question set that arrives while answering joins the mounted form", () => {
     // Prefilled Other text (typing does not reach React state in this happy-dom setup).
     messages = [questionRow("row-a", "ask-a", [STORAGE], { [STORAGE.question]: "use redis" })];

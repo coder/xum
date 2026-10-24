@@ -202,6 +202,28 @@ async function dispatchAnswerMessage(args: {
   }
 }
 
+interface AnswerSend {
+  entries: readonly NonBlockingAnswerEntry[];
+  message: string;
+  sendId: string;
+}
+
+/**
+ * True when the submit repeats the unconfirmed send: every row it answered is still submitted,
+ * with the same answers. Rows that joined the chained form since then do not count.
+ */
+function isRetryOf(pending: AnswerSend, submitted: readonly NonBlockingAnswerEntry[]): boolean {
+  const resubmitted = submitted.filter((entry) =>
+    pending.entries.some(
+      (sent) => sent.toolCallId === entry.toolCallId && sent.rowId === entry.rowId
+    )
+  );
+  return (
+    resubmitted.length === pending.entries.length &&
+    buildAskUserQuestionAnswersMessage(resubmitted) === pending.message
+  );
+}
+
 /**
  * Sends the answers to one or more non-blocking question rows as one user message, and marks
  * every row answered once the backend accepted it. Resolves with an error message, or null.
@@ -212,31 +234,36 @@ export function useNonBlockingAnswerSender(
   const liveApi = useLiveAPI();
   const workspaceStore = useWorkspaceStoreRaw();
   const isTranscriptMutationAllowed = useHostTranscriptMutationCheck();
-  // The idempotency id of the last unconfirmed send. A retry of the same message reuses it, so
-  // a lost success response cannot produce a second answer row (the backend never appends a
-  // second row for an id a row already carries).
-  const pendingSendRef = useRef<{ message: string; sendId: string } | null>(null);
+  // The last unconfirmed send. A retry resends it unchanged, under the same idempotency id, so a
+  // lost success response cannot produce a second answer row (the backend never appends a second
+  // row for an id a row already carries). Rows that joined the chained form since then stay open
+  // for the next submit: adding them would change the message, and so its id.
+  const pendingSendRef = useRef<AnswerSend | null>(null);
 
-  return async (entries) => {
+  return async (submitted) => {
     if (!liveApi || !workspaceId) {
       return "API not connected";
     }
-    const message = buildAskUserQuestionAnswersMessage(entries);
-    const pendingSend = pendingSendRef.current;
-    const sendId = pendingSend?.message === message ? pendingSend.sendId : createSendId();
-    pendingSendRef.current = { message, sendId };
+    const pending = pendingSendRef.current;
+    const send: AnswerSend =
+      pending !== null && isRetryOf(pending, submitted)
+        ? pending
+        : {
+            entries: submitted,
+            message: buildAskUserQuestionAnswersMessage(submitted),
+            sendId: createSendId(),
+          };
+    pendingSendRef.current = send;
     const error = await dispatchAnswerMessage({
       api: liveApi,
       workspaceId,
-      entries,
-      message,
-      sendId,
+      ...send,
       isTranscriptMutationAllowed,
       readTranscript: (id) => readStoreTranscript(workspaceStore, id),
     });
     if (error == null) {
       pendingSendRef.current = null;
-      for (const entry of entries) {
+      for (const entry of send.entries) {
         setAcceptedAnswers(
           { workspaceId, toolCallId: entry.toolCallId, rowId: entry.rowId },
           entry.answers
