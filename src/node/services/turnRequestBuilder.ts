@@ -2629,6 +2629,7 @@ export class TurnRequestBuilder {
                   runtimeTempDir,
                   workspaceSessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
                   trusted: getWorkflowProjectTrusted(),
+                  sessionLocks: this.dependencies.historyService.locks,
                 },
                 getProjectTrusted: getWorkflowProjectTrusted,
               }),

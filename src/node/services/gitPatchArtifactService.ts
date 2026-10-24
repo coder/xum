@@ -37,6 +37,7 @@ import { shellQuote } from "@/common/utils/shell";
 import { getErrorMessage } from "@/common/utils/errors";
 import { PlatformPaths } from "@/common/utils/paths";
 import { PlatformPaths as NodePlatformPaths } from "@/node/utils/paths.main";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import {
   getWorkspaceProjectRepos,
   getWorkspaceProjectStorageKeys,
@@ -321,7 +322,11 @@ export class GitPatchArtifactService {
   private readonly operationLocks = new MutexMap<string>();
   private readonly pendingJobsByTaskId = new Map<string, Promise<void>>();
 
-  constructor(private readonly config: Config) {}
+  constructor(
+    private readonly config: Config,
+    /** The workspace FIFO of the parent's patch artifact index writes (phase 4: SessionLocks). */
+    private readonly locks: SessionLocks
+  ) {}
 
   withOperationLock<T>(childWorkspaceId: string, operation: () => Promise<T>): Promise<T> {
     assert(childWorkspaceId.length > 0, "withOperationLock: childWorkspaceId must be non-empty");
@@ -455,6 +460,7 @@ export class GitPatchArtifactService {
 
     const artifact = await upsertSubagentGitPatchArtifact({
       workspaceId: parentWorkspaceId,
+      locks: this.locks,
       workspaceSessionDir: parentSessionDir,
       childTaskId: childWorkspaceId,
       updater: (existing) => {
@@ -504,6 +510,7 @@ export class GitPatchArtifactService {
           try {
             await upsertSubagentGitPatchArtifact({
               workspaceId: parentWorkspaceId,
+              locks: this.locks,
               workspaceSessionDir: parentSessionDir,
               childTaskId: childWorkspaceId,
               updater: (existing) => {
@@ -538,6 +545,7 @@ export class GitPatchArtifactService {
     } catch (error: unknown) {
       await upsertSubagentGitPatchArtifact({
         workspaceId: parentWorkspaceId,
+        locks: this.locks,
         workspaceSessionDir: parentSessionDir,
         childTaskId: childWorkspaceId,
         updater: (existing) => {
@@ -590,6 +598,7 @@ export class GitPatchArtifactService {
     ): Promise<SubagentGitPatchArtifact> => {
       return await upsertSubagentGitPatchArtifact({
         workspaceId: parentWorkspaceId,
+        locks: this.locks,
         workspaceSessionDir: parentSessionDir,
         childTaskId: childWorkspaceId,
         updater,

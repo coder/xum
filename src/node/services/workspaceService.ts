@@ -453,6 +453,7 @@ import {
   type BashMonitorRegistryRecord,
 } from "@/node/services/bashMonitorRegistryStore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { getSelfIdentity } from "@/node/utils/concurrency/processLiveness";
 import {
   judgeLifecycleMarkerOwner,
@@ -1841,6 +1842,8 @@ interface ChildPatchRollupTarget {
   parentSessionDir: string;
   childWorkspaceId: string;
   childSessionDir: string;
+  /** The parent's workspace FIFO for its artifact index writes (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }
 
 type ChildPatchArtifactEntries = Array<[string, SubagentGitPatchArtifact]>;
@@ -1914,6 +1917,7 @@ async function mergeChildPatchArtifactIndex(
   await updateSubagentGitPatchArtifactsFile({
     workspaceId: params.parentWorkspaceId,
     workspaceSessionDir: params.parentSessionDir,
+    locks: params.locks,
     update: (parentFile) => {
       for (const [taskId, childEntry] of childEntries) {
         if (!taskId) continue;
@@ -1953,6 +1957,8 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
   childTaskModelString?: string;
   /** Task-level thinking/reasoning level for the child workspace (optional; persists into transcript artifacts). */
   childTaskThinkingLevel?: ThinkingLevel;
+  /** The parent's workspace FIFO for its artifact index writes (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }): Promise<void> {
   if (params.parentWorkspaceId.length === 0) {
     return;
@@ -2063,6 +2069,7 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
         await upsertSubagentTranscriptArtifactIndexEntry({
           workspaceId: params.parentWorkspaceId,
           workspaceSessionDir: params.parentSessionDir,
+          locks: params.locks,
           childTaskId: params.childWorkspaceId,
           updater: (existing) => ({
             childTaskId: params.childWorkspaceId,
@@ -2155,6 +2162,7 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
       await updateSubagentReportArtifactsFile({
         workspaceId: params.parentWorkspaceId,
         workspaceSessionDir: params.parentSessionDir,
+        locks: params.locks,
         update: (parentFile) => {
           // rollUpAncestorWorkspaceIds reads the array, so an entry without one is skipped too.
           const mergeable = mergeableIndexEntries(childEntries).filter(([, entry]) =>
@@ -2238,6 +2246,7 @@ async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
       await updateSubagentTranscriptArtifactsFile({
         workspaceId: params.parentWorkspaceId,
         workspaceSessionDir: params.parentSessionDir,
+        locks: params.locks,
         update: (parentFile) => {
           for (const [taskId, childEntry] of mergeableIndexEntries(childEntries)) {
             const existing = parentFile.artifactsByChildTaskId[taskId] ?? null;
@@ -8736,6 +8745,7 @@ export class WorkspaceService
               childSessionDir: sessionDir,
               childTaskModelString,
               childTaskThinkingLevel,
+              locks: this.historyService.locks,
             });
           } catch (error: unknown) {
             log.error("Failed to roll up child session artifacts into parent", {
