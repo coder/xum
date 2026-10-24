@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { createServer, type IncomingHttpHeaders, type Server } from "http";
+import { createServer, type IncomingHttpHeaders, type Server, type ServerResponse } from "http";
 import { createMCPClient, type MCPClientHandle } from "./mcpClient";
 
 // #7384 (CVE-2026-111769): an MCP server that redirects to another origin must not receive the
@@ -25,7 +25,7 @@ function listen(server: Server): Promise<string> {
 }
 
 /** A minimal Streamable HTTP MCP server: initialize and tools/list over plain JSON replies. */
-function answerMcp(body: string, res: import("http").ServerResponse) {
+function answerMcp(body: string, res: ServerResponse) {
   const message = JSON.parse(body || "{}") as { id?: number; method?: string };
   if (message.id === undefined) {
     res.writeHead(202).end();
