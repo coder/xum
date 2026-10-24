@@ -272,8 +272,10 @@ const ComponentChooser: React.FC<{
               <span className="min-w-0 break-words">
                 <span className="text-foreground font-mono break-all">{name}</span>
                 {imported.includes(name) && <span className="text-muted"> — imported</span>}
+                {/* Prose wraps between words. break-words still splits an unbroken URL or path
+                    that cannot fit, so nothing scrolls sideways at phone width. */}
                 {detail && (
-                  <span className="text-muted block break-all whitespace-pre-wrap">{detail}</span>
+                  <span className="text-muted block break-words whitespace-pre-wrap">{detail}</span>
                 )}
                 <SkillDirectives directives={directives} />
               </span>
@@ -882,10 +884,10 @@ const PreviewHeader: React.FC<{ preview: AgentPluginInstallPreview }> = (props) 
     {props.preview.manifest.interface && (
       <PluginInterfaceDetails info={props.preview.manifest.interface} />
     )}
-    {/* break-all: URLs and a 64-char separator-free plugin dir name
-        have no natural break points and would overflow the card on
-        phone widths. */}
-    <p className="text-muted text-[11px] break-all">
+    {/* break-words: wrap at spaces ("@ main" stays whole), and still break URLs and a 64-char
+        separator-free plugin dir name, which have no natural break points and would overflow
+        the card on phone widths. break-all split words mid-way. */}
+    <p className="text-muted text-[11px] break-words">
       {displayRepoUrl(props.preview.source.url)}
       {subpathSuffix(props.preview.source.subpath)} @ {props.preview.source.ref} →{" "}
       <code className="text-accent-text">{props.preview.targetPath}</code>

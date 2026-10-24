@@ -2,8 +2,9 @@
  * Install-method fixtures for the bug bash (startApp.ts seed, charters.install-methods.txt).
  *
  * Local git repositories that Settings > Plugins installs from their absolute path: a Claude Code
- * plugin, a Claude Code marketplace, a plain skills repository, an Agent Plugin with skills and a
- * repository with one manifest per agent tool (multi-harness).
+ * plugin, a Claude Code marketplace, a plain skills repository, an Agent Plugin with skills, a
+ * repository with one manifest per agent tool (multi-harness) and a Claude Code plugin next to
+ * another tool's plugin.json (claude-foreign-root).
  * Nothing here runs on install or review: the one MCP server stays disabled until the user turns
  * it on (and bin/server only exits 0), Claude hooks never run in Xum, and Xum never loads a Claude
  * plugin's hooks.js or workflows/ (both are inert anyway). Model-driven jobs also set
@@ -215,6 +216,29 @@ function multiHarness(): Files {
 }
 
 /**
+ * A root plugin.json with no `$schema` next to a Claude Code manifest only: discovery loads the
+ * Claude manifest, so Settings must offer "Claude Code plugin", not "Agent Plugin".
+ */
+function claudeForeignRoot(): Files {
+  return {
+    "plugin.json": JSON.stringify({ name: "claude-foreign-root" }, null, 2),
+    ".claude-plugin/plugin.json": JSON.stringify(
+      {
+        name: "claude-foreign-root",
+        version: "1.1.0",
+        description: "A Claude Code plugin next to another tool's plugin.json (bug-bash fixture)",
+      },
+      null,
+      2
+    ),
+    "skills/release-notes/SKILL.md": skillMd(
+      "release-notes",
+      "Writes release notes from the merged changes"
+    ),
+  };
+}
+
+/**
  * Skill folders in snake_case, as google/elephant-goldfish-model ships them: Claude Code and Codex
  * name a skill by its SKILL.md `name`, so `skills/egm_bootstrap` holds `egm-bootstrap`.
  */
@@ -250,6 +274,7 @@ export function installFixtures(): Record<string, Files> {
     "plain-skills": plainSkills(),
     "agent-plugin-with-skills": agentPluginWithSkills(),
     "multi-harness": multiHarness(),
+    "claude-foreign-root": claudeForeignRoot(),
     "snake-case-skills": snakeCaseSkills(),
   };
 }
