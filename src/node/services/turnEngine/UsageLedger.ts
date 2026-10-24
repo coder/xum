@@ -4,7 +4,8 @@
  *
  * Shape: like PartialJournal, a plain class that StreamManager constructs with its
  * SessionUsageService and providers-config accessor. The per-turn state stays as fields
- * on WorkspaceStreamInfo.
+ * on WorkspaceStreamInfo, which extends Readonly<UsageLedgerState>: StreamManager can
+ * read the totals to build events and messages, and only this class writes them.
  *
  * Invariants:
  * - Each attempt's usage reaches the session ledger once: settle clears the in-flight key
@@ -25,6 +26,11 @@ import {
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { normalizeUsageModelKey } from "@/common/utils/providers/modelEntries";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import {
+  accumulateProviderMetadata,
+  addUsage,
+  withLongContextTokens,
+} from "@/common/utils/tokens/usageHelpers";
 import type { Logger } from "@/node/services/log";
 import { nodeClock } from "@/node/utils/hostClock";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
@@ -98,6 +104,21 @@ export function markProviderMetadataCostsIncluded(
   };
 }
 
+/**
+ * Deep-clone a PersistedToolModelUsage so the stored copy is independent of the caller's object
+ * (usage/providerMetadata are nested references the caller may mutate). Keeps providerMetadata
+ * optional so the cloned object only carries the field when defined.
+ */
+export function clonePersistedToolModelUsage(
+  event: PersistedToolModelUsage
+): PersistedToolModelUsage {
+  return {
+    ...event,
+    usage: { ...event.usage },
+    ...(event.providerMetadata != null ? { providerMetadata: event.providerMetadata } : {}),
+  };
+}
+
 export function cloneUsage(usage: LanguageModelV2Usage): LanguageModelV2Usage {
   return { ...usage };
 }
@@ -114,6 +135,77 @@ function zeroTokenUsage(): LanguageModelV2Usage {
 
 export class UsageLedger {
   constructor(private readonly deps: UsageLedgerDeps) {}
+
+  static initialState(): UsageLedgerState {
+    return {
+      toolModelUsages: [],
+      cumulativeUsage: zeroTokenUsage(),
+      cumulativeProviderMetadata: undefined,
+    };
+  }
+
+  recordToolModelUsage(turn: UsageLedgerState, event: PersistedToolModelUsage): void {
+    turn.toolModelUsages.push(clonePersistedToolModelUsage(event));
+  }
+
+  /** Adds one finish-step's usage to the attempt totals. */
+  recordStep(
+    turn: UsageTurn,
+    stepUsage: LanguageModelV2Usage,
+    stepProviderMetadata: Record<string, unknown> | undefined
+  ): void {
+    // Effect migration Phase 10: usage accounting stays in plain
+    // mutables on streamInfo by the plain-mutables rule — the only
+    // mutators are this AI-SDK fullStream loop and plain
+    // retry/reset methods, never fibers.
+    turn.cumulativeUsage = addUsage(turn.cumulativeUsage, stepUsage);
+    turn.cumulativeProviderMetadata = accumulateProviderMetadata(
+      turn.cumulativeProviderMetadata,
+      withLongContextTokens(stepProviderMetadata, stepUsage, turn.metadataModel)
+    );
+
+    // Track last step's data for context window display
+    turn.lastStepUsage = stepUsage;
+    turn.lastStepProviderMetadata = stepProviderMetadata;
+  }
+
+  /**
+   * Stream-end usage: after a retry that kept the earlier attempt's billed usage, or when
+   * the SDK total is missing, the live per-step accumulation.
+   */
+  endUsage(
+    turn: UsageLedgerState,
+    totalUsage: LanguageModelV2Usage | undefined,
+    restartedWithPreservedUsage: boolean
+  ): LanguageModelV2Usage | undefined {
+    const cumulativeUsage = turn.cumulativeUsage;
+    if (restartedWithPreservedUsage && hasTokenUsage(cumulativeUsage)) {
+      return cumulativeUsage;
+    }
+
+    // streamResult.totalUsage is read with a short timeout (getStreamMetadata) and can
+    // resolve to undefined under slow SDK settlement even though the provider billed the
+    // turn. Fall back to the live per-step accumulation so completed streams never
+    // persist an unpriced assistant message (analytics prices rows from metadata.usage).
+    if (!hasTokenUsage(totalUsage) && hasTokenUsage(cumulativeUsage)) {
+      return cumulativeUsage;
+    }
+
+    return totalUsage;
+  }
+
+  /**
+   * After a retry that kept the earlier attempt's usage, only the live accumulation also
+   * covers the steps before the retry (their cache writes and long-context shares).
+   * Undefined: use the SDK's per-step aggregation.
+   */
+  preservedEndProviderMetadata(
+    turn: UsageLedgerState,
+    restartedWithPreservedUsage: boolean
+  ): Record<string, unknown> | undefined {
+    const cumulative = turn.cumulativeProviderMetadata;
+    return restartedWithPreservedUsage && cumulative ? { ...cumulative } : undefined;
+  }
 
   /**
    * After each finished step, write the attempt's priced cumulative usage to its own
@@ -203,6 +295,18 @@ export class UsageLedger {
     }
     turn.inFlightUsageKey = undefined;
     await this.discardKey(workspaceId, turn, key);
+  }
+
+  /** A retried attempt that drops the earlier usage starts from zero. */
+  async resetForRetry(workspaceId: string, turn: UsageTurn): Promise<void> {
+    // The dropped attempt's usage is not recorded (refused attempts settled their own).
+    await this.discardInFlight(workspaceId, turn);
+    turn.cumulativeUsage = zeroTokenUsage();
+    turn.cumulativeProviderMetadata = undefined;
+    turn.terminalRefusalUsage = undefined;
+    turn.terminalRefusalProviderMetadata = undefined;
+    turn.lastStepUsage = undefined;
+    turn.lastStepProviderMetadata = undefined;
   }
 
   /**
