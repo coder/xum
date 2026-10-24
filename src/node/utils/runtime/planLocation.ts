@@ -11,7 +11,6 @@ import type { Config } from "@/node/config";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
 import { log } from "@/node/services/log";
-import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { execBuffered, throwIfTransportFailure } from "@/node/utils/runtime/helpers";
 import { REMOTE_PLAN_MIGRATION_LOCK_TIMEOUT_MS } from "@/constants/planReview";
@@ -93,7 +92,7 @@ export async function resolvePlanFileLocation(
   config: PlanLocationConfig,
   runtime: Runtime,
   owner: PlanOwner,
-  locks: SessionLocks = nodeSessionLocks
+  locks: SessionLocks
 ): Promise<PlanFileLocation> {
   const xumHome = runtime.getXumHome();
   const planPath = await resolvePlanFilePath(config, runtime, owner);
@@ -108,8 +107,9 @@ export async function resolvePlanFileLocation(
 
 /**
  * Run `fn` holding `workspaceId`'s plan-migration lock (in-process and across backends). `locks`
- * takes it (phase 4: SessionLocks): AgentSession and WorkspaceService pass their history
- * service's locks, other callers of the exported functions keep the Node default.
+ * takes it (phase 4: SessionLocks). The exported functions take `locks` with no default, so
+ * every caller passes its history service's locks (a caller with none passes nodeSessionLocks
+ * and says why): an omitted argument would split one lock across two layers.
  */
 async function withMigrationLock<T>(
   config: Pick<PlanLocationConfig, "sessionsDir">,
@@ -136,7 +136,7 @@ async function withMigrationLock<T>(
 export async function markRemotePlanMigratedForDeletion(
   config: PlanLocationConfig,
   owner: Pick<PlanOwner, "id" | "runtimeConfig">,
-  locks: SessionLocks = nodeSessionLocks
+  locks: SessionLocks
 ): Promise<void> {
   if (!usesInstallationScopedPlans(owner.runtimeConfig) || config.isRemotePlanMigrated(owner.id)) {
     return;
@@ -224,7 +224,7 @@ async function migrateRemotePlan(
   owner: PlanOwner,
   planPath: string,
   importShared: boolean,
-  locks: SessionLocks = nodeSessionLocks
+  locks: SessionLocks
 ): Promise<MigrationOutcome> {
   const xumHome = runtime.getXumHome();
   const idPlanPath = getLegacyPlanFilePath(owner.id, xumHome);
@@ -285,7 +285,7 @@ export async function findImportableLegacyPlanPath(
   config: PlanLocationConfig,
   runtime: Runtime,
   owner: PlanOwner,
-  locks: SessionLocks = nodeSessionLocks
+  locks: SessionLocks
 ): Promise<string | undefined> {
   if (!usesInstallationScopedPlans(owner.runtimeConfig) || config.isRemotePlanMigrated(owner.id)) {
     return undefined;
@@ -316,7 +316,7 @@ export async function importLegacyRemotePlan(
   config: PlanLocationConfig,
   runtime: Runtime,
   owner: PlanOwner,
-  locks: SessionLocks = nodeSessionLocks
+  locks: SessionLocks
 ): Promise<LegacyPlanImportResult> {
   assert(usesInstallationScopedPlans(owner.runtimeConfig), "legacy plan import is SSH-only");
   const planPath = await resolvePlanFilePath(config, runtime, owner);

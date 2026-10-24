@@ -400,7 +400,12 @@ describe("SSH plans are installation-scoped (#5174)", () => {
       expect(await planContent()).toBeUndefined();
       const snapshot = await harness.service.planReviewEnsureSnapshot(id);
       expect(snapshot.success ? "created" : snapshot.error.type).toBe("plan_missing");
-      const location = await resolvePlanFileLocation(harness.config, host, owner());
+      const location = await resolvePlanFileLocation(
+        harness.config,
+        host,
+        owner(),
+        harness.historyService.locks
+      );
       expect(await AttachmentService.generatePlanFileReference(location, host)).toBeNull();
       expect(await readIfExists(await scopedPlanPath())).toBeUndefined();
     });
@@ -507,7 +512,12 @@ describe("SSH plans are installation-scoped (#5174)", () => {
       const state = await harness.service.getPostCompactionState(id);
       expect(state.planPath).toBe(scoped);
       // Post-compaction attachments: the plan reference, and no legacy file as an edited file.
-      const location = await resolvePlanFileLocation(harness.config, host, owner());
+      const location = await resolvePlanFileLocation(
+        harness.config,
+        host,
+        owner(),
+        harness.historyService.locks
+      );
       expect(location).toEqual({
         planPath: await resolvePlanFilePath(harness.config, host, owner()),
       });

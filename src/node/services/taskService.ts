@@ -20184,7 +20184,7 @@ export class TaskService implements AgentTaskIntegration {
         const runtime = createRuntimeForWorkspace(info);
         const planResult = await readPlanFile(
           runtime,
-          await resolvePlanFileLocation(this.config, runtime, info)
+          await resolvePlanFileLocation(this.config, runtime, info, this.historyService.locks)
         );
         if (planResult.exists && planResult.content.trim().length > 0) {
           if (planResult.path !== args.proposePlanResult.planPath) {
@@ -20297,7 +20297,7 @@ export class TaskService implements AgentTaskIntegration {
           const runtime = createRuntimeForWorkspace(info);
           const planResult = await readPlanFile(
             runtime,
-            await resolvePlanFileLocation(this.config, runtime, info)
+            await resolvePlanFileLocation(this.config, runtime, info, this.historyService.locks)
           );
           if (planResult.exists) {
             planSummary = { content: planResult.content, path: planResult.path };

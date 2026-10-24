@@ -143,6 +143,8 @@ export class InitStateManager extends EventEmitter {
       "init-status.json",
       (state) => this.serializeInitEvents(state),
       (event) => this.emit(event.type, event),
+      // The same locks as the record claim: releaseRecordClaim drains this store's FIFO.
+      this.locks,
       "InitStateManager"
     );
   }
