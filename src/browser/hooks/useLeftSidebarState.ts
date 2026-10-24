@@ -8,12 +8,11 @@ import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
  * The left sidebar's collapsed state and its one toggle: an inline sidebar at wide widths, a
  * drawer over the page at narrow widths.
  */
-export function useLeftSidebarState(): { collapsed: boolean; toggle: () => void } {
+export function useLeftSidebarState() {
   const narrowSession = useNarrowViewportSession();
   const isNarrow = narrowSession !== 0;
   // Auto-collapse the wide sidebar by default when the app starts at phone width.
-  const startsNarrow =
-    typeof window !== "undefined" && window.innerWidth <= NARROW_VIEWPORT_MAX_WIDTH_PX;
+  const startsNarrow = window.innerWidth <= NARROW_VIEWPORT_MAX_WIDTH_PX;
   const [wideCollapsed, setWideCollapsed] = usePersistedState(
     LEFT_SIDEBAR_COLLAPSED_KEY,
     startsNarrow,
@@ -30,7 +29,7 @@ export function useLeftSidebarState(): { collapsed: boolean; toggle: () => void 
 
   const toggle = () => {
     if (isNarrow) {
-      setDrawerSession((open) => (open === narrowSession ? null : narrowSession));
+      setDrawerSession((prev) => (prev === narrowSession ? null : narrowSession));
     } else {
       setWideCollapsed((prev) => !prev);
     }

@@ -131,11 +131,11 @@ async function assertTouchResizesRightSidebar(page: StoryPage) {
 // right safe-area inset in Apple's simulator) at a width where xum shows its phone layout.
 const SIDE_INSET_PX = 84;
 const SIDE_INSET_VIEWPORT = { width: 466, height: 700 };
-const SIDE_INSET_SHEETS: Record<string, string> = {
-  "settings-settingspage--phone-full-screen": "Settings",
-  "app-phoneviewports--i-phone-16-e-analytics-sheet": "Analytics",
-};
-const SIDE_INSET_TOAST_STORY = "app-components-activegoalswarningtoast--above-threshold";
+const SIDE_INSET_TARGETS = new Map<string, { sheet: string } | "toast">([
+  ["settings-settingspage--phone-full-screen", { sheet: "Settings" }],
+  ["app-phoneviewports--i-phone-16-e-analytics-sheet", { sheet: "Analytics" }],
+  ["app-components-activegoalswarningtoast--above-threshold", "toast"],
+]);
 
 /**
  * Phone sheets and toasts are portaled out of the app shell, which pads the side safe areas, so
@@ -201,7 +201,8 @@ async function assertClearsRightInset(page: StoryPage, target: { sheet: string }
           // Scrolled out of its container: not on screen.
           if (right <= left) continue;
           if (right > limit + 0.5) {
-            const name = control.getAttribute("aria-label") ?? control.textContent ?? control.tagName;
+            const name =
+              control.getAttribute("aria-label") ?? control.textContent ?? control.tagName;
             found.push(`${name.trim().slice(0, 40)} ends at ${Math.round(right)}px`);
           }
         }
@@ -236,10 +237,10 @@ const config: TestRunnerConfig = {
     await page.exposeFunction("__storybookUnhover", () => page.mouse.move(0, 0));
   },
   async postVisit(page, context) {
-    const insetSheet = SIDE_INSET_SHEETS[context.id];
-    if (insetSheet || context.id === SIDE_INSET_TOAST_STORY) {
+    const insetTarget = SIDE_INSET_TARGETS.get(context.id);
+    if (insetTarget) {
       if (page.context().browser()?.browserType().name() === "chromium") {
-        await assertClearsRightInset(page, insetSheet ? { sheet: insetSheet } : "toast");
+        await assertClearsRightInset(page, insetTarget);
       }
       return;
     }

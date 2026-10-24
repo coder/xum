@@ -29,6 +29,11 @@ async function sidebarRight(browser: Browser): Promise<number> {
   return right ?? Number.NaN;
 }
 
+async function openDrawer(screen: Screen, browser: Browser): Promise<void> {
+  await screen.getByRole("button", "Open sidebar menu").tap();
+  await expect.poll(() => sidebarRight(browser)).toBeGreaterThan(100);
+}
+
 /** Whether a tap on the composer's center reaches the composer (no drawer or backdrop over it). */
 function composerTakesTaps(browser: Browser): Promise<boolean> {
   return browser.evaluate(() => {
@@ -90,8 +95,7 @@ test(
     await browser.setViewport(INNER);
     await openPlayground(app, screen, browser);
     await fold(screen, browser);
-    await screen.getByRole("button", "Open sidebar menu").tap();
-    await expect.poll(() => sidebarRight(browser)).toBeGreaterThan(100);
+    await openDrawer(screen, browser);
 
     await browser.setViewport(INNER);
     await expectWideSidebar(screen, browser, true);
@@ -109,8 +113,7 @@ test(
     await expectWideSidebar(screen, browser, false);
     await fold(screen, browser);
 
-    await screen.getByRole("button", "Open sidebar menu").tap();
-    await expect.poll(() => sidebarRight(browser)).toBeGreaterThan(100);
+    await openDrawer(screen, browser);
     await screen.getByRole("button", "Collapse sidebar").tap();
     await expectDrawerClosed(screen, browser);
 

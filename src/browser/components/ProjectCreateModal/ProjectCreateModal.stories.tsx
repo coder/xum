@@ -47,8 +47,9 @@ async function openNewProjectModal(canvasElement: HTMLElement): Promise<void> {
   const canvas = within(canvasElement);
   const body = within(canvasElement.ownerDocument.body);
 
-  // Wait for the sidebar's "Add project" button to appear (phones: in the drawer, closed at start)
+  // Phones show the sidebar in a drawer that starts closed.
   await openLeftSidebar(canvasElement);
+  // Wait for the sidebar's "Add project" button to appear
   const addButton = await canvas.findByLabelText("Add project", {}, { timeout: 10000 });
   await userEvent.click(addButton);
 
