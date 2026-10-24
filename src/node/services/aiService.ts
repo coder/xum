@@ -15,7 +15,6 @@ import {
 } from "./agentPlugins/promptHooks";
 import * as path from "path";
 import { EventEmitter } from "events";
-import * as fs from "fs/promises";
 
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
@@ -24,7 +23,6 @@ import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { ensurePrivateDir } from "@/node/utils/fs";
 import {
   TurnRequestBuilder,
   type LoopHostServices,
@@ -519,7 +517,7 @@ export class AIService extends EventEmitter {
 
   private async ensureSessionsDir(): Promise<void> {
     try {
-      await ensurePrivateDir(this.config.sessionsDir);
+      await this.historyService.files.ensurePrivateDir(this.config.sessionsDir);
     } catch (error) {
       log.error("Failed to create sessions directory:", error);
     }
@@ -1241,7 +1239,7 @@ export class AIService extends EventEmitter {
   async deleteWorkspace(workspaceId: string): Promise<Result<void>> {
     try {
       const workspaceDir = path.join(this.config.sessionsDir, workspaceId);
-      await fs.rm(workspaceDir, { recursive: true, force: true });
+      await this.historyService.files.promises.rm(workspaceDir, { recursive: true, force: true });
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
