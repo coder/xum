@@ -880,9 +880,28 @@ function isWithinOrigin(from: URL, to: URL): boolean {
   );
 }
 
+/** The URL that a redirect `response` to a request for `from` points at, if it names a parseable one. */
+function redirectTarget(from: URL, response: Response): URL | undefined {
+  const location = REDIRECT_STATUSES.has(response.status) ? response.headers.get("location") : null;
+  if (!location) return undefined;
+  try {
+    return new URL(location, from);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether a redirect from `from` to `to` stays within the origin and keeps the userinfo. */
+function isSameOriginRedirect(from: URL, to: URL): boolean {
+  const keepsUserinfo =
+    (!to.username && !to.password) ||
+    (to.username === from.username && to.password === from.password);
+  return keepsUserinfo && isWithinOrigin(from, to);
+}
+
 /**
- * GET `url` and follow a redirect only when it stays within the origin of the
- * hop that answered it and keeps the userinfo. Any other redirect comes back
+ * GET `url` and follow a redirect only when isSameOriginRedirect allows it.
+ * Any other redirect, and a redirect without a parseable Location, comes back
  * as its 3xx response, which callers treat as not ok.
  *
  * Copy of the rule in fetchWithinOrigin from @modelcontextprotocol/client
@@ -898,20 +917,14 @@ async function fetchGetWithinOrigin(
   let current = url;
   for (let followed = 0; ; followed++) {
     const response = await fetchFn(current, { ...init, redirect: "manual" });
-    const location = REDIRECT_STATUSES.has(response.status)
-      ? response.headers.get("location")
-      : null;
-    if (!location || followed === MAX_SAME_ORIGIN_REDIRECTS) return response;
-    let target: URL;
-    try {
-      target = new URL(location, current);
-    } catch {
+    const target = redirectTarget(current, response);
+    if (
+      !target ||
+      followed === MAX_SAME_ORIGIN_REDIRECTS ||
+      !isSameOriginRedirect(current, target)
+    ) {
       return response;
     }
-    const keepsUserinfo =
-      (!target.username && !target.password) ||
-      (target.username === current.username && target.password === current.password);
-    if (!keepsUserinfo || !isWithinOrigin(current, target)) return response;
     await response.body?.cancel().catch(() => undefined);
     current = target;
   }
