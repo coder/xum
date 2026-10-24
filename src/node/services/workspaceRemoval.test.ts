@@ -4,6 +4,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { createMemoryHost } from "@/node/services/hostFiles/memoryHostFiles.testHarness";
 import {
   targetMutationLockFilePath,
   withTargetMutationLock,
@@ -23,6 +24,31 @@ import {
 } from "./workspaceRemoval";
 
 describe("workspaceRemoval", () => {
+  test("publishes the tombstone and deletes the session dir through the HostFiles it was given", async () => {
+    // The locks stay on the disk under rootDir. The session dir and the tombstone exist in the
+    // memory volume, and a same-named session dir on the disk must survive.
+    using tmp = new DisposableTempDir("workspace-removal-files");
+    const rootDir = path.join(tmp.path, "xum-home");
+    const workspaceId = "ws-memory-removal";
+    const sessionDir = path.join(rootDir, "sessions", workspaceId);
+    const host = createMemoryHost();
+    await host.files.promises.mkdir(sessionDir, { recursive: true });
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+
+    await removeSessionDirUnderMemoryLocks({
+      rootDir,
+      sessionDir,
+      workspaceId,
+      attemptId: "memory-attempt",
+      files: host.files,
+    });
+
+    expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId, host.files)).toBe(true);
+    expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
+    await expect(host.files.promises.access(sessionDir)).rejects.toThrow();
+    await fsPromises.access(sessionDir);
+  });
+
   test("deletion waits for a live memory writer, then tombstones and deletes (r61)", async () => {
     using tmp = new DisposableTempDir("workspace-removal-test");
     const rootDir = path.join(tmp.path, "xum-home");
