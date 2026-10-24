@@ -1,5 +1,4 @@
 import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
-import { randomUUID } from "crypto";
 import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
 import {
@@ -131,7 +130,6 @@ import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { ToolCallDisplayRegistry, type ExecutionScope } from "./toolCallDisplayRegistry";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { SessionUsageService } from "./sessionUsageService";
-import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
 import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
@@ -140,14 +138,15 @@ import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getModelStats, getModelStatsResolved } from "@/common/utils/tokens/modelStats";
 import { withSequentialExecution } from "@/node/services/tools/withSequentialExecution";
 import type { ResolvedCallSettingsOverrides } from "@/common/config/schemas/modelParameters";
-import {
-  normalizeUsageModelKey,
-  resolveModelForMetadata,
-} from "@/common/utils/providers/modelEntries";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import { hostClockFor } from "./di/hostClockLive";
+import {
+  markProviderMetadataCostsIncluded,
+  UsageLedger,
+} from "@/node/services/turnEngine/UsageLedger";
 import {
   PartialJournal,
   type PartialJournalState,
@@ -900,26 +899,6 @@ function summarizeToolResultForLog(output: unknown): Record<string, unknown> {
   };
 }
 
-export function markProviderMetadataCostsIncluded(
-  providerMetadata: Record<string, unknown> | undefined,
-  costsIncluded: boolean | undefined
-): Record<string, unknown> | undefined {
-  if (!costsIncluded) return providerMetadata;
-
-  const muxMetadata = providerMetadata?.mux;
-  const existingMux =
-    muxMetadata && typeof muxMetadata === "object"
-      ? (muxMetadata as Record<string, unknown>)
-      : undefined;
-
-  return {
-    ...(providerMetadata ?? {}),
-    mux: {
-      ...(existingMux ?? {}),
-      costsIncluded: true,
-    },
-  };
-}
 /** Build a UsageDeltaEvent with consistent costsIncluded stamping on cumulative metadata. */
 function buildUsageDeltaEvent(opts: {
   workspaceId: string;
@@ -1289,6 +1268,8 @@ export class StreamManager {
   private readonly partialJournal: PartialJournal;
   private mcpServerManager?: MCPServerManager;
   private readonly sessionUsageService?: SessionUsageService;
+  // Owns the turn's usage accounting and session-usage writes (turnEngine/UsageLedger.ts).
+  private readonly usageLedger: UsageLedger;
   private readonly getProvidersConfig: () => ProvidersConfigMap | null;
   private eventSink: TurnEngineEventSink;
   /**
@@ -1344,6 +1325,11 @@ export class StreamManager {
     this.historyService = historyService;
     this.sessionUsageService = sessionUsageService;
     this.getProvidersConfig = getProvidersConfig ?? (() => null);
+    this.usageLedger = new UsageLedger({
+      sessionUsageService,
+      getProvidersConfig: this.getProvidersConfig,
+      workspaceLogger: (id, turn) => this.getWorkspaceLogger(id as WorkspaceId, turn),
+    });
     this.eventSink = eventSink;
     this.effectRunner = runner;
     this.hostClock = options.hostClock ?? hostClockFor(runner);
@@ -2316,7 +2302,7 @@ export class StreamManager {
         this.recordStepUsage(workspaceId, streamInfo, intent.usage, intent.providerMetadata);
         return undefined;
       case "RecordInFlightUsage":
-        return this.recordInFlightSessionUsage(workspaceId, streamInfo);
+        return this.usageLedger.recordInFlight(workspaceId, streamInfo);
       case "FlushPartialWrite":
         return this.flushPartialWrite(workspaceId, streamInfo);
       case "Fail":
@@ -2821,7 +2807,7 @@ export class StreamManager {
 
       // Record session usage for aborted streams (mirrors stream-end path)
       // This ensures tokens consumed before abort are tracked for cost display
-      await this.settleSessionUsage(
+      await this.usageLedger.settle(
         workspaceId,
         streamInfo,
         usage,
@@ -2989,140 +2975,6 @@ export class StreamManager {
     }
   }
 
-  private async recordSessionUsage(
-    workspaceId: WorkspaceId,
-    model: string,
-    usage: LanguageModelV2Usage | undefined,
-    providerMetadata: Record<string, unknown> | undefined,
-    logMessage: string,
-    logLevel: "warn" | "error",
-    streamInfo?: Pick<WorkspaceStreamInfo, "workspaceName" | "metadataModel">,
-    settlesInFlightKey?: string
-  ): Promise<"recorded" | "skipped" | "failed"> {
-    if (!this.sessionUsageService || !usage) {
-      return "skipped";
-    }
-    const messageUsage = createDisplayUsage(
-      usage,
-      model,
-      providerMetadata,
-      streamInfo?.metadataModel
-    );
-    if (!messageUsage) {
-      return "skipped";
-    }
-    const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-    const ledgerModel = this.usageAttributionModel(model, streamInfo?.metadataModel);
-    try {
-      await this.sessionUsageService.recordUsage(
-        workspaceId as string,
-        ledgerModel,
-        messageUsage,
-        settlesInFlightKey !== undefined ? { settlesInFlightKey } : undefined
-      );
-      return "recorded";
-    } catch (error) {
-      (logLevel === "error" ? workspaceLog.error : workspaceLog.warn)(logMessage, { error });
-      return "failed";
-    }
-  }
-
-  /**
-   * After each finished step, write the attempt's priced cumulative usage to its own
-   * in-flight file, so a Xum restart mid-turn loses at most the unfinished step. Priced like
-   * the abort path. One write per finished step, never per token.
-   */
-  private async recordInFlightSessionUsage(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo
-  ): Promise<void> {
-    if (!this.sessionUsageService || !hasTokenUsage(streamInfo.cumulativeUsage)) {
-      return;
-    }
-    const usage = createDisplayUsage(
-      streamInfo.cumulativeUsage,
-      streamInfo.model,
-      markProviderMetadataCostsIncluded(
-        streamInfo.cumulativeProviderMetadata,
-        streamInfo.initialMetadata?.costsIncluded
-      ),
-      streamInfo.metadataModel
-    );
-    if (!usage) {
-      return;
-    }
-    const key = streamInfo.inFlightUsageKey ?? randomUUID();
-    try {
-      await this.sessionUsageService.recordInFlightUsage(
-        workspaceId as string,
-        key,
-        streamInfo.messageId,
-        this.usageAttributionModel(streamInfo.model, streamInfo.metadataModel),
-        usage
-      );
-      streamInfo.inFlightUsageKey = key;
-    } catch (error) {
-      this.getWorkspaceLogger(workspaceId, streamInfo).warn(
-        "Failed to record in-flight session usage",
-        { error }
-      );
-    }
-  }
-
-  /**
-   * Record the attempt's final usage. The same ledger write marks its in-flight file settled
-   * (then the file is deleted), so a crash at any point counts the attempt once.
-   */
-  private async settleSessionUsage(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    usage: LanguageModelV2Usage | undefined,
-    providerMetadata: Record<string, unknown> | undefined,
-    logMessage: string,
-    logLevel: "warn" | "error",
-    model: string = streamInfo.model
-  ): Promise<void> {
-    const key = streamInfo.inFlightUsageKey;
-    // Cleared first: a later step (a fallback after a refusal) starts a new in-flight file.
-    streamInfo.inFlightUsageKey = undefined;
-    const result = await this.recordSessionUsage(
-      workspaceId,
-      model,
-      usage,
-      providerMetadata,
-      logMessage,
-      logLevel,
-      streamInfo,
-      key
-    );
-    if (key === undefined) {
-      return;
-    }
-    if (result === "skipped") {
-      await this.discardInFlightKey(workspaceId, streamInfo, key);
-    } else if (result === "failed") {
-      // The file is the only durable record of the finished steps: keep it, and let the
-      // next ledger read fold it.
-      this.sessionUsageService?.releaseInFlightUsage(workspaceId as string, key);
-    }
-  }
-
-  /**
-   * The attempt ends without usage to record (its usage is dropped, or recorded through
-   * another path): delete its in-flight file. Totals match those before in-flight files.
-   */
-  private async discardInFlightSessionUsage(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo
-  ): Promise<void> {
-    const key = streamInfo.inFlightUsageKey;
-    if (key === undefined) {
-      return;
-    }
-    streamInfo.inFlightUsageKey = undefined;
-    await this.discardInFlightKey(workspaceId, streamInfo, key);
-  }
-
   /**
    * A terminal path that recorded no usage (e.g. a completion with no parts) leaves no
    * in-flight file. An abort is not terminal yet here: cleanupAbortedStream settles it after
@@ -3133,40 +2985,8 @@ export class StreamManager {
     streamInfo: WorkspaceStreamInfo
   ): Promise<void> {
     if (streamInfo.terminalCompletion != null) {
-      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
+      await this.usageLedger.discardInFlight(workspaceId, streamInfo);
     }
-  }
-
-  private async discardInFlightKey(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    key: string
-  ): Promise<void> {
-    try {
-      await this.sessionUsageService?.discardInFlightUsage(workspaceId as string, key);
-    } catch (error) {
-      this.getWorkspaceLogger(workspaceId, streamInfo).warn(
-        "Failed to discard in-flight session usage",
-        { error }
-      );
-    }
-  }
-
-  /**
-   * Usage-attribution key, mirroring SessionUsageService.recordHeadlessUsageLocked.
-   * Coder identities keep the stream's PINNED record-time metadata identity
-   * (streamInfo.metadataModel), NOT a live re-resolution of the raw model: a
-   * catalog refresh can remove/retag the instance while the turn is active,
-   * and re-resolving would key the ledger differently from the pricing
-   * identity createDisplayUsage used, so repricing would later change or
-   * strip the row. Non-Coder models resolve to the canonical usage key —
-   * their metadata identity can be a mappedToModel alias target (a pricing
-   * identity, deliberately not the attribution bucket).
-   */
-  private usageAttributionModel(model: string, metadataModel: string | undefined): string {
-    return model.startsWith("coder:") && metadataModel
-      ? metadataModel
-      : normalizeUsageModelKey(model, this.getProvidersConfig());
   }
 
   private buildStreamRequestConfig(input: StreamRequestInput): StreamRequestConfig {
@@ -4517,7 +4337,7 @@ export class StreamManager {
    * Attribute a refused fallback attempt's token usage to the refusing model
    * before the fallback swap wipes per-attempt counters. The toolModelUsages
    * entry is the durable record (session-usage rebuilds scan it per-model); the
-   * live recordSessionUsage call keeps in-memory session totals consistent with it.
+   * live settle keeps in-memory session totals consistent with it.
    */
   private async recordRefusedAttemptUsage(
     workspaceId: WorkspaceId,
@@ -4541,7 +4361,7 @@ export class StreamManager {
       toolName: MODEL_FALLBACK_REFUSAL_TOOL_NAME,
       // Record time: wall clock until #7282 moves its consumers to HostClock.
       timestamp: nodeClock.nowMs(),
-      model: this.usageAttributionModel(refusedModel, streamInfo.metadataModel),
+      model: this.usageLedger.attributionModel(refusedModel, streamInfo.metadataModel),
       metadataModel: streamInfo.metadataModel,
       usage: usage ?? zeroTokenUsage(),
       ...(providerMetadata ? { providerMetadata } : {}),
@@ -4551,7 +4371,7 @@ export class StreamManager {
       return;
     }
 
-    await this.settleSessionUsage(
+    await this.usageLedger.settle(
       workspaceId,
       streamInfo,
       usage,
@@ -4580,7 +4400,7 @@ export class StreamManager {
       return;
     }
 
-    await this.settleSessionUsage(
+    await this.usageLedger.settle(
       workspaceId,
       streamInfo,
       usage,
@@ -5357,7 +5177,7 @@ export class StreamManager {
 
               // Update cumulative session usage (if service is available)
               // Wrapped in try-catch: usage recording is non-critical and shouldn't block stream completion
-              await this.settleSessionUsage(
+              await this.usageLedger.settle(
                 workspaceId,
                 streamInfo,
                 totalUsage,
@@ -5635,7 +5455,7 @@ export class StreamManager {
           : undefined,
         streamInfo.initialMetadata?.costsIncluded
       );
-      await this.settleSessionUsage(
+      await this.usageLedger.settle(
         workspaceId,
         streamInfo,
         cumulativeErrorUsage,
@@ -5645,7 +5465,7 @@ export class StreamManager {
       );
     } else {
       // Refusals recorded their own usage above: drop any in-flight copy.
-      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
+      await this.usageLedger.discardInFlight(workspaceId, streamInfo);
     }
     const errorUsage = terminalRefusalUsage ?? cumulativeErrorUsage;
     const errorProviderMetadata =
@@ -5772,7 +5592,7 @@ export class StreamManager {
 
     if (!preserveUsage) {
       // The dropped attempt's usage is not recorded (refused attempts settled their own).
-      await this.discardInFlightSessionUsage(workspaceId, streamInfo);
+      await this.usageLedger.discardInFlight(workspaceId, streamInfo);
       streamInfo.cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
       streamInfo.cumulativeProviderMetadata = undefined;
       streamInfo.terminalRefusalUsage = undefined;
