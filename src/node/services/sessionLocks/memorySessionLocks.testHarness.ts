@@ -197,13 +197,15 @@ function acquireInMemory(
  * (branchSummary and refinementRollback lock inside the session folder). The place comes first
  * because HostFiles has only an async mkdir: a later caller's folder can be ready first, and it
  * would take the earlier caller's place (phase 4 saw that in 14 of 1500 runs). A failed mkdir
- * rejects as the Node locks do, and gives up the place or the lock.
+ * rejects as the Node locks do, and gives up the place or the lock. So does an abort of signal
+ * (the caller's) during the mkdir: the Node locks check it after their mkdir.
  */
 async function acquireAfterFolder(
   table: MemoryLockTable,
   files: HostFiles,
   lockPath: string,
-  acquire: (giveUp: AbortSignal) => Promise<Entry>
+  acquire: (giveUp: AbortSignal) => Promise<Entry>,
+  signal?: AbortSignal
 ): Promise<Entry> {
   const giveUp = new AbortController();
   // Settled into a value at once: an early refusal must not reject unhandled during the mkdir.
@@ -211,14 +213,19 @@ async function acquireAfterFolder(
     (entry) => ({ entry }),
     (error: unknown) => ({ error })
   );
-  try {
-    await files.promises.mkdir(path.dirname(lockPath), { recursive: true });
-  } catch (error) {
+  /** Gives up the place, or frees the lock that the place already took, and throws error. */
+  const abandon = async (error: unknown): Promise<never> => {
     giveUp.abort();
     const result = await acquired;
     if ("entry" in result) table.free(lockPath, result.entry);
     throw error;
+  };
+  try {
+    await files.promises.mkdir(path.dirname(lockPath), { recursive: true });
+  } catch (error) {
+    return await abandon(error);
   }
+  if (signal?.aborted) return await abandon(abortedAcquireError());
   const result = await acquired;
   if ("error" in result) throw result.error;
   return result.entry;
@@ -361,15 +368,20 @@ export function memorySessionLocks(
           })
         );
       // The folder as crossProcessLock.ts makes it, but no lock record.
-      const entry = await acquireAfterFolder(table, files, lockPath, (giveUp) =>
-        acquireInMemory(
-          table,
-          lockPath,
-          acquireTimeoutMs,
-          clock,
-          refusal,
-          signal === undefined ? giveUp : AbortSignal.any([signal, giveUp])
-        )
+      const entry = await acquireAfterFolder(
+        table,
+        files,
+        lockPath,
+        (giveUp) =>
+          acquireInMemory(
+            table,
+            lockPath,
+            acquireTimeoutMs,
+            clock,
+            refusal,
+            signal === undefined ? giveUp : AbortSignal.any([signal, giveUp])
+          ),
+        signal
       );
       return () => {
         table.free(lockPath, entry);

@@ -306,6 +306,37 @@ test("memory: a failed lock folder rejects with its error and gives up the lock 
   }
 });
 
+test("memory: an abort during the folder's mkdir rejects and frees the lock it took", async () => {
+  const clock = makeTestEffectRunner();
+  try {
+    const folders = heldFolders();
+    const table = new MemoryLockTable();
+    const locks = memorySessionLocks(clock.hostClock, table, folders.files);
+    const lockPath = "/tmp/run/abort.lock";
+    const controller = new AbortController();
+    const acquire = locks
+      .acquireCrossProcessLock({
+        lockPath,
+        acquireTimeoutMs: 0,
+        staleMs: 60_000,
+        timeoutMessage: "record is held.",
+        signal: controller.signal,
+      })
+      .then(
+        () => null,
+        (error: unknown) => error
+      );
+    // The lock was free, so the acquire holds it while its folder is made.
+    expect(table.owner(lockPath)).toBeDefined();
+    controller.abort();
+    folders.finish(0);
+    expect(((await acquire) as Error).message).toBe("Lock acquisition was aborted");
+    expect(table.owner(lockPath)).toBeUndefined();
+  } finally {
+    await clock.dispose();
+  }
+});
+
 test("memory: a held file lock leaves no file at its path", () =>
   onMemory(async (locks, t) => {
     const lockPath = path.join(t.dir, "session", "held.lock");
