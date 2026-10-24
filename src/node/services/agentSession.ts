@@ -58,7 +58,6 @@ import {
   type StartupRecoveryState,
 } from "./startupRecovery";
 import { hasErrorCode } from "./tools/skillFileUtils";
-import { mkdir, readdir, readFile, unlink, writeFile } from "fs/promises";
 import type { Dirent } from "fs";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { PlatformPaths } from "@/common/utils/paths";
@@ -367,6 +366,8 @@ import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { isErrnoWithCode } from "@/node/utils/fs";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
 import {
   listInvocableSkills,
@@ -864,11 +865,14 @@ const AUTO_RETRY_PREFERENCE_FILE = "auto-retry-preference.json";
  */
 export async function clearProviderConfigFixableAbandonMarkers(
   sessionsDir: string,
-  skipWorkspaceIds: ReadonlySet<string>
+  skipWorkspaceIds: ReadonlySet<string>,
+  // The session dirs' files. The default is the host, for the caller outside the loop
+  // (WorkspaceService). Tests pass the memory layer.
+  files: SessionFiles = nodeSessionFiles
 ): Promise<void> {
   let entries: Dirent[];
   try {
-    entries = await readdir(sessionsDir, { withFileTypes: true });
+    entries = await files.promises.readdir(sessionsDir, { withFileTypes: true });
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) {
       return;
@@ -885,7 +889,9 @@ export async function clearProviderConfigFixableAbandonMarkers(
       const preferencePath = path.join(sessionsDir, entry.name, AUTO_RETRY_PREFERENCE_FILE);
       let parsed: { enabled?: unknown; startupAutoRetryAbandon?: unknown };
       try {
-        parsed = JSON.parse(await readFile(preferencePath, "utf-8")) as typeof parsed;
+        parsed = JSON.parse(
+          await files.promises.readFile(preferencePath, "utf-8")
+        ) as typeof parsed;
       } catch {
         // Missing file is the default; corrupt files are self-healed by the
         // session load path when the workspace reopens.
@@ -904,9 +910,13 @@ export async function clearProviderConfigFixableAbandonMarkers(
       // Mirror persistAutoRetryState(): the file only exists to carry an
       // opt-out or an abandon marker, so dropping the last field deletes it.
       if (parsed.enabled === false) {
-        await writeFile(preferencePath, JSON.stringify({ enabled: false }) + "\n", "utf-8");
+        await files.promises.writeFile(
+          preferencePath,
+          JSON.stringify({ enabled: false }) + "\n",
+          "utf-8"
+        );
       } else {
-        await unlink(preferencePath);
+        await files.promises.unlink(preferencePath);
       }
     })
   );
@@ -2703,13 +2713,13 @@ export class AgentSession {
   }
 
   private async readAutoRetryState(): Promise<void> {
-    const raw = await readFile(this.getAutoRetryPreferencePath(), "utf-8").catch(
-      (error: unknown) => {
+    const raw = await this.historyService.files.promises
+      .readFile(this.getAutoRetryPreferencePath(), "utf-8")
+      .catch((error: unknown) => {
         // An unreadable preference is not consent to restart; let bounded admission retry the I/O.
         if (!hasErrorCode(error, "ENOENT")) throw error;
         return null;
-      }
-    );
+      });
     if (this.coordinator.closing) return;
     let parsed: { enabled?: unknown; startupAutoRetryAbandon?: unknown } = {};
     try {
@@ -2768,10 +2778,11 @@ export class AgentSession {
       .then(async () => {
         try {
           if (payload === undefined) {
-            await unlink(preferencePath);
+            await this.historyService.files.promises.unlink(preferencePath);
           } else {
-            await mkdir(path.dirname(preferencePath), { recursive: true });
-            await writeFile(preferencePath, payload, "utf-8");
+            const files = this.historyService.files.promises;
+            await files.mkdir(path.dirname(preferencePath), { recursive: true });
+            await files.writeFile(preferencePath, payload, "utf-8");
           }
         } catch (error) {
           if (payload !== undefined || !isErrnoWithCode(error, "ENOENT")) {
@@ -14042,7 +14053,7 @@ export class AgentSession {
       "exclusions.json"
     );
     try {
-      const data = await readFile(exclusionsPath, "utf-8");
+      const data = await this.historyService.files.promises.readFile(exclusionsPath, "utf-8");
       const exclusions = JSON.parse(data) as PostCompactionExclusions;
       return new Set(exclusions.excludedItems);
     } catch {
@@ -14081,7 +14092,7 @@ export class AgentSession {
     const todoPath = path.join(this.config.sessionsDir, this.workspaceId, "todos.json");
 
     try {
-      const data = await readFile(todoPath, "utf-8");
+      const data = await this.historyService.files.promises.readFile(todoPath, "utf-8");
       const parsed: unknown = JSON.parse(data);
       const todos = this.coerceTodoItems(parsed);
       if (todos.length === 0) {

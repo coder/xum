@@ -6,6 +6,7 @@
  * its code reached. Outcomes reject like execFileAsync does: an Error whose message is the
  * stderr (or the exit code) and that carries code, signal, stdout and stderr.
  */
+import assert from "@/common/utils/assert";
 import type { ExecFileAsyncOptions } from "@/node/utils/disposableExec";
 import type { HostProcess, HostProcesses } from "./hostProcesses";
 
@@ -92,20 +93,40 @@ export function refuseSetOptions(
   }
 }
 
-/** Runs one call on the table, under the option rules of refuseSetOptions. */
+/**
+ * The outcome of the entry for line, or undefined when the table has none. line is the key:
+ * commandLine of the call for HostProcesses, the whole shell command for FakeRuntime.exec.
+ * A function entry first refuses each of `functionRefuses` that is set in `options`.
+ */
+export async function lookupScriptedCommand(
+  table: ScriptTable,
+  line: string,
+  call: ScriptedCall,
+  options?: object,
+  functionRefuses: readonly string[] = []
+): Promise<ScriptedOutcome | undefined> {
+  const entry = Object.hasOwn(table, line) ? table[line] : undefined;
+  if (entry === undefined || typeof entry !== "function") return entry;
+  refuseSetOptions(line, options, functionRefuses);
+  return await entry(call);
+}
+
+/**
+ * Runs one call on the table, under the option rules of refuseSetOptions, and rejects like
+ * execFileAsync on a non-zero exit.
+ */
 export async function runScriptedCommand(
   table: ScriptTable,
   call: ScriptedCall,
   options?: ExecFileAsyncOptions
 ): Promise<{ stdout: string; stderr: string }> {
   const line = commandLine(call.file, call.args);
-  const entry = Object.hasOwn(table, line) ? table[line] : undefined;
-  if (entry === undefined) {
+  if (!Object.hasOwn(table, line)) {
     throw execError(`No scripted command: ${line}`, null, "", "");
   }
   refuseSetOptions(line, options, ["onStderrData"]);
-  if (typeof entry === "function") refuseSetOptions(line, options, ["timeoutMs", "env"]);
-  const outcome = typeof entry === "function" ? await entry(call) : entry;
+  const outcome = await lookupScriptedCommand(table, line, call, options, ["timeoutMs", "env"]);
+  assert(outcome !== undefined, "the entry exists");
   const stdout = outcome.stdout ?? "";
   const stderr = outcome.stderr ?? "";
   // execFileAsync kills the child once stdout and stderr together pass the cap.
