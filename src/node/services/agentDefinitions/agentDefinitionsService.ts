@@ -433,7 +433,7 @@ function listCandidateAgentFiles(
 ): Promise<string[]> {
   return scan.pluginFs == null && isRemoteRuntime(scan.runtime)
     ? listAgentFilesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
-    : listAgentFiles(scan.pluginFs ?? scan.hostFs, resolvedRoot);
+    : listAgentFiles(candidateFs(scan), resolvedRoot);
 }
 
 /** A scan root, resolved. A remote plugin root is already a real remote path: no round trip. */
@@ -443,6 +443,14 @@ function resolveCandidateRoot(
   return candidate.pluginFs != null
     ? Promise.resolve(candidate.root)
     : candidate.runtime.resolvePath(candidate.root);
+}
+
+/** The filesystem of a candidate's plugin reads: its remote snapshot, else the host's. */
+function candidateFs(
+  candidate: Pick<AgentDefinitionScanCandidate, "pluginFs" | "hostFs">
+): PluginFs {
+  // mutation-equivalent: pluginFs is a PluginFs object or undefined, so ?? and || agree
+  return candidate.pluginFs ?? candidate.hostFs;
 }
 
 /** A plugin agent file: from its remote snapshot, else the host's contained reader (hostFs). */
@@ -712,7 +720,7 @@ export async function discoverAgentDefinitions(
           pluginRoot: scan.pluginRoot,
           filePath,
           agentId,
-          pluginFs: scan.pluginFs ?? scan.hostFs,
+          pluginFs: candidateFs(scan),
         });
         if (!contained) continue;
       }
@@ -725,7 +733,7 @@ export async function discoverAgentDefinitions(
         scan.pluginName,
         scan.pluginRoot,
         scan.pluginConsent,
-        scan.pluginFs ?? scan.hostFs
+        candidateFs(scan)
       );
       if (!descriptor) continue;
 
@@ -957,7 +965,7 @@ async function loadAgentDefinition(
         pluginRoot: candidate.pluginRoot,
         agentsDir: resolvedRoot,
         agentId,
-        pluginFs: candidate.pluginFs ?? candidate.hostFs,
+        pluginFs: candidateFs(candidate),
       });
       if (pluginFile === null) continue;
       filePath = pluginFile;
@@ -972,7 +980,7 @@ async function loadAgentDefinition(
         // This frontmatter controls agent policy (runnable/base/tools), so a
         // replacement symlink promoted after isPluginAgentContained must not
         // have its outside target read here.
-        const result = await readPluginAgentFile(candidate.pluginFs ?? candidate.hostFs, {
+        const result = await readPluginAgentFile(candidateFs(candidate), {
           filePath,
           pluginRoot: candidate.pluginRoot,
           maxBytes: MAX_FILE_SIZE,

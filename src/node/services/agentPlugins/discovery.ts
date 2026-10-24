@@ -1669,10 +1669,17 @@ export async function discoverAgentPlugins(
     fs?: PluginFs;
   }
 ): Promise<DiscoverAgentPluginsResult> {
-  if (options?.fs !== undefined) {
-    const { fs, ...rest } = options;
-    return await pluginFsStorage.run(fs, () => discoverAgentPlugins(containers, rest));
-  }
+  const fs = options?.fs;
+  return fs === undefined
+    ? await discoverAgentPluginsOnCurrentFs(containers, options)
+    : await pluginFsStorage.run(fs, () => discoverAgentPluginsOnCurrentFs(containers, options));
+}
+
+/** discoverAgentPlugins on the current PluginFs (pluginFs()). */
+async function discoverAgentPluginsOnCurrentFs(
+  containers: AgentPluginContainer[],
+  options: { managedHome?: string } | undefined
+): Promise<DiscoverAgentPluginsResult> {
   let plugins: AgentPluginInfo[] = [];
   let diagnostics: AgentPluginDiagnostic[] = [];
   // Consent and recovery belong to the physical container, not its spelling.

@@ -2980,9 +2980,9 @@ describe("agentSkillsService host filesystem", () => {
       options
     );
 
-    expect(skills.map((descriptor) => descriptor.name)).toEqual(
-      expect.arrayContaining(["demo", "helper"])
-    );
+    const names = skills.map((descriptor) => descriptor.name);
+    expect(names).toContain("demo");
+    expect(names).toContain("helper");
     expect(helper.pluginRoot).toBe(plugin);
     expect(helper.package.body).toContain("Body");
   });

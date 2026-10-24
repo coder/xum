@@ -1569,12 +1569,9 @@ describe("agentDefinitionsService host filesystem", () => {
       options
     );
 
-    expect(agents.map((agent) => [agent.id, agent.scope])).toEqual(
-      expect.arrayContaining([
-        ["helper", "project"],
-        ["reviewer", "global"],
-      ])
-    );
+    const found = agents.map((agent) => `${agent.id}:${agent.scope}`);
+    expect(found).toContain("helper:project");
+    expect(found).toContain("reviewer:global");
     expect(reviewer.body).toContain("Review.");
   });
 });
