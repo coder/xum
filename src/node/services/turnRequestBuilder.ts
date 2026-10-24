@@ -3039,6 +3039,7 @@ export class TurnRequestBuilder {
             workspaceId,
             sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             kernelFileLoader,
+            locks: this.dependencies.historyService.locks,
           },
         });
         if (options.recordTimings) {
