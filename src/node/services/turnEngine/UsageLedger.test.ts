@@ -263,4 +263,72 @@ describe("UsageLedger", () => {
       expect(totalTokens(await afterRestart())).toBe(1_100);
     });
   });
+
+  describe("usage state", () => {
+    test("finished steps add up, and the last step is kept for the context display", () => {
+      const attempt = turn(UsageLedger.initialState());
+      const second = { inputTokens: 1_500, outputTokens: 50, totalTokens: 1_550 };
+      ledger.recordStep(attempt, STEP, { anthropic: { cacheCreationInputTokens: 10 } });
+      ledger.recordStep(attempt, second, undefined);
+
+      expect(attempt.cumulativeUsage).toMatchObject({
+        inputTokens: 2_500,
+        outputTokens: 150,
+        totalTokens: 2_650,
+      });
+      expect(attempt.lastStepUsage).toEqual(second);
+      expect(attempt.lastStepProviderMetadata).toBeUndefined();
+      expect(attempt.cumulativeProviderMetadata).toMatchObject({
+        anthropic: { cacheCreationInputTokens: 10 },
+      });
+    });
+
+    test("end usage is the live total after a preserved-usage restart or without an SDK total", () => {
+      const attempt = turn({ cumulativeUsage: { ...TWO_STEPS } });
+      const sdkTotal = { ...STEP };
+
+      expect(ledger.endUsage(attempt, sdkTotal, false)).toBe(sdkTotal);
+      expect(ledger.endUsage(attempt, sdkTotal, true)).toEqual(TWO_STEPS);
+      expect(ledger.endUsage(attempt, undefined, false)).toEqual(TWO_STEPS);
+      // No live total to fall back to: the SDK total stands.
+      expect(ledger.endUsage(turn(UsageLedger.initialState()), sdkTotal, true)).toBe(sdkTotal);
+    });
+
+    test("end provider metadata is a copy of the live metadata only after a preserved-usage restart", () => {
+      const metadata = { anthropic: { cacheCreationInputTokens: 10 } };
+      const attempt = turn({ cumulativeProviderMetadata: metadata });
+
+      expect(ledger.preservedEndProviderMetadata(attempt, false)).toBeUndefined();
+      const preserved = ledger.preservedEndProviderMetadata(attempt, true);
+      expect(preserved).toEqual(metadata);
+      expect(preserved).not.toBe(metadata);
+      expect(ledger.preservedEndProviderMetadata(turn(), true)).toBeUndefined();
+    });
+
+    test("a retry reset drops the attempt's in-flight usage and zeroes its totals", async () => {
+      const attempt = turn(UsageLedger.initialState());
+      ledger.recordStep(attempt, STEP, undefined);
+      await ledger.recordInFlight(WORKSPACE_ID, attempt);
+      await ledger.recordTerminalRefusal(WORKSPACE_ID, attempt, MODEL, {});
+
+      await ledger.resetForRetry(WORKSPACE_ID, attempt);
+      expect(await inFlightFiles()).toEqual([]);
+      expect(totalTokens(await afterRestart())).toBe(0);
+      expect(attempt).toMatchObject({
+        cumulativeUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        cumulativeProviderMetadata: undefined,
+        terminalRefusalUsage: undefined,
+        lastStepUsage: undefined,
+      });
+    });
+
+    test("a recorded tool-model usage is a copy the caller cannot change later", () => {
+      const attempt = turn();
+      const event = { toolName: "task", timestamp: 1, model: MODEL, usage: { ...STEP } };
+      ledger.recordToolModelUsage(attempt, event);
+      event.usage.inputTokens = 0;
+
+      expect(attempt.toolModelUsages[0]?.usage).toEqual(STEP);
+    });
+  });
 });
