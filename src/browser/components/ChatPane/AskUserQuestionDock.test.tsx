@@ -18,6 +18,19 @@ import { buildAskUserQuestionAnswerMessage } from "@/common/utils/tools/askUserQ
 // The same harness as AskUserQuestionToolCall.test.tsx: the real APIProvider with a test client,
 // and the WorkspaceStore overlay serving this suite's transcript.
 let messages: DisplayedMessage[] = [];
+// A stable snapshot per transcript: the blocking card reads it through useSyncExternalStore.
+let workspaceState = {
+  autoRetryStatus: null,
+  isStreamStarting: false,
+  canInterrupt: false,
+  messages,
+};
+function getWorkspaceState() {
+  if (workspaceState.messages !== messages) {
+    workspaceState = { ...workspaceState, messages };
+  }
+  return workspaceState;
+}
 
 const sendMessageData: Record<string, never> = {};
 const sendMessage = mock((_input: unknown) =>
@@ -32,12 +45,7 @@ void mock.module("@/browser/stores/WorkspaceStore", () => ({
   useWorkspaceStoreRaw: () =>
     overlayWorkspaceStoreRaw(actualWorkspaceStore.useWorkspaceStoreRaw(), {
       subscribeKey: (_workspaceId: string, _listener: () => void) => () => undefined,
-      getWorkspaceState: (_workspaceId: string) => ({
-        autoRetryStatus: null,
-        isStreamStarting: false,
-        canInterrupt: false,
-        messages,
-      }),
+      getWorkspaceState: (_workspaceId: string) => getWorkspaceState(),
     }),
 }));
 
@@ -70,7 +78,7 @@ function questionRow(
   toolCallId: string,
   questions: AskUserQuestionQuestion[],
   answers?: Record<string, string>
-): DisplayedMessage {
+): Extract<DisplayedMessage, { type: "tool" }> {
   return {
     type: "tool",
     id,
@@ -196,6 +204,26 @@ describe("AskUserQuestionDock", () => {
 
     await waitFor(() => expect(view.getByText(/later question replaced/)).toBeTruthy());
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("a blocking question keeps its own card after the chained form", () => {
+    // Plan mode: the call still executes and waits for its answer, so it has no result yet.
+    const blocking: DisplayedMessage = {
+      ...questionRow("row-plan", "ask-plan", [PLATFORMS]),
+      result: undefined,
+      status: "executing",
+    };
+    messages = [blocking, ROW_A];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+
+    // Two forms: the chain (first, despite the blocking row coming first) and the blocking card.
+    const nextButtons = view.getAllByRole("button", { name: "Next" });
+    expect(nextButtons).toHaveLength(2);
+    const storage = view.getByText(STORAGE.question);
+    const platforms = view.getByText(PLATFORMS.question);
+    expect(
+      storage.compareDocumentPosition(platforms) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
   });
 
   test("drafts and the active tab survive a remount", () => {
