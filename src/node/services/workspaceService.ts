@@ -6079,10 +6079,12 @@ export class WorkspaceService
     }
     try {
       const runtime = createRuntimeForWorkspace(metadata);
-      const result = await importLegacyRemotePlan(this.config, runtime, {
-        ...metadata,
-        id: workspaceId,
-      });
+      const result = await importLegacyRemotePlan(
+        this.config,
+        runtime,
+        { ...metadata, id: workspaceId },
+        this.historyService.locks
+      );
       return Ok({ status: result.status, planPath: await runtime.resolvePath(result.planPath) });
     } catch (error) {
       return Err(`Failed to import the plan: ${getErrorMessage(error)}`);
@@ -9015,7 +9017,7 @@ export class WorkspaceService
       });
     }
     try {
-      await markRemotePlanMigratedForDeletion(this.config, owner);
+      await markRemotePlanMigratedForDeletion(this.config, owner, this.historyService.locks);
     } catch (error) {
       log.warn("Failed to mark the plan of a removed workspace migrated", {
         workspaceId,
@@ -18768,7 +18770,7 @@ export class WorkspaceService
       await resolvePlanFilePath(this.config, runtime, owner);
       if (options.markMigrated === true) {
         try {
-          await markRemotePlanMigratedForDeletion(this.config, owner);
+          await markRemotePlanMigratedForDeletion(this.config, owner, this.historyService.locks);
         } catch (error) {
           return Err({
             type: "delete_failed",
@@ -18797,7 +18799,7 @@ export class WorkspaceService
     >,
     runtime: Runtime
   ): Promise<PlanFileLocation> {
-    return resolvePlanFileLocation(this.config, runtime, metadata);
+    return resolvePlanFileLocation(this.config, runtime, metadata, this.historyService.locks);
   }
 
   /**

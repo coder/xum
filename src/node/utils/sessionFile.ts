@@ -4,7 +4,8 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import type { Config } from "@/node/config";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { log } from "@/node/services/log";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -33,11 +34,13 @@ export interface SessionFileWriteOptions {
 export class SessionFileManager<T> {
   private readonly config: Config;
   private readonly fileName: string;
-  private readonly fileLocks = workspaceFileLocks;
+  private readonly fileLocks: SessionLocks["workspaceFiles"];
 
-  constructor(config: Config, fileName: string) {
+  /** `locks` gives the workspace FIFO (phase 4: SessionLocks). Callers keep the Node default. */
+  constructor(config: Config, fileName: string, locks: SessionLocks = nodeSessionLocks) {
     this.config = config;
     this.fileName = fileName;
+    this.fileLocks = locks.workspaceFiles;
   }
 
   private getFilePath(workspaceId: string): string {
