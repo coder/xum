@@ -94,7 +94,11 @@ function canonicalizeUrlForSchemeCheck(value: string): string {
   for (const char of normalized) {
     const charCode = char.charCodeAt(0);
     const isAsciiControl = charCode <= 0x1f || charCode === 0x7f;
-    if (isAsciiControl || /\s/.test(char)) {
+    // The HTML parser turns an invalid numeric reference (java&#1114112;script:) into U+FFFD
+    // before this check sees the value. Drop it like the other separators, so the check fails
+    // closed and never depends on how a parser decodes such a reference.
+    const isReplacementChar = charCode === 0xfffd;
+    if (isAsciiControl || isReplacementChar || /\s/.test(char)) {
       continue;
     }
 

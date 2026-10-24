@@ -1,6 +1,7 @@
 import type { CompletedMessagePart } from "@/common/types/stream";
 import { TURN_STOP_PROMPT_MAX_CHARS } from "@/node/services/agentPlugins/promptHooks";
 import { isSuccessfulToolResult } from "@/node/services/aiServiceEventGuards";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { TODO_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
 
@@ -24,6 +25,8 @@ function isSuccessfulTodoWrite(call: { toolName: string; state: string; output?:
 export async function needsTodoTurnEndNudge(input: {
   sessionDir: string;
   parts: readonly CompletedMessagePart[];
+  /** The session files that todo_write writes (the memory volume in the in-memory loop). */
+  files: SessionFiles;
 }): Promise<boolean> {
   const wroteTodos = input.parts.some(
     (part) =>
@@ -34,7 +37,7 @@ export async function needsTodoTurnEndNudge(input: {
   );
   if (!wroteTodos) return false;
 
-  const todos = await readTodosForSessionDir(input.sessionDir);
+  const todos = await readTodosForSessionDir(input.sessionDir, input.files);
   return todos.some((todo) => todo.status !== "completed");
 }
 

@@ -315,7 +315,7 @@ describe("Unread indicator (mock AI router)", () => {
 
       // Simulate the user alt-tabbing back while settings still covers the chat.
       const lastReadBeforeFocus = getLastReadTimestamp(app.workspaceId);
-      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new window.Event("focus"));
 
       expect(getLastReadTimestamp(app.workspaceId)).toBe(lastReadBeforeFocus);
       expect(getWorkspaceUnreadState(app.workspaceId).isUnread(lastReadBeforeFocus)).toBe(true);

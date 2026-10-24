@@ -16,6 +16,8 @@ import {
   ProviderModelFactory,
 } from "./providerModelFactory";
 import { createTestHistoryService } from "./testHistoryService";
+import { createMemoryHost } from "@/node/services/hostFiles/memoryHostFiles.testHarness";
+import { fakeRuntimeFactory } from "@/node/services/runtimeFactory/fakeRuntimeFactory.testHarness";
 import { buildRequiredToolPatterns } from "@/common/utils/tools/toolPolicy";
 import { HistoryService } from "./historyService";
 import { CompactionCancellation } from "./compactionCancellation";
@@ -6579,5 +6581,56 @@ describe("discoverAvailableSubagentsForToolContext", () => {
     expect(desktop).toBeDefined();
     expect(desktop?.scope).toBe("project");
     expect(desktop?.subagentRunnable).toBe(true);
+  });
+});
+
+describe("AIService runtimes", () => {
+  it("builds the workspace runtime through the RuntimeFactory it was given", async () => {
+    const testHistory = await createTestHistoryService();
+    try {
+      const config = new Config(testHistory.tempDir);
+      const projectPath = path.join(testHistory.tempDir, "project");
+      const metadata = createLocalWorkspaceMetadata("ws-runtimes", projectPath);
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          trusted: true,
+          workspaces: [
+            {
+              path: path.join(projectPath, metadata.name),
+              id: metadata.id,
+              name: metadata.name,
+              runtimeConfig: metadata.runtimeConfig,
+            },
+          ],
+        });
+        return cfg;
+      });
+      const host = createMemoryHost();
+      const providersConfigStore = new ProvidersConfigStore(config.rootDir);
+      const service = new AIService(
+        config,
+        testHistory.historyService,
+        new InitStateManager(config),
+        new ProviderService(config, providersConfigStore),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        providersConfigStore,
+        undefined,
+        { runtimeFactory: fakeRuntimeFactory(host.runtime) }
+      );
+
+      const context = service.createWorkspaceRuntimeContext(metadata.id, metadata);
+
+      if (!context.success) throw new Error(`no runtime context: ${JSON.stringify(context.error)}`);
+      expect(context.data.runtime).toBe(host.runtime);
+    } finally {
+      await testHistory.cleanup();
+    }
   });
 });

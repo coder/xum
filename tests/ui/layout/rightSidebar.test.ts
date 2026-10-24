@@ -1134,7 +1134,7 @@ describeIntegration("RightSidebar (UI)", () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
       // Force a narrow viewport so the right sidebar max clamp is exercised.
       Object.defineProperty(window, "innerWidth", { value: 900, configurable: true });
-      window.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(new window.Event("resize"));
     });
 
     try {

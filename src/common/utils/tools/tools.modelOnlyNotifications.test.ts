@@ -6,10 +6,14 @@ import * as path from "path";
 
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { buildSessionFiles } from "@/node/services/sessionFiles/buildSessionFiles.testHarness";
+import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
 import { setTodosForSessionDir } from "@/node/services/tools/todo";
 
 import { MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD } from "./internalToolResultFields";
 import { getToolsForModel } from "./tools";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 type ToolExecuteFn = (args?: unknown, options?: unknown) => Promise<unknown>;
 
@@ -39,11 +43,17 @@ describe("getToolsForModel - model-only notifications", () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-ws-"));
 
     try {
-      await setTodosForSessionDir("ws-1", workspaceSessionDir, [
-        { content: "Completed", status: "completed" },
-        { content: "In progress", status: "in_progress" },
-        { content: "Pending", status: "pending" },
-      ]);
+      await setTodosForSessionDir(
+        "ws-1",
+        workspaceSessionDir,
+        [
+          { content: "Completed", status: "completed" },
+          { content: "In progress", status: "in_progress" },
+          { content: "Pending", status: "pending" },
+        ],
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
 
       const runtime = new LocalRuntime(process.cwd());
       const initStateManager = {
@@ -83,9 +93,13 @@ describe("getToolsForModel - model-only notifications", () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-ws-"));
 
     try {
-      await setTodosForSessionDir("ws-1", workspaceSessionDir, [
-        { content: "In progress", status: "in_progress" },
-      ]);
+      await setTodosForSessionDir(
+        "ws-1",
+        workspaceSessionDir,
+        [{ content: "In progress", status: "in_progress" }],
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
 
       const runtime = new LocalRuntime(process.cwd());
       const initStateManager = {
@@ -180,9 +194,13 @@ describe("getToolsForModel - model-only notifications", () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-ws-"));
 
     try {
-      await setTodosForSessionDir("ws-1", workspaceSessionDir, [
-        { content: "In progress", status: "in_progress" },
-      ]);
+      await setTodosForSessionDir(
+        "ws-1",
+        workspaceSessionDir,
+        [{ content: "In progress", status: "in_progress" }],
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
 
       const runtime = new LocalRuntime(process.cwd());
       const initStateManager = {
@@ -218,6 +236,47 @@ describe("getToolsForModel - model-only notifications", () => {
 
       const fifth = asRecord(await todoReadExecute());
       expect(Array.isArray(fifth[MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD])).toBe(true);
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
+  test("the reminder reads the list that todo_write left in the session's SessionFiles", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-ws-"));
+
+    try {
+      const initStateManager = {
+        waitForInit: () => Promise.resolve(),
+      } as unknown as InitStateManager;
+      const tools = await getToolsForModel(
+        "noop:model",
+        {
+          cwd: process.cwd(),
+          runtime: new LocalRuntime(process.cwd()),
+          runtimeTempDir: "/tmp",
+          workspaceId: "ws-1",
+          workspaceSessionDir,
+          sessionFiles: buildSessionFiles(SessionFilesMemory),
+        },
+        "ws-1",
+        initStateManager
+      );
+
+      await getExecute(tools.todo_write)(
+        { todos: [{ content: "In progress", status: "in_progress" }] },
+        { toolCallId: "todo-1", messages: [] }
+      );
+      const todoReadExecute = getExecute(tools.todo_read);
+      for (let i = 0; i < 4; i += 1) {
+        const result = asRecord(await todoReadExecute());
+        expect(MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD in result).toBe(false);
+      }
+
+      const fifth = asRecord(await todoReadExecute());
+      expect(String((fifth[MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD] as unknown[])[0])).toContain(
+        "- [>] In progress"
+      );
+      expect(await fs.readdir(workspaceSessionDir)).toEqual([]);
     } finally {
       await fs.rm(workspaceSessionDir, { recursive: true, force: true });
     }
