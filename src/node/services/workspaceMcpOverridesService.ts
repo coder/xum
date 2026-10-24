@@ -1697,7 +1697,7 @@ export class WorkspaceMcpOverridesService {
       const raced = await raceWithAbortAndTimeout(resolution, {
         ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
         ...(options.signal !== undefined ? { signal: options.signal } : {}),
-        ...(options.clock !== undefined ? { clock: options.clock } : {}),
+        clock: options.clock,
       });
       if (raced.kind !== "ok") {
         snapshot.cancel();
