@@ -1119,6 +1119,246 @@ function isAnthropicOverloadError(error: unknown): boolean {
   return false;
 }
 
+/** The request fields the stop conditions read, and the stop cause they record. */
+type StopWhenRequest = Pick<
+  StreamRequestConfig,
+  | "hasQueuedMessages"
+  | "getQueuedInputStopCause"
+  | "stopCause"
+  | "toolPolicy"
+  | "onStepSettled"
+  | "modelString"
+  | "tools"
+  | "budgetMetadataModel"
+  | "contextBudgetLimit"
+  | "system"
+  | "messages"
+  | "toolSearchState"
+>;
+
+type StopConditionOptions = Parameters<ReturnType<typeof stepCountIs>>[0];
+type StopConditionStep = StopConditionOptions["steps"][number];
+
+// Completion-tool stop check: completion/routing tools use explicit
+// success/ok markers (agent_report, propose_plan).
+// When a marker is present, respect it — success:false means the tool
+// should be retried, so don't stop. When no marker is present (e.g.,
+// MCP tools, arbitrary required tools), treat non-null object results
+// as successful completion unless the result is error-shaped.
+export function isSuccessfulToolOutput(output: unknown): boolean {
+  if (typeof output !== "object" || output === null) {
+    return false;
+  }
+  const parsedOutput = output as Record<string, unknown>;
+  if ("success" in parsedOutput) {
+    return parsedOutput.success === true;
+  }
+  if ("ok" in parsedOutput) {
+    return parsedOutput.ok === true;
+  }
+  if (parsedOutput.error != null || parsedOutput.isError === true) {
+    return false;
+  }
+  return true;
+}
+
+/** The last step returned a successful result from a tool the policy requires. */
+export function hasSuccessfulRequiredToolResult(
+  { steps }: StopConditionOptions,
+  requiredPatterns: readonly RegExp[]
+): boolean {
+  if (requiredPatterns.length === 0) {
+    return false;
+  }
+  const lastStep = steps[steps.length - 1];
+  return (
+    lastStep?.toolResults?.some(
+      (toolResult) =>
+        // A context-lifecycle request is never a terminal completion, even if a policy
+        // lists it as required; otherwise its success would end the stream before the
+        // settled-step callback could schedule the rollover it promised.
+        toolResult.toolName !== "new_context" &&
+        requiredPatterns.some((pattern) => pattern.test(toolResult.toolName)) &&
+        isSuccessfulToolOutput(toolResult.output)
+    ) ?? false
+  );
+}
+
+/**
+ * Record a settled step's budget decision as the stop cause and say whether to stop.
+ * A blocked decision throws: the settled results do not fit the context budget.
+ */
+export function applyContextBudgetDecision(
+  request: Pick<StreamRequestConfig, "stopCause">,
+  { decision, continuationEntryId }: SettledStepOutcome
+): boolean {
+  // All siblings have settled: stop before another provider step without discarding results.
+  if (decision !== "continue") {
+    // The session captured its designated successor when it decided; a blocked stop hands
+    // over to nothing.
+    request.stopCause ??= {
+      kind: "context-budget",
+      decision,
+      ...(decision !== "block" && continuationEntryId != null ? { continuationEntryId } : {}),
+    };
+  }
+  if (decision === "block")
+    throw new ContextBudgetBlockedError(
+      "The settled tool results exceed the context budget. Use /compact or start a new context before continuing."
+    );
+  return decision !== "continue";
+}
+
+/**
+ * Estimate the next step's request the way its preflight will (#4855): this step's input
+ * plus its response messages, anchored on this step's usage like prepareStep.
+ */
+async function estimateNextRequestTokens(
+  request: Pick<
+    StreamRequestConfig,
+    | "modelString"
+    | "tools"
+    | "budgetMetadataModel"
+    | "contextBudgetLimit"
+    | "system"
+    | "messages"
+    | "toolSearchState"
+  >,
+  stepTracker: StepMessageTracker | undefined,
+  steps: StopConditionOptions["steps"],
+  step: StopConditionStep
+): Promise<number | undefined> {
+  // The next step's preflight hard-stops on the assembled estimate, which can exceed
+  // provider-reported usage by ~10% (#4855). Measure that same request here so the
+  // budget decision can roll over before the preflight blocks. Invariant: this measure
+  // is never below the one prepareStep will enforce for the next step. The SDK builds
+  // the next input as this step's input plus its response messages.
+  const nextMessages =
+    request.contextBudgetLimit == null
+      ? undefined
+      : dedupeNativeToolReferences(
+          await transformStepMessages([
+            ...(stepTracker?.latestMessages ?? [
+              ...request.messages,
+              ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
+            ]),
+            ...step.response.messages,
+          ])
+        );
+  const nextRequest =
+    nextMessages == null
+      ? undefined
+      : await estimateAnchoredRequestTokensForModel(
+          {
+            system: request.system,
+            messages: nextMessages,
+            tools: isAgentToolsDisabled() ? undefined : request.tools,
+          },
+          {
+            model: request.modelString,
+            metadataModel: request.budgetMetadataModel,
+            modelContextLimit: request.contextBudgetLimit,
+            activeTools: computeContextLoadedToolNames(request.toolSearchState, nextMessages),
+          },
+          // prepareStep anchors the next step on this same request and usage, so both
+          // measures take the same anchored-or-full branch and the invariant holds.
+          createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
+        );
+  return nextRequest?.estimate;
+}
+
+/** The request's stop cause, as the stream-end helpers read it. */
+interface StopCauseHolder {
+  readonly request: Pick<StreamRequestConfig, "stopCause">;
+}
+
+/** The stream-end event of a completed stream, with its final metadata and parts. */
+export function buildStreamEndEvent(
+  workspaceId: WorkspaceId,
+  streamInfo: Pick<
+    WorkspaceStreamInfo,
+    | "messageId"
+    | "model"
+    | "metadataModel"
+    | "thinkingLevel"
+    | "initialMetadata"
+    | "toolModelUsages"
+    | "historySequence"
+    | "parts"
+  > &
+    StopCauseHolder,
+  end: {
+    totalUsage: StreamEndEvent["metadata"]["usage"];
+    contextUsage: StreamEndEvent["metadata"]["contextUsage"];
+    providerMetadata: StreamEndEvent["metadata"]["providerMetadata"];
+    contextProviderMetadata: StreamEndEvent["metadata"]["contextProviderMetadata"];
+    finishReason: StreamEndEvent["metadata"]["finishReason"];
+    duration: number;
+    ttftMs: number | undefined;
+  }
+): StreamEndEvent {
+  const {
+    totalUsage,
+    contextUsage,
+    providerMetadata,
+    contextProviderMetadata,
+    finishReason,
+    duration,
+    ttftMs,
+  } = end;
+  const canonicalModel = metadataModelIdentity(streamInfo.model);
+  const toolModelUsages =
+    streamInfo.toolModelUsages.length > 0
+      ? streamInfo.toolModelUsages.map(clonePersistedToolModelUsage)
+      : undefined;
+
+  // Emit stream end event with parts preserved in temporal order
+  const streamEndEvent: StreamEndEvent = {
+    type: "stream-end",
+    workspaceId: workspaceId as string,
+    messageId: streamInfo.messageId,
+    ...(streamInfo.initialMetadata?.acpPromptId != null
+      ? { acpPromptId: streamInfo.initialMetadata.acpPromptId }
+      : {}),
+    metadata: {
+      ...streamInfo.initialMetadata, // TurnRequestBuilder-provided metadata (systemMessageTokens, etc)
+      model: canonicalModel,
+      metadataModel: streamInfo.metadataModel,
+      ...(streamInfo.thinkingLevel && {
+        thinkingLevel: streamInfo.thinkingLevel as ThinkingLevel,
+      }),
+      usage: totalUsage, // Total across all steps (for cost calculation)
+      contextUsage, // Last step only (for context window display)
+      providerMetadata, // Aggregated (for cost calculation)
+      contextProviderMetadata, // Last step (for context window display)
+      ...(toolModelUsages != null ? { toolModelUsages } : {}),
+      ...(finishReason !== undefined && { finishReason }),
+      ...(streamInfo.request.stopCause != null && {
+        stopCause: streamInfo.request.stopCause,
+      }),
+      historySequence: streamInfo.historySequence,
+      duration,
+      ...(ttftMs !== undefined && { ttftMs }),
+    },
+    parts: streamInfo.parts, // Parts array with temporal ordering (includes reasoning)
+  };
+  return streamEndEvent;
+}
+
+/**
+ * The finish reason a completed stream persists. Required-tool completion must remain
+ * successful after downgrade or crash recovery: keep the internal stop cause, but persist
+ * the legacy-compatible terminal signal.
+ */
+export function resolveStreamEndFinishReason(
+  streamInfo: Pick<WorkspaceStreamInfo, "terminalFinishReason"> & StopCauseHolder,
+  providerFinishReason: StreamEndEvent["metadata"]["finishReason"]
+): StreamEndEvent["metadata"]["finishReason"] {
+  return streamInfo.request.stopCause?.kind === "required-tool"
+    ? "stop"
+    : (streamInfo.terminalFinishReason ?? providerFinishReason);
+}
+
 /** A tool call that PTC code_execution made, as its kernel reports it. */
 interface NestedToolEvent {
   type: "tool-call-start" | "tool-call-end";
@@ -2816,67 +3056,10 @@ export class StreamManager {
   }
 
   private createStopWhenCondition(
-    request: Pick<
-      StreamRequestConfig,
-      | "hasQueuedMessages"
-      | "getQueuedInputStopCause"
-      | "stopCause"
-      | "toolPolicy"
-      | "onStepSettled"
-      | "modelString"
-      | "tools"
-      | "budgetMetadataModel"
-      | "contextBudgetLimit"
-      | "system"
-      | "messages"
-      | "toolSearchState"
-    >,
+    request: StopWhenRequest,
     stepTracker?: StepMessageTracker
   ): Array<ReturnType<typeof stepCountIs>> {
-    // Completion-tool stop check: completion/routing tools use explicit
-    // success/ok markers (agent_report, propose_plan).
-    // When a marker is present, respect it — success:false means the tool
-    // should be retried, so don't stop. When no marker is present (e.g.,
-    // MCP tools, arbitrary required tools), treat non-null object results
-    // as successful completion unless the result is error-shaped.
-    const isSuccessfulOutput = (output: unknown): boolean => {
-      if (typeof output !== "object" || output === null) {
-        return false;
-      }
-      const parsedOutput = output as Record<string, unknown>;
-      if ("success" in parsedOutput) {
-        return parsedOutput.success === true;
-      }
-      if ("ok" in parsedOutput) {
-        return parsedOutput.ok === true;
-      }
-      if (parsedOutput.error != null || parsedOutput.isError === true) {
-        return false;
-      }
-      return true;
-    };
-
     const requiredPatterns = buildRequiredToolPatterns(request.toolPolicy);
-
-    const hasSuccessfulRequiredToolResult = ({
-      steps,
-    }: Parameters<ReturnType<typeof stepCountIs>>[0]): boolean => {
-      if (requiredPatterns.length === 0) {
-        return false;
-      }
-      const lastStep = steps[steps.length - 1];
-      return (
-        lastStep?.toolResults?.some(
-          (toolResult) =>
-            // A context-lifecycle request is never a terminal completion, even if a policy
-            // lists it as required; otherwise its success would end the stream before the
-            // settled-step callback could schedule the rollover it promised.
-            toolResult.toolName !== "new_context" &&
-            requiredPatterns.some((pattern) => pattern.test(toolResult.toolName)) &&
-            isSuccessfulOutput(toolResult.output)
-        ) ?? false
-      );
-    };
 
     return [
       ({ steps }) => {
@@ -2887,101 +3070,74 @@ export class StreamManager {
       // The SDK evaluates stop conditions only after every sibling tool result in the
       // model's current step settles. Do not move this to individual tool-call-end events:
       // that would abort the remaining calls the model emitted in the same batch.
-      async ({ steps }) => {
-        const step = steps.at(-1);
-        if (request.onStepSettled && step && !hasSuccessfulRequiredToolResult({ steps })) {
-          const outputs = step.toolResults.map((result) => result.output);
-          const size = estimateToolResultSize(outputs);
-          const toolResultTokens = await estimateToolResultTokensForModel(outputs, {
-            model: request.modelString,
-            metadataModel: request.budgetMetadataModel,
-          });
-          // The next step's preflight hard-stops on the assembled estimate, which can exceed
-          // provider-reported usage by ~10% (#4855). Measure that same request here so the
-          // budget decision can roll over before the preflight blocks. Invariant: this measure
-          // is never below the one prepareStep will enforce for the next step. The SDK builds
-          // the next input as this step's input plus its response messages.
-          const nextMessages =
-            request.contextBudgetLimit == null
-              ? undefined
-              : dedupeNativeToolReferences(
-                  await transformStepMessages([
-                    ...(stepTracker?.latestMessages ?? [
-                      ...request.messages,
-                      ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
-                    ]),
-                    ...step.response.messages,
-                  ])
-                );
-          const nextRequest =
-            nextMessages == null
-              ? undefined
-              : await estimateAnchoredRequestTokensForModel(
-                  {
-                    system: request.system,
-                    messages: nextMessages,
-                    tools: isAgentToolsDisabled() ? undefined : request.tools,
-                  },
-                  {
-                    model: request.modelString,
-                    metadataModel: request.budgetMetadataModel,
-                    modelContextLimit: request.contextBudgetLimit,
-                    activeTools: computeContextLoadedToolNames(
-                      request.toolSearchState,
-                      nextMessages
-                    ),
-                  },
-                  // prepareStep anchors the next step on this same request and usage, so both
-                  // measures take the same anchored-or-full branch and the invariant holds.
-                  createContextBudgetAnchor(stepTracker?.contextBudgetRequest, step)
-                );
-          const nextRequestTokens = nextRequest?.estimate;
-          const { decision, continuationEntryId } = await request.onStepSettled({
-            model: request.modelString,
-            usage: normalizeUsage(step.usage),
-            providerMetadata: step.providerMetadata,
-            ...size,
-            toolResultTokens,
-            ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
-            sessionHistoryAvailable: request.tools?.session_history != null,
-            newContextAvailable: request.tools?.new_context != null,
-            newContextRequested: step.toolResults.some(
-              (result) => result.toolName === "new_context" && isSuccessfulOutput(result.output)
-            ),
-          });
-          // All siblings have settled: stop before another provider step without discarding results.
-          if (decision !== "continue") {
-            // The session captured its designated successor when it decided; a blocked stop hands
-            // over to nothing.
-            request.stopCause ??= {
-              kind: "context-budget",
-              decision,
-              ...(decision !== "block" && continuationEntryId != null
-                ? { continuationEntryId }
-                : {}),
-            };
-          }
-          if (decision === "block")
-            throw new ContextBudgetBlockedError(
-              "The settled tool results exceed the context budget. Use /compact or start a new context before continuing."
-            );
-          // Budget stops are authoritative even when only a turn-end message is queued.
-          if (decision !== "continue") return true;
-        }
-        if (hasSuccessfulRequiredToolResult({ steps })) return false;
-        const queuedInput = request.getQueuedInputStopCause?.();
-        if (queuedInput != null) {
-          request.stopCause ??= queuedInput;
-          return true;
-        }
-        return request.hasQueuedMessages?.("tool-end") ?? false;
-      },
+      (options) => this.stopAfterSettledStep(request, stepTracker, requiredPatterns, options),
       (options) => {
-        if (!hasSuccessfulRequiredToolResult(options)) return false;
+        if (!hasSuccessfulRequiredToolResult(options, requiredPatterns)) return false;
         request.stopCause ??= { kind: "required-tool" };
         return true;
       },
     ];
+  }
+
+  /**
+   * The settled-step stop condition: the step's context-budget decision first, then a
+   * required-tool completion (handled by its own condition), then queued input.
+   */
+  private async stopAfterSettledStep(
+    request: StopWhenRequest,
+    stepTracker: StepMessageTracker | undefined,
+    requiredPatterns: readonly RegExp[],
+    options: StopConditionOptions
+  ): Promise<boolean> {
+    const { steps } = options;
+    const step = steps.at(-1);
+    const onStepSettled = request.onStepSettled;
+    if (onStepSettled && step && !hasSuccessfulRequiredToolResult(options, requiredPatterns)) {
+      // Budget stops are authoritative even when only a turn-end message is queued.
+      if (await this.settleStepBudget(request, onStepSettled, stepTracker, steps, step))
+        return true;
+    }
+    if (hasSuccessfulRequiredToolResult(options, requiredPatterns)) return false;
+    const queuedInput = request.getQueuedInputStopCause?.();
+    if (queuedInput != null) {
+      request.stopCause ??= queuedInput;
+      return true;
+    }
+    return request.hasQueuedMessages?.("tool-end") ?? false;
+  }
+
+  /**
+   * Report a settled step to the session's budget callback, with its tool-result size and
+   * the next request's estimate, and apply the decision. True means stop now.
+   */
+  private async settleStepBudget(
+    request: StopWhenRequest,
+    onStepSettled: OnStepSettled,
+    stepTracker: StepMessageTracker | undefined,
+    steps: StopConditionOptions["steps"],
+    step: StopConditionStep
+  ): Promise<boolean> {
+    const outputs = step.toolResults.map((result) => result.output);
+    const size = estimateToolResultSize(outputs);
+    const toolResultTokens = await estimateToolResultTokensForModel(outputs, {
+      model: request.modelString,
+      metadataModel: request.budgetMetadataModel,
+    });
+    const nextRequestTokens = await estimateNextRequestTokens(request, stepTracker, steps, step);
+    const outcome = await onStepSettled({
+      model: request.modelString,
+      usage: normalizeUsage(step.usage),
+      providerMetadata: step.providerMetadata,
+      ...size,
+      toolResultTokens,
+      ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
+      sessionHistoryAvailable: request.tools?.session_history != null,
+      newContextAvailable: request.tools?.new_context != null,
+      newContextRequested: step.toolResults.some(
+        (result) => result.toolName === "new_context" && isSuccessfulToolOutput(result.output)
+      ),
+    });
+    return applyContextBudgetDecision(request, outcome);
   }
 
   getPrefixSwapPreparation(workspaceId: string) {
@@ -4519,6 +4675,132 @@ export class StreamManager {
     }
   }
 
+  /** Fold one attempt's provider stream into the turn, part by part, until it ends or aborts. */
+  private async consumeAttemptStream(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    loop: PartLoopState
+  ): Promise<void> {
+    for await (const part of streamInfo.streamResult.fullStream) {
+      // Check if stream was cancelled BEFORE processing any parts
+      // This improves interruption responsiveness by catching aborts earlier
+      if (streamInfo.abortController.signal.aborted) {
+        break;
+      }
+
+      // Log all stream parts to debug reasoning (commented out - too spammy)
+      // console.log("[DEBUG streamManager]: Stream part", {
+      //   type: part.type,
+      //   hasText: "text" in part,
+      //   preview: "text" in part ? (part as StreamPartWithText).text?.substring(0, 50) : undefined,
+      // });
+
+      const step = partFold(
+        this.foldView(workspaceId, streamInfo, loop),
+        part as FoldablePart,
+        nodeClock.nowMs()
+      );
+      await this.applyStep(workspaceId, streamInfo, step, loop);
+    }
+  }
+
+  /**
+   * Finish a completed stream: read its final metadata, commit the final message and settle
+   * its usage, then mark it completed and emit stream-end (in that order, see below).
+   */
+  private async completeStream(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    workspaceLog: Logger
+  ): Promise<void> {
+    // Get all metadata from stream result in one call
+    // - totalUsage: sum of all steps (for cost calculation)
+    // - contextUsage: last step only (for context window display)
+    // - contextProviderMetadata: last step (for context window cache tokens)
+    // Falls back to tracked values when step retries invalidate totalUsage
+    // or streamResult metadata fails/times out.
+    const streamMeta = await this.getStreamMetadata(streamInfo);
+    const totalUsage = this.endUsage(streamInfo, streamMeta.totalUsage);
+    await this.backfillReasoningTokensFromParts(streamInfo, totalUsage);
+    const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
+    const contextProviderMetadata =
+      streamMeta.contextProviderMetadata ?? streamInfo.lastStepProviderMetadata;
+    const finishReason = resolveStreamEndFinishReason(streamInfo, streamMeta.finishReason);
+    if (finishReason === "tool-calls" && streamInfo.request.stopCause == null) {
+      workspaceLog.warn("Tool-calls stream ended without a recorded stop cause", {
+        messageId: streamInfo.messageId,
+        muxMetadata: streamInfo.initialMetadata?.muxMetadata,
+      });
+    }
+    const duration = streamMeta.duration;
+    const ttftMs = this.resolveTtftMsForStreamEnd(streamInfo);
+    // Aggregated provider metadata across all steps (for cost calculation with cache tokens)
+    const providerMetadata = markProviderMetadataCostsIncluded(
+      await this.resolveProviderMetadataForStreamEnd(streamInfo),
+      streamInfo.initialMetadata?.costsIncluded
+    );
+    const streamEndEvent = buildStreamEndEvent(workspaceId, streamInfo, {
+      totalUsage,
+      contextUsage,
+      providerMetadata,
+      contextProviderMetadata,
+      finishReason,
+      duration,
+      ttftMs,
+    });
+
+    // Update history with final message BEFORE emitting stream-end
+    // This prevents a race condition where compaction (triggered by stream-end)
+    // clears history while updateHistory is still running, causing old messages
+    // to be written back after compaction completes.
+    if (streamInfo.parts && streamInfo.parts.length > 0) {
+      const finalAssistantMessage: MuxMessage = {
+        id: streamInfo.messageId,
+        role: "assistant",
+        metadata: {
+          ...streamEndEvent.metadata,
+          historySequence: streamInfo.historySequence,
+          stepStartPartIndices: streamInfo.stepStartIndices.filter(
+            (index) => index < streamInfo.parts.length
+          ),
+        },
+        parts: streamInfo.parts,
+      };
+
+      await this.partialJournal.commitFinal(
+        workspaceId,
+        streamInfo,
+        finalAssistantMessage,
+        workspaceLog
+      );
+
+      // Update cumulative session usage (if service is available)
+      // Wrapped in try-catch: usage recording is non-critical and shouldn't block stream completion
+      await this.usageLedger.settle(
+        workspaceId,
+        streamInfo,
+        totalUsage,
+        providerMetadata,
+        "Failed to record session usage (stream completion unaffected)",
+        "warn"
+      );
+    }
+
+    // Mark as completed right before emitting stream-end.
+    // This must happen AFTER async I/O (deletePartial, updateHistory) completes.
+    // If we set COMPLETED earlier, isStreaming() returns false during cleanup,
+    // allowing new messages (e.g., force-compaction) to bypass queuing and write
+    // to history before stream-end fires - causing compaction to use wrong parts.
+    streamInfo.state = StreamState.COMPLETED;
+
+    // Emit stream-end AFTER history is updated to prevent race with compaction
+    // Compaction handler listens to this event and clears history - if we emit
+    // before updateHistory completes, compaction can clear the file and then
+    // updateHistory writes stale data back.
+    this.turnEvents.emitTurnEvent(streamEndEvent);
+    streamInfo.terminalCompletion = { status: "completed", streamEnd: streamEndEvent };
+  }
+
   /**
    * Processes a stream with guaranteed cleanup, regardless of success or failure
    */
@@ -4553,27 +4835,7 @@ export class StreamManager {
         loop.toolCalls = new Map();
 
         try {
-          for await (const part of streamInfo.streamResult.fullStream) {
-            // Check if stream was cancelled BEFORE processing any parts
-            // This improves interruption responsiveness by catching aborts earlier
-            if (streamInfo.abortController.signal.aborted) {
-              break;
-            }
-
-            // Log all stream parts to debug reasoning (commented out - too spammy)
-            // console.log("[DEBUG streamManager]: Stream part", {
-            //   type: part.type,
-            //   hasText: "text" in part,
-            //   preview: "text" in part ? (part as StreamPartWithText).text?.substring(0, 50) : undefined,
-            // });
-
-            const step = partFold(
-              this.foldView(workspaceId, streamInfo, loop),
-              part as FoldablePart,
-              nodeClock.nowMs()
-            );
-            await this.applyStep(workspaceId, streamInfo, step, loop);
-          }
+          await this.consumeAttemptStream(workspaceId, streamInfo, loop);
 
           // No need to save remaining text - text-delta handler already maintains parts array
           // (Removed duplicate push that was causing double text parts)
@@ -4589,124 +4851,7 @@ export class StreamManager {
             continue;
           }
           if (next === "complete") {
-            // Get all metadata from stream result in one call
-            // - totalUsage: sum of all steps (for cost calculation)
-            // - contextUsage: last step only (for context window display)
-            // - contextProviderMetadata: last step (for context window cache tokens)
-            // Falls back to tracked values when step retries invalidate totalUsage
-            // or streamResult metadata fails/times out.
-            const streamMeta = await this.getStreamMetadata(streamInfo);
-            const totalUsage = this.endUsage(streamInfo, streamMeta.totalUsage);
-            await this.backfillReasoningTokensFromParts(streamInfo, totalUsage);
-            const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
-            const contextProviderMetadata =
-              streamMeta.contextProviderMetadata ?? streamInfo.lastStepProviderMetadata;
-            // Required-tool completion must remain successful after downgrade or crash recovery.
-            // Keep the internal stop cause, but persist the legacy-compatible terminal signal.
-            const finishReason =
-              streamInfo.request.stopCause?.kind === "required-tool"
-                ? "stop"
-                : (streamInfo.terminalFinishReason ?? streamMeta.finishReason);
-            if (finishReason === "tool-calls" && streamInfo.request.stopCause == null) {
-              workspaceLog.warn("Tool-calls stream ended without a recorded stop cause", {
-                messageId: streamInfo.messageId,
-                muxMetadata: streamInfo.initialMetadata?.muxMetadata,
-              });
-            }
-            const duration = streamMeta.duration;
-            const ttftMs = this.resolveTtftMsForStreamEnd(streamInfo);
-            // Aggregated provider metadata across all steps (for cost calculation with cache tokens)
-            const providerMetadata = markProviderMetadataCostsIncluded(
-              await this.resolveProviderMetadataForStreamEnd(streamInfo),
-              streamInfo.initialMetadata?.costsIncluded
-            );
-            const canonicalModel = metadataModelIdentity(streamInfo.model);
-            const toolModelUsages =
-              streamInfo.toolModelUsages.length > 0
-                ? streamInfo.toolModelUsages.map(clonePersistedToolModelUsage)
-                : undefined;
-
-            // Emit stream end event with parts preserved in temporal order
-            const streamEndEvent: StreamEndEvent = {
-              type: "stream-end",
-              workspaceId: workspaceId as string,
-              messageId: streamInfo.messageId,
-              ...(streamInfo.initialMetadata?.acpPromptId != null
-                ? { acpPromptId: streamInfo.initialMetadata.acpPromptId }
-                : {}),
-              metadata: {
-                ...streamInfo.initialMetadata, // TurnRequestBuilder-provided metadata (systemMessageTokens, etc)
-                model: canonicalModel,
-                metadataModel: streamInfo.metadataModel,
-                ...(streamInfo.thinkingLevel && {
-                  thinkingLevel: streamInfo.thinkingLevel as ThinkingLevel,
-                }),
-                usage: totalUsage, // Total across all steps (for cost calculation)
-                contextUsage, // Last step only (for context window display)
-                providerMetadata, // Aggregated (for cost calculation)
-                contextProviderMetadata, // Last step (for context window display)
-                ...(toolModelUsages != null ? { toolModelUsages } : {}),
-                ...(finishReason !== undefined && { finishReason }),
-                ...(streamInfo.request.stopCause != null && {
-                  stopCause: streamInfo.request.stopCause,
-                }),
-                historySequence: streamInfo.historySequence,
-                duration,
-                ...(ttftMs !== undefined && { ttftMs }),
-              },
-              parts: streamInfo.parts, // Parts array with temporal ordering (includes reasoning)
-            };
-
-            // Update history with final message BEFORE emitting stream-end
-            // This prevents a race condition where compaction (triggered by stream-end)
-            // clears history while updateHistory is still running, causing old messages
-            // to be written back after compaction completes.
-            if (streamInfo.parts && streamInfo.parts.length > 0) {
-              const finalAssistantMessage: MuxMessage = {
-                id: streamInfo.messageId,
-                role: "assistant",
-                metadata: {
-                  ...streamEndEvent.metadata,
-                  historySequence: streamInfo.historySequence,
-                  stepStartPartIndices: streamInfo.stepStartIndices.filter(
-                    (index) => index < streamInfo.parts.length
-                  ),
-                },
-                parts: streamInfo.parts,
-              };
-
-              await this.partialJournal.commitFinal(
-                workspaceId,
-                streamInfo,
-                finalAssistantMessage,
-                workspaceLog
-              );
-
-              // Update cumulative session usage (if service is available)
-              // Wrapped in try-catch: usage recording is non-critical and shouldn't block stream completion
-              await this.usageLedger.settle(
-                workspaceId,
-                streamInfo,
-                totalUsage,
-                providerMetadata,
-                "Failed to record session usage (stream completion unaffected)",
-                "warn"
-              );
-            }
-
-            // Mark as completed right before emitting stream-end.
-            // This must happen AFTER async I/O (deletePartial, updateHistory) completes.
-            // If we set COMPLETED earlier, isStreaming() returns false during cleanup,
-            // allowing new messages (e.g., force-compaction) to bypass queuing and write
-            // to history before stream-end fires - causing compaction to use wrong parts.
-            streamInfo.state = StreamState.COMPLETED;
-
-            // Emit stream-end AFTER history is updated to prevent race with compaction
-            // Compaction handler listens to this event and clears history - if we emit
-            // before updateHistory completes, compaction can clear the file and then
-            // updateHistory writes stale data back.
-            this.turnEvents.emitTurnEvent(streamEndEvent);
-            streamInfo.terminalCompletion = { status: "completed", streamEnd: streamEndEvent };
+            await this.completeStream(workspaceId, streamInfo, workspaceLog);
           }
           break;
         } catch (error) {
@@ -4741,33 +4886,41 @@ export class StreamManager {
     } catch (error) {
       await this.handleStreamFailure(workspaceId, streamInfo, error);
     } finally {
-      this.mcpServerManager?.releaseLease(workspaceId as string);
+      await this.settleStreamProcessing(workspaceId, streamInfo);
+    }
+  }
 
-      await this.closeStreamResources(streamInfo);
+  /** The guaranteed cleanup of processStreamWithCleanup, for every terminal outcome. */
+  private async settleStreamProcessing(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<void> {
+    this.mcpServerManager?.releaseLease(workspaceId as string);
 
-      // Aborts keep their registration until cleanupAbortedStream completes its disk
-      // transaction and raw delivery. A stale finally must never remove a replacement.
-      if (
-        streamInfo.terminalCompletion != null &&
-        this.workspaceStreams.get(workspaceId) === streamInfo
-      ) {
-        this.workspaceStreams.delete(workspaceId);
-      }
-      await this.discardUnsettledSessionUsage(workspaceId, streamInfo);
+    await this.closeStreamResources(streamInfo);
 
-      // Lifecycle spine event: emitted from the guaranteed-cleanup path so
-      // EVERY terminal outcome (completion, abort/Escape, provider failure)
-      // closes the stream.start emitted at the top of this method — observers
-      // tracking active streams must never retain stale entries.
-      eventSpine.emit("stream.end", {
-        workspaceId: workspaceId as string,
-        messageId: streamInfo.messageId,
-      });
+    // Aborts keep their registration until cleanupAbortedStream completes its disk
+    // transaction and raw delivery. A stale finally must never remove a replacement.
+    if (
+      streamInfo.terminalCompletion != null &&
+      this.workspaceStreams.get(workspaceId) === streamInfo
+    ) {
+      this.workspaceStreams.delete(workspaceId);
+    }
+    await this.discardUnsettledSessionUsage(workspaceId, streamInfo);
 
-      if (streamInfo.terminalCompletion != null) {
-        // Optional-chained: whitebox test fixtures register stream infos without a controller.
-        streamInfo.completionController?.settle(streamInfo.terminalCompletion);
-      }
+    // Lifecycle spine event: emitted from the guaranteed-cleanup path so
+    // EVERY terminal outcome (completion, abort/Escape, provider failure)
+    // closes the stream.start emitted at the top of this method — observers
+    // tracking active streams must never retain stale entries.
+    eventSpine.emit("stream.end", {
+      workspaceId: workspaceId as string,
+      messageId: streamInfo.messageId,
+    });
+
+    if (streamInfo.terminalCompletion != null) {
+      // Optional-chained: whitebox test fixtures register stream infos without a controller.
+      streamInfo.completionController?.settle(streamInfo.terminalCompletion);
     }
   }
 
