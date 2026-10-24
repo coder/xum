@@ -13,7 +13,8 @@
  *   rejects with a RuntimeError "exec" that names it. An exec whose signal is already aborted
  *   rejects before it runs anything, as LocalRuntime does.
  *   An option that the entry cannot honor is refused by name (refuseSetOptions): pathEnv,
- *   hostEnv and forcePTY always, and timeout and env for a function entry.
+ *   hostEnv and forcePTY always, and timeout, env and abortSignal for a function entry.
+ * - readFile and ensureDir honor an aborted signal as LocalBaseRuntime does.
  * - idle() resolves when every exec has settled, so a test can drain fire-and-forget execs.
  * - The workspace lifecycle methods reject: loop tests do not create workspaces.
  */
@@ -87,7 +88,8 @@ export class FakeRuntime implements Runtime {
   }
 
   // The option rules of refuseSetOptions: the built-in rule and a fixed outcome settle at once
-  // and read no environment, so timeout and env hold for them. A function entry refuses both.
+  // and read no environment, so timeout and env hold for them. A function entry refuses both,
+  // and abortSignal too.
   private async outcomeOf(command: string, options: ExecOptions): Promise<ScriptedOutcome> {
     const { cwd } = options;
     refuseSetOptions(command, options, ["pathEnv", "hostEnv", "forcePTY"]);
@@ -107,7 +109,8 @@ export class FakeRuntime implements Runtime {
       command,
       { file: command, args: [], cwd },
       options,
-      ["timeout", "env"]
+      // The fake checks abortSignal only before the start, which a slow entry outlives.
+      ["timeout", "env", "abortSignal"]
     );
     if (outcome === undefined) {
       throw new RuntimeError(`FakeRuntime has no scripted command: ${command}`, "exec");
@@ -143,20 +146,46 @@ export class FakeRuntime implements Runtime {
     }
   }
 
-  readFile(filePath: string): ReadableStream<Uint8Array> {
+  // As LocalBaseRuntime.readFile: an abort before the consumer reads the end errors the stream.
+  readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
     const target = path.posix.resolve(this.expand(filePath));
     const files = this.fs.promises;
-    return new ReadableStream({
-      async start(controller) {
-        try {
-          const bytes = (await files.readFile(target)) as Buffer;
-          controller.enqueue(new Uint8Array(bytes));
-          controller.close();
-        } catch (error) {
-          controller.error(fileError("read file", filePath, error));
-        }
+    const aborted = () => new RuntimeError(`Read of ${filePath} aborted`, "file_io");
+    let bytes: Uint8Array | undefined;
+    return new ReadableStream<Uint8Array>(
+      {
+        async start(controller) {
+          if (abortSignal?.aborted) {
+            controller.error(aborted());
+            return;
+          }
+          try {
+            bytes = new Uint8Array((await files.readFile(target)) as Buffer);
+          } catch (error) {
+            // As LocalBaseRuntime: an abort during the read wins over its failure.
+            controller.error(
+              abortSignal?.aborted ? aborted() : fileError("read file", filePath, error)
+            );
+          }
+        },
+        // Each read of the consumer checks the signal first, as LocalBaseRuntime's pull does
+        // after each chunk: the bytes, then the end.
+        pull(controller) {
+          if (abortSignal?.aborted) {
+            controller.error(aborted());
+            return;
+          }
+          if (bytes === undefined) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(bytes);
+          bytes = undefined;
+        },
       },
-    });
+      // No read ahead: a pull runs only for a read of the consumer, so the end waits for it.
+      { highWaterMark: 0 }
+    );
   }
 
   writeFile(filePath: string): WritableStream<Uint8Array> {
@@ -194,7 +223,12 @@ export class FakeRuntime implements Runtime {
     }
   }
 
-  async ensureDir(dirPath: string): Promise<void> {
+  // As LocalBaseRuntime.ensureDir: an aborted signal rejects before the folder is made.
+  // writeFile and stat take no signal here, because LocalBaseRuntime ignores theirs.
+  async ensureDir(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
+    if (abortSignal?.aborted) {
+      throw new RuntimeError("Operation aborted before directory creation", "file_io");
+    }
     try {
       await this.fs.promises.mkdir(path.posix.resolve(this.expand(dirPath)), { recursive: true });
     } catch (error) {
