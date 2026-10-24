@@ -1,7 +1,15 @@
 import assert from "@/common/utils/assert";
 
 import { AlertTriangle, Check } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  type RefObject,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 
 import { useLiveAPI } from "@/browser/contexts/API";
 import {
@@ -9,6 +17,7 @@ import {
   type ClosedUnansweredReason,
   useNonBlockingQuestionAnswers,
 } from "@/browser/features/Tools/AskUserQuestion/useNonBlockingQuestionAnswers";
+import { useAskUserQuestionPlacement } from "@/browser/features/Tools/AskUserQuestion/askUserQuestionPlacement";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
@@ -44,6 +53,8 @@ import {
   isAsyncAskUserQuestionOutput,
 } from "@/common/utils/tools/askUserQuestionSummary";
 import { getErrorMessage } from "@/common/utils/errors";
+import { useHostTranscriptMutationCheck } from "@/browser/utils/transcriptBarrier";
+import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 
 const OTHER_VALUE = "__other__";
@@ -220,6 +231,18 @@ function getDescriptionsForLabels(question: AskUserQuestionQuestion, labels: str
     .filter((d): d is string => d !== undefined);
 }
 
+/** A question (or Summary) tab: the active tab, a finished one, or one still to do. */
+function getQuestionTabClassName(active: boolean, done: boolean): string {
+  return cn(
+    "inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors",
+    active
+      ? "border-accent bg-accent text-accent-foreground shadow-sm"
+      : done
+        ? "border-success/40 bg-success/10 text-success-text hover:bg-success/20"
+        : "border-white/10 bg-white/5 text-secondary hover:border-white/20 hover:text-foreground"
+  );
+}
+
 /** Auto-resizing textarea for "Other" text input. */
 function AutoResizeTextarea(props: {
   value: string;
@@ -314,7 +337,37 @@ const ANSWERING_HINTS = {
   },
 } as const;
 
-export function AskUserQuestionToolCall(props: {
+/**
+ * A docked card stays mounted after its questions close until nothing is left to finish: no
+ * submit in flight and no auto-retry rollback waiting on the resumed stream. Then the dock
+ * unmounts it, so closed cards do not pile up. Reruns on every workspace update, which is when
+ * the rollback settles.
+ */
+function useReleaseSettledDockCard(args: {
+  rowId: string | undefined;
+  isAnswering: boolean;
+  isSubmitting: boolean;
+  rollbackPendingRef: RefObject<boolean>;
+  workspaceState: unknown;
+}): void {
+  const placement = useAskUserQuestionPlacement();
+  const release = placement.kind === "dock" ? placement.release : null;
+  const { rowId, isAnswering, isSubmitting, rollbackPendingRef, workspaceState } = args;
+  useEffect(() => {
+    if (
+      release === null ||
+      rowId == null ||
+      isAnswering ||
+      isSubmitting ||
+      rollbackPendingRef.current
+    ) {
+      return;
+    }
+    release(rowId);
+  }, [release, rowId, isAnswering, isSubmitting, rollbackPendingRef, workspaceState]);
+}
+
+interface AskUserQuestionToolCallProps {
   args: AskUserQuestionToolArgs;
   result: AskUserQuestionToolResult | null;
   status: ToolStatus;
@@ -322,7 +375,51 @@ export function AskUserQuestionToolCall(props: {
   workspaceId?: string;
   /** The transcript row's display id: tells apart rows that reuse a tool call id. */
   rowId?: string;
-}): JSX.Element {
+}
+
+/**
+ * The transcript row of a question that is open in the dock above the chat input: the form lives
+ * there (sticky to the bottom of the chat), so only one copy of it takes answers.
+ */
+function DockedQuestionStub(props: { status: ToolStatus }): JSX.Element {
+  return (
+    <ToolContainer expanded={false}>
+      <ToolHeader className="cursor-default">
+        <ToolIcon toolName="ask_user_question" />
+        <div className="flex min-w-0 flex-1 flex-col">
+          <ToolName>ask_user_question</ToolName>
+          <div className="text-secondary text-[10px] leading-tight">
+            Answer in the panel above the chat input.
+          </div>
+        </div>
+        <StatusIndicator status={props.status}>{getStatusDisplay(props.status)}</StatusIndicator>
+      </ToolHeader>
+    </ToolContainer>
+  );
+}
+
+/** The registered ask_user_question card: the form, or a stub while the dock holds the form. */
+export function PlacedAskUserQuestionToolCall(
+  props: AskUserQuestionToolCallProps
+): JSX.Element | null {
+  const placement = useAskUserQuestionPlacement();
+  if (
+    placement.kind === "transcript" &&
+    placement.workspaceId === props.workspaceId &&
+    props.rowId != null &&
+    placement.dockedRowIds.has(props.rowId)
+  ) {
+    return <DockedQuestionStub status={props.status} />;
+  }
+  return <AskUserQuestionToolCall {...props} docked={placement.kind === "dock"} />;
+}
+
+export function AskUserQuestionToolCall(
+  props: AskUserQuestionToolCallProps & {
+    /** Rendered in the dock above the chat input: nothing once the questions close. */
+    docked?: boolean;
+  }
+): JSX.Element | null {
   const argsAnswers = props.args.answers ?? {};
   const draftStateKey = getDraftStateKey(props);
 
@@ -386,6 +483,7 @@ export function AskUserQuestionToolCall(props: {
   const isMountedRef = useRef(true);
   // The rollback skips while offline, as it did when useAPI() went null in the gap.
   const liveApi = useLiveAPI();
+  const isTranscriptMutationAllowed = useHostTranscriptMutationCheck();
   const apiRef = useRef(liveApi);
 
   useEffect(() => {
@@ -488,6 +586,14 @@ export function AskUserQuestionToolCall(props: {
     workspaceState?.canInterrupt,
     workspaceState?.messages.length,
   ]);
+  // After the rollback effects above, so a rollback that just ran in this commit counts as settled.
+  useReleaseSettledDockCard({
+    rowId: props.rowId,
+    isAnswering,
+    isSubmitting,
+    rollbackPendingRef: autoRetryRollbackPendingRef,
+    workspaceState,
+  });
 
   const [draftAnswers, setDraftAnswers] = useState<Record<string, DraftAnswer>>(() => {
     if (cachedState) {
@@ -588,6 +694,9 @@ export function AskUserQuestionToolCall(props: {
       assert(liveApi, "API not connected");
       assert(props.workspaceId, "workspaceId is required");
       workspaceId = props.workspaceId;
+      // The composer's barrier: the dock shows open questions before a replay catches up, and a
+      // blocking answer resumes the turn, so never answer from a stale copy of the question.
+      assert(isTranscriptMutationAllowed(workspaceId), TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
     } catch (error) {
       const errorMessage = getErrorMessage(error);
       setSubmitError(errorMessage);
@@ -700,6 +809,13 @@ export function AskUserQuestionToolCall(props: {
   const totalCount = props.args.questions.length;
   const answeredCount = totalCount - unansweredCount;
 
+  // The dock only holds questions that take answers; the transcript row shows the outcome. The
+  // dock keeps a closed card mounted (rendering nothing) so the auto-retry rollback above still
+  // sees the resumed stream settle, as the transcript card did when it owned the form.
+  if (props.docked === true && !isAnswering) {
+    return null;
+  }
+
   return (
     <ToolContainer expanded={expanded}>
       <ToolHeader onClick={toggleExpanded}>
@@ -728,14 +844,7 @@ export function AskUserQuestionToolCall(props: {
                       <button
                         key={q.question}
                         type="button"
-                        className={cn(
-                          "inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors",
-                          isActive
-                            ? "border-accent bg-accent text-accent-foreground shadow-sm"
-                            : answered
-                              ? "border-success/40 bg-success/10 text-success-text hover:bg-success/20"
-                              : "border-white/10 bg-white/5 text-secondary hover:border-white/20 hover:text-foreground"
-                        )}
+                        className={getQuestionTabClassName(isActive, answered)}
                         onClick={() => setActiveIndex(idx)}
                       >
                         {q.header}
@@ -745,14 +854,7 @@ export function AskUserQuestionToolCall(props: {
                   })}
                   <button
                     type="button"
-                    className={cn(
-                      "inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors",
-                      isOnSummary
-                        ? "border-accent bg-accent text-accent-foreground shadow-sm"
-                        : isComplete
-                          ? "border-success/40 bg-success/10 text-success-text hover:bg-success/20"
-                          : "border-white/10 bg-white/5 text-secondary hover:border-white/20 hover:text-foreground"
-                    )}
+                    className={getQuestionTabClassName(isOnSummary, isComplete)}
                     onClick={() => setActiveIndex(summaryIndex)}
                   >
                     Summary

@@ -1263,7 +1263,17 @@
               },
               {
                 "module": "@/common/constants/paths",
-                "names": ["cleanupObsoleteXumBinArtifacts", "getXumExtensionMetadataPath", "getXumHome", "getXumLogsDir", "getXumPerfCapturesDir", "getXumPerfReportsDir", "getXumPerfTapesDir", "getXumProjectsDir", "getXumSessionsDir"]
+                "names": [
+                  "cleanupObsoleteXumBinArtifacts",
+                  "getXumExtensionMetadataPath",
+                  "getXumHome",
+                  "getXumLogsDir",
+                  "getXumPerfCapturesDir",
+                  "getXumPerfReportsDir",
+                  "getXumPerfTapesDir",
+                  "getXumProjectsDir",
+                  "getXumSessionsDir"
+                ]
               },
               "@/node/utils/concurrency/workspaceFileLocks",
               "@/node/utils/concurrency/fileLock",
@@ -1274,41 +1284,21 @@
             "allow": {
               "src/node/services/agentSession.ts": [
                 "@/node/runtime/runtimeHelpers",
-                "@/node/services/workspaceUseLeases",
-                "fs/promises"
+                "@/node/services/workspaceUseLeases"
               ],
               "src/node/services/aiService.ts": [
                 "@/node/runtime/multiProjectRuntime",
                 "@/node/runtime/runtimeFactory",
-                "@/node/runtime/runtimeHelpers",
-                "@/node/utils/fs",
-                "fs/promises"
+                "@/node/runtime/runtimeHelpers"
               ],
               "src/node/services/contextManagement/strategies/tokenBudget.ts": [
                 "@/node/runtime/runtimeHelpers"
               ],
-              "src/node/services/historyService.ts": [
-                "@/node/utils/concurrency/fileLock",
-                "@/node/utils/concurrency/workspaceFileLocks"
-              ],
-              "src/node/services/tools/bash.ts": ["fs"],
               "src/node/services/tools/review_pane.ts": [
-                "@/node/utils/concurrency/workspaceFileLocks",
                 "@/node/utils/writeFileAtomic",
                 "fs/promises"
               ],
-              "src/node/services/tools/shared/configReadWrite.ts": [
-                "@/node/utils/writeFileAtomic",
-                "fs/promises"
-              ],
-              "src/node/services/tools/todo.ts": [
-                "@/node/utils/concurrency/workspaceFileLocks",
-                "@/node/utils/writeFileAtomic",
-                "fs/promises"
-              ],
-              "src/node/services/tools/xum_agents_path.ts": ["fs/promises"],
-              "src/node/services/tools/xum_agents_read.ts": ["fs/promises"],
-              "src/node/services/tools/xum_agents_write.ts": ["fs/promises"]
+              "src/node/services/tools/todo.ts": ["@/node/utils/writeFileAtomic", "fs/promises"]
             }
           }
         ]
@@ -1503,7 +1493,9 @@
               "src/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection.test.tsx": [
                 "./useBrowserBridgeConnection.ts?test-isolation=static"
               ],
-              "src/browser/utils/feedbackToastView.test.tsx": ["../components/Dialog/Dialog?real=1"],
+              "src/browser/utils/feedbackToastView.test.tsx": [
+                "../components/Dialog/Dialog?real=1"
+              ],
               "src/browser/utils/perf/appShellReady.test.ts": ["./appShellReady?fresh=1"]
             }
           }

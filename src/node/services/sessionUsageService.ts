@@ -8,7 +8,7 @@ import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -227,7 +227,14 @@ function pruneSettledInFlightKeys(
  */
 export class SessionUsageService {
   private readonly SESSION_USAGE_FILE = "session-usage.json";
-  private readonly fileLocks = workspaceFileLocks;
+  /**
+   * The one workspace FIFO, from the HistoryService's SessionLocks (phase 4), so a
+   * memory or foreign-holder layer reaches these writes too. Read at each use, not
+   * at construction: tests that pass a partial HistoryService keep working.
+   */
+  private get fileLocks(): SessionLocks["workspaceFiles"] {
+    return this.historyService.locks.workspaceFiles;
+  }
   private readonly config: Config;
   private readonly historyService: HistoryService;
   private readonly getProvidersConfig: () => ProvidersConfigMap | null;

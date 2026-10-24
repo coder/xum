@@ -98,7 +98,9 @@ export const createProposePlanTool: ToolFactory = (config) => {
             await setTodosForSessionDir(
               config.workspaceId,
               config.workspaceSessionDir,
-              completedTodos
+              completedTodos,
+              // Absent: setTodosForSessionDir's Node default.
+              config.sessionLocks
             );
           }
         } catch (error) {

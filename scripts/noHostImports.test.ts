@@ -122,27 +122,14 @@ test("allows listed modules and fails stale entries", () => {
 const FROZEN_ALLOW_PAIRS = [
   "src/node/services/agentSession.ts @/node/runtime/runtimeHelpers",
   "src/node/services/agentSession.ts @/node/services/workspaceUseLeases",
-  "src/node/services/agentSession.ts fs/promises",
   "src/node/services/aiService.ts @/node/runtime/multiProjectRuntime",
   "src/node/services/aiService.ts @/node/runtime/runtimeFactory",
   "src/node/services/aiService.ts @/node/runtime/runtimeHelpers",
-  "src/node/services/aiService.ts @/node/utils/fs",
-  "src/node/services/aiService.ts fs/promises",
   "src/node/services/contextManagement/strategies/tokenBudget.ts @/node/runtime/runtimeHelpers",
-  "src/node/services/historyService.ts @/node/utils/concurrency/fileLock",
-  "src/node/services/historyService.ts @/node/utils/concurrency/workspaceFileLocks",
-  "src/node/services/tools/bash.ts fs",
-  "src/node/services/tools/review_pane.ts @/node/utils/concurrency/workspaceFileLocks",
   "src/node/services/tools/review_pane.ts @/node/utils/writeFileAtomic",
   "src/node/services/tools/review_pane.ts fs/promises",
-  "src/node/services/tools/shared/configReadWrite.ts @/node/utils/writeFileAtomic",
-  "src/node/services/tools/shared/configReadWrite.ts fs/promises",
-  "src/node/services/tools/todo.ts @/node/utils/concurrency/workspaceFileLocks",
   "src/node/services/tools/todo.ts @/node/utils/writeFileAtomic",
   "src/node/services/tools/todo.ts fs/promises",
-  "src/node/services/tools/xum_agents_path.ts fs/promises",
-  "src/node/services/tools/xum_agents_read.ts fs/promises",
-  "src/node/services/tools/xum_agents_write.ts fs/promises",
 ];
 
 function allowMap(): Record<string, string[]> {

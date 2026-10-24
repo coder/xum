@@ -8,7 +8,12 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as prettier from "prettier";
+import { Layer } from "effect";
+import { HostClockTag } from "@/node/services/di/hostClockLive";
+import { createMemoryHost } from "@/node/services/hostFiles/memoryHostFiles.testHarness";
+import { SessionLocksMemory } from "@/node/services/sessionLocks/memorySessionLocks.testHarness";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
+import { nodeClock } from "@/node/utils/hostClock";
 import { SessionFilesMemory } from "./memorySessionFiles.testHarness";
 import { runGoldenScript, STEPS, type GoldenSnapshot } from "./goldenScript.testHarness";
 
@@ -50,16 +55,23 @@ async function listHostEntries(root: string): Promise<string[]> {
     .sort();
 }
 
-// A history write that skips SessionFiles lands in the real temp folder instead of the volume.
-test("the memory layer writes the golden bytes and nothing on disk", async () => {
+// A history write that skips SessionFiles lands in the real temp folder instead of the volume,
+// and a lock taken around SessionLocks, or its folder made on the disk, lands under <root>/locks.
+test("the memory layers write the golden bytes and nothing on disk", async () => {
   const { historyService, config, files, tempDir, cleanup } = await createTestHistoryService({
     files: SessionFilesMemory,
+    locks: SessionLocksMemory.pipe(
+      Layer.provide(Layer.succeed(HostClockTag)(nodeClock)),
+      Layer.provide(createMemoryHost().layer)
+    ),
   });
   try {
     const snapshots = await runGoldenScript(historyService, config, STEPS, files);
     const fixture = JSON.parse(await fs.readFile(FIXTURE, "utf8")) as GoldenSnapshot[];
     expect(snapshots).toEqual(fixture);
     expect(await listHostEntries(path.join(tempDir, "sessions"))).toEqual([]);
+    // The memory locks make their folders on the memory volume.
+    expect(await listHostEntries(path.join(tempDir, "locks"))).toEqual([]);
   } finally {
     await cleanup();
   }

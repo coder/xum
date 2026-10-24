@@ -186,40 +186,17 @@ const HOST_IMPORT_ALLOW = {
   "src/node/services/agentSession.ts": [
     "@/node/runtime/runtimeHelpers",
     "@/node/services/workspaceUseLeases",
-    "fs/promises",
   ],
   "src/node/services/aiService.ts": [
     "@/node/runtime/multiProjectRuntime",
     "@/node/runtime/runtimeFactory",
     "@/node/runtime/runtimeHelpers",
-    "@/node/utils/fs",
-    "fs/promises",
   ],
   "src/node/services/contextManagement/strategies/tokenBudget.ts": [
     "@/node/runtime/runtimeHelpers",
   ],
-  "src/node/services/historyService.ts": [
-    "@/node/utils/concurrency/fileLock",
-    "@/node/utils/concurrency/workspaceFileLocks",
-  ],
-  "src/node/services/tools/bash.ts": ["fs"],
-  "src/node/services/tools/review_pane.ts": [
-    "@/node/utils/concurrency/workspaceFileLocks",
-    "@/node/utils/writeFileAtomic",
-    "fs/promises",
-  ],
-  "src/node/services/tools/shared/configReadWrite.ts": [
-    "@/node/utils/writeFileAtomic",
-    "fs/promises",
-  ],
-  "src/node/services/tools/todo.ts": [
-    "@/node/utils/concurrency/workspaceFileLocks",
-    "@/node/utils/writeFileAtomic",
-    "fs/promises",
-  ],
-  "src/node/services/tools/xum_agents_path.ts": ["fs/promises"],
-  "src/node/services/tools/xum_agents_read.ts": ["fs/promises"],
-  "src/node/services/tools/xum_agents_write.ts": ["fs/promises"],
+  "src/node/services/tools/review_pane.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
+  "src/node/services/tools/todo.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
 };
 
 const SHARED_RESTRICTED_PATHS = [AI_TOKENIZER_ENCODING_RESTRICTION];

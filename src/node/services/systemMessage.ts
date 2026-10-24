@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import * as os from "node:os";
 import path from "node:path";
 
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -29,7 +28,7 @@ import {
 } from "@/node/utils/main/markdown";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { resolveWorkspaceRootPath } from "@/node/runtime/runtimeHelpers";
-import { getXumHome } from "@/common/constants/paths";
+import { nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import type { ProjectConfig } from "@/common/types/project";
 import { getAvailableTools } from "@/common/utils/tools/toolDefinitions";
@@ -543,10 +542,10 @@ export async function loadInstructionSources(
   const [claudeCompatGlobal, nativeGlobal, context] = await Promise.all([
     claudeSkillsCompatEnabled
       ? readClaudeCompatGlobalInstructionSet(
-          path.join(os.homedir(), CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY)
+          path.join(nodeHostPaths.userHome(), CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY)
         )
       : Promise.resolve(null),
-    readInstructionSet(getXumHome(), INSTRUCTION_SCOPE.GLOBAL),
+    readInstructionSet(nodeHostPaths.xumHome(), INSTRUCTION_SCOPE.GLOBAL),
     isMultiProject(metadata)
       ? readMultiProjectContextInstructions(metadata, runtime, workspaceRootPath)
       : readSingleProjectContextInstructions(metadata, runtime, workspaceRootPath),
@@ -575,7 +574,7 @@ function buildProjectSettingsInstructionSets(
   projectConfigs: Map<string, ProjectConfig> | undefined
 ): InstructionSet[] {
   if (!projectConfigs) return [];
-  const configPath = path.join(getXumHome(), "config.json");
+  const configPath = path.join(nodeHostPaths.xumHome(), "config.json");
   const sets: InstructionSet[] = [];
   for (const project of getProjects(metadata)) {
     const normalizedPath = stripTrailingSlashes(project.projectPath);
@@ -588,7 +587,7 @@ function buildProjectSettingsInstructionSets(
     sets.push({
       scope: INSTRUCTION_SCOPE.PROJECT,
       projectName: project.projectName,
-      directory: getXumHome(),
+      directory: nodeHostPaths.xumHome(),
       files: [
         {
           // Suffix with the project path so multi-project workspaces keep a
