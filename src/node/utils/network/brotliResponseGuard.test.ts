@@ -2,8 +2,12 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as http from "node:http";
 import * as net from "node:net";
 import * as zlib from "node:zlib";
-import { Client, fetch } from "undici/index.js";
-import { isBrotliResponseGuardNeeded, refuseBrotliResponses } from "./brotliResponseGuard";
+import { Client, Dispatcher, fetch } from "undici/index.js";
+import {
+  dispatcherToGuard,
+  isBrotliResponseGuardNeeded,
+  refuseBrotliResponses,
+} from "./brotliResponseGuard";
 
 let server: http.Server;
 let baseUrl: string;
@@ -75,6 +79,28 @@ describe("refuseBrotliResponses", () => {
     });
     expect(await response.text()).toBe("hello");
     expect(sentAcceptEncoding).toEqual([sent]);
+  });
+});
+
+describe("dispatcherToGuard", () => {
+  // Stands in for a dispatcher from the undici bundled with Node, which is another class.
+  const nodeOwnDispatcher = Object.create(null) as Dispatcher;
+
+  test("keeps a dispatcher from this undici on any Node", async () => {
+    const client = new Client(baseUrl);
+    expect(dispatcherToGuard(client, "6.21.2")).toBe(client);
+    await client.close();
+  });
+
+  test("keeps Node's own dispatcher when Node bundles undici 7", () => {
+    expect(dispatcherToGuard(nodeOwnDispatcher, "7.29.1")).toBe(nodeOwnDispatcher);
+  });
+
+  test("replaces Node's own undici 6 dispatcher, which calls the older handler methods", async () => {
+    const replacement = dispatcherToGuard(nodeOwnDispatcher, "6.21.2");
+    expect(replacement).not.toBe(nodeOwnDispatcher);
+    expect(replacement).toBeInstanceOf(Dispatcher);
+    await replacement.close();
   });
 });
 

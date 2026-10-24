@@ -122,8 +122,11 @@ const RealAgent = Agent as new () => Dispatcher;
 // Once Node's own fetch has run, the global dispatcher comes from the undici bundled with Node.
 // Node 22 bundles undici 6, which calls older handler methods that RefuseBrotliHandler does not
 // have, so every request would fail. A dispatcher from this undici takes its place there.
-function dispatcherToGuard(current: Dispatcher): Dispatcher {
-  const bundledUndiciMajor = Number(process.versions.undici?.split(".")[0]);
+export function dispatcherToGuard(
+  current: Dispatcher,
+  bundledUndici = process.versions.undici
+): Dispatcher {
+  const bundledUndiciMajor = Number(bundledUndici?.split(".")[0]);
   return current instanceof Dispatcher || bundledUndiciMajor >= 7 ? current : new RealAgent();
 }
 
