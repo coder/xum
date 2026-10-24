@@ -43,6 +43,7 @@ import {
 } from "@/node/services/workspaceProjectRepos";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { taskGitPatchEngine } from "@/node/services/taskGitPatchEngine";
+// Outside the agent loop: GitPatchArtifactService passes the host's runtimes (nodeRuntimeFactory) to agent and skill reads.
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 /** Callback invoked after patch generation completes (success or failure). */
@@ -117,7 +118,7 @@ async function resolveAgentEditingCapability(args: {
         discovery.runtime,
         discovery.workspacePath,
         parsedAgentId.data,
-        { projectPluginsTrusted: args.projectPluginsTrusted }
+        { projectPluginsTrusted: args.projectPluginsTrusted, runtimeFactory: nodeRuntimeFactory }
       );
       const chain = await resolveAgentInheritanceChain({
         runtime: discovery.runtime,
@@ -126,6 +127,7 @@ async function resolveAgentEditingCapability(args: {
         agentDefinition,
         workspaceId: args.workspaceId,
         projectPluginsTrusted: args.projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
 
       if (agentDefinition.scope === "project") {

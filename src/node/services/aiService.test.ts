@@ -115,6 +115,7 @@ import {
   DEBUG_LLM_REQUEST_MAX_WORKSPACES,
 } from "@/constants/debugLlmRequest";
 import { Ok } from "@/common/types/result";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 // Captured before any test spies on the module, so a test can still build the
 // real tool set from the configuration the request builder produced.
@@ -6424,6 +6425,7 @@ describe("discoverAvailableSubagentsForToolContext", () => {
           projectRoots: [agentsRoot],
           globalRoot: path.join(project.path, "empty-global-agents"),
         },
+        runtimeFactory: nodeRuntimeFactory,
       }).catch((error: unknown) => error);
       expect(outcome).toMatchObject({ type: "network" });
     } finally {
@@ -6456,6 +6458,7 @@ describe("discoverAvailableSubagentsForToolContext", () => {
         projectRoots: [agentsRoot],
         globalRoot: path.join(project.path, "empty-global-agents"),
       },
+      runtimeFactory: nodeRuntimeFactory,
     });
 
     const custom = availableSubagents.find((agent) => agent.id === "custom");
@@ -6506,6 +6509,7 @@ describe("discoverAvailableSubagentsForToolContext", () => {
         globalRoot: path.join(project.path, "empty-global-agents"),
       },
       loadDesktopCapability,
+      runtimeFactory: nodeRuntimeFactory,
     });
 
     // The built-in `desktop` agent should be filtered out when capability is unavailable.
@@ -6537,6 +6541,7 @@ describe("discoverAvailableSubagentsForToolContext", () => {
         globalRoot: path.join(project.path, "empty-global-agents"),
       },
       loadDesktopCapability,
+      runtimeFactory: nodeRuntimeFactory,
     });
 
     expect(availableSubagents.find((agent) => agent.id === "desktop")?.subagentRunnable).toBe(true);
@@ -6575,6 +6580,7 @@ describe("discoverAvailableSubagentsForToolContext", () => {
         globalRoot: path.join(project.path, "empty-global-agents"),
       },
       loadDesktopCapability,
+      runtimeFactory: nodeRuntimeFactory,
     });
 
     const desktop = availableSubagents.find((agent) => agent.id === "desktop");
