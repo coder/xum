@@ -13592,10 +13592,12 @@ export class AgentSession {
     const runtime = createRuntimeForWorkspace(metadataResult.data);
 
     const attachments = await AttachmentService.generatePostCompactionAttachments(
-      await resolvePlanFileLocation(this.config, runtime, {
-        ...metadataResult.data,
-        id: this.workspaceId,
-      }),
+      await resolvePlanFileLocation(
+        this.config,
+        runtime,
+        { ...metadataResult.data, id: this.workspaceId },
+        this.historyService.locks
+      ),
       context.diffs,
       context.loadedSkills,
       runtime,
