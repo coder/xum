@@ -1,7 +1,8 @@
 import { useContext, useEffect, useState } from "react";
 
 import { APIContext } from "@/browser/contexts/API";
-import { loadGoalDefaults } from "@/browser/utils/goals/resolveGoalSetIntent";
+import { loadShownGoalDefaults } from "@/browser/utils/goals/resolveGoalSetIntent";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { DEFAULT_GOAL_DEFAULTS, type GoalDefaults } from "@/constants/goals";
 
 /**
@@ -19,6 +20,15 @@ export interface UseGoalDefaultsResult {
   defaults: GoalDefaults;
   isLoading: boolean;
   reload: () => void;
+}
+
+/**
+ * A cancelled load, or a read cut off by a lost connection, keeps the shown values: the next
+ * client reads again. Other failures (a server cancel included) fall back to the canonical
+ * defaults.
+ */
+function keepsShownDefaults(cancelled: boolean, error: unknown): boolean {
+  return cancelled || isConnectionLostError(error);
 }
 
 export function useGoalDefaults(workspaceId?: string): UseGoalDefaultsResult {
@@ -40,17 +50,14 @@ export function useGoalDefaults(workspaceId?: string): UseGoalDefaultsResult {
     if (!api) return;
     let cancelled = false;
     setIsLoading(true);
-    void loadGoalDefaults(api, workspaceId)
+    void loadShownGoalDefaults(api, workspaceId)
       .then((next) => {
         if (cancelled) return;
         setDefaults(next);
         setIsLoading(false);
       })
-      .catch(() => {
-        if (cancelled) return;
-        // `loadGoalDefaults` already swallows errors and falls back to the
-        // canonical defaults, but be defensive about state cleanup in case
-        // a different rejection path lands here.
+      .catch((error: unknown) => {
+        if (keepsShownDefaults(cancelled, error)) return;
         setDefaults({ ...DEFAULT_GOAL_DEFAULTS });
         setIsLoading(false);
       });

@@ -24,11 +24,22 @@ restoreModulesAfterSuite([
     { ...RealBrowserBridgeConnectionModule },
   ],
 ]);
+/**
+ * How often BrowserTab replaced the (stubbed) bridge: a disconnect, or a connect (which closes the
+ * old socket first). And the session the bridge shows.
+ */
+let bridgeDisconnects = 0;
+let bridgeSession: { sessionName: string; status: "live" | "error"; lastError?: string } | null =
+  null;
 void mock.module("@/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection", () => ({
   useBrowserBridgeConnection: () => ({
-    session: null,
-    connect: () => undefined,
-    disconnect: () => undefined,
+    session: bridgeSession,
+    connect: () => {
+      bridgeDisconnects += 1;
+    },
+    disconnect: () => {
+      bridgeDisconnects += 1;
+    },
     sendInput: () => undefined,
     setPendingUrl: () => undefined,
   }),
@@ -93,6 +104,7 @@ describe.each([...GAP_MODES])("BrowserTab across a dropped connection (%s)", (mo
   beforeEach(() => {
     cleanupDom = installDom();
     window.localStorage.clear();
+    bridgeSession = null;
     harness = createConnectionHarness(mode, serverOverrides);
     answerSessions = () =>
       Promise.resolve({
@@ -142,6 +154,38 @@ describe.each([...GAP_MODES])("BrowserTab across a dropped connection (%s)", (mo
     await reconnect();
     await view.findByTestId("browser-page-tab-t3");
     expect(view.queryByTestId("browser-page-tab-t2")).toBeNull();
+  });
+
+  // The selected session is still listed while offline: dropping its bridge would throw away the
+  // shown preview for a connection the reconnect restores.
+  // Picking another session offline drops the old bridge: its input must not reach a session
+  // the picker no longer shows.
+  test("keeps the selected session's bridge while offline, and drops it for another pick", async () => {
+    answerSessions = () =>
+      Promise.resolve({
+        sessions: [
+          { sessionName: "alpha", status: "attachable" },
+          { sessionName: "beta", status: "attachable" },
+        ],
+        otherSessions: [],
+      });
+    bridgeSession = { sessionName: "alpha", status: "live" };
+    const view = render(<BrowserTab workspaceId="ws-1" projectPath="/project" />, {
+      wrapper: Wrapper,
+    });
+    await view.findByTestId("browser-page-tab-t2");
+    const disconnectsBefore = bridgeDisconnects;
+
+    // The bridge's own socket fails with the connection (a retryable error). Offline, a new
+    // connect could not reach the server and would clear the last frame, so none starts.
+    bridgeSession = { sessionName: "alpha", status: "error", lastError: "bridge disconnected" };
+    await drop();
+    expect(bridgeDisconnects).toBe(disconnectsBefore);
+
+    fireEvent.click(view.getByText("alpha"));
+    fireEvent.click(view.getByTestId("browser-session-beta"));
+    await flush();
+    expect(bridgeDisconnects).toBeGreaterThan(disconnectsBefore);
   });
 
   test("picking another session while reconnecting clears the previous session's page tabs", async () => {
