@@ -412,8 +412,8 @@ export type PluginSkillsRoot =
   /** Holds `<name>/SKILL.md` skill folders. */
   | { dir: string; single?: undefined; name?: undefined; command?: undefined }
   /**
-   * Holds SKILL.md itself. `name` is the folder name as declared, or the plugin name when the
-   * path is the plugin root. It is not validated here: scan sites reject an invalid skill name.
+   * Holds SKILL.md itself. `name` is the skill name of the folder as declared
+   * (pluginSkillNameOfFolder), or the plugin name when the path is the plugin root. It is not validated here: scan sites reject an invalid skill name.
    * `command`: a Claude command instead, the file `<dir>/<name>.md` (claudeCommands.ts). Its
    * `dir` is the commands folder and its name is valid. Command roots follow every skills root,
    * so a skill of the same name wins; discovery drops such a command with a warning.
@@ -421,29 +421,87 @@ export type PluginSkillsRoot =
   | { dir: string; single: true; name: string; command?: true };
 
 /**
+ * The skill name of a plugin skill folder. Claude Code and Codex name a skill by its SKILL.md
+ * `name`, not its folder, so plugins ship snake_case folders: google/elephant-goldfish-model
+ * has `skills/egm_bootstrap/SKILL.md` with `name: egm-bootstrap`. A folder with `_` and no `-`
+ * loads under the kebab-case name. The mapping is 1:1 (pluginSkillFolderAlias inverts it), so a
+ * lookup finds the folder without listing the root. Other names come back unchanged: scan sites
+ * reject an invalid one, and the SKILL.md `name` must still match the result.
+ */
+export function pluginSkillNameOfFolder(folder: string): string {
+  if (!folder.includes("_") || folder.includes("-")) return folder;
+  return folder.replaceAll("_", "-");
+}
+
+/** The snake_case folder that can also hold plugin skill `name` (pluginSkillNameOfFolder). */
+export function pluginSkillFolderAlias(name: string): string | undefined {
+  return name.includes("-") ? name.replaceAll("-", "_") : undefined;
+}
+
+/**
+ * The skill name of each plugin skill folder. A snake_case folder is dropped when the kebab-case
+ * path is a directory (`isDirectory` follows symlinks): lookups try that path first and fall
+ * back only when it is not a directory, so the two always agree. The path is stat'ed even when
+ * the listing has no entry of that exact name: on a case-insensitive filesystem a `Foo-Bar`
+ * folder answers the lookup of `foo-bar`.
+ */
+export async function pluginSkillFolderNames(
+  folders: readonly string[],
+  isDirectory: (folder: string) => Promise<boolean>
+): Promise<Array<{ folder: string; name: string }>> {
+  const entries: Array<{ folder: string; name: string }> = [];
+  for (const folder of folders) {
+    const name = pluginSkillNameOfFolder(folder);
+    if (name !== folder && (await isDirectory(name))) continue;
+    entries.push({ folder, name });
+  }
+  return entries;
+}
+
+/**
+ * Whether the kebab-case twin of a snake_case plugin skill folder is a directory
+ * (pluginSkillFolderNames). An entry Xum cannot stat for a reason other than absence (a symlink
+ * loop, a permission error) counts as present: a lookup refuses such a folder instead of falling
+ * back (#4438), so its snake_case twin must not load in its place anywhere.
+ */
+export function isPluginSkillDirectory(
+  stat: Promise<{ isDirectory(): boolean }>
+): Promise<boolean> {
+  return stat.then(
+    (result) => result.isDirectory(),
+    (error: unknown) => !(hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR"))
+  );
+}
+
+/**
  * The skill folders of one skills root, sorted: the root itself when it is a single skill, else
  * its subfolders, symlinks included (runtime discovery follows them, so consent must list them).
+ * `name` is the skill name (pluginSkillNameOfFolder). `folder` is the folder's own name in a
+ * container root, and `name` for a single root (whose review label is the root's path).
  * `file` is the skill's Markdown file (SKILL.md, or a command's `<name>.md`). Names are not
  * validated: callers report an invalid one.
  */
 export async function listPluginSkillFolders(
   root: PluginSkillsRoot
-): Promise<Array<{ name: string; dir: string; file: string }>> {
+): Promise<Array<{ name: string; folder: string; dir: string; file: string }>> {
   if (root.single) {
     const file = path.join(root.dir, pluginSkillFileName(root.name, root.command));
-    return [{ name: root.name, dir: root.dir, file }];
+    return [{ name: root.name, folder: root.name, dir: root.dir, file }];
   }
   try {
     const entries = await pluginFs().readdir(root.dir);
-    return entries
+    const folders = entries
       .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
       .map((entry) => entry.name)
-      .sort((a, b) => a.localeCompare(b))
-      .map((name) => ({
-        name,
-        dir: path.join(root.dir, name),
-        file: path.join(root.dir, name, SKILL_FILENAME),
-      }));
+      .sort((a, b) => a.localeCompare(b));
+    const isDirectory = (folder: string) =>
+      isPluginSkillDirectory(pluginFs().stat(path.join(root.dir, folder)));
+    return (await pluginSkillFolderNames(folders, isDirectory)).map(({ folder, name }) => ({
+      name,
+      folder,
+      dir: path.join(root.dir, folder),
+      file: path.join(root.dir, folder, SKILL_FILENAME),
+    }));
   } catch {
     return [];
   }
@@ -678,7 +736,10 @@ async function classifySkillsRoot(args: {
   // Decide "root" from the declared path, not the canonical one: `alias -> .` is still
   // the folder the author named `alias`.
   const declaredPath = path.resolve(args.rootReal, args.relative);
-  const name = declaredPath === args.rootReal ? args.pluginName : path.basename(declaredPath);
+  const name =
+    declaredPath === args.rootReal
+      ? args.pluginName
+      : pluginSkillNameOfFolder(path.basename(declaredPath));
   return { dir: args.canonical, single: true, name };
 }
 

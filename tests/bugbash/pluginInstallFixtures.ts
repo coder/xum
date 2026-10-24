@@ -214,6 +214,33 @@ function multiHarness(): Files {
   };
 }
 
+/**
+ * Skill folders in snake_case, as google/elephant-goldfish-model ships them: Claude Code and Codex
+ * name a skill by its SKILL.md `name`, so `skills/egm_bootstrap` holds `egm-bootstrap`.
+ */
+function snakeCaseSkills(): Files {
+  return {
+    "plugin.json": JSON.stringify(
+      {
+        $schema: SCHEMA_ID,
+        name: "snake-case-skills",
+        version: "1.0.0",
+        description: "An Agent Plugin whose skill folders use snake_case names (bug-bash fixture)",
+      },
+      null,
+      2
+    ),
+    "skills/egm_bootstrap/SKILL.md": skillMd(
+      "egm-bootstrap",
+      "Writes a README.md for each folder of a repository subtree"
+    ),
+    "skills/egm_review_loop/SKILL.md": skillMd(
+      "egm-review-loop",
+      "Reviews a design document again until no reviewer finds a problem"
+    ),
+  };
+}
+
 const EXECUTABLE = new Set(["claude-review-kit/bin/server"]);
 
 export function installFixtures(): Record<string, Files> {
@@ -223,6 +250,7 @@ export function installFixtures(): Record<string, Files> {
     "plain-skills": plainSkills(),
     "agent-plugin-with-skills": agentPluginWithSkills(),
     "multi-harness": multiHarness(),
+    "snake-case-skills": snakeCaseSkills(),
   };
 }
 

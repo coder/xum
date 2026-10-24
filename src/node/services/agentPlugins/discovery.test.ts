@@ -10,6 +10,7 @@ import {
   discoverAgentPlugins,
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
+  pluginSkillFolderNames,
   readPluginFileWithinRootCapped,
   setAgentPluginDiscoveryGate,
 } from "./discovery";
@@ -2365,4 +2366,16 @@ describe("generatedFrom marker (Claude marketplace packages)", () => {
       });
     }
   });
+});
+
+// On a case-insensitive filesystem (the macOS default), a `Foo-Bar` folder answers the lookup of
+// `foo-bar`, so its snake_case twin must not be offered although no entry is named `foo-bar`.
+test("a snake_case plugin skill folder yields to any kebab-case path that is a directory", async () => {
+  const caseInsensitive = (folder: string) => Promise.resolve(folder.toLowerCase() === "foo-bar");
+  expect(
+    await pluginSkillFolderNames(["Foo-Bar", "foo_bar", "other_skill"], caseInsensitive)
+  ).toEqual([
+    { folder: "Foo-Bar", name: "Foo-Bar" },
+    { folder: "other_skill", name: "other-skill" },
+  ]);
 });
