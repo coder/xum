@@ -22,6 +22,7 @@ import {
   type LanguageModel,
   type Tool,
   type ToolSet,
+  type PrepareStepFunction,
   type PrepareStepResult,
   LoadAPIKeyError,
   APICallError,
@@ -911,6 +912,67 @@ interface ReasoningReplayBoundary {
   index: number;
   /** The SDK step whose request first sent that boundary (stepTracker.anthropicThinkingStripStep). */
   step: number;
+}
+
+/** Why a step stops after a cross-family fallback invalidated its staged prefix swap. */
+export function prefixSwapInvalidationReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new Error("Prefix swap invalidated");
+}
+
+/** Clear the staged prefix swap when a thinking change voids it. */
+export function dropVoidedPrefixSwap(
+  request: Pick<StreamRequestConfig, "thinkingOverrideState">,
+  stepTracker: StepMessageTracker | undefined
+): void {
+  if (
+    stepTracker &&
+    thinkingChangeVoidsPrefixSwap(request.thinkingOverrideState, stepTracker.pendingPrefixSwap)
+  ) {
+    stepTracker.pendingPrefixSwap = undefined;
+  }
+}
+
+/** Record the messages a step sends and notify the request's step-messages listener. */
+export function recordStepMessages(
+  request: Pick<StreamRequestConfig, "onStepMessages">,
+  stepTracker: StepMessageTracker | undefined,
+  effectiveMessages: ModelMessage[]
+): void {
+  if (stepTracker) {
+    stepTracker.latestMessages = effectiveMessages;
+  }
+  request.onStepMessages?.(effectiveMessages);
+}
+
+/** Whether a step sends the turn's first provider request; without a tracker, assume a step ran. */
+export function isFirstTurnRequest(
+  stepTracker: StepMessageTracker | undefined,
+  stepNumber: number
+): boolean {
+  return stepTracker != null && stepNumber === 0 && !stepTracker.providerRequestPrepared;
+}
+
+/** What one streamText call's prepareStep reads, and the replay boundary its steps advance. */
+interface StepPreparationContext {
+  request: StreamRequestConfig;
+  abortController: AbortController;
+  stepTracker: StepMessageTracker | undefined;
+  agentToolsDisabled: boolean;
+  replayBoundary: ReasoningReplayBoundary;
+}
+
+/** The prepareStep options the phases read. */
+type StepPreparationInput = Pick<
+  Parameters<PrepareStepFunction<ToolSet>>[0],
+  "messages" | "stepNumber" | "steps"
+>;
+
+/** A step after prepareStep's messages phase, as its request phase takes it. */
+interface StagedStepMessages {
+  effectiveMessages: ModelMessage[];
+  escalation: ProposedThinkingEscalation | undefined;
+  escalationState: AutoThinkingEscalationState | undefined;
+  overrideState: ActiveTurnThinkingOverride | undefined;
 }
 
 /** Move the boundary to this step's outgoing length when its prefix changed. */
@@ -3548,6 +3610,168 @@ export class StreamManager {
     return effectiveMessages;
   }
 
+  /**
+   * prepareStep's messages phase: rewrite the step's messages, apply a staged prefix swap
+   * and record the messages the step sends. streamText runs one LLM call per step.
+   */
+  private async prepareStepMessages(
+    context: StepPreparationContext,
+    step: StepPreparationInput
+  ): Promise<PrepareStepResult<ToolSet>> {
+    const { request, abortController, stepTracker } = context;
+    const { messages: stepMessages, stepNumber } = step;
+    // streamText runs multiple internal LLM calls (steps) when tools are enabled.
+    const rewritten = await transformStepMessages(stepMessages);
+    let effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
+    if (stepTracker?.prefixSwapInvalidated) {
+      // Cross-family fallback must not send the old provider's cached prefix.
+      // Release only on the session's stop, after fallback reset/locks have completed.
+      if (!abortController.signal.aborted) {
+        await new Promise<void>((resolve) =>
+          abortController.signal.addEventListener("abort", () => resolve(), { once: true })
+        );
+      }
+      throw prefixSwapInvalidationReason(abortController.signal);
+    }
+    // Auto-set thinking raises itself when the turn looks stuck, through the same
+    // override the slider uses (so the swap check below sees it too); a slider move
+    // this turn hands the level to the user.
+    const escalationState = stepTracker?.autoThinkingEscalation;
+    const overrideState = request.thinkingOverrideState;
+    const escalation = stageAutoThinkingEscalation(escalationState, overrideState, stepMessages);
+    // The staged prefix was prepared under the previous thinking options.
+    // Keep full context if those options change before the swap is consumed.
+    dropVoidedPrefixSwap(request, stepTracker);
+    const swap = stepTracker?.pendingPrefixSwap;
+    if (swap && stepTracker?.workspaceId) {
+      const swapped = this.providerRequest.swapPrefix(effectiveMessages, swap);
+      if (swapped) {
+        effectiveMessages = await this.commitPrefixSwap(
+          request,
+          abortController,
+          stepTracker,
+          stepTracker.workspaceId,
+          { swap, swapped, stepNumber },
+          effectiveMessages
+        );
+      }
+      if (stepTracker.pendingPrefixSwap === swap) stepTracker.pendingPrefixSwap = undefined;
+    }
+    // Dedupe after the swap, never before: the swap replaces the prefix this
+    // projection is decided against, and the SDK accumulates the next step's
+    // input from these returned messages, so a reference dropped against a
+    // swapped-out prefix would stay lost for the rest of the turn.
+    effectiveMessages = dedupeNativeToolReferences(effectiveMessages);
+    recordStepMessages(request, stepTracker, effectiveMessages);
+    // Hand off without an await, so the request phase starts in the same tick.
+    return this.prepareStepRequest(context, step, {
+      effectiveMessages,
+      escalation,
+      escalationState,
+      overrideState,
+    });
+  }
+
+  /**
+   * prepareStep's request phase: tools, the thinking override, the step-0 rebuild, the
+   * replay strip and the context budget, then the step's prepareStep result.
+   */
+  private async prepareStepRequest(
+    context: StepPreparationContext,
+    step: StepPreparationInput,
+    staged: StagedStepMessages
+  ): Promise<PrepareStepResult<ToolSet>> {
+    const { request, stepTracker, agentToolsDisabled, replayBoundary } = context;
+    const { messages: stepMessages, stepNumber, steps } = step;
+    const { escalation, escalationState, overrideState } = staged;
+    let { effectiveMessages } = staged;
+    const { forceFirstStepTools, activeTools } = selectStepActiveTools(
+      request,
+      stepNumber,
+      agentToolsDisabled
+    );
+    // Mid-turn thinking-level change: consume a pending override before
+    // this step's provider request is built. Before the turn's first request it
+    // resolves as at turn start (#5279); without a tracker, assume a step ran.
+    const firstTurnRequest = isFirstTurnRequest(stepTracker, stepNumber);
+    const thinkingOverride = this.providerRequest.applyPendingThinkingOverride(
+      request,
+      firstTurnRequest
+    );
+    if (stepTracker) stepTracker.providerRequestPrepared = true;
+    settleAutoThinkingEscalation(escalation, escalationState, overrideState, thinkingOverride);
+    // Step 0: an override consumed here raced stream setup (written during
+    // startStream's awaits, after TurnRequestBuilder's pre-construction quiescence
+    // fold). Message preparation is thinking-level-dependent (Anthropic
+    // signed-reasoning transforms), so rebuild the first-step messages
+    // under the applied level too; the closure also emits a superseding
+    // turn envelope so wire, envelope, and replay agree.
+    const pendingRebuild = startFirstStepRebuild(
+      request,
+      stepTracker,
+      stepNumber,
+      thinkingOverride
+    );
+    let rebuiltFirstStepMessages = pendingRebuild == null ? undefined : await pendingRebuild;
+    // #5086, preserved thinking: a replayed in-turn thinking block stays valid only
+    // while everything before it is unchanged. A consumed prefix swap or a change to
+    // the advertised tool set edits that prefix, so rows sent up to that step never
+    // replay reasoning again. Blocks produced after it are bound to the new prefix and
+    // keep replaying (#5279). This applies to every Anthropic Messages thinking mode,
+    // not only `between_tools` (which cannot carry blockBinding): only the direct API
+    // route and anthropic-typed Coder AI Gateway instances send `drop_block`, so
+    // adaptive/enabled thinking on other routes would 400.
+    // Claude on Bedrock gets the same strip (#5841): Bedrock cannot take drop_block.
+    const outgoing = rebuiltFirstStepMessages ?? effectiveMessages;
+    advanceReasoningReplayBoundary(
+      replayBoundary,
+      activeTools,
+      stepTracker?.consumedPrefixSwap,
+      outgoing.length,
+      stepNumber
+    );
+    const stripped = stripReasoningBeforeReplayBoundary(
+      request,
+      stepTracker,
+      replayBoundary,
+      outgoing
+    );
+    if (stripped != null) {
+      if (rebuiltFirstStepMessages != null) {
+        rebuiltFirstStepMessages = stripped;
+      } else {
+        effectiveMessages = stripped;
+      }
+    }
+    // Taken before this step records its own request; step zero has no settled step.
+    const previousRequest = stepNumber > 0 ? stepTracker?.contextBudgetRequest : undefined;
+    const budgetRequest = buildContextBudgetRequest(
+      request,
+      agentToolsDisabled,
+      forceFirstStepTools,
+      rebuiltFirstStepMessages ?? effectiveMessages
+    );
+    if (stepTracker) stepTracker.contextBudgetRequest = budgetRequest;
+    if (request.contextBudgetLimit != null) {
+      await enforceContextBudgetPreflight(
+        request,
+        request.contextBudgetLimit,
+        budgetRequest,
+        previousRequest,
+        steps.at(-1),
+        stepNumber
+      );
+    }
+    return buildPrepareStepResult({
+      stepMessages,
+      effectiveMessages,
+      rebuiltFirstStepMessages,
+      forceFirstStepTools,
+      activeTools,
+      thinkingOverride,
+    });
+  }
+
   private createStreamResult(
     request: StreamRequestConfig,
     abortController: AbortController,
@@ -3558,11 +3782,17 @@ export class StreamManager {
     // Explicit <ToolSet> pins RUNTIME_CONTEXT to its default: mux tools use
     // Tool's `any` context, which would otherwise infect the inferred result
     // type (no-unsafe-return).
-    // #5086: see the `between_tools` replay guard in prepareStep.
-    const replayBoundary: ReasoningReplayBoundary = { index: 0, step: 0 };
     // XUM_DISABLE_AGENT_TOOLS=1 sends no tools at all (see isAgentToolsDisabled). Every chat
     // turn, sub-agent and workflow agent streams through here.
     const agentToolsDisabled = isAgentToolsDisabled();
+    const context: StepPreparationContext = {
+      request,
+      abortController,
+      stepTracker,
+      agentToolsDisabled,
+      // #5086: see the `between_tools` replay guard in prepareStepRequest.
+      replayBoundary: { index: 0, step: 0 },
+    };
     return (this.streamTextOverride ?? streamText)<ToolSet>({
       model: request.model,
       messages: request.messages,
@@ -3572,152 +3802,7 @@ export class StreamManager {
       // Trusted: mux builds these messages server-side.
       allowSystemInMessages: true,
       abortSignal: abortController.signal,
-      prepareStep: async ({ messages: stepMessages, stepNumber, steps }) => {
-        // streamText runs multiple internal LLM calls (steps) when tools are enabled.
-        const rewritten = await transformStepMessages(stepMessages);
-        let effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
-        if (stepTracker?.prefixSwapInvalidated) {
-          // Cross-family fallback must not send the old provider's cached prefix.
-          // Release only on the session's stop, after fallback reset/locks have completed.
-          if (!abortController.signal.aborted) {
-            await new Promise<void>((resolve) =>
-              abortController.signal.addEventListener("abort", () => resolve(), { once: true })
-            );
-          }
-          throw abortController.signal.reason ?? new Error("Prefix swap invalidated");
-        }
-        // Auto-set thinking raises itself when the turn looks stuck, through the same
-        // override the slider uses (so the swap check below sees it too); a slider move
-        // this turn hands the level to the user.
-        const escalationState = stepTracker?.autoThinkingEscalation;
-        const overrideState = request.thinkingOverrideState;
-        const escalation = stageAutoThinkingEscalation(
-          escalationState,
-          overrideState,
-          stepMessages
-        );
-        // The staged prefix was prepared under the previous thinking options.
-        // Keep full context if those options change before the swap is consumed.
-        if (
-          stepTracker &&
-          thinkingChangeVoidsPrefixSwap(
-            request.thinkingOverrideState,
-            stepTracker.pendingPrefixSwap
-          )
-        ) {
-          stepTracker.pendingPrefixSwap = undefined;
-        }
-        const swap = stepTracker?.pendingPrefixSwap;
-        if (swap && stepTracker?.workspaceId) {
-          const swapped = this.providerRequest.swapPrefix(effectiveMessages, swap);
-          if (swapped) {
-            effectiveMessages = await this.commitPrefixSwap(
-              request,
-              abortController,
-              stepTracker,
-              stepTracker.workspaceId,
-              { swap, swapped, stepNumber },
-              effectiveMessages
-            );
-          }
-          if (stepTracker.pendingPrefixSwap === swap) stepTracker.pendingPrefixSwap = undefined;
-        }
-        // Dedupe after the swap, never before: the swap replaces the prefix this
-        // projection is decided against, and the SDK accumulates the next step's
-        // input from these returned messages, so a reference dropped against a
-        // swapped-out prefix would stay lost for the rest of the turn.
-        effectiveMessages = dedupeNativeToolReferences(effectiveMessages);
-        if (stepTracker) {
-          stepTracker.latestMessages = effectiveMessages;
-        }
-        request.onStepMessages?.(effectiveMessages);
-        const { forceFirstStepTools, activeTools } = selectStepActiveTools(
-          request,
-          stepNumber,
-          agentToolsDisabled
-        );
-        // Mid-turn thinking-level change: consume a pending override before
-        // this step's provider request is built. Before the turn's first request it
-        // resolves as at turn start (#5279); without a tracker, assume a step ran.
-        const firstTurnRequest =
-          stepTracker != null && stepNumber === 0 && !stepTracker.providerRequestPrepared;
-        const thinkingOverride = this.providerRequest.applyPendingThinkingOverride(
-          request,
-          firstTurnRequest
-        );
-        if (stepTracker) stepTracker.providerRequestPrepared = true;
-        settleAutoThinkingEscalation(escalation, escalationState, overrideState, thinkingOverride);
-        // Step 0: an override consumed here raced stream setup (written during
-        // startStream's awaits, after TurnRequestBuilder's pre-construction quiescence
-        // fold). Message preparation is thinking-level-dependent (Anthropic
-        // signed-reasoning transforms), so rebuild the first-step messages
-        // under the applied level too; the closure also emits a superseding
-        // turn envelope so wire, envelope, and replay agree.
-        const pendingRebuild = startFirstStepRebuild(
-          request,
-          stepTracker,
-          stepNumber,
-          thinkingOverride
-        );
-        let rebuiltFirstStepMessages = pendingRebuild == null ? undefined : await pendingRebuild;
-        // #5086, preserved thinking: a replayed in-turn thinking block stays valid only
-        // while everything before it is unchanged. A consumed prefix swap or a change to
-        // the advertised tool set edits that prefix, so rows sent up to that step never
-        // replay reasoning again. Blocks produced after it are bound to the new prefix and
-        // keep replaying (#5279). This applies to every Anthropic Messages thinking mode,
-        // not only `between_tools` (which cannot carry blockBinding): only the direct API
-        // route and anthropic-typed Coder AI Gateway instances send `drop_block`, so
-        // adaptive/enabled thinking on other routes would 400.
-        // Claude on Bedrock gets the same strip (#5841): Bedrock cannot take drop_block.
-        const outgoing = rebuiltFirstStepMessages ?? effectiveMessages;
-        advanceReasoningReplayBoundary(
-          replayBoundary,
-          activeTools,
-          stepTracker?.consumedPrefixSwap,
-          outgoing.length,
-          stepNumber
-        );
-        const stripped = stripReasoningBeforeReplayBoundary(
-          request,
-          stepTracker,
-          replayBoundary,
-          outgoing
-        );
-        if (stripped != null) {
-          if (rebuiltFirstStepMessages != null) {
-            rebuiltFirstStepMessages = stripped;
-          } else {
-            effectiveMessages = stripped;
-          }
-        }
-        // Taken before this step records its own request; step zero has no settled step.
-        const previousRequest = stepNumber > 0 ? stepTracker?.contextBudgetRequest : undefined;
-        const budgetRequest = buildContextBudgetRequest(
-          request,
-          agentToolsDisabled,
-          forceFirstStepTools,
-          rebuiltFirstStepMessages ?? effectiveMessages
-        );
-        if (stepTracker) stepTracker.contextBudgetRequest = budgetRequest;
-        if (request.contextBudgetLimit != null) {
-          await enforceContextBudgetPreflight(
-            request,
-            request.contextBudgetLimit,
-            budgetRequest,
-            previousRequest,
-            steps.at(-1),
-            stepNumber
-          );
-        }
-        return buildPrepareStepResult({
-          stepMessages,
-          effectiveMessages,
-          rebuiltFirstStepMessages,
-          forceFirstStepTools,
-          activeTools,
-          thinkingOverride,
-        });
-      },
+      prepareStep: (step) => this.prepareStepMessages(context, step),
       onChunk: request.onChunk,
       tools: agentToolsDisabled ? undefined : request.tools,
       experimental_transform: summarizeInvalidToolInputErrors(),
