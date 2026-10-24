@@ -290,6 +290,26 @@ test("an open FileHandle fails drain() until close()", async () => {
   }
 });
 
+test("an fs.watch fails drain() until close(), whatever its listener does", async () => {
+  // Config and ProviderService watch with a listener that runs on events only: the watcher,
+  // not the listener, is the open work.
+  trap.arm();
+  try {
+    const watcher = fsNs.watch(os.tmpdir(), { persistent: false }, () => undefined);
+    let failure = "";
+    try {
+      await trap.drain(200);
+    } catch (error) {
+      failure = String(error);
+    }
+    watcher.close();
+    await trap.drain(200);
+    expect(failure).toContain("fs.watch");
+  } finally {
+    trap.disarm();
+  }
+});
+
 test("arm() resets the open work", async () => {
   trap.arm();
   const interval = setInterval(() => undefined, 50);

@@ -163,7 +163,9 @@ function wrapFunction(rec: Recorder, original: AnyFunction, api: string, promise
   const name = api.slice(api.indexOf(".") + 1);
   const wrapped = function (this: unknown, ...args: unknown[]): unknown {
     const id = rec.record(api, args[0]);
-    if (id !== null && !promiseApi && !name.endsWith("Sync")) {
+    // fs.watch takes an event listener, not a completion callback: the watcher is open until
+    // it closes (below).
+    if (id !== null && !promiseApi && !name.endsWith("Sync") && api !== "fs.watch") {
       // Callback form (fs.readFile(path, cb)): open until the callback runs.
       const at = args.findLastIndex(isFunction);
       if (at >= 0) {
@@ -206,7 +208,7 @@ function wrapFunction(rec: Recorder, original: AnyFunction, api: string, promise
       // Bun.spawn: open until the child exits.
       rec.openUntil(id, api, exited);
     } else if (
-      /^fs\.create(Read|Write)Stream$/.test(api) ||
+      /^fs\.(create(Read|Write)Stream|watch)$/.test(api) ||
       (api.startsWith("cp.") && CHILD_FUNCTIONS.has(name))
     ) {
       const emitter = result as { once(event: string, listener: () => void): unknown };
