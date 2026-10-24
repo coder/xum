@@ -10868,6 +10868,7 @@ export class AgentSession {
       (await needsTodoTurnEndNudge({
         sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
         parts: payload.parts,
+        files: this.historyService.files,
       }))
     );
   }

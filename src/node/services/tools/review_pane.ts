@@ -222,7 +222,11 @@ export const createReviewPaneGetTool: ToolFactory = (config) => {
     execute: async () => {
       assert(config.workspaceSessionDir, "review_pane_get requires workspaceSessionDir");
       const hunks = (
-        await readAssistedReviewForSessionDir(config.workspaceSessionDir, config.sessionFiles)
+        await readAssistedReviewForSessionDir(
+          config.workspaceSessionDir,
+          // mutation-equivalent: sessionFiles is a SessionFiles object or undefined, so ?? and || agree
+          config.sessionFiles ?? nodeSessionFiles
+        )
       ).map((hunk) =>
         normalizeAssistedReviewHunk(hunk, {
           projectPath: config.workspaceProjectPath,

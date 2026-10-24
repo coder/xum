@@ -4,6 +4,7 @@ import type { ToolFactory } from "@/common/utils/tools/tools";
 import { completeInProgressTodoItems } from "@/common/utils/todoList";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { log } from "@/node/services/log";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { RuntimeError, isRuntimeTransportError } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
@@ -90,10 +91,9 @@ export const createProposePlanTool: ToolFactory = (config) => {
 
       if (config.workspaceId && config.workspaceSessionDir) {
         try {
-          const existingTodos = await readTodosForSessionDir(
-            config.workspaceSessionDir,
-            config.sessionFiles
-          );
+          // mutation-equivalent: sessionFiles is a SessionFiles object or undefined, so ?? and || agree
+          const files = config.sessionFiles ?? nodeSessionFiles;
+          const existingTodos = await readTodosForSessionDir(config.workspaceSessionDir, files);
           const completedTodos = completeInProgressTodoItems(existingTodos);
           if (completedTodos !== existingTodos) {
             // A successful propose_plan ends the planning turn immediately, so persist the
@@ -102,9 +102,9 @@ export const createProposePlanTool: ToolFactory = (config) => {
               config.workspaceId,
               config.workspaceSessionDir,
               completedTodos,
-              // Absent: setTodosForSessionDir's Node defaults.
+              // Absent: setTodosForSessionDir's Node default.
               config.sessionLocks,
-              config.sessionFiles
+              files
             );
           }
         } catch (error) {

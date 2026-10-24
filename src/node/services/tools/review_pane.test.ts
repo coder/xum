@@ -17,6 +17,7 @@ import {
 import { buildSessionFiles } from "@/node/services/sessionFiles/buildSessionFiles.testHarness";
 import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
 import { TestTempDir, createTestToolConfig, mockToolCallOptions } from "./testHelpers";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 
 type UpdateExecArgs = Parameters<
   NonNullable<ReturnType<typeof createReviewPaneUpdateTool>["execute"]>
@@ -403,8 +404,8 @@ describe("review_pane tool persistence", () => {
     expect(gotB.hunks).toEqual([]);
 
     // And direct disk reads agree.
-    expect(await readAssistedReviewForSessionDir(dirA)).toHaveLength(1);
-    expect(await readAssistedReviewForSessionDir(dirB)).toHaveLength(0);
+    expect(await readAssistedReviewForSessionDir(dirA, nodeSessionFiles)).toHaveLength(1);
+    expect(await readAssistedReviewForSessionDir(dirB, nodeSessionFiles)).toHaveLength(0);
   });
 
   it("self-heals from a corrupted file by treating it as empty", async () => {

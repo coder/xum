@@ -100,6 +100,7 @@ import {
   isWorkspaceEvent,
   statusSetResultStatus,
 } from "@/node/services/aiServiceEventGuards";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
 import type { TelemetryService } from "@/node/services/telemetryService";
@@ -5268,7 +5269,8 @@ export class WorkspaceService
       .catch(() => undefined)
       .then(async () => {
         const sessionDir = path.join(this.config.sessionsDir, workspaceId);
-        const todos = await readTodosForSessionDir(sessionDir);
+        // Outside the agent loop: the host's session files.
+        const todos = await readTodosForSessionDir(sessionDir, nodeSessionFiles);
         const todoStatus = deriveTodoStatus(todos) ?? null;
 
         await this.emitWorkspaceActivityUpdate(workspaceId, "update workspace todo status", () =>
@@ -5327,7 +5329,8 @@ export class WorkspaceService
         // Stop snapshots need an authoritative todo summary even for background workspaces,
         // and centralizing the read here preserves the fire-and-forget abort/error handlers.
         const sessionDir = path.join(this.config.sessionsDir, workspaceId);
-        const todos = await readTodosForSessionDir(sessionDir);
+        // Outside the agent loop: the host's session files.
+        const todos = await readTodosForSessionDir(sessionDir, nodeSessionFiles);
         hasTodos ??= todos.length > 0;
         // When there are no todos to derive from, leave `todoStatus` undefined
         // so setStreaming doesn't touch the slot. AgentStatusService writes

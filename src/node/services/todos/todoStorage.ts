@@ -1,7 +1,6 @@
 import * as path from "path";
 
 import type { TodoItem } from "@/common/types/tools";
-import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 
 const TODO_FILE_NAME = "todos.json";
@@ -40,7 +39,7 @@ export function coerceTodoItems(value: unknown): TodoItem[] {
  */
 export async function readTodosForSessionDir(
   workspaceSessionDir: string,
-  files: SessionFiles = nodeSessionFiles
+  files: SessionFiles
 ): Promise<TodoItem[]> {
   const todoFile = getTodoFilePath(workspaceSessionDir);
 

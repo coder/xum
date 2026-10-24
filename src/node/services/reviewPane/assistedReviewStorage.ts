@@ -1,7 +1,6 @@
 import * as path from "path";
 
 import type { AssistedReviewHunk } from "@/common/types/review";
-import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 
 /**
@@ -75,7 +74,7 @@ export function coerceAssistedReviewHunks(value: unknown): AssistedReviewHunk[] 
  */
 export async function readAssistedReviewForSessionDir(
   workspaceSessionDir: string,
-  files: SessionFiles = nodeSessionFiles
+  files: SessionFiles
 ): Promise<AssistedReviewHunk[]> {
   const filePath = getAssistedReviewFilePath(workspaceSessionDir);
   try {

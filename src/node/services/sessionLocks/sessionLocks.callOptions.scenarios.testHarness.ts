@@ -61,6 +61,8 @@ import {
 } from "../workspaceTurnManager.testHarness";
 import { removeSessionDirUnderMemoryLocks } from "../workspaceRemoval";
 import { workspaceUseLeasesFor } from "../workspaceUseLeases";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 /**
  * Each scenario names the temp roots and workspace ids that it creates, and
@@ -119,9 +121,13 @@ export async function oneTurn(names: LockNames): Promise<void> {
   try {
     await b.session.sendMessage("hello", sendOptions);
     const sessionDir = path.join(b.config.sessionsDir, workspaceId);
-    await setTodosForSessionDir(workspaceId, sessionDir, [
-      { content: "Record the locks", status: "in_progress" },
-    ]);
+    await setTodosForSessionDir(
+      workspaceId,
+      sessionDir,
+      [{ content: "Record the locks", status: "in_progress" }],
+      nodeSessionLocks,
+      nodeSessionFiles
+    );
     const reviewPane = createReviewPaneUpdateTool(
       createTestToolConfig(b.config.sessionsDir, {
         workspaceId,

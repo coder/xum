@@ -132,7 +132,11 @@ export const createTodoReadTool: ToolFactory = (config) => {
     inputSchema: TOOL_DEFINITIONS.todo_read.schema,
     execute: async () => {
       assert(config.workspaceSessionDir, "todo_read requires workspaceSessionDir");
-      const todos = await readTodosForSessionDir(config.workspaceSessionDir, config.sessionFiles);
+      const todos = await readTodosForSessionDir(
+        config.workspaceSessionDir,
+        // mutation-equivalent: sessionFiles is a SessionFiles object or undefined, so ?? and || agree
+        config.sessionFiles ?? nodeSessionFiles
+      );
       return {
         todos,
       };
@@ -150,7 +154,7 @@ export async function setTodosForSessionDir(
   workspaceSessionDir: string,
   todos: TodoItem[],
   locks: SessionLocks = nodeSessionLocks,
-  files: SessionFiles = nodeSessionFiles
+  files: SessionFiles
 ): Promise<void> {
   await writeTodos(workspaceId, workspaceSessionDir, todos, locks, files);
 }

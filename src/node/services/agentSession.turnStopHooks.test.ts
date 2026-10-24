@@ -24,6 +24,7 @@ import {
   type AgentSessionHarnessOptions,
 } from "./agentSession.testHarness";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import { registerNoopContinuationBridgeForTest } from "./testDispatchHelpers";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -773,6 +774,24 @@ describe("todo turn-end nudge", () => {
     await h.session.sendMessage("now lint", options);
     await settle(h);
     expect(streams()).toBe(4);
+  });
+
+  test("the nudge reads the list in the session's SessionFiles", async () => {
+    const history = await createTestHistoryService({ files: SessionFilesMemory });
+    unregisters.push(() => void history.cleanup());
+    const { h, streams } = await setup({
+      parts: todoWriteThenReply,
+      session: { config: history.config, historyService: history.historyService },
+    });
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    await history.files.promises.mkdir(sessionDir, { recursive: true });
+    await history.files.promises.writeFile(getTodoFilePath(sessionDir), JSON.stringify(openTodos));
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(streams()).toBe(2);
+    expect(await userTexts(h)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
   });
 
   test("a plugin continuation and the nudge share one continuation prompt", async () => {
