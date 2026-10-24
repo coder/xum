@@ -294,8 +294,7 @@ async function isLegacyMuxRootTheGlobalRoot(
     );
     if (resolvedGlobal === resolvedLegacy) return true;
     return (
-      !isRemoteRuntime(globalRuntime) &&
-      (await isSameHostDirectory(resolvedGlobal, resolvedLegacy))
+      !isRemoteRuntime(globalRuntime) && (await isSameHostDirectory(resolvedGlobal, resolvedLegacy))
     );
   } catch {
     // Unresolvable: keep the root, so its scan reports why it is unavailable.
