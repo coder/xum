@@ -87,7 +87,11 @@ describe("SSH plans are installation-scoped (#5174)", () => {
     expandTilde(await resolvePlanFilePath(config, host, owner()));
   const planContent = async () => {
     const read = await getWorkspacePlanContent(
-      { workspaceService: harness.service, config: harness.config } as unknown as ORPCContext,
+      {
+        workspaceService: harness.service,
+        config: harness.config,
+        historyService: harness.historyService,
+      } as unknown as ORPCContext,
       id
     );
     return read.success ? read.data.content : undefined;
