@@ -2556,13 +2556,16 @@ describe("AgentPluginInstallService", () => {
       path.join(remoteDir, ".codex-plugin", "plugin.json"),
       JSON.stringify({ name: "demo-plugin", skills: ["./skills/", "./extra/"] })
     );
-    for (const [dir, name] of [
-      ["extra", "summarize"],
-      ["extra", "greet"],
+    for (const [dir, folder, name] of [
+      ["extra", "summarize", "summarize"],
+      ["extra", "greet", "greet"],
+      ["skills", "review-loop", "review-loop"],
+      // A snake_case folder loads as review-loop too: its warning names the real folder.
+      ["extra", "review_loop", "review-loop"],
     ]) {
-      await fsPromises.mkdir(path.join(remoteDir, dir, name), { recursive: true });
+      await fsPromises.mkdir(path.join(remoteDir, dir, folder), { recursive: true });
       await fsPromises.writeFile(
-        path.join(remoteDir, dir, name, "SKILL.md"),
+        path.join(remoteDir, dir, folder, "SKILL.md"),
         `---\nname: ${name}\ndescription: From ${dir}\n---\n\nBody.\n`
       );
     }
@@ -2572,11 +2575,12 @@ describe("AgentPluginInstallService", () => {
     // skills/greet comes first, so extra/greet never loads and is not offered.
     expect(preview.skills).toEqual([
       { name: "greet", description: "Greets people" },
+      { name: "review-loop", description: "From skills" },
       { name: "summarize", description: "From extra" },
     ]);
-    expect(preview.warnings.filter((warning) => warning.startsWith("extra/greet:"))).toHaveLength(
-      1
-    );
+    for (const label of ["extra/greet:", "extra/review_loop:"]) {
+      expect(preview.warnings.filter((warning) => warning.startsWith(label))).toHaveLength(1);
+    }
   });
 
   test("consent preview and install treat a skills path that holds SKILL.md as one skill", async () => {

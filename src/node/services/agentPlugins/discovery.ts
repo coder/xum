@@ -439,19 +439,20 @@ export function pluginSkillFolderAlias(name: string): string | undefined {
 }
 
 /**
- * The skill name of each plugin skill folder. A snake_case folder is dropped when the root also
- * has the kebab-case folder as a directory (`isDirectory` follows symlinks): lookups try that
- * folder first and fall back only when it is not a directory, so the two always agree.
+ * The skill name of each plugin skill folder. A snake_case folder is dropped when the kebab-case
+ * path is a directory (`isDirectory` follows symlinks): lookups try that path first and fall
+ * back only when it is not a directory, so the two always agree. The path is stat'ed even when
+ * the listing has no entry of that exact name: on a case-insensitive filesystem a `Foo-Bar`
+ * folder answers the lookup of `foo-bar`.
  */
 export async function pluginSkillFolderNames(
   folders: readonly string[],
   isDirectory: (folder: string) => Promise<boolean>
 ): Promise<Array<{ folder: string; name: string }>> {
-  const present = new Set(folders);
   const entries: Array<{ folder: string; name: string }> = [];
   for (const folder of folders) {
     const name = pluginSkillNameOfFolder(folder);
-    if (name !== folder && present.has(name) && (await isDirectory(name))) continue;
+    if (name !== folder && (await isDirectory(name))) continue;
     entries.push({ folder, name });
   }
   return entries;

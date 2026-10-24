@@ -3133,12 +3133,16 @@ export class AgentPluginInstallService {
   ): Promise<CollectedPluginSkill[]> {
     const skills: CollectedPluginSkill[] = [];
     for (const skillsRoot of plugin.skillsDirs ?? []) {
-      for (const skill of await this.collectSkills(plugin.rootPath, skillsRoot, warnings)) {
+      for (const { skill, label } of await this.collectSkills(
+        plugin.rootPath,
+        skillsRoot,
+        warnings
+      )) {
         // Runtime discovery keeps the first skill of a name (roots in declared order), so the
         // preview must not promise the later one (#6121).
         if (skills.some((earlier) => earlier.name === skill.name)) {
           warnings.push(
-            `${skillReviewLabel(plugin.rootPath, skillsRoot, skill.name)}: an earlier skills root has a skill with this name; it will not load`
+            `${label}: an earlier skills root has a skill with this name; it will not load`
           );
           continue;
         }
@@ -3148,13 +3152,16 @@ export class AgentPluginInstallService {
     return skills;
   }
 
-  /** One skills root of collectSkillsFromRoots. Warnings name the root by its plugin-relative path. */
+  /**
+   * One skills root of collectSkillsFromRoots. Warnings name the root by its plugin-relative path;
+   * `label` names each skill's real folder (a snake_case folder has a kebab-case skill name).
+   */
   private async collectSkills(
     pluginRoot: string,
     skillsRoot: PluginSkillsRoot,
     warnings: string[]
-  ): Promise<CollectedPluginSkill[]> {
-    const skills: CollectedPluginSkill[] = [];
+  ): Promise<Array<{ skill: CollectedPluginSkill; label: string }>> {
+    const skills: Array<{ skill: CollectedPluginSkill; label: string }> = [];
     // Includes symlinked skill dirs, matching runtime discovery: a symlinked
     // skill activates after install, so it MUST appear in the consent preview.
     for (const {
@@ -3229,27 +3236,30 @@ export class AgentPluginInstallService {
         warnings.push(...displayNameWarnings(label, skillName, parsed.displayName));
         const relativeDir = path.relative(pluginRoot, skillDir);
         skills.push({
-          name: parsed.frontmatter.name,
-          ...skillConsentFields({
-            relativeDir,
-            frontmatter: skillConsentFrontmatter(parsed),
-            body: parsed.body,
-          }),
-          approvedCopy: { relativeDir, content },
-          // The commands the skill can run when invoked (#6617): shown, then fingerprinted.
-          ...directivesField(skillReviewDirectives(parsed.body)),
-          ...(parsed.frontmatter.description !== undefined
-            ? { description: parsed.frontmatter.description }
-            : {}),
-          // Model-visible beyond name/description: whenToUse interpolates
-          // into the agent_skill_read tool description, and advertise
-          // controls whether the skill appears there at all. Both feed the
-          // update capability fingerprint (capabilitySurface), resolved with
-          // the same helpers the runtime uses.
-          whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
-          advertise: resolveSkillAdvertise(parsed.frontmatter),
-          // paths moves the skill from the static index to file-tool pointers.
-          paths: resolveSkillPaths(parsed.frontmatter),
+          label,
+          skill: {
+            name: parsed.frontmatter.name,
+            ...skillConsentFields({
+              relativeDir,
+              frontmatter: skillConsentFrontmatter(parsed),
+              body: parsed.body,
+            }),
+            approvedCopy: { relativeDir, content },
+            // The commands the skill can run when invoked (#6617): shown, then fingerprinted.
+            ...directivesField(skillReviewDirectives(parsed.body)),
+            ...(parsed.frontmatter.description !== undefined
+              ? { description: parsed.frontmatter.description }
+              : {}),
+            // Model-visible beyond name/description: whenToUse interpolates
+            // into the agent_skill_read tool description, and advertise
+            // controls whether the skill appears there at all. Both feed the
+            // update capability fingerprint (capabilitySurface), resolved with
+            // the same helpers the runtime uses.
+            whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
+            advertise: resolveSkillAdvertise(parsed.frontmatter),
+            // paths moves the skill from the static index to file-tool pointers.
+            paths: resolveSkillPaths(parsed.frontmatter),
+          },
         });
       } catch (error) {
         warnings.push(`${label}: ${getErrorMessage(error)}`);
