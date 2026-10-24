@@ -30,8 +30,8 @@ import {
   SessionLocksMemory,
 } from "./memorySessionLocks.testHarness";
 import { nodeSessionLocks, SessionLocksNode } from "./nodeSessionLocks";
+import { buildSessionLocks } from "./buildSessionLocks.testHarness";
 import {
-  buildSessionLocks,
   describeSessionLocksContract,
   type ForeignHolder,
   type LocksUnderTest,
@@ -153,7 +153,7 @@ describeSessionLocksContract("memory + foreign", withForeign(memoryLocks));
 test("node: the timeout text for a live child holder is fileLockTimeoutMessage", async () => {
   const t = await nodeLocks();
   try {
-    const locks = await buildSessionLocks(t.layer);
+    const locks = buildSessionLocks(t.layer);
     const lockPath = path.join(t.dir, "text.lock");
     const holder = await t.foreignHolder(lockPath, "live", "file");
     const error = await locks
@@ -183,7 +183,7 @@ async function onMemory(
 ): Promise<void> {
   const t = await memoryLocks();
   try {
-    await fn(await buildSessionLocks(t.layer), t);
+    await fn(buildSessionLocks(t.layer), t);
   } finally {
     await t.cleanup();
   }
@@ -231,6 +231,18 @@ test("memory: a release hands the file lock to the waiters in FIFO order", () =>
     expect((stale as Error).message).toContain("is no longer owned by this holder");
   }));
 
+test("memory: a held file lock leaves no file at its path", () =>
+  onMemory(async (locks, t) => {
+    const lockPath = path.join(t.dir, "session", "held.lock");
+    const lock = await locks.acquireProcessFileLock({ lockPath, timeoutMs: 200, label: "l" });
+    const found = await fs.stat(lockPath).then(
+      () => true,
+      () => false
+    );
+    expect(found).toBe(false);
+    await lock[Symbol.asyncDispose]();
+  }));
+
 test("memory: an init-record lock makes a real file, and inspect sees it", () =>
   onMemory(async (locks, t) => {
     const lockPath = path.join(t.dir, "locks", "init-record", "ws", "backend.lock");
@@ -246,27 +258,28 @@ test("memory: an init-record lock makes a real file, and inspect sees it", () =>
     expect(await locks.inspectCrossProcessLock(lockPath)).toEqual({ state: "absent" });
   }));
 
-test("memory: each build of SessionLocksMemory has its own lock table", async () => {
-  const clock = makeTestEffectRunner();
-  try {
-    const layer = SessionLocksMemory.pipe(
-      Layer.provide(Layer.succeed(HostClockTag)(clock.hostClock))
-    );
-    const options = { lockPath: "/memory/one.lock", timeoutMs: 200, label: "l" };
-    const a = await (await buildSessionLocks(layer)).acquireProcessFileLock(options);
-    const b = await (await buildSessionLocks(layer)).acquireProcessFileLock(options);
-    await a[Symbol.asyncDispose]();
-    await b[Symbol.asyncDispose]();
-  } finally {
-    await clock.dispose();
-  }
-});
+test("memory: each build of SessionLocksMemory has its own lock table", () =>
+  onMemory(async (_locks, t) => {
+    const clock = makeTestEffectRunner();
+    try {
+      const layer = SessionLocksMemory.pipe(
+        Layer.provide(Layer.succeed(HostClockTag)(clock.hostClock))
+      );
+      const options = { lockPath: path.join(t.dir, "one.lock"), timeoutMs: 200, label: "l" };
+      const a = await buildSessionLocks(layer).acquireProcessFileLock(options);
+      const b = await buildSessionLocks(layer).acquireProcessFileLock(options);
+      await a[Symbol.asyncDispose]();
+      await b[Symbol.asyncDispose]();
+    } finally {
+      await clock.dispose();
+    }
+  }));
 
 test("foreign: dead holders are reclaimed in order, and a probe reclaims none", async () => {
   const t = await nodeLocks();
   try {
     const holders = makeForeignHolders();
-    const locks = await buildSessionLocks(withForeignHolders(t.layer, holders));
+    const locks = buildSessionLocks(withForeignHolders(t.layer, holders));
     const file = path.join(t.dir, "a.lock");
     const record = path.join(t.dir, "b.lock");
     holders.hold(record, "dead");
@@ -291,7 +304,7 @@ test("foreign: a live foreign mutator makes hold() refuse with today's text", as
   const t = await nodeLocks();
   try {
     const holders = makeForeignHolders();
-    const locks = await buildSessionLocks(withForeignHolders(t.layer, holders));
+    const locks = buildSessionLocks(withForeignHolders(t.layer, holders));
     const config = { rootDir: t.dir };
     const leases = locks.useLeasesFor(config);
     expect(locks.useLeasesFor(config)).toBe(leases);
@@ -352,7 +365,7 @@ test("foreign: a live fake lease of another backend makes isHeld true", async ()
   const t = await nodeLocks();
   try {
     const holders = makeForeignHolders();
-    const leases = (await buildSessionLocks(withForeignHolders(t.layer, holders))).useLeasesFor({
+    const leases = buildSessionLocks(withForeignHolders(t.layer, holders)).useLeasesFor({
       rootDir: t.dir,
     });
     const dir = workspaceUseLockDir(t.dir, "ws-leases");

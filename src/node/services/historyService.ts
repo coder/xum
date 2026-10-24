@@ -85,9 +85,10 @@ import type { AIService } from "@/node/services/aiService";
 import type { TaskService } from "@/node/services/taskService";
 import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { unlockedHistoryScans } from "./unlockedHistoryScans";
 import {
   decideSendIdsFromHistory,
@@ -119,7 +120,6 @@ import {
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import {
   historyWriteLockPath,
   isWorkspaceRemovalTombstoned,
@@ -864,14 +864,25 @@ export class HistoryService {
   private sealedRotationChecked = new Set<string>();
   // Shared file operation lock across all workspace file services
   // This prevents deadlocks when operations compose while touching the same workspace files.
-  private readonly fileLocks = workspaceFileLocks;
+  private readonly fileLocks: SessionLocks["workspaceFiles"];
   private readonly config: HistorySessionLocation;
   /** Every host file call of this class goes through here (node:fs in the app). */
   readonly files: SessionFiles;
+  /**
+   * Every session lock of this class goes through here (today's lock functions in the app).
+   * Phase 4: the other owners of session locks take them from here.
+   */
+  readonly locks: SessionLocks;
 
-  constructor(config: HistorySessionLocation, files: SessionFiles = nodeSessionFiles) {
+  constructor(
+    config: HistorySessionLocation,
+    files: SessionFiles = nodeSessionFiles,
+    locks: SessionLocks = nodeSessionLocks
+  ) {
     this.config = config;
     this.files = files;
+    this.locks = locks;
+    this.fileLocks = locks.workspaceFiles;
   }
 
   private readonly emptyErroredReplyDeletedListeners = new Set<
@@ -4115,7 +4126,7 @@ export class HistoryService {
     workspaceId: string,
     operation: (assertStillOwned: () => Promise<void>) => Promise<T>
   ): Promise<T> {
-    await using _lock = await acquireProcessFileLock({
+    await using _lock = await this.locks.acquireProcessFileLock({
       lockPath: historyWriteLockPath(this.config.rootDir, workspaceId),
       timeoutMs: HISTORY_WRITE_LOCK_TIMEOUT_MS,
       label: "history write lock",

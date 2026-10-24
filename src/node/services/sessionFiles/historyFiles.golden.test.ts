@@ -8,7 +8,11 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as prettier from "prettier";
+import { Layer } from "effect";
+import { HostClockTag } from "@/node/services/di/hostClockLive";
+import { SessionLocksMemory } from "@/node/services/sessionLocks/memorySessionLocks.testHarness";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
+import { nodeClock } from "@/node/utils/hostClock";
 import { SessionFilesMemory } from "./memorySessionFiles.testHarness";
 import { runGoldenScript, STEPS, type GoldenSnapshot } from "./goldenScript.testHarness";
 
@@ -50,16 +54,34 @@ async function listHostEntries(root: string): Promise<string[]> {
     .sort();
 }
 
-// A history write that skips SessionFiles lands in the real temp folder instead of the volume.
-test("the memory layer writes the golden bytes and nothing on disk", async () => {
+/** Every file (not folder) under root on the host disk, relative to root. */
+async function listHostFiles(root: string): Promise<string[]> {
+  const entries = await fs
+    .readdir(root, { recursive: true, withFileTypes: true })
+    .catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+  return entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => path.relative(root, path.join(entry.parentPath, entry.name)))
+    .sort();
+}
+
+// A history write that skips SessionFiles lands in the real temp folder instead of the volume,
+// and a lock taken around SessionLocks leaves a lock file under <root>/locks.
+test("the memory layers write the golden bytes and nothing on disk", async () => {
   const { historyService, config, files, tempDir, cleanup } = await createTestHistoryService({
     files: SessionFilesMemory,
+    locks: SessionLocksMemory.pipe(Layer.provide(Layer.succeed(HostClockTag)(nodeClock))),
   });
   try {
     const snapshots = await runGoldenScript(historyService, config, STEPS, files);
     const fixture = JSON.parse(await fs.readFile(FIXTURE, "utf8")) as GoldenSnapshot[];
     expect(snapshots).toEqual(fixture);
     expect(await listHostEntries(path.join(tempDir, "sessions"))).toEqual([]);
+    // The memory locks create the lock folder as the Node locks do, but no lock file.
+    expect(await listHostFiles(path.join(tempDir, "locks"))).toEqual([]);
   } finally {
     await cleanup();
   }

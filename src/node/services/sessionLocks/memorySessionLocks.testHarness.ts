@@ -13,7 +13,7 @@
  *   backends' lease files. Phase 5 moves them.
  */
 import assert from "node:assert";
-import * as fs from "node:fs/promises";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Effect, Layer } from "effect";
 import { SessionLocksTag } from "@/node/services/di/tags";
@@ -194,6 +194,12 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
       // The same argument checks as fileLock.ts acquireProcessFileLock.
       assert(lockPath.length > 0, "acquireProcessFileLock requires a lock path");
       assert(timeoutMs > 0, "acquireProcessFileLock timeoutMs must be positive");
+      // As fileLock.ts does first: a caller may write into the folder once it holds the lock
+      // (branchSummary and refinementRollback lock inside the session folder). No lock file.
+      // Synchronous, so waiters queue in call order: with an awaited mkdir, a later caller's
+      // mkdir could finish first and take its place in the FIFO.
+      // eslint-disable-next-line local/no-sync-fs-methods -- keeps the waiters' FIFO order (above).
+      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
       const entry = await acquireInMemory(table, lockPath, timeoutMs, clock, (blocker) => {
         const { why, ...holder } = blocker;
         return new Error(fileLockTimeoutMessage(label, lockPath, timeoutMs, { holder, why }));
@@ -221,7 +227,9 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
       }
       const { lockPath, acquireTimeoutMs, timeoutMessage, signal } = options;
       // As crossProcessLock.ts does first: a caller may write into the folder once it holds the lock.
-      await fs.mkdir(path.dirname(lockPath), { recursive: true });
+      // Synchronous for the same FIFO reason as the file lock above.
+      // eslint-disable-next-line local/no-sync-fs-methods -- keeps the waiters' FIFO order (above).
+      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
       const refusal = (blocker: Blocker) =>
         new CrossProcessLockTimeoutError(
           crossProcessLockTimeoutMessage(timeoutMessage, lockPath, {

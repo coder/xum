@@ -6,22 +6,12 @@
 import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { Effect, type Layer } from "effect";
-import { SessionLocksTag } from "@/node/services/di/tags";
+import type { Layer } from "effect";
+import type { SessionLocksTag } from "@/node/services/di/tags";
 import type { ProcessIdentity } from "@/node/utils/concurrency/processLiveness";
 import { CrossProcessLockTimeoutError } from "@/node/utils/concurrency/lockErrors";
+import { buildSessionLocks } from "./buildSessionLocks.testHarness";
 import type { SessionLocks } from "./sessionLocks";
-
-/** Builds a SessionLocks layer into its service. The layers keep no scope. */
-export async function buildSessionLocks(
-  layer: Layer.Layer<SessionLocksTag>
-): Promise<SessionLocks> {
-  return await Effect.runPromise(
-    Effect.gen(function* () {
-      return yield* SessionLocksTag;
-    }).pipe(Effect.provide(layer))
-  );
-}
 
 /** Another backend that holds a lock, in the medium of the layer under test. */
 export interface ForeignHolder {
@@ -57,7 +47,7 @@ export function describeSessionLocksContract(
   const withLayer = async (fn: (locks: SessionLocks, t: LocksUnderTest) => Promise<void>) => {
     const t = await make();
     try {
-      await fn(await buildSessionLocks(t.layer), t);
+      await fn(buildSessionLocks(t.layer), t);
     } finally {
       await t.cleanup();
     }
@@ -189,6 +179,18 @@ export function describeSessionLocksContract(
             (caught: unknown) => caught
           );
         expect((error as NodeJS.ErrnoException).code).toBe("ENOENT");
+      }));
+
+    test("a file lock creates its missing parent", () =>
+      withLayer(async (locks, t) => {
+        const lockPath = path.join(t.dir, "new-file-dir", "file.lock");
+        const lock = await locks.acquireProcessFileLock({
+          lockPath,
+          timeoutMs: SHORT_MS,
+          label: "contract lock",
+        });
+        expect((await fs.stat(path.dirname(lockPath))).isDirectory()).toBe(true);
+        await lock[Symbol.asyncDispose]();
       }));
 
     test("a record lock creates its missing parent by default", () =>
