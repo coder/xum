@@ -2,7 +2,8 @@
  * Install-method fixtures for the bug bash (startApp.ts seed, charters.install-methods.txt).
  *
  * Local git repositories that Settings > Plugins installs from their absolute path: a Claude Code
- * plugin, a Claude Code marketplace, a plain skills repository and an Agent Plugin with skills.
+ * plugin, a Claude Code marketplace, a plain skills repository, an Agent Plugin with skills and a
+ * repository with one manifest per agent tool (multi-harness).
  * Nothing here runs on install or review: the one MCP server stays disabled until the user turns
  * it on (and bin/server only exits 0), Claude hooks never run in Xum, and Xum never loads a Claude
  * plugin's hooks.js or workflows/ (both are inert anyway). Model-driven jobs also set
@@ -187,6 +188,32 @@ function agentPluginWithSkills(): Files {
   };
 }
 
+/**
+ * The shape of DietrichGebert/ponytail: a root plugin.json with no `$schema` (another harness's
+ * file), next to complete Codex and Claude Code manifests. Xum must install it through the Codex
+ * manifest instead of failing on the root file.
+ */
+function multiHarness(): Files {
+  const about = {
+    name: "multi-harness",
+    version: "2.0.0",
+    description: "One repository with a manifest for each agent tool (bug-bash fixture)",
+  };
+  return {
+    "plugin.json": JSON.stringify({ name: "multi-harness" }, null, 2),
+    ".codex-plugin/plugin.json": JSON.stringify({ ...about, skills: "./skills/" }, null, 2),
+    ".claude-plugin/plugin.json": JSON.stringify(about, null, 2),
+    "skills/keep-it-small/SKILL.md": skillMd(
+      "keep-it-small",
+      "Picks the smallest change that fully solves the task"
+    ),
+    "skills/debt-ledger/SKILL.md": skillMd(
+      "debt-ledger",
+      "Lists the shortcuts in the code as a debt ledger"
+    ),
+  };
+}
+
 const EXECUTABLE = new Set(["claude-review-kit/bin/server"]);
 
 export function installFixtures(): Record<string, Files> {
@@ -195,6 +222,7 @@ export function installFixtures(): Record<string, Files> {
     "claude-market": claudeMarket(),
     "plain-skills": plainSkills(),
     "agent-plugin-with-skills": agentPluginWithSkills(),
+    "multi-harness": multiHarness(),
   };
 }
 
