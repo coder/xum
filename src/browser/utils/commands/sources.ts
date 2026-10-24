@@ -41,6 +41,10 @@ import {
   pinAndOpenArtifact,
 } from "@/browser/features/RightSidebar/ArtifactsTab/openArtifact";
 import {
+  hasAgentInterfaceStatusPage,
+  toggleAgentInterfaceView,
+} from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceView";
+import {
   appViewDetails,
   appViewServerNames,
   focusMcpAppViewTab,
@@ -300,6 +304,8 @@ export interface BuildSourcesParams {
   multiProjectWorkspacesEnabled: boolean;
   /** artifacts experiment: gates "Open Artifacts" and "Open File as Artifact…". */
   artifactsEnabled?: boolean;
+  /** Artifacts plus its Agent interface view sub-experiment: gates the status/chat switch. */
+  agentInterfaceViewEnabled?: boolean;
   /** mcp-apps experiment: gates the MCP App view and entry-point commands. */
   mcpAppsEnabled?: boolean;
   /** The selected workspace's MCP App entry points; undefined until listed. */
@@ -1146,6 +1152,21 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                     await pinAndOpenArtifact(p.api, wsId, vals.path);
                   },
                 },
+              },
+            ]
+          : []),
+        ...(p.agentInterfaceViewEnabled === true
+          ? [
+              {
+                // Not in CommandIds: a single static id, like "cycle-agent".
+                id: "nav:toggle-agent-interface-view",
+                title: "Switch Status Page / Chat",
+                section: section.navigation,
+                shortcutHint: formatKeybind(KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW),
+                keywords: ["status", "chat", "agent interface", "transcript", "view"],
+                // Listed only while there is a status page to switch to.
+                visible: () => hasAgentInterfaceStatusPage(wsId),
+                run: () => toggleAgentInterfaceView(wsId),
               },
             ]
           : []),

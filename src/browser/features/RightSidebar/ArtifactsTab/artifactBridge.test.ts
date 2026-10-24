@@ -11,6 +11,7 @@ import {
   ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND,
   ARTIFACT_STATE_POST_INTERVAL_MS,
   ARTIFACT_WORKSPACE_ID_MAX_CHARS,
+  ArtifactHostToFrameMessageSchema,
   buildArtifactBridgeScript,
   createBridgeRateLimiter,
 } from "./artifactBridge";
@@ -443,6 +444,83 @@ describe("buildArtifactBridgeScript", () => {
     expect(attributes.get("data-xum-theme")).toBe("light");
     send({ xumArtifact: 1, type: "theme", theme: "dark" });
     expect(attributes.get("data-xum-theme")).toBe("dark");
+  });
+
+  test("applies the app palette as --xum-* properties, at load and on theme messages", () => {
+    const attributes = new Map<string, string>();
+    const properties = new Map<string, string>();
+    type FakeMessageListener = (event: { source: unknown; data: unknown }) => void;
+    const listeners: FakeMessageListener[] = [];
+    const parent = {};
+    const fakeWindow = {
+      parent,
+      addEventListener: (type: string, listener: FakeMessageListener) => {
+        if (type === "message") listeners.push(listener);
+      },
+      dispatchEvent: () => true,
+    };
+    const fakeDocument = {
+      documentElement: {
+        setAttribute: (name: string, value: string) => attributes.set(name, value),
+        style: { setProperty: (name: string, value: string) => properties.set(name, value) },
+      },
+    };
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
+    const run = new Function(
+      "window",
+      "document",
+      "CustomEvent",
+      buildArtifactBridgeScript("light", null, {
+        themeName: "flexoki-light",
+        variables: { "--xum-bg": "#fffcf0" },
+      })
+    ) as (window: unknown, document: unknown, customEvent: unknown) => void;
+    run(fakeWindow, fakeDocument, class {});
+    expect(attributes.get("data-xum-theme-name")).toBe("flexoki-light");
+    expect(properties.get("--xum-bg")).toBe("#fffcf0");
+
+    listeners.forEach((listener) =>
+      listener({
+        source: parent,
+        data: {
+          xumArtifact: 1,
+          type: "theme",
+          theme: "dark",
+          themeName: "flexoki-dark",
+          variables: {
+            "--xum-bg": "#100f0f",
+            // Not --xum-*: an artifact's own properties (or anything else) stay untouched.
+            "--color-background": "red",
+            background: "red",
+            "--xum-fg": 7,
+          },
+        },
+      })
+    );
+    expect(attributes.get("data-xum-theme-name")).toBe("flexoki-dark");
+    expect(Object.fromEntries(properties)).toEqual({ "--xum-bg": "#100f0f" });
+  });
+});
+
+describe("ArtifactHostToFrameMessageSchema theme variables", () => {
+  const theme = { xumArtifact: 1, type: "theme", theme: "dark", themeName: "dark" } as const;
+
+  test("accepts --xum-* string variables", () => {
+    expect(
+      ArtifactHostToFrameMessageSchema.safeParse({ ...theme, variables: { "--xum-bg": "#000" } })
+        .success
+    ).toBe(true);
+  });
+
+  test.each([
+    ["a name outside --xum-*", { "--color-background": "#000" }],
+    ["a non-string value", { "--xum-bg": 0 }],
+    [
+      "too many variables",
+      Object.fromEntries(Array.from({ length: 33 }, (_, i) => [`--xum-v${i}`, "#000"])),
+    ],
+  ])("rejects %s", (_name, variables) => {
+    expect(ArtifactHostToFrameMessageSchema.safeParse({ ...theme, variables }).success).toBe(false);
   });
 });
 

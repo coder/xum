@@ -605,6 +605,15 @@ export const ARTIFACTS_SELECTION_MAX_WORKSPACES = 16;
 export const ARTIFACTS_SELECTION_MAX_CHARS = 20_000;
 
 /**
+ * Explicit Agent interface view choices ("status" or "chat") for the most recently used
+ * workspaces, as one bounded global map `{ [workspaceId]: view }` (agentInterfaceView.ts).
+ * Only explicit choices are stored; a workspace without one follows the default.
+ */
+export const AGENT_INTERFACE_VIEW_KEY = "artifacts:agentInterfaceView";
+export const AGENT_INTERFACE_VIEW_MAX_WORKSPACES = 64;
+export const AGENT_INTERFACE_VIEW_MAX_CHARS = 4096;
+
+/**
  * Get the localStorage key for terminal titles per workspace.
  * Maps sessionId -> title for persisting OSC-set terminal titles.
  * Format: "right-sidebar:terminal-titles:{workspaceId}"
@@ -913,6 +922,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Paint cache for the first-run view's early script, written by SplashScreenProvider.
   globalKey(ONBOARDING_VIEWED_KEY, "cache", 8),
   globalKey(ARTIFACTS_SELECTION_KEY, "ui", ARTIFACTS_SELECTION_MAX_CHARS),
+  globalKey(AGENT_INTERFACE_VIEW_KEY, "ui", AGENT_INTERFACE_VIEW_MAX_CHARS),
   globalKey(LAST_CUSTOM_MODEL_PROVIDER_KEY, "ui", 128),
   // { workspaceId } (older builds also stored paths; readers use only the id).
   globalKey(SELECTED_WORKSPACE_KEY, "ui", 256),

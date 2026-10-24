@@ -21,6 +21,7 @@ import {
   createBridgeRateLimiter,
   postArtifactAnnotateMode,
   postArtifactTheme,
+  type ArtifactAppearance,
   type ArtifactFrameChord,
   type ArtifactFrameToHostMessage,
   type ArtifactTheme,
@@ -36,6 +37,7 @@ import { pickFromFrameAnnotation, type ArtifactAnnotationPick } from "./artifact
 import type { ArtifactInteractionHandlers, ArtifactSendOrigin } from "./artifactInteractions";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { Notice, SourceText } from "./SourceText";
+import { readAppStyleVariables } from "./appStyleVariables";
 import { useArtifactAssetReader } from "./useArtifactAssetReader";
 
 /**
@@ -225,6 +227,12 @@ export function SandboxedArtifactFrame(props: {
   // Only the theme at mount is baked into the document; later changes travel over the bridge
   // so a theme switch never reloads the artifact.
   const [initialTheme] = useState(theme);
+  // The palette (`--xum-*`) follows the full theme mode: light and flexoki-light differ.
+  const currentAppearance = (): ArtifactAppearance => ({
+    themeName: themeMode,
+    variables: readAppStyleVariables("xum"),
+  });
+  const [initialAppearance] = useState(currentAppearance);
   const [allowMessage] = useState(() => createBridgeRateLimiter());
   const [built, setBuilt] = useState<BuiltDocument | null>(null);
   const { openWorkspace, openWorkspaceRefused } = useArtifactWorkspaceOpener();
@@ -252,7 +260,7 @@ export function SandboxedArtifactFrame(props: {
     let cancelled = false;
     const options = {
       csp: buildArtifactCsp({ allowCdn }),
-      bridgeScript: buildArtifactBridgeScript(initialTheme, state),
+      bridgeScript: buildArtifactBridgeScript(initialTheme, state, initialAppearance),
     };
     const finish = (srcDoc: string | null, notices: string[], error: string | null = null) => {
       if (!cancelled) setBuilt({ content, allowCdn, state, srcDoc, notices, error });
@@ -269,7 +277,17 @@ export function SandboxedArtifactFrame(props: {
     return () => {
       cancelled = true;
     };
-  }, [kind, content, path, allowCdn, initialTheme, read, waitingForState, state]);
+  }, [
+    kind,
+    content,
+    path,
+    allowCdn,
+    initialTheme,
+    initialAppearance,
+    read,
+    waitingForState,
+    state,
+  ]);
 
   // Bridge, host side: only messages from this frame's window, rate limited, schema-valid.
   const onFrameKey = props.onFrameKey;
@@ -331,8 +349,11 @@ export function SandboxedArtifactFrame(props: {
 
   // Keep the artifact's view of the theme current without reloading it.
   useEffect(() => {
-    postArtifactTheme(navigatedRef.current ? null : frameRef.current?.contentWindow, theme);
-  }, [theme, navigatedRef]);
+    postArtifactTheme(navigatedRef.current ? null : frameRef.current?.contentWindow, theme, {
+      themeName: themeMode,
+      variables: readAppStyleVariables("xum"),
+    });
+  }, [theme, themeMode, navigatedRef]);
 
   if (current == null) return <Notice>Loading…</Notice>;
   if (current.error != null) return <div className="text-danger p-4 text-xs">{current.error}</div>;
@@ -373,7 +394,7 @@ export function SandboxedArtifactFrame(props: {
         onLoad={() => {
           // A second load is the frame navigating away: never re-post into it.
           if (!guard.onLoad()) return;
-          postArtifactTheme(liveWindow(), theme);
+          postArtifactTheme(liveWindow(), theme, currentAppearance());
           if (annotating) postArtifactAnnotateMode(liveWindow(), true);
         }}
         className={`min-h-0 w-full flex-1 border-0 bg-white ${annotating ? "cursor-crosshair" : ""}`}

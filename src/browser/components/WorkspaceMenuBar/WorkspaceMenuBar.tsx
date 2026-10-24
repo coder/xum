@@ -14,6 +14,7 @@ import {
 } from "@/browser/stores/AppConfigStore";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { LazySettingsModal } from "./LazySettingsModal";
+import { AgentInterfaceViewToggle } from "@/browser/features/RightSidebar/ArtifactsTab/AgentInterfaceViewToggle";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Checkbox } from "../Checkbox/Checkbox";
 import {
@@ -838,6 +839,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           isDesktop && "titlebar-no-drag"
         )}
       >
+        <AgentInterfaceViewToggle workspaceId={workspaceId} />
         {/* The footer hides these links at this width, so the header carries them. */}
         <WorkspaceLinks
           workspaceId={workspaceId}

@@ -10,6 +10,12 @@ import {
   isJsonValue,
   jsonByteLength,
 } from "@/common/constants/artifactInteractions";
+import { ThemePreferenceSchema } from "@/common/config/schemas/userPreferences";
+import {
+  ARTIFACT_THEME_VARIABLE_NAME_PATTERN,
+  ARTIFACT_THEME_VARIABLE_VALUE_MAX_CHARS,
+  ARTIFACT_THEME_VARIABLES_MAX_COUNT,
+} from "./appStyleVariables";
 
 /**
  * postMessage bridge between the app and a sandboxed HTML/SVG artifact frame
@@ -41,8 +47,10 @@ import {
  *   the user clicked or typed inside this frame, and only for an active workspace
  *   (SandboxedArtifactFrame.tsx). The frame never gets a reply, so no workspace list or title
  *   reaches it.
- * - Host -> frame: `{ type: "theme", theme: "dark" | "light" }`, sent after load and on theme
- *   change; the artifact may read it, and the host never injects its own CSS.
+ * - Host -> frame: `{ type: "theme", theme: "dark" | "light", themeName?, variables? }`, sent
+ *   after load and on theme change; the artifact may read it. The host injects no style sheets:
+ *   `variables` are only `--xum-*` custom-property values, inert until the artifact's own CSS
+ *   uses them.
  *   `{ type: "annotate", enabled }` switches the shim's click-to-pin capture on or off (clicks
  *   are swallowed while it is on).
  * - The persisted `window.xum.state` is never posted: it is baked into the shim when the srcdoc
@@ -171,11 +179,30 @@ export type ArtifactFrameToHostMessage = z.infer<typeof ArtifactFrameToHostMessa
 
 export type ArtifactTheme = "dark" | "light";
 
+/** The full theme mode (`data-xum-theme-name`), beyond the light/dark `theme`. */
+const ArtifactThemeNameSchema = ThemePreferenceSchema.exclude(["auto"]);
+
+/** `--xum-*` custom properties the frame sets on its root element (appStyleVariables.ts). */
+export const ArtifactThemeVariablesSchema = z
+  .record(
+    z.string().regex(ARTIFACT_THEME_VARIABLE_NAME_PATTERN),
+    z.string().max(ARTIFACT_THEME_VARIABLE_VALUE_MAX_CHARS)
+  )
+  .refine((variables) => Object.keys(variables).length <= ARTIFACT_THEME_VARIABLES_MAX_COUNT);
+
+/** What a theme message carries besides light/dark: the theme mode and its palette. */
+export interface ArtifactAppearance {
+  themeName: z.infer<typeof ArtifactThemeNameSchema>;
+  variables: z.infer<typeof ArtifactThemeVariablesSchema>;
+}
+
 const ArtifactThemeMessageSchema = z
   .object({
     ...bridgeEnvelope,
     type: z.literal("theme"),
     theme: z.enum(["dark", "light"]),
+    themeName: ArtifactThemeNameSchema.optional(),
+    variables: ArtifactThemeVariablesSchema.optional(),
   })
   .strict();
 
@@ -241,12 +268,19 @@ export function acceptArtifactFrameMessage(
   return parsed.success ? parsed.data : null;
 }
 
-export function postArtifactTheme(frameWindow: Window | null | undefined, theme: ArtifactTheme) {
+export function postArtifactTheme(
+  frameWindow: Window | null | undefined,
+  theme: ArtifactTheme,
+  appearance?: ArtifactAppearance
+) {
   if (frameWindow == null) return;
   const message: ArtifactHostToFrameMessage = {
     xumArtifact: ARTIFACT_BRIDGE_VERSION,
     type: "theme",
     theme,
+    ...(appearance != null
+      ? { themeName: appearance.themeName, variables: appearance.variables }
+      : {}),
   };
   // The sandboxed frame has an opaque origin ("null"), which cannot be named as a target
   // origin, so "*" is required. The payload carries nothing sensitive by contract.
@@ -268,12 +302,15 @@ export function postArtifactAnnotateMode(frameWindow: Window | null | undefined,
  * Source of the inline <script> injected as the frame's first script (inline, so the CSP's
  * 'unsafe-inline' allows it). It forwards Escape and Shift+F to the host and exposes a
  * read-only `window.xum.theme`, updated from theme messages, plus a `xumthemechange` event;
+ * theme messages may also carry the full theme mode, mirrored into `data-xum-theme-name`, and
+ * the app palette, set as `--xum-*` custom properties on the root element so plain CSS can use
+ * `var(--xum-bg)` and friends (appStyleVariables.ts);
  * `window.xum.send` / `window.xum.setState` / `window.xum.openWorkspace`, and a read-only
  * `window.xum.state` with a `xumstatechange` event. It also mirrors the theme into `data-xum-theme` on the root element,
  * so plain CSS (the goal status board, which has no scripts) can follow the app theme instead
  * of the OS preference. While the host has annotate mode on, a capture-phase click listener
  * swallows clicks and reports the point (plus any selected text) instead.
- * Only the initial theme and the persisted state are interpolated. The state goes in as a JSON
+ * Only the initial theme and appearance and the persisted state are interpolated. The state goes in as a JSON
  * string passed to JSON.parse, never as an object literal (a literal `"__proto__"` key would set
  * the prototype instead of an own property), with `<` escaped so a `</script>` or `<!--` inside
  * it cannot leave the inline script. A restored state also gets one `xumstatechange` just after
@@ -539,7 +576,8 @@ function sidebarKeyListener(): string {
 
 export function buildArtifactBridgeScript(
   initialTheme: ArtifactTheme,
-  initialState: unknown = null
+  initialState: unknown = null,
+  initialAppearance: ArtifactAppearance | null = null
 ): string {
   return `(function () {
   "use strict";
@@ -550,6 +588,8 @@ export function buildArtifactBridgeScript(
   });
   var host = window.parent;
   var theme = ${JSON.stringify(initialTheme)};
+  var themeNames = ${JSON.stringify(ArtifactThemeNameSchema.options)};
+  var themeVariablePattern = ${ARTIFACT_THEME_VARIABLE_NAME_PATTERN.toString()};
   var state = JSON.parse(${inlineScriptJson(JSON.stringify(initialState ?? null))});
   var annotating = false;
   var api = {};
@@ -603,6 +643,27 @@ export function buildArtifactBridgeScript(
     if (root) root.setAttribute("data-xum-theme", theme);
   }
   applyThemeAttribute();
+  // Checked again here (the host validates too): own string keys matching --xum-*, string
+  // values, bounded count and length. Unknown entries are skipped, never applied.
+  function applyAppearance(themeName, variables) {
+    var root = document.documentElement;
+    if (!root) return;
+    if (typeof themeName === "string" && themeNames.indexOf(themeName) !== -1) {
+      root.setAttribute("data-xum-theme-name", themeName);
+    }
+    if (!variables || typeof variables !== "object" || Array.isArray(variables)) return;
+    if (!root.style || typeof root.style.setProperty !== "function") return;
+    var names = Object.keys(variables);
+    if (names.length > ${ARTIFACT_THEME_VARIABLES_MAX_COUNT}) return;
+    for (var i = 0; i < names.length; i++) {
+      var value = variables[names[i]];
+      if (!themeVariablePattern.test(names[i]) || typeof value !== "string") continue;
+      if (value.length > ${ARTIFACT_THEME_VARIABLE_VALUE_MAX_CHARS}) continue;
+      root.style.setProperty(names[i], value);
+    }
+  }
+  var initialAppearance = JSON.parse(${inlineScriptJson(JSON.stringify(initialAppearance))});
+  if (initialAppearance) applyAppearance(initialAppearance.themeName, initialAppearance.variables);
   window.addEventListener("message", function (event) {
     if (event.source !== host) return;
     var data = event.data;
@@ -610,6 +671,7 @@ export function buildArtifactBridgeScript(
     if (data.type === "theme" && (data.theme === "dark" || data.theme === "light")) {
       theme = data.theme;
       applyThemeAttribute();
+      applyAppearance(data.themeName, data.variables);
       window.dispatchEvent(new CustomEvent("xumthemechange", { detail: { theme: theme } }));
     } else if (data.type === "annotate") {
       annotating = data.enabled === true;

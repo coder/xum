@@ -38,6 +38,12 @@ const MEMORY_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [EXPERIMENT_IDS.MEMOR
 // mode is a no-op while PTC is off (code_execution is never assembled).
 const PTC_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [EXPERIMENT_IDS.RLM];
 
+// Sub-experiments of Artifacts: the Agent interface view shows an artifact, so it is a no-op
+// while Artifacts is off.
+const ARTIFACTS_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
+  EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
+];
+
 interface ExperimentRowProps {
   experimentId: ExperimentId;
   name: string;
@@ -728,7 +734,8 @@ export function ExperimentsSection() {
         (exp) =>
           exp.showInSettings !== false &&
           !MEMORY_SUB_EXPERIMENT_IDS.includes(exp.id) &&
-          !PTC_SUB_EXPERIMENT_IDS.includes(exp.id)
+          !PTC_SUB_EXPERIMENT_IDS.includes(exp.id) &&
+          !ARTIFACTS_SUB_EXPERIMENT_IDS.includes(exp.id)
       ),
     [allExperiments]
   );
@@ -788,7 +795,12 @@ export function ExperimentsSection() {
                 </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.ARTIFACTS && artifactsEnabled && (
-                <ArtifactsExperimentConfig />
+                <>
+                  <ArtifactsExperimentConfig />
+                  <ExperimentSettingsPanel>
+                    <SubExperimentRows experimentIds={ARTIFACTS_SUB_EXPERIMENT_IDS} />
+                  </ExperimentSettingsPanel>
+                </>
               )}
               {exp.id === EXPERIMENT_IDS.PORTABLE_DESKTOP && <PortableDesktopExperimentWarning />}
               {exp.id === EXPERIMENT_IDS.CONFIGURABLE_BIND_URL && <ConfigurableBindUrlControls />}

@@ -68,6 +68,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   OPEN_TIMELINE_DIALOG: "Open Timeline tab (small viewports)",
   OPEN_STATS_DIALOG: "Open Stats tab (small viewports)",
   OPEN_ARTIFACTS_TAB: "Toggle Artifacts tab",
+  TOGGLE_AGENT_INTERFACE_VIEW: "Switch between status page and chat (Agent interface view)",
   TOGGLE_ARTIFACT_FULLSCREEN: "Toggle artifact fullscreen (Artifacts tab)",
   NEXT_ARTIFACT: "Next artifact (Artifacts tab)",
   PREV_ARTIFACT: "Previous artifact (Artifacts tab)",
@@ -265,6 +266,7 @@ const KEYBIND_GROUPS: Array<{
     label: "Artifacts",
     keys: [
       "OPEN_ARTIFACTS_TAB",
+      "TOGGLE_AGENT_INTERFACE_VIEW",
       "TOGGLE_ARTIFACT_FULLSCREEN",
       "NEXT_ARTIFACT",
       "PREV_ARTIFACT",

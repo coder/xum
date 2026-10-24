@@ -56,7 +56,14 @@ import { BashCollapsedSummaryModeProvider } from "@/browser/features/Tools/BashC
 import { BashOutputCollapsedIndicator } from "@/browser/features/Tools/BashOutputCollapsedIndicator";
 import { getLastNonDecorativeMessage } from "@/common/utils/messages/retryEligibility";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
-import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import {
+  formatKeybind,
+  isDesktopViewportFocused,
+  isDialogOpen,
+  isTerminalFocused,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 import { useAutoScroll } from "@/browser/hooks/useAutoScroll";
 import { useBoundedTranscriptReveal } from "@/browser/hooks/useBoundedTranscriptReveal";
 import { TRANSCRIPT_MAX_MOUNTED_ROWS } from "@/common/constants/ui";
@@ -69,6 +76,14 @@ import {
   useWorkspaceStoreRaw,
 } from "@/browser/stores/WorkspaceStore";
 import { WorkspaceMenuBar } from "../WorkspaceMenuBar/WorkspaceMenuBar";
+import {
+  type AgentInterfaceView,
+  toggleAgentInterfaceView,
+  useAgentInterfaceEnabled,
+  useAgentInterfaceView,
+  useStatusArtifactPoll,
+} from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceView";
+import { AgentInterfaceStatusView } from "@/browser/features/RightSidebar/ArtifactsTab/AgentInterfaceStatusView";
 import { WorkspaceFooterBar } from "./WorkspaceFooterBar";
 import type { DisplayedMessage, QueuedMessage as QueuedMessageData } from "@/common/types/message";
 import type { HeldInput as HeldInputData } from "@/common/orpc/types";
@@ -181,6 +196,11 @@ export type ChatPaneContentProps = Omit<
   embedded?: boolean;
   /** Let an explicitly opened embedded chat claim focus when its composer mounts. */
   onChatInputReady?: (api: ChatInputAPI) => void;
+  /**
+   * Agent interface view: which view the main pane shows, or null/absent when the workspace has
+   * no status page to show (or the experiment is off), which leaves the transcript as is.
+   */
+  agentInterfaceView?: AgentInterfaceView | null;
 };
 
 type ReviewsState = ReturnType<typeof useReviews>;
@@ -348,6 +368,30 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   const meta = workspaceMetadata.get(workspaceId);
   const workspaceTitle = meta?.title ?? meta?.name ?? props.workspaceName;
 
+  // Agent interface view: one status page listing per main pane feeds the view, the menu-bar
+  // toggle and the command palette.
+  const agentInterfaceEnabled = useAgentInterfaceEnabled();
+  useStatusArtifactPoll(workspaceId, agentInterfaceEnabled);
+  const agentInterface = useAgentInterfaceView(workspaceId);
+  const agentInterfaceAvailable = agentInterface.available;
+  useEffect(() => {
+    if (!agentInterfaceAvailable) return;
+    const handler = (e: KeyboardEvent) => {
+      if (
+        !matchesKeybind(e, KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW) ||
+        isDialogOpen() ||
+        isTerminalFocused(e.target) ||
+        isDesktopViewportFocused(e.target)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      toggleAgentInterfaceView(workspaceId);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [agentInterfaceAvailable, workspaceId]);
+
   return (
     <PerfRenderMarker id="chat-pane">
       <div
@@ -399,6 +443,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
             namedWorkspacePath={props.namedWorkspacePath}
             runtimeConfig={props.runtimeConfig}
             onOpenTerminal={props.onOpenTerminal}
+            agentInterfaceView={agentInterfaceAvailable ? agentInterface.view : null}
           />
         </main>
 
@@ -450,6 +495,11 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const workspaceUsage = useWorkspaceUsage(workspaceId);
   const reviews = useReviews(workspaceId);
   const { clearError: clearBackgroundBashError } = useBackgroundBashError();
+
+  // Agent interface view: the status page stays mounted (hidden) while the transcript shows, so
+  // switching back neither reloads the page nor loses its in-page state.
+  const agentInterfaceView = props.agentInterfaceView ?? null;
+  const showStatusView = agentInterfaceView === "status";
 
   // Transcript-only workspaces preserve historical chat and usage after the worktree is deleted,
   // so the transcript stays readable while new sends remain disabled.
@@ -1700,7 +1750,9 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // so the placeholder's flex-1 centering works). The hydration
                 // skeleton renders in normal top-aligned transcript flow so it sits
                 // where real messages will, avoiding a jump when hydration completes.
-                showEmptyTranscriptPlaceholder && "flex flex-col"
+                showEmptyTranscriptPlaceholder && "flex flex-col",
+                // Under the status page: hidden but laid out, so its scroll position survives.
+                showStatusView && "invisible"
               )}
             >
               {showTranscriptHydrationPlaceholder ? (
@@ -1815,7 +1867,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       <span className="sr-only">Loading messages...</span>
                     </div>
                   )}
-                  {offersJumpToBottom(autoScroll, isTranscriptDetached) && (
+                  {!showStatusView && offersJumpToBottom(autoScroll, isTranscriptDetached) && (
                     <button
                       onClick={handleJumpToBottom}
                       type="button"
@@ -1903,6 +1955,14 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               </ChatDockColumnProvider>
             </PerfRenderMarker>
           </div>
+          {agentInterfaceView != null && (
+            <AgentInterfaceStatusView
+              key={workspaceId}
+              workspaceId={workspaceId}
+              hidden={!showStatusView}
+              dockRef={composerDockRef}
+            />
+          )}
           {transcriptContextMenu.menu}
         </div>
       </PerfRenderMarker>
