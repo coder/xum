@@ -1281,9 +1281,7 @@
               "@/node/utils/main/crossProcessLock",
               "@/node/services/workspaceUseLeases"
             ],
-            "allow": {
-              "src/node/services/agentSession.ts": ["@/node/services/workspaceUseLeases"]
-            }
+            "allow": {}
           }
         ]
       }

@@ -182,9 +182,7 @@ const HOST_MODULES = [
   "@/node/services/workspaceUseLeases",
 ];
 // File -> the host modules it still imports. Phase plans list the pairs they add or remove.
-const HOST_IMPORT_ALLOW = {
-  "src/node/services/agentSession.ts": ["@/node/services/workspaceUseLeases"],
-};
+const HOST_IMPORT_ALLOW = {};
 
 const SHARED_RESTRICTED_PATHS = [AI_TOKENIZER_ENCODING_RESTRICTION];
 const SHARED_RESTRICTED_PATTERNS = [SHIKI_RESTRICTION, ORPC_SCHEMAS_BARREL_RESTRICTION];
