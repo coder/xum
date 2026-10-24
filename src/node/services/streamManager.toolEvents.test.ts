@@ -282,6 +282,56 @@ describe("StreamManager - nested kernel call race and replay", () => {
     await live.finish();
   });
 
+  test("re-delivers a nested call that started and ended before its parent, after the parent start", async () => {
+    const harness = createLiveStreamHarness();
+    const workspaceId = "nested-early-end-workspace";
+    const messageId = "nested-early-end-message";
+    const scope = { workspaceId, messageId, token: "test" };
+    const live = await harness.start({ workspaceId, messageId });
+    const timestamp = Date.now();
+    const nested = {
+      callId: "nested-early",
+      toolName: "bash",
+      args: { script: "true" },
+      parentToolCallId: "code-exec-early",
+      startTime: timestamp,
+    };
+    // execute() runs the whole nested call before the fullStream consumer stores the parent.
+    harness.streamManager.emitNestedToolEvent(scope, { ...nested, type: "tool-call-start" });
+    harness.streamManager.emitNestedToolEvent(scope, {
+      ...nested,
+      type: "tool-call-end",
+      result: { ok: true },
+      endTime: timestamp + 5,
+    });
+
+    const pushStart = harness.events.length;
+    await live.push(dynamicToolCall("code-exec-early", "code_execution", { code: "mux.bash()" }));
+
+    // The renderer dropped the raced events (no parent row yet), so they come again,
+    // in order, after the parent's own start.
+    const merged = harness.events
+      .slice(pushStart)
+      .map((event) => [
+        event.type,
+        "toolCallId" in event ? event.toolCallId : undefined,
+        "parentToolCallId" in event ? event.parentToolCallId : undefined,
+      ]);
+    expect(merged).toEqual([
+      ["tool-call-start", "code-exec-early", undefined],
+      ["tool-call-start", "nested-early", "code-exec-early"],
+      ["tool-call-end", "nested-early", "code-exec-early"],
+    ]);
+    const parts = liveParts(harness, workspaceId);
+    expect(parts).toHaveLength(1);
+    expect(parts[0]).toMatchObject({
+      nestedCalls: [
+        { toolCallId: "nested-early", state: "output-available", output: { ok: true } },
+      ],
+    });
+    await live.finish();
+  });
+
   test("replays persisted nested calls (start, attachment, end) with the parent part", async () => {
     const harness = createLiveStreamHarness();
     const workspaceId = "nested-replay-workspace";

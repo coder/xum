@@ -51,6 +51,46 @@ describe("StreamManager - replayStream", () => {
     await live.finish();
   });
 
+  test("replay during a part's live emit skips that part, and the live emit lands once", async () => {
+    // appendPartAndEmit emits a part before it pushes it to the parts that replay
+    // snapshots, so a replay that runs mid-emit must not send the part a second time.
+    let holdLive = false;
+    let signalCounting!: () => void;
+    const counting = new Promise<void>((resolve) => (signalCounting = resolve));
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    const tokenTracker: StreamManagerTokenTracker = {
+      setModel: () => Promise.resolve(),
+      countTokens: async (text) => {
+        if (text === "b" && holdLive) {
+          holdLive = false;
+          signalCounting();
+          await released;
+        }
+        return 1;
+      },
+    };
+    const harness = createLiveStreamHarness({ tokenTracker });
+    const workspaceId = "ws-replay-in-flight";
+    const live = await harness.start({ workspaceId, messageId: "msg-1" });
+    await live.push({ type: "text-delta", text: "a" });
+
+    holdLive = true;
+    const pushing = live.push({ type: "text-delta", text: "b" });
+    await counting;
+    await harness.streamManager.replayStream(workspaceId);
+    release();
+    await pushing;
+
+    const deltas = eventsOfType(harness.events, "stream-delta");
+    expect(deltas.filter(isReplay).map((event) => event.delta)).toEqual(["a"]);
+    expect(deltas.filter((event) => !isReplay(event)).map((event) => event.delta)).toEqual([
+      "a",
+      "b",
+    ]);
+    await live.finish();
+  });
+
   test("replayStream filters output-available tool parts using completion timestamps", async () => {
     const harness = createLiveStreamHarness();
     const workspaceId = "ws-replay-tool-filter";
