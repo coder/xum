@@ -146,30 +146,43 @@ export class FakeRuntime implements Runtime {
     }
   }
 
-  // As LocalBaseRuntime.readFile: an abort before the read or during it errors the stream.
+  // As LocalBaseRuntime.readFile: an abort before the consumer reads the end errors the stream.
   readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
     const target = path.posix.resolve(this.expand(filePath));
     const files = this.fs.promises;
     const aborted = () => new RuntimeError(`Read of ${filePath} aborted`, "file_io");
-    return new ReadableStream({
-      async start(controller) {
-        if (abortSignal?.aborted) {
-          controller.error(aborted());
-          return;
-        }
-        try {
-          const bytes = (await files.readFile(target)) as Buffer;
+    let bytes: Uint8Array | undefined;
+    return new ReadableStream<Uint8Array>(
+      {
+        async start(controller) {
           if (abortSignal?.aborted) {
             controller.error(aborted());
             return;
           }
-          controller.enqueue(new Uint8Array(bytes));
-          controller.close();
-        } catch (error) {
-          controller.error(fileError("read file", filePath, error));
-        }
+          try {
+            bytes = new Uint8Array((await files.readFile(target)) as Buffer);
+          } catch (error) {
+            controller.error(fileError("read file", filePath, error));
+          }
+        },
+        // Each read of the consumer checks the signal first, as LocalBaseRuntime's pull does
+        // after each chunk: the bytes, then the end.
+        pull(controller) {
+          if (abortSignal?.aborted) {
+            controller.error(aborted());
+            return;
+          }
+          if (bytes === undefined) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(bytes);
+          bytes = undefined;
+        },
       },
-    });
+      // No read ahead: a pull runs only for a read of the consumer, so the end waits for it.
+      { highWaterMark: 0 }
+    );
   }
 
   writeFile(filePath: string): WritableStream<Uint8Array> {

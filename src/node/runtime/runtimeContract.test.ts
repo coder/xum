@@ -82,6 +82,19 @@ describe.each<[string, () => RuntimeUnderTest]>([
     expect(await under.runtime.stat(dir)).toMatchObject({ isDirectory: true });
   });
 
+  test("an abort after the first chunk, before the consumer reads the end, errors the stream", async () => {
+    using under = create();
+    const file = under.path.join(under.root, "abort.txt");
+    await writeFileString(under.runtime, file, "data");
+    const controller = new AbortController();
+    const reader = under.runtime.readFile(file, controller.signal).getReader();
+    const first = await reader.read();
+    expect(new TextDecoder().decode(first.value)).toBe("data");
+    controller.abort();
+    const end = await reader.read().catch((error: unknown) => error);
+    expect((end as RuntimeError).message).toBe(`Read of ${file} aborted`);
+  });
+
   test("normalizePath resolves a relative path and '.' against the base", () => {
     using under = create();
     expect(under.runtime.normalizePath("c/d", "/a/b")).toBe(under.path.resolve("/a/b", "c/d"));
