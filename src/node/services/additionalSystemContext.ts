@@ -46,7 +46,10 @@ async function readContentFile(
   files: SessionFiles
 ): Promise<string> {
   try {
-    return await files.promises.readFile(getAdditionalSystemContextPath(config, workspaceId), "utf-8");
+    return await files.promises.readFile(
+      getAdditionalSystemContextPath(config, workspaceId),
+      "utf-8"
+    );
   } catch (error) {
     if (isErrnoWithCode(error, "ENOENT")) {
       return "";
@@ -100,7 +103,10 @@ export async function writeAdditionalSystemContext(
   // injection don't carry around blank durable state. We also drop the
   // disabled marker so the next non-empty edit defaults to enabled.
   if (record.content.length === 0) {
-    await Promise.all([files.promises.rm(filePath, { force: true }), files.promises.rm(disabledPath, { force: true })]);
+    await Promise.all([
+      files.promises.rm(filePath, { force: true }),
+      files.promises.rm(disabledPath, { force: true }),
+    ]);
     return;
   }
 
