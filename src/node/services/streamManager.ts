@@ -148,6 +148,7 @@ import {
   extractPreviousResponseIdFromError,
   extractStatusCode,
 } from "@/node/services/turnEngine/providerWire";
+import { TurnEvents, type WorkflowRunToolAttachment } from "@/node/services/turnEngine/TurnEvents";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { shellQuote } from "@/common/utils/shell";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
@@ -266,7 +267,7 @@ interface PartLoopState {
   orphanToolResultCount: number;
 }
 
-type WorkspaceId = string & { __brand: "WorkspaceId" };
+export type WorkspaceId = string & { __brand: "WorkspaceId" };
 type StreamToken = string & { __brand: "StreamToken" };
 
 export type TurnEngineEvent =
@@ -840,9 +841,6 @@ function hasIncompleteToolCallPart(parts: CompletedMessagePart[]): boolean {
   return parts.some((part) => part.type === "dynamic-tool" && part.state !== "output-available");
 }
 
-type DynamicToolCompletedMessagePart = Extract<CompletedMessagePart, { type: "dynamic-tool" }>;
-type WorkflowRunToolAttachment = NonNullable<DynamicToolCompletedMessagePart["workflowRun"]>;
-
 // Comprehensive stream info
 interface WorkspaceStreamInfo extends PartialJournalState, Readonly<UsageLedgerState> {
   state: StreamState;
@@ -1137,10 +1135,11 @@ export class StreamManager {
   private mcpServerManager?: MCPServerManager;
   // Owns the turn's usage accounting and session-usage writes (turnEngine/UsageLedger.ts).
   private readonly usageLedger: UsageLedger;
+  // Owns turn event delivery and workflow-run attachments (turnEngine/TurnEvents.ts).
+  private readonly turnEvents: TurnEvents<WorkspaceStreamInfo>;
   // Owns lost previousResponseIds and prefix swaps (turnEngine/ProviderRequest.ts).
   private readonly providerRequest: ProviderRequest;
   private readonly getProvidersConfig: () => ProvidersConfigMap | null;
-  private eventSink: TurnEngineEventSink;
   /**
    * Runs the clock-driven lifecycle fibers (partial-write debounce and its
    * interrupt) and is handed to per-session workers that must share this
@@ -1194,7 +1193,9 @@ export class StreamManager {
       getProvidersConfig: this.getProvidersConfig,
       workspaceLogger: (id, turn) => this.getWorkspaceLogger(id as WorkspaceId, turn),
     });
-    this.eventSink = eventSink;
+    this.turnEvents = new TurnEvents<WorkspaceStreamInfo>(eventSink, {
+      flushPartialWrite: (id, info) => this.flushPartialWrite(id, info),
+    });
     this.effectRunner = runner;
     this.hostClock = options.hostClock ?? hostClockFor(runner);
     this.partialJournal = new PartialJournal({
@@ -1209,17 +1210,7 @@ export class StreamManager {
   }
 
   setEventSink(eventSink: TurnEngineEventSink): void {
-    this.eventSink = eventSink;
-  }
-
-  private emitTurnEvent(event: TurnEngineEvent): void {
-    // TurnEngineEventSink may return a promise; non-abort delivery stays
-    // fire-and-forget, so contain rejections here or a failing async sink
-    // becomes an unhandled rejection. Abort delivery is sequenced separately
-    // via emitStreamAbort.
-    void Promise.resolve(this.eventSink(event)).catch((error) => {
-      log.error("Turn event sink failed", { eventType: event.type, error: getErrorMessage(error) });
-    });
+    this.turnEvents.setEventSink(eventSink);
   }
 
   private getWorkspaceLogger(
@@ -1312,141 +1303,11 @@ export class StreamManager {
     this.usageLedger.recordToolModelUsage(streamInfo, event);
   }
 
-  private getWorkflowRunAttachment(event: WorkflowRunAttachedEvent): WorkflowRunToolAttachment {
-    return {
-      runId: event.runId,
-      ...(event.run != null ? { run: event.run } : {}),
-      timestamp: event.timestamp,
-    };
-  }
-
-  private takePendingWorkflowRunAttachment(
-    streamInfo: WorkspaceStreamInfo,
-    toolCallId: string
-  ): WorkflowRunToolAttachment | undefined {
-    const pendingAttachments = (streamInfo.pendingWorkflowRunAttachments ??= new Map());
-    const attachment = pendingAttachments.get(toolCallId);
-    if (attachment != null) {
-      pendingAttachments.delete(toolCallId);
-    }
-    return attachment;
-  }
-
-  private emitWorkflowRunAttachedFromAttachment(input: {
-    workspaceId: WorkspaceId;
-    messageId: string;
-    toolCallId: string;
-    attachment: WorkflowRunToolAttachment;
-  }): void {
-    this.emitTurnEvent({
-      type: "workflow-run-attached",
-      workspaceId: input.workspaceId as string,
-      messageId: input.messageId,
-      toolCallId: input.toolCallId,
-      runId: input.attachment.runId,
-      ...(input.attachment.run != null ? { run: input.attachment.run } : {}),
-      timestamp: input.attachment.timestamp,
-    } satisfies WorkflowRunAttachedEvent);
-  }
-
   async attachWorkflowRunToToolCall(event: WorkflowRunAttachedEvent): Promise<boolean> {
-    const workspaceId = event.workspaceId as WorkspaceId;
-    const streamInfo = this.workspaceStreams.get(workspaceId);
-    if (
-      streamInfo == null ||
-      (event.messageId != null && streamInfo.messageId !== event.messageId)
-    ) {
-      return false;
-    }
-
-    const attachment = this.getWorkflowRunAttachment(event);
-    const partIndex = streamInfo.parts.findIndex(
-      (part) => part.type === "dynamic-tool" && part.toolCallId === event.toolCallId
+    return this.turnEvents.attachWorkflowRunToToolCall(
+      event,
+      this.workspaceStreams.get(event.workspaceId as WorkspaceId)
     );
-    if (partIndex === -1) {
-      // Kernel-launched workflows target a NESTED call persisted on a
-      // code_execution part (see emitNestedToolEvent), not a top-level part.
-      if (
-        await this.attachWorkflowRunToNestedCall(
-          workspaceId,
-          streamInfo,
-          event.toolCallId,
-          attachment
-        )
-      ) {
-        return true;
-      }
-      (streamInfo.pendingWorkflowRunAttachments ??= new Map()).set(event.toolCallId, attachment);
-      return true;
-    }
-
-    const part = streamInfo.parts[partIndex];
-    if (part.type !== "dynamic-tool") {
-      return false;
-    }
-
-    streamInfo.pendingWorkflowRunAttachments?.delete(event.toolCallId);
-    streamInfo.parts[partIndex] = {
-      ...part,
-      workflowRun: attachment,
-    };
-
-    await this.flushPartialWrite(workspaceId, streamInfo);
-    return true;
-  }
-
-  /**
-   * A nested call's persisted attachment keeps only the run identity: the full
-   * WorkflowRunRecord carries the workflow source and invocation args, which
-   * would ride into partial.json unbounded and defeat the kernel record caps
-   * that already replaced the nested args/result with markers. The frontend
-   * re-fetches the durable run by runId. (The live workflow-run-attached event
-   * still carries the full run snapshot.)
-   */
-  private static toNestedWorkflowRunAttachment(
-    attachment: WorkflowRunToolAttachment
-  ): WorkflowRunToolAttachment {
-    return { runId: attachment.runId, timestamp: attachment.timestamp };
-  }
-
-  /**
-   * Persist a workflow run attachment onto the nested call record it targets,
-   * so a kernel-launched run's identity survives reload even when kernel
-   * bounding replaced the nested args/result with a marker. The live event
-   * still reaches the frontend through the normal emit path.
-   */
-  private async attachWorkflowRunToNestedCall(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    toolCallId: string,
-    attachment: WorkflowRunToolAttachment
-  ): Promise<boolean> {
-    const nestedAttachment = StreamManager.toNestedWorkflowRunAttachment(attachment);
-    for (const part of streamInfo.parts) {
-      if (part.type !== "dynamic-tool") {
-        continue;
-      }
-      const parentPart = part as { nestedCalls?: NestedToolCall[] };
-      const nestedCalls = parentPart.nestedCalls;
-      const nestedIndex =
-        nestedCalls?.findIndex((nested) => nested.toolCallId === toolCallId) ?? -1;
-      if (nestedCalls == null || nestedIndex === -1) {
-        continue;
-      }
-      nestedCalls[nestedIndex] = { ...nestedCalls[nestedIndex], workflowRun: nestedAttachment };
-      await this.flushPartialWrite(workspaceId, streamInfo);
-      return true;
-    }
-    // The nested record may still be buffered because its parent part has not
-    // landed yet; attach there so the merge in appendPartAndEmit persists it.
-    for (const buffered of streamInfo.pendingNestedCalls?.values() ?? []) {
-      const nestedIndex = buffered.findIndex((nested) => nested.toolCallId === toolCallId);
-      if (nestedIndex !== -1) {
-        buffered[nestedIndex] = { ...buffered[nestedIndex], workflowRun: nestedAttachment };
-        return true;
-      }
-    }
-    return false;
   }
 
   /**
@@ -1470,7 +1331,7 @@ export class StreamManager {
     assert(part.type === "dynamic-tool", "applyToolExecutionStart matched a non-tool part");
     streamInfo.parts[partIndex] = { ...part, executionStartedAt: timestamp };
 
-    this.emitTurnEvent({
+    this.turnEvents.emitTurnEvent({
       type: "tool-call-execution-start",
       workspaceId: workspaceId as string,
       messageId: streamInfo.messageId,
@@ -1648,7 +1509,7 @@ export class StreamManager {
     // Record time: wall clock until #7282 moves its consumers to HostClock.
     const timestamp = nodeClock.nowMs();
 
-    this.emitTurnEvent({
+    this.turnEvents.emitTurnEvent({
       type: "tool-call-delta",
       workspaceId: workspaceId as string,
       messageId: streamInfo.messageId,
@@ -1879,7 +1740,7 @@ export class StreamManager {
 
     if (part.type === "text") {
       const tokens = await this.tokenTracker.countTokens(part.text);
-      this.emitTurnEvent({
+      this.turnEvents.emitTurnEvent({
         type: "stream-delta",
         workspaceId: workspaceId as string,
         messageId,
@@ -1890,7 +1751,7 @@ export class StreamManager {
       });
     } else if (part.type === "reasoning") {
       const tokens = await this.tokenTracker.countTokens(part.text);
-      this.emitTurnEvent({
+      this.turnEvents.emitTurnEvent({
         type: "reasoning-delta",
         workspaceId: workspaceId as string,
         messageId,
@@ -1903,7 +1764,7 @@ export class StreamManager {
     } else if (part.type === "dynamic-tool") {
       const inputText = JSON.stringify(part.input);
       const tokens = await this.tokenTracker.countTokens(inputText);
-      this.emitTurnEvent({
+      this.turnEvents.emitTurnEvent({
         type: "tool-call-start",
         workspaceId: workspaceId as string,
         messageId,
@@ -1921,7 +1782,7 @@ export class StreamManager {
       });
 
       if (part.workflowRun != null) {
-        this.emitTurnEvent({
+        this.turnEvents.emitTurnEvent({
           type: "workflow-run-attached",
           workspaceId: workspaceId as string,
           messageId,
@@ -1940,14 +1801,14 @@ export class StreamManager {
       // nested rows. Live appends never carry nestedCalls (buffered nested
       // records merge after this emit), so this only fires on replay in practice.
       const nestedCalls = (part as { nestedCalls?: NestedToolCall[] }).nestedCalls ?? [];
-      this.emitNestedCallEvents(workspaceId, messageId, part.toolCallId, nestedCalls, {
+      this.turnEvents.emitNestedCallEvents(workspaceId, messageId, part.toolCallId, nestedCalls, {
         replay: isReplay,
         fallbackTimestamp: timestamp,
       });
 
       // If tool has output, emit completion
       if (part.state === "output-available") {
-        this.emitTurnEvent({
+        this.turnEvents.emitTurnEvent({
           type: "tool-call-end",
           workspaceId: workspaceId as string,
           messageId,
@@ -1958,64 +1819,6 @@ export class StreamManager {
           ...(part.mcpServer ? { mcpServer: part.mcpServer } : {}),
           // Record time: wall clock until #7282 moves its consumers to HostClock.
           timestamp: nodeClock.nowMs(),
-        });
-      }
-    }
-  }
-
-  /**
-   * Emit a nested call's full event sequence (start, workflow attachment, end)
-   * on behalf of its parent part. Used when the renderer could not have applied
-   * the original live events: reconnect replays, and the buffered-merge path in
-   * appendPartAndEmit where the original events raced ahead of the parent part.
-   * The aggregator dedupes re-delivered nested starts by toolCallId.
-   */
-  private emitNestedCallEvents(
-    workspaceId: WorkspaceId,
-    messageId: string,
-    parentToolCallId: string,
-    nestedCalls: NestedToolCall[],
-    options: { replay?: boolean; fallbackTimestamp: number }
-  ): void {
-    const isReplay = options.replay === true;
-    for (const nested of nestedCalls) {
-      this.emitTurnEvent({
-        type: "tool-call-start",
-        workspaceId: workspaceId as string,
-        messageId,
-        ...(isReplay ? { replay: true } : {}),
-        toolCallId: nested.toolCallId,
-        toolName: nested.toolName,
-        args: nested.input ?? {},
-        tokens: 0,
-        timestamp: nested.timestamp ?? options.fallbackTimestamp,
-        parentToolCallId,
-      });
-      if (nested.workflowRun != null) {
-        this.emitTurnEvent({
-          type: "workflow-run-attached",
-          workspaceId: workspaceId as string,
-          messageId,
-          ...(isReplay ? { replay: true } : {}),
-          toolCallId: nested.toolCallId,
-          runId: nested.workflowRun.runId,
-          ...(nested.workflowRun.run != null ? { run: nested.workflowRun.run } : {}),
-          timestamp: nested.workflowRun.timestamp,
-        } satisfies WorkflowRunAttachedEvent);
-      }
-      if (nested.state === "output-available") {
-        this.emitTurnEvent({
-          type: "tool-call-end",
-          workspaceId: workspaceId as string,
-          messageId,
-          ...(isReplay ? { replay: true } : {}),
-          toolCallId: nested.toolCallId,
-          toolName: nested.toolName,
-          result: nested.output,
-          ...(nested.mcpServer ? { mcpServer: nested.mcpServer } : {}),
-          // Record time: wall clock until #7282 moves its consumers to HostClock.
-          timestamp: nodeClock.nowMs(),
-          parentToolCallId,
         });
       }
     }
@@ -2089,7 +1892,7 @@ export class StreamManager {
         this.updateReasoningPart(streamInfo, intent);
         return undefined;
       case "Emit":
-        this.emitTurnEvent(intent.event);
+        this.turnEvents.emitTurnEvent(intent.event);
         return undefined;
       case "CheckSoftCancel":
         return this.checkSoftCancelStream(workspaceId, streamInfo);
@@ -2254,7 +2057,7 @@ export class StreamManager {
       costsIncluded: streamInfo.initialMetadata?.costsIncluded,
     });
     streamInfo.currentStepStartIndex = streamInfo.parts.length;
-    this.emitTurnEvent(usageEvent);
+    this.turnEvents.emitTurnEvent(usageEvent);
   }
 
   private updateReasoningPart(
@@ -2293,7 +2096,10 @@ export class StreamManager {
       let pendingExecutionStart: number | undefined;
       let bufferedNestedCalls: NestedToolCall[] | undefined;
       if (part.type === "dynamic-tool") {
-        pendingAttachment = this.takePendingWorkflowRunAttachment(streamInfo, part.toolCallId);
+        pendingAttachment = this.turnEvents.takePendingWorkflowRunAttachment(
+          streamInfo,
+          part.toolCallId
+        );
         // execute() may have started (lock acquired) before the fullStream consumer
         // stored this part; carry the real execution start onto the persisted part.
         pendingExecutionStart = streamInfo.pendingToolExecutionStarts?.get(part.toolCallId);
@@ -2325,7 +2131,7 @@ export class StreamManager {
       streamInfo.parts.push(partToPersist);
       if (part.type === "reasoning") this.turnReplayOffAfterServerTool(streamInfo);
       if (pendingExecutionStart !== undefined && part.type === "dynamic-tool") {
-        this.emitTurnEvent({
+        this.turnEvents.emitTurnEvent({
           type: "tool-call-execution-start",
           workspaceId: workspaceId as string,
           messageId: streamInfo.messageId,
@@ -2342,7 +2148,7 @@ export class StreamManager {
         // The original nested events raced ahead of the parent part, so the
         // renderer dropped them (it refuses parented events with no parent
         // row); re-deliver them now that the parent start has been emitted.
-        this.emitNestedCallEvents(
+        this.turnEvents.emitNestedCallEvents(
           workspaceId,
           streamInfo.messageId,
           part.toolCallId,
@@ -2353,7 +2159,7 @@ export class StreamManager {
       }
       if (pendingAttachment != null && part.type === "dynamic-tool") {
         await this.flushPartialWrite(workspaceId, streamInfo);
-        this.emitWorkflowRunAttachedFromAttachment({
+        this.turnEvents.emitWorkflowRunAttachedFromAttachment({
           workspaceId,
           messageId: streamInfo.messageId,
           toolCallId: part.toolCallId,
@@ -2738,7 +2544,7 @@ export class StreamManager {
         log.error("Failed partial cleanup during stream-abort", { workspaceId, error });
       }
       try {
-        await this.eventSink(streamAbort);
+        await this.turnEvents.deliver(streamAbort);
       } catch (error) {
         log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
       } finally {
@@ -3500,7 +3306,10 @@ export class StreamManager {
     const existingPartIndex = streamInfo.parts.findIndex(
       (p) => p.type === "dynamic-tool" && p.toolCallId === toolCallId
     );
-    const pendingAttachment = this.takePendingWorkflowRunAttachment(streamInfo, toolCallId);
+    const pendingAttachment = this.turnEvents.takePendingWorkflowRunAttachment(
+      streamInfo,
+      toolCallId
+    );
     const mcpServer = streamInfo.executionScope
       ? this.toolCallDisplayRegistry.take(streamInfo.executionScope, toolCallId)
       : undefined;
@@ -3542,7 +3351,7 @@ export class StreamManager {
     // where the partial is read before the tool result is written, causing "amnesia".
     await this.flushPartialWrite(workspaceId, streamInfo);
     if (pendingAttachment != null) {
-      this.emitWorkflowRunAttachedFromAttachment({
+      this.turnEvents.emitWorkflowRunAttachedFromAttachment({
         workspaceId,
         messageId: streamInfo.messageId,
         toolCallId,
@@ -3554,7 +3363,7 @@ export class StreamManager {
     const completionTimestamp = nextPartTimestamp(streamInfo);
     streamInfo.toolCompletionTimestamps ??= new Map();
     streamInfo.toolCompletionTimestamps.set(toolCallId, completionTimestamp);
-    this.emitTurnEvent({
+    this.turnEvents.emitTurnEvent({
       type: "tool-call-end",
       workspaceId: workspaceId as string,
       messageId: streamInfo.messageId,
@@ -3739,7 +3548,7 @@ export class StreamManager {
 
     // Emit to frontend
     if (event.type === "tool-call-start") {
-      this.emitTurnEvent({
+      this.turnEvents.emitTurnEvent({
         type: "tool-call-start",
         workspaceId,
         messageId,
@@ -3751,7 +3560,7 @@ export class StreamManager {
         parentToolCallId: event.parentToolCallId,
       });
     } else if (event.type === "tool-call-end") {
-      this.emitTurnEvent({
+      this.turnEvents.emitTurnEvent({
         type: "tool-call-end",
         workspaceId,
         messageId,
@@ -3784,7 +3593,7 @@ export class StreamManager {
     const canonicalModel = metadataModelIdentity(streamInfo.model);
     const routeProvider = streamInfo.initialMetadata?.routeProvider;
 
-    this.emitTurnEvent({
+    this.turnEvents.emitTurnEvent({
       type: "stream-start",
       workspaceId: workspaceId as string,
       messageId: streamInfo.messageId,
@@ -3823,27 +3632,6 @@ export class StreamManager {
         messageId: streamInfo.messageId,
       });
     }
-  }
-
-  private async emitStreamAbort(
-    workspaceId: WorkspaceId,
-    messageId: string,
-    metadata: Record<string, unknown>,
-    abortReason: StreamAbortReason,
-    abandonPartial?: boolean,
-    acpPromptId?: string
-  ): Promise<void> {
-    return Promise.resolve(
-      this.eventSink({
-        type: "stream-abort",
-        workspaceId: workspaceId as string,
-        messageId,
-        abortReason,
-        metadata,
-        abandonPartial,
-        acpPromptId,
-      })
-    );
   }
 
   private async handleEmptyStreamCompletion(
@@ -4350,7 +4138,7 @@ export class StreamManager {
       !streamInfo.stepTracker.prefixSwapInvalidationEmitted
     ) {
       streamInfo.stepTracker.prefixSwapInvalidationEmitted = true;
-      this.emitTurnEvent({
+      this.turnEvents.emitTurnEvent({
         type: "prefix-swap-invalidated",
         workspaceId,
         messageId: streamInfo.messageId,
@@ -4752,7 +4540,7 @@ export class StreamManager {
             // Compaction handler listens to this event and clears history - if we emit
             // before updateHistory completes, compaction can clear the file and then
             // updateHistory writes stale data back.
-            this.emitTurnEvent(streamEndEvent);
+            this.turnEvents.emitTurnEvent(streamEndEvent);
             streamInfo.terminalCompletion = { status: "completed", streamEnd: streamEndEvent };
           }
           break;
@@ -5071,7 +4859,7 @@ export class StreamManager {
     }
 
     // Emit error event before completion settles so recovery bookkeeping is ready for waiters.
-    this.emitTurnEvent(createErrorEvent(workspaceId as string, payload));
+    this.turnEvents.emitTurnEvent(createErrorEvent(workspaceId as string, payload));
     return payload;
   }
 
@@ -5989,15 +5777,17 @@ export class StreamManager {
           const delivery = Promise.withResolvers<void>();
           pending.abortDelivery = delivery.promise;
           pending.abortController.abort(options?.abortReason ?? "startup");
-          this.emitStreamAbort(
-            typedWorkspaceId,
-            pending.syntheticMessageId,
-            // Duration from the wall-clock pending.startTime.
-            { duration: nodeClock.nowMs() - pending.startTime },
-            this.getStartupAbortReason(pending.abortController.signal),
-            options?.abandonPartial,
-            pending.acpPromptId
-          ).then(delivery.resolve, delivery.reject);
+          this.turnEvents
+            .emitStreamAbort(
+              typedWorkspaceId,
+              pending.syntheticMessageId,
+              // Duration from the wall-clock pending.startTime.
+              { duration: nodeClock.nowMs() - pending.startTime },
+              this.getStartupAbortReason(pending.abortController.signal),
+              options?.abandonPartial,
+              pending.acpPromptId
+            )
+            .then(delivery.resolve, delivery.reject);
         } else {
           pending.abortController.abort(options?.abortReason ?? "startup");
         }
@@ -6005,7 +5795,7 @@ export class StreamManager {
       }
 
       if (!mockLifecycle && !streamInfo && !pending && options?.emitIfMissing !== false) {
-        startupDelivery = this.emitStreamAbort(
+        startupDelivery = this.turnEvents.emitStreamAbort(
           typedWorkspaceId,
           "",
           {},
@@ -6255,7 +6045,7 @@ export class StreamManager {
         // Replays must preserve costs-included zero-cost behavior from the original stream.
         costsIncluded: streamInfo.initialMetadata?.costsIncluded,
       });
-      this.emitTurnEvent(usageEvent);
+      this.turnEvents.emitTurnEvent(usageEvent);
     }
   }
 }
