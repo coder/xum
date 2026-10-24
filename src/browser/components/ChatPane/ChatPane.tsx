@@ -465,8 +465,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const reviews = useReviews(workspaceId);
   const { clearError: clearBackgroundBashError } = useBackgroundBashError();
 
-  // Agent interface view: the status page stays mounted (hidden) while the transcript shows, so
-  // switching back neither reloads the page nor loses its in-page state.
+  // Agent interface view: the transcript stays mounted (hidden) under the status page, so its
+  // scroll position survives a round trip; the status page unmounts while the transcript shows.
   const showStatusView = props.agentInterfaceView === "status";
 
   // Transcript-only workspaces preserve historical chat and usage after the worktree is deleted,

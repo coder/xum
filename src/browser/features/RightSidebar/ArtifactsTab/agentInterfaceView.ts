@@ -286,6 +286,8 @@ export function useMainPaneAgentInterfaceView(workspaceId: string): AgentInterfa
         return;
       }
       e.preventDefault();
+      // A held chord would flip the view on every key repeat.
+      if (e.repeat) return;
       toggleAgentInterfaceView(workspaceId);
     };
     window.addEventListener("keydown", handler);

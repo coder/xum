@@ -65,8 +65,7 @@ interface BuiltDocument {
 
 /**
  * Whether the user's focus is in `frame`. Browsers leave focus on a frame that a `hidden`
- * ancestor stopped rendering (the main pane's status page after a switch to the chat), so that
- * focus does not count.
+ * ancestor stopped rendering, so that focus does not count.
  */
 function frameHasFocus(frame: HTMLIFrameElement | null): frame is HTMLIFrameElement {
   return frame != null && document.activeElement === frame && frame.checkVisibility();
@@ -100,19 +99,17 @@ function hasLiveUserGesture(frame: HTMLIFrameElement | null): boolean {
  * view handler for TOGGLE_AGENT_INTERFACE_VIEW. All keep the dialog block (Artifacts fullscreen is
  * a modal dialog); the sidebar ones also move focus to the toggle after a collapse.
  *
- * SECURITY AUDIT: the artifact's script can post the message without a key press. The host
- * honours it only while the visible frame holds focus (frameHasFocus), and the replayed event
- * matches only the named chord's keybind. In the right sidebar's Artifacts tab, the sidebar chords
- * can only collapse the sidebar, which unmounts the frame: OPEN_ARTIFACTS_TAB collapses a sidebar
- * that shows that tab, and where a collapse refuses it selects the tab that already shows. The
- * Agent interface chord only switches the main pane between the status page and the transcript,
- * the same as the visible toggle. Like Escape, they need no live gesture.
+ * SECURITY AUDIT: the artifact's script can post the message without a key press, and can move
+ * focus into its own frame with window.focus(). The host honours it only during the user's own
+ * key press in the visible frame (hasLiveUserGesture), and the replayed event matches only the
+ * named chord's keybind. Otherwise a timer could flip the main pane's view, or the right sidebar
+ * under a main-pane status page, over and over, rewriting the stored view choice each time.
  */
 function replayFrameSidebarKey(
   frame: HTMLIFrameElement | null,
   message: { chord: ArtifactFrameChord; ctrlKey: boolean; metaKey: boolean }
 ): void {
-  if (!frameHasFocus(frame)) return;
+  if (!hasLiveUserGesture(frame) || frame == null) return;
   const keybind = ARTIFACT_FRAME_CHORDS[message.chord];
   const event = new KeyboardEvent("keydown", {
     key: keybind.key,
@@ -203,11 +200,14 @@ async function buildFrameDocument(input: {
   }
 }
 
-/** A page with the theme's scheme paints no canvas of its own, so the theme's background shows. */
+/**
+ * A page with the theme's scheme paints no canvas of its own, so the backdrop shows: the pane
+ * surface (main pane and right sidebar alike), so the page sits seamlessly in the pane.
+ */
 function frameClassName(followsColorScheme: boolean, annotating: boolean): string {
   return cn(
     "min-h-0 w-full flex-1 border-0",
-    followsColorScheme ? "bg-background" : "bg-white",
+    followsColorScheme ? "bg-surface-primary" : "bg-white",
     annotating && "cursor-crosshair"
   );
 }

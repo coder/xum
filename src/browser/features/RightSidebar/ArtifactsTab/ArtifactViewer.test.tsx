@@ -386,7 +386,12 @@ describe("ArtifactViewer renderers", () => {
     }
   });
 
-  test("a chord posted by a frame that is no longer shown is not replayed, though focus stays there", async () => {
+  test("a chord posted by a frame is replayed only during the user's key press in the shown frame", async () => {
+    let activation = { isActive: false };
+    Object.defineProperty(window.navigator, "userActivation", {
+      configurable: true,
+      get: () => activation,
+    });
     const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
     let replayed = 0;
@@ -413,12 +418,17 @@ describe("ArtifactViewer renderers", () => {
           Object.defineProperty(event, "source", { value: frame.contentWindow });
           window.dispatchEvent(event);
         });
+      // The page's script can move focus into its frame (window.focus()) and post the chord from
+      // a timer: without the user's activation that must not switch the view.
       act(() => frame.focus());
+      postChord();
+      expect(replayed).toBe(0);
+
+      activation = { isActive: true };
       postChord();
       expect(replayed).toBe(1);
 
-      // The main pane hides its status page with display: none and the browser leaves focus on
-      // the frame, so the page's script could keep switching the view back.
+      // A frame that stopped rendering keeps focus in the browser; that focus does not count.
       frame.parentElement!.style.display = "none";
       expect(document.activeElement).toBe(frame);
       postChord();
@@ -426,6 +436,7 @@ describe("ArtifactViewer renderers", () => {
     } finally {
       globalThis.KeyboardEvent = globalKeyboardEvent;
       window.removeEventListener("keydown", onKeyDown, true);
+      Reflect.deleteProperty(window.navigator, "userActivation");
     }
   });
 
