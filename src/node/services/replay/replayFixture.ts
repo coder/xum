@@ -144,7 +144,7 @@ export function createReplayFixtureSessionContext(
     workspaceId,
     historyService,
     // The journal's locks are the history service's (phase 4: SessionLocks).
-    journal: new DurableEventJournal(sessionDir, historyService.locks),
+    journal: new DurableEventJournal(sessionDir, historyService.locks, historyService.files),
     devtoolsLines: [],
     turnCounter: 0,
   };
