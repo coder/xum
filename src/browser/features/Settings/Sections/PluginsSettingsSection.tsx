@@ -884,10 +884,10 @@ const PreviewHeader: React.FC<{ preview: AgentPluginInstallPreview }> = (props) 
     {props.preview.manifest.interface && (
       <PluginInterfaceDetails info={props.preview.manifest.interface} />
     )}
-    {/* break-all: URLs and a 64-char separator-free plugin dir name
-        have no natural break points and would overflow the card on
-        phone widths. */}
-    <p className="text-muted text-[11px] break-all">
+    {/* break-words: wrap at spaces ("@ main" stays whole), and still break URLs and a 64-char
+        separator-free plugin dir name, which have no natural break points and would overflow
+        the card on phone widths. break-all split words mid-way. */}
+    <p className="text-muted text-[11px] break-words">
       {displayRepoUrl(props.preview.source.url)}
       {subpathSuffix(props.preview.source.subpath)} @ {props.preview.source.ref} →{" "}
       <code className="text-accent-text">{props.preview.targetPath}</code>

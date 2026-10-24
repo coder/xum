@@ -2170,6 +2170,25 @@ describe("Claude Code plugin discovery", () => {
     ]);
   });
 
+  test("a manifest error names the file from the repository root when given the plugin folder", async () => {
+    // Settings installs a repository's `.codex-plugin` folder as the plugin root: its
+    // plugin.json must read as `.codex-plugin/plugin.json`, the path the user knows.
+    using tmp = new DisposableTempDir("agent-plugins");
+    const pluginDir = path.join(tmp.path, "staged");
+    await writeTree(pluginDir, { "plugin.json": JSON.stringify({ name: "multi-harness" }) });
+
+    const result = await discoverAgentPluginAt({
+      pluginDir,
+      scope: "global",
+      shownRoot: ".codex-plugin",
+    });
+
+    expect(result.plugin).toBeNull();
+    expect(result.diagnostics.map((d) => d.message)).toEqual([
+      "Invalid plugin manifest (.codex-plugin/plugin.json): '$schema' is required and must be a string",
+    ]);
+  });
+
   test("an invalid Codex manifest error names .codex-plugin/plugin.json", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");

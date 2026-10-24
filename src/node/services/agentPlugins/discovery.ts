@@ -1164,6 +1164,8 @@ async function discoverPluginAt(args: {
   dirName: string;
   scope: AgentPluginScope;
   diagnostics: AgentPluginDiagnostic[];
+  /** See discoverAgentPluginAt. */
+  shownRoot?: string;
 }): Promise<AgentPluginInfo | null> {
   const { pluginDir, scope, diagnostics } = args;
 
@@ -1210,7 +1212,10 @@ async function discoverPluginAt(args: {
     // Name the manifest: a plugin can carry plugin.json, .codex-plugin/plugin.json and
     // .claude-plugin/plugin.json, and the user must see which one failed. Forward slashes on
     // every OS, because the path is shown, not opened.
-    const shownManifest = manifestRelative.split(path.sep).join("/");
+    const shownManifest = path.posix.join(
+      args.shownRoot ?? ".",
+      manifestRelative.split(path.sep).join("/")
+    );
     pushError(manifestPath, `${label} (${shownManifest}): ${validation.errors.join("; ")}`);
     return null;
   }
@@ -1420,6 +1425,12 @@ export async function discoverWorkspaceAgentPlugins(args: {
 export async function discoverAgentPluginAt(args: {
   pluginDir: string;
   scope: AgentPluginScope;
+  /**
+   * The plugin folder's path inside its repository (an install's "Plugin folder"), so a manifest
+   * error names the file the way the user sees the repository: `.codex-plugin/plugin.json`, not
+   * a bare `plugin.json`. Display only.
+   */
+  shownRoot?: string;
 }): Promise<{ plugin: AgentPluginInfo | null; diagnostics: AgentPluginDiagnostic[] }> {
   if (!path.isAbsolute(args.pluginDir)) {
     throw new Error(`discoverAgentPluginAt: pluginDir must be absolute: ${args.pluginDir}`);
@@ -1432,6 +1443,7 @@ export async function discoverAgentPluginAt(args: {
     dirName: path.basename(args.pluginDir),
     scope: args.scope,
     diagnostics,
+    shownRoot: args.shownRoot,
   });
   return { plugin, diagnostics };
 }

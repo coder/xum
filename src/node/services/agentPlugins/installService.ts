@@ -2720,6 +2720,9 @@ export class AgentPluginInstallService {
     const { plugin, diagnostics } = await discoverAgentPluginAt({
       pluginDir: stagedDir,
       scope: "global",
+      // The staged tree is the "Plugin folder", so errors name e.g. `.codex-plugin/plugin.json`.
+      // A marketplace entry's folder sits below it, so its errors keep entry-relative paths.
+      shownRoot: marketplace === undefined ? (source.subpath ?? undefined) : undefined,
     });
     if (!plugin) {
       const reasons = diagnostics.map((d) => d.message);
