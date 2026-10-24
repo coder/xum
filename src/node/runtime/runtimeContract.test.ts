@@ -95,6 +95,19 @@ describe.each<[string, () => RuntimeUnderTest]>([
     expect((end as RuntimeError).message).toBe(`Read of ${file} aborted`);
   });
 
+  test("an abort right after a read of a missing path starts wins over the missing path", async () => {
+    using under = create();
+    const missing = under.path.join(under.root, "missing.txt");
+    const controller = new AbortController();
+    const stream = under.runtime.readFile(missing, controller.signal);
+    controller.abort();
+    const read = await stream
+      .getReader()
+      .read()
+      .catch((error: unknown) => error);
+    expect((read as RuntimeError).message).toBe(`Read of ${missing} aborted`);
+  });
+
   test("normalizePath resolves a relative path and '.' against the base", () => {
     using under = create();
     expect(under.runtime.normalizePath("c/d", "/a/b")).toBe(under.path.resolve("/a/b", "c/d"));

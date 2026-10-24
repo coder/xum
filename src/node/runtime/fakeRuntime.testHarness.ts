@@ -162,7 +162,10 @@ export class FakeRuntime implements Runtime {
           try {
             bytes = new Uint8Array((await files.readFile(target)) as Buffer);
           } catch (error) {
-            controller.error(fileError("read file", filePath, error));
+            // As LocalBaseRuntime: an abort during the read wins over its failure.
+            controller.error(
+              abortSignal?.aborted ? aborted() : fileError("read file", filePath, error)
+            );
           }
         },
         // Each read of the consumer checks the signal first, as LocalBaseRuntime's pull does
