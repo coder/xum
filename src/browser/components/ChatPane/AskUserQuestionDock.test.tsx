@@ -290,6 +290,19 @@ describe("AskUserQuestionDock", () => {
     expect(second.queryByText(REGION.question)).toBeNull();
   });
 
+  test("a call earlier in the transcript joins without moving the untouched form", () => {
+    const rowX = questionRow("row-x", "ask-x", [REGION]);
+    messages = [executing(rowX), ROW_A];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    expect(view.getByText(STORAGE.question)).toBeTruthy();
+
+    // ask-x returned after ask-a: its tabs go before the one the user is reading.
+    messages = [rowX, ROW_A];
+    view.rerender(dock(workspaceId));
+    expect(view.getByText(STORAGE.question)).toBeTruthy();
+    expect(view.queryByText(REGION.question)).toBeNull();
+  });
+
   test("a retry after a lost response resends only the sent question sets, with the same id", async () => {
     messages = [ROW_A, ROW_B];
     const view = render(dock(workspaceId), { wrapper: Wrapper });
