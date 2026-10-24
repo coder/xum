@@ -45,7 +45,12 @@ describe("workspaceRemoval", () => {
 
     expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId, host.files)).toBe(true);
     expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
-    await expect(host.files.promises.access(sessionDir)).rejects.toThrow();
+    expect(
+      await host.files.promises.access(sessionDir).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
     await fsPromises.access(sessionDir);
   });
 
