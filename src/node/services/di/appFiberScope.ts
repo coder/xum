@@ -11,7 +11,7 @@
  * later re-closes it idempotently as a backstop.
  *
  * This is the seam for I/O-suspended, long-lived work that shutdown must wait
- * for. Its occupants include the stream engine: `StreamManager.superviseEngine`
+ * for. Its occupants include the stream engine: `TurnRegistry.superviseEngine`
  * forks one supervisor fiber per stream into it, whose interruption cancels the
  * stream (`"system"` abort) and awaits the turn's settlement, so dispose()
  * commits the partial into chat.jsonl before the bridges stop. Each AgentSession also

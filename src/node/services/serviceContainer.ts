@@ -950,7 +950,7 @@ export class ServiceContainer {
       }
     });
     // Interrupt and await the runtime's supervised fibers — the stream engine's
-    // per-stream supervisors (StreamManager.superviseEngine): every in-flight
+    // per-stream supervisors (TurnRegistry.superviseEngine): every in-flight
     // stream is aborted as "system" and its partial committed to chat.jsonl —
     // while every dependency they touch during finalization is still alive.
     // Fixed here (before the explicit teardown) so clients still receive the
