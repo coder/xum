@@ -90,6 +90,7 @@ import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DesktopNotifications } from "@/node/services/desktopNotifications/desktopNotifications";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
@@ -151,6 +152,8 @@ export interface ToolConfiguration {
   runtime: Runtime;
   /** OS notifications for the notify tool. Absent: the Node layer (configs that tests build by hand). */
   desktopNotifications?: DesktopNotifications;
+  /** Session locks of the todo and review pane writes. Absent: the Node layer (configs that tests build by hand). */
+  sessionLocks?: SessionLocks;
   /** Project roots in this workspace (single- or multi-project context for tool descriptions) */
   projects?: ProjectRef[];
   /** Environment secrets to inject (optional) */
