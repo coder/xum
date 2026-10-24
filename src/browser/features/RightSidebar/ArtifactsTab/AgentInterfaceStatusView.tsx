@@ -101,7 +101,7 @@ export function AgentInterfaceStatusView(
 function useComposerFocusWhenHidden(
   hidden: boolean,
   composerApiRef: StatusViewProps["composerApiRef"]
-): React.RefObject<HTMLElement | null> {
+): React.RefObject<HTMLElement> {
   const sectionRef = useRef<HTMLElement>(null);
   useEffect(() => {
     const section = sectionRef.current;
