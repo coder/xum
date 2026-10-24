@@ -5,7 +5,8 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 /**
  * Durable terminal-failure artifacts for sub-agent tasks.
@@ -175,8 +176,12 @@ export async function upsertSubagentFailureArtifact(params: {
   workflowOwnedAncestorWorkspaceIds?: string[];
   model?: string;
   nowMs?: number;
+  /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
 }): Promise<void> {
-  await workspaceFileLocks.withLock(params.workspaceId, async () => {
+  // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
+  const fileLocks = (params.locks ?? nodeSessionLocks).workspaceFiles;
+  await fileLocks.withLock(params.workspaceId, async () => {
     const nowMs = params.nowMs ?? Date.now();
 
     const file = await readSubagentFailureArtifactsFile(params.workspaceSessionDir);

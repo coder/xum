@@ -6,7 +6,8 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
 
 import { log } from "@/node/services/log";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 export interface SubagentReportArtifactsFile {
   version: 1;
@@ -266,8 +267,12 @@ export async function updateSubagentReportArtifactsFile(params: {
   workspaceId: string;
   workspaceSessionDir: string;
   update: (file: SubagentReportArtifactsFile) => void;
+  /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
 }): Promise<SubagentReportArtifactsFile> {
-  return workspaceFileLocks.withLock(params.workspaceId, async () => {
+  // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
+  const fileLocks = (params.locks ?? nodeSessionLocks).workspaceFiles;
+  return fileLocks.withLock(params.workspaceId, async () => {
     const file = await readSubagentReportArtifactsFile(params.workspaceSessionDir);
     params.update(file);
 
@@ -302,10 +307,14 @@ export async function upsertSubagentReportArtifact(params: {
   nowMs?: number;
   /** The reporting attempt (see SubagentReportArtifactIndexEntry.taskAttemptId). */
   taskAttemptId?: string;
+  /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
 }): Promise<SubagentReportArtifactIndexEntry> {
   let updated: SubagentReportArtifactIndexEntry | null = null;
 
-  await workspaceFileLocks.withLock(params.workspaceId, async () => {
+  // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
+  const fileLocks = (params.locks ?? nodeSessionLocks).workspaceFiles;
+  await fileLocks.withLock(params.workspaceId, async () => {
     const nowMs = params.nowMs ?? Date.now();
 
     const model =
