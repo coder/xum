@@ -145,6 +145,9 @@ export function wrapWithForeignHolders(inner: SessionLocks, holders: ForeignHold
       }
       return await inner.acquireProcessFileLock(options);
     },
+    // A probe never reclaims: a dead holder's lock exists until an acquire meets it.
+    processFileLockExists: async (lockPath) =>
+      table.has(lockPath) || (await inner.processFileLockExists(lockPath)),
     acquireCrossProcessLock: async (options) => {
       // crossProcessLock.ts checks the signal before each attempt: abort wins over a holder.
       if (options.signal?.aborted) throw abortedAcquireError();

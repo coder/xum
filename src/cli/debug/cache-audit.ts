@@ -31,7 +31,7 @@ export async function cacheAuditCommand(
   session: ReturnType<typeof resolveReplaySessionDir> = resolveReplaySessionDir(workspaceId)
 ): Promise<void> {
   const { sessionDir, historyService } = session;
-  const journal = new DurableEventJournal(sessionDir, historyService.locks);
+  const journal = new DurableEventJournal(sessionDir, historyService.locks, historyService.files);
   const events = await journal.read();
   // Final envelope per sequence only: fallback turns emit a superseding row.
   const envelopes = collapseEnvelopesToFinalPerSequence(

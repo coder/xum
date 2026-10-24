@@ -4,7 +4,15 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import type { BlobRef } from "@/common/types/durableEvent";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { DurableEventJournal, sharedDurableEventJournal } from "./durableEventJournal";
+import { buildSessionFiles } from "@/node/services/sessionFiles/buildSessionFiles.testHarness";
+import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import {
+  BLOBS_DIR_NAME,
+  DURABLE_EVENTS_FILE_NAME,
+  DurableEventJournal,
+  sharedDurableEventJournal,
+} from "./durableEventJournal";
 
 describe("DurableEventJournal", () => {
   test("appends drafts for every schema kind and reads them back in order", async () => {
@@ -335,5 +343,36 @@ describe("DurableEventJournal", () => {
 
     const rows = await writerA.read();
     expect(rows.map((row) => row.seq)).toEqual([0, 1, 2]);
+  });
+});
+
+describe("DurableEventJournal session files", () => {
+  test("keeps the rows and the blobs in the SessionFiles it was given", async () => {
+    // The Node locks write their lock files in the temp dir. The rows and the blobs must go to the
+    // memory volume only.
+    using tmp = new DisposableTempDir("durable-journal-files");
+    const files = buildSessionFiles(SessionFilesMemory);
+    const journal = new DurableEventJournal(tmp.path, nodeSessionLocks, files);
+
+    const { ref, size } = await journal.blobs.put("payload");
+    await journal.append({
+      workspaceId: "ws-1",
+      kind: "result-handle",
+      data: { handle: "vars.payload", preview: "payload", blobHash: ref, size },
+    });
+
+    expect((await journal.read()).map((event) => event.kind)).toEqual(["result-handle"]);
+    expect(await journal.blobs.getText(ref)).toBe("payload");
+    // The mention index stats the journal file through the same SessionFiles.
+    const mentions = await journal.withBlobLock(() => journal.blobMentionIndex());
+    expect(mentions.get(ref)?.kinds).toEqual(new Set(["result-handle"]));
+    const memoryRows = await files.promises.readFile(
+      path.join(tmp.path, DURABLE_EVENTS_FILE_NAME),
+      "utf-8"
+    );
+    expect(memoryRows).toContain(ref);
+    const onDisk = await fs.readdir(tmp.path);
+    expect(onDisk).not.toContain(DURABLE_EVENTS_FILE_NAME);
+    expect(onDisk).not.toContain(BLOBS_DIR_NAME);
   });
 });
