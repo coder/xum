@@ -3,6 +3,7 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { ClutterScanner, getClutterWatchRoots } from "@/node/runtime/homeClutterWatch";
+import { makeTestEffectRunner } from "@/node/services/di/testEffectRunner";
 import { HomeClutterReminderSource } from "./HomeClutterReminderSource";
 
 interface PollResult {
@@ -123,6 +124,39 @@ describe("HomeClutterReminderSource (stalled or failing reads)", () => {
     fake.dirs.get(home)!.push("made-by-first-call");
     const next = await poll(turn);
     expect(next[0].content).toContain("~/made-by-first-call");
+  });
+
+  test("a poll on a stuck scan gives up when the session clock passes the timeout", async () => {
+    const clock = makeTestEffectRunner();
+    try {
+      const fake = fakeHome(home);
+      const scanner = new ClutterScanner(getClutterWatchRoots(home), fake.readDir);
+      fake.stall();
+      const turn = new HomeClutterReminderSource({
+        homeDir: home,
+        scanner,
+        clock: clock.hostClock,
+      });
+
+      let settled = false;
+      const result = poll(turn).then((notifications) => {
+        settled = true;
+        return notifications;
+      });
+      // A macrotask turn: a real setTimeout of 250 ms cannot fire here, so only the TestClock
+      // can end the wait.
+      const macrotask = () => new Promise((resolve) => setImmediate(resolve));
+      await clock.adjust("249 millis");
+      await macrotask();
+      expect(settled).toBe(false);
+      await clock.adjust("1 millis");
+      await macrotask();
+      expect(settled).toBe(true);
+      expect(await result).toEqual([]);
+      fake.unstall();
+    } finally {
+      await clock.dispose();
+    }
   });
 
   test("shares one stuck scan across turns instead of piling up reads", async () => {
