@@ -73,6 +73,7 @@ import type { ServerService } from "@/node/services/serverService";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
 import type { HostProcesses } from "@/node/services/hostProcesses/hostProcesses";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
@@ -115,6 +116,10 @@ export class HostPathsTag extends Context.Service<HostPathsTag, HostPaths>()("xu
 /** Host git spawns and network calls of loop code (hostProcesses/hostProcesses.ts). */
 export class HostProcessesTag extends Context.Service<HostProcessesTag, HostProcesses>()(
   "xum/HostProcesses"
+) {}
+/** Every runtime that loop code builds (runtimeFactory/runtimeFactoryService.ts). */
+export class RuntimeFactoryTag extends Context.Service<RuntimeFactoryTag, RuntimeFactory>()(
+  "xum/RuntimeFactory"
 ) {}
 /** Every lock that guards a session write (phase 4); StoresLive gives the Node layer. */
 export class SessionLocksTag extends Context.Service<SessionLocksTag, SessionLocks>()(
@@ -346,6 +351,7 @@ export type StoreTags =
   | HostFilesTag
   | HostPathsTag
   | HostProcessesTag
+  | RuntimeFactoryTag
   | SessionLocksTag
   | ProvidersConfigStoreTag
   | SecretsStoreTag

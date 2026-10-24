@@ -34,6 +34,7 @@ import {
   ConfigTag,
   ContextManagement,
   DesktopNotificationsTag,
+  RuntimeFactoryTag,
   Evaluation,
   ExtensionMetadata,
   FileLeaseManagerTag,
@@ -343,7 +344,10 @@ export const AILive = Layer.effect(
       yield* TurnRequestBuilderBindingsTag,
       yield* ProvidersConfigStoreTag,
       yield* SecretsStoreTag,
-      { desktopNotifications: yield* DesktopNotificationsTag }
+      {
+        desktopNotifications: yield* DesktopNotificationsTag,
+        runtimeFactory: yield* RuntimeFactoryTag,
+      }
     );
   })
 );
