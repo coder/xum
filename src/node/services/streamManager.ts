@@ -22,6 +22,7 @@ import {
   type LanguageModel,
   type Tool,
   type ToolSet,
+  type PrepareStepResult,
   LoadAPIKeyError,
   APICallError,
   RetryError,
@@ -70,6 +71,7 @@ import {
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import type {
+  ActiveTurnThinkingOverride,
   RebuildFirstStepForThinkingLevel,
   RebuildProviderOptionsForThinkingLevel,
 } from "@/node/services/thinkingOverride";
@@ -741,6 +743,329 @@ function isAnthropicMessagesModel(model: LanguageModel): boolean {
 function isBedrockClaudeModel(model: LanguageModel, metadataModel: string | undefined): boolean {
   if (typeof model === "string" || model.provider !== "amazon-bedrock") return false;
   return model.modelId.includes("anthropic") || metadataModel?.includes("claude-") === true;
+}
+
+/** One Auto thinking raise, as proposeAutoThinkingEscalation stages it. */
+type ProposedThinkingEscalation = NonNullable<ReturnType<typeof proposeAutoThinkingEscalation>>;
+
+/** Stage an Auto thinking raise as the pending override; returns the raise it staged. */
+export function stageAutoThinkingEscalation(
+  escalationState: AutoThinkingEscalationState | undefined,
+  overrideState: ActiveTurnThinkingOverride | undefined,
+  stepMessages: ModelMessage[]
+): ProposedThinkingEscalation | undefined {
+  const escalation =
+    escalationState && overrideState && !overrideState.manual && overrideState.pending == null
+      ? proposeAutoThinkingEscalation(escalationState, stepMessages)
+      : undefined;
+  if (escalation && overrideState) {
+    overrideState.pending = escalation.to;
+  }
+  return escalation;
+}
+
+/** True when a thinking change voids the staged prefix swap (see the prepareStep call). */
+export function thinkingChangeVoidsPrefixSwap(
+  overrideState: ActiveTurnThinkingOverride | undefined,
+  pendingSwap: ContinuousPrefixSwap | undefined
+): boolean {
+  const appliedThinking = overrideState?.applied;
+  return (
+    overrideState?.pending != null ||
+    (pendingSwap != null &&
+      appliedThinking != null &&
+      appliedThinking !== pendingSwap.journal.preparation.effectiveThinkingLevel)
+  );
+}
+
+/** A prefix swap that swapPrefix applied to a step's messages, before its journal commits. */
+interface StagedPrefixSwap {
+  swap: ContinuousPrefixSwap;
+  swapped: ModelMessage[];
+  stepNumber: number;
+}
+
+/** The tools a step advertises, and the forced first-step tools when they apply. */
+export function selectStepActiveTools(
+  request: Pick<StreamRequestConfig, "toolSearchState" | "forcedFirstStepToolNames">,
+  stepNumber: number,
+  agentToolsDisabled: boolean
+): { forceFirstStepTools: string[] | undefined; activeTools: string[] | undefined } {
+  // Tool search: scope the advertised tool list to core tools +
+  // activated deferred tools. Read per step so tools activated by
+  // tool_catalog_search.execute appear on the following step.
+  // undefined when the feature is inactive, keeping the return value
+  // byte-identical to the pre-feature behavior, and in native mode, which
+  // keeps the tools block stable (#5262).
+  const searchedActiveTools = agentToolsDisabled
+    ? undefined
+    : computeActiveToolNames(request.toolSearchState);
+  const forceFirstStepTools =
+    !agentToolsDisabled && stepNumber === 0 && request.forcedFirstStepToolNames?.length
+      ? request.forcedFirstStepToolNames
+      : undefined;
+  return { forceFirstStepTools, activeTools: forceFirstStepTools ?? searchedActiveTools };
+}
+
+/** Report a staged Auto thinking raise back to its escalation state once the step built options. */
+export function settleAutoThinkingEscalation(
+  escalation: ProposedThinkingEscalation | undefined,
+  escalationState: AutoThinkingEscalationState | undefined,
+  overrideState: ActiveTurnThinkingOverride | undefined,
+  thinkingOverride: Record<string, unknown> | undefined
+): void {
+  if (!escalation || !escalationState) return;
+  // The rebuild clamps to the model's ladder and reports a no-op as "not applicable";
+  // only a level that actually changed is provenance, at the level it changed to (a
+  // sparse ladder can land above the requested step). A slider write that raced the
+  // step's awaits is the user's level, not Auto's.
+  const applied = overrideState?.applied;
+  if (
+    thinkingOverride !== undefined &&
+    applied != null &&
+    applied !== escalation.from &&
+    !overrideState?.manual
+  ) {
+    const effective = applied === escalation.to ? escalation : { ...escalation, to: applied };
+    recordAutoThinkingEscalation(escalationState, effective);
+    log.info("Auto thinking escalated mid-turn", effective);
+  } else {
+    markAutoThinkingEscalationExhausted(escalationState);
+  }
+}
+
+/**
+ * Start the step-0 message rebuild for a thinking override this step applied (see the
+ * prepareStep call). Returns undefined when no rebuild applies, so the step awaits nothing extra.
+ */
+export function startFirstStepRebuild(
+  request: Pick<
+    StreamRequestConfig,
+    "thinkingOverrideState" | "rebuildFirstStepForThinkingLevel" | "onStepMessages"
+  >,
+  stepTracker: StepMessageTracker | undefined,
+  stepNumber: number,
+  thinkingOverride: Record<string, unknown> | undefined
+): Promise<ModelMessage[] | undefined> | undefined {
+  const appliedLevel = request.thinkingOverrideState?.applied;
+  const rebuild = request.rebuildFirstStepForThinkingLevel;
+  if (
+    thinkingOverride !== undefined &&
+    stepNumber === 0 &&
+    !stepTracker?.consumedPrefixSwap &&
+    rebuild != null &&
+    appliedLevel != null
+  ) {
+    return rebuildFirstStepMessages(request, stepTracker, stepNumber, () =>
+      rebuild(appliedLevel, thinkingOverride)
+    );
+  }
+  return undefined;
+}
+
+/** The step-0 rebuild itself; fails open to the options-only rebuild (undefined). */
+async function rebuildFirstStepMessages(
+  request: Pick<StreamRequestConfig, "onStepMessages">,
+  stepTracker: StepMessageTracker | undefined,
+  stepNumber: number,
+  rebuild: () => ReturnType<RebuildFirstStepForThinkingLevel>
+): Promise<ModelMessage[] | undefined> {
+  let rebuiltFirstStepMessages: ModelMessage[] | undefined;
+  try {
+    const { messages: rebuilt, ...rebuiltSystem } = await rebuild();
+    const receiptApplied = applyTurnReplayReceipt(stepTracker, rebuilt);
+    // A retry's step 0 can rebuild this row's earlier steps too: what it stripped
+    // is gone from here on, so the receipt's point moves to this step.
+    if (stepTracker && receiptApplied !== rebuilt) {
+      stepTracker.anthropicThinkingStripStep = stepNumber;
+    }
+    // Same per-step transforms the construction-time messages receive.
+    rebuiltFirstStepMessages = dedupeNativeToolReferences(
+      await transformStepMessages(receiptApplied)
+    );
+    if (stepTracker) {
+      stepTracker.latestMessages = rebuiltFirstStepMessages;
+      // The rebuilt request decides which volatile-tail rows the row recorded, and
+      // what its system content (tail rows included) costs.
+      stepTracker.recordSystemSections(rebuiltSystem);
+    }
+    // onStepMessages fired above with the pre-rebuild transcript;
+    // re-notify so consumers track the
+    // messages this step actually sends.
+    request.onStepMessages?.(rebuiltFirstStepMessages);
+  } catch (error) {
+    // Fail open to the options-only rebuild rather than killing the
+    // turn; the envelope then still matches the options change.
+    log.warn("First-step message rebuild for thinking override failed", {
+      error: getErrorMessage(error),
+    });
+  }
+  return rebuiltFirstStepMessages;
+}
+
+/** #5086: where in-turn thinking stops replaying. One per streamText call (see prepareStep). */
+interface ReasoningReplayBoundary {
+  previousToolSetKey?: string;
+  seenPrefixSwap?: ContinuousPrefixSwap;
+  /** Outgoing rows before this index predate the latest in-turn prefix change. */
+  index: number;
+  /** The SDK step whose request first sent that boundary (stepTracker.anthropicThinkingStripStep). */
+  step: number;
+}
+
+/** Move the boundary to this step's outgoing length when its prefix changed. */
+export function advanceReasoningReplayBoundary(
+  boundary: ReasoningReplayBoundary,
+  activeTools: string[] | undefined,
+  consumedSwap: ContinuousPrefixSwap | undefined,
+  outgoingLength: number,
+  stepNumber: number
+): void {
+  const toolSetKey = activeTools === undefined ? "" : [...activeTools].sort().join("\n");
+  if (
+    (consumedSwap != null && consumedSwap !== boundary.seenPrefixSwap) ||
+    (boundary.previousToolSetKey !== undefined && toolSetKey !== boundary.previousToolSetKey)
+  ) {
+    // Kept at the unstripped length: if stripping drops reasoning-only rows, the
+    // boundary covers a few later rows too, which only strips more (fail safe).
+    boundary.index = outgoingLength;
+    boundary.step = stepNumber;
+  }
+  boundary.seenPrefixSwap = consumedSwap;
+  boundary.previousToolSetKey = toolSetKey;
+}
+
+/**
+ * Strip thinking from the rows before the boundary on routes that replay it (see the
+ * prepareStep call). Returns the stripped messages, or undefined when there is nothing to strip.
+ */
+export function stripReasoningBeforeReplayBoundary(
+  request: Pick<StreamRequestConfig, "providerOptions" | "model" | "budgetMetadataModel">,
+  stepTracker: StepMessageTracker | undefined,
+  boundary: ReasoningReplayBoundary,
+  outgoing: ModelMessage[]
+): ModelMessage[] | undefined {
+  if (
+    !(
+      (sendsBetweenToolsThinking(request.providerOptions) ||
+        isAnthropicMessagesModel(request.model) ||
+        isBedrockClaudeModel(request.model, request.budgetMetadataModel)) &&
+      outgoing.some(
+        (message, index) =>
+          index < boundary.index &&
+          message.role === "assistant" &&
+          typeof message.content !== "string" &&
+          message.content.some((part) => part.type === "reasoning")
+      )
+    )
+  ) {
+    return undefined;
+  }
+  // No receipt for Bedrock: Xum never replays Bedrock thinking across turns
+  // (sanitizeReasoningReplayMetadata keeps no `bedrock` namespace), so the
+  // stripped blocks cannot come back, and a receipt would strip later
+  // Anthropic-route thinking in the same segment for nothing.
+  // The point is the step that first sent this boundary: its own thinking and later
+  // keep replaying. Steps after it re-strip the same rows and repeat the same value.
+  if (stepTracker && isAnthropicMessagesModel(request.model)) {
+    stepTracker.anthropicThinkingStripStep = boundary.step;
+  }
+  return [
+    ...stripAnthropicReasoning(outgoing.slice(0, boundary.index)),
+    ...outgoing.slice(boundary.index),
+  ];
+}
+
+/** The request this step sends, as the context budget measures and anchors it. */
+export function buildContextBudgetRequest(
+  request: Pick<
+    StreamRequestConfig,
+    "modelString" | "budgetMetadataModel" | "system" | "tools" | "toolSearchState"
+  >,
+  agentToolsDisabled: boolean,
+  forceFirstStepTools: string[] | undefined,
+  messages: ModelMessage[]
+): ContextBudgetAnchorRequest {
+  return {
+    model: request.modelString,
+    metadataModel: request.budgetMetadataModel,
+    system: request.system,
+    tools: agentToolsDisabled ? undefined : request.tools,
+    // Native tool search sends deferred tools without loading them into context.
+    activeTools:
+      forceFirstStepTools ?? computeContextLoadedToolNames(request.toolSearchState, messages),
+    messages,
+  };
+}
+
+/** Hard-stop the step when its assembled request exceeds the safe context budget. */
+async function enforceContextBudgetPreflight(
+  request: Pick<StreamRequestConfig, "onStepSettled">,
+  modelContextLimit: number,
+  budgetRequest: ContextBudgetAnchorRequest,
+  previousRequest: ContextBudgetAnchorRequest | undefined,
+  lastStep: Parameters<typeof createContextBudgetAnchor>[1],
+  stepNumber: number
+): Promise<void> {
+  const budgetOptions = { ...budgetRequest, modelContextLimit };
+  const anchor = createContextBudgetAnchor(previousRequest, lastStep);
+  const exceeded = await checkAssembledRequestBudgetForModel(budgetRequest, budgetOptions, anchor);
+  // Step zero can follow executed tools on a fallback. This late hard stop
+  // preserves settled results; it must not reset/replay the activated catalog.
+  if (exceeded) {
+    // The settled-step callback measured this same request and should have rolled
+    // over first; reaching here after a settled step means the two measures diverged.
+    if (stepNumber > 0 && request.onStepSettled != null)
+      log.warn("Context budget preflight blocked after a settled step", {
+        model: exceeded.model,
+        estimate: exceeded.estimate,
+        hardCeiling: exceeded.hardCeiling,
+      });
+    throw new ContextBudgetBlockedError(
+      `The estimated next request exceeds the safe context budget for ${exceeded.model} (${exceeded.hardCeiling} tokens). Use /compact or reduce the active tool/context payload.`
+    );
+  }
+}
+
+/** prepareStep's return: undefined when the step sends what the SDK assembled. */
+export function buildPrepareStepResult(step: {
+  stepMessages: ModelMessage[];
+  effectiveMessages: ModelMessage[];
+  rebuiltFirstStepMessages: ModelMessage[] | undefined;
+  forceFirstStepTools: string[] | undefined;
+  activeTools: string[] | undefined;
+  thinkingOverride: Record<string, unknown> | undefined;
+}): PrepareStepResult<ToolSet> {
+  const {
+    stepMessages,
+    effectiveMessages,
+    rebuiltFirstStepMessages,
+    forceFirstStepTools,
+    activeTools,
+    thinkingOverride,
+  } = step;
+  if (
+    effectiveMessages === stepMessages &&
+    activeTools === undefined &&
+    thinkingOverride === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    ...(rebuiltFirstStepMessages != null
+      ? { messages: rebuiltFirstStepMessages }
+      : effectiveMessages === stepMessages
+        ? {}
+        : { messages: effectiveMessages }),
+    ...(forceFirstStepTools !== undefined ? { toolChoice: "required" as const } : {}),
+    ...(activeTools !== undefined ? { activeTools } : {}),
+    // Defense in depth: the in-place request mutation is authoritative
+    // (per-step deep-merge cannot delete keys); returning the rebuilt
+    // options also covers any future SDK options snapshotting.
+    ...(thinkingOverride !== undefined
+      ? { providerOptions: thinkingOverride as ProviderOptions }
+      : {}),
+  };
 }
 
 // Stream state enum for exhaustive checking
@@ -3182,6 +3507,47 @@ export class StreamManager {
     );
   }
 
+  /**
+   * Write a swapped prefix's journal entry, then send the swapped messages only if the swap
+   * is still current: same thinking level, not aborted, still the staged swap. Returns the
+   * messages the step sends.
+   */
+  private async commitPrefixSwap(
+    request: StreamRequestConfig,
+    abortController: AbortController,
+    stepTracker: StepMessageTracker,
+    workspaceId: string,
+    { swap, swapped, stepNumber }: StagedPrefixSwap,
+    effectiveMessages: ModelMessage[]
+  ): Promise<ModelMessage[]> {
+    const store = this.historyService.getContinuousCompactionJournal(workspaceId);
+    const thinkingLevel = request.thinkingOverrideState?.applied;
+    const isCurrent = () =>
+      stepTracker.pendingPrefixSwap === swap &&
+      !abortController.signal.aborted &&
+      request.thinkingOverrideState?.pending == null &&
+      request.thinkingOverrideState?.applied === thinkingLevel;
+    const journal = await store.write(
+      { ...swap.journal, stepNumber },
+      swap.prefix,
+      isCurrent,
+      (committed) => {
+        swap.journal = committed;
+      }
+    );
+    if (journal && isCurrent()) {
+      swap.journal = journal;
+      swap.consumed = true;
+      stepTracker.consumedPrefixSwap = swap;
+      return swapped;
+    }
+    if (journal && stepTracker.pendingPrefixSwap === swap) {
+      // A thinking change can also arrive after write()'s last fence.
+      await store.clear(journal);
+    }
+    return effectiveMessages;
+  }
+
   private createStreamResult(
     request: StreamRequestConfig,
     abortController: AbortController,
@@ -3193,13 +3559,7 @@ export class StreamManager {
     // Tool's `any` context, which would otherwise infect the inferred result
     // type (no-unsafe-return).
     // #5086: see the `between_tools` replay guard in prepareStep.
-    let previousToolSetKey: string | undefined;
-    let seenPrefixSwap: ContinuousPrefixSwap | undefined;
-
-    // Outgoing rows before this index predate the latest in-turn prefix change.
-    let reasoningReplayBoundary = 0;
-    // The SDK step whose request first sent that boundary (stepTracker.anthropicThinkingStripStep).
-    let reasoningReplayBoundaryStep = 0;
+    const replayBoundary: ReasoningReplayBoundary = { index: 0, step: 0 };
     // XUM_DISABLE_AGENT_TOOLS=1 sends no tools at all (see isAgentToolsDisabled). Every chat
     // turn, sub-agent and workflow agent streams through here.
     const agentToolsDisabled = isAgentToolsDisabled();
@@ -3231,23 +3591,19 @@ export class StreamManager {
         // this turn hands the level to the user.
         const escalationState = stepTracker?.autoThinkingEscalation;
         const overrideState = request.thinkingOverrideState;
-        const escalation =
-          escalationState && overrideState && !overrideState.manual && overrideState.pending == null
-            ? proposeAutoThinkingEscalation(escalationState, stepMessages)
-            : undefined;
-        if (escalation && overrideState) {
-          overrideState.pending = escalation.to;
-        }
+        const escalation = stageAutoThinkingEscalation(
+          escalationState,
+          overrideState,
+          stepMessages
+        );
         // The staged prefix was prepared under the previous thinking options.
         // Keep full context if those options change before the swap is consumed.
-        const pendingSwap = stepTracker?.pendingPrefixSwap;
-        const appliedThinking = request.thinkingOverrideState?.applied;
         if (
           stepTracker &&
-          (request.thinkingOverrideState?.pending != null ||
-            (pendingSwap &&
-              appliedThinking != null &&
-              appliedThinking !== pendingSwap.journal.preparation.effectiveThinkingLevel))
+          thinkingChangeVoidsPrefixSwap(
+            request.thinkingOverrideState,
+            stepTracker.pendingPrefixSwap
+          )
         ) {
           stepTracker.pendingPrefixSwap = undefined;
         }
@@ -3255,32 +3611,14 @@ export class StreamManager {
         if (swap && stepTracker?.workspaceId) {
           const swapped = this.providerRequest.swapPrefix(effectiveMessages, swap);
           if (swapped) {
-            const store = this.historyService.getContinuousCompactionJournal(
-              stepTracker.workspaceId
+            effectiveMessages = await this.commitPrefixSwap(
+              request,
+              abortController,
+              stepTracker,
+              stepTracker.workspaceId,
+              { swap, swapped, stepNumber },
+              effectiveMessages
             );
-            const thinkingLevel = request.thinkingOverrideState?.applied;
-            const isCurrent = () =>
-              stepTracker.pendingPrefixSwap === swap &&
-              !abortController.signal.aborted &&
-              request.thinkingOverrideState?.pending == null &&
-              request.thinkingOverrideState?.applied === thinkingLevel;
-            const journal = await store.write(
-              { ...swap.journal, stepNumber },
-              swap.prefix,
-              isCurrent,
-              (committed) => {
-                swap.journal = committed;
-              }
-            );
-            if (journal && isCurrent()) {
-              swap.journal = journal;
-              swap.consumed = true;
-              stepTracker.consumedPrefixSwap = swap;
-              effectiveMessages = swapped;
-            } else if (journal && stepTracker.pendingPrefixSwap === swap) {
-              // A thinking change can also arrive after write()'s last fence.
-              await store.clear(journal);
-            }
           }
           if (stepTracker.pendingPrefixSwap === swap) stepTracker.pendingPrefixSwap = undefined;
         }
@@ -3293,20 +3631,11 @@ export class StreamManager {
           stepTracker.latestMessages = effectiveMessages;
         }
         request.onStepMessages?.(effectiveMessages);
-        // Tool search: scope the advertised tool list to core tools +
-        // activated deferred tools. Read per step so tools activated by
-        // tool_catalog_search.execute appear on the following step.
-        // undefined when the feature is inactive, keeping the return value
-        // byte-identical to the pre-feature behavior, and in native mode, which
-        // keeps the tools block stable (#5262).
-        const searchedActiveTools = agentToolsDisabled
-          ? undefined
-          : computeActiveToolNames(request.toolSearchState);
-        const forceFirstStepTools =
-          !agentToolsDisabled && stepNumber === 0 && request.forcedFirstStepToolNames?.length
-            ? request.forcedFirstStepToolNames
-            : undefined;
-        const activeTools = forceFirstStepTools ?? searchedActiveTools;
+        const { forceFirstStepTools, activeTools } = selectStepActiveTools(
+          request,
+          stepNumber,
+          agentToolsDisabled
+        );
         // Mid-turn thinking-level change: consume a pending override before
         // this step's provider request is built. Before the turn's first request it
         // resolves as at turn start (#5279); without a tracker, assume a step ran.
@@ -3317,72 +3646,20 @@ export class StreamManager {
           firstTurnRequest
         );
         if (stepTracker) stepTracker.providerRequestPrepared = true;
-        if (escalation && escalationState) {
-          // The rebuild clamps to the model's ladder and reports a no-op as "not applicable";
-          // only a level that actually changed is provenance, at the level it changed to (a
-          // sparse ladder can land above the requested step). A slider write that raced the
-          // step's awaits is the user's level, not Auto's.
-          const applied = overrideState?.applied;
-          if (
-            thinkingOverride !== undefined &&
-            applied != null &&
-            applied !== escalation.from &&
-            !overrideState?.manual
-          ) {
-            const effective =
-              applied === escalation.to ? escalation : { ...escalation, to: applied };
-            recordAutoThinkingEscalation(escalationState, effective);
-            log.info("Auto thinking escalated mid-turn", effective);
-          } else {
-            markAutoThinkingEscalationExhausted(escalationState);
-          }
-        }
+        settleAutoThinkingEscalation(escalation, escalationState, overrideState, thinkingOverride);
         // Step 0: an override consumed here raced stream setup (written during
         // startStream's awaits, after TurnRequestBuilder's pre-construction quiescence
         // fold). Message preparation is thinking-level-dependent (Anthropic
         // signed-reasoning transforms), so rebuild the first-step messages
         // under the applied level too; the closure also emits a superseding
         // turn envelope so wire, envelope, and replay agree.
-        let rebuiltFirstStepMessages: ModelMessage[] | undefined;
-        const appliedLevel = request.thinkingOverrideState?.applied;
-        if (
-          thinkingOverride !== undefined &&
-          stepNumber === 0 &&
-          !stepTracker?.consumedPrefixSwap &&
-          request.rebuildFirstStepForThinkingLevel != null &&
-          appliedLevel != null
-        ) {
-          try {
-            const { messages: rebuilt, ...rebuiltSystem } =
-              await request.rebuildFirstStepForThinkingLevel(appliedLevel, thinkingOverride);
-            const receiptApplied = applyTurnReplayReceipt(stepTracker, rebuilt);
-            // A retry's step 0 can rebuild this row's earlier steps too: what it stripped
-            // is gone from here on, so the receipt's point moves to this step.
-            if (stepTracker && receiptApplied !== rebuilt) {
-              stepTracker.anthropicThinkingStripStep = stepNumber;
-            }
-            // Same per-step transforms the construction-time messages receive.
-            rebuiltFirstStepMessages = dedupeNativeToolReferences(
-              await transformStepMessages(receiptApplied)
-            );
-            if (stepTracker) {
-              stepTracker.latestMessages = rebuiltFirstStepMessages;
-              // The rebuilt request decides which volatile-tail rows the row recorded, and
-              // what its system content (tail rows included) costs.
-              stepTracker.recordSystemSections(rebuiltSystem);
-            }
-            // onStepMessages fired above with the pre-rebuild transcript;
-            // re-notify so consumers track the
-            // messages this step actually sends.
-            request.onStepMessages?.(rebuiltFirstStepMessages);
-          } catch (error) {
-            // Fail open to the options-only rebuild rather than killing the
-            // turn; the envelope then still matches the options change.
-            log.warn("First-step message rebuild for thinking override failed", {
-              error: getErrorMessage(error),
-            });
-          }
-        }
+        const pendingRebuild = startFirstStepRebuild(
+          request,
+          stepTracker,
+          stepNumber,
+          thinkingOverride
+        );
+        let rebuiltFirstStepMessages = pendingRebuild == null ? undefined : await pendingRebuild;
         // #5086, preserved thinking: a replayed in-turn thinking block stays valid only
         // while everything before it is unchanged. A consumed prefix swap or a change to
         // the advertised tool set edits that prefix, so rows sent up to that step never
@@ -3392,114 +3669,54 @@ export class StreamManager {
         // route and anthropic-typed Coder AI Gateway instances send `drop_block`, so
         // adaptive/enabled thinking on other routes would 400.
         // Claude on Bedrock gets the same strip (#5841): Bedrock cannot take drop_block.
-        const toolSetKey = activeTools === undefined ? "" : [...activeTools].sort().join("\n");
-        const consumedSwap = stepTracker?.consumedPrefixSwap;
         const outgoing = rebuiltFirstStepMessages ?? effectiveMessages;
-        if (
-          (consumedSwap != null && consumedSwap !== seenPrefixSwap) ||
-          (previousToolSetKey !== undefined && toolSetKey !== previousToolSetKey)
-        ) {
-          // Kept at the unstripped length: if stripping drops reasoning-only rows, the
-          // boundary covers a few later rows too, which only strips more (fail safe).
-          reasoningReplayBoundary = outgoing.length;
-          reasoningReplayBoundaryStep = stepNumber;
-        }
-        seenPrefixSwap = consumedSwap;
-        previousToolSetKey = toolSetKey;
-        if (
-          (sendsBetweenToolsThinking(request.providerOptions) ||
-            isAnthropicMessagesModel(request.model) ||
-            isBedrockClaudeModel(request.model, request.budgetMetadataModel)) &&
-          outgoing.some(
-            (message, index) =>
-              index < reasoningReplayBoundary &&
-              message.role === "assistant" &&
-              typeof message.content !== "string" &&
-              message.content.some((part) => part.type === "reasoning")
-          )
-        ) {
-          const stripped = [
-            ...stripAnthropicReasoning(outgoing.slice(0, reasoningReplayBoundary)),
-            ...outgoing.slice(reasoningReplayBoundary),
-          ];
+        advanceReasoningReplayBoundary(
+          replayBoundary,
+          activeTools,
+          stepTracker?.consumedPrefixSwap,
+          outgoing.length,
+          stepNumber
+        );
+        const stripped = stripReasoningBeforeReplayBoundary(
+          request,
+          stepTracker,
+          replayBoundary,
+          outgoing
+        );
+        if (stripped != null) {
           if (rebuiltFirstStepMessages != null) {
             rebuiltFirstStepMessages = stripped;
           } else {
             effectiveMessages = stripped;
           }
-          // No receipt for Bedrock: Xum never replays Bedrock thinking across turns
-          // (sanitizeReasoningReplayMetadata keeps no `bedrock` namespace), so the
-          // stripped blocks cannot come back, and a receipt would strip later
-          // Anthropic-route thinking in the same segment for nothing.
-          // The point is the step that first sent this boundary: its own thinking and later
-          // keep replaying. Steps after it re-strip the same rows and repeat the same value.
-          if (stepTracker && isAnthropicMessagesModel(request.model)) {
-            stepTracker.anthropicThinkingStripStep = reasoningReplayBoundaryStep;
-          }
         }
         // Taken before this step records its own request; step zero has no settled step.
         const previousRequest = stepNumber > 0 ? stepTracker?.contextBudgetRequest : undefined;
-        const budgetRequest: ContextBudgetAnchorRequest = {
-          model: request.modelString,
-          metadataModel: request.budgetMetadataModel,
-          system: request.system,
-          tools: agentToolsDisabled ? undefined : request.tools,
-          // Native tool search sends deferred tools without loading them into context.
-          activeTools:
-            forceFirstStepTools ??
-            computeContextLoadedToolNames(
-              request.toolSearchState,
-              rebuiltFirstStepMessages ?? effectiveMessages
-            ),
-          messages: rebuiltFirstStepMessages ?? effectiveMessages,
-        };
+        const budgetRequest = buildContextBudgetRequest(
+          request,
+          agentToolsDisabled,
+          forceFirstStepTools,
+          rebuiltFirstStepMessages ?? effectiveMessages
+        );
         if (stepTracker) stepTracker.contextBudgetRequest = budgetRequest;
         if (request.contextBudgetLimit != null) {
-          const budgetOptions = { ...budgetRequest, modelContextLimit: request.contextBudgetLimit };
-          const anchor = createContextBudgetAnchor(previousRequest, steps.at(-1));
-          const exceeded = await checkAssembledRequestBudgetForModel(
+          await enforceContextBudgetPreflight(
+            request,
+            request.contextBudgetLimit,
             budgetRequest,
-            budgetOptions,
-            anchor
+            previousRequest,
+            steps.at(-1),
+            stepNumber
           );
-          // Step zero can follow executed tools on a fallback. This late hard stop
-          // preserves settled results; it must not reset/replay the activated catalog.
-          if (exceeded) {
-            // The settled-step callback measured this same request and should have rolled
-            // over first; reaching here after a settled step means the two measures diverged.
-            if (stepNumber > 0 && request.onStepSettled != null)
-              log.warn("Context budget preflight blocked after a settled step", {
-                model: exceeded.model,
-                estimate: exceeded.estimate,
-                hardCeiling: exceeded.hardCeiling,
-              });
-            throw new ContextBudgetBlockedError(
-              `The estimated next request exceeds the safe context budget for ${exceeded.model} (${exceeded.hardCeiling} tokens). Use /compact or reduce the active tool/context payload.`
-            );
-          }
         }
-        if (
-          effectiveMessages === stepMessages &&
-          activeTools === undefined &&
-          thinkingOverride === undefined
-        ) {
-          return undefined;
-        }
-        return {
-          ...(rebuiltFirstStepMessages != null
-            ? { messages: rebuiltFirstStepMessages }
-            : effectiveMessages === stepMessages
-              ? {}
-              : { messages: effectiveMessages }),
-          ...(forceFirstStepTools !== undefined ? { toolChoice: "required" as const } : {}),
-          ...(activeTools !== undefined ? { activeTools } : {}),
-          // Defense in depth: the in-place request mutation is authoritative
-          // (per-step deep-merge cannot delete keys); returning the rebuilt
-          // options also covers any future SDK options snapshotting.
-          ...(thinkingOverride !== undefined
-            ? { providerOptions: thinkingOverride as ProviderOptions }
-            : {}),
-        };
+        return buildPrepareStepResult({
+          stepMessages,
+          effectiveMessages,
+          rebuiltFirstStepMessages,
+          forceFirstStepTools,
+          activeTools,
+          thinkingOverride,
+        });
       },
       onChunk: request.onChunk,
       tools: agentToolsDisabled ? undefined : request.tools,
