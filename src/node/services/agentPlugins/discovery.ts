@@ -614,10 +614,14 @@ type ManifestCandidate =
   | { status: "invalid"; message: string }
   | { status: "ok"; raw: unknown };
 
-/** Read one manifest location with the shared containment and size caps. */
+/**
+ * Read one manifest location with the shared containment and size caps. `shown`: the path that
+ * error messages name (shownManifestPath), default `relative`.
+ */
 async function readManifestCandidate(
   rootReal: string,
-  relative: string
+  relative: string,
+  shown = relative
 ): Promise<ManifestCandidate> {
   let manifestReal: string;
   try {
@@ -632,8 +636,8 @@ async function readManifestCandidate(
       status: "invalid",
       message:
         error instanceof PluginGitPathError
-          ? `${relative} resolves into the plugin's .git directory`
-          : `${relative} resolves outside the plugin root: ${getErrorMessage(error)}`,
+          ? `${shown} resolves into the plugin's .git directory`
+          : `${shown} resolves outside the plugin root: ${getErrorMessage(error)}`,
     };
   }
   const stat = await pluginFs()
@@ -644,7 +648,7 @@ async function readManifestCandidate(
   if (stat.size > MAX_PLUGIN_MANIFEST_BYTES) {
     return {
       status: "invalid",
-      message: `${relative} is too large (${stat.size} bytes; max ${MAX_PLUGIN_MANIFEST_BYTES})`,
+      message: `${shown} is too large (${stat.size} bytes; max ${MAX_PLUGIN_MANIFEST_BYTES})`,
     };
   }
   try {
@@ -655,11 +659,11 @@ async function readManifestCandidate(
       filePath: manifestReal,
       pluginRoot: rootReal,
       maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
-      label: relative,
+      label: shown,
     });
     return { status: "ok", raw: JSON.parse(content) };
   } catch (error) {
-    return { status: "invalid", message: `Failed to read ${relative}: ${getErrorMessage(error)}` };
+    return { status: "invalid", message: `Failed to read ${shown}: ${getErrorMessage(error)}` };
   }
 }
 
@@ -1138,7 +1142,9 @@ export async function isSchemaLessRootManifest(rootReal: string): Promise<boolea
  * when no other manifest exists. The fallback gets the narrower Codex or Claude component set.
  */
 async function selectManifest(
-  rootReal: string
+  rootReal: string,
+  /** See discoverAgentPluginAt: read errors name the file from here, like validation errors. */
+  shownRoot: string | undefined
 ): Promise<{ relative: string; raw: unknown } | { relative: string; error: string } | null> {
   let schemaLessRoot: { relative: string; raw: unknown } | null = null;
   for (const relative of [
@@ -1146,7 +1152,11 @@ async function selectManifest(
     CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
     CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
   ]) {
-    const read = await readManifestCandidate(rootReal, relative);
+    const read = await readManifestCandidate(
+      rootReal,
+      relative,
+      shownManifestPath(shownRoot, relative)
+    );
     if (read.status === "missing") continue;
     if (read.status === "invalid") return { relative, error: read.message };
     if (relative === PLUGIN_MANIFEST_RELATIVE_PATH && isSchemaLessManifest(read.raw)) {
@@ -1188,7 +1198,7 @@ async function discoverPluginAt(args: {
     return null;
   }
 
-  const selected = await selectManifest(rootReal);
+  const selected = await selectManifest(rootReal, args.shownRoot);
   if (selected === null) {
     // No manifest → not a plugin (silent skip, e.g. Codex marketplace.json entries).
     return null;

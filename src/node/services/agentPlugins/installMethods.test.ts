@@ -207,15 +207,30 @@ describe("detectInstallMethods", () => {
     expect((await detectInstallMethods(withSchema)).methods).toEqual([{ kind: "agent-plugin" }]);
   });
 
-  test("a root plugin.json that is a symlink or not JSON stays the own manifest", async () => {
+  test("a root plugin.json is read the way discovery reads it", async () => {
     using tmp = new DisposableTempDir("install-methods");
+    // A symlink inside the tree to a schema-less file: discovery follows it and loads the Claude
+    // manifest, so the method is claude-plugin (Codex review, #7422).
     const linked = path.join(tmp.path, "linked");
     await writeTree(linked, [], {
       "other.json": JSON.stringify({ name: "ponytail" }),
       ".claude-plugin/plugin.json": JSON.stringify({ name: "ponytail" }),
     });
     await fs.symlink(path.join(linked, "other.json"), path.join(linked, "plugin.json"));
-    expect((await detectInstallMethods(linked)).methods).toEqual([{ kind: "agent-plugin" }]);
+    expect((await detectInstallMethods(linked)).methods).toEqual([{ kind: "claude-plugin" }]);
+    const { plugin } = await discoverAgentPluginAt({ pluginDir: linked, scope: "global" });
+    expect(plugin?.claudeFallback).toBe(true);
+
+    // A symlink that leaves the tree: discovery refuses it, so it stays the own manifest.
+    const escaping = path.join(tmp.path, "escaping");
+    await writeTree(escaping, [], {
+      ".claude-plugin/plugin.json": JSON.stringify({ name: "ponytail" }),
+    });
+    await fs.writeFile(path.join(tmp.path, "outside.json"), JSON.stringify({ name: "ponytail" }));
+    await fs.symlink(path.join(tmp.path, "outside.json"), path.join(escaping, "plugin.json"));
+    expect((await detectInstallMethods(escaping)).methods).toEqual([{ kind: "agent-plugin" }]);
+    const refused = await discoverAgentPluginAt({ pluginDir: escaping, scope: "global" });
+    expect(refused.plugin).toBeNull();
 
     const invalid = path.join(tmp.path, "invalid");
     await writeTree(invalid, [], {

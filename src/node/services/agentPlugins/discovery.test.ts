@@ -2189,6 +2189,24 @@ describe("Claude Code plugin discovery", () => {
     ]);
   });
 
+  test("a manifest read error names the file from the repository root too", async () => {
+    // Read, size and containment errors come before validation (Codex review, #7422).
+    using tmp = new DisposableTempDir("agent-plugins");
+    const pluginDir = path.join(tmp.path, "staged");
+    await writeTree(pluginDir, { "plugin.json": "{ not json" });
+
+    const result = await discoverAgentPluginAt({
+      pluginDir,
+      scope: "global",
+      shownRoot: ".codex-plugin",
+    });
+
+    expect(result.plugin).toBeNull();
+    const messages = result.diagnostics.map((d) => d.message);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatch(/^Failed to read \.codex-plugin\/plugin\.json: /);
+  });
+
   test("an invalid Codex manifest error names .codex-plugin/plugin.json", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");

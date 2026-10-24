@@ -286,15 +286,12 @@ export interface DetectedInstallMethods {
 }
 
 /**
- * True when the root plugin.json is a regular file that discovery reads as schema-less, so it
- * yields to a Claude manifest. A symlink or an unreadable file stays the own manifest: the
- * method then names the file discovery validates and reports.
+ * True when discovery reads the root plugin.json as schema-less, so it yields to a Claude
+ * manifest. It uses discovery's own reader, which follows a symlink inside the tree and refuses
+ * one that leaves it, so the method always names the manifest discovery loads. A refused or
+ * unreadable file stays the own manifest: discovery then reports its error.
  */
 async function rootManifestIsSchemaLess(stagedDir: string): Promise<boolean> {
-  const stat = await fsPromises
-    .lstat(path.join(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH))
-    .catch(() => null);
-  if (!stat?.isFile()) return false;
   return isSchemaLessRootManifest(await fsPromises.realpath(stagedDir));
 }
 
