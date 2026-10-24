@@ -10,8 +10,8 @@ interface RuntimeUnderTest extends Disposable {
   runtime: Runtime;
   /** An existing, empty folder. */
   root: string;
-  /** The path API the runtime resolves with: the platform's for LocalRuntime, POSIX for the fake. */
-  resolve: (...segments: string[]) => string;
+  /** The path rules of the runtime: the platform's for LocalRuntime, POSIX for the fake. */
+  path: path.PlatformPath;
 }
 
 // The file members that loop tools use must behave alike on LocalRuntime and on FakeRuntime, so a
@@ -24,7 +24,7 @@ describe.each<[string, () => RuntimeUnderTest]>([
       return {
         runtime: new LocalRuntime(dir.path),
         root: dir.path,
-        resolve: (...segments) => path.resolve(...segments),
+        path,
         [Symbol.dispose]: () => dir[Symbol.dispose](),
       };
     },
@@ -36,7 +36,7 @@ describe.each<[string, () => RuntimeUnderTest]>([
       return {
         runtime: host.runtime,
         root: host.paths.tmpDir(),
-        resolve: (...segments) => path.posix.resolve(...segments),
+        path: path.posix,
         [Symbol.dispose]: () => undefined,
       };
     },
@@ -44,14 +44,14 @@ describe.each<[string, () => RuntimeUnderTest]>([
 ])("the file contract on %s", (_name, create) => {
   test("a written file reads back, and the write creates its parent folders", async () => {
     using under = create();
-    const file = path.join(under.root, "a", "b", "note.txt");
+    const file = under.path.join(under.root, "a", "b", "note.txt");
     await writeFileString(under.runtime, file, "hello\n");
     expect(await readFileString(under.runtime, file)).toBe("hello\n");
   });
 
   test("stat gives the size of a file and marks a folder", async () => {
     using under = create();
-    const file = path.join(under.root, "note.txt");
+    const file = under.path.join(under.root, "note.txt");
     await writeFileString(under.runtime, file, "four");
     expect(await under.runtime.stat(file)).toMatchObject({ size: 4, isDirectory: false });
     expect(await under.runtime.stat(under.root)).toMatchObject({ isDirectory: true });
@@ -59,7 +59,7 @@ describe.each<[string, () => RuntimeUnderTest]>([
 
   test("stat and readFile of a missing path fail as an absent path", async () => {
     using under = create();
-    const missing = path.join(under.root, "missing.txt");
+    const missing = under.path.join(under.root, "missing.txt");
     for (const attempt of [
       () => under.runtime.stat(missing),
       () => readFileString(under.runtime, missing),
@@ -76,7 +76,7 @@ describe.each<[string, () => RuntimeUnderTest]>([
 
   test("ensureDir creates nested folders and accepts an existing one", async () => {
     using under = create();
-    const dir = path.join(under.root, "x", "y");
+    const dir = under.path.join(under.root, "x", "y");
     await under.runtime.ensureDir(dir);
     await under.runtime.ensureDir(dir);
     expect(await under.runtime.stat(dir)).toMatchObject({ isDirectory: true });
@@ -84,8 +84,8 @@ describe.each<[string, () => RuntimeUnderTest]>([
 
   test("normalizePath resolves a relative path and '.' against the base", () => {
     using under = create();
-    expect(under.runtime.normalizePath("c/d", "/a/b")).toBe(under.resolve("/a/b", "c/d"));
-    expect(under.runtime.normalizePath(".", "/a/b")).toBe(under.resolve("/a/b"));
+    expect(under.runtime.normalizePath("c/d", "/a/b")).toBe(under.path.resolve("/a/b", "c/d"));
+    expect(under.runtime.normalizePath(".", "/a/b")).toBe(under.path.resolve("/a/b"));
   });
 });
 
@@ -97,7 +97,7 @@ describe("FakeRuntime", () => {
 
   test("shares its volume with the memory HostFiles", async () => {
     const host = createMemoryHost();
-    const file = path.join(host.paths.userHome(), "ws", "README.md");
+    const file = path.posix.join(host.paths.userHome(), "ws", "README.md");
     await writeFileString(host.runtime, "~/ws/README.md", "# hi\n");
     expect(await host.files.promises.readFile(file, "utf-8")).toBe("# hi\n");
   });
