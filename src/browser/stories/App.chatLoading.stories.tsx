@@ -12,6 +12,7 @@ import {
   clearWorkspaceSelection,
   collapseLeftSidebar,
   collapseRightSidebar,
+  expandLeftSidebar,
   expandProjects,
   selectWorkspace,
 } from "./helpers/uiState";
@@ -31,6 +32,10 @@ async function checkPhoneViewport(context: Parameters<NonNullable<AppStory["play
 }
 
 async function switchWorkspace(canvasElement: HTMLElement, workspaceId: string) {
+  // The wide sidebar: collapseLeftSidebar() below only writes storage, so without this live
+  // write the next switch's re-render reads it and collapses the sidebar, changing the desktop
+  // snapshot. The phone drawer ignores that saved flag, so openLeftSidebar() opens it.
+  expandLeftSidebar();
   await openLeftSidebar(canvasElement);
   const row = await waitFor(async () => {
     const element = canvasElement.querySelector<HTMLElement>(
