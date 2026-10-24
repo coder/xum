@@ -69,13 +69,7 @@ import {
   MODEL_FALLBACK_REFUSAL_TOOL_NAME,
   SYSTEM_SECTION_RECORD_FIELDS,
 } from "@/common/types/message";
-import {
-  findFirstReasoningPartIndexInTrailingRun,
-  mergeReasoningProviderOptions,
-  reasoningProviderOptionsFromMetadata,
-  stripReasoningReplay,
-  type ReasoningProviderMetadata,
-} from "@/node/utils/messages/reasoningProviderOptions";
+import { stripReasoningReplay } from "@/node/utils/messages/reasoningProviderOptions";
 import {
   laterAnthropicThinkingReplayPoint,
   type AnthropicThinkingReplayPoint,
@@ -164,7 +158,6 @@ import { hostClockFor } from "./di/hostClockLive";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { shellQuote } from "@/common/utils/shell";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
-import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { getOpenAIResponsesBaseUrlHint } from "@/node/services/utils/openAIResponsesBaseUrlHint";
@@ -174,6 +167,13 @@ import {
   type AttemptHistory,
   type AttemptOutcome,
 } from "@/node/services/turnEngine/recoveryPolicy";
+import {
+  partFold,
+  type FoldablePart,
+  type FoldIntent,
+  type FoldStep,
+  type FoldView,
+} from "@/node/services/turnEngine/partFold";
 
 // Disable noisy AI SDK warning logging.
 globalThis.AI_SDK_LOG_WARNINGS = false;
@@ -243,20 +243,6 @@ class StreamTruncatedError extends Error {
     this.name = "StreamTruncatedError";
     this.providerDisplayName = providerDisplayName;
   }
-}
-
-// Type definitions for stream parts with extended properties
-interface ReasoningDeltaPart {
-  type: "reasoning-delta";
-  text?: string;
-  delta?: string;
-  providerMetadata?: ReasoningProviderMetadata;
-}
-
-interface ReasoningLifecyclePart {
-  type: "reasoning-start" | "reasoning-end";
-  id?: string;
-  providerMetadata?: ReasoningProviderMetadata;
 }
 
 // Tool-call tracking + branded types
@@ -2268,6 +2254,104 @@ export class StreamManager {
           parentToolCallId,
         });
       }
+    }
+  }
+
+  /** Read-only snapshot of the stream state that partFold reads. */
+  private foldView(workspaceId: WorkspaceId, streamInfo: WorkspaceStreamInfo): FoldView {
+    return {
+      workspaceId: workspaceId as string,
+      messageId: streamInfo.messageId,
+      parts: streamInfo.parts,
+      currentReasoningBlock: streamInfo.currentReasoningBlock,
+      lastPartTimestamp: streamInfo.lastPartTimestamp,
+    };
+  }
+
+  /**
+   * Runs partFold's intents in order with the existing helpers. Synchronous
+   * intents run without a yield between them, awaited helpers stay awaited, and
+   * schedulePartialWrite stays fire-and-forget, as when the fold was inline.
+   */
+  private async applyStep(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    step: FoldStep
+  ): Promise<void> {
+    // Store before the first await: tool execution starts stamp parts while
+    // the intents below await, and part timestamps must stay monotonic.
+    streamInfo.lastPartTimestamp = step.lastPartTimestamp;
+    if (step.ignoredTextDelta) {
+      log.debug("[streamManager] Ignoring non-string text-delta payload", {
+        workspaceId,
+        model: streamInfo.model,
+        ...step.ignoredTextDelta,
+      });
+    }
+    for (const intent of step.intents) {
+      const pending = this.applyIntent(workspaceId, streamInfo, intent);
+      if (pending !== undefined) {
+        await pending;
+      }
+    }
+  }
+
+  /** Returns the helper's promise for intents the stream loop must await. */
+  private applyIntent(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    intent: FoldIntent
+  ): Promise<void> | undefined {
+    switch (intent._tag) {
+      case "StartStep":
+        this.recordStepStart(streamInfo);
+        streamInfo.streamStepOrdinals.push(streamInfo.stepStartIndices.length - 1);
+        return this.writeInTurnThinkingStripReceipt(workspaceId, streamInfo);
+      case "OpenReasoningBlock":
+        streamInfo.currentReasoningBlock = {};
+        return undefined;
+      case "Append":
+        return this.appendFoldedPart(workspaceId, streamInfo, intent.part, intent.trackInBlock);
+      case "UpdateReasoningPart":
+        this.updateReasoningPart(streamInfo, intent);
+        return undefined;
+      case "Emit":
+        this.emitTurnEvent(intent.event);
+        return undefined;
+      case "SchedulePartialWrite":
+        void this.schedulePartialWrite(workspaceId, streamInfo);
+        return undefined;
+      case "CheckSoftCancel":
+        return this.checkSoftCancelStream(workspaceId, streamInfo);
+    }
+  }
+
+  private async appendFoldedPart(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    part: CompletedMessagePart,
+    trackInBlock: boolean
+  ): Promise<void> {
+    await this.appendPartAndEmit(workspaceId, streamInfo, part, true);
+    // The same object appendPartAndEmit pushed: signature deltas compare by reference.
+    if (trackInBlock && streamInfo.currentReasoningBlock) {
+      streamInfo.currentReasoningBlock.lastPart = part;
+    }
+  }
+
+  private updateReasoningPart(
+    streamInfo: WorkspaceStreamInfo,
+    intent: Extract<FoldIntent, { _tag: "UpdateReasoningPart" }>
+  ): void {
+    const target = streamInfo.parts[intent.index];
+    // partFold read the index from this array in the same synchronous turn.
+    assert(target?.type === "reasoning", "partFold updates only reasoning parts");
+    if (intent.signature) {
+      target.signature = intent.signature;
+    }
+    target.providerOptions = intent.providerOptions;
+    if (intent.trackInBlock && streamInfo.currentReasoningBlock) {
+      streamInfo.currentReasoningBlock.lastPart = target;
     }
   }
 
@@ -5067,47 +5151,17 @@ export class StreamManager {
             // });
 
             switch (part.type) {
-              case "start-step": {
-                this.recordStepStart(streamInfo);
-                streamInfo.streamStepOrdinals.push(streamInfo.stepStartIndices.length - 1);
-                await this.writeInTurnThinkingStripReceipt(workspaceId, streamInfo);
-                break;
-              }
-
-              case "text-delta": {
-                // Providers/SDKs may stream text deltas under different keys.
-                const textDeltaPart = part as Record<string, unknown>;
-
-                const deltaText = extractChunkDeltaText(textDeltaPart, [
-                  "text",
-                  "delta",
-                  "textDelta",
-                ]);
-
-                if (deltaText.length === 0) {
-                  if (
-                    textDeltaPart.text !== undefined ||
-                    textDeltaPart.delta !== undefined ||
-                    textDeltaPart.textDelta !== undefined
-                  ) {
-                    log.debug("[streamManager] Ignoring non-string text-delta payload", {
-                      workspaceId,
-                      model: streamInfo.model,
-                      textType: typeof textDeltaPart.text,
-                      deltaType: typeof textDeltaPart.delta,
-                      textDeltaType: typeof textDeltaPart.textDelta,
-                    });
-                  }
-                  break;
-                }
-
-                // Append each delta as a new part (merging happens at display time)
-                const textPart = {
-                  type: "text" as const,
-                  text: deltaText,
-                  timestamp: nextPartTimestamp(streamInfo),
-                };
-                await this.appendPartAndEmit(workspaceId, streamInfo, textPart, true);
+              case "start-step":
+              case "text-delta":
+              case "reasoning-start":
+              case "reasoning-delta":
+              case "reasoning-end": {
+                const step = partFold(
+                  this.foldView(workspaceId, streamInfo),
+                  part as FoldablePart,
+                  nodeClock.nowMs()
+                );
+                await this.applyStep(workspaceId, streamInfo, step);
                 break;
               }
 
@@ -5115,161 +5169,6 @@ export class StreamManager {
                 if (await this.emitToolCallDeltaIfPresent(workspaceId, streamInfo, part)) {
                   break;
                 }
-                break;
-              }
-
-              case "reasoning-start": {
-                // OpenAI/xAI may attach itemId (and sometimes encrypted content) on start.
-                // Stash on the latest reasoning part, or open an empty one for later deltas.
-                const lifecyclePart = part as ReasoningLifecyclePart;
-                const startOptions = reasoningProviderOptionsFromMetadata(
-                  lifecyclePart.providerMetadata
-                );
-                const block: { lastPart?: CompletedMessagePart } = {};
-                streamInfo.currentReasoningBlock = block;
-                if (startOptions?.anthropic?.redactedData != null) {
-                  // An Anthropic redacted_thinking block is complete at start and
-                  // replays as its own block: never merge it into earlier reasoning.
-                  const redactedPart = {
-                    type: "reasoning" as const,
-                    text: "",
-                    timestamp: nextPartTimestamp(streamInfo),
-                    providerOptions: startOptions,
-                  };
-                  await this.appendPartAndEmit(workspaceId, streamInfo, redactedPart, true);
-                  block.lastPart = redactedPart;
-                } else if (startOptions) {
-                  const lastPart = streamInfo.parts.at(-1);
-                  if (lastPart?.type === "reasoning") {
-                    lastPart.providerOptions = mergeReasoningProviderOptions(
-                      lastPart.providerOptions,
-                      startOptions
-                    );
-                    void this.schedulePartialWrite(workspaceId, streamInfo);
-                  } else {
-                    await this.appendPartAndEmit(
-                      workspaceId,
-                      streamInfo,
-                      {
-                        type: "reasoning" as const,
-                        text: "",
-                        timestamp: nextPartTimestamp(streamInfo),
-                        providerOptions: startOptions,
-                      },
-                      true
-                    );
-                  }
-                  block.lastPart = streamInfo.parts.at(-1);
-                }
-                break;
-              }
-
-              case "reasoning-delta": {
-                // Anthropic, OpenAI, and xAI stream reasoning content via reasoning-delta.
-                const reasoningPart = part as ReasoningDeltaPart;
-                const delta = reasoningPart.text ?? reasoningPart.delta ?? "";
-                const signature = reasoningPart.providerMetadata?.anthropic?.signature;
-                const deltaOptions = reasoningProviderOptionsFromMetadata(
-                  reasoningPart.providerMetadata
-                );
-
-                // Metadata-only deltas (Anthropic signature, OpenAI/xAI itemId) attach to
-                // the latest reasoning part without creating a new empty text part.
-                if (!delta && (signature || deltaOptions)) {
-                  const lastPart = streamInfo.parts.at(-1);
-                  const block = streamInfo.currentReasoningBlock;
-                  // Without a reasoning-start (some normalized streams) the last
-                  // reasoning part is the only block we know of.
-                  const lastPartInBlock = block == null || block.lastPart === lastPart;
-                  if (signature && !(lastPart?.type === "reasoning" && lastPartInBlock)) {
-                    // The block has no part yet (empty thinking, only a signature) or
-                    // the last part belongs to an earlier block: the signature is a
-                    // block of its own. Attaching it elsewhere would drop this block
-                    // and overwrite the earlier block's signature.
-                    const signedPart = {
-                      type: "reasoning" as const,
-                      text: "",
-                      timestamp: nextPartTimestamp(streamInfo),
-                      signature,
-                      providerOptions: deltaOptions,
-                    };
-                    await this.appendPartAndEmit(workspaceId, streamInfo, signedPart, true);
-                    if (block) block.lastPart = signedPart;
-                    break;
-                  }
-                  if (lastPart?.type === "reasoning") {
-                    if (signature) {
-                      lastPart.signature = signature;
-                    }
-                    lastPart.providerOptions = mergeReasoningProviderOptions(
-                      lastPart.providerOptions,
-                      deltaOptions ?? (signature ? { anthropic: { signature } } : undefined)
-                    );
-                    // Emit signature update event for Anthropic UI consumers.
-                    if (signature) {
-                      this.emitTurnEvent({
-                        type: "reasoning-delta",
-                        workspaceId: workspaceId as string,
-                        messageId: streamInfo.messageId,
-                        delta: "",
-                        tokens: 0,
-                        timestamp: nextPartTimestamp(streamInfo),
-                        signature,
-                      });
-                    }
-                    void this.schedulePartialWrite(workspaceId, streamInfo);
-                  }
-                  break;
-                }
-
-                // Append each delta as a new part (merging happens at display time)
-                // Include providerOptions for SDK compatibility when converting to ModelMessages
-                const newPart = {
-                  type: "reasoning" as const,
-                  text: delta,
-                  timestamp: nextPartTimestamp(streamInfo),
-                  signature, // May be undefined, will be filled by subsequent signature delta
-                  providerOptions: deltaOptions,
-                };
-                await this.appendPartAndEmit(workspaceId, streamInfo, newPart, true);
-                if (streamInfo.currentReasoningBlock) {
-                  streamInfo.currentReasoningBlock.lastPart = newPart;
-                }
-                break;
-              }
-
-              case "reasoning-end": {
-                // xAI (and OpenAI store=false) put reasoningEncryptedContent on reasoning-end.
-                // Xum streams reasoning as many tiny delta parts; providers expect one
-                // reasoning item with encrypted content. Attach metadata to the first part
-                // of the contiguous reasoning run so convertToModelMessages can replay it
-                // even if later parts lack providerOptions.
-                const lifecyclePart = part as ReasoningLifecyclePart;
-                const endOptions = reasoningProviderOptionsFromMetadata(
-                  lifecyclePart.providerMetadata
-                );
-                if (endOptions) {
-                  const firstReasoningIndex = findFirstReasoningPartIndexInTrailingRun(
-                    streamInfo.parts
-                  );
-                  if (firstReasoningIndex >= 0) {
-                    const firstPart = streamInfo.parts[firstReasoningIndex];
-                    if (firstPart?.type === "reasoning") {
-                      firstPart.providerOptions = mergeReasoningProviderOptions(
-                        firstPart.providerOptions,
-                        endOptions
-                      );
-                      void this.schedulePartialWrite(workspaceId, streamInfo);
-                    }
-                  }
-                }
-
-                this.emitTurnEvent({
-                  type: "reasoning-end",
-                  workspaceId: workspaceId as string,
-                  messageId: streamInfo.messageId,
-                });
-                await this.checkSoftCancelStream(workspaceId, streamInfo);
                 break;
               }
 
