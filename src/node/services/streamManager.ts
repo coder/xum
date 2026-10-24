@@ -113,11 +113,7 @@ import {
 } from "@/common/utils/tokens/usageHelpers";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import {
-  modelOnlyNotificationsField,
-  readModelOnlyToolNotifications,
-  stripInternalToolResultFields,
-} from "@/common/utils/tools/internalToolResultFields";
+import { modelOnlyNotificationsField } from "@/common/utils/tools/internalToolResultFields";
 import { summarizeInvalidToolInputErrors } from "@/node/utils/messages/summarizeInvalidToolInputErrors";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
@@ -139,7 +135,6 @@ import type { SessionUsageService } from "./sessionUsageService";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
 import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
-import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
 import { countAnthropicInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
 import { stripAnthropicReasoning } from "@/browser/utils/messages/modelMessageTransform";
@@ -254,6 +249,15 @@ interface ToolCallState {
 }
 
 type ToolCallMap = Map<string, ToolCallState>;
+
+/** Stream-loop state of one processStreamWithCleanup turn that applyStep reads and updates. */
+interface PartLoopState {
+  readonly workspaceLog: Logger;
+  /** Per attempt: processStreamWithCleanup replaces it before each attempt. */
+  toolCalls: ToolCallMap;
+  /** Per turn: counts orphan tool results for log suppression. */
+  orphanToolResultCount: number;
+}
 
 type WorkspaceId = string & { __brand: "WorkspaceId" };
 type StreamToken = string & { __brand: "StreamToken" };
@@ -2258,13 +2262,19 @@ export class StreamManager {
   }
 
   /** Read-only snapshot of the stream state that partFold reads. */
-  private foldView(workspaceId: WorkspaceId, streamInfo: WorkspaceStreamInfo): FoldView {
+  private foldView(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    loop: PartLoopState
+  ): FoldView {
     return {
       workspaceId: workspaceId as string,
       messageId: streamInfo.messageId,
       parts: streamInfo.parts,
       currentReasoningBlock: streamInfo.currentReasoningBlock,
       lastPartTimestamp: streamInfo.lastPartTimestamp,
+      anthropicMessagesWire: isAnthropicMessagesModel(streamInfo.request.model),
+      toolCalls: loop.toolCalls,
     };
   }
 
@@ -2276,7 +2286,8 @@ export class StreamManager {
   private async applyStep(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
-    step: FoldStep
+    step: FoldStep,
+    loop: PartLoopState
   ): Promise<void> {
     // Store before the first await: tool execution starts stamp parts while
     // the intents below await, and part timestamps must stay monotonic.
@@ -2289,19 +2300,20 @@ export class StreamManager {
       });
     }
     for (const intent of step.intents) {
-      const pending = this.applyIntent(workspaceId, streamInfo, intent);
+      const pending = this.applyIntent(workspaceId, streamInfo, intent, loop);
       if (pending !== undefined) {
         await pending;
       }
     }
   }
 
-  /** Returns the helper's promise for intents the stream loop must await. */
+  /** Returns the helper's promise for intents the stream loop must await (its value is unused). */
   private applyIntent(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
-    intent: FoldIntent
-  ): Promise<void> | undefined {
+    intent: FoldIntent,
+    loop: PartLoopState
+  ): Promise<unknown> | undefined {
     switch (intent._tag) {
       case "StartStep":
         this.recordStepStart(streamInfo);
@@ -2311,31 +2323,132 @@ export class StreamManager {
         streamInfo.currentReasoningBlock = {};
         return undefined;
       case "Append":
-        return this.appendFoldedPart(workspaceId, streamInfo, intent.part, intent.trackInBlock);
+        return this.appendFoldedPart(workspaceId, streamInfo, intent);
       case "UpdateReasoningPart":
         this.updateReasoningPart(streamInfo, intent);
         return undefined;
       case "Emit":
         this.emitTurnEvent(intent.event);
         return undefined;
+      case "CheckSoftCancel":
+        return this.checkSoftCancelStream(workspaceId, streamInfo);
+      default:
+        return this.applyToolIntent(workspaceId, streamInfo, intent, loop);
+    }
+  }
+
+  private applyToolIntent(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    intent: FoldIntent,
+    loop: PartLoopState
+  ): Promise<unknown> | undefined {
+    switch (intent._tag) {
+      case "RecordToolCall":
+        // Tool call started - store in map for later lookup
+        loop.toolCalls.set(intent.toolCallId, {
+          toolCallId: intent.toolCallId,
+          toolName: intent.toolName,
+          input: intent.input,
+        });
+        if (intent.anthropicServerTool) {
+          (streamInfo.anthropicServerToolCallIds ??= new Set()).add(intent.toolCallId);
+        }
+        return undefined;
+      case "SetToolCallOutput": {
+        const toolCall = loop.toolCalls.get(intent.toolCallId);
+        assert(toolCall != null, "partFold sets output only on a tracked tool call");
+        toolCall.output = intent.output;
+        return undefined;
+      }
+      case "FinishToolCall":
+        // Use shared completion logic (await to ensure partial is flushed before event)
+        return this.finishToolCall(
+          workspaceId,
+          streamInfo,
+          loop.toolCalls,
+          intent.toolCallId,
+          intent.toolName,
+          intent.output,
+          intent.providerExecuted,
+          intent.modelOnlyNotifications
+        );
+      case "EmitToolCallDelta":
+        return this.emitToolCallDeltaIfPresent(workspaceId, streamInfo, intent.part);
       case "SchedulePartialWrite":
         void this.schedulePartialWrite(workspaceId, streamInfo);
         return undefined;
-      case "CheckSoftCancel":
-        return this.checkSoftCancelStream(workspaceId, streamInfo);
+      default:
+        return this.applyTurnIntent(workspaceId, streamInfo, intent, loop);
+    }
+  }
+
+  private applyTurnIntent(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    intent: FoldIntent,
+    loop: PartLoopState
+  ): Promise<unknown> | undefined {
+    switch (intent._tag) {
+      case "FlushPartialWrite":
+        return this.flushPartialWrite(workspaceId, streamInfo);
+      default:
+        this.applyLogIntent(streamInfo, intent, loop);
+        return undefined;
+    }
+  }
+
+  private applyLogIntent(
+    streamInfo: WorkspaceStreamInfo,
+    intent: FoldIntent,
+    loop: PartLoopState
+  ): void {
+    switch (intent._tag) {
+      case "LogToolCall": {
+        const inputText = JSON.stringify(intent.input);
+        log.debug(
+          `[StreamManager] tool-call: toolName=${intent.toolName}, input length=${inputText.length}`
+        );
+        return;
+      }
+      case "LogOrphanToolResult":
+        loop.orphanToolResultCount += 1;
+        this.logOrphanToolResult(
+          loop.workspaceLog,
+          streamInfo,
+          { toolCallId: intent.toolCallId, toolName: intent.toolName },
+          intent.output,
+          loop.orphanToolResultCount,
+          loop.toolCalls.size
+        );
+        return;
+      case "LogToolError": {
+        const logLevel = streamInfo.abortController.signal.aborted ? log.debug : log.error;
+        logLevel(`Tool execution error for '${intent.toolName}'`, {
+          toolCallId: intent.toolCallId,
+          error: intent.error,
+        });
+        return;
+      }
+      default:
+        assert(false, `applyStep has no handler for ${intent._tag}`);
     }
   }
 
   private async appendFoldedPart(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
-    part: CompletedMessagePart,
-    trackInBlock: boolean
+    intent: Extract<FoldIntent, { _tag: "Append" }>
   ): Promise<void> {
-    await this.appendPartAndEmit(workspaceId, streamInfo, part, true);
+    await this.appendPartAndEmit(
+      workspaceId,
+      streamInfo,
+      intent.part,
+      intent.skipPartialWrite !== true
+    );
     // The same object appendPartAndEmit pushed: signature deltas compare by reference.
-    if (trackInBlock && streamInfo.currentReasoningBlock) {
-      streamInfo.currentReasoningBlock.lastPart = part;
+    if (intent.trackInBlock && streamInfo.currentReasoningBlock) {
+      streamInfo.currentReasoningBlock.lastPart = intent.part;
     }
   }
 
@@ -5129,11 +5242,11 @@ export class StreamManager {
         retriedReasoningReplay: false,
       };
       const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-      let orphanToolResultCount = 0;
+      const loop: PartLoopState = { workspaceLog, toolCalls: new Map(), orphanToolResultCount: 0 };
 
       while (true) {
         // Use fullStream to capture all events including tool calls
-        const toolCalls: ToolCallMap = new Map();
+        loop.toolCalls = new Map();
 
         try {
           for await (const part of streamInfo.streamResult.fullStream) {
@@ -5151,166 +5264,6 @@ export class StreamManager {
             // });
 
             switch (part.type) {
-              case "start-step":
-              case "text-delta":
-              case "reasoning-start":
-              case "reasoning-delta":
-              case "reasoning-end": {
-                const step = partFold(
-                  this.foldView(workspaceId, streamInfo),
-                  part as FoldablePart,
-                  nodeClock.nowMs()
-                );
-                await this.applyStep(workspaceId, streamInfo, step);
-                break;
-              }
-
-              default: {
-                if (await this.emitToolCallDeltaIfPresent(workspaceId, streamInfo, part)) {
-                  break;
-                }
-                break;
-              }
-
-              case "tool-call": {
-                // Tool call started - store in map for later lookup
-                toolCalls.set(part.toolCallId, {
-                  toolCallId: part.toolCallId,
-                  toolName: part.toolName,
-                  input: part.input,
-                });
-                if (
-                  part.providerExecuted === true &&
-                  isAnthropicMessagesModel(streamInfo.request.model)
-                ) {
-                  (streamInfo.anthropicServerToolCallIds ??= new Set()).add(part.toolCallId);
-                }
-
-                // Note: Tool availability is handled by the SDK, which emits tool-error events
-                // for unavailable tools. No need to check here.
-
-                // IMPORTANT: Add tool part to streamInfo.parts immediately (not just on completion)
-                // This ensures in-progress tool calls are saved to partial.json if stream is interrupted
-                const toolPart = {
-                  type: "dynamic-tool" as const,
-                  toolCallId: part.toolCallId,
-                  toolName: part.toolName,
-                  state: "input-available" as const,
-                  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-                  input: part.input,
-                  timestamp: nextPartTimestamp(streamInfo),
-                };
-
-                // Emit using shared logic (ensures replay consistency)
-                const inputText = JSON.stringify(part.input);
-                log.debug(
-                  `[StreamManager] tool-call: toolName=${part.toolName}, input length=${inputText.length}`
-                );
-                await this.appendPartAndEmit(workspaceId, streamInfo, toolPart);
-
-                // CRITICAL: Flush partial immediately for ask_user_question
-                // This tool blocks waiting for user input, and if the app restarts during
-                // that wait, the partial must be persisted so it can be restored.
-                // Without this, the throttled write might not complete before app shutdown.
-                if (part.toolName === "ask_user_question") {
-                  await this.flushPartialWrite(workspaceId, streamInfo);
-                }
-                break;
-              }
-
-              case "tool-result": {
-                const toolResultPart = part as {
-                  toolCallId: string;
-                  toolName: string;
-                  output: unknown;
-                  providerExecuted?: boolean;
-                };
-
-                // Strip encrypted content from web search results before storing
-                const strippedOutput = stripInternalToolResultFields(
-                  stripEncryptedContent(toolResultPart.output)
-                );
-                // Kept beside the output, so the next turn's rebuild can resend them.
-                const modelOnlyNotifications = readModelOnlyToolNotifications(
-                  toolResultPart.output
-                );
-
-                // Tool call completed successfully
-                const toolCall = toolCalls.get(toolResultPart.toolCallId);
-                if (toolCall) {
-                  toolCall.output = strippedOutput;
-                } else {
-                  orphanToolResultCount += 1;
-                  this.logOrphanToolResult(
-                    workspaceLog,
-                    streamInfo,
-                    {
-                      toolCallId: toolResultPart.toolCallId,
-                      toolName: toolResultPart.toolName,
-                    },
-                    strippedOutput,
-                    orphanToolResultCount,
-                    toolCalls.size
-                  );
-                }
-
-                // Use shared completion logic (await to ensure partial is flushed before event)
-                await this.finishToolCall(
-                  workspaceId,
-                  streamInfo,
-                  toolCalls,
-                  toolResultPart.toolCallId,
-                  toolResultPart.toolName,
-                  strippedOutput,
-                  toolResultPart.providerExecuted,
-                  modelOnlyNotifications
-                );
-                break;
-              }
-
-              // Handle tool-error parts from the stream (AI SDK 5.0+)
-              // These are emitted when tool execution fails (e.g., tool doesn't exist)
-              case "tool-error": {
-                const toolErrorPart = part as {
-                  toolCallId: string;
-                  toolName: string;
-                  error: unknown;
-                  providerExecuted?: boolean;
-                };
-
-                const logLevel = streamInfo.abortController.signal.aborted ? log.debug : log.error;
-                logLevel(`Tool execution error for '${toolErrorPart.toolName}'`, {
-                  toolCallId: toolErrorPart.toolCallId,
-                  error: toolErrorPart.error,
-                });
-
-                // Format error output. getErrorMessage (not bare
-                // JSON.stringify) so a cyclic/BigInt tool-error payload stays
-                // a recoverable tool error instead of throwing here and
-                // failing the whole stream.
-                const errorOutput = {
-                  success: false,
-                  error:
-                    typeof toolErrorPart.error === "string"
-                      ? toolErrorPart.error
-                      : toolErrorPart.error instanceof Error
-                        ? toolErrorPart.error.message
-                        : getErrorMessage(toolErrorPart.error),
-                };
-
-                // Use shared completion logic (await to ensure partial is flushed before event)
-                await this.finishToolCall(
-                  workspaceId,
-                  streamInfo,
-                  toolCalls,
-                  toolErrorPart.toolCallId,
-                  toolErrorPart.toolName,
-                  errorOutput,
-                  toolErrorPart.providerExecuted
-                );
-                break;
-              }
-
               // Handle error parts from the stream (e.g., OpenAI context_length_exceeded)
               case "error": {
                 // Capture the error and immediately throw to trigger error handling
@@ -5498,6 +5451,16 @@ export class StreamManager {
 
               case "text-end": {
                 await this.checkSoftCancelStream(workspaceId, streamInfo);
+                break;
+              }
+
+              default: {
+                const step = partFold(
+                  this.foldView(workspaceId, streamInfo, loop),
+                  part as FoldablePart,
+                  nodeClock.nowMs()
+                );
+                await this.applyStep(workspaceId, streamInfo, step, loop);
                 break;
               }
             }
