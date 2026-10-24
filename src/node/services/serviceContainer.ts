@@ -9,6 +9,7 @@ import {
   replayPendingArtifactInteractions,
 } from "@/node/services/artifactInteractions";
 import { log } from "@/node/services/log";
+import { installBrotliResponseGuard } from "@/node/utils/network/brotliResponseGuard";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
@@ -320,6 +321,8 @@ export class ServiceContainer {
   private disposePromise: Promise<void> | null = null;
 
   constructor(stores: ConfigStores) {
+    // Desktop, `xum server` and ACP all build this before any service can fetch (#7358).
+    installBrotliResponseGuard();
     // Built eagerly and synchronously: a layer body that throws fails the
     // constructor, like any service constructor did before the graph existed.
     this.runtime = makeAppRuntime(AppLive(stores));
