@@ -8,8 +8,16 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Layer } from "effect";
 import type { SessionLocksTag } from "@/node/services/di/tags";
+import {
+  WorkspaceMutationInProgressError,
+  workspaceMutationInProgressMessage,
+  workspaceMutationLockPath,
+  workspaceUseLockDir,
+} from "@/node/services/workspaceUseLeases";
 import type { ProcessIdentity } from "@/node/utils/concurrency/processLiveness";
 import { CrossProcessLockTimeoutError } from "@/node/utils/concurrency/lockErrors";
+import { describeHolder } from "@/node/utils/main/crossProcessLock";
+import { foreignRecord, liveBlocker } from "./foreignHolders.testHarness";
 import { buildSessionLocks } from "./buildSessionLocks.testHarness";
 import type { SessionLocks } from "./sessionLocks";
 
@@ -233,6 +241,47 @@ export function describeSessionLocksContract(
         expect(await leases.isHeld("ws-contract", "turn")).toBe(true);
         await lease.release();
         expect(await leases.isHeld("ws-contract", "turn")).toBe(false);
+      }));
+
+    test("a live foreign mutator makes hold refuse with today's text, and its release admits", () =>
+      withLayer(async (locks, t) => {
+        const leases = locks.useLeasesFor({ rootDir: t.dir });
+        const gate = workspaceMutationLockPath(t.dir, "ws-gate");
+        const mutator = await t.foreignHolder(gate, "live", "record");
+        const error = await leases.hold("ws-gate", "turn").then(
+          () => null,
+          (caught: unknown) => caught
+        );
+        expect(error).toBeInstanceOf(WorkspaceMutationInProgressError);
+        const identity = mutator.identity ?? undefined;
+        expect((error as Error).message).toBe(
+          workspaceMutationInProgressMessage("ws-gate", {
+            holder: describeHolder(foreignRecord(mutator.pid, identity)),
+            why: liveBlocker(mutator.pid, identity).why,
+          })
+        );
+        // The refused hold withdrew its lease.
+        expect(await leases.isHeld("ws-gate", "turn")).toBe(false);
+        await mutator.release();
+        const lease = await leases.hold("ws-gate", "turn");
+        await lease.release();
+      }));
+
+    test("isHeld sees another backend's live lease of that kind, and not a dead one", () =>
+      withLayer(async (locks, t) => {
+        const leases = locks.useLeasesFor({ rootDir: t.dir });
+        const dir = workspaceUseLockDir(t.dir, "ws-leases");
+        const live = await t.foreignHolder(
+          path.join(dir, "other-backend.turn.lock"),
+          "live",
+          "record"
+        );
+        await t.foreignHolder(path.join(dir, "other-backend.exec.lock"), "dead", "record");
+        expect(await leases.isHeld("ws-leases", "turn")).toBe(true);
+        expect(await leases.isHeld("ws-leases", "exec")).toBe(false);
+        expect(await leases.isHeld("ws-leases", "terminal")).toBe(false);
+        await live.release();
+        expect(await leases.isHeld("ws-leases", "turn")).toBe(false);
       }));
 
     test("workspaceFiles runs two operations on one key in FIFO order", () =>
