@@ -21,7 +21,7 @@ export async function openSettingsDialog(canvasElement: HTMLElement): Promise<HT
 /**
  * Open the left sidebar when it is collapsed, so plays can reach its controls (the titlebar's
  * settings button, project rows). At phone widths (Pixel's phone and tablet variants) the sidebar
- * is a drawer that starts closed on every render, whatever `expandLeftSidebar()` saved.
+ * is a drawer that starts closed each time a story mounts, whatever `expandLeftSidebar()` saved.
  */
 export async function openLeftSidebar(canvasElement: HTMLElement): Promise<void> {
   const canvas = within(canvasElement);

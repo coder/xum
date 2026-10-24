@@ -32,9 +32,9 @@ async function checkPhoneViewport(context: Parameters<NonNullable<AppStory["play
 }
 
 async function switchWorkspace(canvasElement: HTMLElement, workspaceId: string) {
-  // The wide sidebar: collapseLeftSidebar() below only writes storage, so without this live
-  // write the next switch's re-render reads it and collapses the sidebar, changing the desktop
-  // snapshot. The phone drawer ignores that saved flag, so openLeftSidebar() opens it.
+  // The wide sidebar: collapseLeftSidebar() below only writes storage, and a later re-render
+  // reads it and collapses the sidebar. This live write keeps it open for the next switch, as
+  // the desktop snapshot expects. openLeftSidebar() opens the phone drawer, which ignores the flag.
   expandLeftSidebar();
   await openLeftSidebar(canvasElement);
   const row = await waitFor(async () => {
