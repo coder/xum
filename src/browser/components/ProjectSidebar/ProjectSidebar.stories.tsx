@@ -8,10 +8,7 @@ import {
 } from "@/browser/stories/helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { setWorkspaceDrafts } from "@/browser/stories/helpers/drafts";
-import {
-  openLeftSidebar,
-  waitForChatInputAutofocusDone,
-} from "@/browser/stories/storyPlayHelpers";
+import { openLeftSidebar, waitForChatInputAutofocusDone } from "@/browser/stories/storyPlayHelpers";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
