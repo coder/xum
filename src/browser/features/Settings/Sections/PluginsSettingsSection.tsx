@@ -272,8 +272,10 @@ const ComponentChooser: React.FC<{
               <span className="min-w-0 break-words">
                 <span className="text-foreground font-mono break-all">{name}</span>
                 {imported.includes(name) && <span className="text-muted"> — imported</span>}
+                {/* Prose wraps between words. break-words still splits an unbroken URL or path
+                    that cannot fit, so nothing scrolls sideways at phone width. */}
                 {detail && (
-                  <span className="text-muted block break-all whitespace-pre-wrap">{detail}</span>
+                  <span className="text-muted block break-words whitespace-pre-wrap">{detail}</span>
                 )}
                 <SkillDirectives directives={directives} />
               </span>
