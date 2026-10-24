@@ -121,7 +121,6 @@ test("allows listed modules and fails stale entries", () => {
 // Phases 2 to 5 remove pairs until the map is empty.
 const FROZEN_ALLOW_PAIRS = [
   "src/node/services/agentSession.ts @/node/runtime/runtimeHelpers",
-  "src/node/services/agentSession.ts @/node/services/workspaceUseLeases",
   "src/node/services/aiService.ts @/node/runtime/multiProjectRuntime",
   "src/node/services/aiService.ts @/node/runtime/runtimeFactory",
   "src/node/services/aiService.ts @/node/runtime/runtimeHelpers",
