@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
+import { MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
 import type { Config } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
 import { log, type Logger } from "@/node/services/log";
@@ -170,6 +172,95 @@ describe("UsageLedger", () => {
       const settled = tokensByModel(await afterRestart());
       expect(Object.values(settled)).toEqual([1_100, 1_100]);
       expect(totalTokens(await sessionUsage.getSessionUsage(WORKSPACE_ID))).toBe(2_200);
+    });
+  });
+
+  describe("sidecar usage and refusals", () => {
+    /** The sources of the headless-usage sidecar rows, in write order. */
+    const sidecarSources = async (): Promise<string[]> => {
+      const file = path.join(config.sessionsDir, WORKSPACE_ID, HEADLESS_USAGE_FILE_NAME);
+      const text = await fs.readFile(file, "utf-8");
+      return text
+        .trim()
+        .split("\n")
+        .map((line) => (JSON.parse(line) as { source: string }).source);
+    };
+
+    test("a dropped partial's usage reaches only the sidecar, with refused hops labeled as refusals", async () => {
+      const dropped = turn({
+        toolModelUsages: [
+          { toolName: MODEL_FALLBACK_REFUSAL_TOOL_NAME, timestamp: 1, model: MODEL, usage: STEP },
+          { toolName: "task", timestamp: 2, model: MODEL, usage: STEP },
+        ],
+      });
+      await ledger.recordDroppedPartialUsage(
+        WORKSPACE_ID,
+        dropped,
+        STEP,
+        undefined,
+        "aborted_stream"
+      );
+      await ledger.recordDroppedPartialUsage(
+        WORKSPACE_ID,
+        turn(),
+        STEP,
+        undefined,
+        "errored_stream",
+        "refused_stream"
+      );
+
+      expect(await sidecarSources()).toEqual([
+        "aborted_stream",
+        "refused_stream",
+        "aborted_stream",
+        "refused_stream",
+      ]);
+      // The session ledger already has (or never gets) this spend.
+      expect(totalTokens(await sessionUsage.getSessionUsage(WORKSPACE_ID))).toBe(0);
+    });
+
+    test("across a fallback, the refused hop and the answering attempt are each counted once", async () => {
+      const attempt = turn();
+      await ledger.recordInFlight(WORKSPACE_ID, attempt);
+      await ledger.recordRefusedAttempt(WORKSPACE_ID, attempt, MODEL, { usage: STEP });
+      expect(attempt.toolModelUsages).toMatchObject([
+        { toolName: MODEL_FALLBACK_REFUSAL_TOOL_NAME, usage: STEP },
+      ]);
+
+      await ledger.recordInFlight(WORKSPACE_ID, attempt);
+      await ledger.settle(
+        WORKSPACE_ID,
+        attempt,
+        STEP,
+        undefined,
+        "settle failed",
+        "warn",
+        FALLBACK_MODEL
+      );
+
+      expect(await inFlightFiles()).toEqual([]);
+      expect(Object.values(tokensByModel(await afterRestart()))).toEqual([1_100, 1_100]);
+    });
+
+    test("a refusal that billed nothing still leaves an all-zero record, but no ledger row", async () => {
+      const attempt = turn();
+      await ledger.recordRefusedAttempt(WORKSPACE_ID, attempt, MODEL, {});
+      await ledger.recordTerminalRefusal(WORKSPACE_ID, attempt, MODEL, {});
+
+      const zero = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+      expect(attempt.toolModelUsages).toMatchObject([{ usage: zero }]);
+      expect(attempt.terminalRefusalUsage).toEqual(zero);
+      expect((await sessionUsage.getSessionUsage(WORKSPACE_ID))?.byModel ?? {}).toEqual({});
+    });
+
+    test("a terminal refusal keeps its usage for the error row and settles it once", async () => {
+      const attempt = turn();
+      await ledger.recordInFlight(WORKSPACE_ID, attempt);
+      await ledger.recordTerminalRefusal(WORKSPACE_ID, attempt, MODEL, { usage: STEP });
+
+      expect(attempt.terminalRefusalUsage).toEqual(STEP);
+      expect(await inFlightFiles()).toEqual([]);
+      expect(totalTokens(await afterRestart())).toBe(1_100);
     });
   });
 });
