@@ -450,4 +450,19 @@ describe("AskUserQuestionDock", () => {
     expect(second.getByText(PLATFORMS.question)).toBeTruthy();
     expect(second.queryByRole("button", { name: "Submit answers" })).toBeNull();
   });
+
+  test("a Summary left before a workspace switch stays while a set that joined it is open", () => {
+    messages = [ROW_A];
+    const first = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(first.getByRole("button", { name: "Summary" }));
+    messages = [ROW_A, ROW_B];
+    first.rerender(dock(workspaceId));
+    first.unmount();
+
+    // While away: another client answered ask-a. Live, the Summary would stay: ask-b is open.
+    messages = [ROW_A, ROW_B, ANSWER_A];
+    const second = render(dock(workspaceId), { wrapper: Wrapper });
+    expect(second.getByRole("button", { name: "Submit answers" })).toBeTruthy();
+    expect(second.queryByText(PLATFORMS.question)).toBeNull();
+  });
 });
