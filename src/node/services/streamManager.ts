@@ -114,7 +114,6 @@ import {
   computeContextLoadedToolNames,
   dedupeNativeToolReferences,
   computeLoadedToolNames,
-  unprojectNativeToolReferences,
   type ToolSearchStreamState,
 } from "@/common/utils/tools/toolCatalog";
 import { StreamingTokenTracker } from "@/node/utils/main/StreamingTokenTracker";
@@ -148,6 +147,12 @@ import {
   type PartialJournalState,
   type PartialTarget,
 } from "@/node/services/turnEngine/PartialJournal";
+import { ProviderRequest } from "@/node/services/turnEngine/ProviderRequest";
+import {
+  extractErrorCode,
+  extractPreviousResponseIdFromError,
+  extractStatusCode,
+} from "@/node/services/turnEngine/providerWire";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { shellQuote } from "@/common/utils/shell";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
@@ -1218,6 +1223,8 @@ export class StreamManager {
   private mcpServerManager?: MCPServerManager;
   // Owns the turn's usage accounting and session-usage writes (turnEngine/UsageLedger.ts).
   private readonly usageLedger: UsageLedger;
+  // Owns lost previousResponseIds and prefix swaps (turnEngine/ProviderRequest.ts).
+  private readonly providerRequest: ProviderRequest;
   private readonly getProvidersConfig: () => ProvidersConfigMap | null;
   private eventSink: TurnEngineEventSink;
   /**
@@ -1251,14 +1258,6 @@ export class StreamManager {
   // Injected stream factory; undefined uses the AI SDK's streamText, resolved at
   // call time so the default stays the live module export.
   private readonly streamTextOverride?: typeof streamText;
-  // Track OpenAI previousResponseIds that have been invalidated
-  // When frontend retries, buildProviderOptions will omit these IDs
-  //
-  // Effect migration Phase 10: stays a plain Set by the plain-mutables rule —
-  // every mutator runs in a non-Effect context (AI-SDK error paths inside
-  // processStreamWithCleanup) and no fiber reads or mutates it, so a Ref would
-  // add ceremony without adding safety.
-  private lostResponseIds = new Set<string>();
 
   constructor(
     historyService: HistoryService,
@@ -1275,6 +1274,9 @@ export class StreamManager {
     this.usageLedger = new UsageLedger({
       sessionUsageService,
       getProvidersConfig: this.getProvidersConfig,
+      workspaceLogger: (id, turn) => this.getWorkspaceLogger(id as WorkspaceId, turn),
+    });
+    this.providerRequest = new ProviderRequest({
       workspaceLogger: (id, turn) => this.getWorkspaceLogger(id as WorkspaceId, turn),
     });
     this.eventSink = eventSink;
@@ -3183,66 +3185,22 @@ export class StreamManager {
   }
 
   setPrefixSwap(workspaceId: string, swap: ContinuousPrefixSwap): boolean {
-    const stream = this.workspaceStreams.get(workspaceId as WorkspaceId);
-    if (
-      !stream ||
-      stream.messageId !== swap.journal.streamMessageId ||
-      stream.model !== swap.journal.parentModel ||
-      (stream.thinkingLevel ?? "off") !== swap.journal.preparation.effectiveThinkingLevel ||
-      stream.stepTracker.pendingPrefixSwap ||
-      stream.stepTracker.consumedPrefixSwap
-    )
-      return false;
-    stream.stepTracker.pendingPrefixSwap = swap;
-    return true;
+    return this.providerRequest.setPrefixSwap(
+      this.workspaceStreams.get(workspaceId as WorkspaceId),
+      swap
+    );
   }
 
   clearPrefixSwap(workspaceId: string): void {
-    const tracker = this.workspaceStreams.get(workspaceId as WorkspaceId)?.stepTracker;
-    if (tracker) {
-      tracker.pendingPrefixSwap = undefined;
-      tracker.consumedPrefixSwap = undefined;
-    }
+    this.providerRequest.clearPrefixSwap(
+      this.workspaceStreams.get(workspaceId as WorkspaceId)?.stepTracker
+    );
   }
 
   getPrefixSwapState(workspaceId: string): "none" | "pending" | "consumed" | "invalidated" {
-    const tracker = this.workspaceStreams.get(workspaceId as WorkspaceId)?.stepTracker;
-    return tracker?.prefixSwapInvalidated
-      ? "invalidated"
-      : tracker?.consumedPrefixSwap
-        ? "consumed"
-        : tracker?.pendingPrefixSwap
-          ? "pending"
-          : "none";
-  }
-
-  private swapPrefix(messages: ModelMessage[], swap: ContinuousPrefixSwap): ModelMessage[] | null {
-    // Reused IDs can name different turns or steps. Neither oldest nor newest
-    // proves the cut: ambiguity must use P1 instead of dropping or restoring context.
-    let index = -1;
-    for (const [messageIndex, message] of messages.entries()) {
-      if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
-      for (const part of message.content) {
-        if (part.type !== "tool-call" || part.toolCallId !== swap.firstTailToolCallId) continue;
-        if (index !== -1) {
-          log.warn("[continuous-compaction] ambiguous prefix locator; retaining full context");
-          return null;
-        }
-        index = messageIndex;
-      }
-    }
-    if (index < 0) {
-      log.warn("[continuous-compaction] prefix locator missing; retaining full context");
-      return null;
-    }
-    // The retained tail may hold a projected repeated search whose first
-    // occurrence the swapped-out prefix carried; restore the raw references so
-    // the caller's dedupe re-decides against the swapped transcript. Done here
-    // so every swap site (per-step and fallback rebuild) inverts identically.
-    return [
-      ...swap.prefix,
-      ...stripMessageCacheControl(unprojectNativeToolReferences(messages.slice(index))),
-    ];
+    return this.providerRequest.getPrefixSwapState(
+      this.workspaceStreams.get(workspaceId as WorkspaceId)?.stepTracker
+    );
   }
 
   private createStreamResult(
@@ -3316,7 +3274,7 @@ export class StreamManager {
         }
         const swap = stepTracker?.pendingPrefixSwap;
         if (swap && stepTracker?.workspaceId) {
-          const swapped = this.swapPrefix(effectiveMessages, swap);
+          const swapped = this.providerRequest.swapPrefix(effectiveMessages, swap);
           if (swapped) {
             const store = this.historyService.getContinuousCompactionJournal(
               stepTracker.workspaceId
@@ -4464,7 +4422,10 @@ export class StreamManager {
               )
             : conversation),
         ];
-        const swapped = this.swapPrefix(nextRequest.messages, { ...consumedSwap, prefix });
+        const swapped = this.providerRequest.swapPrefix(nextRequest.messages, {
+          ...consumedSwap,
+          prefix,
+        });
         if (swapped) {
           const appliedThinking = nextRequest.thinkingOverrideState?.applied;
           const isCurrent = () =>
@@ -5090,7 +5051,12 @@ export class StreamManager {
     workspaceLog.error("Stream processing error:", error);
 
     // Record lost previousResponseId so future requests can filter it out
-    this.recordLostResponseIdIfApplicable(workspaceId, error, streamInfo, workspaceLog);
+    this.providerRequest.recordLostResponseIdIfApplicable(
+      workspaceId,
+      error,
+      streamInfo,
+      workspaceLog
+    );
 
     const errorPayload = this.buildStreamErrorPayload(streamInfo, error);
     const persistedPayload = await this.persistStreamError(workspaceId, streamInfo, errorPayload);
@@ -5169,7 +5135,7 @@ export class StreamManager {
 
     // Enhance previous-response and model-not-found error messages
 
-    const previousResponseId = this.extractPreviousResponseIdFromError(actualError);
+    const previousResponseId = extractPreviousResponseIdFromError(actualError);
     if (previousResponseId) {
       errorMessage = "OpenAI lost the previous response state while streaming. Retry to continue.";
     }
@@ -5460,13 +5426,13 @@ export class StreamManager {
     error: unknown,
     previousResponseId: string | undefined
   ): Pick<PreviousResponseIdRetryPlan, "previousResponseId" | "errorCode" | "statusCode"> | null {
-    const responseId = this.extractPreviousResponseIdFromError(error);
+    const responseId = extractPreviousResponseIdFromError(error);
     if (!responseId || responseId !== previousResponseId) {
       return null;
     }
 
-    const errorCode = this.extractErrorCode(error);
-    const statusCode = this.extractStatusCode(error);
+    const errorCode = extractErrorCode(error);
+    const statusCode = extractStatusCode(error);
     // Retry if: we have the specific error code, OR a likely status code,
     // OR we successfully extracted a response ID from the error message
     // (the message match is strong evidence this is a "not found" error regardless of status code)
@@ -5488,7 +5454,12 @@ export class StreamManager {
     const { hasParts, previousResponseId, stepMessages, providerOptions, errorCode, statusCode } =
       plan;
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-    this.recordLostResponseIdIfApplicable(workspaceId, error, streamInfo, workspaceLog);
+    this.providerRequest.recordLostResponseIdIfApplicable(
+      workspaceId,
+      error,
+      streamInfo,
+      workspaceLog
+    );
 
     // Step-boundary retries restart the SDK stream, so totalUsage only reflects
     // the retried step. Track this to prefer cumulativeUsage at stream end.
@@ -5536,7 +5507,7 @@ export class StreamManager {
     if (RetryError.isInstance(error)) {
       error = error.lastError;
     }
-    const statusCode = this.extractStatusCode(error);
+    const statusCode = extractStatusCode(error);
     // Gateways can drop the structured code and forward only the message.
     const texts = [
       APICallError.isInstance(error) ? error.responseBody : undefined,
@@ -5565,7 +5536,7 @@ export class StreamManager {
     if (!isOpenAIResponsesModel(model)) {
       return null;
     }
-    return this.extractErrorCode(error) === "invalid_encrypted_content" ||
+    return extractErrorCode(error) === "invalid_encrypted_content" ||
       mentions(OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN) ||
       mentions(OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN)
       ? "openai"
@@ -5622,8 +5593,8 @@ export class StreamManager {
   ): Promise<void> {
     const { hasParts, rejectedNamespace, messages } = plan;
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-    const errorCode = this.extractErrorCode(error);
-    const statusCode = this.extractStatusCode(error);
+    const errorCode = extractErrorCode(error);
+    const statusCode = extractStatusCode(error);
 
     // Step-boundary retries restart the SDK stream, so totalUsage only reflects
     // the retried step. Track this to prefer cumulativeUsage at stream end.
@@ -6175,139 +6146,11 @@ export class StreamManager {
   }
 
   /**
-   * Record a previousResponseId as lost if the error indicates OpenAI no longer has it.
-   * StreamManager retries once automatically, and buildProviderOptions filters it for future requests.
-   */
-  private recordLostResponseIdIfApplicable(
-    workspaceId: WorkspaceId,
-    error: unknown,
-    streamInfo: WorkspaceStreamInfo,
-    workspaceLog?: Logger
-  ): void {
-    const responseId = this.extractPreviousResponseIdFromError(error);
-    if (!responseId) {
-      return;
-    }
-
-    const errorCode = this.extractErrorCode(error);
-    const statusCode = this.extractStatusCode(error);
-    // Record if: we have the specific error code, OR a likely status code.
-    // Proxies can surface OpenAI's "previous_response_not_found" as a 400 without the
-    // structured error code, so we treat 400 as eligible once the responseId regex
-    // matched the error payload/message.
-    const shouldRecord =
-      errorCode === "previous_response_not_found" ||
-      statusCode === 404 ||
-      statusCode === 500 ||
-      statusCode === 400;
-
-    if (!shouldRecord || this.lostResponseIds.has(responseId)) {
-      return;
-    }
-
-    const logger = workspaceLog ?? this.getWorkspaceLogger(workspaceId, streamInfo);
-    logger.info("Recording lost previousResponseId for future filtering", {
-      previousResponseId: responseId,
-      messageId: streamInfo.messageId,
-      model: streamInfo.model,
-      statusCode,
-      errorCode,
-    });
-
-    this.lostResponseIds.add(responseId);
-  }
-
-  /**
-   * Extract previousResponseId from error response body
-   * OpenAI's error message includes the ID: "Previous response with id 'resp_...' not found."
-   */
-  private extractPreviousResponseIdFromError(error: unknown): string | undefined {
-    // Check APICallError.responseBody first
-    if (APICallError.isInstance(error) && typeof error.responseBody === "string") {
-      const match = /'(resp_[a-f0-9]+)'/.exec(error.responseBody);
-      if (match) {
-        return match[1];
-      }
-    }
-
-    // Check error message
-    if (error instanceof Error) {
-      const match = /'(resp_[a-f0-9]+)'/.exec(error.message);
-      if (match) {
-        return match[1];
-      }
-    }
-
-    return undefined;
-  }
-
-  /**
    * Check if a previousResponseId has been marked as lost
    * Called by buildProviderOptions to filter out invalid IDs
    */
   public isResponseIdLost(responseId: string): boolean {
-    return this.lostResponseIds.has(responseId);
-  }
-
-  private extractErrorCode(error: unknown): string | undefined {
-    const candidates: unknown[] = [];
-    if (error instanceof Error && error.cause) {
-      candidates.push(error.cause);
-    }
-    if (APICallError.isInstance(error)) {
-      candidates.push(error.data);
-    }
-    candidates.push(error);
-    for (const candidate of candidates) {
-      const directCode = this.getStructuredErrorCode(candidate);
-      if (directCode) {
-        return directCode;
-      }
-      if (candidate && typeof candidate === "object" && "data" in candidate) {
-        const dataCandidate = (candidate as { data?: unknown }).data;
-        const nestedCode = this.getStructuredErrorCode(dataCandidate);
-        if (nestedCode) {
-          return nestedCode;
-        }
-      }
-    }
-    return undefined;
-  }
-
-  private extractStatusCode(error: unknown): number | undefined {
-    if (error instanceof Error && error.cause) {
-      const statusCode = this.extractStatusCode(error.cause);
-      if (typeof statusCode === "number") {
-        return statusCode;
-      }
-    }
-
-    if (APICallError.isInstance(error) && typeof error.statusCode === "number") {
-      return error.statusCode;
-    }
-
-    if (typeof error === "object" && error !== null && "statusCode" in error) {
-      const candidate = (error as { statusCode?: unknown }).statusCode;
-      if (typeof candidate === "number") {
-        return candidate;
-      }
-    }
-
-    return undefined;
-  }
-
-  private getStructuredErrorCode(candidate: unknown): string | undefined {
-    if (typeof candidate === "object" && candidate !== null && "error" in candidate) {
-      const withError = candidate as { error?: unknown };
-      if (withError.error && typeof withError.error === "object") {
-        const nested = withError.error as Record<string, unknown>;
-        const code = nested.code;
-        if (typeof code === "string") {
-          return code;
-        }
-      }
-    }
-    return undefined;
+    return this.providerRequest.isResponseIdLost(responseId);
   }
 
   /**
