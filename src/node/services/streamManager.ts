@@ -63,11 +63,7 @@ import type {
   PersistedToolModelUsage,
   SystemSectionRecords,
 } from "@/common/types/message";
-import {
-  hasTokenUsage,
-  MODEL_FALLBACK_REFUSAL_TOOL_NAME,
-  SYSTEM_SECTION_RECORD_FIELDS,
-} from "@/common/types/message";
+import { hasTokenUsage, SYSTEM_SECTION_RECORD_FIELDS } from "@/common/types/message";
 import { stripReasoningReplay } from "@/node/utils/messages/reasoningProviderOptions";
 import {
   laterAnthropicThinkingReplayPoint,
@@ -144,6 +140,7 @@ import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import { hostClockFor } from "./di/hostClockLive";
 import {
+  cloneUsage,
   markProviderMetadataCostsIncluded,
   UsageLedger,
 } from "@/node/services/turnEngine/UsageLedger";
@@ -201,10 +198,6 @@ interface ReasoningReplayRetryPlan {
   messages: ModelMessage[];
 }
 
-/** Drop reason for a partial that never reaches chat.jsonl. */
-type DroppedStreamSource = "aborted_stream" | "errored_stream";
-/** Sidecar analytics label: drop reason, or the refusal-specific label. */
-type HeadlessDropSource = DroppedStreamSource | "refused_stream";
 const STREAM_TRUNCATED_MESSAGE_SUFFIX =
   "stream closed unexpectedly before the response completed. Xum will retry automatically when possible, and if retries keep failing you should try again or switch models.";
 
@@ -938,20 +931,6 @@ function clonePersistedToolModelUsage(event: PersistedToolModelUsage): Persisted
   };
 }
 
-function cloneUsage(usage: LanguageModelV2Usage): LanguageModelV2Usage {
-  return { ...usage };
-}
-
-/**
- * Fresh all-zero usage object for refusals where the provider billed nothing
- * (or usage never arrived). A new object per call — downstream code mutates
- * usage objects (e.g. reasoning-token backfill), so a shared singleton would
- * leak counts across records.
- */
-function zeroTokenUsage(): LanguageModelV2Usage {
-  return { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-}
-
 function hasIncompleteToolCallPart(parts: CompletedMessagePart[]): boolean {
   return parts.some((part) => part.type === "dynamic-tool" && part.state !== "output-available");
 }
@@ -1267,7 +1246,6 @@ export class StreamManager {
   // Owns this manager's partial.json and final-message writes (turnEngine/PartialJournal.ts).
   private readonly partialJournal: PartialJournal;
   private mcpServerManager?: MCPServerManager;
-  private readonly sessionUsageService?: SessionUsageService;
   // Owns the turn's usage accounting and session-usage writes (turnEngine/UsageLedger.ts).
   private readonly usageLedger: UsageLedger;
   private readonly getProvidersConfig: () => ProvidersConfigMap | null;
@@ -1323,7 +1301,6 @@ export class StreamManager {
     options: StreamManagerOptions = {}
   ) {
     this.historyService = historyService;
-    this.sessionUsageService = sessionUsageService;
     this.getProvidersConfig = getProvidersConfig ?? (() => null);
     this.usageLedger = new UsageLedger({
       sessionUsageService,
@@ -2845,7 +2822,7 @@ export class StreamManager {
           // instead. Same predicate commitPartial applies, so exactly one of
           // {chat row, sidecar row} carries this turn's usage.
           if (!hasCommitWorthyParts(partialMessage.parts)) {
-            await this.recordDroppedPartialUsageInSidecar(
+            await this.usageLedger.recordDroppedPartialUsage(
               workspaceId,
               streamInfo,
               usage,
@@ -2862,7 +2839,7 @@ export class StreamManager {
         // the provider still billed every completed step. The sidecar is the
         // only route to the events table for this spend.
         try {
-          await this.recordDroppedPartialUsageInSidecar(
+          await this.usageLedger.recordDroppedPartialUsage(
             workspaceId,
             streamInfo,
             usage,
@@ -2912,66 +2889,6 @@ export class StreamManager {
         // so neither this fence nor the raw sink may join that policy.
         streamInfo.completionController?.settle(streamInfo.terminalCompletion);
       }
-    }
-  }
-
-  /**
-   * Route a dropped partial's billed usage to the headless-usage sidecar:
-   * the parent stream's cumulative usage plus every tool-internal model call
-   * (toolModelUsages). Used by the abort and error paths when the partial
-   * fails commitPartial's durability predicate — metadata stamped on such a
-   * partial dies with it, so the sidecar is the only route to the events
-   * table. skipSessionLedger everywhere: parent usage was recorded via
-   * recordSessionUsage and tool usage at report time (AIService).
-   */
-  private async recordDroppedPartialUsageInSidecar(
-    workspaceId: WorkspaceId,
-    streamInfo: Pick<WorkspaceStreamInfo, "model" | "metadataModel" | "toolModelUsages">,
-    usage: LanguageModelV2Usage | undefined,
-    providerMetadata: Record<string, unknown> | undefined,
-    analyticsSource: DroppedStreamSource,
-    // Label for the stream's OWN usage row only. The error path passes
-    // "refused_stream" when the turn died as a terminal model refusal (the
-    // stream usage is then terminalRefusalUsage), so refusals are not
-    // conflated with generic errored_stream rows in analytics.
-    streamUsageSource: HeadlessDropSource = analyticsSource
-  ): Promise<void> {
-    // Thread the request-pinned metadata identities through the sidecar
-    // write: recordHeadlessUsage would otherwise re-resolve the raw model
-    // against the CURRENT config, so a Coder instance removed/retagged
-    // mid-turn would persist an unknown or repriced identity in analytics.
-    if (usage !== undefined) {
-      await this.sessionUsageService?.recordHeadlessUsage(
-        workspaceId as string,
-        streamInfo.model,
-        cloneUsage(usage),
-        providerMetadata,
-        {
-          analyticsSource: streamUsageSource,
-          skipSessionLedger: true,
-          metadataModel: streamInfo.metadataModel,
-        }
-      );
-    }
-    for (const toolUsage of streamInfo.toolModelUsages) {
-      // Refused fallback hops ARE refusals regardless of how the turn ended
-      // (aborted, errored, exhausted chain); every other tool-internal usage
-      // entry keeps the turn's drop reason.
-      const entrySource: HeadlessDropSource =
-        toolUsage.toolName === MODEL_FALLBACK_REFUSAL_TOOL_NAME
-          ? "refused_stream"
-          : analyticsSource;
-      await this.sessionUsageService?.recordHeadlessUsage(
-        workspaceId as string,
-        toolUsage.model,
-        cloneUsage(toolUsage.usage),
-        toolUsage.providerMetadata,
-        {
-          analyticsSource: entrySource,
-          skipSessionLedger: true,
-          metadataModel: toolUsage.metadataModel,
-        }
-      );
     }
   }
 
@@ -4333,52 +4250,17 @@ export class StreamManager {
     };
   }
 
-  /**
-   * Attribute a refused fallback attempt's token usage to the refusing model
-   * before the fallback swap wipes per-attempt counters. The toolModelUsages
-   * entry is the durable record (session-usage rebuilds scan it per-model); the
-   * live settle keeps in-memory session totals consistent with it.
-   */
+  /** Attributes a refused fallback attempt's usage (UsageLedger.recordRefusedAttempt). */
   private async recordRefusedAttemptUsage(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
     refusedModel: string
   ): Promise<void> {
-    const { usage, providerMetadata } = await this.getRefusalUsageSnapshot(streamInfo);
-
-    // Zero-usage refusals (provider billed nothing / usage never arrived) are
-    // still real refused attempts: record an explicit all-zero entry so
-    // analytics counts the refusal, but skip the session ledger below — no
-    // zero-cost noise in the costs UI.
-    //
-    // The persisted entry carries the ATTRIBUTION key, not the raw stream
-    // identity: sidecar refused_stream rows are keyed by
-    // recordHeadlessUsageLocked's canonical model, so a raw gateway/Coder
-    // identity here (e.g. coder:openai/gpt-5 vs openai:gpt-5) would
-    // split one model across two analytics buckets when queries group
-    // committed hop rows and sidecar rows together.
-    streamInfo.toolModelUsages.push({
-      toolName: MODEL_FALLBACK_REFUSAL_TOOL_NAME,
-      // Record time: wall clock until #7282 moves its consumers to HostClock.
-      timestamp: nodeClock.nowMs(),
-      model: this.usageLedger.attributionModel(refusedModel, streamInfo.metadataModel),
-      metadataModel: streamInfo.metadataModel,
-      usage: usage ?? zeroTokenUsage(),
-      ...(providerMetadata ? { providerMetadata } : {}),
-    });
-
-    if (!usage) {
-      return;
-    }
-
-    await this.usageLedger.settle(
+    await this.usageLedger.recordRefusedAttempt(
       workspaceId,
       streamInfo,
-      usage,
-      providerMetadata,
-      "Failed to record refused-attempt session usage (fallback unaffected)",
-      "warn",
-      refusedModel
+      refusedModel,
+      await this.getRefusalUsageSnapshot(streamInfo)
     );
   }
 
@@ -4387,27 +4269,11 @@ export class StreamManager {
     streamInfo: WorkspaceStreamInfo,
     refusedModel: string
   ): Promise<void> {
-    const { usage, providerMetadata } = await this.getRefusalUsageSnapshot(streamInfo);
-
-    // Same zero-usage policy as recordRefusedAttemptUsage: the terminal
-    // refusal must reach the analytics sidecar (persistStreamError writes
-    // terminalRefusalUsage as a "refused_stream" row) even when the provider
-    // billed nothing, but the session ledger stays free of zero-cost entries.
-    streamInfo.terminalRefusalUsage = usage ?? zeroTokenUsage();
-    streamInfo.terminalRefusalProviderMetadata = providerMetadata;
-
-    if (!usage) {
-      return;
-    }
-
-    await this.usageLedger.settle(
+    await this.usageLedger.recordTerminalRefusal(
       workspaceId,
       streamInfo,
-      usage,
-      providerMetadata,
-      "Failed to record terminal-refusal session usage",
-      "warn",
-      refusedModel
+      refusedModel,
+      await this.getRefusalUsageSnapshot(streamInfo)
     );
   }
 
@@ -5496,7 +5362,7 @@ export class StreamManager {
     await this.flushPartialWrite(workspaceId, streamInfo, errorPartialMessage);
 
     try {
-      await this.recordDroppedPartialUsageInSidecar(
+      await this.usageLedger.recordDroppedPartialUsage(
         workspaceId,
         streamInfo,
         errorUsage,
