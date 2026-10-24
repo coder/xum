@@ -1777,6 +1777,67 @@ describe("ProjectSidebar flat chat list", () => {
     expect(listOrder()).toEqual(unpinnedOrder);
   });
 
+  test("collapses each section from its heading and keeps it collapsed after a remount", () => {
+    const pinned = {
+      ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
+      projects: singleProjectRefs,
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const regular = {
+      ...createWorkspace("regular-chat", { title: "Regular chat" }),
+      projects: singleProjectRefs,
+    };
+    mockDraftActions({
+      "/projects/demo-project": [{ draftId: "draft-kept", createdAt: Date.now(), manualName: "" }],
+    });
+    const renderFlatList = () =>
+      render(
+        <ProjectSidebar
+          collapsed={false}
+          onToggleCollapsed={() => undefined}
+          sortedWorkspacesByProject={new Map([["/projects/demo-project", [pinned, regular]]])}
+          workspaceRecency={{ "pinned-chat": Date.now(), "regular-chat": Date.now() }}
+        />
+      );
+    let view = renderFlatList();
+    // The project management row stands for the Projects section's rows.
+    const visibleRows = () => [
+      ...renderedRowIds(view.container),
+      ...(view.queryByRole("button", { name: "Create workspace in demo-project" })
+        ? ["project-row"]
+        : []),
+    ];
+    const toggleSection = (name: string) => fireEvent.click(view.getByRole("button", { name }));
+
+    toggleSection("Pinned");
+    expect(view.getByRole("button", { name: "Pinned" }).getAttribute("aria-expanded")).toBe(
+      "false"
+    );
+    expect(visibleRows()).toEqual([
+      "draft-item-draft-kept",
+      agentItemTestId("regular-chat"),
+      "project-row",
+    ]);
+    toggleSection("Recent");
+    toggleSection("Projects");
+    // Drafts belong to no section.
+    expect(visibleRows()).toEqual(["draft-item-draft-kept"]);
+
+    view.unmount();
+    view = renderFlatList();
+    expect(visibleRows()).toEqual(["draft-item-draft-kept"]);
+
+    toggleSection("Pinned");
+    toggleSection("Recent");
+    toggleSection("Projects");
+    expect(visibleRows()).toEqual([
+      "draft-item-draft-kept",
+      agentItemTestId("pinned-chat"),
+      agentItemTestId("regular-chat"),
+      "project-row",
+    ]);
+  });
+
   test("renders drafts first in the unsectioned zone and in their sub-project in the project view", () => {
     projectContextValue = createProjectContextValue({
       userProjects: new Map([
@@ -3651,6 +3712,31 @@ describe("ProjectSidebar project actions menu", () => {
       .find((props) => props.section.id === "section-1");
 
     expect(sectionProps?.hasAttention).toBe(true);
+  });
+
+  test("collapses a sub-project on its first toggle", () => {
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        [demoProjectPath, { workspaces: [] }],
+        [
+          "section-1",
+          { displayName: "Section 1", parentProjectPath: demoProjectPath, workspaces: [] },
+        ],
+      ]),
+    });
+    renderSidebar();
+    const latestSectionProps = () =>
+      (
+        SectionHeaderModule.SectionHeader as unknown as {
+          mock: { calls: Array<[Parameters<typeof SectionHeaderModule.SectionHeader>[0]]> };
+        }
+      ).mock.calls
+        .map(([props]) => props)
+        .findLast((props) => props.section.id === "section-1");
+
+    expect(latestSectionProps()?.isExpanded).toBe(true);
+    act(() => latestSectionProps()?.onToggleExpand?.());
+    expect(latestSectionProps()?.isExpanded).toBe(false);
   });
 
   test("supports inline project name editing with Enter, Escape, and empty-to-null commit", async () => {
