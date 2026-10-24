@@ -2,8 +2,8 @@
  * Pure fold of provider stream parts into turn-engine work.
  *
  * StreamManager.processStreamWithCleanup consumes the AI SDK fullStream part by
- * part. For the parts this module handles, partFold reads a read-only view of
- * the stream state and returns the work as data (FoldIntent[]). It calls
+ * part. For each part, partFold reads a read-only view of the stream state
+ * and returns the work as data (FoldIntent[]). It calls
  * nothing: no clock (the caller passes `now`), no I/O, no logging, no mutation.
  * StreamManager.applyStep runs the intents in order with the existing helpers.
  *
@@ -18,6 +18,12 @@ import type {
   ReasoningEndEvent,
 } from "@/common/types/stream";
 import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
+import { getErrorMessage } from "@/common/utils/errors";
+import {
+  readModelOnlyToolNotifications,
+  stripInternalToolResultFields,
+} from "@/common/utils/tools/internalToolResultFields";
+import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
 import {
   findFirstReasoningPartIndexInTrailingRun,
   mergeReasoningProviderOptions,
@@ -38,12 +44,20 @@ export interface ReasoningLifecyclePart {
   providerMetadata?: ReasoningProviderMetadata;
 }
 
-/** The stream parts partFold handles. Every other part type stays in StreamManager. */
-export type FoldablePart =
-  | { type: "start-step" }
-  | ({ type: "text-delta" } & Record<string, unknown>)
-  | ReasoningLifecyclePart
-  | ReasoningDeltaPart;
+interface ToolPart {
+  toolCallId: string;
+  toolName: string;
+  providerExecuted?: boolean;
+}
+
+/**
+ * Any AI SDK fullStream part. foldIntents narrows by `type` and reads each
+ * part type's fields, as the inline switch in processStreamWithCleanup did.
+ */
+export interface FoldablePart {
+  readonly type: string;
+  readonly [key: string]: unknown;
+}
 
 /** Read-only snapshot of the stream state the fold reads. */
 export interface FoldView {
@@ -52,6 +66,10 @@ export interface FoldView {
   readonly parts: readonly CompletedMessagePart[];
   readonly currentReasoningBlock: { readonly lastPart?: CompletedMessagePart } | undefined;
   readonly lastPartTimestamp: number;
+  /** The request runs on the Anthropic Messages wire (server-tool IDs are tracked). */
+  readonly anthropicMessagesWire: boolean;
+  /** Tool calls of the current attempt, by toolCallId. */
+  readonly toolCalls: ReadonlyMap<string, unknown>;
 }
 
 type ReasoningPart = Extract<CompletedMessagePart, { type: "reasoning" }>;
@@ -66,7 +84,13 @@ export type FoldIntent =
    * With trackInBlock, then set the current reasoning block's lastPart to this
    * exact object: signature deltas compare block.lastPart by reference.
    */
-  | { _tag: "Append"; part: CompletedMessagePart; trackInBlock: boolean }
+  | {
+      _tag: "Append";
+      part: CompletedMessagePart;
+      trackInBlock: boolean;
+      /** Tool parts append without scheduling a partial write. */
+      skipPartialWrite?: true;
+    }
   /**
    * Update the reasoning part at `index` in place (the object keeps its identity):
    * set `signature` when present, replace providerOptions, and with trackInBlock
@@ -83,7 +107,36 @@ export type FoldIntent =
   /** Fire-and-forget schedulePartialWrite (never awaited). */
   | { _tag: "SchedulePartialWrite" }
   /** Await checkSoftCancelStream. */
-  | { _tag: "CheckSoftCancel" };
+  | { _tag: "CheckSoftCancel" }
+  /** Await flushPartialWrite. */
+  | { _tag: "FlushPartialWrite" }
+  /** Await emitToolCallDeltaIfPresent for a part type the fold does not know. */
+  | { _tag: "EmitToolCallDelta"; part: FoldablePart }
+  /** Track the call in the attempt's tool-call map (and the Anthropic server-tool ID set). */
+  | {
+      _tag: "RecordToolCall";
+      toolCallId: string;
+      toolName: string;
+      input: unknown;
+      anthropicServerTool: boolean;
+    }
+  /** Set the output on the tracked tool call. */
+  | { _tag: "SetToolCallOutput"; toolCallId: string; output: unknown }
+  /** Await finishToolCall (complete the tool part, then check for a soft cancel). */
+  | {
+      _tag: "FinishToolCall";
+      toolCallId: string;
+      toolName: string;
+      output: unknown;
+      providerExecuted: boolean | undefined;
+      modelOnlyNotifications: string[] | undefined;
+    }
+  /** Debug-log the call with its JSON input length (JSON.stringify can throw, so the caller runs it). */
+  | { _tag: "LogToolCall"; toolName: string; input: unknown }
+  /** Count the orphan result and log it (the caller owns the per-turn count). */
+  | { _tag: "LogOrphanToolResult"; toolCallId: string; toolName: string; output: unknown }
+  /** Log the tool error; the caller picks the level from the abort state. */
+  | { _tag: "LogToolError"; toolCallId: string; toolName: string; error: unknown };
 
 /** typeof each text-delta payload key, for the caller's debug log. */
 export interface IgnoredTextDelta {
@@ -133,11 +186,28 @@ function foldIntents(view: FoldView, part: FoldablePart, cursor: StampCursor): F
     case "text-delta":
       return foldTextDelta(part, cursor);
     case "reasoning-start":
-      return foldReasoningStart(view, part, cursor);
+      return foldReasoningStart(view, part as ReasoningLifecyclePart, cursor);
     case "reasoning-delta":
-      return foldReasoningDelta(view, part, cursor);
+      return foldReasoningDelta(view, part as ReasoningDeltaPart, cursor);
     case "reasoning-end":
-      return foldReasoningEnd(view, part);
+      return foldReasoningEnd(view, part as ReasoningLifecyclePart);
+    default:
+      return foldToolPart(view, part, cursor);
+  }
+}
+
+function foldToolPart(view: FoldView, part: FoldablePart, cursor: StampCursor): FoldIntent[] {
+  switch (part.type) {
+    case "tool-call":
+      return foldToolCall(view, part as FoldablePart & ToolPart & { input: unknown }, cursor);
+    case "tool-result":
+      return foldToolResult(view, part as FoldablePart & ToolPart & { output: unknown });
+    // Handle tool-error parts from the stream (AI SDK 5.0+)
+    // These are emitted when tool execution fails (e.g., tool doesn't exist)
+    case "tool-error":
+      return foldToolError(part as FoldablePart & ToolPart & { error: unknown });
+    default:
+      return [{ _tag: "EmitToolCallDelta", part }];
   }
 }
 
@@ -339,4 +409,90 @@ function foldReasoningEnd(view: FoldView, part: ReasoningLifecyclePart): FoldInt
     { _tag: "CheckSoftCancel" }
   );
   return intents;
+}
+
+function foldToolCall(
+  view: FoldView,
+  part: ToolPart & { input: unknown },
+  cursor: StampCursor
+): FoldIntent[] {
+  // Note: Tool availability is handled by the SDK, which emits tool-error events
+  // for unavailable tools. No need to check here.
+
+  // IMPORTANT: Add tool part to streamInfo.parts immediately (not just on completion)
+  // This ensures in-progress tool calls are saved to partial.json if stream is interrupted
+  const toolPart = {
+    type: "dynamic-tool" as const,
+    toolCallId: part.toolCallId,
+    toolName: part.toolName,
+    state: "input-available" as const,
+    input: part.input,
+    timestamp: stamp(cursor),
+  };
+  const intents: FoldIntent[] = [
+    {
+      _tag: "RecordToolCall",
+      toolCallId: part.toolCallId,
+      toolName: part.toolName,
+      input: part.input,
+      anthropicServerTool: part.providerExecuted === true && view.anthropicMessagesWire,
+    },
+    { _tag: "LogToolCall", toolName: part.toolName, input: part.input },
+    { _tag: "Append", part: toolPart, trackInBlock: false, skipPartialWrite: true },
+  ];
+  // CRITICAL: Flush partial immediately for ask_user_question
+  // This tool blocks waiting for user input, and if the app restarts during
+  // that wait, the partial must be persisted so it can be restored.
+  // Without this, the throttled write might not complete before app shutdown.
+  if (part.toolName === "ask_user_question") {
+    intents.push({ _tag: "FlushPartialWrite" });
+  }
+  return intents;
+}
+
+function foldToolResult(view: FoldView, part: ToolPart & { output: unknown }): FoldIntent[] {
+  // Strip encrypted content from web search results before storing
+  const output = stripInternalToolResultFields(stripEncryptedContent(part.output));
+  const { toolCallId, toolName } = part;
+  return [
+    view.toolCalls.has(toolCallId)
+      ? { _tag: "SetToolCallOutput", toolCallId, output }
+      : { _tag: "LogOrphanToolResult", toolCallId, toolName, output },
+    {
+      _tag: "FinishToolCall",
+      toolCallId,
+      toolName,
+      output,
+      providerExecuted: part.providerExecuted,
+      // Kept beside the output, so the next turn's rebuild can resend them.
+      modelOnlyNotifications: readModelOnlyToolNotifications(part.output),
+    },
+  ];
+}
+
+function foldToolError(part: ToolPart & { error: unknown }): FoldIntent[] {
+  const { toolCallId, toolName, error } = part;
+  // Format error output. getErrorMessage (not bare JSON.stringify) so a
+  // cyclic/BigInt tool-error payload stays a recoverable tool error instead
+  // of throwing here and failing the whole stream.
+  const output = {
+    success: false,
+    error:
+      typeof error === "string"
+        ? error
+        : error instanceof Error
+          ? error.message
+          : getErrorMessage(error),
+  };
+  return [
+    { _tag: "LogToolError", toolCallId, toolName, error },
+    {
+      _tag: "FinishToolCall",
+      toolCallId,
+      toolName,
+      output,
+      providerExecuted: part.providerExecuted,
+      modelOnlyNotifications: undefined,
+    },
+  ];
 }
