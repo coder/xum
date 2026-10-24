@@ -476,6 +476,7 @@ function createWorkflowService(input: {
           runtimeTempDir: runtime.normalizePath(".xum/tmp", input.ctx.workspacePath),
           workspaceSessionDir,
           trusted: input.ctx.projectTrusted,
+          sessionLocks: input.ctx.services.historyService.locks,
         },
       }),
     resolveWorkflowScript: (scriptPath) =>
