@@ -2,6 +2,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 
 import {
+  isRemoteRuntime,
   isRuntimeReadFailure,
   isRuntimeTransportError,
   type Runtime,
@@ -16,7 +17,6 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import { resolveAgentDiscoveryContext } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveSkillStorageContext, type SkillStorageContext } from "./skillStorageContext";
-import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { PlatformPaths } from "@/node/utils/paths.main";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
@@ -210,7 +210,7 @@ function pluginRootsOf(
   AgentSkillsRoots,
   "projectPluginRoots" | "remoteProjectPluginRoots" | "globalPluginRoots" | "pluginManagedHome"
 > {
-  if (runtime instanceof RemoteRuntime) {
+  if (isRemoteRuntime(runtime)) {
     return {
       ...(projectContainers.length > 0 ? { remoteProjectPluginRoots: projectContainers } : {}),
       globalPluginRoots: [`${HOST_XUM_HOME}/plugins`, UNIVERSAL_PLUGINS_ROOT],
@@ -274,7 +274,7 @@ export function getProjectSkillRoots(roots: AgentSkillsRoots): string[] {
  * maps a `~/.mux` path to the Xum home.
  */
 export function getLegacyMuxGlobalSkillsRoot(runtime: Runtime, workspacePath: string): string {
-  if (resolveGlobalRuntime(runtime, workspacePath) instanceof RemoteRuntime) {
+  if (isRemoteRuntime(resolveGlobalRuntime(runtime, workspacePath))) {
     return `~/${LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR}`;
   }
   // The same home that universalRoot's `~/` expands to (HOME/USERPROFILE when called), not
@@ -296,8 +296,7 @@ async function isLegacyMuxRootTheGlobalRoot(
     );
     if (resolvedGlobal === resolvedLegacy) return true;
     return (
-      !(globalRuntime instanceof RemoteRuntime) &&
-      (await isSameHostDirectory(resolvedGlobal, resolvedLegacy))
+      !isRemoteRuntime(globalRuntime) && (await isSameHostDirectory(resolvedGlobal, resolvedLegacy))
     );
   } catch {
     // Unresolvable: keep the root, so its scan reports why it is unavailable.
@@ -822,7 +821,7 @@ async function listCandidateSkillNames(
 ): Promise<string[]> {
   if (candidate.singleSkillName != null) return [candidate.singleSkillName];
   if (candidate.pluginFs != null) return listSkillDirectories(candidate.pluginFs, resolvedRoot);
-  return candidate.runtime instanceof RemoteRuntime
+  return isRemoteRuntime(candidate.runtime)
     ? listSkillDirectoriesFromRuntime(candidate.runtime, resolvedRoot, { cwd: workspacePath })
     : listSkillDirectoriesFromLocalFs(resolvedRoot);
 }
