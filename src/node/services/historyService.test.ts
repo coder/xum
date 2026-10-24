@@ -9,7 +9,10 @@ import { createTestHistoryService } from "./testHistoryService";
 import { prepareProviderRequestMessages } from "./turnContextAssembler";
 import type { ContinuousCompactionJournal } from "@/common/orpc/schemas/continuousCompaction";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
-import { updateSubagentTranscriptArtifactsFile } from "./subagentTranscriptArtifacts";
+import {
+  getSubagentTranscriptArtifactsFilePath,
+  updateSubagentTranscriptArtifactsFile,
+} from "./subagentTranscriptArtifacts";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "node:assert";
 import { createHash } from "node:crypto";
@@ -4692,6 +4695,60 @@ describe("HistoryService", () => {
           )
         ).messages.map((message) => message.id)
       ).toEqual(["partial-only"]);
+    });
+
+    it("finds a transcript whose artifact index exists only in its SessionFiles", async () => {
+      // The index write and both index reads (the owner and the session scan) go through the
+      // history's SessionFiles (phase 5): with memory files, nothing reaches the disk.
+      const memory = await createTestHistoryService({ files: SessionFilesMemory });
+      try {
+        const ownerId = "memory-owner";
+        const taskId = "memory-task";
+        const ownerDir = path.join(memory.config.sessionsDir, ownerId);
+        const transcriptDir = path.join(ownerDir, "subagent-transcripts", taskId);
+        const chatPath = path.join(transcriptDir, "chat.jsonl");
+        const message = createMuxMessage("in-memory", "assistant", "saved", {
+          historySequence: 1,
+        });
+        await memory.files.promises.mkdir(transcriptDir, { recursive: true });
+        await memory.files.promises.writeFile(chatPath, JSON.stringify(message) + "\n");
+        await updateSubagentTranscriptArtifactsFile({
+          workspaceId: ownerId,
+          workspaceSessionDir: ownerDir,
+          files: memory.files,
+          update: (file) => {
+            file.artifactsByChildTaskId[taskId] = {
+              childTaskId: taskId,
+              parentWorkspaceId: ownerId,
+              createdAtMs: 1,
+              updatedAtMs: 1,
+              chatPath,
+            };
+          },
+        });
+        expect(
+          await memory.files.promises.readFile(
+            getSubagentTranscriptArtifactsFilePath(ownerDir),
+            "utf-8"
+          )
+        ).toContain(taskId);
+        expect(
+          await fs.access(ownerDir).then(
+            () => true,
+            () => false
+          )
+        ).toBe(false);
+
+        for (const requestingWorkspaceId of [ownerId, null]) {
+          const transcript = await memory.historyService.getSubagentTranscript(
+            { taskId, requestingWorkspaceId },
+            dependencies
+          );
+          expect(transcript.messages.map((row) => row.id)).toEqual(["in-memory"]);
+        }
+      } finally {
+        await memory.cleanup();
+      }
     });
 
     it("reports a cross-session miss", async () => {

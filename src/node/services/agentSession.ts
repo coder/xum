@@ -1976,7 +1976,12 @@ export class AgentSession {
 
     this.workspaceId = trimmedWorkspaceId;
     this.config = config;
-    this.memoryContextStore = new MemoryContextStore(config, trimmedWorkspaceId);
+    // The memory-context file is a session file: it follows the history's SessionFiles (phase 5).
+    this.memoryContextStore = new MemoryContextStore(
+      config,
+      trimmedWorkspaceId,
+      historyService.files
+    );
     this.historyService = historyService;
     this.compactionCancellation = new CompactionCancellation(
       historyService.getCompactionCancellationStorage(trimmedWorkspaceId)

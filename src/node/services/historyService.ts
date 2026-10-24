@@ -1256,7 +1256,10 @@ export class HistoryService {
       workspaceId: string;
       entry: SubagentTranscriptArtifactIndexEntry;
     } | null> => {
-      const artifacts = await readSubagentTranscriptArtifactsFile(this.getSessionDir(workspaceId));
+      const artifacts = await readSubagentTranscriptArtifactsFile(
+        this.getSessionDir(workspaceId),
+        this.files
+      );
       const entry = artifacts.artifactsByChildTaskId[taskId] ?? null;
       return entry ? { workspaceId, entry } : null;
     };
@@ -1464,7 +1467,8 @@ export class HistoryService {
     for (const dirent of dirents) {
       if (!dirent.isDirectory() || !dirent.name) continue;
       const artifacts = await readSubagentTranscriptArtifactsFile(
-        path.join(sessionsDir, dirent.name)
+        path.join(sessionsDir, dirent.name),
+        this.files
       );
       const entry = artifacts.artifactsByChildTaskId[taskId];
       if (entry && (!best || entry.updatedAtMs > best.entry.updatedAtMs)) {

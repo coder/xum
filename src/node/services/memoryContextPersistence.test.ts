@@ -7,6 +7,8 @@ import { Config } from "@/node/config";
 
 import { MEMORY_CONTEXT_FILE_NAME, MemoryContextStore } from "./memoryContextPersistence";
 import { DisposableTempDir } from "./tempDir";
+import { buildSessionFiles } from "@/node/services/sessionFiles/buildSessionFiles.testHarness";
+import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
 
 const WORKSPACE_ID = "workspace-memory-context-file";
 
@@ -100,5 +102,35 @@ describe("MemoryContextStore", () => {
       context: { indexEntries },
       memoryEnabled: true,
     });
+  });
+
+  test("saves, loads and discards through the SessionFiles it was given", async () => {
+    // AgentSession builds the store on the history's SessionFiles (phase 5): with memory files,
+    // the file lives in the memory volume and the session dir on disk is never created.
+    using tempDir = new DisposableTempDir("memory-context-files");
+    const config = new Config(tempDir.path);
+    const files = buildSessionFiles(SessionFilesMemory);
+    const store = new MemoryContextStore(config, WORKSPACE_ID, files);
+    const filePath = path.join(config.sessionsDir, WORKSPACE_ID, MEMORY_CONTEXT_FILE_NAME);
+    const contexts = new Map([["model", { context: null, memoryEnabled: false }]]);
+
+    expect(await store.save("window-1", contexts)).toBe(true);
+    expect(await files.promises.readFile(filePath, "utf-8")).toContain("window-1");
+    expect((await store.load())?.windowKey).toBe("window-1");
+    expect(
+      await fs.access(path.join(config.sessionsDir, WORKSPACE_ID)).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+
+    await store.discard();
+    expect(
+      await files.promises.access(filePath).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+    expect(await store.load()).toBeNull();
   });
 });

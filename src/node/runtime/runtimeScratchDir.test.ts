@@ -20,6 +20,9 @@ import {
 import { cdThenExecShell, runInPosixShell, shescape } from "./streamUtils";
 import { expandTildeForSSH } from "./tildeExpansion";
 import { getWorkspaceScratchDir } from "./workspaceScratchDir";
+import { createMemoryHost } from "@/node/services/hostFiles/memoryHostFiles.testHarness";
+import { buildSessionFiles } from "@/node/services/sessionFiles/buildSessionFiles.testHarness";
+import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
 
 /** A local runtime whose Xum home is a temp dir, standing in for an SSH host. */
 class FakeRemoteHomeRuntime extends LocalRuntime {
@@ -172,9 +175,44 @@ describe("runtimeScratchDir", () => {
         await canBindMountHostPathsIntoContainers({ DOCKER_CONTEXT: "gone" }, "linux", tempDir)
       ).toBe(false);
     });
+
+    test("reads the client config through the HostFiles it was given", async () => {
+      // The config names a remote context only in the memory volume. tempDir on disk has no
+      // config, which would mean the default local socket.
+      const host = createMemoryHost();
+      const configDir = path.join(tempDir, ".docker");
+      await host.files.promises.mkdir(configDir, { recursive: true });
+      await host.files.promises.writeFile(
+        path.join(configDir, "config.json"),
+        JSON.stringify({ currentContext: "remote" })
+      );
+
+      expect(await canBindMountHostPathsIntoContainers({}, "linux", tempDir, host.files)).toBe(
+        false
+      );
+      expect(await canBindMountHostPathsIntoContainers({}, "linux", tempDir)).toBe(true);
+    });
   });
 
   describe("ensureScratchDirForSpec", () => {
+    test("creates a host dir through the SessionFiles it was given", async () => {
+      // The host scratch dir is in the session dir: the turn creates it through the history's
+      // SessionFiles (phase 5), so memory files keep it off the disk.
+      const files = buildSessionFiles(SessionFilesMemory);
+      const dir = getWorkspaceScratchDir(path.join(tempDir, "sessions"), "ws-memory");
+
+      expect(
+        await ensureScratchDirForSpec(
+          new LocalRuntime(tempDir),
+          { kind: "host", dir },
+          undefined,
+          files
+        )
+      ).toBe(dir);
+      expect((await files.promises.stat(dir)).isDirectory()).toBe(true);
+      expect(await fs.readdir(tempDir)).toEqual([]);
+    });
+
     test("creates a runtime-side dir and returns the path the runtime expanded", async () => {
       const runtime = new LocalRuntime(tempDir);
       const scratch = path.join(tempDir, "remote-home", RUNTIME_SCRATCH_DIR_NAME, "ws1");
