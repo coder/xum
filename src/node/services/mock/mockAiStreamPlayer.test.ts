@@ -12,6 +12,7 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import * as path from "node:path";
 import * as tokenizerModule from "@/node/utils/main/tokenizer";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 
 function readWorkspaceId(payload: unknown): string | undefined {
   if (!payload || typeof payload !== "object") return undefined;
@@ -834,13 +835,13 @@ describe("MockAiStreamPlayer", () => {
     );
     abort.abort();
     expect((await held).success).toBe(true);
-    expect(await readTodosForSessionDir(sessionDir)).toEqual([]);
+    expect(await readTodosForSessionDir(sessionDir, nodeSessionFiles)).toEqual([]);
 
     // A finished stream leaves the list on disk before it ends (the turn-end nudge reads it).
     const result = await player.play([user("u-done", "[mock:todo-nudge] go")], workspaceId);
     if (!result.success || !result.data) throw new Error("expected a stream handle");
     expect(await result.data.completion).toMatchObject({ status: "completed" });
-    expect(await readTodosForSessionDir(sessionDir)).toEqual([
+    expect(await readTodosForSessionDir(sessionDir, nodeSessionFiles)).toEqual([
       { content: "Fixed the bug", status: "completed" },
       { content: "Verify the fix", status: "pending" },
     ]);

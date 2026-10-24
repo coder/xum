@@ -7,7 +7,7 @@ import { log } from "@/node/services/log";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { RuntimeError, isRuntimeTransportError } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
-import { setTodosForSessionDir } from "./todo";
+import { setTodosForSessionDir, toolSessionFiles } from "./todo";
 
 // Schema for propose_plan - empty object (no input parameters)
 // Defined locally to avoid type inference issues with `as const` in TOOL_DEFINITIONS
@@ -90,7 +90,8 @@ export const createProposePlanTool: ToolFactory = (config) => {
 
       if (config.workspaceId && config.workspaceSessionDir) {
         try {
-          const existingTodos = await readTodosForSessionDir(config.workspaceSessionDir);
+          const files = toolSessionFiles(config);
+          const existingTodos = await readTodosForSessionDir(config.workspaceSessionDir, files);
           const completedTodos = completeInProgressTodoItems(existingTodos);
           if (completedTodos !== existingTodos) {
             // A successful propose_plan ends the planning turn immediately, so persist the
@@ -100,7 +101,8 @@ export const createProposePlanTool: ToolFactory = (config) => {
               config.workspaceSessionDir,
               completedTodos,
               // Absent: setTodosForSessionDir's Node default.
-              config.sessionLocks
+              config.sessionLocks,
+              files
             );
           }
         } catch (error) {

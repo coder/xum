@@ -90,6 +90,8 @@ import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DesktopNotifications } from "@/node/services/desktopNotifications/desktopNotifications";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { TaskService } from "@/node/services/taskService";
@@ -154,6 +156,8 @@ export interface ToolConfiguration {
   desktopNotifications?: DesktopNotifications;
   /** Session locks of the todo and review pane writes. Absent: the Node layer (configs that tests build by hand). */
   sessionLocks?: SessionLocks;
+  /** Session files of the todo and review pane state. Absent: the Node layer (configs that tests build by hand). */
+  sessionFiles?: SessionFiles;
   /** Project roots in this workspace (single- or multi-project context for tool descriptions) */
   projects?: ProjectRef[];
   /** Environment secrets to inject (optional) */
@@ -590,7 +594,11 @@ function wrapToolsWithModelOnlyNotifications(
   }
 
   const engine = new NotificationEngine([
-    new TodoListReminderSource({ workspaceSessionDir: config.workspaceSessionDir }),
+    new TodoListReminderSource({
+      workspaceSessionDir: config.workspaceSessionDir,
+      // mutation-equivalent: sessionFiles is a SessionFiles object or undefined, so ?? and || agree
+      sessionFiles: config.sessionFiles ?? nodeSessionFiles,
+    }),
     // Only commands on this host can clutter this host's home dir, so gate on the runtime type
     // (XUM_RUNTIME), not on XUM_SCRATCH_DIR, which SSH/Docker/devcontainer export too. The
     // env value also covers multi-project local workspaces, whose MultiProjectRuntime wrapper is

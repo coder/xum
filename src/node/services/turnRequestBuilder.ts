@@ -2811,6 +2811,7 @@ export class TurnRequestBuilder {
       timelineService: this.dependencies.bindings.timelineService,
       desktopNotifications: this.dependencies.hostServices.desktopNotifications,
       sessionLocks: this.dependencies.historyService.locks,
+      sessionFiles: this.dependencies.historyService.files,
       // Agent-scheduled heartbeats start paid turns unattended, so they are user opt-in.
       workspaceHeartbeatService:
         this.dependencies.config.loadConfigOrDefault().agentHeartbeatsEnabled === true
