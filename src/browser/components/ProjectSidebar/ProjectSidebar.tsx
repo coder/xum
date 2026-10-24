@@ -172,22 +172,81 @@ import type { ProjectIconName } from "@/common/constants/projectIcons";
 import type { ProjectConfig } from "@/common/types/project";
 
 /**
- * Flat sidebar section heading ("Pinned", "Recent"), shown only above a non-empty section. A
- * label with rows above it gets more top spacing to separate it from them.
+ * Collapse state of sidebar sections: grouped sub-projects (getSectionExpandedKey) and the flat
+ * list's sections share one persisted map. Sections start expanded.
  */
-function FlatSectionLabel(props: { label: string; rowCount: number; rowsAbove: number }) {
+function useSectionExpansion() {
+  const [expandedSections, setExpandedSections] = usePersistedState<Record<string, boolean>>(
+    EXPANDED_SECTIONS_KEY,
+    {}
+  );
+  return {
+    isExpanded: (key: string): boolean => expandedSections[key] ?? true,
+    toggle: (key: string) => {
+      setExpandedSections((prev) =>
+        withRecordEntry(prev, key, !(prev[key] ?? true), SIDEBAR_EXPANSION_MAP_MAX_CHARS)
+      );
+    },
+  };
+}
+
+// Flat list sections in the useSectionExpansion map; grouped keys start with "section:".
+const FLAT_PINNED_SECTION_KEY = "flat:pinned";
+const FLAT_RECENT_SECTION_KEY = "flat:recent";
+const FLAT_PROJECTS_SECTION_KEY = "flat:projects";
+
+interface FlatSectionHeaderProps {
+  label: string;
+  rowCount: number;
+  expanded: boolean;
+  onToggle: () => void;
+}
+
+/** Flat sidebar section heading that collapses the section, shown only above a non-empty one. */
+function FlatSectionHeader(props: FlatSectionHeaderProps & { className: string }) {
   if (props.rowCount === 0) {
     return null;
   }
   return (
-    <div
+    <button
+      type="button"
+      onClick={props.onToggle}
+      aria-expanded={props.expanded}
       className={cn(
-        "font-monospace text-muted px-2 pb-1 text-[10.5px] tracking-[0.06em] uppercase",
-        props.rowsAbove === 0 ? "pt-2.5" : "pt-3.5"
+        "text-muted hover:text-foreground focus-visible:text-foreground flex w-full cursor-pointer items-center gap-1",
+        props.className
       )}
     >
       {props.label}
-    </div>
+      <ChevronRight
+        className="h-3 w-3 shrink-0 transition-transform duration-200"
+        style={{ transform: props.expanded ? "rotate(90deg)" : undefined }}
+      />
+    </button>
+  );
+}
+
+/**
+ * Flat sidebar chat section ("Pinned", "Recent"). A heading with rows above it gets more top
+ * spacing to separate it from them.
+ */
+function FlatChatSection(
+  props: FlatSectionHeaderProps & { rowsAbove: number; children: React.ReactNode }
+) {
+  return (
+    <>
+      <FlatSectionHeader
+        label={props.label}
+        rowCount={props.rowCount}
+        expanded={props.expanded}
+        onToggle={props.onToggle}
+        className={cn(
+          "font-monospace px-2 pb-1 text-[10.5px] tracking-[0.06em] uppercase",
+          props.rowsAbove === 0 ? "pt-2.5" : "pt-3.5"
+        )}
+      />
+      {props.expanded && props.children}
+    </>
   );
 }
 
@@ -907,11 +966,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const hideSubAgentRows =
     useUserPreferences((preferences) => preferences.ui?.sidebarHideSubAgents) ?? false;
 
-  // Track which sections are expanded
-  const [expandedSections, setExpandedSections] = usePersistedState<Record<string, boolean>>(
-    EXPANDED_SECTIONS_KEY,
-    {}
-  );
+  const sectionExpansion = useSectionExpansion();
 
   // Track parent workspaces whose reported child tasks are expanded.
   const [expandedCompletedSubAgents, setExpandedCompletedSubAgents] = usePersistedState<
@@ -1052,13 +1107,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     },
     [handleAddScratchWorkspace, handleAddWorkspace, sortedWorkspacesByProject, userProjects]
   );
-
-  const toggleSection = (projectPath: string, sectionId: string) => {
-    const key = getSectionExpandedKey(projectPath, sectionId);
-    setExpandedSections((prev) =>
-      withRecordEntry(prev, key, !prev[key], SIDEBAR_EXPANSION_MAP_MAX_CHARS)
-    );
-  };
 
   const handleForkWorkspace = useCallback(
     async (workspaceId: string, buttonElement?: HTMLElement) => {
@@ -1834,6 +1882,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // rename, color, delete) so core project operations stay reachable via
   // mouse/touch without leaving flat mode.
   const projectHeaderPaths = sortedProjectPaths;
+  const flatProjectsExpanded = sectionExpansion.isExpanded(FLAT_PROJECTS_SECTION_KEY);
+  // Flat mode can collapse its project management rows; grouped mode always lists every project.
+  const projectRowPaths = flatSidebarEnabled && !flatProjectsExpanded ? [] : projectHeaderPaths;
   // Flat rows identify their project by a monogram avatar, so projects without a configured
   // color get a stable hashed one instead of all sharing the default gray.
   const getProjectBadge = (projectPath: string): FlatProjectBadge =>
@@ -2527,28 +2578,34 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         );
       })}
       {/* Drafts lead the list without a section label of their own. */}
-      <FlatSectionLabel
+      <FlatChatSection
         label="Pinned"
         rowCount={visiblePinnedFlatWorkspaces.length}
         rowsAbove={flatDrafts.length}
-      />
-      {renderCoalescedWorkspaceList(visiblePinnedFlatWorkspaces, flatRowsForDisplay, {
-        tierKeyPrefix: "flat",
-        depthByWorkspaceId: flatDepthByWorkspaceId,
-        baseRowMetaByWorkspaceId: flatRowMetaByWorkspaceId,
-        renderRow: renderFlatRow,
-      })}
-      <FlatSectionLabel
+        expanded={sectionExpansion.isExpanded(FLAT_PINNED_SECTION_KEY)}
+        onToggle={() => sectionExpansion.toggle(FLAT_PINNED_SECTION_KEY)}
+      >
+        {renderCoalescedWorkspaceList(visiblePinnedFlatWorkspaces, flatRowsForDisplay, {
+          tierKeyPrefix: "flat",
+          depthByWorkspaceId: flatDepthByWorkspaceId,
+          baseRowMetaByWorkspaceId: flatRowMetaByWorkspaceId,
+          renderRow: renderFlatRow,
+        })}
+      </FlatChatSection>
+      <FlatChatSection
         label="Recent"
         rowCount={visibleUnpinnedFlatWorkspaces.length}
         rowsAbove={flatDrafts.length + visiblePinnedFlatWorkspaces.length}
-      />
-      {renderCoalescedWorkspaceList(visibleUnpinnedFlatWorkspaces, flatRowsForDisplay, {
-        tierKeyPrefix: "flat",
-        depthByWorkspaceId: flatDepthByWorkspaceId,
-        baseRowMetaByWorkspaceId: flatRowMetaByWorkspaceId,
-        renderRow: renderFlatRow,
-      })}
+        expanded={sectionExpansion.isExpanded(FLAT_RECENT_SECTION_KEY)}
+        onToggle={() => sectionExpansion.toggle(FLAT_RECENT_SECTION_KEY)}
+      >
+        {renderCoalescedWorkspaceList(visibleUnpinnedFlatWorkspaces, flatRowsForDisplay, {
+          tierKeyPrefix: "flat",
+          depthByWorkspaceId: flatDepthByWorkspaceId,
+          baseRowMetaByWorkspaceId: flatRowMetaByWorkspaceId,
+          renderRow: renderFlatRow,
+        })}
+      </FlatChatSection>
     </div>
   );
 
@@ -2850,12 +2907,16 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                   </div>
                 ) : (
                   <>
-                    {flatSidebarEnabled && projectHeaderPaths.length > 0 && (
-                      <div className="text-muted border-hover mt-1 border-t px-3 py-2 text-xs font-medium">
-                        Projects
-                      </div>
+                    {flatSidebarEnabled && (
+                      <FlatSectionHeader
+                        label="Projects"
+                        rowCount={projectHeaderPaths.length}
+                        expanded={flatProjectsExpanded}
+                        onToggle={() => sectionExpansion.toggle(FLAT_PROJECTS_SECTION_KEY)}
+                        className="border-hover mt-1 border-t px-3 py-2 text-xs font-medium"
+                      />
                     )}
-                    {projectHeaderPaths.map((projectPath) => {
+                    {projectRowPaths.map((projectPath) => {
                       const config = userProjects.get(projectPath);
                       if (!config) return null;
                       const projectFolderColor = config.color
@@ -3494,7 +3555,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                     section.id
                                   );
                                   const isSectionExpanded =
-                                    expandedSections[sectionExpandedKey] ?? true;
+                                    sectionExpansion.isExpanded(sectionExpandedKey);
                                   const shouldAutoEditSection =
                                     autoEditingSection?.projectPath === projectPath &&
                                     autoEditingSection?.sectionId === section.id;
@@ -3514,7 +3575,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                         }
                                         hasAttention={sectionHasAttention}
                                         onToggleExpand={() =>
-                                          toggleSection(projectPath, section.id)
+                                          sectionExpansion.toggle(sectionExpandedKey)
                                         }
                                         onAddWorkspace={() => {
                                           // Create workspace in this section
