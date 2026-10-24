@@ -10,11 +10,15 @@
  * - Each attempt's usage reaches the session ledger once: settle clears the in-flight key
  *   before its write, the same write marks the in-flight file settled, and a failed write
  *   keeps the file for the next ledger read instead of recording again.
+ * - A refused fallback hop is recorded as a toolModelUsages entry plus one settle; the
+ *   error path then does not record the cumulative counters again.
+ * - Sidecar (headless) rows never touch the session ledger (skipSessionLedger).
  */
 import { randomUUID } from "crypto";
 
 import {
   hasTokenUsage,
+  MODEL_FALLBACK_REFUSAL_TOOL_NAME,
   type MuxMetadata,
   type PersistedToolModelUsage,
 } from "@/common/types/message";
@@ -22,6 +26,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { normalizeUsageModelKey } from "@/common/utils/providers/modelEntries";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import type { Logger } from "@/node/services/log";
+import { nodeClock } from "@/node/utils/hostClock";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
@@ -53,6 +58,16 @@ export interface UsageTurn extends UsageLedgerState {
   readonly initialMetadata?: Partial<MuxMetadata>;
 }
 
+/** Drop reason for a partial that never reaches chat.jsonl. */
+export type DroppedStreamSource = "aborted_stream" | "errored_stream";
+/** Sidecar analytics label: drop reason, or the refusal-specific label. */
+type HeadlessDropSource = DroppedStreamSource | "refused_stream";
+
+export interface UsageSnapshot {
+  usage?: LanguageModelV2Usage;
+  providerMetadata?: Record<string, unknown>;
+}
+
 export interface UsageLedgerDeps {
   readonly sessionUsageService?: SessionUsageService;
   readonly getProvidersConfig: () => ProvidersConfigMap | null;
@@ -81,6 +96,20 @@ export function markProviderMetadataCostsIncluded(
       costsIncluded: true,
     },
   };
+}
+
+export function cloneUsage(usage: LanguageModelV2Usage): LanguageModelV2Usage {
+  return { ...usage };
+}
+
+/**
+ * Fresh all-zero usage object for refusals where the provider billed nothing
+ * (or usage never arrived). A new object per call — downstream code mutates
+ * usage objects (e.g. reasoning-token backfill), so a shared singleton would
+ * leak counts across records.
+ */
+function zeroTokenUsage(): LanguageModelV2Usage {
+  return { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 }
 
 export class UsageLedger {
@@ -176,6 +205,144 @@ export class UsageLedger {
     await this.discardKey(workspaceId, turn, key);
   }
 
+  /**
+   * Attribute a refused fallback attempt's token usage to the refusing model
+   * before the fallback swap wipes per-attempt counters. The toolModelUsages
+   * entry is the durable record (session-usage rebuilds scan it per-model); the
+   * live settle keeps in-memory session totals consistent with it.
+   */
+  async recordRefusedAttempt(
+    workspaceId: string,
+    turn: UsageTurn,
+    refusedModel: string,
+    snapshot: UsageSnapshot
+  ): Promise<void> {
+    const { usage, providerMetadata } = snapshot;
+    // Zero-usage refusals (provider billed nothing / usage never arrived) are
+    // still real refused attempts: record an explicit all-zero entry so
+    // analytics counts the refusal, but skip the session ledger below — no
+    // zero-cost noise in the costs UI.
+    //
+    // The persisted entry carries the ATTRIBUTION key, not the raw stream
+    // identity: sidecar refused_stream rows are keyed by
+    // recordHeadlessUsageLocked's canonical model, so a raw gateway/Coder
+    // identity here (e.g. coder:openai/gpt-5 vs openai:gpt-5) would
+    // split one model across two analytics buckets when queries group
+    // committed hop rows and sidecar rows together.
+    turn.toolModelUsages.push({
+      toolName: MODEL_FALLBACK_REFUSAL_TOOL_NAME,
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      timestamp: nodeClock.nowMs(),
+      model: this.attributionModel(refusedModel, turn.metadataModel),
+      metadataModel: turn.metadataModel,
+      usage: usage ?? zeroTokenUsage(),
+      ...(providerMetadata ? { providerMetadata } : {}),
+    });
+
+    if (!usage) {
+      return;
+    }
+
+    await this.settle(
+      workspaceId,
+      turn,
+      usage,
+      providerMetadata,
+      "Failed to record refused-attempt session usage (fallback unaffected)",
+      "warn",
+      refusedModel
+    );
+  }
+
+  async recordTerminalRefusal(
+    workspaceId: string,
+    turn: UsageTurn,
+    refusedModel: string,
+    snapshot: UsageSnapshot
+  ): Promise<void> {
+    const { usage, providerMetadata } = snapshot;
+    // Same zero-usage policy as recordRefusedAttempt: the terminal
+    // refusal must reach the analytics sidecar (persistStreamError writes
+    // terminalRefusalUsage as a "refused_stream" row) even when the provider
+    // billed nothing, but the session ledger stays free of zero-cost entries.
+    turn.terminalRefusalUsage = usage ?? zeroTokenUsage();
+    turn.terminalRefusalProviderMetadata = providerMetadata;
+
+    if (!usage) {
+      return;
+    }
+
+    await this.settle(
+      workspaceId,
+      turn,
+      usage,
+      providerMetadata,
+      "Failed to record terminal-refusal session usage",
+      "warn",
+      refusedModel
+    );
+  }
+
+  /**
+   * Route a dropped partial's billed usage to the headless-usage sidecar:
+   * the parent stream's cumulative usage plus every tool-internal model call
+   * (toolModelUsages). Used by the abort and error paths when the partial
+   * fails commitPartial's durability predicate — metadata stamped on such a
+   * partial dies with it, so the sidecar is the only route to the events
+   * table. skipSessionLedger everywhere: parent usage was recorded via
+   * settle and tool usage at report time (AIService).
+   */
+  async recordDroppedPartialUsage(
+    workspaceId: string,
+    turn: Pick<UsageTurn, "model" | "metadataModel" | "toolModelUsages">,
+    usage: LanguageModelV2Usage | undefined,
+    providerMetadata: Record<string, unknown> | undefined,
+    analyticsSource: DroppedStreamSource,
+    // Label for the stream's OWN usage row only. The error path passes
+    // "refused_stream" when the turn died as a terminal model refusal (the
+    // stream usage is then terminalRefusalUsage), so refusals are not
+    // conflated with generic errored_stream rows in analytics.
+    streamUsageSource: HeadlessDropSource = analyticsSource
+  ): Promise<void> {
+    // Thread the request-pinned metadata identities through the sidecar
+    // write: recordHeadlessUsage would otherwise re-resolve the raw model
+    // against the CURRENT config, so a Coder instance removed/retagged
+    // mid-turn would persist an unknown or repriced identity in analytics.
+    if (usage !== undefined) {
+      await this.deps.sessionUsageService?.recordHeadlessUsage(
+        workspaceId,
+        turn.model,
+        cloneUsage(usage),
+        providerMetadata,
+        {
+          analyticsSource: streamUsageSource,
+          skipSessionLedger: true,
+          metadataModel: turn.metadataModel,
+        }
+      );
+    }
+    for (const toolUsage of turn.toolModelUsages) {
+      // Refused fallback hops ARE refusals regardless of how the turn ended
+      // (aborted, errored, exhausted chain); every other tool-internal usage
+      // entry keeps the turn's drop reason.
+      const entrySource: HeadlessDropSource =
+        toolUsage.toolName === MODEL_FALLBACK_REFUSAL_TOOL_NAME
+          ? "refused_stream"
+          : analyticsSource;
+      await this.deps.sessionUsageService?.recordHeadlessUsage(
+        workspaceId,
+        toolUsage.model,
+        cloneUsage(toolUsage.usage),
+        toolUsage.providerMetadata,
+        {
+          analyticsSource: entrySource,
+          skipSessionLedger: true,
+          metadataModel: toolUsage.metadataModel,
+        }
+      );
+    }
+  }
+
   private async recordUsage(
     workspaceId: string,
     turn: Pick<UsageTurn, "workspaceName" | "metadataModel">,
@@ -231,7 +398,7 @@ export class UsageLedger {
    * their metadata identity can be a mappedToModel alias target (a pricing
    * identity, deliberately not the attribution bucket).
    */
-  attributionModel(model: string, metadataModel: string | undefined): string {
+  private attributionModel(model: string, metadataModel: string | undefined): string {
     return model.startsWith("coder:") && metadataModel
       ? metadataModel
       : normalizeUsageModelKey(model, this.deps.getProvidersConfig());
