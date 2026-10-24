@@ -98,12 +98,9 @@ import {
 } from "@/node/services/utils/sendMessageError";
 import { hasCommitWorthyParts, type HistoryService } from "./historyService";
 import {
-  addUsage,
-  accumulateProviderMetadata,
   accumulateStepsProviderMetadata,
   normalizeUsage,
   withCacheWriteMetadata,
-  withLongContextTokens,
 } from "@/common/utils/tokens/usageHelpers";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -140,9 +137,11 @@ import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import { hostClockFor } from "./di/hostClockLive";
 import {
+  clonePersistedToolModelUsage,
   cloneUsage,
   markProviderMetadataCostsIncluded,
   UsageLedger,
+  type UsageLedgerState,
 } from "@/node/services/turnEngine/UsageLedger";
 import {
   PartialJournal,
@@ -918,19 +917,6 @@ function buildUsageDeltaEvent(opts: {
   };
 }
 
-/**
- * Deep-clone a PersistedToolModelUsage so the stored copy is independent of the caller's object
- * (usage/providerMetadata are nested references the caller may mutate). Keeps providerMetadata
- * optional so the cloned object only carries the field when defined.
- */
-function clonePersistedToolModelUsage(event: PersistedToolModelUsage): PersistedToolModelUsage {
-  return {
-    ...event,
-    usage: { ...event.usage },
-    ...(event.providerMetadata != null ? { providerMetadata: event.providerMetadata } : {}),
-  };
-}
-
 function hasIncompleteToolCallPart(parts: CompletedMessagePart[]): boolean {
   return parts.some((part) => part.type === "dynamic-tool" && part.state !== "output-available");
 }
@@ -939,7 +925,7 @@ type DynamicToolCompletedMessagePart = Extract<CompletedMessagePart, { type: "dy
 type WorkflowRunToolAttachment = NonNullable<DynamicToolCompletedMessagePart["workflowRun"]>;
 
 // Comprehensive stream info
-interface WorkspaceStreamInfo extends PartialJournalState {
+interface WorkspaceStreamInfo extends PartialJournalState, Readonly<UsageLedgerState> {
   state: StreamState;
   streamResult: Awaited<ReturnType<typeof streamText>>;
   unlinkAbortSignal?: () => void;
@@ -986,16 +972,12 @@ interface WorkspaceStreamInfo extends PartialJournalState {
   /** Effective thinking level after model policy clamping */
   thinkingLevel?: string;
   initialMetadata?: Partial<MuxMetadata>;
-  toolModelUsages: PersistedToolModelUsage[];
   request: StreamRequestConfig;
   // Track last prepared step messages for safe retries after tool steps
   stepTracker: StepMessageTracker;
   // Track if a previousResponseId retry happened after a step completed so
   // stream-end uses cumulative usage instead of the retried step's totalUsage.
   didRetryPreviousResponseIdAtStep: boolean;
-  // Key of this attempt's in-flight usage file (SessionUsageService.recordInFlightUsage);
-  // set by the first finished step, cleared when the attempt settles or is discarded.
-  inFlightUsageKey?: string;
   // Track when Xum restarted the stream after an empty-output completion so
   // stream-end prefers cumulative usage across attempts instead of the final
   // attempt's totalUsage only.
@@ -1067,18 +1049,6 @@ interface WorkspaceStreamInfo extends PartialJournalState {
   // infos without a resource scope.
   resourceScope?: Scope.Closeable;
   resourceCleanup?: Promise<void>;
-  // Cumulative usage across all steps (for live cost display during streaming)
-  cumulativeUsage: LanguageModelV2Usage;
-  // Cumulative provider metadata across all steps (for live cost display with cache tokens)
-  cumulativeProviderMetadata?: Record<string, unknown>;
-  // Terminal model_refusal usage persisted on no-fallback error partials so live
-  // and rebuilt session costs include the refused attempt.
-  terminalRefusalUsage?: LanguageModelV2Usage;
-  terminalRefusalProviderMetadata?: Record<string, unknown>;
-  // Last step's usage (for context window display during streaming)
-  lastStepUsage?: LanguageModelV2Usage;
-  // Last step's provider metadata (for context window cache display)
-  lastStepProviderMetadata?: Record<string, unknown>;
   completionController: TurnCompletionController;
   terminalCompletion?: TurnCompletion;
 }
@@ -1422,7 +1392,7 @@ export class StreamManager {
       return;
     }
 
-    streamInfo.toolModelUsages.push(clonePersistedToolModelUsage(event));
+    this.usageLedger.recordToolModelUsage(streamInfo, event);
   }
 
   private getWorkflowRunAttachment(event: WorkflowRunAttachedEvent): WorkflowRunToolAttachment {
@@ -1839,24 +1809,15 @@ export class StreamManager {
     );
   }
 
-  private resolveTotalUsageForStreamEnd(
+  private endUsage(
     streamInfo: WorkspaceStreamInfo,
     totalUsage: LanguageModelV2Usage | undefined
   ): LanguageModelV2Usage | undefined {
-    const cumulativeUsage = streamInfo.cumulativeUsage;
-    if (this.restartedWithPreservedUsage(streamInfo) && hasTokenUsage(cumulativeUsage)) {
-      return cumulativeUsage;
-    }
-
-    // streamResult.totalUsage is read with a short timeout (getStreamMetadata) and can
-    // resolve to undefined under slow SDK settlement even though the provider billed the
-    // turn. Fall back to the live per-step accumulation so completed streams never
-    // persist an unpriced assistant message (analytics prices rows from metadata.usage).
-    if (!hasTokenUsage(totalUsage) && hasTokenUsage(cumulativeUsage)) {
-      return cumulativeUsage;
-    }
-
-    return totalUsage;
+    return this.usageLedger.endUsage(
+      streamInfo,
+      totalUsage,
+      this.restartedWithPreservedUsage(streamInfo)
+    );
   }
 
   private async backfillReasoningTokensFromParts(
@@ -1927,11 +1888,12 @@ export class StreamManager {
   private async resolveProviderMetadataForStreamEnd(
     streamInfo: WorkspaceStreamInfo
   ): Promise<Record<string, unknown> | undefined> {
-    const cumulative = streamInfo.cumulativeProviderMetadata;
-    if (this.restartedWithPreservedUsage(streamInfo) && cumulative) {
-      return { ...cumulative };
-    }
-    return this.getAggregatedProviderMetadata(streamInfo);
+    return (
+      this.usageLedger.preservedEndProviderMetadata(
+        streamInfo,
+        this.restartedWithPreservedUsage(streamInfo)
+      ) ?? this.getAggregatedProviderMetadata(streamInfo)
+    );
   }
 
   /**
@@ -2355,25 +2317,12 @@ export class StreamManager {
     stepUsage: LanguageModelV2Usage,
     stepProviderMetadata: Record<string, unknown> | undefined
   ): void {
-    // Update cumulative totals for this stream.
-    //
-    // Effect migration Phase 10: usage accounting stays in plain
-    // mutables on streamInfo by the plain-mutables rule — the only
-    // mutators are this AI-SDK fullStream loop and plain
-    // retry/reset methods, never fibers. The emit below runs with
+    // Update cumulative totals for this stream. The emit below runs with
     // zero suspension after the mutation (emitTurnEvent invokes
     // the sink synchronously), so downstream Effect queue bridges
     // (SubscriptionEmit's offerUnsafe) observe usage-delta events
     // in mutation order.
-    streamInfo.cumulativeUsage = addUsage(streamInfo.cumulativeUsage, stepUsage);
-    streamInfo.cumulativeProviderMetadata = accumulateProviderMetadata(
-      streamInfo.cumulativeProviderMetadata,
-      withLongContextTokens(stepProviderMetadata, stepUsage, streamInfo.metadataModel)
-    );
-
-    // Track last step's data for context window display
-    streamInfo.lastStepUsage = stepUsage;
-    streamInfo.lastStepProviderMetadata = stepProviderMetadata;
+    this.usageLedger.recordStep(streamInfo, stepUsage, stepProviderMetadata);
 
     const usageEvent = buildUsageDeltaEvent({
       workspaceId: workspaceId as string,
@@ -3706,7 +3655,6 @@ export class StreamManager {
       metadataModel,
       thinkingLevel,
       initialMetadata,
-      toolModelUsages: [],
       didRetryPreviousResponseIdAtStep: false,
       didRetryAfterEmptyOutput: false,
       ...(modelFallback && modelFallback.chain.length > 0
@@ -3737,8 +3685,7 @@ export class StreamManager {
       runtime, // Runtime for temp directory cleanup
       resourceScope: ctx.resourceScope, // Owns temp-dir release + debounce fiber
       // Initialize cumulative tracking for multi-step streams
-      cumulativeUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-      cumulativeProviderMetadata: undefined,
+      ...UsageLedger.initialState(),
     };
     // Single source for same-turn rebuilds: the receipt lives on initialMetadata (#5886).
     stepTracker.hasAnthropicReplayReceipt = () =>
@@ -4164,7 +4111,7 @@ export class StreamManager {
   ): Promise<void> {
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     const streamMeta = await this.getStreamMetadata(streamInfo);
-    const totalUsage = this.resolveTotalUsageForStreamEnd(streamInfo, streamMeta.totalUsage);
+    const totalUsage = this.endUsage(streamInfo, streamMeta.totalUsage);
     const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
     const previousResponseId = this.getOpenAIPreviousResponseId(streamInfo.request.providerOptions);
 
@@ -4675,7 +4622,7 @@ export class StreamManager {
   ): Promise<void> {
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     const streamMeta = await this.getStreamMetadata(streamInfo);
-    const totalUsage = this.resolveTotalUsageForStreamEnd(streamInfo, streamMeta.totalUsage);
+    const totalUsage = this.endUsage(streamInfo, streamMeta.totalUsage);
     const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
     const previousResponseId = this.getOpenAIPreviousResponseId(streamInfo.request.providerOptions);
     const providerDisplayName = getStreamProviderDisplayName(streamInfo.model);
@@ -4952,10 +4899,7 @@ export class StreamManager {
             // Falls back to tracked values when step retries invalidate totalUsage
             // or streamResult metadata fails/times out.
             const streamMeta = await this.getStreamMetadata(streamInfo);
-            const totalUsage = this.resolveTotalUsageForStreamEnd(
-              streamInfo,
-              streamMeta.totalUsage
-            );
+            const totalUsage = this.endUsage(streamInfo, streamMeta.totalUsage);
             await this.backfillReasoningTokensFromParts(streamInfo, totalUsage);
             const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
             const contextProviderMetadata =
@@ -5457,14 +5401,7 @@ export class StreamManager {
     streamInfo.terminalRawFinishReason = undefined;
 
     if (!preserveUsage) {
-      // The dropped attempt's usage is not recorded (refused attempts settled their own).
-      await this.usageLedger.discardInFlight(workspaceId, streamInfo);
-      streamInfo.cumulativeUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-      streamInfo.cumulativeProviderMetadata = undefined;
-      streamInfo.terminalRefusalUsage = undefined;
-      streamInfo.terminalRefusalProviderMetadata = undefined;
-      streamInfo.lastStepUsage = undefined;
-      streamInfo.lastStepProviderMetadata = undefined;
+      await this.usageLedger.resetForRetry(workspaceId, streamInfo);
     }
 
     if (!preserveParts) {
