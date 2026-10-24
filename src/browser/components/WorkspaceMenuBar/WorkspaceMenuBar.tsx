@@ -839,11 +839,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           isDesktop && "titlebar-no-drag"
         )}
       >
-        {/* The phone row starts at the screen edge when the left sidebar is collapsed (pl-0). */}
-        <AgentInterfaceViewToggle
-          workspaceId={workspaceId}
-          className={isPhoneHeader ? "ml-2" : undefined}
-        />
+        <AgentInterfaceViewToggle workspaceId={workspaceId} />
         {/* The footer hides these links at this width, so the header carries them. */}
         <WorkspaceLinks
           workspaceId={workspaceId}

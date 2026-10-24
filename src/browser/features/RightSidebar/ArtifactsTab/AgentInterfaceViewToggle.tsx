@@ -37,8 +37,9 @@ export function AgentInterfaceViewToggle(props: { workspaceId: string; className
       data-testid="agent-interface-view-toggle"
       className={cn(
         // Touch screens give buttons 44px targets (globals.css): the group grows to fit them,
-        // or its overflow clip would leave a 24px tap strip.
-        "border-border-light flex h-6 shrink-0 items-center overflow-hidden rounded border [@media(max-width:768px)_and_(pointer:coarse)]:h-11",
+        // or its overflow clip would leave a 24px tap strip. On phones (the menu bar's
+        // PHONE_HEADER_QUERY) it starts the actions row, which meets the screen edge.
+        "border-border-light flex h-6 shrink-0 items-center overflow-hidden rounded border [@media(max-width:768px)_and_(pointer:coarse)]:h-11 [@media(max-width:480px)_and_(pointer:coarse)]:ml-2",
         props.className
       )}
     >
