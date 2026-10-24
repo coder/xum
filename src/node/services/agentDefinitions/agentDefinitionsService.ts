@@ -2,6 +2,7 @@ import * as path from "node:path";
 import assert from "@/common/utils/assert";
 
 import {
+  isRemoteRuntime,
   isRuntimeReadFailure,
   isRuntimeTransportError,
   type Runtime,
@@ -12,7 +13,6 @@ import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { isAgentEffectivelyDisabled } from "./agentEnablement";
 import { resolveAgentVisibility } from "./agentVisibility";
-import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
@@ -167,7 +167,7 @@ function pluginRootsOf(
   AgentDefinitionsRoots,
   "projectPluginRoots" | "remoteProjectPluginRoots" | "globalPluginRoots"
 > {
-  if (runtime instanceof RemoteRuntime) {
+  if (isRemoteRuntime(runtime)) {
     return {
       ...(projectContainers.length > 0 ? { remoteProjectPluginRoots: projectContainers } : {}),
       // Tilde form: the host LocalRuntime maps ~/.xum to the host Xum home.
@@ -411,7 +411,7 @@ function listCandidateAgentFiles(
   resolvedRoot: string,
   workspacePath: string
 ): Promise<string[]> {
-  return scan.pluginFs == null && scan.runtime instanceof RemoteRuntime
+  return scan.pluginFs == null && isRemoteRuntime(scan.runtime)
     ? listAgentFilesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
     : listAgentFiles(scan.pluginFs, resolvedRoot);
 }

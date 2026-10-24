@@ -1,7 +1,6 @@
 import { LEGACY_REMOTE_MUX_HOME } from "@/common/compat/legacyMux";
-import type { Runtime } from "./Runtime";
+import { isRemoteRuntime, type Runtime } from "./Runtime";
 import { LocalRuntime } from "./LocalRuntime";
-import { RemoteRuntime } from "./RemoteRuntime";
 
 /**
  * SSH runtimes retain the legacy remote home because local startup cannot safely migrate
@@ -9,7 +8,7 @@ import { RemoteRuntime } from "./RemoteRuntime";
  * ~/.xum directory; Docker's separate /var/mux contract remains inside the container.
  */
 function shouldUseHostGlobalXumFallback(runtime: Runtime): boolean {
-  return runtime instanceof RemoteRuntime && runtime.getXumHome() === LEGACY_REMOTE_MUX_HOME;
+  return isRemoteRuntime(runtime) && runtime.getXumHome() === LEGACY_REMOTE_MUX_HOME;
 }
 
 /** Return the runtime used to read global xum agent and skill roots. */

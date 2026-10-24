@@ -5,7 +5,6 @@ import {
   listProjectMetadataRelativePaths,
 } from "@/common/compat/legacyMux";
 import type { XumToolScope } from "@/common/types/toolScope";
-import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { projectPluginsAllowed } from "@/node/utils/projectTrust";
@@ -91,7 +90,7 @@ function resolveProjectLocalRuntime(input: {
   runtime: Runtime;
   xumScope: Extract<XumToolScope, { type: "project" }>;
 }): Runtime {
-  if (input.runtime instanceof DevcontainerRuntime) {
+  if (input.runtime.location === "devcontainer") {
     // Devcontainer commands run in the container, but project-local skill roots point at
     // host paths. Use host-local I/O here so discovery can still reach host-global skills.
     return new LocalRuntime(input.xumScope.projectRoot);
