@@ -72,6 +72,15 @@ const PLATFORMS: AskUserQuestionQuestion = {
   ],
   multiSelect: true,
 };
+const REGION: AskUserQuestionQuestion = {
+  question: "Which region?",
+  header: "Region",
+  options: [
+    { label: "US East", description: "Virginia" },
+    { label: "EU West", description: "Ireland" },
+  ],
+  multiSelect: false,
+};
 
 function questionRow(
   id: string,
@@ -263,6 +272,22 @@ describe("AskUserQuestionDock", () => {
     expect(view.getByRole("button", { name: "Submit answers" })).toBeTruthy();
     expect(view.queryByText(STORAGE.question)).toBeNull();
     expect(view.queryByText(PLATFORMS.question)).toBeNull();
+  });
+
+  test("a remount keeps the form's tab, not the tab of a card that joined it", () => {
+    messages = [ROW_B, executing(questionRow("row-x", "ask-x", [STORAGE, REGION]))];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    // The card moves on to its second question.
+    fireEvent.click(view.getByText("SQLite"));
+
+    messages = [ROW_B, questionRow("row-x", "ask-x", [STORAGE, REGION])];
+    view.rerender(dock(workspaceId));
+    expect(view.getByText(PLATFORMS.question)).toBeTruthy();
+    view.unmount();
+
+    const second = render(dock(workspaceId), { wrapper: Wrapper });
+    expect(second.getByText(PLATFORMS.question)).toBeTruthy();
+    expect(second.queryByText(REGION.question)).toBeNull();
   });
 
   test("a retry after a lost response resends only the sent question sets, with the same id", async () => {

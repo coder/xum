@@ -131,7 +131,7 @@ function useChainGroups(props: AskUserQuestionChainProps) {
   return { groups, changeDraft };
 }
 
-/** The active tab: a question of one row, or the Summary. Null means the first question. */
+/** The active tab: a question of one row, or the Summary. Null while no question set is open. */
 type ActiveEntryKey = { rowId: string; questionIndex: number } | "summary" | null;
 
 // Per workspace, so the active tab survives a workspace switch (the dock remounts per workspace).
@@ -149,7 +149,7 @@ function resolveActiveIndex(key: ActiveEntryKey, groups: readonly ChainGroup[]):
     }
     offset += group.questions.length;
   }
-  // The row closed (or nothing was picked yet): the first question.
+  // The row closed (or none is open): the first question.
   return 0;
 }
 
@@ -165,11 +165,11 @@ function getActiveEntryKey(index: number, groups: readonly ChainGroup[]): Active
 }
 
 /**
- * The tab a single card left its row on. A non-blocking call has no result while it executes, so
- * it renders as its own card until it returns, then moves into the chain; that card cached its
- * tab with its drafts.
+ * Where the chain starts: the tab a single card left its row on, else the first question. A
+ * non-blocking call has no result while it executes, so it renders as its own card until it
+ * returns, then moves into the chain; that card cached its tab with its drafts.
  */
-function getCardActiveKey(groups: readonly ChainGroup[]): ActiveEntryKey {
+function getStartKey(groups: readonly ChainGroup[]): ActiveEntryKey {
   for (const group of groups) {
     const cardIndex = getCachedDraftState(group.draftKey)?.activeIndex ?? 0;
     if (cardIndex > 0) {
@@ -179,22 +179,23 @@ function getCardActiveKey(groups: readonly ChainGroup[]): ActiveEntryKey {
         : "summary";
     }
   }
-  return null;
+  return groups.length > 0 ? { rowId: groups[0].key, questionIndex: 0 } : null;
 }
 
 /**
  * The active tab, stored by row and question rather than by position: a row appended while the
- * user answers adds tabs after the current one without moving it. A new chain starts where the
- * user left the card its row came from; a mounted chain keeps its own tab.
+ * user answers adds tabs after the current one without moving it. The chain starts where the
+ * user left the card its row came from, then keeps its own tab, across a remount too.
  */
 function useChainActiveIndex(workspaceId: string, groups: readonly ChainGroup[]) {
   const [activeKey, setActiveKey] = useState<ActiveEntryKey>(
-    () => activeEntryByWorkspace.get(workspaceId) ?? getCardActiveKey(groups)
+    () => activeEntryByWorkspace.get(workspaceId) ?? getStartKey(groups)
   );
-  if (groups.length === 0 && activeKey !== null) {
-    // Adjust state during render (no effect): every question set closed, so the next one starts
-    // on its first question.
-    setActiveKey(null);
+  if ((groups.length === 0) !== (activeKey === null)) {
+    // Adjust state during render (no effect). The key is set while any question set is open, even
+    // if the user never moved: a remount must restore it rather than read the stale tab of a card
+    // that joined later. Once every set closed, the next one starts afresh.
+    setActiveKey(getStartKey(groups));
   }
 
   useEffect(() => {
