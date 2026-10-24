@@ -32,7 +32,7 @@ describe("ask_user_question occurrences", () => {
   });
   const answer = (choice: string, toolCallId = "call_0") => ({
     type: "user",
-    askUserQuestionAnswer: { toolCallId, answers: { "Which?": choice } },
+    askUserQuestionAnswers: [{ toolCallId, answers: { "Which?": choice } }],
   });
   const states = (
     transcript: readonly AskUserQuestionTranscriptRow[]

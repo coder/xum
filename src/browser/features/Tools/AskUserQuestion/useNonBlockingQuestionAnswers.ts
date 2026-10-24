@@ -10,7 +10,7 @@ import {
 } from "@/browser/utils/messages/openAskUserQuestions";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { useHostTranscriptMutationCheck } from "@/browser/utils/transcriptBarrier";
-import type { DisplayedMessage } from "@/common/types/message";
+import type { AskUserQuestionAnswerMetadata, DisplayedMessage } from "@/common/types/message";
 import type { AskUserQuestionQuestion } from "@/common/types/tools";
 import { createSendId } from "@/common/utils/drafts";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -18,7 +18,7 @@ import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import {
   ASK_USER_QUESTION_LEFT_CONTEXT_MESSAGE,
   type AskUserQuestionSelection,
-  buildAskUserQuestionAnswerMessage,
+  buildAskUserQuestionAnswersMessage,
   ASK_USER_QUESTION_SUPERSEDED_MESSAGE,
   type AskUserQuestionOccurrenceState,
   getAskUserQuestionOccurrenceState,
@@ -112,6 +112,51 @@ function readStoreTranscript(
   }
 }
 
+/** One question row's answers in an answer message. */
+export interface NonBlockingAnswerEntry {
+  toolCallId: string;
+  /** The transcript row's display id: tells apart rows that reuse a tool call id. */
+  rowId: string | undefined;
+  selections: AskUserQuestionSelection[];
+  answers: Record<string, string>;
+}
+
+/** One call keeps the object shape older builds read; a chained answer lists every call. */
+function buildAnswerMetadata(
+  entries: readonly NonBlockingAnswerEntry[]
+): AskUserQuestionAnswerMetadata | AskUserQuestionAnswerMetadata[] {
+  const metadata = entries.map((entry) => ({
+    toolCallId: entry.toolCallId,
+    answers: entry.answers,
+  }));
+  return metadata.length === 1 ? metadata[0] : metadata;
+}
+
+/**
+ * Why the message must not go out: a row closed since render (the state is a snapshot: a boundary
+ * or a question reusing the tool call id may have landed while the preferences flushed), or two
+ * entries name the same call (the agent could not tell their answers apart). Any closed row
+ * refuses the whole message, so the user never answers a set they can no longer review.
+ */
+function getAnswerMessageRefusal(
+  transcript: readonly DisplayedMessage[],
+  entries: readonly NonBlockingAnswerEntry[]
+): string | null {
+  const toolCallIds = new Set(entries.map((entry) => entry.toolCallId));
+  if (toolCallIds.size !== entries.length) {
+    return CLOSED_UNANSWERED_MESSAGES.superseded;
+  }
+  for (const entry of entries) {
+    const closedUnanswered = getClosedUnansweredReason(
+      getAskUserQuestionOccurrenceState(transcript, entry)
+    );
+    if (closedUnanswered !== null) {
+      return CLOSED_UNANSWERED_MESSAGES[closedUnanswered];
+    }
+  }
+  return null;
+}
+
 /**
  * Dispatches one answer message, behind the composer's barriers. Resolves with an error message,
  * or null once the backend accepted the send.
@@ -119,11 +164,9 @@ function readStoreTranscript(
 async function dispatchAnswerMessage(args: {
   api: NonNullable<ReturnType<typeof useLiveAPI>>;
   workspaceId: string;
-  toolCallId: string;
-  rowId: string | undefined;
+  entries: readonly NonBlockingAnswerEntry[];
   message: string;
   sendId: string;
-  answers: Record<string, string>;
   isTranscriptMutationAllowed: (workspaceId: string) => boolean;
   readTranscript: (workspaceId: string) => readonly DisplayedMessage[];
 }): Promise<string | null> {
@@ -135,16 +178,10 @@ async function dispatchAnswerMessage(args: {
     if (!args.isTranscriptMutationAllowed(args.workspaceId)) {
       return TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE;
     }
-    // The render-time state is a snapshot: a boundary or a question reusing the tool call id may
-    // have landed while the preferences flushed, so re-read the latest transcript before sending.
-    const closedUnanswered = getClosedUnansweredReason(
-      getAskUserQuestionOccurrenceState(args.readTranscript(args.workspaceId), {
-        toolCallId: args.toolCallId,
-        rowId: args.rowId,
-      })
-    );
-    if (closedUnanswered !== null) {
-      return CLOSED_UNANSWERED_MESSAGES[closedUnanswered];
+    // The render-time state is a snapshot, so re-read the latest transcript before sending.
+    const refusal = getAnswerMessageRefusal(args.readTranscript(args.workspaceId), args.entries);
+    if (refusal !== null) {
+      return refusal;
     }
     const result = await args.api.workspace.sendMessage({
       workspaceId: args.workspaceId,
@@ -152,10 +189,7 @@ async function dispatchAnswerMessage(args: {
       options: {
         ...getSendOptionsFromStorage(args.workspaceId),
         sendId: args.sendId,
-        muxMetadata: {
-          type: "normal",
-          askUserQuestionAnswer: { toolCallId: args.toolCallId, answers: args.answers },
-        },
+        muxMetadata: { type: "normal", askUserQuestionAnswer: buildAnswerMetadata(args.entries) },
       },
     });
     if (!result.success) {
@@ -166,6 +200,51 @@ async function dispatchAnswerMessage(args: {
   } catch (error) {
     return getErrorMessage(error);
   }
+}
+
+/**
+ * Sends the answers to one or more non-blocking question rows as one user message, and marks
+ * every row answered once the backend accepted it. Resolves with an error message, or null.
+ */
+export function useNonBlockingAnswerSender(
+  workspaceId: string | undefined
+): (entries: readonly NonBlockingAnswerEntry[]) => Promise<string | null> {
+  const liveApi = useLiveAPI();
+  const workspaceStore = useWorkspaceStoreRaw();
+  const isTranscriptMutationAllowed = useHostTranscriptMutationCheck();
+  // The idempotency id of the last unconfirmed send. A retry of the same message reuses it, so
+  // a lost success response cannot produce a second answer row (the backend never appends a
+  // second row for an id a row already carries).
+  const pendingSendRef = useRef<{ message: string; sendId: string } | null>(null);
+
+  return async (entries) => {
+    if (!liveApi || !workspaceId) {
+      return "API not connected";
+    }
+    const message = buildAskUserQuestionAnswersMessage(entries);
+    const pendingSend = pendingSendRef.current;
+    const sendId = pendingSend?.message === message ? pendingSend.sendId : createSendId();
+    pendingSendRef.current = { message, sendId };
+    const error = await dispatchAnswerMessage({
+      api: liveApi,
+      workspaceId,
+      entries,
+      message,
+      sendId,
+      isTranscriptMutationAllowed,
+      readTranscript: (id) => readStoreTranscript(workspaceStore, id),
+    });
+    if (error == null) {
+      pendingSendRef.current = null;
+      for (const entry of entries) {
+        setAcceptedAnswers(
+          { workspaceId, toolCallId: entry.toolCallId, rowId: entry.rowId },
+          entry.answers
+        );
+      }
+    }
+    return error;
+  };
 }
 
 /**
@@ -188,45 +267,10 @@ export function useNonBlockingQuestionAnswers(props: {
     answers: Record<string, string>
   ) => Promise<string | null>;
 } {
-  const liveApi = useLiveAPI();
-  const workspaceStore = useWorkspaceStoreRaw();
-  const isTranscriptMutationAllowed = useHostTranscriptMutationCheck();
+  const sendAnswers = useNonBlockingAnswerSender(props.workspaceId);
   const sentAnswers = useSyncExternalStore(subscribeAcceptedAnswers, () =>
     getAcceptedAnswers(props)
   );
-  // The idempotency id of the last unconfirmed send. A retry of the same message reuses it, so
-  // a lost success response cannot produce a second answer row (the backend never appends a
-  // second row for an id a row already carries).
-  const pendingSendRef = useRef<{ message: string; sendId: string } | null>(null);
-
-  const send = async (
-    selections: AskUserQuestionSelection[],
-    answers: Record<string, string>
-  ): Promise<string | null> => {
-    if (!liveApi || !props.workspaceId) {
-      return "API not connected";
-    }
-    const message = buildAskUserQuestionAnswerMessage(props.toolCallId, selections);
-    const pendingSend = pendingSendRef.current;
-    const sendId = pendingSend?.message === message ? pendingSend.sendId : createSendId();
-    pendingSendRef.current = { message, sendId };
-    const error = await dispatchAnswerMessage({
-      api: liveApi,
-      workspaceId: props.workspaceId,
-      toolCallId: props.toolCallId,
-      rowId: props.rowId,
-      message,
-      sendId,
-      answers,
-      isTranscriptMutationAllowed,
-      readTranscript: (workspaceId) => readStoreTranscript(workspaceStore, workspaceId),
-    });
-    if (error == null) {
-      pendingSendRef.current = null;
-      setAcceptedAnswers(props, answers);
-    }
-    return error;
-  };
 
   return {
     ...getNonBlockingQuestionState({
@@ -237,6 +281,7 @@ export function useNonBlockingQuestionAnswers(props: {
       transcript: props.transcript,
       sentAnswers,
     }),
-    send,
+    send: (selections, answers) =>
+      sendAnswers([{ toolCallId: props.toolCallId, rowId: props.rowId, selections, answers }]),
   };
 }

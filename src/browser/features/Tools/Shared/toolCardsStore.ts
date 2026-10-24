@@ -3,6 +3,7 @@ import assert from "@/common/utils/assert";
 import { isDynamicToolPart } from "@/common/types/toolParts";
 import type { getToolComponent } from "./getToolComponent";
 import type { ProposePlanToolCall } from "../ProposePlanToolCall";
+import type { AskUserQuestionChain } from "../AskUserQuestion/AskUserQuestionChain";
 
 // The tool cards (getToolComponent's registry, ~150 KB brotli with markdown-it and framer-motion)
 // are off the workspace page's first load (T3, #5971): in the browser a chat without tool calls
@@ -12,6 +13,7 @@ import type { ProposePlanToolCall } from "../ProposePlanToolCall";
 export interface ToolCards {
   getToolComponent: typeof getToolComponent;
   ProposePlanToolCall: typeof ProposePlanToolCall;
+  AskUserQuestionChain: typeof AskUserQuestionChain;
 }
 
 let cards: ToolCards | null = null;

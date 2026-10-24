@@ -589,8 +589,12 @@ interface MuxMessageMetadataBase {
    * ask_user_question (answerDelivery "message"). A display hint only, like Codex dropping a
    * pending question once its reply is in history: the card shows these answers instead of the
    * form. Nothing gates on it, so a missing or forged value only changes which card looks open.
+   *
+   * One answered call is an object (the only shape older builds read). The dock's chained form
+   * answers several open calls in one message and sends an array, one entry per call; an older
+   * build drops the array as malformed and keeps showing those calls as open (display-only).
    */
-  askUserQuestionAnswer?: AskUserQuestionAnswerMetadata;
+  askUserQuestionAnswer?: AskUserQuestionAnswerMetadata | AskUserQuestionAnswerMetadata[];
   /** Command prefix to highlight in UI (e.g., "/compact -m sonnet" or "/react-effects") */
   commandPrefix?: string;
   /**
@@ -1447,8 +1451,8 @@ export type DisplayedMessage =
       reviews?: ReviewNoteDataForDisplay[];
       /** Message sent from an artifact (from muxMetadata); drives the "from artifact" pill. */
       artifactInteraction?: ArtifactInteractionMetadata;
-      /** Answers to a non-blocking ask_user_question (from muxMetadata). */
-      askUserQuestionAnswer?: AskUserQuestionAnswerMetadata;
+      /** Answers to non-blocking ask_user_question calls, one entry per call (from muxMetadata). */
+      askUserQuestionAnswers?: AskUserQuestionAnswerMetadata[];
       /** Present when this synthetic turn is a background bash monitor wake-up. */
       bashMonitorWake?: {
         records: BashMonitorWakeDisplayRecord[];
