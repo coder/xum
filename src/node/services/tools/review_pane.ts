@@ -190,6 +190,7 @@ export const createReviewPaneUpdateTool: ToolFactory = (config) => {
         config.workspaceId,
         config.workspaceSessionDir,
         args,
+        // mutation-equivalent: sessionLocks is a SessionLocks object or undefined, so ?? and || agree
         config.sessionLocks ?? nodeSessionLocks,
         {
           projectPath: config.workspaceProjectPath,
