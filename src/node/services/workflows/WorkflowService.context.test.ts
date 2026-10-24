@@ -15,6 +15,7 @@ import {
   startWorkflowRun,
   type WorkflowServiceContext,
 } from "./WorkflowService";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import { WorkflowArgsValidationError } from "./workflowArgs";
 import { WorkflowDeclaredPhasesValidationError } from "./workflowMetadata";
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
@@ -121,6 +122,7 @@ describe("WorkflowService request orchestration", () => {
         noteWorkflowRunTerminalAttention: mock(() => undefined),
         clearWorkflowRunDowngradeSettlement: mock(async () => undefined),
       },
+      historyService: { locks: nodeSessionLocks },
     } as unknown as WorkflowServiceContext;
     return { context, workspaceService, waitForInit };
   }

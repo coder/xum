@@ -17,6 +17,8 @@ import {
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
 import { TestTempDir } from "@/node/services/tools/testHelpers";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 describe("upsertProjectArtifact", () => {
   it("appends unmatched project artifacts instead of dropping them", () => {
@@ -97,7 +99,7 @@ describe("GitPatchArtifactService coordination", () => {
           totalCommitCount: 0,
         }),
       });
-      const service = new GitPatchArtifactService(config);
+      const service = new GitPatchArtifactService(config, nodeSessionLocks);
       const completed: string[] = [];
       const discovery = spyOn(agentDefinitions, "readAgentDefinition");
       const upsert = spyOn(patchArtifacts, "upsertSubagentGitPatchArtifact");
@@ -152,7 +154,18 @@ describe("GitPatchArtifactService coordination", () => {
       });
       return cfg;
     });
-    const service = new GitPatchArtifactService(config);
+    // The parent's index writes take the injected workspace FIFO, not the Node default.
+    const lockedWorkspaceIds: string[] = [];
+    const locks: SessionLocks = {
+      ...nodeSessionLocks,
+      workspaceFiles: {
+        withLock: <T>(workspaceId: string, operation: () => Promise<T>) => {
+          lockedWorkspaceIds.push(workspaceId);
+          return nodeSessionLocks.workspaceFiles.withLock(workspaceId, operation);
+        },
+      },
+    };
+    const service = new GitPatchArtifactService(config, locks);
     const parentSessionDir = path.join(config.sessionsDir, "parent");
     for (const continuation of [false, true]) {
       if (continuation) {
@@ -178,11 +191,13 @@ describe("GitPatchArtifactService coordination", () => {
       expect(artifact?.projectArtifacts[0]?.headCommitSha).toBe(git("rev-parse", "HEAD"));
       expect(completed).toBe(true);
     }
+    expect(lockedWorkspaceIds.length).toBeGreaterThan(0);
+    expect(new Set(lockedWorkspaceIds)).toEqual(new Set(["parent"]));
   });
 
   it("waits for an in-flight apply operation before refreshing the stable task artifact", async () => {
     using tempDir = new TestTempDir("git-patch-artifact-lock");
-    const service = new GitPatchArtifactService(new Config(tempDir.path));
+    const service = new GitPatchArtifactService(new Config(tempDir.path), nodeSessionLocks);
     let releaseApply: (() => void) | undefined;
     const applyGate = new Promise<void>((resolve) => {
       releaseApply = resolve;
@@ -268,7 +283,7 @@ describe("GitPatchArtifactService coordination", () => {
     });
 
     const snapshot = config.loadConfigOrDefault();
-    const service = new GitPatchArtifactService(config);
+    const service = new GitPatchArtifactService(config, nodeSessionLocks);
     const loadConfigSpy = spyOn(config, "loadConfigOrDefault");
     const completedChildIds: string[] = [];
     let resolveFreshCompletion: (() => void) | undefined;
