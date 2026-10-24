@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as http from "node:http";
-import type { AddressInfo } from "node:net";
+import * as net from "node:net";
 import * as zlib from "node:zlib";
 import { Client, fetch } from "undici/index.js";
 import { isBrotliResponseGuardNeeded, refuseBrotliResponses } from "./brotliResponseGuard";
@@ -17,7 +17,7 @@ beforeAll(async () => {
     res.end(brotli ? zlib.brotliCompressSync("secret") : zlib.gzipSync("hello"));
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  baseUrl = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`;
 });
 
 afterAll(async () => {
@@ -37,6 +37,28 @@ describe("refuseBrotliResponses", () => {
     const cause = (failure as TypeError).cause;
     expect(cause).toBeInstanceOf(Error);
     expect((cause as Error).message).toContain("Brotli");
+  });
+
+  test("forwards an informational response such as 103 Early Hints before the final one", async () => {
+    const body = zlib.gzipSync("hello");
+    const earlyHints = net.createServer((socket) => {
+      socket.once("data", () => {
+        const head =
+          "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n" +
+          `HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n`;
+        socket.end(Buffer.concat([Buffer.from(head), body]));
+      });
+    });
+    await new Promise<void>((resolve) => earlyHints.listen(0, "127.0.0.1", resolve));
+    const url = `http://127.0.0.1:${(earlyHints.address() as net.AddressInfo).port}`;
+    try {
+      const response = await fetch(url, {
+        dispatcher: new Client(url).compose(refuseBrotliResponses),
+      });
+      expect(await response.text()).toBe("hello");
+    } finally {
+      await new Promise((resolve) => earlyHints.close(resolve));
+    }
   });
 
   test.each([
