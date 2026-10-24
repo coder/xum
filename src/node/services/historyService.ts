@@ -696,7 +696,7 @@ export class HistoryService {
     options.abortSignal?.throwIfAborted();
     {
       {
-        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId, this.files))
           throw new Error(options.requireExistingHistory ? "session_unavailable" : "stale_cursor");
         if (options.requireExistingHistory) {
           // Either artifact counts as retained history (mirrors hasHistory): an archive-only
@@ -772,7 +772,8 @@ export class HistoryService {
   ): Promise<string | null> {
     try {
       const capture = async () => {
-        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return null;
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId, this.files))
+          return null;
         for (const marker of this.getTruncateMarkerPaths(workspaceId)) {
           // Any error but ENOENT rethrows, which also yields null below.
           const marked = await this.files.promises
@@ -818,7 +819,7 @@ export class HistoryService {
     const underLocks = <T>(operation: () => Promise<T>) =>
       this.withRecoveredHistoryLock(workspaceId, () =>
         this.withHistoryWriteFileLock(workspaceId, async () => {
-          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId, this.files)) {
             throw new Error("workspace was removed");
           }
           return operation();
@@ -918,7 +919,7 @@ export class HistoryService {
         workspaceId,
         (operation) =>
           this.withHistoryWriteFileLock(workspaceId, async () => {
-            if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
+            if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId, this.files))
               throw new Error(`workspace ${workspaceId} was removed; refusing journal mutation`);
             await this.files.ensurePrivateDir(this.getSessionDir(workspaceId));
             return operation();
@@ -1078,7 +1079,7 @@ export class HistoryService {
   ): Promise<T> {
     return this.fileLocks.withLock(workspaceId, () =>
       this.withHistoryWriteFileLock(workspaceId, async (assertStillOwned) => {
-        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId, this.files))
           throw new Error(`workspace ${workspaceId} was removed; refusing compaction mutation`);
         const sessionDir = this.getSessionDir(workspaceId);
         await assertStillOwned();
@@ -1690,7 +1691,7 @@ export class HistoryService {
       return;
     }
     await this.withHistoryWriteFileLock(workspaceId, async (assertStillOwned) => {
-      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId, this.files)) {
         return;
       }
       await this.getAppendProvenance(workspaceId).runMutation(async () => {
@@ -3127,7 +3128,8 @@ export class HistoryService {
         // Pass the lock's ownership check through, like the eager path after a boundary
         // write: a reclaimed stale lock must stop rotation before its destructive steps.
         await this.withHistoryWriteFileLock(workspaceId, async (assertLockOwned) => {
-          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return;
+          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId, this.files))
+            return;
           await this.files.ensurePrivateDir(this.getSessionDir(workspaceId));
           await provenance.runMutation(
             () => this.ensureSealedHistoryRotatedUnlocked(workspaceId, assertLockOwned),
@@ -3481,7 +3483,7 @@ export class HistoryService {
     workspaceId: string,
     message: MuxMessage
   ): Promise<Result<void>> {
-    if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+    if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId, this.files)) {
       return Err(`workspace ${workspaceId} was removed; refusing partial write`);
     }
     const workspaceDir = this.getSessionDir(workspaceId);
@@ -4104,7 +4106,7 @@ export class HistoryService {
       // late append would otherwise recreate the deleted session directory via
       // ensurePrivateDir below. Throwing here surfaces as a normal Err through
       // withRecoveredHistoryWriteResultLock.
-      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId, this.files)) {
         throw new Error(`workspace ${workspaceId} was removed; refusing history mutation`);
       }
       // Create the session dir with private permissions only for a live

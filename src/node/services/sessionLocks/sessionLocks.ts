@@ -18,6 +18,11 @@ export interface SessionLocks {
   readonly workspaceFiles: Pick<MutexMap<string>, "withLock">;
   /** A cross-process lock file. Node: acquireProcessFileLock. */
   acquireProcessFileLock(options: ProcessFileLockOptions): Promise<ProcessFileLock>;
+  /**
+   * A read-only probe of a lock file: true while any holder (this process or another, live or
+   * dead) has it. It never takes or reclaims the lock. Node: processFileLockExists, one stat.
+   */
+  processFileLockExists(lockPath: string): Promise<boolean>;
   /** A cross-process lock record. Node: acquireCrossProcessLock. */
   acquireCrossProcessLock(options: CrossProcessLockOptions): Promise<() => Promise<void>>;
   /** A read-only probe of a lock record: absent, dead or held. Node: inspectCrossProcessLock. */

@@ -26,6 +26,7 @@ import {
   historyWriteLockPath,
   workspaceRemovalTombstonePath,
 } from "@/node/services/workspaceRemoval";
+import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
 
 /** Collect all messages via iterateFullHistory (replaces removed getFullHistory). */
 async function collectFullHistory(service: HistoryService, workspaceId: string) {
@@ -506,6 +507,30 @@ describe("HistoryService", () => {
         () => false
       );
       expect(sessionDirExists).toBe(false);
+    });
+
+    it("reads the removal tombstone through its own SessionFiles", async () => {
+      // The tombstone exists only in the memory volume of this HistoryService's SessionFiles, so
+      // the refusal shows that the check read it there and not on the disk.
+      const memory = await createTestHistoryService({ files: SessionFilesMemory });
+      try {
+        const workspaceId = "removed-in-memory";
+        const tombstonePath = workspaceRemovalTombstonePath(memory.config.rootDir, workspaceId);
+        await memory.files.promises.mkdir(path.dirname(tombstonePath), { recursive: true });
+        await memory.files.promises.writeFile(
+          tombstonePath,
+          JSON.stringify({ workspaceId, removedAt: Date.now() })
+        );
+
+        const result = await memory.historyService.writePartial(
+          workspaceId,
+          createMuxMessage("late-partial", "assistant", "must not land")
+        );
+        expect(result.success).toBe(false);
+        if (!result.success) expect(result.error).toContain("was removed");
+      } finally {
+        await memory.cleanup();
+      }
     });
 
     it("read-path truncation recovery waits on the cross-process lock (r64)", async () => {

@@ -355,6 +355,12 @@ export function memorySessionLocks(
         },
       };
     },
+    // A memory file lock leaves no file, so the table answers: a dead holder stays until an
+    // acquire reclaims it, as its lock file would on the disk.
+    processFileLockExists: (lockPath) => {
+      assert(lockPath.length > 0, "processFileLockExists requires a lock path");
+      return Promise.resolve(table.owner(lockPath) !== undefined);
+    },
     acquireCrossProcessLock: async (options) => {
       if (foundByReaddir(options.lockPath) || options.createParentDirectory === false) {
         return await nodeSessionLocks.acquireCrossProcessLock(options);

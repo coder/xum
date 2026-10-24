@@ -150,6 +150,31 @@ export function describeSessionLocksContract(
         await reclaimed();
       }));
 
+    // branchSummary's marker reader relies on it: the probe sees the writer in every layer, and
+    // it never takes or reclaims the lock.
+    test("processFileLockExists sees an own or a foreign file lock, live or dead, and takes none", () =>
+      withLayer(async (locks, t) => {
+        const own = path.join(t.dir, "probe-own.lock");
+        const options = { lockPath: own, timeoutMs: SHORT_MS, label: "contract lock" };
+        expect(await locks.processFileLockExists(own)).toBe(false);
+        const lock = await locks.acquireProcessFileLock(options);
+        expect(await locks.processFileLockExists(own)).toBe(true);
+        await lock[Symbol.asyncDispose]();
+        expect(await locks.processFileLockExists(own)).toBe(false);
+        const live = path.join(t.dir, "probe-live.lock");
+        const holder = await t.foreignHolder(live, "live", "file");
+        expect(await locks.processFileLockExists(live)).toBe(true);
+        await holder.release();
+        expect(await locks.processFileLockExists(live)).toBe(false);
+        const dead = path.join(t.dir, "probe-dead.lock");
+        await t.foreignHolder(dead, "dead", "file");
+        expect(await locks.processFileLockExists(dead)).toBe(true);
+        expect(await locks.processFileLockExists(dead)).toBe(true);
+        const reclaimed = await locks.acquireProcessFileLock({ ...options, lockPath: dead });
+        expect(await locks.processFileLockExists(dead)).toBe(true);
+        await reclaimed[Symbol.asyncDispose]();
+        expect(await locks.processFileLockExists(dead)).toBe(false);
+      }));
     test("a dead foreign holder is reclaimed", () =>
       withLayer(async (locks, t) => {
         const file = path.join(t.dir, "dead-file.lock");

@@ -14,7 +14,6 @@
 
 import assert from "node:assert";
 import crypto from "node:crypto";
-import * as fs from "fs/promises";
 import * as path from "path";
 import {
   DurableEventSchema,
@@ -27,6 +26,8 @@ import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import type { ProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { Journal } from "./journal";
 import { BlobStore } from "./blobStore";
 
@@ -147,16 +148,20 @@ export class DurableEventJournal {
    * `locks` takes the blob lock and the journal's append lock (phase 4: SessionLocks). Callers with
    * a history service pass its locks. The process-wide registry (sharedDurableEventJournal) and
    * replayVerifySession have none, so they keep the Node default.
+   * `files` holds the journal and its blobs (phase 5: SessionFiles), with the same callers and
+   * defaults as `locks`.
    */
   constructor(
     sessionDir: string,
-    private readonly locks: SessionLocks = nodeSessionLocks
+    private readonly locks: SessionLocks = nodeSessionLocks,
+    private readonly files: SessionFiles = nodeSessionFiles
   ) {
     this.journalFilePath = path.join(sessionDir, DURABLE_EVENTS_FILE_NAME);
     this.blobLockPath = path.join(sessionDir, BLOB_LOCK_FILE_NAME);
     this.journal = new Journal<DurableEvent>({
       filePath: this.journalFilePath,
       locks,
+      files,
       schema: DurableEventSchema,
       getSeq: (row) => row.seq,
       getId: (row) => row.id,
@@ -176,7 +181,7 @@ export class DurableEventJournal {
         }
       },
     });
-    this.blobs = new BlobStore(path.join(sessionDir, BLOBS_DIR_NAME));
+    this.blobs = new BlobStore(path.join(sessionDir, BLOBS_DIR_NAME), files);
   }
 
   /** Append a draft; the journal assigns v/seq/ts (and id unless provided). */
@@ -359,7 +364,7 @@ export class DurableEventJournal {
   /** Journal file size in bytes; 0 when the file does not exist yet. */
   private async journalFileSize(): Promise<number> {
     try {
-      return (await fs.stat(this.journalFilePath)).size;
+      return (await this.files.promises.stat(this.journalFilePath)).size;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         return 0;

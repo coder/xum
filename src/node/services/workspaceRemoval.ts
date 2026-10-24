@@ -30,7 +30,6 @@
 import crypto from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import assert from "@/common/utils/assert";
 import { log } from "@/node/services/log";
@@ -42,6 +41,8 @@ import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { SESSION_MEMORY_DIR_NAME } from "@/common/constants/memory";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 
 /**
  * Removal failed WITHOUT a durable tombstone (r63). Callers must abort
@@ -134,10 +135,13 @@ export function refineApplyLockPath(rootDir: string, workspaceId: string): strin
  */
 export async function isWorkspaceRemovalTombstoned(
   rootDir: string,
-  workspaceId: string
+  workspaceId: string,
+  // The marker lives under `<rootDir>/locks`, not in a session dir, so the default is the host's
+  // files. HistoryService passes its own SessionFiles: the check needs only `access`.
+  files: { readonly promises: Pick<HostFiles["promises"], "access"> } = nodeHostFiles
 ): Promise<boolean> {
   try {
-    await fsPromises.access(workspaceRemovalTombstonePath(rootDir, workspaceId));
+    await files.promises.access(workspaceRemovalTombstonePath(rootDir, workspaceId));
     return true;
   } catch (error) {
     return !hasErrorCode(error, "ENOENT");
@@ -192,6 +196,8 @@ export async function removeSessionDirUnderMemoryLocks(args: {
   beforeTombstone?: () => Promise<void>;
   /** The refine and history locks (phase 4: SessionLocks). Absent: the Node layer. */
   locks?: SessionLocks;
+  /** Writes the tombstone and deletes the session dir (phase 5: HostFiles). Absent: the Node layer. */
+  files?: HostFiles;
 }): Promise<void> {
   assert(args.sessionDir.length > 0, "removeSessionDirUnderMemoryLocks requires a session dir");
   // Crash clearly on a malformed config (test stubs, future refactors): an
@@ -215,7 +221,11 @@ export async function removeSessionDirUnderMemoryLocks(args: {
       // proceeds to delete the session and deregister.
       await publishRemovalTombstone(args);
       tombstonePublishedUnderLocks = true;
-      await fsPromises.rm(args.sessionDir, { recursive: true, force: true });
+      // mutation-equivalent: files is a HostFiles object or undefined, so ?? and || agree
+      await (args.files ?? nodeHostFiles).promises.rm(args.sessionDir, {
+        recursive: true,
+        force: true,
+      });
     });
   } catch (error) {
     // The orphan path below assumes a wedged writer's target is THIS
@@ -269,6 +279,8 @@ export async function sealSubAgentForRemovalUnderMemoryLocks(args: {
   beforeTombstone: () => Promise<void>;
   /** The refine and history locks (phase 4: SessionLocks). Absent: the Node layer. */
   locks?: SessionLocks;
+  /** Writes the tombstone (phase 5: HostFiles). Absent: the Node layer. */
+  files?: HostFiles;
 }): Promise<void> {
   try {
     await withRemovalLocks(args, async () => {
@@ -284,11 +296,14 @@ async function publishRemovalTombstone(args: {
   rootDir: string;
   workspaceId: string;
   attemptId: string;
+  files?: HostFiles;
 }): Promise<void> {
   assert(args.attemptId.length > 0, "removal tombstone requires an attemptId");
+  // mutation-equivalent: files is a HostFiles object or undefined, so ?? and || agree
+  const files = args.files ?? nodeHostFiles;
   const tombstonePath = workspaceRemovalTombstonePath(args.rootDir, args.workspaceId);
-  await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
-  await writeFileAtomic(
+  await files.promises.mkdir(path.dirname(tombstonePath), { recursive: true });
+  await files.writeFileAtomic(
     tombstonePath,
     JSON.stringify({
       workspaceId: args.workspaceId,

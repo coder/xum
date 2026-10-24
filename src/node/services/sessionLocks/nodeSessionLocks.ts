@@ -1,7 +1,7 @@
 import { Layer } from "effect";
 import { SessionLocksTag } from "@/node/services/di/tags";
 import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { acquireProcessFileLock, processFileLockExists } from "@/node/utils/concurrency/fileLock";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import {
   acquireCrossProcessLock,
@@ -19,6 +19,7 @@ export const nodeSessionLocks: SessionLocks = {
   // let two writers of one workspace run at once.
   workspaceFiles: workspaceFileLocks,
   acquireProcessFileLock: (options) => acquireProcessFileLock(options),
+  processFileLockExists: (lockPath) => processFileLockExists(lockPath),
   acquireCrossProcessLock: (options) => acquireCrossProcessLock(options),
   inspectCrossProcessLock: (lockPath) => inspectCrossProcessLock(lockPath),
   useLeasesFor: (config) => workspaceUseLeasesFor(config),

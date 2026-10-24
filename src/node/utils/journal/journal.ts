@@ -17,10 +17,12 @@
  */
 
 import assert from "node:assert";
-import * as fs from "fs/promises";
+import type { FileHandle } from "fs/promises";
 import * as path from "path";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { log } from "@/node/services/log";
 
 /** Default bound on waiting for the append lock (see JournalOptions). */
@@ -64,6 +66,8 @@ export interface JournalOptions<T> {
   testOnlyBeforeAppendWrite?: () => Promise<void>;
   /** The session locks (phase 4); the default is the Node layer. */
   locks?: SessionLocks;
+  /** The session files that hold the journal (phase 5); the default is the Node layer. */
+  files?: SessionFiles;
 }
 
 export class Journal<T> {
@@ -76,6 +80,7 @@ export class Journal<T> {
   private readonly onAppended?: JournalOptions<T>["onAppended"];
   private readonly testOnlyBeforeAppendWrite?: () => Promise<void>;
   private readonly locks: SessionLocks;
+  private readonly files: SessionFiles;
   /** Next sequence to assign; null until the file has been scanned once. */
   private nextSeq: number | null = null;
   /**
@@ -101,6 +106,8 @@ export class Journal<T> {
     this.testOnlyBeforeAppendWrite = options.testOnlyBeforeAppendWrite;
     // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
     this.locks = options.locks ?? nodeSessionLocks;
+    // mutation-equivalent: files is a SessionFiles object or undefined, so ?? and || agree
+    this.files = options.files ?? nodeSessionFiles;
   }
 
   /**
@@ -110,7 +117,7 @@ export class Journal<T> {
    */
   async append(build: (seq: number) => T): Promise<T> {
     const task = this.writeQueue.then(async () => {
-      await fs.mkdir(path.dirname(this.filePath), { recursive: true });
+      await this.files.promises.mkdir(path.dirname(this.filePath), { recursive: true });
       // Cross-process serialization: seq derivation and the write must be one
       // exclusive unit, or a concurrent writer in another process (debug CLI
       // vs live backend) could assign the same sequence number.
@@ -147,7 +154,7 @@ export class Journal<T> {
       // duplicate sequence. Failure throws — callers already tolerate append
       // failures per the self-healing doctrine.
       await lock.assertStillOwned();
-      await fs.appendFile(this.filePath, payload, "utf-8");
+      await this.files.promises.appendFile(this.filePath, payload, "utf-8");
       this.nextSeq = seq + 1;
       const postAppendFileSize = fileSize + Buffer.byteLength(payload, "utf-8");
       this.lastKnownSize = postAppendFileSize;
@@ -170,7 +177,7 @@ export class Journal<T> {
   async read(): Promise<T[]> {
     let raw: string;
     try {
-      raw = await fs.readFile(this.filePath, "utf-8");
+      raw = await this.files.promises.readFile(this.filePath, "utf-8");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         return [];
@@ -221,7 +228,7 @@ export class Journal<T> {
   private async nextSeqLocked(): Promise<{ seq: number; fileSize: number }> {
     let fileSize = 0;
     try {
-      fileSize = (await fs.stat(this.filePath)).size;
+      fileSize = (await this.files.promises.stat(this.filePath)).size;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         throw error;
@@ -237,9 +244,9 @@ export class Journal<T> {
 
   /** True when the file exists, is non-empty, and does not end with "\n". */
   private async hasUnterminatedTail(): Promise<boolean> {
-    let handle: fs.FileHandle;
+    let handle: FileHandle;
     try {
-      handle = await fs.open(this.filePath, "r");
+      handle = await this.files.promises.open(this.filePath, "r");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         return false;
