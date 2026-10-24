@@ -96,6 +96,11 @@ function questionRow(
   };
 }
 
+/** The row while its call still executes: no result yet, so it renders as its own card. */
+function executing(row: Extract<DisplayedMessage, { type: "tool" }>): DisplayedMessage {
+  return { ...row, result: undefined, status: "executing" };
+}
+
 const ROW_A = questionRow("row-a", "ask-a", [STORAGE]);
 const ROW_B = questionRow("row-b", "ask-b", [PLATFORMS]);
 
@@ -208,11 +213,7 @@ describe("AskUserQuestionDock", () => {
 
   test("a blocking question keeps its own card after the chained form", () => {
     // Plan mode: the call still executes and waits for its answer, so it has no result yet.
-    const blocking: DisplayedMessage = {
-      ...questionRow("row-plan", "ask-plan", [PLATFORMS]),
-      result: undefined,
-      status: "executing",
-    };
+    const blocking = executing(questionRow("row-plan", "ask-plan", [PLATFORMS]));
     messages = [blocking, ROW_A];
     const view = render(dock(workspaceId), { wrapper: Wrapper });
 
@@ -238,14 +239,7 @@ describe("AskUserQuestionDock", () => {
   });
 
   test("drafts and the active tab survive the call returning without waiting", () => {
-    // While the call still executes it has no result, so it renders as its own card.
-    messages = [
-      {
-        ...questionRow("row-x", "ask-x", [STORAGE, PLATFORMS]),
-        result: undefined,
-        status: "executing",
-      },
-    ];
+    messages = [executing(questionRow("row-x", "ask-x", [STORAGE, PLATFORMS]))];
     const view = render(dock(workspaceId), { wrapper: Wrapper });
     fireEvent.click(view.getByText("SQLite"));
     expect(view.getByText(PLATFORMS.question)).toBeTruthy();
@@ -256,6 +250,19 @@ describe("AskUserQuestionDock", () => {
 
     expect(view.getByText(PLATFORMS.question)).toBeTruthy();
     expect(view.getByText("1/2 answered")).toBeTruthy();
+  });
+
+  test("a card left on its Summary reopens on the chained Summary", () => {
+    messages = [executing(questionRow("row-x", "ask-x", [STORAGE, PLATFORMS]))];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(view.getByRole("button", { name: "Summary" }));
+
+    messages = [questionRow("row-x", "ask-x", [STORAGE, PLATFORMS])];
+    view.rerender(dock(workspaceId));
+
+    expect(view.getByRole("button", { name: "Submit answers" })).toBeTruthy();
+    expect(view.queryByText(STORAGE.question)).toBeNull();
+    expect(view.queryByText(PLATFORMS.question)).toBeNull();
   });
 
   test("a retry after a lost response resends only the sent question sets, with the same id", async () => {
@@ -283,6 +290,28 @@ describe("AskUserQuestionDock", () => {
         "row-c",
       ])
     );
+  });
+
+  test("a changed answer after a failed send goes out under a new id", async () => {
+    messages = [ROW_A, ROW_B];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    sendMessage.mockImplementationOnce(() => Promise.reject(new Error("connection lost")));
+    fireEvent.click(view.getByRole("button", { name: "Summary" }));
+    fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+    await waitFor(() => expect(view.getByText(/connection lost/)).toBeTruthy());
+
+    fireEvent.click(view.getByRole("button", { name: "Storage" }));
+    fireEvent.click(view.getByText("SQLite"));
+    fireEvent.click(view.getByRole("button", { name: "Summary" }));
+    fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(2));
+    const [sent, resent] = sendMessage.mock.calls.map(
+      (call) => (call as [{ message: string; options: { sendId?: string } }])[0]
+    );
+    expect(resent.message).toContain("Tool call ask-a:\n- Question 1: option 1\n");
+    // A different message under the old id would be dropped as a repeat of the first send.
+    expect(resent.options.sendId).not.toBe(sent.options.sendId);
   });
 
   test("a question set that arrives while answering joins the mounted form", () => {
