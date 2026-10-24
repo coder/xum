@@ -17,6 +17,8 @@ interface ReplayState {
   parts: CompletedMessagePart[];
   block: { lastPart?: CompletedMessagePart } | undefined;
   lastPartTimestamp: number;
+  toolCalls: Map<string, unknown>;
+  anthropicMessagesWire: boolean;
 }
 
 function applyToState(state: ReplayState, step: FoldStep): void {
@@ -33,6 +35,8 @@ function applyToState(state: ReplayState, step: FoldStep): void {
       if (intent.signature) target.signature = intent.signature;
       target.providerOptions = intent.providerOptions;
       if (intent.trackInBlock && state.block) state.block.lastPart = target;
+    } else if (intent._tag === "RecordToolCall") {
+      state.toolCalls.set(intent.toolCallId, intent.input);
     }
   }
 }
@@ -46,6 +50,8 @@ function replay(
     parts: [],
     block: undefined,
     lastPartTimestamp: 0,
+    toolCalls: new Map(),
+    anthropicMessagesWire: false,
     ...initial,
   };
   const steps = sequence.map(([part, now]) => {
@@ -57,6 +63,8 @@ function replay(
         parts: state.parts,
         currentReasoningBlock: state.block,
         lastPartTimestamp: state.lastPartTimestamp,
+        anthropicMessagesWire: state.anthropicMessagesWire,
+        toolCalls: state.toolCalls,
       },
       part,
       now
@@ -369,5 +377,143 @@ describe("partFold", () => {
     ).toBe(54);
     expect(state.parts.map((part) => part.timestamp)).toEqual([51, 52, 53, 55]);
     expect(state.lastPartTimestamp).toBe(55);
+  });
+
+  describe("tool parts", () => {
+    const toolCall = (toolName: string, extra: Record<string, unknown> = {}): FoldablePart => ({
+      type: "tool-call",
+      toolCallId: "call-1",
+      toolName,
+      input: { script: "ls" },
+      ...extra,
+    });
+
+    test("a tool call is tracked, logged, appended without a partial write, then completed by its result", () => {
+      const { steps, state } = replay([
+        [toolCall("bash"), 100],
+        [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "bash",
+            // Encrypted web-search content never reaches the stored output.
+            output: [{ url: "https://example.com", encryptedContent: "secret" }],
+          },
+          200,
+        ],
+      ]);
+      expect(steps[0]).toEqual({
+        intents: [
+          {
+            _tag: "RecordToolCall",
+            toolCallId: "call-1",
+            toolName: "bash",
+            input: { script: "ls" },
+            anthropicServerTool: false,
+          },
+          { _tag: "LogToolCall", toolName: "bash", input: { script: "ls" } },
+          {
+            _tag: "Append",
+            part: {
+              type: "dynamic-tool",
+              toolCallId: "call-1",
+              toolName: "bash",
+              state: "input-available",
+              input: { script: "ls" },
+              timestamp: 100,
+            },
+            trackInBlock: false,
+            skipPartialWrite: true,
+          },
+        ],
+        lastPartTimestamp: 100,
+      });
+      const output = [{ url: "https://example.com" }];
+      expect(steps[1]).toEqual({
+        intents: [
+          { _tag: "SetToolCallOutput", toolCallId: "call-1", output },
+          {
+            _tag: "FinishToolCall",
+            toolCallId: "call-1",
+            toolName: "bash",
+            output,
+            providerExecuted: undefined,
+            modelOnlyNotifications: undefined,
+          },
+        ],
+        lastPartTimestamp: 100,
+      });
+      expect(state.toolCalls.has("call-1")).toBe(true);
+    });
+
+    test("ask_user_question flushes the partial after the append", () => {
+      const { steps } = replay([[toolCall("ask_user_question"), 100]]);
+      expect(tags(steps[0])).toEqual([
+        "RecordToolCall",
+        "LogToolCall",
+        "Append",
+        "FlushPartialWrite",
+      ]);
+    });
+
+    test("only provider-executed calls on the Anthropic Messages wire are server tools", () => {
+      const serverTool = (anthropicMessagesWire: boolean, providerExecuted: boolean) => {
+        const { steps } = replay([[toolCall("web_search", { providerExecuted }), 100]], {
+          anthropicMessagesWire,
+        });
+        const record = steps[0].intents[0];
+        return record._tag === "RecordToolCall" ? record.anthropicServerTool : null;
+      };
+      expect([serverTool(true, true), serverTool(true, false), serverTool(false, true)]).toEqual([
+        true,
+        false,
+        false,
+      ]);
+    });
+
+    test("a result without a tracked call is logged as an orphan and still completed", () => {
+      const { steps } = replay([
+        [
+          {
+            type: "tool-result",
+            toolCallId: "lost",
+            toolName: "web_search",
+            output: "ok",
+            providerExecuted: true,
+          },
+          100,
+        ],
+      ]);
+      expect(steps[0].intents).toEqual([
+        { _tag: "LogOrphanToolResult", toolCallId: "lost", toolName: "web_search", output: "ok" },
+        {
+          _tag: "FinishToolCall",
+          toolCallId: "lost",
+          toolName: "web_search",
+          output: "ok",
+          providerExecuted: true,
+          modelOnlyNotifications: undefined,
+        },
+      ]);
+    });
+
+    test("a tool error becomes a failed tool output whatever the error's form", () => {
+      const cyclic: Record<string, unknown> = { code: 7 };
+      cyclic.self = cyclic;
+      const errorText = (error: unknown) => {
+        const { steps } = replay([
+          [{ type: "tool-error", toolCallId: "call-1", toolName: "bash", error }, 100],
+        ]);
+        expect(tags(steps[0])).toEqual(["LogToolError", "FinishToolCall"]);
+        const finish = steps[0].intents[1];
+        return finish._tag === "FinishToolCall" ? finish.output : null;
+      };
+      expect(errorText("not found")).toEqual({ success: false, error: "not found" });
+      expect(errorText(new Error("exit 1"))).toEqual({ success: false, error: "exit 1" });
+      // A cyclic payload must not throw out of the fold.
+      const cyclicOutput = errorText(cyclic) as { success: boolean; error: unknown };
+      expect(cyclicOutput.success).toBe(false);
+      expect(typeof cyclicOutput.error).toBe("string");
+    });
   });
 });
