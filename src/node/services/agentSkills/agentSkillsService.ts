@@ -60,7 +60,7 @@ import { AgentSkillParseError, parseSkillMarkdown } from "./parseSkillMarkdown";
 import { getBuiltInSkillByName, getBuiltInSkillDescriptors } from "./builtInSkillDefinitions";
 import type { ProjectSkillContainment } from "./skillStorageContext";
 import {
-  discoverAgentPlugins,
+  discoverAgentPluginsOnHost,
   type AgentPluginContainer,
   hostPluginFs,
   type PluginFileReadArgs,
@@ -449,7 +449,7 @@ async function buildPluginScanCandidates(args: {
     }
   }
 
-  const { plugins } = await discoverAgentPlugins(resolvedContainers, { managedHome, fs: hostFs });
+  const { plugins } = await discoverAgentPluginsOnHost(hostFs, resolvedContainers, { managedHome });
 
   const candidates: AgentSkillScanCandidate[] = [];
   for (const plugin of plugins) {

@@ -44,7 +44,7 @@ import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommo
 
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
-  discoverAgentPlugins,
+  discoverAgentPluginsOnHost,
   hostPluginFs,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
   type AgentPluginContainer,
@@ -264,9 +264,8 @@ async function buildPluginAgentScanCandidates(args: {
     }
   }
 
-  const { plugins } = await discoverAgentPlugins(resolvedContainers, {
+  const { plugins } = await discoverAgentPluginsOnHost(hostFs, resolvedContainers, {
     managedHome: await localRuntime.resolvePath(args.managedHome),
-    fs: hostFs,
   });
 
   const candidates: AgentDefinitionScanCandidate[] = [];

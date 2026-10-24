@@ -215,6 +215,19 @@ export async function discoverAgentPluginsIn(
   return await pluginFsStorage.run(fs, () => discoverAgentPlugins(containers));
 }
 
+/**
+ * discoverAgentPlugins on a host filesystem (hostPluginFs of the caller's RuntimeFactory, phase
+ * 5). Unlike discoverAgentPluginsIn, managed containers are allowed: their registries and
+ * journals still read the Node host.
+ */
+export async function discoverAgentPluginsOnHost(
+  fs: PluginFs,
+  containers: AgentPluginContainer[],
+  options?: { managedHome?: string }
+): Promise<DiscoverAgentPluginsResult> {
+  return await pluginFsStorage.run(fs, () => discoverAgentPlugins(containers, options));
+}
+
 /** A plugin path that resolves into the plugin root's `.git` directory (#6161). */
 export class PluginGitPathError extends Error {
   constructor() {
@@ -1662,23 +1675,7 @@ export async function discoverAgentPlugins(
   options?: {
     /** Ownership and recovery authority only; never scanned or registered as MCP views. */
     managedHome?: string;
-    /**
-     * The host filesystem of the scan (hostPluginFs of the caller's RuntimeFactory). Absent:
-     * nodePluginFs. The registries and journals of managed containers still read the Node host.
-     */
-    fs?: PluginFs;
   }
-): Promise<DiscoverAgentPluginsResult> {
-  const fs = options?.fs;
-  return fs === undefined
-    ? await discoverAgentPluginsOnCurrentFs(containers, options)
-    : await pluginFsStorage.run(fs, () => discoverAgentPluginsOnCurrentFs(containers, options));
-}
-
-/** discoverAgentPlugins on the current PluginFs (pluginFs()). */
-async function discoverAgentPluginsOnCurrentFs(
-  containers: AgentPluginContainer[],
-  options: { managedHome?: string } | undefined
 ): Promise<DiscoverAgentPluginsResult> {
   let plugins: AgentPluginInfo[] = [];
   let diagnostics: AgentPluginDiagnostic[] = [];

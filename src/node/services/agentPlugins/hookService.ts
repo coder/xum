@@ -48,7 +48,7 @@ import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
 import { nodeHostFiles, nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 import {
   computeAgentPluginContainers,
-  discoverAgentPlugins,
+  discoverAgentPluginsOnHost,
   hostPluginFs,
   MAX_PLUGIN_HOOK_SOURCE_BYTES,
   nodePluginFs,
@@ -393,7 +393,7 @@ export class AgentPluginHookService {
     });
     // mutation-equivalent: hostFiles is a HostFiles object or undefined, so ?? and || agree
     const fs = hostPluginFs(args.hostFiles ?? nodeHostFiles);
-    const { plugins } = await discoverAgentPlugins(containers, { fs });
+    const { plugins } = await discoverAgentPluginsOnHost(fs, containers);
 
     const result: DiscoveredHookPlugin[] = [];
     for (const plugin of plugins) {
