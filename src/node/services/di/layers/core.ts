@@ -35,6 +35,8 @@ import {
   ContextManagement,
   DesktopNotificationsTag,
   RuntimeFactoryTag,
+  HostFilesTag,
+  HostPathsTag,
   Evaluation,
   ExtensionMetadata,
   FileLeaseManagerTag,
@@ -347,6 +349,8 @@ export const AILive = Layer.effect(
       {
         desktopNotifications: yield* DesktopNotificationsTag,
         runtimeFactory: yield* RuntimeFactoryTag,
+        hostFiles: yield* HostFilesTag,
+        hostPaths: yield* HostPathsTag,
       }
     );
   })

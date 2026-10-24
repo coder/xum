@@ -1,5 +1,6 @@
 import * as path from "path";
 import { assert } from "@/common/utils/assert";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 
 /**
@@ -125,14 +126,24 @@ export class ClutterScanner {
   }
 }
 
-const sharedScanners = new Map<string, ClutterScanner>();
+// One registry per HostFiles: the Node layer in production. A test graph on a memory volume
+// (phase 5) gets its own scanners, which read that volume.
+const sharedScanners = new WeakMap<HostFiles, Map<string, ClutterScanner>>();
 
-export function getSharedClutterScanner(homeDir: string): ClutterScanner {
+export function getSharedClutterScanner(
+  homeDir: string,
+  files: HostFiles = nodeHostFiles
+): ClutterScanner {
+  let byHome = sharedScanners.get(files);
+  if (byHome == null) {
+    byHome = new Map();
+    sharedScanners.set(files, byHome);
+  }
   const key = path.resolve(homeDir);
-  let scanner = sharedScanners.get(key);
+  let scanner = byHome.get(key);
   if (scanner == null) {
-    scanner = new ClutterScanner(getClutterWatchRoots(key));
-    sharedScanners.set(key, scanner);
+    scanner = new ClutterScanner(getClutterWatchRoots(key), (dir) => files.promises.readdir(dir));
+    byHome.set(key, scanner);
   }
   return scanner;
 }
