@@ -263,6 +263,12 @@ export async function readSubagentReportArtifactStrict(
   }
 }
 
+/** The workspace FIFO of the index writes: the caller's SessionLocks (phase 4), else the Node layer. */
+function workspaceFileLocksOf(locks: SessionLocks | undefined): SessionLocks["workspaceFiles"] {
+  // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
+  return (locks ?? nodeSessionLocks).workspaceFiles;
+}
+
 export async function updateSubagentReportArtifactsFile(params: {
   workspaceId: string;
   workspaceSessionDir: string;
@@ -270,8 +276,7 @@ export async function updateSubagentReportArtifactsFile(params: {
   /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
   locks?: SessionLocks;
 }): Promise<SubagentReportArtifactsFile> {
-  // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
-  const fileLocks = (params.locks ?? nodeSessionLocks).workspaceFiles;
+  const fileLocks = workspaceFileLocksOf(params.locks);
   return fileLocks.withLock(params.workspaceId, async () => {
     const file = await readSubagentReportArtifactsFile(params.workspaceSessionDir);
     params.update(file);
@@ -312,8 +317,7 @@ export async function upsertSubagentReportArtifact(params: {
 }): Promise<SubagentReportArtifactIndexEntry> {
   let updated: SubagentReportArtifactIndexEntry | null = null;
 
-  // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
-  const fileLocks = (params.locks ?? nodeSessionLocks).workspaceFiles;
+  const fileLocks = workspaceFileLocksOf(params.locks);
   await fileLocks.withLock(params.workspaceId, async () => {
     const nowMs = params.nowMs ?? Date.now();
 
