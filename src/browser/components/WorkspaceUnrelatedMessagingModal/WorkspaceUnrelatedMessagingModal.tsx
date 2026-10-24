@@ -108,6 +108,8 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
                     Applies to agents in other local chats in this Xum instance, outside this
                     chat&apos;s task tree. On by default for new chats you create, and for chats an
                     agent creates once their first turn ends; same-tree sub-agents are unaffected.
+                    Allowed agents can also read this chat&apos;s replies and history since its last
+                    reset, and wait for its turns to finish.
                   </DialogDescription>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
