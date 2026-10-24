@@ -618,7 +618,8 @@ export class SessionUsageService {
             providerMetadata,
             options
           );
-        }
+        },
+        this.historyService.locks
       );
     } catch (error) {
       log.warn("Failed to record headless usage", { workspaceId, modelString, error });

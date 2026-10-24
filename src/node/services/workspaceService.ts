@@ -8882,6 +8882,7 @@ export class WorkspaceService
             workspaceId,
             attemptId: removalAttemptId,
             workspaceStillRegistered: () => this.config.findWorkspace(workspaceId) != null,
+            locks: this.historyService.locks,
           });
         } catch (rollbackError) {
           // r63: a failed rollback must not be silent — the workspace
@@ -8964,6 +8965,7 @@ export class WorkspaceService
               workspaceId,
               attemptId: removalAttemptId,
               workspaceStillRegistered: () => this.config.findWorkspace(workspaceId) != null,
+              locks: this.historyService.locks,
             });
           } catch (rollbackError) {
             log.error(
