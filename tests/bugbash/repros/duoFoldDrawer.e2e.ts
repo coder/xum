@@ -23,7 +23,7 @@ const TAGS = ["bugbash", "duo-fold-drawer"];
 async function sidebarRight(browser: Browser): Promise<number> {
   const right = await browser.evaluate(() => {
     const sidebar = document.querySelector('[data-testid="left-sidebar"]');
-    if (sidebar == null || sidebar.getAnimations({ subtree: true }).length !== 0) return null;
+    if (sidebar?.getAnimations({ subtree: true }).length !== 0) return null;
     return sidebar.getBoundingClientRect().right;
   });
   return right ?? Number.NaN;
