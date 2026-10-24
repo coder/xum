@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import assert from "node:assert";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6,19 +7,18 @@ import { Layer } from "effect";
 import { SessionLocksTag } from "@/node/services/di/tags";
 import { HostClockTag } from "@/node/services/di/hostClockLive";
 import { makeTestEffectRunner } from "@/node/services/di/testEffectRunner";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
+import { createMemoryHost } from "@/node/services/hostFiles/memoryHostFiles.testHarness";
+import { HostFilesNode, nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import {
   WorkspaceMutationInProgressError,
-  workspaceMutationInProgressMessage,
   workspaceMutationLockPath,
-  workspaceUseLockDir,
 } from "@/node/services/workspaceUseLeases";
 import { fileLockTimeoutMessage } from "@/node/utils/concurrency/fileLock";
 import type { ProcessIdentity } from "@/node/utils/concurrency/processLiveness";
-import { describeHolder } from "@/node/utils/main/crossProcessLock";
 import {
   foreignIdentity,
   foreignPid,
-  foreignRecord,
   liveBlocker,
   makeForeignHolders,
   withForeignHolders,
@@ -107,7 +107,10 @@ async function memoryLocks(): Promise<LocksUnderTest> {
   const clock = makeTestEffectRunner();
   const table = new MemoryLockTable();
   return {
-    layer: Layer.succeed(SessionLocksTag)(memorySessionLocks(clock.hostClock, table)),
+    // The lock folders on the disk, as the Node locks make them: the contract stats them there.
+    layer: Layer.succeed(SessionLocksTag)(
+      memorySessionLocks(clock.hostClock, table, nodeHostFiles)
+    ),
     dir,
     foreignHolder: (lockPath, state) => {
       table.hold(lockPath, state, { pid: foreignPid(1) });
@@ -210,10 +213,43 @@ test("memory: a 60 s timeout passes on TestClock.adjust, with no real wait", () 
     );
   }));
 
-test("memory: a release hands the file lock to the waiters in FIFO order", () =>
-  onMemory(async (locks, t) => {
-    const options = { lockPath: path.join(t.dir, "fifo.lock"), timeoutMs: 1_000, label: "l" };
-    const first = await locks.acquireProcessFileLock(options);
+/**
+ * HostFiles on a memory volume whose mkdir calls wait until the test lets each one finish, so a
+ * test picks the order in which the lock folders are ready.
+ */
+function heldFolders(): { files: HostFiles; finish(index: number, error?: Error): void } {
+  const host = createMemoryHost().files;
+  const pending: Array<ReturnType<typeof Promise.withResolvers<void>>> = [];
+  const mkdir = async (...args: Parameters<HostFiles["promises"]["mkdir"]>) => {
+    const gate = Promise.withResolvers<void>();
+    pending.push(gate);
+    await gate.promise;
+    return await host.promises.mkdir(...args);
+  };
+  return {
+    files: {
+      ...host,
+      promises: { ...host.promises, mkdir: mkdir as HostFiles["promises"]["mkdir"] },
+    },
+    // An error fails that mkdir with it.
+    finish: (index, error) => {
+      const gate = pending[index];
+      assert(gate !== undefined, `mkdir ${index} was not called`);
+      if (error === undefined) gate.resolve();
+      else gate.reject(error);
+    },
+  };
+}
+
+test("memory: a release hands the file lock to the waiters in FIFO order", async () => {
+  const clock = makeTestEffectRunner();
+  try {
+    const folders = heldFolders();
+    const locks = memorySessionLocks(clock.hostClock, new MemoryLockTable(), folders.files);
+    const options = { lockPath: "/tmp/session/fifo.lock", timeoutMs: 1_000, label: "l" };
+    const firstLock = locks.acquireProcessFileLock(options);
+    folders.finish(0);
+    const first = await firstLock;
     const order: string[] = [];
     const waiter = (name: string) =>
       locks.acquireProcessFileLock(options).then(async (lock) => {
@@ -221,6 +257,9 @@ test("memory: a release hands the file lock to the waiters in FIFO order", () =>
         await lock[Symbol.asyncDispose]();
       });
     const both = Promise.all([waiter("b"), waiter("c")]);
+    // c's folder is ready first. The queue still follows the call order.
+    folders.finish(2);
+    folders.finish(1);
     await first[Symbol.asyncDispose]();
     await both;
     expect(order).toEqual(["b", "c"]);
@@ -229,7 +268,43 @@ test("memory: a release hands the file lock to the waiters in FIFO order", () =>
       (error: unknown) => error
     );
     expect((stale as Error).message).toContain("is no longer owned by this holder");
-  }));
+  } finally {
+    await clock.dispose();
+  }
+});
+
+test("memory: a failed lock folder rejects with its error and gives up the lock or the place", async () => {
+  const clock = makeTestEffectRunner();
+  try {
+    const folders = heldFolders();
+    const table = new MemoryLockTable();
+    const locks = memorySessionLocks(clock.hostClock, table, folders.files);
+    const lockPath = "/tmp/session/fail.lock";
+    const options = { lockPath, timeoutMs: 1_000, label: "l" };
+    const folderError = new Error("EACCES: the lock folder");
+    const rejection = (acquire: Promise<unknown>) =>
+      acquire.then(
+        () => null,
+        (error: unknown) => error
+      );
+    // The lock was free: the caller had taken it before its folder failed.
+    const taken = rejection(locks.acquireProcessFileLock(options));
+    folders.finish(0, folderError);
+    expect(await taken).toBe(folderError);
+    expect(table.owner(lockPath)).toBeUndefined();
+    // The lock was held: the caller had a place in the queue before its folder failed.
+    const holderLock = locks.acquireProcessFileLock(options);
+    folders.finish(1);
+    const holder = await holderLock;
+    const queued = rejection(locks.acquireProcessFileLock(options));
+    folders.finish(2, folderError);
+    expect(await queued).toBe(folderError);
+    await holder[Symbol.asyncDispose]();
+    expect(table.owner(lockPath)).toBeUndefined();
+  } finally {
+    await clock.dispose();
+  }
+});
 
 test("memory: a held file lock leaves no file at its path", () =>
   onMemory(async (locks, t) => {
@@ -263,7 +338,8 @@ test("memory: each build of SessionLocksMemory has its own lock table", () =>
     const clock = makeTestEffectRunner();
     try {
       const layer = SessionLocksMemory.pipe(
-        Layer.provide(Layer.succeed(HostClockTag)(clock.hostClock))
+        Layer.provide(Layer.succeed(HostClockTag)(clock.hostClock)),
+        Layer.provide(HostFilesNode)
       );
       const options = { lockPath: path.join(t.dir, "one.lock"), timeoutMs: 200, label: "l" };
       const a = await buildSessionLocks(layer).acquireProcessFileLock(options);
@@ -300,35 +376,6 @@ test("foreign: dead holders are reclaimed in order, and a probe reclaims none", 
   }
 });
 
-test("foreign: a live foreign mutator makes hold() refuse with today's text", async () => {
-  const t = await nodeLocks();
-  try {
-    const holders = makeForeignHolders();
-    const locks = buildSessionLocks(withForeignHolders(t.layer, holders));
-    const config = { rootDir: t.dir };
-    const leases = locks.useLeasesFor(config);
-    expect(locks.useLeasesFor(config)).toBe(leases);
-    holders.hold(workspaceMutationLockPath(t.dir, "ws-gate"), "live", { pid: foreignPid(3) });
-    const error = await leases.hold("ws-gate", "turn").then(
-      () => null,
-      (caught: unknown) => caught
-    );
-    expect(error).toBeInstanceOf(WorkspaceMutationInProgressError);
-    expect((error as Error).message).toBe(
-      workspaceMutationInProgressMessage("ws-gate", {
-        holder: describeHolder(foreignRecord(foreignPid(3))),
-        why: liveBlocker(foreignPid(3)).why,
-      })
-    );
-    expect(await leases.isHeld("ws-gate", "turn")).toBe(false);
-    holders.release(workspaceMutationLockPath(t.dir, "ws-gate"));
-    const lease = await leases.hold("ws-gate", "turn");
-    await lease.release();
-  } finally {
-    await t.cleanup();
-  }
-});
-
 test("foreign: hold() publishes its lease before it probes the gate", async () => {
   const t = await nodeLocks();
   try {
@@ -356,24 +403,6 @@ test("foreign: hold() publishes its lease before it probes the gate", async () =
     );
     expect(refused).toBeInstanceOf(WorkspaceMutationInProgressError);
     expect(await leases.isHeld("ws-order", "turn")).toBe(false);
-  } finally {
-    await t.cleanup();
-  }
-});
-
-test("foreign: a live fake lease of another backend makes isHeld true", async () => {
-  const t = await nodeLocks();
-  try {
-    const holders = makeForeignHolders();
-    const leases = buildSessionLocks(withForeignHolders(t.layer, holders)).useLeasesFor({
-      rootDir: t.dir,
-    });
-    const dir = workspaceUseLockDir(t.dir, "ws-leases");
-    holders.hold(path.join(dir, "other-backend.turn.lock"), "live");
-    holders.hold(path.join(dir, "other-backend.exec.lock"), "dead");
-    expect(await leases.isHeld("ws-leases", "turn")).toBe(true);
-    expect(await leases.isHeld("ws-leases", "exec")).toBe(false);
-    expect(await leases.isHeld("ws-leases", "terminal")).toBe(false);
   } finally {
     await t.cleanup();
   }

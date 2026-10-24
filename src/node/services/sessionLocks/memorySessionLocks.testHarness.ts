@@ -1,27 +1,39 @@
 /**
- * SessionLocks in memory: the lock files and records live in a table, and a
- * waiter waits on the HostClock, so under a TestClock a test moves time
- * instead of waiting. Refusals use today's text (fileLockTimeoutMessage,
- * crossProcessLockTimeoutMessage). Three parts stay on the Node locks:
+ * SessionLocks in memory: the lock files, records and use leases live in a
+ * table, and a waiter waits on the HostClock, so under a TestClock a test moves
+ * time instead of waiting. Refusals use today's text (fileLockTimeoutMessage,
+ * crossProcessLockTimeoutMessage, workspaceMutationInProgressMessage). The lock
+ * folders go to the injected HostFiles: the memory volume in the in-memory
+ * loop, so a lock writes nothing on the disk. Two parts stay on the Node locks:
  * - Init-record locks: InitStateManager lists their folder (initStateManager.ts
  *   isRecordLockHeld), so a holder in memory would leave no file, and a live
  *   init would look abandoned.
  * - Record locks with createParentDirectory false: WorkflowRunStore needs their
  *   acquire to fail with ENOENT once the run directory is gone, with no window
  *   between a check and the take. Only the Node lock's own write gives that.
- * - The use leases: the mutation gate, isHeld and taskService read other
- *   backends' lease files. Phase 5 moves them.
+ * A memory use lease leaves no lease file, so only this table sees it: the Node
+ * mutation gate (WorkspaceUseLeases.withMutationGate) and taskService's
+ * findForeignUse read lease files, and they are not SessionLocks members.
  */
 import assert from "node:assert";
-import * as fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { Effect, Layer } from "effect";
-import { SessionLocksTag } from "@/node/services/di/tags";
+import { HostFilesTag, SessionLocksTag } from "@/node/services/di/tags";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
+import {
+  workspaceMutationInProgressMessage,
+  workspaceMutationLockPath,
+  workspaceUseLockDir,
+} from "@/node/services/workspaceUseLeases";
 import { HostClockTag } from "@/node/services/di/hostClockLive";
 import type { HostClock } from "@/node/utils/hostClock";
 import type { ProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { fileLockTimeoutMessage } from "@/node/utils/concurrency/fileLock";
-import { CrossProcessLockTimeoutError } from "@/node/utils/concurrency/lockErrors";
+import {
+  CrossProcessLockTimeoutError,
+  WorkspaceMutationInProgressError,
+} from "@/node/utils/concurrency/lockErrors";
 import { getSelfIdentity, type ProcessIdentity } from "@/node/utils/concurrency/processLiveness";
 import {
   crossProcessLockTimeoutMessage,
@@ -80,6 +92,14 @@ export class MemoryLockTable {
 
   owner(lockPath: string): Entry | undefined {
     return this.held.get(lockPath);
+  }
+
+  /** Whether a live holder (this process or a foreign one) holds a path that matches. */
+  anyLive(matches: (lockPath: string) => boolean): boolean {
+    for (const [lockPath, entry] of this.held) {
+      if (!entry.dead && matches(lockPath)) return true;
+    }
+    return false;
   }
 
   /** Takes a free or dead lock now. Else null, and the caller waits or refuses. */
@@ -171,6 +191,100 @@ function acquireInMemory(
   });
 }
 
+/**
+ * Takes the lock's place in the FIFO at once, then creates the lock's folder: the Node locks
+ * create it before they try, and a caller may write into the folder once it holds the lock
+ * (branchSummary and refinementRollback lock inside the session folder). The place comes first
+ * because HostFiles has only an async mkdir: a later caller's folder can be ready first, and it
+ * would take the earlier caller's place (phase 4 saw that in 14 of 1500 runs). A failed mkdir
+ * rejects as the Node locks do, and gives up the place or the lock.
+ */
+async function acquireAfterFolder(
+  table: MemoryLockTable,
+  files: HostFiles,
+  lockPath: string,
+  acquire: (giveUp: AbortSignal) => Promise<Entry>
+): Promise<Entry> {
+  const giveUp = new AbortController();
+  // Settled into a value at once: an early refusal must not reject unhandled during the mkdir.
+  const acquired = acquire(giveUp.signal).then(
+    (entry) => ({ entry }),
+    (error: unknown) => ({ error })
+  );
+  try {
+    await files.promises.mkdir(path.dirname(lockPath), { recursive: true });
+  } catch (error) {
+    giveUp.abort();
+    const result = await acquired;
+    if ("entry" in result) table.free(lockPath, result.entry);
+    throw error;
+  }
+  const result = await acquired;
+  if ("error" in result) throw result.error;
+  return result.entry;
+}
+
+type UseLeases = ReturnType<SessionLocks["useLeasesFor"]>;
+
+/**
+ * The use leases of one backend, as WorkspaceUseLeases keeps them, with each lease file an entry
+ * of the table: the same path, so isHeld of every backend on the table sees it. The gate is the
+ * table's entry at workspaceMutationLockPath. Nothing here awaits, so a hold needs no transition
+ * lock: no other call runs between its publication and its probe.
+ */
+function memoryLeases(table: MemoryLockTable, rootDir: string): UseLeases {
+  const token = randomUUID();
+  const held = new Map<string, { count: number; entry: Entry }>();
+  return {
+    hold: (workspaceId, kind) => {
+      const leasePath = path.join(
+        workspaceUseLockDir(rootDir, workspaceId),
+        `${token}.${kind}.lock`
+      );
+      const existing = held.get(leasePath);
+      const entry = existing?.entry ?? table.tryTake(leasePath);
+      assert(entry !== null, "a lease path belongs to one backend");
+      // Publish first, probe second (WorkspaceUseLeases.hold). A nested hold probes too.
+      const gate = inspectInMemory(table, workspaceMutationLockPath(rootDir, workspaceId));
+      if (gate.state === "held") {
+        if (existing === undefined) table.free(leasePath, entry);
+        return Promise.reject(
+          new WorkspaceMutationInProgressError(
+            workspaceMutationInProgressMessage(workspaceId, gate)
+          )
+        );
+      }
+      if (existing === undefined) held.set(leasePath, { count: 1, entry });
+      else existing.count++;
+      let released = false;
+      return Promise.resolve({
+        // Idempotent: a second call never releases another holder's share.
+        release: () => {
+          if (released) return Promise.resolve();
+          released = true;
+          const file = held.get(leasePath);
+          assert(file !== undefined && file.count > 0, `use lease ${kind} over-released`);
+          file.count--;
+          if (file.count === 0) {
+            held.delete(leasePath);
+            table.free(leasePath, file.entry);
+          }
+          return Promise.resolve();
+        },
+      });
+    },
+    // Every backend's live lease of that kind, as WorkspaceUseLeases.isHeld lists the folder.
+    isHeld: (workspaceId, kind) => {
+      const dir = workspaceUseLockDir(rootDir, workspaceId);
+      return Promise.resolve(
+        table.anyLive(
+          (lockPath) => path.dirname(lockPath) === dir && lockPath.endsWith(`.${kind}.lock`)
+        )
+      );
+    },
+  };
+}
+
 function inspectInMemory(table: MemoryLockTable, lockPath: string): CrossProcessLockState {
   const entry = table.owner(lockPath);
   if (entry === undefined) return { state: "absent" };
@@ -184,8 +298,17 @@ export function foundByReaddir(lockPath: string): boolean {
   return lockPath.split(path.sep).join("/").includes("/locks/init-record/");
 }
 
-/** The memory locks over one table. SessionLocksMemory gives each build its own. */
-export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): SessionLocks {
+/**
+ * The memory locks over one table. SessionLocksMemory gives each build its own. files gets the
+ * lock folders: nodeHostFiles makes them on the disk as the Node locks do.
+ */
+export function memorySessionLocks(
+  clock: HostClock,
+  table: MemoryLockTable,
+  files: HostFiles
+): SessionLocks {
+  // One object per config, as workspaceUseLeasesFor gives.
+  const leasesByConfig = new WeakMap<object, UseLeases>();
   return {
     // Pure memory already: every session-file service shares this one FIFO.
     workspaceFiles: nodeSessionLocks.workspaceFiles,
@@ -194,16 +317,20 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
       // The same argument checks as fileLock.ts acquireProcessFileLock.
       assert(lockPath.length > 0, "acquireProcessFileLock requires a lock path");
       assert(timeoutMs > 0, "acquireProcessFileLock timeoutMs must be positive");
-      // As fileLock.ts does first: a caller may write into the folder once it holds the lock
-      // (branchSummary and refinementRollback lock inside the session folder). No lock file.
-      // Synchronous, so waiters queue in call order: with an awaited mkdir, a later caller's
-      // mkdir could finish first and take its place in the FIFO.
-      // eslint-disable-next-line local/no-sync-fs-methods -- keeps the waiters' FIFO order (above).
-      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-      const entry = await acquireInMemory(table, lockPath, timeoutMs, clock, (blocker) => {
-        const { why, ...holder } = blocker;
-        return new Error(fileLockTimeoutMessage(label, lockPath, timeoutMs, { holder, why }));
-      });
+      // The folder as fileLock.ts makes it, but no lock file.
+      const entry = await acquireAfterFolder(table, files, lockPath, (giveUp) =>
+        acquireInMemory(
+          table,
+          lockPath,
+          timeoutMs,
+          clock,
+          (blocker) => {
+            const { why, ...holder } = blocker;
+            return new Error(fileLockTimeoutMessage(label, lockPath, timeoutMs, { holder, why }));
+          },
+          giveUp
+        )
+      );
       return {
         assertStillOwned: () => {
           if (table.owner(lockPath) === entry) return Promise.resolve();
@@ -226,10 +353,6 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
         return await nodeSessionLocks.acquireCrossProcessLock(options);
       }
       const { lockPath, acquireTimeoutMs, timeoutMessage, signal } = options;
-      // As crossProcessLock.ts does first: a caller may write into the folder once it holds the lock.
-      // Synchronous for the same FIFO reason as the file lock above.
-      // eslint-disable-next-line local/no-sync-fs-methods -- keeps the waiters' FIFO order (above).
-      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
       const refusal = (blocker: Blocker) =>
         new CrossProcessLockTimeoutError(
           crossProcessLockTimeoutMessage(timeoutMessage, lockPath, {
@@ -237,13 +360,16 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
             why: blocker.why,
           })
         );
-      const entry = await acquireInMemory(
-        table,
-        lockPath,
-        acquireTimeoutMs,
-        clock,
-        refusal,
-        signal
+      // The folder as crossProcessLock.ts makes it, but no lock record.
+      const entry = await acquireAfterFolder(table, files, lockPath, (giveUp) =>
+        acquireInMemory(
+          table,
+          lockPath,
+          acquireTimeoutMs,
+          clock,
+          refusal,
+          signal === undefined ? giveUp : AbortSignal.any([signal, giveUp])
+        )
       );
       return () => {
         table.free(lockPath, entry);
@@ -255,12 +381,24 @@ export function memorySessionLocks(clock: HostClock, table: MemoryLockTable): Se
       table.owner(lockPath) === undefined
         ? await nodeSessionLocks.inspectCrossProcessLock(lockPath)
         : inspectInMemory(table, lockPath),
-    useLeasesFor: (config) => nodeSessionLocks.useLeasesFor(config),
+    useLeasesFor: (config) => {
+      let leases = leasesByConfig.get(config);
+      if (leases === undefined) {
+        leases = memoryLeases(table, config.rootDir);
+        leasesByConfig.set(config, leases);
+      }
+      return leases;
+    },
   };
 }
 
 /** Each build gets fresh lock tables: no lock state outlives a test's layer. */
-export const SessionLocksMemory: Layer.Layer<SessionLocksTag, never, HostClockTag> = Layer.effect(
-  SessionLocksTag,
-  Effect.map(HostClockTag, (clock) => memorySessionLocks(clock, new MemoryLockTable()))
-);
+export const SessionLocksMemory: Layer.Layer<SessionLocksTag, never, HostClockTag | HostFilesTag> =
+  Layer.effect(
+    SessionLocksTag,
+    Effect.gen(function* () {
+      const clock = yield* HostClockTag;
+      const files = yield* HostFilesTag;
+      return memorySessionLocks(clock, new MemoryLockTable(), files);
+    })
+  );
