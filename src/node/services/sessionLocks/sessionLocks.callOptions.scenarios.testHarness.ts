@@ -63,7 +63,6 @@ import {
 import { removeSessionDirUnderMemoryLocks } from "../workspaceRemoval";
 import { workspaceUseLeasesFor } from "../workspaceUseLeases";
 import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
-import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 /**
  * Each scenario names the temp roots and workspace ids that it creates, and
