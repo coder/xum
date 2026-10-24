@@ -13,7 +13,6 @@ import {
   getSubagentTranscriptArtifactsFilePath,
   updateSubagentTranscriptArtifactsFile,
 } from "./subagentTranscriptArtifacts";
-import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "node:assert";
 import { createHash } from "node:crypto";
