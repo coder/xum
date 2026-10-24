@@ -38,7 +38,10 @@ import type {
 } from "@/node/services/streamManager";
 import { nodeClock } from "@/node/utils/hostClock";
 
-type DynamicToolCompletedMessagePart = Extract<CompletedMessagePart, { type: "dynamic-tool" }>;
+export type DynamicToolCompletedMessagePart = Extract<
+  CompletedMessagePart,
+  { type: "dynamic-tool" }
+>;
 export type WorkflowRunToolAttachment = NonNullable<DynamicToolCompletedMessagePart["workflowRun"]>;
 
 /** The stream fields that workflow-run attachments read and buffer on. */
