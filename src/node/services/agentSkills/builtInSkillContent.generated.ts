@@ -3957,7 +3957,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "What you’ll see:",
       "",
-      "- An inline “tool call card” in the chat with a small form (single-select or multi-select).",
+      "- A small form (single-select or multi-select) in the panel above the chat input, and a short card in the chat where the agent asked.",
       "- An always-available **Other** option for free-form answers.",
       "",
       "How to respond:",
