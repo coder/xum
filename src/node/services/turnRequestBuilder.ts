@@ -2260,7 +2260,8 @@ export class TurnRequestBuilder {
         ? this.dependencies.config
         : withInstallationId(this.dependencies.config, installationId),
       runtime,
-      { ...metadata, id: workspaceId }
+      { ...metadata, id: workspaceId },
+      this.dependencies.historyService.locks
     );
     const { effectiveAdditionalInstructions, planFilePath, planContentForTransition } =
       await buildPlanInstructions({

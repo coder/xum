@@ -31,6 +31,7 @@ import {
   startAbandonedBranchSummaryInBackground,
 } from "../branchSummary";
 import { InitStateManager } from "../initStateManager";
+import { nodeSessionLocks } from "./nodeSessionLocks";
 import { addPinnedPath } from "../pinnedArtifactFiles";
 import { acquireRollbackFileLock } from "../refinement/refinementRollback";
 import { SessionTimingService } from "../sessionTimingService";
@@ -433,7 +434,9 @@ export async function oneInitAndPlan(names: LockNames): Promise<void> {
       {
         id: workspaceId,
         runtimeConfig: { type: "ssh", host: "plans.invalid", srcBaseDir: "~/xum" },
-      }
+      },
+      // The scenario records the Node lock calls.
+      nodeSessionLocks
     );
   });
 }
