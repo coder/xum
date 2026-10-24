@@ -34,9 +34,9 @@ describe("refuseBrotliResponses", () => {
       (error: unknown) => error
     );
     expect(failure).toBeInstanceOf(TypeError);
-    expect((failure as TypeError).cause).toMatchObject({
-      message: expect.stringContaining("Brotli"),
-    });
+    const cause = (failure as TypeError).cause;
+    expect(cause).toBeInstanceOf(Error);
+    expect((cause as Error).message).toContain("Brotli");
   });
 
   test.each([
