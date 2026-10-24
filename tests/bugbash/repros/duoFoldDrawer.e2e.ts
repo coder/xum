@@ -125,10 +125,10 @@ test(
   async ({ app, screen, browser }) => {
     await browser.setViewport(COVER);
     await openPlayground(app, screen, browser);
-    await browser.evaluate(
-      (key) => localStorage.setItem(key, JSON.stringify(false)),
-      LEFT_SIDEBAR_COLLAPSED_KEY
-    );
+    await browser.evaluate((key) => {
+      localStorage.setItem(key, JSON.stringify(false));
+      return null;
+    }, LEFT_SIDEBAR_COLLAPSED_KEY);
     await browser.reload();
     await expectDrawerClosed(screen, browser);
   }

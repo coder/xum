@@ -246,13 +246,12 @@ describe("the early script", () => {
   ])("at %i px with data-sidebar %s the view shows the %s sidebar", (width, saved, shown) => {
     const window = new GlobalWindow({ width, height: 700 });
     dom = window;
-    const doc = window.document as unknown as Document;
-    doc.body.innerHTML = FIRST_RUN_VIEW_HTML;
-    const view = doc.getElementById(FIRST_RUN_VIEW_ID)!;
-    if (saved !== "unset") view.dataset.sidebar = saved;
+    window.document.body.innerHTML = FIRST_RUN_VIEW_HTML;
+    const view = window.document.getElementById(FIRST_RUN_VIEW_ID)!;
+    if (saved !== "unset") view.setAttribute("data-sidebar", saved);
     const visible = (copy: string) =>
       [...view.querySelectorAll(`[data-pre="${copy}"]`)].map(
-        (el) => window.getComputedStyle(el as unknown as Element).display !== "none"
+        (el) => window.getComputedStyle(el).display !== "none"
       );
     const expanded = shown === "expanded";
     expect([visible("e"), visible("c")]).toEqual([
