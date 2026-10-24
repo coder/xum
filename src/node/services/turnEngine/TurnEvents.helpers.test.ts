@@ -5,7 +5,7 @@ import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import { log } from "@/node/services/log";
 
-import type { WorkspaceId } from "@/node/services/streamManager";
+import type { WorkspaceId } from "@/node/services/turnEngine/types";
 
 import { applyNestedToolEvent, buildStreamStartEvent, shouldReplayPartAfter } from "./TurnEvents";
 

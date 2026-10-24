@@ -4,14 +4,15 @@ import { Scope } from "effect";
 import type { StreamAbortReason } from "@/common/types/stream";
 import { closeScopeBounded } from "@/node/services/di/appRuntime";
 import { defaultEffectRunner } from "@/node/services/di/effectRunner";
-import {
-  createTurnCompletionController,
-  type ActiveStreamInfo,
-  type MockStreamLifecycle,
-  type TurnEngineEvent,
-  type WorkspaceId,
-  type WorkspaceStreamInfo,
-} from "@/node/services/streamManager";
+import type {
+  ActiveStreamInfo,
+  MockStreamLifecycle,
+  TurnCompletion,
+  TurnCompletionController,
+  TurnEngineEvent,
+  WorkspaceId,
+  WorkspaceStreamInfo,
+} from "@/node/services/turnEngine/types";
 
 import { TurnEvents } from "./TurnEvents";
 import { StreamState, TurnRegistry } from "./TurnRegistry";
@@ -62,6 +63,20 @@ function createRegistry(options: { engineScope?: Scope.Closeable } = {}) {
   };
 }
 
+/** A settle-once completion, like StreamManager's createTurnCompletionController. */
+function completionController(): TurnCompletionController {
+  const completion = Promise.withResolvers<TurnCompletion>();
+  let settled = false;
+  return {
+    promise: completion.promise,
+    settle: (value) => {
+      if (settled) return;
+      settled = true;
+      completion.resolve(value);
+    },
+  };
+}
+
 function streamFixture(overrides: Partial<WorkspaceStreamInfo> = {}): WorkspaceStreamInfo {
   const info: Partial<WorkspaceStreamInfo> = {
     messageId: "msg-1",
@@ -75,7 +90,7 @@ function streamFixture(overrides: Partial<WorkspaceStreamInfo> = {}): WorkspaceS
     processingPromise: Promise.resolve(),
     abortController: new AbortController(),
     softInterrupt: { pending: false },
-    completionController: createTurnCompletionController(),
+    completionController: completionController(),
     ...overrides,
   };
   return info as WorkspaceStreamInfo;

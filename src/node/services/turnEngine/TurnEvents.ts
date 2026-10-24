@@ -38,15 +38,13 @@ import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getErrorMessage } from "@/common/utils/errors";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { log } from "@/node/services/log";
-// Type-only back-edge: the event union, workspace ID brand, stream info and token
-// tracker type still live in streamManager.ts.
 import type {
   StreamManagerTokenTracker,
   TurnEngineEvent,
   TurnEngineEventSink,
   WorkspaceId,
   WorkspaceStreamInfo,
-} from "@/node/services/streamManager";
+} from "@/node/services/turnEngine/types";
 import type {
   ExecutionScope,
   ToolCallDisplayRegistry,

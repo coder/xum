@@ -4,7 +4,7 @@ import type { NestedToolCall } from "@/common/orpc/schemas/message";
 import type { CompletedMessagePart, WorkflowRunAttachedEvent } from "@/common/types/stream";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { log } from "@/node/services/log";
-import type { TurnEngineEvent, WorkspaceId } from "@/node/services/streamManager";
+import type { TurnEngineEvent, WorkspaceId } from "@/node/services/turnEngine/types";
 
 import { TurnEvents, type TurnEventsStream } from "./TurnEvents";
 

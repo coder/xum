@@ -14,15 +14,13 @@ import type { StreamAbortReason } from "@/common/types/stream";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { EffectRunner } from "@/node/services/di/effectRunner";
 import { log } from "@/node/services/log";
-// Type-only back-edge: the stream info and the facade's option and snapshot
-// types still live in streamManager.ts.
 import type {
   ActiveStreamInfo,
   MockStreamLifecycle,
   StopStreamOptions,
   WorkspaceId,
   WorkspaceStreamInfo,
-} from "@/node/services/streamManager";
+} from "@/node/services/turnEngine/types";
 import type { TurnEvents } from "@/node/services/turnEngine/TurnEvents";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";

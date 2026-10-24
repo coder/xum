@@ -39,8 +39,7 @@ import {
   type ContinuousPrefixSwap,
 } from "@/node/services/continuousCompactionJournal";
 import { log, type Logger } from "@/node/services/log";
-// Type-only back-edge: these step-budget and chunk types still live with the stream loop.
-import type { OnStepSettled, StreamTextOnChunk } from "@/node/services/streamManager";
+import type { OnStepSettled, StreamTextOnChunk } from "@/node/services/turnEngine/types";
 import type {
   ActiveTurnThinkingOverride,
   RebuildFirstStepForThinkingLevel,
