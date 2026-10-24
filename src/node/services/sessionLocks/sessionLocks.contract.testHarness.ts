@@ -130,6 +130,26 @@ export function describeSessionLocksContract(
         expect(await locks.inspectCrossProcessLock(dead)).toEqual({ state: "dead" });
       }));
 
+    // The turn owner's probe (workspaceTurnManager keepIfOwnedElsewhere) relies on both halves:
+    // a record this backend holds reads as held, and a probe never takes or reclaims a lock.
+    test("inspect never takes a lock: an own record reads held, a dead one stays until an acquire", () =>
+      withLayer(async (locks, t) => {
+        const own = path.join(t.dir, "own.lock");
+        const options = { acquireTimeoutMs: 0, staleMs: 60_000, timeoutMessage: "contract." };
+        const release = await locks.acquireCrossProcessLock({ lockPath: own, ...options });
+        expect(await locks.inspectCrossProcessLock(own)).toMatchObject({ state: "held" });
+        await release();
+        expect(await locks.inspectCrossProcessLock(own)).toEqual({ state: "absent" });
+
+        const dead = path.join(t.dir, "dead-record.lock");
+        await t.foreignHolder(dead, "dead", "record");
+        expect(await locks.inspectCrossProcessLock(dead)).toEqual({ state: "dead" });
+        expect(await locks.inspectCrossProcessLock(dead)).toEqual({ state: "dead" });
+        const reclaimed = await locks.acquireCrossProcessLock({ lockPath: dead, ...options });
+        expect(await locks.inspectCrossProcessLock(dead)).toMatchObject({ state: "held" });
+        await reclaimed();
+      }));
+
     test("a dead foreign holder is reclaimed", () =>
       withLayer(async (locks, t) => {
         const file = path.join(t.dir, "dead-file.lock");

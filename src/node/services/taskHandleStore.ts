@@ -19,7 +19,9 @@ import {
 import { log } from "@/node/services/log";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
-import { acquireProcessFileLock, type ProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import type { ProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 export type { WorkspaceTurnFinalMessageRef };
 
@@ -150,7 +152,14 @@ function assertValidWorkspaceTurnTaskId(handleId: string): void {
 }
 
 export class TaskHandleStore {
-  constructor(private readonly config: Config) {}
+  /**
+   * `locks` takes the publication lock (phase 4: SessionLocks). The workspace-turn manager passes
+   * its history service's locks; other callers keep the Node default.
+   */
+  constructor(
+    private readonly config: Config,
+    private readonly locks: SessionLocks = nodeSessionLocks
+  ) {}
 
   async upsertWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
     this.assertValidRecord(record);
@@ -203,7 +212,7 @@ export class TaskHandleStore {
     fn: (lock: ProcessFileLock) => Promise<T>
   ): Promise<T> {
     assertValidWorkspaceTurnTaskId(handleId);
-    await using lock = await acquireProcessFileLock({
+    await using lock = await this.locks.acquireProcessFileLock({
       lockPath: path.join(
         this.config.rootDir,
         "locks",
