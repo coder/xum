@@ -614,10 +614,14 @@ type ManifestCandidate =
   | { status: "invalid"; message: string }
   | { status: "ok"; raw: unknown };
 
-/** Read one manifest location with the shared containment and size caps. */
+/**
+ * Read one manifest location with the shared containment and size caps. `shown`: the path that
+ * error messages name (shownManifestPath), default `relative`.
+ */
 async function readManifestCandidate(
   rootReal: string,
-  relative: string
+  relative: string,
+  shown = relative
 ): Promise<ManifestCandidate> {
   let manifestReal: string;
   try {
@@ -632,8 +636,8 @@ async function readManifestCandidate(
       status: "invalid",
       message:
         error instanceof PluginGitPathError
-          ? `${relative} resolves into the plugin's .git directory`
-          : `${relative} resolves outside the plugin root: ${getErrorMessage(error)}`,
+          ? `${shown} resolves into the plugin's .git directory`
+          : `${shown} resolves outside the plugin root: ${getErrorMessage(error)}`,
     };
   }
   const stat = await pluginFs()
@@ -644,7 +648,7 @@ async function readManifestCandidate(
   if (stat.size > MAX_PLUGIN_MANIFEST_BYTES) {
     return {
       status: "invalid",
-      message: `${relative} is too large (${stat.size} bytes; max ${MAX_PLUGIN_MANIFEST_BYTES})`,
+      message: `${shown} is too large (${stat.size} bytes; max ${MAX_PLUGIN_MANIFEST_BYTES})`,
     };
   }
   try {
@@ -655,11 +659,11 @@ async function readManifestCandidate(
       filePath: manifestReal,
       pluginRoot: rootReal,
       maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
-      label: relative,
+      label: shown,
     });
     return { status: "ok", raw: JSON.parse(content) };
   } catch (error) {
-    return { status: "invalid", message: `Failed to read ${relative}: ${getErrorMessage(error)}` };
+    return { status: "invalid", message: `Failed to read ${shown}: ${getErrorMessage(error)}` };
   }
 }
 
@@ -1111,6 +1115,24 @@ async function resolveXumComponents(args: {
 }
 
 /**
+ * A root plugin.json that other harnesses use (no `$schema` member): it yields to a Codex or a
+ * Claude manifest (selectManifest).
+ */
+function isSchemaLessManifest(raw: unknown): boolean {
+  return isPlainObject(raw) && raw.$schema === undefined;
+}
+
+/**
+ * True when the root plugin.json of `rootReal` reads, through the manifest containment and size
+ * caps, as a schema-less one. installMethods uses it so the method it offers is the manifest
+ * discovery loads.
+ */
+export async function isSchemaLessRootManifest(rootReal: string): Promise<boolean> {
+  const read = await readManifestCandidate(rootReal, PLUGIN_MANIFEST_RELATIVE_PATH);
+  return read.status === "ok" && isSchemaLessManifest(read.raw);
+}
+
+/**
  * Pick the manifest of a plugin folder. Root plugin.json wins, then the Codex and the Claude Code
  * manifests. Each one goes through the same caps and containment. Null when none exists.
  *
@@ -1120,7 +1142,9 @@ async function resolveXumComponents(args: {
  * when no other manifest exists. The fallback gets the narrower Codex or Claude component set.
  */
 async function selectManifest(
-  rootReal: string
+  rootReal: string,
+  /** See discoverAgentPluginAt: read errors name the file from here, like validation errors. */
+  shownRoot: string | undefined
 ): Promise<{ relative: string; raw: unknown } | { relative: string; error: string } | null> {
   let schemaLessRoot: { relative: string; raw: unknown } | null = null;
   for (const relative of [
@@ -1128,11 +1152,14 @@ async function selectManifest(
     CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
     CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
   ]) {
-    const read = await readManifestCandidate(rootReal, relative);
+    const read = await readManifestCandidate(
+      rootReal,
+      relative,
+      shownManifestPath(shownRoot, relative)
+    );
     if (read.status === "missing") continue;
     if (read.status === "invalid") return { relative, error: read.message };
-    const schemaLess = isPlainObject(read.raw) && read.raw.$schema === undefined;
-    if (relative === PLUGIN_MANIFEST_RELATIVE_PATH && schemaLess) {
+    if (relative === PLUGIN_MANIFEST_RELATIVE_PATH && isSchemaLessManifest(read.raw)) {
       schemaLessRoot = { relative, raw: read.raw };
       continue;
     }
@@ -1141,12 +1168,19 @@ async function selectManifest(
   return schemaLessRoot;
 }
 
+/** The manifest path an error shows: from `shownRoot` (default the plugin root), `/` on every OS. */
+function shownManifestPath(shownRoot: string | undefined, manifestRelative: string): string {
+  return path.posix.join(shownRoot ?? ".", manifestRelative.split(path.sep).join("/"));
+}
+
 async function discoverPluginAt(args: {
   pluginDir: string;
   containerPath: string;
   dirName: string;
   scope: AgentPluginScope;
   diagnostics: AgentPluginDiagnostic[];
+  /** See discoverAgentPluginAt. */
+  shownRoot?: string;
 }): Promise<AgentPluginInfo | null> {
   const { pluginDir, scope, diagnostics } = args;
 
@@ -1164,7 +1198,7 @@ async function discoverPluginAt(args: {
     return null;
   }
 
-  const selected = await selectManifest(rootReal);
+  const selected = await selectManifest(rootReal, args.shownRoot);
   if (selected === null) {
     // No manifest → not a plugin (silent skip, e.g. Codex marketplace.json entries).
     return null;
@@ -1190,7 +1224,11 @@ async function discoverPluginAt(args: {
       validation.reason === "unsupported-version"
         ? "Unsupported Agent Plugins version"
         : "Invalid plugin manifest";
-    pushError(manifestPath, `${label}: ${validation.errors.join("; ")}`);
+    // Name the manifest: a plugin can carry plugin.json, .codex-plugin/plugin.json and
+    // .claude-plugin/plugin.json, and the user must see which one failed. Forward slashes on
+    // every OS, because the path is shown, not opened.
+    const shownManifest = shownManifestPath(args.shownRoot, manifestRelative);
+    pushError(manifestPath, `${label} (${shownManifest}): ${validation.errors.join("; ")}`);
     return null;
   }
 
@@ -1399,6 +1437,12 @@ export async function discoverWorkspaceAgentPlugins(args: {
 export async function discoverAgentPluginAt(args: {
   pluginDir: string;
   scope: AgentPluginScope;
+  /**
+   * The plugin folder's path inside its repository (an install's "Plugin folder"), so a manifest
+   * error names the file the way the user sees the repository: `.codex-plugin/plugin.json`, not
+   * a bare `plugin.json`. Display only.
+   */
+  shownRoot?: string;
 }): Promise<{ plugin: AgentPluginInfo | null; diagnostics: AgentPluginDiagnostic[] }> {
   if (!path.isAbsolute(args.pluginDir)) {
     throw new Error(`discoverAgentPluginAt: pluginDir must be absolute: ${args.pluginDir}`);
@@ -1411,6 +1455,7 @@ export async function discoverAgentPluginAt(args: {
     dirName: path.basename(args.pluginDir),
     scope: args.scope,
     diagnostics,
+    shownRoot: args.shownRoot,
   });
   return { plugin, diagnostics };
 }

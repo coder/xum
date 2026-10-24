@@ -1584,6 +1584,7 @@ describe("buildPlanInstructions", () => {
         createMuxMessage("a1", "assistant", "Here is the plan.", { agentId: "plan" }),
         createMuxMessage("u1", "user", "implement it"),
       ],
+      runtimeFactory,
     }).catch((error: unknown) => error);
     expect(outcome).toMatchObject({ type: "network" });
   });
@@ -1626,6 +1627,7 @@ describe("buildPlanInstructions", () => {
       taskDepth: 0,
       taskSettings: DEFAULT_TASK_SETTINGS,
       requestPayloadMessages,
+      runtimeFactory,
     });
 
     expect(result.effectiveAdditionalInstructions).toContain(
@@ -1702,6 +1704,7 @@ describe("buildPlanInstructions", () => {
       taskDepth: 0,
       taskSettings: DEFAULT_TASK_SETTINGS,
       requestPayloadMessages,
+      runtimeFactory,
     });
 
     const fromFullHistory = await buildPlanInstructions({
@@ -1720,6 +1723,7 @@ describe("buildPlanInstructions", () => {
       taskDepth: 0,
       taskSettings: DEFAULT_TASK_SETTINGS,
       requestPayloadMessages: fullHistory,
+      runtimeFactory,
     });
 
     expect(fromSlicedPayload.effectiveAdditionalInstructions).toContain(

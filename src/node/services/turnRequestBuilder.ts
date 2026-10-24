@@ -2269,6 +2269,7 @@ export class TurnRequestBuilder {
     const { effectiveAdditionalInstructions, planFilePath, planContentForTransition } =
       await buildPlanInstructions({
         runtime,
+        runtimeFactory: this.dependencies.runtimeFactory,
         metadata,
         planLocation,
         workspaceId,
@@ -3039,6 +3040,7 @@ export class TurnRequestBuilder {
             workspaceId,
             sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             kernelFileLoader,
+            locks: this.dependencies.historyService.locks,
           },
         });
         if (options.recordTimings) {

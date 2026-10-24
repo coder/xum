@@ -1423,7 +1423,9 @@ describe("discoverAgentPlugins", () => {
 
     expect(result.plugins).toEqual([]);
     expect(result.diagnostics).toHaveLength(1);
-    expect(result.diagnostics[0].message).toContain("Unsupported Agent Plugins version");
+    expect(result.diagnostics[0].message).toStartWith(
+      "Unsupported Agent Plugins version (plugin.json): "
+    );
   });
 
   test("loads plugins with unknown top-level manifest fields and reports a warning", async () => {
@@ -2162,9 +2164,66 @@ describe("Claude Code plugin discovery", () => {
       {
         diagnosticPath: path.join(container, "c", "plugin.json"),
         severity: "error",
-        message: "Invalid plugin manifest: '$schema' is required and must be a string",
+        message:
+          "Invalid plugin manifest (plugin.json): '$schema' is required and must be a string",
       },
     ]);
+  });
+
+  test("a manifest error names the file from the repository root when given the plugin folder", async () => {
+    // Settings installs a repository's `.codex-plugin` folder as the plugin root: its
+    // plugin.json must read as `.codex-plugin/plugin.json`, the path the user knows.
+    using tmp = new DisposableTempDir("agent-plugins");
+    const pluginDir = path.join(tmp.path, "staged");
+    await writeTree(pluginDir, { "plugin.json": JSON.stringify({ name: "multi-harness" }) });
+
+    const result = await discoverAgentPluginAt({
+      pluginDir,
+      scope: "global",
+      shownRoot: ".codex-plugin",
+    });
+
+    expect(result.plugin).toBeNull();
+    expect(result.diagnostics.map((d) => d.message)).toEqual([
+      "Invalid plugin manifest (.codex-plugin/plugin.json): '$schema' is required and must be a string",
+    ]);
+  });
+
+  test("a manifest read error names the file from the repository root too", async () => {
+    // Read, size and containment errors come before validation (Codex review, #7422).
+    using tmp = new DisposableTempDir("agent-plugins");
+    const pluginDir = path.join(tmp.path, "staged");
+    await writeTree(pluginDir, { "plugin.json": "{ not json" });
+
+    const result = await discoverAgentPluginAt({
+      pluginDir,
+      scope: "global",
+      shownRoot: ".codex-plugin",
+    });
+
+    expect(result.plugin).toBeNull();
+    const messages = result.diagnostics.map((d) => d.message);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatch(/^Failed to read \.codex-plugin\/plugin\.json: /);
+  });
+
+  test("an invalid Codex manifest error names .codex-plugin/plugin.json", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    // "--" has no safe name mapping, so the validator refuses the manifest.
+    await writeTree(path.join(container, "bad"), {
+      ".codex-plugin/plugin.json": JSON.stringify({ name: "my--plugin" }),
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toEqual([]);
+    expect(result.diagnostics.map((d) => [d.severity, d.path])).toEqual([
+      ["error", path.join(container, "bad", ".codex-plugin", "plugin.json")],
+    ]);
+    expect(result.diagnostics[0].message).toStartWith(
+      "Invalid plugin manifest (.codex-plugin/plugin.json): "
+    );
   });
 });
 

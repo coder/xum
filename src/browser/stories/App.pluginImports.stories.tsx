@@ -22,7 +22,12 @@ const preview: AgentPluginInstallPreview = {
   manifest: { name: "review-tools", version: "1.0.0", description: "Review and research tools" },
   targetPath: "~/.xum/plugins/review-tools",
   skills: [
-    { name: "review", description: "Review a change" },
+    // Long prose description: at phone width it must wrap between words, not mid-word.
+    {
+      name: "review",
+      description:
+        "Picks the smallest change that fully solves the task, then reviews it for scope creep",
+    },
     { name: "research", description: "Research a topic" },
   ],
   mcpServers: [

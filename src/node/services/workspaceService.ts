@@ -100,6 +100,7 @@ import {
   isWorkspaceEvent,
   statusSetResultStatus,
 } from "@/node/services/aiServiceEventGuards";
+// Outside the agent loop: WorkspaceService passes the host's runtimes (nodeRuntimeFactory) to agent and skill reads.
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
@@ -8882,6 +8883,7 @@ export class WorkspaceService
             workspaceId,
             attemptId: removalAttemptId,
             workspaceStillRegistered: () => this.config.findWorkspace(workspaceId) != null,
+            locks: this.historyService.locks,
           });
         } catch (rollbackError) {
           // r63: a failed rollback must not be silent — the workspace
@@ -8964,6 +8966,7 @@ export class WorkspaceService
               workspaceId,
               attemptId: removalAttemptId,
               workspaceStillRegistered: () => this.config.findWorkspace(workspaceId) != null,
+              locks: this.historyService.locks,
             });
           } catch (rollbackError) {
             log.error(
@@ -21732,6 +21735,7 @@ export class WorkspaceService
         workspacePath: resolveWorkspaceRootPath(metadata, runtime),
         workspaceId,
         projectPluginsTrusted: isWorkspaceProjectTrusted(this.config, metadata),
+        runtimeFactory: nodeRuntimeFactory,
       };
     } catch {
       return undefined;

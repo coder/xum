@@ -389,7 +389,8 @@ async function withRemovalLocks(
           label: "history write lock (removal)",
         });
         await body();
-      }
+      },
+      locks
     );
   }
 }
@@ -415,9 +416,14 @@ export async function rollbackRemovalTombstoneIfOwned(args: {
   workspaceId: string;
   attemptId: string;
   workspaceStillRegistered: () => boolean;
+  /** The target lock (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
 }): Promise<boolean> {
   const tombstonePath = workspaceRemovalTombstonePath(args.rootDir, args.workspaceId);
-  return await withTargetMutationLocks(args.rootDir, [path.resolve(args.sessionDir)], async () => {
+  // The caller's SessionLocks (phase 4) take the target lock.
+  const withTargetLock = <T>(fn: () => Promise<T>) =>
+    withTargetMutationLocks(args.rootDir, [path.resolve(args.sessionDir)], fn, args.locks);
+  return await withTargetLock(async () => {
     let parsed: { attemptId?: unknown };
     try {
       parsed = JSON.parse(await fsPromises.readFile(tombstonePath, "utf-8")) as {
