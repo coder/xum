@@ -3767,10 +3767,17 @@ describe("AgentPluginInstallService", () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
       await result;
       await failing.dispose();
+      // 2 s, not 10 ms: the pass deadline must outlast the real sign-out's disk write after
+      // release under CI load, or the pass counts it as late and keeps the record (#7416). It
+      // stays below the test timeout, so recovery that awaited the slow pass stores false.
       const restarted = new AgentPluginInstallService(config, {
         mcpServerManager: stopStub as unknown as MCPServerManager,
-        reconciliationTimeoutMs: 10,
+        reconciliationTimeoutMs: 2_000,
       });
+      const internals = restarted as unknown as {
+        settledSignOutPasses: () => Promise<void>;
+        reconciliationState: Promise<boolean>;
+      };
       const oauth = new McpOauthService(config, new MCPConfigService(config));
       let release: (() => void) | undefined;
       let entered: (() => void) | undefined;
@@ -3788,19 +3795,16 @@ describe("AgentPluginInstallService", () => {
       } as unknown as McpOauthService);
       // The startup pass fails fast and keeps the record; section open meets the slow logout.
       await restarted.list();
+      // A fast-fail pass that is still running must not meet the slow logout.
+      await internals.settledSignOutPasses();
       slow = true;
-      // The list waits on the plugin mutation lock behind the sign-out, so release it first.
       const listed = restarted.list();
       await slowEntered;
-      const internals = restarted as unknown as {
-        pendingSignOutPass?: Promise<void>;
-        reconciliationState: Promise<boolean>;
-      };
       // Recovery settles while the sign-out still hangs, and its health stays true.
       expect(await internals.reconciliationState).toBe(true);
       release?.();
       await listed;
-      await internals.pendingSignOutPass;
+      await internals.settledSignOutPasses();
       expect(await pendingSignOuts()).toBeUndefined();
       // Journal health stayed true, so the custom gate opens without another section open.
       expect(await discovered()).toBe(1);
