@@ -14,11 +14,8 @@ import { ProjectCreateModal } from "./components/ProjectCreateModal/ProjectCreat
 import { MultiProjectWorkspaceCreateModal } from "./components/MultiProjectWorkspaceCreateModal/MultiProjectWorkspaceCreateModal";
 import type * as AIViewModule from "./components/AIView/AIView";
 import { ErrorBoundary } from "./components/ErrorBoundary/ErrorBoundary";
-import {
-  readPersistedState,
-  usePersistedState,
-  updatePersistedState,
-} from "./hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "./hooks/usePersistedState";
+import { useLeftSidebarState } from "./hooks/useLeftSidebarState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
 import { useComputerUse } from "./hooks/useComputerUse";
 import {
@@ -87,7 +84,6 @@ import {
   getWorkspaceLastReadKey,
   EXPANDED_PROJECTS_KEY,
   LAST_VISITED_ROUTE_KEY,
-  LEFT_SIDEBAR_COLLAPSED_KEY,
   LEFT_SIDEBAR_WIDTH_KEY,
 } from "@/common/constants/storage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
@@ -328,15 +324,7 @@ function AppInner() {
     addProject,
   } = useProjectContext();
 
-  // Auto-collapse sidebar on mobile by default
-  const isMobile = typeof window !== "undefined" && window.innerWidth <= 768;
-  const [sidebarCollapsed, setSidebarCollapsed] = usePersistedState(
-    LEFT_SIDEBAR_COLLAPSED_KEY,
-    isMobile,
-    {
-      listener: true,
-    }
-  );
+  const { collapsed: sidebarCollapsed, toggle: toggleSidebar } = useLeftSidebarState();
 
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
@@ -400,10 +388,6 @@ function AppInner() {
   });
 
   // ProjectPage handles its own focus when mounted
-
-  const handleToggleSidebar = useCallback(() => {
-    setSidebarCollapsed((prev) => !prev);
-  }, [setSidebarCollapsed]);
 
   // Telemetry tracking
   const telemetry = useTelemetry();
@@ -985,10 +969,6 @@ function AppInner() {
     [handleRemoveProject]
   );
 
-  const toggleSidebarFromPalette = useCallback(() => {
-    setSidebarCollapsed((prev) => !prev);
-  }, [setSidebarCollapsed]);
-
   const navigateWorkspaceFromPalette = useCallback(
     (dir: "next" | "prev") => {
       handleNavigateWorkspace(dir);
@@ -1073,7 +1053,7 @@ function AppInner() {
     onUpdateTitle: updateTitleFromPalette,
     onAddProject: addProjectFromPalette,
     onRemoveProject: removeProjectFromPalette,
-    onToggleSidebar: toggleSidebarFromPalette,
+    onToggleSidebar: toggleSidebar,
     onNavigateWorkspace: navigateWorkspaceFromPalette,
     onMovePinnedChat: movePinnedChatFromPalette,
     onOpenWorkspaceInTerminal: (workspaceId, runtimeConfig) => {
@@ -1173,7 +1153,7 @@ function AppInner() {
         if (!e.repeat && !isDialogOpen()) computerUse.toggle().catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_SIDEBAR)) {
         e.preventDefault();
-        if (!isDialogOpen()) setSidebarCollapsed((prev) => !prev);
+        if (!isDialogOpen()) toggleSidebar();
       } else if (matchesKeybind(e, KEYBINDS.OPEN_SETTINGS)) {
         e.preventDefault();
         // An open palette would stay behind the settings modal and swallow its first Escape.
@@ -1233,7 +1213,7 @@ function AppInner() {
   }, [
     openNewScratchFromPalette,
     handleNavigateWorkspace,
-    setSidebarCollapsed,
+    toggleSidebar,
     isCommandPaletteOpen,
     closeCommandPalette,
     openCommandPalette,
@@ -1486,11 +1466,11 @@ function AppInner() {
         <LeftSidebarToggleBar
           collapsed={sidebarCollapsed}
           showNewChat={toggleBarShowsNewChat}
-          onToggle={handleToggleSidebar}
+          onToggle={toggleSidebar}
         />
         <LeftSidebar
           collapsed={sidebarCollapsed}
-          onToggleCollapsed={handleToggleSidebar}
+          onToggleCollapsed={toggleSidebar}
           widthPx={leftSidebar.width}
           isResizing={leftSidebar.isResizing}
           onStartResize={leftSidebar.startResize}

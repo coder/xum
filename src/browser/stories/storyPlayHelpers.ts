@@ -13,9 +13,33 @@ export async function openSidebarNewTab(scope: HTMLElement): Promise<void> {
  * modal stays mounted, so plays should query within the dialog rather than the whole canvas.
  */
 export async function openSettingsDialog(canvasElement: HTMLElement): Promise<HTMLElement> {
-  const canvas = within(canvasElement);
-  await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
+  await openLeftSidebar(canvasElement);
+  await userEvent.click(within(canvasElement).getByTestId("settings-button"));
   return findSettingsDialog(canvasElement.ownerDocument);
+}
+
+/**
+ * Open the left sidebar when it is collapsed, so plays can reach its controls (the titlebar's
+ * settings button, project rows). At phone widths (Pixel's phone and tablet variants) the sidebar
+ * is a drawer that starts closed each time a story mounts, whatever `expandLeftSidebar()` saved.
+ */
+export async function openLeftSidebar(canvasElement: HTMLElement): Promise<void> {
+  const canvas = within(canvasElement);
+  const openToggle = () => canvas.queryByRole("button", { name: "Open sidebar menu" });
+  await waitFor(
+    () => {
+      if (!canvas.queryByTestId("settings-button") && !openToggle()) {
+        throw new Error("Neither the sidebar nor its open toggle rendered yet");
+      }
+    },
+    { timeout: 10000 }
+  );
+  const toggle = canvas.queryByTestId("settings-button") ? null : openToggle();
+  if (toggle) {
+    // A native click: userEvent's synthetic hover could leave the toggle's tooltip in a snapshot.
+    toggle.click();
+    await canvas.findByTestId("settings-button", {}, { timeout: 10000 });
+  }
 }
 
 /**

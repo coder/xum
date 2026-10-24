@@ -29,6 +29,7 @@ import { clearWorkspaceSelection, collapseRightSidebar, expandProjects } from ".
 import { createMockORPCClient } from "./mocks/orpc";
 import {
   blurActiveElement,
+  openLeftSidebar,
   waitForChatInputAutofocusDone,
   waitForScrollStabilization,
 } from "./storyPlayHelpers.js";
@@ -259,6 +260,8 @@ export const IPhone16eAnalyticsSheet: AppStory = {
     const canvas = within(canvasElement);
     await stabilizePhoneViewportStory(canvasElement);
 
+    // The analytics button sits in the sidebar's title bar: on phones a drawer that starts closed.
+    await openLeftSidebar(canvasElement);
     await userEvent.click(await canvas.findByTestId("analytics-button"));
     const dialog = await within(canvasElement.ownerDocument.body).findByRole(
       "dialog",
@@ -880,6 +883,8 @@ export const IPhone16eSidebarWithSections: AppStory = {
   },
   play: async ({ canvasElement }) => {
     const projectPath = "/home/user/projects/my-app";
+    // The capture shows the drawer, which starts closed on phones.
+    await openLeftSidebar(canvasElement);
     // No workspace is selected so there's no ChatInput to wait for;
     // skip stabilizePhoneViewportStory and wait for the section directly.
     await waitFor(
