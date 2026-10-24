@@ -193,11 +193,13 @@ describe("web_fetch server bundle", () => {
       const document = parseHtmlDocument("<p>Text</p>", "http://127.0.0.1:" + portA + "/page");
       const window = document.defaultView;
       const response = await window.fetch("http://127.0.0.1:" + portA + "/fetched");
-      if (response.ok) throw new Error("fetch was not refused: " + response.status);
+      if (response.status !== 403) throw new Error("fetch was not refused: " + response.status);
       const syncRequest = new window.XMLHttpRequest();
       syncRequest.open("GET", "http://127.0.0.1:" + portA + "/sync", false);
       syncRequest.send();
-      if (syncRequest.status === 200) throw new Error("sync XMLHttpRequest was not refused");
+      if (syncRequest.status !== 403) {
+        throw new Error("sync XMLHttpRequest was not refused: " + syncRequest.status);
+      }
       await new Promise((resolveWait) => setTimeout(resolveWait, 500));
       `
     );

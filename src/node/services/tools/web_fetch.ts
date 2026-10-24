@@ -104,16 +104,18 @@ export function parseHtmlDocument(html: string, url: string): Document {
   // SECURITY: the HTML is untrusted. Parsing must never trigger network
   // fetches from the Mux backend (subresources like iframes or external
   // stylesheets would bypass the SSRF checks in assertWebFetchTargetAllowed).
-  // JavaScript evaluation is already disabled by default in happy-dom. The
-  // settings below turn off the loaders we know about, and the fetch
-  // interceptor enforces the guarantee for every request type: happy-dom sends
-  // all of its requests (fetch, XMLHttpRequest, <link> elements, stylesheets,
-  // scripts, frames) through Fetch/SyncFetch, which call the
-  // interceptor before they open a connection, so a refused request never
-  // reaches the network and never follows a redirect.
+  // The settings below turn off the loaders we know about, and the fetch
+  // interceptor refuses every HTTP request: happy-dom sends all of them
+  // (fetch, XMLHttpRequest, sendBeacon, <link> elements, stylesheets,
+  // scripts, frames) through Fetch/SyncFetch, which call the interceptor
+  // before they open a connection, so a refused request never reaches the
+  // network and never follows a redirect. WebSocket is the one happy-dom
+  // network path that skips the interceptor, and only script can open one:
+  // keep JavaScript evaluation off (happy-dom's default, also set here).
   const window = new Window({
     url,
     settings: {
+      enableJavaScriptEvaluation: false,
       disableJavaScriptFileLoading: true,
       disableCSSFileLoading: true,
       navigation: {
