@@ -8,6 +8,7 @@
  */
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 import type { createRuntime } from "@/node/runtime/runtimeFactory";
 import type {
   createRuntimeContextForWorkspace,
@@ -36,4 +37,9 @@ export interface RuntimeFactory {
   createMultiProjectRuntime(input: MultiProjectRuntimeInput): Runtime;
   /** Host-local I/O on a path: `new LocalRuntime(path)`. */
   createLocalRuntime(path: string): Runtime;
+  /**
+   * The host filesystem that the local runtimes see. The host-local reads beside a runtime
+   * (plugin discovery, containment checks, skill and agent listings) go through it (phase 5).
+   */
+  readonly hostFiles: HostFiles;
 }

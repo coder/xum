@@ -2208,6 +2208,8 @@ export class TurnRequestBuilder {
         hostCheckoutRoot,
         journal: this.dependencies.durableEventJournalFor(workspaceId),
         mcpServerManager: this.dependencies.bindings.mcpServerManager,
+        hostFiles: this.dependencies.hostServices.hostFiles,
+        hostPaths: this.dependencies.hostServices.hostPaths,
       });
     }
 

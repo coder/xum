@@ -44,14 +44,17 @@ import {
 } from "@/node/services/sandbox/sandboxHostService";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
-import { ensurePathContained } from "@/node/services/tools/skillFileUtils";
+import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
+import { nodeHostFiles, nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 import {
   computeAgentPluginContainers,
   discoverAgentPlugins,
+  hostPluginFs,
   MAX_PLUGIN_HOOK_SOURCE_BYTES,
-  readPluginFileWithinRootCapped,
+  nodePluginFs,
   type AgentPluginContainer,
   type AgentPluginInfo,
+  type PluginFs,
 } from "./discovery";
 import { buildPluginServerKey, resolvePluginInstanceId } from "./mcpConfig";
 import { readMutationEpochToken, STAGING_DIR_NAME } from "./journals";
@@ -96,6 +99,12 @@ export interface EnsureWorkspaceHooksArgs {
   /** Project identity for project-plugin instance IDs (same as the plugin MCP provider). */
   projectKey?: string;
   projectTrusted: boolean;
+  /**
+   * The host's files and paths: discovery, containment and the hooks.js read go through them
+   * (phase 5: the turn passes the loop's). Absent: the Node layers.
+   */
+  hostFiles?: HostFiles;
+  hostPaths?: HostPaths;
 }
 
 /**
@@ -379,8 +388,12 @@ export class AgentPluginHookService {
       xumHome: args.xumHome,
       projectRoot: args.projectRoot,
       projectTrusted: args.projectTrusted,
+      // mutation-equivalent: hostPaths is a HostPaths object or undefined, so ?? and || agree
+      userHome: (args.hostPaths ?? nodeHostPaths).userHome(),
     });
-    const { plugins } = await discoverAgentPlugins(containers);
+    // mutation-equivalent: hostFiles is a HostFiles object or undefined, so ?? and || agree
+    const fs = hostPluginFs(args.hostFiles ?? nodeHostFiles);
+    const { plugins } = await discoverAgentPlugins(containers, { fs });
 
     const result: DiscoveredHookPlugin[] = [];
     for (const plugin of plugins) {
@@ -392,7 +405,7 @@ export class AgentPluginHookService {
         // itself must stay inside the trusted checkout.
         assert(args.projectRoot, "project-scope plugins require a projectRoot");
         try {
-          await ensurePathContained(args.projectRoot, plugin.rootPath);
+          await fs.ensureContained(args.projectRoot, plugin.rootPath);
         } catch (error) {
           log.warn(
             `Agent plugin hooks: skipping project plugin '${plugin.name}': plugin root escapes the project root: ${getErrorMessage(error)}`
@@ -402,7 +415,7 @@ export class AgentPluginHookService {
       }
       let source: string;
       try {
-        source = await readHookSourceCapped(plugin.hooksPath, plugin.rootPath);
+        source = await readHookSourceCapped(plugin.hooksPath, plugin.rootPath, fs);
       } catch (error) {
         log.warn(`Agent plugin hooks: failed to read ${plugin.hooksPath}; skipping`, { error });
         continue;
@@ -832,8 +845,13 @@ function annotateResult(result: unknown, annotation: string, pluginName: string)
  * fstat-reported byte count through the same handle also bounds the read if
  * the file grows mid-read. Exported for tests.
  */
-export async function readHookSourceCapped(hooksPath: string, pluginRoot: string): Promise<string> {
-  const result = await readPluginFileWithinRootCapped({
+export async function readHookSourceCapped(
+  hooksPath: string,
+  pluginRoot: string,
+  /** The host filesystem of the read (hostPluginFs). */
+  fs: PluginFs = nodePluginFs
+): Promise<string> {
+  const result = await fs.readFileCapped({
     filePath: hooksPath,
     pluginRoot,
     maxBytes: MAX_PLUGIN_HOOK_SOURCE_BYTES,

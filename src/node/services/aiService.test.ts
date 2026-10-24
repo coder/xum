@@ -6628,7 +6628,7 @@ describe("AIService runtimes", () => {
         undefined,
         providersConfigStore,
         undefined,
-        { runtimeFactory: fakeRuntimeFactory(host.runtime) }
+        { runtimeFactory: fakeRuntimeFactory(host) }
       );
 
       const context = service.createWorkspaceRuntimeContext(metadata.id, metadata);

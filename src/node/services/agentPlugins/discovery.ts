@@ -39,6 +39,7 @@ import { pluginSkillFileName } from "./claudeCommands";
 import { pluginAgentIdOf } from "./agentFiles";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 import { nodeHostFiles, nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 
 /**
@@ -151,15 +152,33 @@ export interface PluginFileReadArgs {
   label: string;
 }
 
-/** The host filesystem: one module-level object, so a read costs no wrapper per call. */
-export const nodePluginFs: PluginFs = {
-  realpath: (filePath) => nodeHostFiles.promises.realpath(filePath),
-  stat: (filePath) => nodeHostFiles.promises.stat(filePath),
-  lstat: (filePath) => nodeHostFiles.promises.lstat(filePath),
-  readdir: (dirPath) => nodeHostFiles.promises.readdir(dirPath, { withFileTypes: true }),
-  ensureContained: ensurePathContained,
-  readFileCapped: readPluginFileWithinRootCapped,
-};
+const hostPluginFsByFiles = new WeakMap<HostFiles, PluginFs>();
+
+/**
+ * The PluginFs of a host filesystem: one object per HostFiles, so a read costs no wrapper per
+ * call. Phase 5: the host-local scans of skills, agents and plugins read the HostFiles of their
+ * RuntimeFactory, so a test graph's memory host serves them too.
+ */
+export function hostPluginFs(files: HostFiles): PluginFs {
+  const known = hostPluginFsByFiles.get(files);
+  if (known !== undefined) return known;
+  const fs: PluginFs = {
+    realpath: (filePath) => files.promises.realpath(filePath),
+    stat: (filePath) => files.promises.stat(filePath),
+    lstat: (filePath) => files.promises.lstat(filePath),
+    readdir: (dirPath) => files.promises.readdir(dirPath, { withFileTypes: true }),
+    ensureContained: (root, candidatePath, options) =>
+      ensurePathContained(root, candidatePath, options, files),
+    // The reader's own containment check (ensurePluginPathContained) reads the current PluginFs.
+    readFileCapped: (args) =>
+      pluginFsStorage.run(fs, () => readPluginFileWithinRootCapped(args, files)),
+  };
+  hostPluginFsByFiles.set(files, fs);
+  return fs;
+}
+
+/** The host filesystem. */
+export const nodePluginFs: PluginFs = hostPluginFs(nodeHostFiles);
 
 /**
  * The PluginFs of the discovery that is running. AsyncLocalStorage, not a parameter, so the
@@ -262,14 +281,16 @@ export async function ensurePluginPathContained(
  * the caller skips and re-measures on the next discovery.
  */
 export async function readPluginFileWithinRootCapped(
-  args: PluginFileReadArgs
+  args: PluginFileReadArgs,
+  /** The host filesystem of the read (hostPluginFs). Absent: the Node layer. */
+  files: HostFiles = nodeHostFiles
 ): Promise<PluginFileReadResult> {
   const { filePath, pluginRoot, maxBytes, label } = args;
   // Opening a FIFO for reading blocks until a writer appears, which would hang every caller
   // (list(), preview, skill/agent/hook/MCP config loads). Refuse anything but a regular file
   // before the open; O_NONBLOCK covers a swap to a FIFO between this stat and the open (it
   // has no effect on regular files), and the identity check below still runs after the open.
-  const fsPromises = nodeHostFiles.promises;
+  const fsPromises = files.promises;
   const target = await fsPromises.stat(filePath);
   if (!target.isFile()) {
     throw new Error(`${label} is not a regular file: ${filePath}`);
@@ -1357,6 +1378,8 @@ export function computeAgentPluginContainers(args: {
   xumHome: string;
   projectRoot?: string;
   projectTrusted: boolean;
+  /** The home of ~/.agents/plugins (phase 5: the caller's HostPaths). Absent: the Node home. */
+  userHome?: string;
 }): AgentPluginContainer[] {
   const containers: AgentPluginContainer[] = [];
   // projectAutomationDisabled: benchmark harness kill-switch: dataset repos
@@ -1380,7 +1403,8 @@ export function computeAgentPluginContainers(args: {
     registryPath: path.join(args.xumHome, PLUGIN_REGISTRY_FILE_NAME),
   });
   containers.push({
-    path: path.join(nodeHostPaths.userHome(), ".agents", "plugins"),
+    // mutation-equivalent: userHome is a string or undefined, and an empty home is no path
+    path: path.join(args.userHome ?? nodeHostPaths.userHome(), ".agents", "plugins"),
     scope: "global",
   });
   return containers;
@@ -1638,8 +1662,17 @@ export async function discoverAgentPlugins(
   options?: {
     /** Ownership and recovery authority only; never scanned or registered as MCP views. */
     managedHome?: string;
+    /**
+     * The host filesystem of the scan (hostPluginFs of the caller's RuntimeFactory). Absent:
+     * nodePluginFs. The registries and journals of managed containers still read the Node host.
+     */
+    fs?: PluginFs;
   }
 ): Promise<DiscoverAgentPluginsResult> {
+  if (options?.fs !== undefined) {
+    const { fs, ...rest } = options;
+    return await pluginFsStorage.run(fs, () => discoverAgentPlugins(containers, rest));
+  }
   let plugins: AgentPluginInfo[] = [];
   let diagnostics: AgentPluginDiagnostic[] = [];
   // Consent and recovery belong to the physical container, not its spelling.

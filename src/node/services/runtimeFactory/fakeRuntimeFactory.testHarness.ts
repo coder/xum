@@ -1,14 +1,17 @@
 /**
  * RuntimeFactory for the in-memory loop: every member gives the one FakeRuntime of the memory
- * host, so tools and the loop read and write the same volume as HostFiles.
+ * host, so tools and the loop read and write the same volume as HostFiles. Its hostFiles is the
+ * host's HostFiles.
  */
 import { Layer } from "effect";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { resolveWorkspaceExecutionPath } from "@/node/runtime/runtimeHelpers";
 import { RuntimeFactoryTag } from "@/node/services/di/tags";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 import type { RuntimeFactory } from "./runtimeFactoryService";
 
-export function fakeRuntimeFactory(runtime: Runtime): RuntimeFactory {
+export function fakeRuntimeFactory(host: { runtime: Runtime; files: HostFiles }): RuntimeFactory {
+  const runtime = host.runtime;
   return {
     createRuntime: () => runtime,
     createRuntimeForWorkspace: () => runtime,
@@ -20,9 +23,13 @@ export function fakeRuntimeFactory(runtime: Runtime): RuntimeFactory {
     }),
     createMultiProjectRuntime: () => runtime,
     createLocalRuntime: () => runtime,
+    hostFiles: host.files,
   };
 }
 
-export function RuntimeFactoryFake(host: { runtime: Runtime }): Layer.Layer<RuntimeFactoryTag> {
-  return Layer.succeed(RuntimeFactoryTag)(fakeRuntimeFactory(host.runtime));
+export function RuntimeFactoryFake(host: {
+  runtime: Runtime;
+  files: HostFiles;
+}): Layer.Layer<RuntimeFactoryTag> {
+  return Layer.succeed(RuntimeFactoryTag)(fakeRuntimeFactory(host));
 }
