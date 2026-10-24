@@ -144,8 +144,9 @@ export class DurableEventJournal {
   private mentionEpoch = 0;
 
   /**
-   * `locks` takes the blob lock and the journal's append lock (phase 4: SessionLocks). The
-   * process-wide registry (sharedDurableEventJournal) and the CLIs keep the Node default.
+   * `locks` takes the blob lock and the journal's append lock (phase 4: SessionLocks). Callers with
+   * a history service pass its locks. The process-wide registry (sharedDurableEventJournal) and
+   * replayVerifySession have none, so they keep the Node default.
    */
   constructor(
     sessionDir: string,
