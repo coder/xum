@@ -354,7 +354,7 @@ describe("CreationDraftStore", () => {
     await store.flush(id);
     store.update(id, { text: "typed just before reload" });
     const saves = control.updates.length;
-    window.dispatchEvent(new Event("beforeunload"));
+    window.dispatchEvent(new window.Event("beforeunload"));
     // Sent at once, not after the debounce.
     expect(control.updates.length).toBe(saves + 1);
     await waitFor(() => !store.getView(id).unsaved);

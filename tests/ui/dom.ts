@@ -51,6 +51,9 @@ export function installDom(): () => void {
   globalThis.getComputedStyle = domWindow.getComputedStyle.bind(domWindow);
   globalThis.localStorage = domWindow.localStorage;
   globalThis.CustomEvent = domWindow.CustomEvent;
+  // Not `Event`: Node code under test dispatches on native EventTargets (wsFlowControl), which
+  // reject happy-dom events. happy-dom 21 dispatches only its own events, so DOM tests build
+  // them with `new window.Event(...)`.
   (globalThis as unknown as { Element: unknown }).Element = domWindow.Element;
   (globalThis as unknown as { DocumentFragment: unknown }).DocumentFragment =
     domWindow.DocumentFragment;
