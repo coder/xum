@@ -195,6 +195,7 @@ import type {
   WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentId } from "@/common/types/agentDefinition";
 import {
@@ -2193,6 +2194,8 @@ async function readTaskBaseCommitShaByProjectPath(params: {
   runtime: Runtime;
 }): Promise<Record<string, string>> {
   const projectRepos = getWorkspaceProjectRepos({
+    // Outside the agent loop: the host's runtimes.
+    runtimeFactory: nodeRuntimeFactory,
     workspaceId: params.workspaceId,
     workspaceName: params.workspaceName,
     workspacePath: params.workspacePath,
@@ -15565,6 +15568,8 @@ export class TaskService implements AgentTaskIntegration {
               namedWorkspacePath: workspacePath,
             }),
             projectRepos: getWorkspaceProjectRepos({
+              // Outside the agent loop: the host's runtimes.
+              runtimeFactory: nodeRuntimeFactory,
               workspaceId: taskId,
               workspaceName,
               workspacePath,

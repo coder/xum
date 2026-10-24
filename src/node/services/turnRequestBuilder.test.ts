@@ -31,6 +31,7 @@ import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import type { EffectRunner } from "./di/effectRunner";
 import { Ok } from "@/common/types/result";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 type TurnRequestBuilderDependencies = ConstructorParameters<typeof TurnRequestBuilder>[0];
 
@@ -61,6 +62,7 @@ async function createPreparationHarness(
     lastLlmRequestByWorkspace: new Map(),
     bindings: {},
     hostServices: {},
+    runtimeFactory: nodeRuntimeFactory,
     emit: () => false,
     createAbortedTurnHandle: (messageId) => ({
       messageId,

@@ -38,10 +38,8 @@ import {
   PLAN_REVIEW_METADATA_TYPE,
   PLAN_SNAPSHOT_EXISTENCE_PROBE_TIMEOUT_MS,
 } from "@/constants/planReview";
-import {
-  createRuntimeForWorkspace,
-  type WorkspaceMetadataForRuntime,
-} from "@/node/runtime/runtimeHelpers";
+import type { WorkspaceMetadataForRuntime } from "@/node/runtime/runtimeHelpers";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import { execBuffered, planReadPaths, readPlanFile } from "@/node/utils/runtime/helpers";
 import {
   resolvePlanFileLocation,
@@ -76,6 +74,8 @@ export interface PlanReviewHistoryDeps {
 export interface EnsurePlanSnapshotArgs {
   workspaceId: string;
   metadata: WorkspaceMetadataForRuntime & { projectName: string };
+  /** Builds the workspace runtime that the snapshot reads the plan through. */
+  runtimeFactory: RuntimeFactory;
   /** Where the plan lives (planLocation.ts): this installation's identity and the migration flag. */
   planStorage: PlanLocationConfig;
   /** Tool call id of the `propose_plan` that produced this revision; omitted for on-demand snapshots. */
@@ -262,7 +262,7 @@ export async function ensurePlanSnapshot(
     if (!captured.success) return Err(historyFailed(captured.error));
     frontier = { generation: captured.data.generation };
   }
-  const runtime = createRuntimeForWorkspace(args.metadata);
+  const runtime = args.runtimeFactory.createRuntimeForWorkspace(args.metadata);
   const planLocation = await resolvePlanFileLocation(
     args.planStorage,
     runtime,

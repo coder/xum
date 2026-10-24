@@ -49,6 +49,7 @@ import { MAX_PLAN_SNAPSHOT_BYTES } from "@/constants/planReview";
 import { ensurePlanSnapshot, getPlanReviewState } from "./planReviewService";
 import { HistoryService } from "./historyService";
 import { NESTED_COMPACTION_FOLLOW_UP_MESSAGE } from "@/common/utils/messages/pluginSendHookFields";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 const PROJECT_PATH = "/tmp/project";
 
@@ -1383,11 +1384,7 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
     const capture = () =>
       ensurePlanSnapshot(
         { historyService: other, emitChatEvent: () => undefined },
-        {
-          workspaceId,
-          metadata,
-          planStorage: config,
-        }
+        { runtimeFactory: nodeRuntimeFactory, workspaceId, metadata, planStorage: config }
       );
     /** A capture that runs `discard` after its plan read, right before its locked append. */
     const inFlightCapture = async (discard: () => Promise<unknown>) => {

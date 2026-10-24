@@ -32,6 +32,7 @@ import { coerceNonEmptyString, findWorkspaceEntry } from "@/node/services/taskUt
 import { getWorkspaceProjectRepos } from "@/node/services/workspaceProjectRepos";
 
 import { streamToString } from "@/node/runtime/streamUtils";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 export type TaskApplyGitPatchArgs = z.infer<typeof TaskApplyGitPatchToolArgsSchema>;
 export type TaskApplyGitPatchResult = z.infer<typeof TaskApplyGitPatchToolResultSchema>;
@@ -652,6 +653,8 @@ function resolveCurrentWorkspaceRepoTargets(params: {
   }
 
   const projectRepos = getWorkspaceProjectRepos({
+    // Outside the agent loop: the host's runtimes.
+    runtimeFactory: nodeRuntimeFactory,
     workspaceId: params.workspaceId,
     workspaceName,
     workspacePath,

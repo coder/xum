@@ -23,7 +23,6 @@ import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
-import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
@@ -234,10 +233,8 @@ export class TokenBudgetStrategy {
       const resolved = await resolveAgentForStream({
         workspaceId: this.host.workspaceId,
         metadata: metadata.data,
-        // mutation-equivalent: runtimeFactory is a RuntimeFactory object or undefined, so ?? and || agree
-        ...(
-          this.deps.aiService.runtimeFactory ?? nodeRuntimeFactory
-        ).createRuntimeContextForWorkspace(metadata.data),
+        ...this.deps.aiService.runtimeFactory.createRuntimeContextForWorkspace(metadata.data),
+        runtimeFactory: this.deps.aiService.runtimeFactory,
         requestedAgentId: options?.agentId,
         strictAgentResolution: options?.strictAgentResolution,
         disableWorkspaceAgents: options?.disableWorkspaceAgents ?? false,

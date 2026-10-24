@@ -100,6 +100,7 @@ import {
   isWorkspaceEvent,
   statusSetResultStatus,
 } from "@/node/services/aiServiceEventGuards";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
@@ -15646,6 +15647,8 @@ export class WorkspaceService
     const result = await ensurePlanSnapshot(this.planReviewHistoryDeps, {
       workspaceId,
       metadata,
+      // Outside the agent loop: the host's runtimes.
+      runtimeFactory: nodeRuntimeFactory,
       planStorage: this.config,
       ...(proposalToolCallId !== undefined ? { proposalToolCallId } : {}),
     });

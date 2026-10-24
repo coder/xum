@@ -29,7 +29,7 @@ import {
   buildRequiredToolPatterns,
   type ToolPolicy,
 } from "@/common/utils/tools/toolPolicy";
-import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
 import {
   discoverAgentDefinitions,
@@ -53,6 +53,8 @@ export interface ResolveAgentOptions {
   metadata: WorkspaceMetadata;
   runtime: Runtime;
   workspacePath: string;
+  /** Builds the parent workspace's runtime for agent discovery (the session's RuntimeFactory). */
+  runtimeFactory: RuntimeFactory;
   /** Requested agent ID from the frontend (may be undefined → defaults to exec). */
   requestedAgentId: string | undefined;
   /** When true, skip workspace-specific agents (for "unbricking" broken agent files). */
@@ -185,6 +187,7 @@ function getAgentDiscoveryCandidates(params: {
   metadata: WorkspaceMetadata;
   runtime: Runtime;
   workspacePath: string;
+  runtimeFactory: RuntimeFactory;
   disableWorkspaceAgents: boolean;
   cfg: ProjectsConfig;
 }): AgentDiscoveryCandidate[] {
@@ -205,7 +208,7 @@ function getAgentDiscoveryCandidates(params: {
   if (parentWorkspace != null && parentWorkspaceName != null) {
     try {
       candidates.push(
-        createRuntimeContextForWorkspace({
+        params.runtimeFactory.createRuntimeContextForWorkspace({
           runtimeConfig: parentWorkspace.workspace.runtimeConfig ?? params.metadata.runtimeConfig,
           projectPath: parentWorkspace.projectPath,
           name: parentWorkspaceName,
@@ -298,6 +301,7 @@ export async function resolveAgentForStream(
     metadata,
     runtime,
     workspacePath,
+    runtimeFactory: opts.runtimeFactory,
     disableWorkspaceAgents,
     cfg,
   });
