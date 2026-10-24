@@ -270,6 +270,7 @@ export class AIService extends EventEmitter {
       lastLlmRequestByWorkspace: this.lastLlmRequestByWorkspace,
       bindings: this.turnRequestBuilderBindings,
       hostServices,
+      runtimeFactory: this.runtimeFactory,
       emit: (event, ...args) => this.emit(event, ...args),
       createAbortedTurnHandle: (messageId, signal) =>
         this.createAbortedTurnHandle(messageId, signal),
@@ -856,6 +857,7 @@ export class AIService extends EventEmitter {
         metadata: metadata.data,
         runtime: context.data.runtime,
         workspacePath: context.data.workspacePath,
+        runtimeFactory: this.runtimeFactory,
         requestedAgentId: options.agentId,
         disableWorkspaceAgents: options.disableWorkspaceAgents ?? false,
         automaticGoalTurn: true,

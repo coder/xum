@@ -43,6 +43,7 @@ import {
 } from "@/node/services/workspaceProjectRepos";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { taskGitPatchEngine } from "@/node/services/taskGitPatchEngine";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 /** Callback invoked after patch generation completes (success or failure). */
 export type OnPatchGenerationComplete = (childWorkspaceId: string) => Promise<void>;
@@ -703,6 +704,8 @@ export class GitPatchArtifactService {
       });
 
       const projectRepos = getWorkspaceProjectRepos({
+        // Outside the agent loop: the host's runtimes.
+        runtimeFactory: nodeRuntimeFactory,
         workspaceId: childWorkspaceId,
         workspaceName,
         workspacePath,

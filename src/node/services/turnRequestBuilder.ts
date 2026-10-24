@@ -971,6 +971,8 @@ interface TurnRequestBuilderDependencies {
   };
   bindings: TurnRequestBuilderBindings;
   hostServices: LoopHostServices;
+  /** AIService's runtime builders (its hostServices.runtimeFactory, or the Node layer). */
+  runtimeFactory: RuntimeFactory;
   emit: (event: string, ...args: unknown[]) => boolean;
   createAbortedTurnHandle: (messageId: string, signal?: AbortSignal) => TurnStreamHandle;
   createSettledTurnHandle: (messageId: string, completion: TurnCompletion) => TurnStreamHandle;
@@ -2043,6 +2045,7 @@ export class TurnRequestBuilder {
       metadata,
       runtime,
       workspacePath,
+      runtimeFactory: this.dependencies.runtimeFactory,
       requestedAgentId: agentId,
       strictAgentResolution,
       // Goal kind survives retries, restart resumes and compaction follow-ups (#5402).

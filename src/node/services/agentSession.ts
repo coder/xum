@@ -224,7 +224,6 @@ import {
 } from "@/common/types/message";
 import { toValidGoalId } from "@/common/types/goal";
 import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
-import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
   carriedPlanReviewFeedback,
@@ -1053,8 +1052,8 @@ function resolveSessionHostClock(
 
 /** Keeps AgentSession coupled only to the AI operations and events it consumes. */
 export interface AgentSessionAIService extends BranchSummaryAiService {
-  /** Builds the session's runtimes. Absent: the Node layer (test doubles of AIService). */
-  readonly runtimeFactory?: RuntimeFactory;
+  /** Builds the session's runtimes. Test doubles of AIService pass one too (nodeRuntimeFactory). */
+  readonly runtimeFactory: RuntimeFactory;
   createModelWithPinnedOptions: AIService["createModelWithPinnedOptions"];
   on(event: string, listener: (...args: unknown[]) => void): void;
   off(event: string, listener: (...args: unknown[]) => void): void;
@@ -11984,6 +11983,7 @@ export class AgentSession {
         {
           workspaceId: this.workspaceId,
           metadata: metadata.data,
+          runtimeFactory: this.aiService.runtimeFactory,
           planStorage: this.config,
           proposalToolCallId,
           signal: captureSignal,
@@ -13517,12 +13517,6 @@ export class AgentSession {
     });
   }
 
-  /** The session's runtime builders: AIService's, or the Node layer for test doubles. */
-  private runtimes(): RuntimeFactory {
-    // mutation-equivalent: runtimeFactory is a RuntimeFactory object or undefined, so ?? and || agree
-    return this.aiService.runtimeFactory ?? nodeRuntimeFactory;
-  }
-
   /**
    * Shared logic for assembling post-compaction attachments from cached context.
    * Loads exclusions, TODO state, workspace metadata, and plan references,
@@ -13596,7 +13590,7 @@ export class AgentSession {
 
       return attachments;
     }
-    const runtime = this.runtimes().createRuntimeForWorkspace(metadataResult.data);
+    const runtime = this.aiService.runtimeFactory.createRuntimeForWorkspace(metadataResult.data);
 
     const attachments = await AttachmentService.generatePostCompactionAttachments(
       await resolvePlanFileLocation(
@@ -13660,7 +13654,8 @@ export class AgentSession {
     }
 
     const metadata = metadataResult.data;
-    const { runtime, workspacePath } = this.runtimes().createRuntimeContextForWorkspace(metadata);
+    const { runtime, workspacePath } =
+      this.aiService.runtimeFactory.createRuntimeContextForWorkspace(metadata);
 
     const materialized = await materializeFileAtMentions(messageText, {
       runtime,
@@ -13782,7 +13777,8 @@ export class AgentSession {
     }
 
     const metadata = metadataResult.data;
-    const { runtime, workspacePath } = this.runtimes().createRuntimeContextForWorkspace(metadata);
+    const { runtime, workspacePath } =
+      this.aiService.runtimeFactory.createRuntimeContextForWorkspace(metadata);
 
     // When workspace agents are disabled, resolve skills from the project path instead of
     // the worktree so skill invocation uses the same precedence/discovery root as the UI.

@@ -23,6 +23,7 @@ import { InitStateManager } from "@/node/services/initStateManager";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { StreamErrorType } from "@/common/types/errors";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 export function createStartedTurnHandle(
   signal: AbortSignal,
@@ -128,6 +129,7 @@ export function createAgentSessionAIServiceFake(
   const aiEmitter = options.emitter ?? new EventEmitter();
   const getClosingSignal = options.getClosingSignal;
   const aiService: AgentSessionAIService & EventEmitter = Object.assign(aiEmitter, {
+    runtimeFactory: nodeRuntimeFactory,
     // Real implementations report failures as Err results, never rejections.
     createModelWithPinnedOptions: mock(() =>
       Promise.resolve(
