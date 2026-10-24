@@ -64,7 +64,7 @@ import { createPlanReviewRecordMessageId, createUserMessageId } from "./utils/me
 
 type PlanReviewHistory = Pick<
   HistoryService,
-  "iterateFullHistory" | "appendDerivedFromFullHistory" | "captureCompactionReplacement"
+  "iterateFullHistory" | "appendDerivedFromFullHistory" | "captureCompactionReplacement" | "locks"
 >;
 
 export interface PlanReviewHistoryDeps {
@@ -263,10 +263,12 @@ export async function ensurePlanSnapshot(
     frontier = { generation: captured.data.generation };
   }
   const runtime = createRuntimeForWorkspace(args.metadata);
-  const planLocation = await resolvePlanFileLocation(args.planStorage, runtime, {
-    ...args.metadata,
-    id: args.workspaceId,
-  });
+  const planLocation = await resolvePlanFileLocation(
+    args.planStorage,
+    runtime,
+    { ...args.metadata, id: args.workspaceId },
+    deps.historyService.locks
+  );
   const plan =
     args.proposedContent !== undefined
       ? {

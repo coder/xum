@@ -322,12 +322,14 @@ function insufficientScopeHandler(
 
 function createHttpTransport(config: MCPHttpTransportConfig): Transport {
   const url = new URL(config.url);
-  // MCP server URLs are user-configured and already trusted to execute tools,
-  // so follow HTTP redirects (http->https, trailing slash) to avoid breaking
-  // existing setups. Note undici's fetch follows redirects by default; this
-  // pins the behavior explicitly.
+  // The SDK's default redirect policy (since 2.3.0) follows only redirects that stay on the
+  // request's origin and keep the method (307/308, or any redirect of a GET), plus http->https on
+  // the same host with default ports, so trailing-slash and https upgrades keep working. It
+  // refuses a redirect to another origin, so custom headers (API keys) and request bodies never
+  // reach a host the user did not configure (CVE-2026-111769, #7384). Do not set
+  // `redirectPolicy: "follow"`: it restores that leak. A server that moves to another origin
+  // needs its new URL in the config.
   const requestInit: RequestInit = {
-    redirect: "follow",
     ...(config.headers !== undefined ? { headers: config.headers } : {}),
   };
 
