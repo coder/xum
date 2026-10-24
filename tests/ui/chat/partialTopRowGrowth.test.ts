@@ -49,6 +49,9 @@ describe("Growth inside a partly visible top row while scrolled up (#6773)", () 
       try {
         for (const text of ["First message", "Second message"]) {
           await app.chat.send(`${text} for the top-row growth test`);
+          // Wait for the reply itself: right after the click the send may not have reached the
+          // stream state yet, so expectStreamComplete alone can return before the turn starts.
+          await app.chat.expectTranscriptContains(`Mock response: ${text}`);
           await app.chat.expectStreamComplete();
         }
         const container = app.view.container;
