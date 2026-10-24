@@ -13,7 +13,8 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import { ARTIFACT_CLICK_SEND_WINDOW_MS } from "@/common/constants/artifactInteractions";
 import { getErrorMessage } from "@/common/utils/errors";
-import { createArtifactAssetLoader } from "./artifactAssets";
+import { cn } from "@/common/lib/utils";
+import { createArtifactAssetLoader, type ArtifactAssetReader } from "./artifactAssets";
 import {
   ARTIFACT_FRAME_CHORDS,
   acceptArtifactFrameMessage,
@@ -165,6 +166,52 @@ function handleFrameKeyMessage(
   onFrameKey?.(message.key);
 }
 
+type FrameDocument = Pick<BuiltDocument, "srcDoc" | "notices" | "error" | "followsColorScheme">;
+
+/**
+ * The sandboxed srcdoc for an HTML/SVG artifact. `bridgeScript` is told whether the page takes
+ * the theme's color scheme (an HTML page without styles of its own, isUnstyledHtmlDocument).
+ */
+async function buildFrameDocument(input: {
+  kind: "html" | "svg";
+  content: string;
+  path: string;
+  allowCdn: boolean;
+  read: ArtifactAssetReader | null;
+  bridgeScript: (followsColorScheme: boolean) => string;
+}): Promise<FrameDocument> {
+  const csp = buildArtifactCsp({ allowCdn: input.allowCdn });
+  if (input.kind === "svg") {
+    const options = { csp, bridgeScript: input.bridgeScript(false) };
+    const srcDoc = buildSandboxedSvgDocument(input.content, options);
+    return { srcDoc, notices: [], error: null, followsColorScheme: false };
+  }
+  const doc = parseArtifactHtml(input.content);
+  const followsColorScheme = isUnstyledHtmlDocument(doc);
+  const options = { csp, bridgeScript: input.bridgeScript(followsColorScheme) };
+  const loader = createArtifactAssetLoader(input.path, input.read ?? (() => Promise.resolve(null)));
+  try {
+    const notices = await inlineArtifactHtmlAssets(doc, loader, { allowCdn: input.allowCdn });
+    return {
+      srcDoc: finalizeSandboxedDocument(doc, options),
+      notices,
+      error: null,
+      followsColorScheme,
+    };
+  } catch (error) {
+    return { srcDoc: null, notices: [], error: getErrorMessage(error), followsColorScheme };
+  }
+}
+
+/** A page with the theme's scheme paints no canvas of its own, so the theme's background shows. */
+function frameClassName(followsColorScheme: boolean, annotating: boolean): string {
+  return cn(
+    "min-h-0 w-full flex-1 border-0",
+    followsColorScheme ? "bg-background" : "bg-white",
+    annotating && "cursor-crosshair"
+  );
+}
+
 /**
  * The workspace an artifact names: a workspace ID (sub-agent task IDs are workspace IDs), or a
  * workspace-turn task handle (`wst_...`), which tags the workspace it created, as the task
@@ -272,29 +319,21 @@ export function SandboxedArtifactFrame(props: {
   useEffect(() => {
     if (waitingForState) return;
     let cancelled = false;
-    const doc = kind === "html" ? parseArtifactHtml(content) : null;
-    const followsColorScheme = doc != null && isUnstyledHtmlDocument(doc);
-    const options = {
-      csp: buildArtifactCsp({ allowCdn }),
-      bridgeScript: buildArtifactBridgeScript(
-        initialTheme,
-        state,
-        initialAppearance,
-        followsColorScheme
-      ),
-    };
-    const finish = (srcDoc: string | null, notices: string[], error: string | null = null) => {
-      if (cancelled) return;
-      setBuilt({ content, allowCdn, state, srcDoc, notices, error, followsColorScheme });
-    };
-    if (doc == null) {
-      finish(buildSandboxedSvgDocument(content, options), []);
-    } else {
-      const loader = createArtifactAssetLoader(path, read ?? (() => Promise.resolve(null)));
-      inlineArtifactHtmlAssets(doc, loader, { allowCdn })
-        .then((notices) => finish(finalizeSandboxedDocument(doc, options), notices))
-        .catch((error: unknown) => finish(null, [], getErrorMessage(error)));
-    }
+    buildFrameDocument({
+      kind,
+      content,
+      path,
+      allowCdn,
+      read,
+      bridgeScript: (followsColorScheme) =>
+        buildArtifactBridgeScript(initialTheme, state, initialAppearance, followsColorScheme),
+    })
+      .then((frameDocument) => {
+        if (!cancelled) setBuilt({ content, allowCdn, state, ...frameDocument });
+      })
+      .catch((error: unknown) => {
+        console.error("[Artifacts] building the frame document failed:", getErrorMessage(error));
+      });
     return () => {
       cancelled = true;
     };
@@ -418,8 +457,7 @@ export function SandboxedArtifactFrame(props: {
           postArtifactTheme(liveWindow(), theme, currentAppearance());
           if (annotating) postArtifactAnnotateMode(liveWindow(), true);
         }}
-        // A page with the theme's scheme paints no canvas of its own, so the theme's shows.
-        className={`min-h-0 w-full flex-1 border-0 ${current.followsColorScheme ? "bg-background" : "bg-white"} ${annotating ? "cursor-crosshair" : ""}`}
+        className={frameClassName(current.followsColorScheme, annotating)}
         data-testid="artifact-frame"
       />
     </div>

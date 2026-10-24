@@ -5,6 +5,7 @@ import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import { cn } from "@/common/lib/utils";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { ChatInputAPI } from "@/browser/features/ChatInput/types";
 import {
   type AgentInterfaceView,
   recordStatusPageRead,
@@ -68,8 +69,8 @@ function useStatusArtifactRead(workspaceId: string): ArtifactReadResult | null {
 interface StatusViewProps {
   workspaceId: string;
   dockRef: React.RefObject<HTMLElement | null>;
-  /** Moves focus to the composer, where a switch from the status page to the chat leaves it. */
-  focusComposer: () => void;
+  /** The composer, which takes focus when a switch to the chat starts inside the page. */
+  composerApiRef: React.RefObject<Pick<ChatInputAPI, "focus"> | null>;
 }
 
 /**
@@ -86,10 +87,32 @@ export function AgentInterfaceStatusView(
     <StatusPage
       workspaceId={props.workspaceId}
       dockRef={props.dockRef}
-      focusComposer={props.focusComposer}
+      composerApiRef={props.composerApiRef}
       hidden={props.view !== "status"}
     />
   );
+}
+
+/**
+ * Browsers leave focus on a frame that stopped rendering, so after a switch to the chat from
+ * inside the page, keystrokes would go to the hidden page. Hands them to the composer instead.
+ * Returns the ref for the status page's section.
+ */
+function useComposerFocusWhenHidden(
+  hidden: boolean,
+  composerApiRef: StatusViewProps["composerApiRef"]
+): React.RefObject<HTMLElement | null> {
+  const sectionRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const section = sectionRef.current;
+    if (!hidden || section == null || !section.contains(document.activeElement)) return;
+    composerApiRef.current?.focus();
+    // A disabled composer cannot take focus: still take it off the hidden page.
+    if (section.contains(document.activeElement) && document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+  }, [hidden, composerApiRef]);
+  return sectionRef;
 }
 
 function StatusPage(props: StatusViewProps & { hidden: boolean }) {
@@ -98,19 +121,8 @@ function StatusPage(props: StatusViewProps & { hidden: boolean }) {
   const dockHeight = useElementHeight(props.dockRef);
   // window.xum.send / setState, as in the Artifacts tab.
   const interactions = useArtifactInteractions(workspaceId, STATUS_TARGET);
-  const sectionRef = useRef<HTMLElement>(null);
-  const { hidden, focusComposer } = props;
-  // Browsers leave focus on a frame that stopped rendering, so after a switch to the chat from
-  // inside the page, keystrokes would go to the hidden page. Hand them to the composer instead.
-  useEffect(() => {
-    const section = sectionRef.current;
-    if (!hidden || section == null || !section.contains(document.activeElement)) return;
-    focusComposer();
-    // A disabled composer cannot take focus: still take it off the hidden page.
-    if (section.contains(document.activeElement) && document.activeElement instanceof HTMLElement) {
-      document.activeElement.blur();
-    }
-  }, [hidden, focusComposer]);
+  const { hidden } = props;
+  const sectionRef = useComposerFocusWhenHidden(hidden, props.composerApiRef);
 
   return (
     <section
