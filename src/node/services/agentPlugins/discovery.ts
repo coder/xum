@@ -1190,7 +1190,11 @@ async function discoverPluginAt(args: {
       validation.reason === "unsupported-version"
         ? "Unsupported Agent Plugins version"
         : "Invalid plugin manifest";
-    pushError(manifestPath, `${label}: ${validation.errors.join("; ")}`);
+    // Name the manifest: a plugin can carry plugin.json, .codex-plugin/plugin.json and
+    // .claude-plugin/plugin.json, and the user must see which one failed. Forward slashes on
+    // every OS, because the path is shown, not opened.
+    const shownManifest = manifestRelative.split(path.sep).join("/");
+    pushError(manifestPath, `${label} (${shownManifest}): ${validation.errors.join("; ")}`);
     return null;
   }
 
