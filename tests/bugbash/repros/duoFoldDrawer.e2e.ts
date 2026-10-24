@@ -78,13 +78,19 @@ async function fold(screen: Screen, browser: Browser): Promise<void> {
 }
 
 test(
-  "folding with the wide sidebar open keeps the drawer closed",
+  "folding with the wide sidebar open keeps the drawer closed, and closing the drawer keeps it open",
   { tags: TAGS },
   async ({ app, screen, browser }) => {
     await browser.setViewport(INNER);
     await openPlayground(app, screen, browser);
     await expectWideSidebar(screen, browser, true);
     await fold(screen, browser);
+
+    await openDrawer(screen, browser);
+    await screen.getByRole("button", "Collapse sidebar").tap();
+    await expectDrawerClosed(screen, browser);
+    await browser.setViewport(INNER);
+    await expectWideSidebar(screen, browser, true);
   }
 );
 
