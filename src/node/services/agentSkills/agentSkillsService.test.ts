@@ -16,7 +16,7 @@ import { substituteSkillArguments } from "@/node/services/agentSkills/skillArgum
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
-import { RuntimeError } from "@/node/runtime/Runtime";
+import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
 import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -29,6 +29,21 @@ import {
 } from "./agentSkillsService";
 // The Node layer: these tests read through host runtimes.
 import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
+
+/** The Node layer, except that its host-local runtimes read `~/` as `home`: shows which runtime a scan used. */
+function runtimeFactoryWithHome(home: string): RuntimeFactory {
+  return {
+    ...runtimeFactory,
+    createLocalRuntime: (workspacePath) => {
+      const local = runtimeFactory.createLocalRuntime(workspacePath);
+      return Object.assign(Object.create(local) as Runtime, {
+        resolvePath: (target: string) =>
+          local.resolvePath(target.startsWith("~/") ? path.join(home, target.slice(2)) : target),
+      });
+    },
+  };
+}
 
 async function writeSkillWithName(root: string, dir: string, name: string): Promise<void> {
   await fs.mkdir(path.join(root, dir), { recursive: true });
@@ -1714,6 +1729,33 @@ describe("agentSkillsService agent plugins", () => {
       if (saved === undefined) delete process.env[DISABLE_PROJECT_AUTOMATION_ENV];
       else process.env[DISABLE_PROJECT_AUTOMATION_ENV] = saved;
     }
+  });
+
+  test("resolves plugin containers through the host-local runtime of the RuntimeFactory it was given", async () => {
+    using tmp = new DisposableTempDir("plugin-skill-factory");
+    const pluginDir = path.join(tmp.path, "plugins", "probe");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: "probe", skills: ["./core"] })
+    );
+    await writeSkill(path.join(pluginDir, "core"), "factory-probe", "from the factory's home");
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      // Tilde form: only the factory's host-local runtime maps it into tmp.
+      globalPluginRoots: ["~/plugins"],
+    };
+
+    const { skills } = await discoverAgentSkills(new LocalRuntime(tmp.path), tmp.path, {
+      roots,
+      runtimeFactory: runtimeFactoryWithHome(tmp.path),
+    });
+
+    expect(skills.find((s) => s.name === "factory-probe")?.description).toBe(
+      "from the factory's home"
+    );
   });
 
   test("a plugin with several skills roots serves each root's skills; the first root wins a name", async () => {
