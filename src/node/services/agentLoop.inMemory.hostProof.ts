@@ -57,15 +57,18 @@ function isInside(root: string, target: string): boolean {
  * The disk rule of claim 4.3: Config's calls under its root and the log file. Nothing else.
  * - Config and its stores (config.json, providers.jsonc, secrets.json, the plugin registry and
  *   journals of the managed container) stay on the disk until #7209. Config checks each
- *   ancestor of its root for links (lstat).
+ *   ancestor of its root for links (lstat). The session dirs and worktrees under the root are
+ *   not Config's: a call there fails the proof.
  * - The log sink writes XUM_ROOT/logs/mux.log (#7209), and its console sink writes stdout. The
  *   file stream writes by fd. Every other fd comes from an open row that this rule checks by
  *   its path, so an fd row needs no path.
  */
 function allowedOnDisk(configRoot: string): (row: HostTrapRow) => boolean {
   const logsDir = path.dirname(getLogFilePath());
+  // The config root also holds the session dirs and the worktrees: those stay on test layers.
+  const layered = [path.join(configRoot, "sessions"), path.join(configRoot, "src")];
   return (row) =>
-    isInside(configRoot, row.arg) ||
+    (isInside(configRoot, row.arg) && !layered.some((dir) => isInside(dir, row.arg))) ||
     (row.api === "fs.lstatSync" && isInside(row.arg, configRoot)) ||
     isInside(logsDir, row.arg) ||
     /^fd\/\d+$/.test(row.arg);
