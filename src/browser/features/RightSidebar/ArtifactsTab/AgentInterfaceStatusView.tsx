@@ -5,7 +5,7 @@ import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import { cn } from "@/common/lib/utils";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getErrorMessage } from "@/common/utils/errors";
-import { useStatusArtifactEntry } from "./agentInterfaceView";
+import { type AgentInterfaceView, useStatusArtifactEntry } from "./agentInterfaceView";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { useArtifactInteractions } from "./useArtifactInteractions";
 
@@ -30,22 +30,12 @@ function useElementHeight(ref: React.RefObject<HTMLElement | null>): number {
   return height;
 }
 
-/**
- * The Agent interface view's status page in the main pane: the live status artifact, laid over
- * the transcript region down to the composer dock, which stays usable below it. It is kept
- * mounted (hidden) while the transcript shows, so switching back does not reload the page.
- */
-export function AgentInterfaceStatusView(props: {
-  workspaceId: string;
-  hidden: boolean;
-  dockRef: React.RefObject<HTMLElement | null>;
-}) {
+/** The status page's content, re-read when the file changes; null until the first read. */
+function useStatusArtifactRead(workspaceId: string): ArtifactReadResult | null {
   const { api } = useAPI();
-  const { workspaceId } = props;
   const entry = useStatusArtifactEntry(workspaceId);
   const [read, setRead] = useState<ArtifactReadResult | null>(null);
-  const dockHeight = useElementHeight(props.dockRef);
-  // Re-read when the file changes; size too, since a same-mtime rewrite still changes it.
+  // Size too, since a same-mtime rewrite still changes it.
   const readKey = entry == null ? null : `${entry.modifiedMs}\u0000${entry.size}`;
 
   useEffect(() => {
@@ -66,6 +56,37 @@ export function AgentInterfaceStatusView(props: {
     return () => controller.abort();
   }, [api, workspaceId, readKey]);
 
+  return read;
+}
+
+interface StatusViewProps {
+  workspaceId: string;
+  dockRef: React.RefObject<HTMLElement | null>;
+}
+
+/**
+ * The Agent interface view's status page in the main pane: the live status artifact, laid over
+ * the transcript region down to the composer dock, which stays usable below it. It is kept
+ * mounted (hidden) while the transcript shows, so switching back does not reload the page.
+ * Renders nothing when the workspace has no status page to switch to (view null).
+ */
+export function AgentInterfaceStatusView(
+  props: StatusViewProps & { view?: AgentInterfaceView | null }
+) {
+  if (props.view == null) return null;
+  return (
+    <StatusPage
+      workspaceId={props.workspaceId}
+      dockRef={props.dockRef}
+      hidden={props.view !== "status"}
+    />
+  );
+}
+
+function StatusPage(props: StatusViewProps & { hidden: boolean }) {
+  const { workspaceId } = props;
+  const read = useStatusArtifactRead(workspaceId);
+  const dockHeight = useElementHeight(props.dockRef);
   // window.xum.send / setState, as in the Artifacts tab.
   const interactions = useArtifactInteractions(workspaceId, STATUS_TARGET);
 

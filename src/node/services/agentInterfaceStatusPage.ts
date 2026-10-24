@@ -93,30 +93,38 @@ export const AGENT_INTERFACE_STATUS_TEMPLATE = `<!doctype html>
 `;
 
 /**
- * Seed the status page at turn start when both flags are on and the page does not exist yet.
- * Never overwrites (the agent owns the page once it exists) and never throws: a failure is
- * logged and the turn goes on. Returns whether it wrote the page.
+ * At turn start: whether the Agent interface view is active this turn (both flags on and
+ * XUM_SCRATCH_DIR set, so the agent can edit what was seeded), seeding the status page first
+ * when it is active and the page does not exist yet. Never overwrites (the agent owns the page
+ * once it exists) and never throws: a failed seed is logged and the turn goes on.
  */
-export async function seedAgentInterfaceStatusPage(args: {
+export async function prepareAgentInterfaceStatusPage(args: {
+  scratchDirSet: boolean;
   artifactsEnabled: boolean;
   agentInterfaceEnabled: boolean;
   resolveLocation: () => Promise<ArtifactsLocation>;
   abortSignal?: AbortSignal;
 }): Promise<boolean> {
-  if (!args.artifactsEnabled || !args.agentInterfaceEnabled) return false;
+  const active = args.scratchDirSet && args.artifactsEnabled && args.agentInterfaceEnabled;
+  if (active) await seedStatusPage(args.resolveLocation, args.abortSignal);
+  return active;
+}
+
+async function seedStatusPage(
+  resolveLocation: () => Promise<ArtifactsLocation>,
+  abortSignal: AbortSignal | undefined
+): Promise<void> {
   try {
-    const location = await args.resolveLocation();
-    if (location.kind === "unavailable") return false;
-    if (await statusPageExists(location, args.abortSignal)) return false;
+    const location = await resolveLocation();
+    if (location.kind === "unavailable") return;
+    if (await statusPageExists(location, abortSignal)) return;
     await writeArtifactAtLocation(
       location,
       AGENT_INTERFACE_STATUS_ARTIFACT,
       AGENT_INTERFACE_STATUS_TEMPLATE
     );
-    return true;
   } catch (error) {
     log.debug("Seeding the agent interface status page failed", { error });
-    return false;
   }
 }
 

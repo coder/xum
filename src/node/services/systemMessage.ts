@@ -245,7 +245,8 @@ Manage servers in Settings → MCP.
  * The Agent interface view's guidance. Static text (it names $XUM_SCRATCH_DIR, not the path), so
  * the cached prompt stays the same across turns and sibling workspaces.
  */
-function buildAgentInterfaceContext(): string {
+function buildAgentInterfaceContext(options: { agentInterfaceView?: boolean } | undefined): string {
+  if (options?.agentInterfaceView !== true) return "";
   return `
 
 <agent-interface>
@@ -733,9 +734,7 @@ export function buildSystemMessageFromSources(
       "\n\n<scratch-workspace>\nThis is a project-less scratch chat. The workspace directory is app-managed and is not a Git repository unless the user initializes one.\n</scratch-workspace>";
   }
 
-  if (options?.agentInterfaceView === true) {
-    systemMessage += buildAgentInterfaceContext();
-  }
+  systemMessage += buildAgentInterfaceContext(options);
 
   // Add MCP context if servers are configured
   if (mcpServers && Object.keys(mcpServers).length > 0) {

@@ -7,6 +7,13 @@ import {
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import { isAbortError } from "@/browser/utils/isAbortError";
+import {
+  isDesktopViewportFocused,
+  isDialogOpen,
+  isTerminalFocused,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
@@ -14,7 +21,7 @@ import {
   AGENT_INTERFACE_VIEW_MAX_CHARS,
   AGENT_INTERFACE_VIEW_MAX_WORKSPACES,
 } from "@/common/constants/storage";
-import type { ArtifactEntry } from "@/common/orpc/schemas/artifacts";
+import type { ArtifactEntry, ArtifactListing } from "@/common/orpc/schemas/artifacts";
 import { getErrorMessage } from "@/common/utils/errors";
 import { useArtifactsRefreshTick } from "./useArtifactsRefreshTick";
 
@@ -105,16 +112,14 @@ function subscribeStatusEntries(listener: () => void): () => void {
   return () => statusListeners.delete(listener);
 }
 
+/** What a change of the page means to readers: unlisted, none, or a version of the file. */
+function entryKey(entry: ArtifactEntry | null | undefined): string | undefined {
+  if (entry == null) return entry === null ? "none" : undefined;
+  return `${entry.kind}\u0000${entry.modifiedMs}\u0000${entry.size}`;
+}
+
 function publishStatusEntry(workspaceId: string, entry: ArtifactEntry | null) {
-  const previous = statusEntries.get(workspaceId);
-  if (
-    previous !== undefined &&
-    previous?.modifiedMs === entry?.modifiedMs &&
-    previous?.size === entry?.size &&
-    previous?.kind === entry?.kind
-  ) {
-    return;
-  }
+  if (entryKey(statusEntries.get(workspaceId)) === entryKey(entry)) return;
   statusEntries.set(workspaceId, entry);
   for (const listener of statusListeners) listener();
 }
@@ -130,12 +135,18 @@ function useStatusArtifactExists(workspaceId: string): boolean {
   );
 }
 
+/** The status page's entry in a listing; null when the folder has none or is unavailable. */
+function findStatusEntry(listing: ArtifactListing): ArtifactEntry | null {
+  if (!listing.available) return null;
+  return listing.entries.find((e) => e.path === AGENT_INTERFACE_STATUS_ARTIFACT) ?? null;
+}
+
 /**
  * Lists the artifacts folder for the status page while the view is enabled, on the same signals
  * as the Artifacts panel. Mount once per main pane. A failed listing keeps the last entry, so a
  * reconnect does not flip the pane back to the transcript.
  */
-export function useStatusArtifactPoll(workspaceId: string, enabled: boolean) {
+function useStatusArtifactPoll(workspaceId: string, enabled: boolean) {
   const { api } = useAPI();
   const listInFlightRef = useRef(false);
   const [refreshTick] = useArtifactsRefreshTick(workspaceId, {
@@ -154,14 +165,8 @@ export function useStatusArtifactPoll(workspaceId: string, enabled: boolean) {
       })
       .then((result) => {
         if (controller.signal.aborted) return;
-        if (!result.success) {
-          console.debug("[Agent interface] status page listing failed:", result.error);
-          return;
-        }
-        const entry = result.data.available
-          ? result.data.entries.find((e) => e.path === AGENT_INTERFACE_STATUS_ARTIFACT)
-          : undefined;
-        publishStatusEntry(workspaceId, entry ?? null);
+        if (result.success) publishStatusEntry(workspaceId, findStatusEntry(result.data));
+        else console.debug("[Agent interface] status page listing failed:", result.error);
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
@@ -206,4 +211,33 @@ export function toggleAgentInterfaceView(workspaceId: string) {
   );
   const current = resolveAgentInterfaceView({ enabled: true, statusExists: true, stored });
   writeAgentInterfaceViewChoice(workspaceId, current === "status" ? "chat" : "status");
+}
+
+/**
+ * The main pane's Agent interface view: lists the status page (once per main pane, feeding the
+ * menu-bar toggle and the command palette too), owns the switch shortcut, and returns the view
+ * to show, or null when there is nothing to switch to.
+ */
+export function useMainPaneAgentInterfaceView(workspaceId: string): AgentInterfaceView | null {
+  const enabled = useAgentInterfaceEnabled();
+  useStatusArtifactPoll(workspaceId, enabled);
+  const { available, view } = useAgentInterfaceView(workspaceId);
+  useEffect(() => {
+    if (!available) return;
+    const handler = (e: KeyboardEvent) => {
+      if (!matchesKeybind(e, KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW) || isShortcutOwnedElsewhere(e)) {
+        return;
+      }
+      e.preventDefault();
+      toggleAgentInterfaceView(workspaceId);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [available, workspaceId]);
+  return available ? view : null;
+}
+
+/** Dialogs, terminals and remote desktops keep their keystrokes, as for the Artifacts chord. */
+function isShortcutOwnedElsewhere(e: KeyboardEvent): boolean {
+  return isDialogOpen() || isTerminalFocused(e.target) || isDesktopViewportFocused(e.target);
 }

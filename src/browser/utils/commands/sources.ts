@@ -559,6 +559,28 @@ function describeConfigToggle(value: boolean | undefined, fallback: string): str
   return value === undefined ? fallback : `Current: ${value ? "On" : "Off"}`;
 }
 
+/** The Agent interface view's switch, while that experiment (and Artifacts) is on. */
+function agentInterfaceNavigationActions(
+  p: BuildSourcesParams,
+  wsId: string,
+  navigationSection: CommandAction["section"]
+): CommandAction[] {
+  if (p.agentInterfaceViewEnabled !== true) return [];
+  return [
+    {
+      // Not in CommandIds: a single static id, like "cycle-agent".
+      id: "nav:toggle-agent-interface-view",
+      title: "Switch Status Page / Chat",
+      section: navigationSection,
+      shortcutHint: formatKeybind(KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW),
+      keywords: ["status", "chat", "agent interface", "transcript", "view"],
+      // Listed only while there is a status page to switch to.
+      visible: () => hasAgentInterfaceStatusPage(wsId),
+      run: () => toggleAgentInterfaceView(wsId),
+    },
+  ];
+}
+
 /**
  * The mcp-apps experiment's palette commands (independent of Artifacts, #6760): one per MCP App
  * view of the workspace (transcript or opened this session), which opens its tab or focuses the
@@ -1155,21 +1177,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               },
             ]
           : []),
-        ...(p.agentInterfaceViewEnabled === true
-          ? [
-              {
-                // Not in CommandIds: a single static id, like "cycle-agent".
-                id: "nav:toggle-agent-interface-view",
-                title: "Switch Status Page / Chat",
-                section: section.navigation,
-                shortcutHint: formatKeybind(KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW),
-                keywords: ["status", "chat", "agent interface", "transcript", "view"],
-                // Listed only while there is a status page to switch to.
-                visible: () => hasAgentInterfaceStatusPage(wsId),
-                run: () => toggleAgentInterfaceView(wsId),
-              },
-            ]
-          : []),
+        ...agentInterfaceNavigationActions(p, wsId, section.navigation),
         ...mcpAppNavigationActions(p, wsId, section.navigation),
         {
           id: CommandIds.navRightSidebarToggle(),

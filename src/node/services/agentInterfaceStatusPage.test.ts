@@ -5,17 +5,19 @@ import * as path from "path";
 import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import {
   AGENT_INTERFACE_STATUS_TEMPLATE,
-  seedAgentInterfaceStatusPage,
+  prepareAgentInterfaceStatusPage,
 } from "./agentInterfaceStatusPage";
 import type { ArtifactsLocation } from "./artifactsOperations";
 
-describe("seedAgentInterfaceStatusPage", () => {
+const ALL_ON = { scratchDirSet: true, artifactsEnabled: true, agentInterfaceEnabled: true };
+
+describe("prepareAgentInterfaceStatusPage", () => {
   let scratchDir: string;
   let artifactsDir: string;
   let location: ArtifactsLocation;
   const statusPath = () => path.join(artifactsDir, AGENT_INTERFACE_STATUS_ARTIFACT);
-  const seed = (flags: { artifactsEnabled: boolean; agentInterfaceEnabled: boolean }) =>
-    seedAgentInterfaceStatusPage({ ...flags, resolveLocation: () => Promise.resolve(location) });
+  const prepare = (flags: typeof ALL_ON) =>
+    prepareAgentInterfaceStatusPage({ ...flags, resolveLocation: () => Promise.resolve(location) });
 
   beforeEach(async () => {
     scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-interface-seed-"));
@@ -28,31 +30,34 @@ describe("seedAgentInterfaceStatusPage", () => {
   });
 
   test("writes the template when the status page is missing", async () => {
-    expect(await seed({ artifactsEnabled: true, agentInterfaceEnabled: true })).toBe(true);
+    expect(await prepare(ALL_ON)).toBe(true);
     expect(await fs.readFile(statusPath(), "utf8")).toBe(AGENT_INTERFACE_STATUS_TEMPLATE);
   });
 
   test("never overwrites a page the agent wrote", async () => {
     await fs.mkdir(artifactsDir);
     await fs.writeFile(statusPath(), "<p>agent status</p>");
-    expect(await seed({ artifactsEnabled: true, agentInterfaceEnabled: true })).toBe(false);
+    expect(await prepare(ALL_ON)).toBe(true);
     expect(await fs.readFile(statusPath(), "utf8")).toBe("<p>agent status</p>");
   });
 
   test.each([
-    { artifactsEnabled: false, agentInterfaceEnabled: true },
-    { artifactsEnabled: true, agentInterfaceEnabled: false },
-  ])("writes nothing unless both flags are on (%o)", async (flags) => {
-    expect(await seed(flags)).toBe(false);
-    await expect(fs.stat(statusPath())).rejects.toThrow();
-  });
+    { ...ALL_ON, artifactsEnabled: false },
+    { ...ALL_ON, agentInterfaceEnabled: false },
+    { ...ALL_ON, scratchDirSet: false },
+  ])(
+    "is inactive and writes nothing unless both flags are on and the scratch dir is set (%o)",
+    async (flags) => {
+      expect(await prepare(flags)).toBe(false);
+      await expect(fs.stat(statusPath())).rejects.toThrow();
+    }
+  );
 
   test("a failing location does not throw into the turn", async () => {
-    const failing = seedAgentInterfaceStatusPage({
-      artifactsEnabled: true,
-      agentInterfaceEnabled: true,
+    const active = prepareAgentInterfaceStatusPage({
+      ...ALL_ON,
       resolveLocation: () => Promise.reject(new Error("runtime unreachable")),
     });
-    expect(await failing).toBe(false);
+    expect(await active).toBe(true);
   });
 });

@@ -77,7 +77,7 @@ import { formatMcpAppModelContextSection } from "@/node/services/mcpAppResultSto
 import type { InitStateManager } from "./initStateManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
-import { seedAgentInterfaceStatusPage } from "./agentInterfaceStatusPage";
+import { prepareAgentInterfaceStatusPage } from "./agentInterfaceStatusPage";
 import { resolveArtifactsLocation } from "./artifactsOperations";
 import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
 import type { StreamManager } from "./streamManager";
@@ -2352,27 +2352,21 @@ export class TurnRequestBuilder {
               abortSignal: combinedAbortSignal,
             });
     }
-    // Agent interface view: seed the status page the main pane shows before the model runs.
-    // Only where XUM_SCRATCH_DIR is set this turn, so the agent can edit what was seeded, and
-    // the prompt tells the agent about the page under the same condition.
-    const agentInterfaceViewActive =
-      scratchDir !== undefined &&
-      artifactsExperimentEnabled &&
-      isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE);
-    if (scratchDir !== undefined) {
-      await seedAgentInterfaceStatusPage({
-        artifactsEnabled: artifactsExperimentEnabled,
-        agentInterfaceEnabled: isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
-        resolveLocation: () =>
-          resolveArtifactsLocation(
-            this.dependencies.config.sessionsDir,
-            workspaceId,
-            { ...metadata, namedWorkspacePath: workspacePath },
-            { createRuntime: () => runtime, abortSignal: combinedAbortSignal }
-          ),
-        abortSignal: combinedAbortSignal,
-      });
-    }
+    // Agent interface view: seed the status page the main pane shows before the model runs; the
+    // prompt tells the agent about the page under the same condition.
+    const agentInterfaceViewActive = await prepareAgentInterfaceStatusPage({
+      scratchDirSet: scratchDir !== undefined,
+      artifactsEnabled: artifactsExperimentEnabled,
+      agentInterfaceEnabled: isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
+      resolveLocation: () =>
+        resolveArtifactsLocation(
+          this.dependencies.config.sessionsDir,
+          workspaceId,
+          { ...metadata, namedWorkspacePath: workspacePath },
+          { createRuntime: () => runtime, abortSignal: combinedAbortSignal }
+        ),
+      abortSignal: combinedAbortSignal,
+    });
     // Filled by the first build: later rebuilds in this turn (tool policy,
     // model fallback) reuse the same instruction snapshot instead of re-reading.
     const turnInstructionSources: { current?: InstructionSources } = {};

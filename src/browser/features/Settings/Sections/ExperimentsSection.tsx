@@ -44,6 +44,13 @@ const ARTIFACTS_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
   EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
 ];
 
+// Every sub-experiment: hidden from the flat list, since each renders under its parent row.
+const NESTED_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
+  ...MEMORY_SUB_EXPERIMENT_IDS,
+  ...PTC_SUB_EXPERIMENT_IDS,
+  ...ARTIFACTS_SUB_EXPERIMENT_IDS,
+];
+
 interface ExperimentRowProps {
   experimentId: ExperimentId;
   name: string;
@@ -731,11 +738,7 @@ export function ExperimentsSection() {
   const experiments = useMemo(
     () =>
       allExperiments.filter(
-        (exp) =>
-          exp.showInSettings !== false &&
-          !MEMORY_SUB_EXPERIMENT_IDS.includes(exp.id) &&
-          !PTC_SUB_EXPERIMENT_IDS.includes(exp.id) &&
-          !ARTIFACTS_SUB_EXPERIMENT_IDS.includes(exp.id)
+        (exp) => exp.showInSettings !== false && !NESTED_SUB_EXPERIMENT_IDS.includes(exp.id)
       ),
     [allExperiments]
   );

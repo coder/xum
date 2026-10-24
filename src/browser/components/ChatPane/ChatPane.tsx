@@ -56,14 +56,7 @@ import { BashCollapsedSummaryModeProvider } from "@/browser/features/Tools/BashC
 import { BashOutputCollapsedIndicator } from "@/browser/features/Tools/BashOutputCollapsedIndicator";
 import { getLastNonDecorativeMessage } from "@/common/utils/messages/retryEligibility";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
-import {
-  formatKeybind,
-  isDesktopViewportFocused,
-  isDialogOpen,
-  isTerminalFocused,
-  KEYBINDS,
-  matchesKeybind,
-} from "@/browser/utils/ui/keybinds";
+import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAutoScroll } from "@/browser/hooks/useAutoScroll";
 import { useBoundedTranscriptReveal } from "@/browser/hooks/useBoundedTranscriptReveal";
 import { TRANSCRIPT_MAX_MOUNTED_ROWS } from "@/common/constants/ui";
@@ -78,10 +71,7 @@ import {
 import { WorkspaceMenuBar } from "../WorkspaceMenuBar/WorkspaceMenuBar";
 import {
   type AgentInterfaceView,
-  toggleAgentInterfaceView,
-  useAgentInterfaceEnabled,
-  useAgentInterfaceView,
-  useStatusArtifactPoll,
+  useMainPaneAgentInterfaceView,
 } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceView";
 import { AgentInterfaceStatusView } from "@/browser/features/RightSidebar/ArtifactsTab/AgentInterfaceStatusView";
 import { WorkspaceFooterBar } from "./WorkspaceFooterBar";
@@ -230,7 +220,8 @@ function mountedSlice<Row>(rows: readonly Row[], from: number, to: number): read
 const isInSlice = (index: number, from: number, to: number) => index >= from && index < to;
 
 /** Off the bottom, or detached: the bottom of the slice is not the live tail. */
-const offersJumpToBottom = (autoScroll: boolean, isDetached: boolean) => !autoScroll || isDetached;
+const offersJumpToBottom = (autoScroll: boolean, isDetached: boolean, statusShown: boolean) =>
+  !statusShown && (!autoScroll || isDetached);
 
 /** The last mounted transcript row and where it is now, for loadOlderAnchorRef. */
 function lastRowAnchor(scrollport: HTMLDivElement | null) {
@@ -368,29 +359,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   const meta = workspaceMetadata.get(workspaceId);
   const workspaceTitle = meta?.title ?? meta?.name ?? props.workspaceName;
 
-  // Agent interface view: one status page listing per main pane feeds the view, the menu-bar
-  // toggle and the command palette.
-  const agentInterfaceEnabled = useAgentInterfaceEnabled();
-  useStatusArtifactPoll(workspaceId, agentInterfaceEnabled);
-  const agentInterface = useAgentInterfaceView(workspaceId);
-  const agentInterfaceAvailable = agentInterface.available;
-  useEffect(() => {
-    if (!agentInterfaceAvailable) return;
-    const handler = (e: KeyboardEvent) => {
-      if (
-        !matchesKeybind(e, KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW) ||
-        isDialogOpen() ||
-        isTerminalFocused(e.target) ||
-        isDesktopViewportFocused(e.target)
-      ) {
-        return;
-      }
-      e.preventDefault();
-      toggleAgentInterfaceView(workspaceId);
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [agentInterfaceAvailable, workspaceId]);
+  const agentInterfaceView = useMainPaneAgentInterfaceView(workspaceId);
 
   return (
     <PerfRenderMarker id="chat-pane">
@@ -443,7 +412,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
             namedWorkspacePath={props.namedWorkspacePath}
             runtimeConfig={props.runtimeConfig}
             onOpenTerminal={props.onOpenTerminal}
-            agentInterfaceView={agentInterfaceAvailable ? agentInterface.view : null}
+            agentInterfaceView={agentInterfaceView}
           />
         </main>
 
@@ -498,8 +467,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   // Agent interface view: the status page stays mounted (hidden) while the transcript shows, so
   // switching back neither reloads the page nor loses its in-page state.
-  const agentInterfaceView = props.agentInterfaceView ?? null;
-  const showStatusView = agentInterfaceView === "status";
+  const showStatusView = props.agentInterfaceView === "status";
 
   // Transcript-only workspaces preserve historical chat and usage after the worktree is deleted,
   // so the transcript stays readable while new sends remain disabled.
@@ -1752,7 +1720,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // where real messages will, avoiding a jump when hydration completes.
                 showEmptyTranscriptPlaceholder && "flex flex-col",
                 // Under the status page: hidden but laid out, so its scroll position survives.
-                showStatusView && "invisible"
+                { invisible: showStatusView }
               )}
             >
               {showTranscriptHydrationPlaceholder ? (
@@ -1867,7 +1835,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       <span className="sr-only">Loading messages...</span>
                     </div>
                   )}
-                  {!showStatusView && offersJumpToBottom(autoScroll, isTranscriptDetached) && (
+                  {offersJumpToBottom(autoScroll, isTranscriptDetached, showStatusView) && (
                     <button
                       onClick={handleJumpToBottom}
                       type="button"
@@ -1955,14 +1923,12 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               </ChatDockColumnProvider>
             </PerfRenderMarker>
           </div>
-          {agentInterfaceView != null && (
-            <AgentInterfaceStatusView
-              key={workspaceId}
-              workspaceId={workspaceId}
-              hidden={!showStatusView}
-              dockRef={composerDockRef}
-            />
-          )}
+          <AgentInterfaceStatusView
+            key={workspaceId}
+            workspaceId={workspaceId}
+            view={props.agentInterfaceView}
+            dockRef={composerDockRef}
+          />
           {transcriptContextMenu.menu}
         </div>
       </PerfRenderMarker>
