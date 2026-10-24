@@ -168,6 +168,12 @@ import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { getOpenAIResponsesBaseUrlHint } from "@/node/services/utils/openAIResponsesBaseUrlHint";
+import {
+  MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS,
+  recoveryPolicy,
+  type AttemptHistory,
+  type AttemptOutcome,
+} from "@/node/services/turnEngine/recoveryPolicy";
 
 // Disable noisy AI SDK warning logging.
 globalThis.AI_SDK_LOG_WARNINGS = false;
@@ -177,7 +183,26 @@ export type StreamTextOnChunk = NonNullable<Parameters<typeof streamText>[0]["on
 const EMPTY_STREAM_OUTPUT_ERROR_MESSAGE =
   "The model ended the stream before producing any assistant-visible output. This usually means the upstream stream was dropped rather than completed normally. Xum will retry automatically when possible, and if retries keep failing you should try again or switch models.";
 
-const MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS = 1;
+/** What planPreviousResponseIdRetry found; its executor consumes it unchanged. */
+interface PreviousResponseIdRetryPlan {
+  /** Retry the current step only (keep parts and usage) instead of the whole stream. */
+  hasParts: boolean;
+  previousResponseId: string;
+  stepMessages: WorkspaceStreamInfo["stepTracker"]["latestMessages"];
+  /** The request's provider options without previousResponseId. */
+  providerOptions: Record<string, unknown> | undefined;
+  errorCode: string | undefined;
+  statusCode: number | undefined;
+}
+
+/** What planReasoningReplayRetry found; its executor consumes it unchanged. */
+interface ReasoningReplayRetryPlan {
+  /** Retry the current step only (keep parts and usage) instead of the whole stream. */
+  hasParts: boolean;
+  rejectedNamespace: "openai" | "anthropic";
+  /** The request transcript without the rejected namespace's reasoning. */
+  messages: ModelMessage[];
+}
 
 /** Drop reason for a partial that never reaches chat.jsonl. */
 type DroppedStreamSource = "aborted_stream" | "errored_stream";
@@ -4820,23 +4845,12 @@ export class StreamManager {
     );
   }
 
-  private async retryEmptyStreamBeforeFailure(
+  /** Executes recoveryPolicy's empty-output retry; the policy owns eligibility. */
+  private async retryEmptyStream(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
     emptyStreamRecoveryAttempts: number
-  ): Promise<boolean> {
-    if (emptyStreamRecoveryAttempts >= MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS) {
-      return false;
-    }
-
-    if (streamInfo.abortController.signal.aborted || streamInfo.softInterrupt.pending) {
-      return false;
-    }
-
-    if (streamInfo.parts.length > 0) {
-      return false;
-    }
-
+  ): Promise<void> {
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     workspaceLog.warn("Retrying stream after empty-output completion", {
       messageId: streamInfo.messageId,
@@ -4856,7 +4870,152 @@ export class StreamManager {
       streamInfo.abortController,
       streamInfo.stepTracker
     );
-    return true;
+  }
+
+  /** Facts for recoveryPolicy about an attempt whose stream closed without throwing. */
+  private finishedAttemptOutcome(streamInfo: WorkspaceStreamInfo): AttemptOutcome {
+    // A refusal is a deliberate provider outcome, not a transport drop, so
+    // recoveryPolicy checks it before the empty-output and truncation paths.
+    // With partial output, a configured fallback must continue from the
+    // partial transcript rather than replay the original turn and re-run tools.
+    const refusal = streamInfo.receivedTerminalEvent
+      ? ([streamInfo.terminalFinishReason, streamInfo.terminalRawFinishReason].find(
+          isRefusalFinishReason
+        ) ?? null)
+      : null;
+    return {
+      _tag: "Finished",
+      aborted: streamInfo.abortController.signal.aborted,
+      interruptPending: streamInfo.softInterrupt.pending,
+      partCount: streamInfo.parts.length,
+      terminal: streamInfo.receivedTerminalEvent,
+      refusal,
+    };
+  }
+
+  /**
+   * Chooses and runs what follows an attempt whose stream closed without
+   * throwing. "retry" starts the next attempt and "complete" lets the caller
+   * finalize the turn. "stop" ends the turn: the executor already settled it,
+   * or after an abort the canceller owns the terminal bookkeeping
+   * (cleanupAbortedStream).
+   */
+  private async recoverFinishedAttempt(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    history: AttemptHistory
+  ): Promise<"retry" | "complete" | "stop"> {
+    const decision = recoveryPolicy(this.finishedAttemptOutcome(streamInfo), history);
+    switch (decision._tag) {
+      case "Aborted":
+        return "stop";
+      case "Complete":
+        return "complete";
+      case "Fallback":
+        return this.recoverRefusedAttempt(workspaceId, streamInfo, decision.refusal);
+      case "Retry":
+        assert(decision.change === "empty", "finished attempts only retry empty output");
+        await this.retryEmptyStream(workspaceId, streamInfo, history.emptyRetries);
+        history.emptyRetries += 1;
+        return "retry";
+      case "Empty":
+        await this.handleEmptyStreamCompletion(workspaceId, streamInfo);
+        return "stop";
+      case "Truncated":
+        await this.handleTruncatedStreamCompletion(workspaceId, streamInfo);
+        return "stop";
+      default:
+        assert(false, `recoveryPolicy returned ${decision._tag} for a finished attempt`);
+    }
+  }
+
+  private async recoverRefusedAttempt(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    refusal: string
+  ): Promise<"retry" | "stop"> {
+    // A configured fallback chain may swap models in place of the
+    // terminal failure. The swap happens before any error event is
+    // emitted, so task settlement can never race a pending fallback.
+    const fallback = await this.tryModelFallbackAfterRefusal(workspaceId, streamInfo, refusal, {
+      preserveParts: streamInfo.parts.length > 0,
+    });
+    if (fallback.kind === "swapped") {
+      return "retry";
+    }
+
+    await this.handleModelRefusalCompletion(
+      workspaceId,
+      streamInfo,
+      refusal,
+      fallback.terminalNote
+    );
+    return "stop";
+  }
+
+  /**
+   * Chooses and runs what follows an attempt whose stream threw. "retry" starts
+   * the next attempt, "fail" asks the caller to fail the turn with `error`, and
+   * "aborted" asks the caller to flush the partial and leave the turn for the
+   * canceller to settle. Only "retry" runs side effects here.
+   */
+  private async recoverErroredAttempt(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    error: unknown,
+    history: AttemptHistory
+  ): Promise<{ kind: "retry" } | { kind: "aborted" } | { kind: "fail"; error: unknown }> {
+    // A throw from a check or an executor fails the turn with the thrown error,
+    // as when the checks lived in the retry helpers.
+    try {
+      // The plans are read-only checks over the error and stream state.
+      // After an abort they are skipped, as before: the policy ignores them.
+      const aborted = streamInfo.abortController.signal.aborted;
+      const previousResponseIdPlan = aborted
+        ? null
+        : this.planPreviousResponseIdRetry(streamInfo, error);
+      const reasoningReplayPlan = aborted ? null : this.planReasoningReplayRetry(streamInfo, error);
+      const decision = recoveryPolicy(
+        {
+          _tag: "Errored",
+          aborted,
+          interruptPending: streamInfo.softInterrupt.pending,
+          previousResponseIdRetryable: previousResponseIdPlan != null,
+          reasoningReplayRetryable: reasoningReplayPlan != null,
+        },
+        history
+      );
+      if (decision._tag === "Aborted") {
+        return { kind: "aborted" };
+      }
+      if (decision._tag !== "Retry") {
+        assert(decision._tag === "Fail", `recoveryPolicy returned ${decision._tag} for an error`);
+        return { kind: "fail", error };
+      }
+      if (decision.change === "dropPreviousResponseId") {
+        assert(previousResponseIdPlan != null, "policy retried without a plan");
+        await this.retryStreamWithoutPreviousResponseId(
+          workspaceId,
+          streamInfo,
+          error,
+          previousResponseIdPlan
+        );
+        history.retriedPreviousResponseId = true;
+      } else {
+        assert(decision.change === "dropReasoningReplay", "errors never retry as empty output");
+        assert(reasoningReplayPlan != null, "policy retried without a plan");
+        await this.retryStreamWithoutReasoningReplay(
+          workspaceId,
+          streamInfo,
+          error,
+          reasoningReplayPlan
+        );
+        history.retriedReasoningReplay = true;
+      }
+      return { kind: "retry" };
+    } catch (retryError) {
+      return { kind: "fail", error: retryError };
+    }
   }
 
   /**
@@ -4879,9 +5038,12 @@ export class StreamManager {
       // Initialize token tracker for this model
       await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
 
-      let didRetryPreviousResponseId = false;
-      let didRetryReasoningReplay = false;
-      let emptyStreamRecoveryAttempts = 0;
+      // Recovery spent in this turn. The recovery helpers update it after each retry.
+      const attemptHistory: AttemptHistory = {
+        emptyRetries: 0,
+        retriedPreviousResponseId: false,
+        retriedReasoningReplay: false,
+      };
       const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
       let orphanToolResultCount = 0;
 
@@ -5451,61 +5613,11 @@ export class StreamManager {
           // On normal completion: provides crash resilience before AIService writes to chat.jsonl
           await this.flushPartialWrite(workspaceId, streamInfo);
 
-          // Check if stream completed successfully
-          if (!streamInfo.abortController.signal.aborted) {
-            // Terminal refusal check must precede both the empty-output recovery
-            // path and normal stream-end finalization. A refusal is a deliberate
-            // provider outcome, not a transport drop; with partial output, a
-            // configured fallback must continue from the partial transcript rather
-            // than replay the original turn and re-run tools.
-            const refusalFinishReason = streamInfo.receivedTerminalEvent
-              ? ([streamInfo.terminalFinishReason, streamInfo.terminalRawFinishReason].find(
-                  isRefusalFinishReason
-                ) ?? null)
-              : null;
-            if (refusalFinishReason !== null) {
-              // A configured fallback chain may swap models in place of the
-              // terminal failure. The swap happens before any error event is
-              // emitted, so task settlement can never race a pending fallback.
-              const fallback = await this.tryModelFallbackAfterRefusal(
-                workspaceId,
-                streamInfo,
-                refusalFinishReason,
-                { preserveParts: streamInfo.parts.length > 0 }
-              );
-              if (fallback.kind === "swapped") {
-                continue;
-              }
-
-              await this.handleModelRefusalCompletion(
-                workspaceId,
-                streamInfo,
-                refusalFinishReason,
-                fallback.terminalNote
-              );
-              break;
-            }
-
-            if (streamInfo.parts.length === 0) {
-              const retriedEmptyStream = await this.retryEmptyStreamBeforeFailure(
-                workspaceId,
-                streamInfo,
-                emptyStreamRecoveryAttempts
-              );
-              if (retriedEmptyStream) {
-                emptyStreamRecoveryAttempts += 1;
-                continue;
-              }
-
-              await this.handleEmptyStreamCompletion(workspaceId, streamInfo);
-              break;
-            }
-
-            if (!streamInfo.receivedTerminalEvent) {
-              await this.handleTruncatedStreamCompletion(workspaceId, streamInfo);
-              break;
-            }
-
+          const next = await this.recoverFinishedAttempt(workspaceId, streamInfo, attemptHistory);
+          if (next === "retry") {
+            continue;
+          }
+          if (next === "complete") {
             // Get all metadata from stream result in one call
             // - totalUsage: sum of all steps (for cost calculation)
             // - contextUsage: last step only (for context window display)
@@ -5684,46 +5796,23 @@ export class StreamManager {
           // stop or a shutdown abort into an error event and — via the
           // lost-race guard in cleanupAbortedStream — suppress the abort. Take
           // the same exit as the clean-close abort path instead.
-          if (streamInfo.abortController.signal.aborted) {
+          const recovery = await this.recoverErroredAttempt(
+            workspaceId,
+            streamInfo,
+            error,
+            attemptHistory
+          );
+          if (recovery.kind === "retry") {
+            continue;
+          }
+          if (recovery.kind === "aborted") {
             workspaceLog.debug("Stream iterator rejected after abort; treating as cancellation", {
               error: getErrorMessage(error),
             });
             await this.flushPartialWrite(workspaceId, streamInfo);
-            break;
+          } else {
+            await this.handleStreamFailure(workspaceId, streamInfo, recovery.error);
           }
-          let handledError: unknown = error;
-          let retried = false;
-          try {
-            if (
-              await this.retryStreamWithoutPreviousResponseId(
-                workspaceId,
-                streamInfo,
-                error,
-                didRetryPreviousResponseId
-              )
-            ) {
-              didRetryPreviousResponseId = true;
-              retried = true;
-            } else if (
-              await this.retryStreamWithoutReasoningReplay(
-                workspaceId,
-                streamInfo,
-                error,
-                didRetryReasoningReplay
-              )
-            ) {
-              didRetryReasoningReplay = true;
-              retried = true;
-            }
-          } catch (retryError) {
-            handledError = retryError;
-          }
-
-          if (retried) {
-            continue;
-          }
-
-          await this.handleStreamFailure(workspaceId, streamInfo, handledError);
           break;
         }
       }
@@ -6111,30 +6200,55 @@ export class StreamManager {
     }
   }
 
-  private async retryStreamWithoutPreviousResponseId(
-    workspaceId: WorkspaceId,
+  /**
+   * Read-only eligibility check for recoveryPolicy: returns what a retry without
+   * an invalid previousResponseId needs, or null when the error is not that case
+   * or a retry here would duplicate output. Interrupts and the once-per-turn
+   * budget belong to the policy.
+   */
+  private planPreviousResponseIdRetry(
     streamInfo: WorkspaceStreamInfo,
-    error: unknown,
-    hasRetried: boolean
-  ): Promise<boolean> {
-    if (hasRetried) {
-      return false;
-    }
-
-    if (streamInfo.abortController.signal.aborted || streamInfo.softInterrupt.pending) {
-      return false;
-    }
-
+    error: unknown
+  ): PreviousResponseIdRetryPlan | null {
     const hasParts = streamInfo.parts.length > 0;
     const currentStepStartIndex = streamInfo.currentStepStartIndex;
     // If the current step already emitted parts, retrying would duplicate output/tool calls.
     if (hasParts && currentStepStartIndex !== streamInfo.parts.length) {
-      return false;
+      return null;
     }
 
+    const lost = this.matchLostPreviousResponseId(
+      error,
+      this.getOpenAIPreviousResponseId(streamInfo.request.providerOptions)
+    );
+    if (lost == null) {
+      return null;
+    }
+
+    const stepMessages = streamInfo.stepTracker.latestMessages;
+    if (hasParts && !stepMessages) {
+      return null;
+    }
+
+    const providerOptions = this.clearOpenAIPreviousResponseId(streamInfo.request.providerOptions);
+    if (providerOptions === streamInfo.request.providerOptions) {
+      return null;
+    }
+
+    return { hasParts, stepMessages, providerOptions, ...lost };
+  }
+
+  /**
+   * Pure error check: the error says the request's previousResponseId is gone.
+   * Returns the lost ID with the error's code and status for logging, or null.
+   */
+  private matchLostPreviousResponseId(
+    error: unknown,
+    previousResponseId: string | undefined
+  ): Pick<PreviousResponseIdRetryPlan, "previousResponseId" | "errorCode" | "statusCode"> | null {
     const responseId = this.extractPreviousResponseIdFromError(error);
-    if (!responseId) {
-      return false;
+    if (!responseId || responseId !== previousResponseId) {
+      return null;
     }
 
     const errorCode = this.extractErrorCode(error);
@@ -6147,25 +6261,18 @@ export class StreamManager {
       statusCode === 404 ||
       statusCode === 500 ||
       statusCode === 400;
-    if (!shouldRetry) {
-      return false;
-    }
+    return shouldRetry ? { previousResponseId: responseId, errorCode, statusCode } : null;
+  }
 
-    const previousResponseId = this.getOpenAIPreviousResponseId(streamInfo.request.providerOptions);
-    if (!previousResponseId || previousResponseId !== responseId) {
-      return false;
-    }
-
-    const stepMessages = streamInfo.stepTracker.latestMessages;
-    if (hasParts && !stepMessages) {
-      return false;
-    }
-
-    const providerOptions = this.clearOpenAIPreviousResponseId(streamInfo.request.providerOptions);
-    if (providerOptions === streamInfo.request.providerOptions) {
-      return false;
-    }
-
+  /** Executes recoveryPolicy's dropPreviousResponseId retry with a plan from the check above. */
+  private async retryStreamWithoutPreviousResponseId(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    error: unknown,
+    plan: PreviousResponseIdRetryPlan
+  ): Promise<void> {
+    const { hasParts, previousResponseId, stepMessages, providerOptions, errorCode, statusCode } =
+      plan;
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     this.recordLostResponseIdIfApplicable(workspaceId, error, streamInfo, workspaceLog);
 
@@ -6200,8 +6307,6 @@ export class StreamManager {
       streamInfo.abortController,
       streamInfo.stepTracker
     );
-
-    return true;
   }
 
   // These deterministic rejections survive encrypted-only replay: cross-org
@@ -6256,45 +6361,52 @@ export class StreamManager {
   // Mirror previousResponseId recovery without repeating emitted output or
   // completed tools. The repair budget belongs to this attempt, so a manual
   // continuation may try again after the user changes route or credentials.
-  private async retryStreamWithoutReasoningReplay(
-    workspaceId: WorkspaceId,
+  /**
+   * Read-only eligibility check for recoveryPolicy: returns the stripped request
+   * for a retry without rejected reasoning replay, or null when the error is not
+   * that case or a retry here would duplicate output or change nothing.
+   * Interrupts and the once-per-turn budget belong to the policy.
+   */
+  private planReasoningReplayRetry(
     streamInfo: WorkspaceStreamInfo,
-    error: unknown,
-    hasRetried: boolean
-  ): Promise<boolean> {
-    if (hasRetried) {
-      return false;
-    }
-
-    if (streamInfo.abortController.signal.aborted || streamInfo.softInterrupt.pending) {
-      return false;
-    }
-
+    error: unknown
+  ): ReasoningReplayRetryPlan | null {
     const hasParts = streamInfo.parts.length > 0;
     // If the current step already emitted parts, retrying would duplicate output/tool calls.
     if (hasParts && streamInfo.currentStepStartIndex !== streamInfo.parts.length) {
-      return false;
+      return null;
     }
 
     const rejectedNamespace = this.getReasoningReplayRejection(error, streamInfo.request.model);
     if (rejectedNamespace == null) {
-      return false;
+      return null;
     }
 
     // Even step 0 can be compacted or rebuilt before output. Retry the prepared
     // transcript so recovery cannot restore context that preparation discarded.
     const stepMessages = streamInfo.stepTracker.latestMessages;
     if (hasParts && !stepMessages) {
-      return false;
+      return null;
     }
     const sourceMessages = stepMessages ?? streamInfo.request.messages;
     // Strip every block of the namespace, not just the one the error names:
     // removing one changes the prefix later blocks were bound to.
     const messages = stripReasoningReplay(sourceMessages, rejectedNamespace);
     if (messages === sourceMessages) {
-      return false;
+      return null;
     }
 
+    return { hasParts, rejectedNamespace, messages };
+  }
+
+  /** Executes recoveryPolicy's dropReasoningReplay retry with a plan from the check above. */
+  private async retryStreamWithoutReasoningReplay(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    error: unknown,
+    plan: ReasoningReplayRetryPlan
+  ): Promise<void> {
+    const { hasParts, rejectedNamespace, messages } = plan;
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
     const errorCode = this.extractErrorCode(error);
     const statusCode = this.extractStatusCode(error);
@@ -6338,8 +6450,6 @@ export class StreamManager {
       streamInfo.abortController,
       streamInfo.stepTracker
     );
-
-    return true;
   }
 
   /**
