@@ -1702,6 +1702,66 @@ describe("agentSkillsService agent plugins", () => {
     ).toBe("from extra");
   });
 
+  // google/elephant-goldfish-model ships `skills/egm_bootstrap/SKILL.md` with `name: egm-bootstrap`.
+  test("a plugin skill in a snake_case folder loads under its kebab-case name", async () => {
+    using tmp = new DisposableTempDir("plugin-snake-case-skill");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "egm");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: "egm", skills: ["./skills", "./solo_skill"] })
+    );
+    const skillsDir = path.join(pluginDir, "skills");
+    await writeSkillWithName(skillsDir, "egm_review_loop", "egm-review-loop");
+    // The kebab-case folder wins over its snake_case twin, in discovery and in lookups.
+    await writeSkillWithName(skillsDir, "both-ways", "both-ways");
+    await writeSkillWithName(skillsDir, "both_ways", "both-ways");
+    // A kebab-case entry that is not a directory (a broken symlink) does not hide its twin.
+    await writeSkillWithName(skillsDir, "dangling_twin", "dangling-twin");
+    await fs.symlink(path.join(tmp.path, "missing"), path.join(skillsDir, "dangling-twin"));
+    // A kebab-case entry that cannot be read (a symlink loop) still wins: a lookup refuses it
+    // (#4438), so discovery must not offer its twin either.
+    await writeSkillWithName(skillsDir, "loop_twin", "loop-twin");
+    await fs.symlink(path.join(skillsDir, "loop-twin"), path.join(skillsDir, "loop-twin"));
+    // Mixed separators have no 1:1 mapping, so the folder stays invalid.
+    await writeSkillWithName(skillsDir, "mixed_name-x", "mixed-name-x");
+    await writeSkillWithName(pluginDir, "solo_skill", "solo-skill");
+    // Non-plugin roots keep the strict folder rule: the user can rename their own folder.
+    const globalRoot = path.join(tmp.path, "skills");
+    await writeSkillWithName(globalRoot, "user_skill", "user-skill");
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot,
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+
+    const { skills, invalidSkills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+
+    expect(skills.filter((skill) => skill.pluginName === "egm").map((skill) => skill.name)).toEqual(
+      ["both-ways", "dangling-twin", "egm-review-loop", "solo-skill"]
+    );
+    const globalIssues = invalidSkills.filter((issue) => issue.scope === "global");
+    expect(globalIssues.map((issue) => issue.directoryName).sort()).toEqual([
+      "loop-twin",
+      "mixed_name-x",
+      "user_skill",
+    ]);
+    const read = async (name: string) =>
+      readAgentSkill(runtime, tmp.path, SkillNameSchema.parse(name), { roots });
+    const realSkillsDir = await fs.realpath(skillsDir);
+    expect((await read("egm-review-loop")).skillDir).toBe(
+      path.join(realSkillsDir, "egm_review_loop")
+    );
+    expect((await read("both-ways")).skillDir).toBe(path.join(realSkillsDir, "both-ways"));
+    expect((await read("dangling-twin")).skillDir).toBe(path.join(realSkillsDir, "dangling_twin"));
+    await expect(read("loop-twin")).rejects.toThrow();
+    expect((await read("solo-skill")).package.frontmatter.name).toBe("solo-skill");
+    await expect(read("user-skill")).rejects.toThrow("not found");
+  });
+
   test("a skills path that holds SKILL.md serves one skill; the first root still wins a name", async () => {
     using tmp = new DisposableTempDir("plugin-single-skill");
     const container = path.join(tmp.path, "plugins");
