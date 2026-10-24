@@ -146,7 +146,9 @@ describe("web_fetch server bundle", () => {
         }
         process.exit(0);
       })().catch((error) => {
-        console.error("SCRIPT_ERROR: " + (error && error.stack ? error.stack : error));
+        console.error(
+          "SCRIPT_ERROR: " + (error && error.stack ? error.stack : error) + " hits=" + hits.join(",")
+        );
         process.exit(2);
       });
       `
@@ -190,7 +192,7 @@ describe("web_fetch server bundle", () => {
       `
       const document = parseHtmlDocument("<p>Text</p>", "http://127.0.0.1:" + portA + "/page");
       const window = document.defaultView;
-      const response = await window.fetch("http://127.0.0.1:" + portA + "/redirect");
+      const response = await window.fetch("http://127.0.0.1:" + portA + "/fetched");
       if (response.ok) throw new Error("fetch was not refused: " + response.status);
       const syncRequest = new window.XMLHttpRequest();
       syncRequest.open("GET", "http://127.0.0.1:" + portA + "/sync", false);
