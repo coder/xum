@@ -55,14 +55,37 @@ const BLOB_LOCK_TIMEOUT_MS = 10_000;
  * blob-mention index are per-instance). Entries are tiny and live for the
  * process.
  */
-const sharedJournals = new Map<string, DurableEventJournal>();
+// One registry per pair of file and lock layers: the Node layers in production, so every writer of
+// a session dir shares one journal. A test graph on memory layers (5b PR 9) gets its own journal
+// on its own volume, and never the Node journal of the same path.
+const sharedJournals = new WeakMap<
+  SessionFiles,
+  WeakMap<SessionLocks, Map<string, DurableEventJournal>>
+>();
 
-export function sharedDurableEventJournal(sessionDir: string): DurableEventJournal {
+export function sharedDurableEventJournal(
+  sessionDir: string,
+  /** The session's file and lock layers (phase 5). Absent: the Node layers. */
+  layers: { files: SessionFiles; locks: SessionLocks } = {
+    files: nodeSessionFiles,
+    locks: nodeSessionLocks,
+  }
+): DurableEventJournal {
+  let byLocks = sharedJournals.get(layers.files);
+  if (!byLocks) {
+    byLocks = new WeakMap();
+    sharedJournals.set(layers.files, byLocks);
+  }
+  let byDir = byLocks.get(layers.locks);
+  if (!byDir) {
+    byDir = new Map();
+    byLocks.set(layers.locks, byDir);
+  }
   const key = path.resolve(sessionDir);
-  let journal = sharedJournals.get(key);
+  let journal = byDir.get(key);
   if (!journal) {
-    journal = new DurableEventJournal(sessionDir);
-    sharedJournals.set(key, journal);
+    journal = new DurableEventJournal(sessionDir, layers.locks, layers.files);
+    byDir.set(key, journal);
   }
   return journal;
 }
@@ -146,8 +169,8 @@ export class DurableEventJournal {
 
   /**
    * `locks` takes the blob lock and the journal's append lock (phase 4: SessionLocks). Callers with
-   * a history service pass its locks. The process-wide registry (sharedDurableEventJournal) and
-   * replayVerifySession have none, so they keep the Node default.
+   * a history service pass its locks. The process-wide registry (sharedDurableEventJournal) passes
+   * the layers it was given, and replayVerifySession has none, so it keeps the Node default.
    * `files` holds the journal and its blobs (phase 5: SessionFiles), with the same callers and
    * defaults as `locks`.
    */

@@ -2,7 +2,9 @@ import type { HistoryService } from "@/node/services/historyService";
 import type { HostClock } from "@/node/utils/hostClock";
 import { createSessionHistoryTool } from "@/node/services/tools/session_history";
 import { createNewContextTool } from "@/node/services/tools/new_context";
+import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
 import { nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
+import { getSharedClutterScanner } from "@/node/runtime/homeClutterWatch";
 import { xai } from "@ai-sdk/xai";
 import type { Tool } from "ai";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -161,6 +163,9 @@ export interface ToolConfiguration {
   sessionFiles?: SessionFiles;
   /** Runtime builders of the skill tools. Absent: the Node layer (configs that tests build by hand). */
   runtimeFactory?: RuntimeFactory;
+  /** Host files and paths of the home clutter scan. Absent: the Node layers (configs that tests build by hand). */
+  hostFiles?: HostFiles;
+  hostPaths?: HostPaths;
   /** Project roots in this workspace (single- or multi-project context for tool descriptions) */
   projects?: ProjectRef[];
   /** Environment secrets to inject (optional) */
@@ -608,15 +613,7 @@ function wrapToolsWithModelOnlyNotifications(
     // not a LocalBaseRuntime. The reminder points at $XUM_SCRATCH_DIR, so it must be set.
     ...((config.xumEnv?.XUM_RUNTIME === "local" || config.xumEnv?.XUM_RUNTIME === "worktree") &&
     config.xumEnv.XUM_SCRATCH_DIR != null
-      ? [
-          new HomeClutterReminderSource({
-            // The host user's real home is where clutter piles up. A HOME override (project
-            // secret, .xum/tool_env) already sends writes elsewhere, so it is not tracked.
-            homeDir: nodeHostPaths.userHome(),
-            workspaceId: config.workspaceId,
-            clock: config.clock,
-          }),
-        ]
+      ? [homeClutterSource(config)]
       : []),
   ]);
 
@@ -626,6 +623,20 @@ function wrapToolsWithModelOnlyNotifications(
   }
 
   return wrappedTools;
+}
+
+function homeClutterSource(config: ToolConfiguration): HomeClutterReminderSource {
+  // The host user's real home is where clutter piles up. A HOME override (project
+  // secret, .xum/tool_env) already sends writes elsewhere, so it is not tracked.
+  // mutation-equivalent: hostPaths is a HostPaths object or undefined, so ?? and || agree
+  const homeDir = (config.hostPaths ?? nodeHostPaths).userHome();
+  return new HomeClutterReminderSource({
+    homeDir,
+    workspaceId: config.workspaceId,
+    // The loop's HostFiles reads the home dir (phase 5).
+    scanner: getSharedClutterScanner(homeDir, config.hostFiles),
+    clock: config.clock,
+  });
 }
 
 export { deriveToolHookConfig } from "@/node/services/tools/withHooks";

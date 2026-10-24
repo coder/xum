@@ -376,3 +376,24 @@ describe("DurableEventJournal session files", () => {
     expect(onDisk).not.toContain(BLOBS_DIR_NAME);
   });
 });
+
+describe("sharedDurableEventJournal layers", () => {
+  test("gives each pair of layers its own journal, on its own files", async () => {
+    // AIService passes its history's layers. A memory graph must not get the Node journal of the
+    // same session dir, and its writers must still share one journal (one seq counter).
+    using tmp = new DisposableTempDir("shared-journal-layers");
+    const layers = { files: buildSessionFiles(SessionFilesMemory), locks: nodeSessionLocks };
+    const journal = sharedDurableEventJournal(tmp.path, layers);
+    expect(sharedDurableEventJournal(tmp.path, layers)).toBe(journal);
+    expect(sharedDurableEventJournal(tmp.path)).not.toBe(journal);
+
+    await journal.append({
+      workspaceId: "ws",
+      kind: "hook-context",
+      data: { hookId: "plugin:demo", placement: "system-prompt", text: "a1" },
+    });
+
+    expect((await journal.read()).map((row) => row.seq)).toEqual([0]);
+    expect(await fs.readdir(tmp.path)).not.toContain(DURABLE_EVENTS_FILE_NAME);
+  });
+});

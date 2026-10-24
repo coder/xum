@@ -530,7 +530,11 @@ export class AIService extends EventEmitter {
    * vars-snapshot writer (independent instances would corrupt seq ordering).
    */
   private durableEventJournalFor(workspaceId: string): DurableEventJournal {
-    return sharedDurableEventJournal(path.join(this.config.sessionsDir, workspaceId));
+    // The history's layers: a memory graph keeps the turn's journal rows and blobs in its volume.
+    return sharedDurableEventJournal(path.join(this.config.sessionsDir, workspaceId), {
+      files: this.historyService.files,
+      locks: this.historyService.locks,
+    });
   }
 
   /** Reconcile lazy workspace hooks before pinning a rollover's request-assembly contract. */

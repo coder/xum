@@ -8,6 +8,7 @@ import { Config } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
+import { makeTestEffectRunner } from "./di/testEffectRunner";
 import {
   boundContainerMutation,
   isPositivelyAbsent,
@@ -2183,6 +2184,30 @@ describe("WorkspaceMcpOverridesService", () => {
         signal: AbortSignal.abort(),
       });
       expect(aborted.authoritative).toBe(false);
+    });
+
+    it("arms the send-path timeout on the clock it is given", async () => {
+      // The agent loop passes its HostClock, so a TestClock drives the 30 s timeout. On the Node
+      // clock this read would wait 30 s of wall time and fail the test's timeout.
+      const clock = makeTestEffectRunner();
+      const service = new WorkspaceMcpOverridesService(config);
+      const source = await registerWorkspace("clock-read");
+      const internals = service as unknown as {
+        resolveOverridesFor: (...args: unknown[]) => Promise<unknown>;
+      };
+      spyOn(internals, "resolveOverridesFor").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      try {
+        const read = service.getOverridesForWorkspace(source.workspaceId, {
+          timeoutMs: 30_000,
+          clock: clock.hostClock,
+        });
+        await clock.adjust(30_000);
+        expect(await read).toMatchObject({ overrides: {}, authoritative: false });
+      } finally {
+        await clock.dispose();
+      }
     });
 
     it("gives up at one absolute deadline instead of a fresh budget per retry", async () => {

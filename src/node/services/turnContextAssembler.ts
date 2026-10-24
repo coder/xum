@@ -85,6 +85,7 @@ import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillSto
 import {
   buildSystemMessageFromSources,
   loadWorkspaceInstructionSources,
+  type InstructionHost,
   type BuiltSystemMessage,
 } from "./systemMessage";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
@@ -1030,6 +1031,8 @@ export interface BuildStreamSystemContextOptions {
   runtime: Runtime;
   /** The session's runtime builders, for agent-definition and skill reads. */
   runtimeFactory: RuntimeFactory;
+  /** The loop's host files and paths, for the global instruction reads. Absent: the Node layers. */
+  instructionHost?: InstructionHost;
   metadata: WorkspaceMetadata;
   workspacePath: string;
   workspaceId: string;
@@ -1495,7 +1498,8 @@ export async function buildStreamSystemContext(
         runtime,
         workspacePath,
         cfg.projects,
-        opts.claudeSkillsCompatEnabled
+        opts.claudeSkillsCompatEnabled,
+        opts.instructionHost
       ),
   ]);
 

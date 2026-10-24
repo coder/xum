@@ -28,6 +28,7 @@ import {
 } from "@/node/utils/main/markdown";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { resolveWorkspaceRootPath } from "@/node/runtime/runtimeHelpers";
+import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
 import { nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import type { ProjectConfig } from "@/common/types/project";
@@ -382,6 +383,15 @@ function subProjectAwareWorkspaceRoot(
 }
 
 /**
+ * The host layers of the global instruction reads (~/.xum, ~/.claude). The agent loop passes its
+ * own (phase 5). Absent members: the Node layers.
+ */
+export interface InstructionHost {
+  files?: HostFiles;
+  paths?: HostPaths;
+}
+
+/**
  * Load instruction sources for a workspace execution path. Sub-project
  * workspaces are anchored at the workspace root so the parent project's
  * AGENTS.md is still read (see `loadInstructionSources`).
@@ -391,21 +401,24 @@ export async function loadWorkspaceInstructionSources(
   runtime: Runtime,
   workspacePath: string,
   projectConfigs?: Map<string, ProjectConfig>,
-  claudeSkillsCompatEnabled = false
+  claudeSkillsCompatEnabled = false,
+  host: InstructionHost = {}
 ): Promise<InstructionSources> {
   return loadInstructionSources(
     metadata,
     runtime,
     subProjectAwareWorkspaceRoot(metadata, runtime, workspacePath),
     projectConfigs,
-    claudeSkillsCompatEnabled
+    claudeSkillsCompatEnabled,
+    host
   );
 }
 
 async function readMultiProjectContextInstructions(
   metadata: WorkspaceMetadata,
   runtime: Runtime,
-  workspaceRootPath: string
+  workspaceRootPath: string,
+  files: HostFiles | undefined
 ): Promise<InstructionSet[]> {
   const sets: InstructionSet[] = [];
   const workspaceInstructions = await readInstructionSetFromRuntime(
@@ -440,7 +453,8 @@ async function readMultiProjectContextInstructions(
       (await readInstructionSet(
         project.projectPath,
         INSTRUCTION_SCOPE.PROJECT,
-        project.projectName
+        project.projectName,
+        files
       ));
     if (projectInstructions) {
       sets.push(projectInstructions);
@@ -523,6 +537,7 @@ function deriveSubProjectRelativePath(projectPath: string, subProjectPath: strin
  * @param workspacePath - Workspace directory path
  * @param projectConfigs - Project configs from ~/.mux/config.json for per-project customInstructions
  * @param claudeSkillsCompatEnabled - Whether to include ~/.claude/CLAUDE.md before native globals
+ * @param host - The host files and paths of the global reads (see InstructionHost)
  * @returns Structured instruction sources (ordered global and context entries)
  */
 export async function loadInstructionSources(
@@ -530,8 +545,11 @@ export async function loadInstructionSources(
   runtime: Runtime,
   workspaceRootPath: string,
   projectConfigs?: Map<string, ProjectConfig>,
-  claudeSkillsCompatEnabled = false
+  claudeSkillsCompatEnabled = false,
+  host: InstructionHost = {}
 ): Promise<InstructionSources> {
+  // mutation-equivalent: paths is a HostPaths object or undefined, so ?? and || agree
+  const paths = host.paths ?? nodeHostPaths;
   // `workspaceRootPath` is the parent project's checkout root — *without* the
   // optional sub-project segment. Callers that hand us the execution path
   // (root + subProject) for a sub-project workspace would silently lose the
@@ -542,12 +560,13 @@ export async function loadInstructionSources(
   const [claudeCompatGlobal, nativeGlobal, context] = await Promise.all([
     claudeSkillsCompatEnabled
       ? readClaudeCompatGlobalInstructionSet(
-          path.join(nodeHostPaths.userHome(), CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY)
+          path.join(paths.userHome(), CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY),
+          host.files
         )
       : Promise.resolve(null),
-    readInstructionSet(nodeHostPaths.xumHome(), INSTRUCTION_SCOPE.GLOBAL),
+    readInstructionSet(paths.xumHome(), INSTRUCTION_SCOPE.GLOBAL, undefined, host.files),
     isMultiProject(metadata)
-      ? readMultiProjectContextInstructions(metadata, runtime, workspaceRootPath)
+      ? readMultiProjectContextInstructions(metadata, runtime, workspaceRootPath, host.files)
       : readSingleProjectContextInstructions(metadata, runtime, workspaceRootPath),
   ]);
   const global = [claudeCompatGlobal, nativeGlobal].filter(
@@ -556,7 +575,7 @@ export async function loadInstructionSources(
 
   // Config-stored per-project instructions (Settings → Instructions) come after
   // the repo-file sets so user settings layer on top of committed guidance.
-  const settingsSets = buildProjectSettingsInstructionSets(metadata, projectConfigs);
+  const settingsSets = buildProjectSettingsInstructionSets(metadata, projectConfigs, paths);
 
   return { global, context: [...context, ...settingsSets] };
 }
@@ -571,10 +590,11 @@ export async function loadInstructionSources(
  */
 function buildProjectSettingsInstructionSets(
   metadata: WorkspaceMetadata,
-  projectConfigs: Map<string, ProjectConfig> | undefined
+  projectConfigs: Map<string, ProjectConfig> | undefined,
+  paths: HostPaths
 ): InstructionSet[] {
   if (!projectConfigs) return [];
-  const configPath = path.join(nodeHostPaths.xumHome(), "config.json");
+  const configPath = path.join(paths.xumHome(), "config.json");
   const sets: InstructionSet[] = [];
   for (const project of getProjects(metadata)) {
     const normalizedPath = stripTrailingSlashes(project.projectPath);
@@ -587,7 +607,7 @@ function buildProjectSettingsInstructionSets(
     sets.push({
       scope: INSTRUCTION_SCOPE.PROJECT,
       projectName: project.projectName,
-      directory: nodeHostPaths.xumHome(),
+      directory: paths.xumHome(),
       files: [
         {
           // Suffix with the project path so multi-project workspaces keep a

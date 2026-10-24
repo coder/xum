@@ -23,6 +23,12 @@ import { describe, test, expect, beforeEach, afterEach, spyOn, type Mock } from 
 import { randomUUID } from "node:crypto";
 import * as markdown from "@/node/utils/main/markdown";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import {
+  createMemoryHost,
+  MEMORY_USER_HOME,
+  MEMORY_XUM_HOME,
+} from "@/node/services/hostFiles/memoryHostFiles.testHarness";
+import { CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY } from "@/node/utils/main/instructionFiles";
 
 // Stream startup loads one instruction-source snapshot (turnContextAssembler) and shares it
 // between the prompt and tool-instruction extraction (turnRequestBuilder). These helpers run
@@ -1273,5 +1279,44 @@ OpenAI-only instructions.
         scenario.assert(systemMessage);
       });
     }
+  });
+});
+
+describe("loadWorkspaceInstructionSources host", () => {
+  test("reads the global instructions through the host files and paths it is given", async () => {
+    // The agent loop passes its HostFiles and HostPaths (phase 5), so a memory host gives the
+    // global instructions, never the Node home of the test process.
+    const host = createMemoryHost();
+    const claudeDir = path.join(MEMORY_USER_HOME, CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY);
+    await host.files.promises.mkdir(claudeDir, { recursive: true });
+    await host.files.promises.writeFile(path.join(claudeDir, "CLAUDE.md"), "Claude from memory.");
+    await host.files.promises.writeFile(
+      path.join(MEMORY_XUM_HOME, "AGENTS.md"),
+      "Xum from memory."
+    );
+    const projectConfigs = new Map<string, ProjectConfig>([
+      ["/ws", { workspaces: [], customInstructions: "Project settings." }],
+    ]);
+
+    const sources = await loadWorkspaceInstructionSources(
+      {
+        id: "ws",
+        name: "ws",
+        projectName: "p",
+        projectPath: "/ws",
+        runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+      },
+      host.runtime,
+      "/ws",
+      projectConfigs,
+      true,
+      { files: host.files, paths: host.paths }
+    );
+
+    expect(sources.global.map((set) => set.combinedContent)).toEqual([
+      "Claude from memory.",
+      "Xum from memory.",
+    ]);
+    expect(sources.context.map((set) => set.directory)).toEqual([MEMORY_XUM_HOME]);
   });
 });

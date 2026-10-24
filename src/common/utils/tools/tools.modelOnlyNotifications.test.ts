@@ -9,6 +9,10 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { buildSessionFiles } from "@/node/services/sessionFiles/buildSessionFiles.testHarness";
 import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
 import { setTodosForSessionDir } from "@/node/services/tools/todo";
+import {
+  createMemoryHost,
+  MEMORY_USER_HOME,
+} from "@/node/services/hostFiles/memoryHostFiles.testHarness";
 
 import { MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD } from "./internalToolResultFields";
 import { getToolsForModel } from "./tools";
@@ -280,5 +284,40 @@ describe("getToolsForModel - model-only notifications", () => {
     } finally {
       await fs.rm(workspaceSessionDir, { recursive: true, force: true });
     }
+  });
+
+  test("the home clutter note reads the home of the HostFiles and HostPaths it was given", async () => {
+    // The agent loop passes its host layers (phase 5): an entry that appears in the memory home
+    // gets the note, and the Node home of the test process is never read.
+    const host = createMemoryHost();
+    const initStateManager = {
+      waitForInit: () => Promise.resolve(),
+    } as unknown as InitStateManager;
+    const tools = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime: new LocalRuntime(process.cwd()),
+        runtimeTempDir: "/tmp",
+        workspaceId: "ws-1",
+        workspaceSessionDir: "/sessions/ws-1",
+        sessionFiles: buildSessionFiles(SessionFilesMemory),
+        hostFiles: host.files,
+        hostPaths: host.paths,
+        xumEnv: { XUM_RUNTIME: "local", XUM_SCRATCH_DIR: "/tmp/scratch" },
+      },
+      "ws-1",
+      initStateManager
+    );
+    const todoReadExecute = getExecute(tools.todo_read);
+    // The first call waits for the turn-start listing of the home.
+    expect(MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD in asRecord(await todoReadExecute())).toBe(false);
+
+    await host.files.promises.writeFile(path.join(MEMORY_USER_HOME, "helper.sh"), "echo hi\n");
+
+    const next = asRecord(await todoReadExecute());
+    expect(String((next[MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD] as unknown[])[0])).toContain(
+      "`~/helper.sh`"
+    );
   });
 });
