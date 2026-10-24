@@ -2225,7 +2225,11 @@ export class TurnRequestBuilder {
         // `effectiveAdditionalSystemContext` honors the `enabled` toggle: when
         // the user has disabled the scratchpad, the persisted content is
         // intentionally not injected.
-        const record = await readAdditionalSystemContext(this.dependencies.config, workspaceId);
+        const record = await readAdditionalSystemContext(
+          this.dependencies.config,
+          workspaceId,
+          this.dependencies.historyService.files
+        );
         workspaceAdditionalSystemContext = effectiveAdditionalSystemContext(record);
       } catch (error) {
         // The scratchpad is user-editable state, so a transient read failure should not block a send.
@@ -2341,13 +2345,19 @@ export class TurnRequestBuilder {
       });
       scratchDir =
         scratchSpec.kind === "host"
-          ? await ensureScratchDirForSpec(runtime, scratchSpec, combinedAbortSignal)
+          ? await ensureScratchDirForSpec(
+              runtime,
+              scratchSpec,
+              combinedAbortSignal,
+              this.dependencies.historyService.files
+            )
           : await this.remoteScratchDirs.ensure({
               workspaceId,
               runtimeConfig: metadata.runtimeConfig,
               runtime,
               spec: scratchSpec,
               abortSignal: combinedAbortSignal,
+              files: this.dependencies.historyService.files,
             });
     }
     // Filled by the first build: later rebuilds in this turn (tool policy,
