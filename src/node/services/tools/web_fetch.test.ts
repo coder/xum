@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import type { ExecResult } from "@/node/utils/runtime/helpers";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
-import { createWebFetchTool } from "./web_fetch";
+import { createWebFetchTool, stripHeavyTags } from "./web_fetch";
 import type { WebFetchToolResult } from "@/common/types/tools";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import type { ToolExecutionOptions } from "ai";
@@ -529,5 +529,41 @@ describe("web_fetch tool", () => {
       success: false,
       error: "HTTP 403: Cloudflare security challenge (page requires JavaScript)",
     });
+  });
+});
+
+describe("stripHeavyTags", () => {
+  // The regexes that stripHeavyTags replaced: they define the expected matches.
+  const referenceStrip = (html: string) =>
+    html
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, "")
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "");
+
+  it("removes the same blocks as the reference regexes", () => {
+    const inputs = [
+      "<p>keep</p>",
+      "<style>a{}</style><p>keep</p><SCRIPT type=x>b()</script >",
+      "<style>one</style>mid<style media=print>two</style>end",
+      "<script>if (a < b) {}</script><stylesheet>keep</stylesheet>",
+      "<style>no closer<p>keep</p>",
+      "<style no opener end",
+      "<script>a</script><script>unclosed<style>x</style>tail",
+      "<style><script>x</style></script>after",
+      "</style><style>a</style   ><style>b</STYLE>",
+    ];
+    for (const input of inputs) {
+      expect(stripHeavyTags(input)).toBe(referenceStrip(input));
+    }
+  });
+
+  it("strips 200 KB of unclosed openers in linear time", () => {
+    // The reference regexes took 1 to 4 seconds on each of these inputs.
+    const size = 200 * 1024;
+    const started = performance.now();
+    for (const opener of ["<style ", "<style>", "<script ", "<script>"]) {
+      const html = opener.repeat(Math.ceil(size / opener.length));
+      expect(stripHeavyTags(html)).toBe(html);
+    }
+    expect(performance.now() - started).toBeLessThan(1000);
   });
 });

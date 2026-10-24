@@ -58,14 +58,41 @@ function stripPreloadLinks(html: string): string {
 }
 
 /**
+ * Remove every `<tagName ...>...</tagName>` block, with the same matches as
+ * /<tagName\b[^>]*>[\s\S]*?<\/tagName\s*>/gi. That regex restarts its scan at
+ * every opener that has no ">" or no closer after it, so it takes quadratic
+ * time on untrusted HTML full of unclosed openers. This scan runs in linear
+ * time: each search starts where the last match ended, and the first failed
+ * search ends the scan, because a later start cannot succeed where an earlier
+ * one failed.
+ */
+function stripElementBlocks(html: string, tagName: string): string {
+  assert(/^[a-z]+$/.test(tagName), `stripElementBlocks: unsupported tag name ${tagName}`);
+  const opener = new RegExp(`<${tagName}\\b`, "gi");
+  const closer = new RegExp(`<\\/${tagName}\\s*>`, "gi");
+  const kept: string[] = [];
+  let keptFrom = 0;
+  for (let open = opener.exec(html); open !== null; open = opener.exec(html)) {
+    const openerEnd = html.indexOf(">", opener.lastIndex);
+    if (openerEnd === -1) break;
+    closer.lastIndex = openerEnd + 1;
+    if (closer.exec(html) === null) break;
+    kept.push(html.slice(keptFrom, open.index));
+    keptFrom = closer.lastIndex;
+    opener.lastIndex = keptFrom;
+  }
+  kept.push(html.slice(keptFrom));
+  return kept.join("");
+}
+
+/**
  * Strip <style> and <script> blocks before happy-dom parsing. Large minified
  * blocks add substantial parsing work, while Readability only needs DOM
  * structure and visible text.
  */
-function stripHeavyTags(html: string): string {
-  return html
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, "")
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "");
+// Exported for web_fetch.test.ts, which checks the matches and the linear time.
+export function stripHeavyTags(html: string): string {
+  return stripElementBlocks(stripElementBlocks(html, "style"), "script");
 }
 
 // Exported for web_fetch.bundle.test.ts: the no-subresource-fetch guarantee
