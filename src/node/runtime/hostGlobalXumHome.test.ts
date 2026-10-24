@@ -30,11 +30,13 @@ describe("hostGlobalXumHome", () => {
 
   it("reads the runtime family from Runtime.location, not from the runtime class", () => {
     // A double with no RemoteRuntime prototype: the agent loop's runtimes need not be runtime classes.
-    const remoteDouble = {
+    const remoteDouble: Partial<Runtime> = {
       location: "remote",
       getXumHome: () => LEGACY_REMOTE_MUX_HOME,
-    } as Partial<Runtime> as Runtime;
-    expect(resolveGlobalRuntime(remoteDouble, workspacePath)).toBeInstanceOf(LocalRuntime);
+    };
+    expect(resolveGlobalRuntime(remoteDouble as Runtime, workspacePath)).toBeInstanceOf(
+      LocalRuntime
+    );
   });
 
   it("keeps local canonical ~/.xum on the workspace runtime", () => {
