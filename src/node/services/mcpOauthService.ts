@@ -865,13 +865,68 @@ export async function resolveOAuthScope(
   return scopes.length > 0 ? scopes.join(" ") : undefined;
 }
 
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const MAX_SAME_ORIGIN_REDIRECTS = 5;
+
+/** Whether `to` has the scheme, host and port of `from`, or is its https form with both on the default port. */
+function isWithinOrigin(from: URL, to: URL): boolean {
+  if (from.protocol === to.protocol && from.host === to.host) return true;
+  return (
+    from.protocol === "http:" &&
+    to.protocol === "https:" &&
+    from.hostname === to.hostname &&
+    !from.port &&
+    !to.port
+  );
+}
+
+/**
+ * GET `url` and follow a redirect only when it stays within the origin of the
+ * hop that answered it and keeps the userinfo. Any other redirect comes back
+ * as its 3xx response, which callers treat as not ok.
+ *
+ * Copy of the rule in fetchWithinOrigin from @modelcontextprotocol/client
+ * 2.3.0. The SDK uses that function when it fetches this same metadata URL
+ * for discovery, so Xum reads the document the SDK reads (#7390). Xum copies
+ * it because the SDK does not export it.
+ */
+async function fetchGetWithinOrigin(
+  url: URL,
+  fetchFn: FetchLike,
+  init: Omit<RequestInit, "method" | "redirect">
+): Promise<Response> {
+  let current = url;
+  for (let followed = 0; ; followed++) {
+    const response = await fetchFn(current, { ...init, redirect: "manual" });
+    const location = REDIRECT_STATUSES.has(response.status)
+      ? response.headers.get("location")
+      : null;
+    if (!location || followed === MAX_SAME_ORIGIN_REDIRECTS) return response;
+    let target: URL;
+    try {
+      target = new URL(location, current);
+    } catch {
+      return response;
+    }
+    const keepsUserinfo =
+      (!target.username && !target.password) ||
+      (target.username === current.username && target.password === current.password);
+    if (!keepsUserinfo || !isWithinOrigin(current, target)) return response;
+    await response.body?.cancel().catch(() => undefined);
+    current = target;
+  }
+}
+
 async function fetchProtectedResourceScopes(url: URL, fetchFn: FetchLike): Promise<string[]> {
   try {
-    const response = await fetchFn(url, {
+    // One timeout covers the whole redirect chain.
+    const response = await fetchGetWithinOrigin(url, fetchFn, {
       headers: { Accept: "application/json" },
       signal: AbortSignal.timeout(5_000),
     });
     if (!response.ok) {
+      // Includes a redirect that was not followed.
+      await response.body?.cancel().catch(() => undefined);
       return [];
     }
     const json: unknown = await response.json();
