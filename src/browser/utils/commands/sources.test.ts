@@ -2673,6 +2673,9 @@ test("an app view with an open tab gets a Reload command that focuses its tab", 
   const originalDocument = globalThis.document;
   globalThis.window = testWindow as unknown as Window & typeof globalThis;
   globalThis.document = testWindow.document as unknown as Document;
+  const originalCustomEvent = globalThis.CustomEvent;
+  // happy-dom 21 dispatches only its own Event instances; createCustomEvent uses the global.
+  globalThis.CustomEvent = testWindow.CustomEvent as unknown as typeof CustomEvent;
   try {
     const call = (toolCallId: string) => ({
       type: "tool",
@@ -2703,6 +2706,7 @@ test("an app view with an open tab gets a Reload command that focuses its tab", 
     void reload?.run();
     expect(focused).toEqual([{ workspaceId: "w1", toolCallId: "open" }]);
   } finally {
+    globalThis.CustomEvent = originalCustomEvent;
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
   }
@@ -2801,7 +2805,10 @@ test("an MCP App entry point's palette entry shows its server label and opens it
   // Opening dispatches OPEN_MCP_APP_VIEW on window (the "Open in tab" path).
   const testWindow = new GlobalWindow();
   const originalWindow = globalThis.window;
+  const originalCustomEvent = globalThis.CustomEvent;
   globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  // happy-dom 21 dispatches only its own Event instances; createCustomEvent uses the global.
+  globalThis.CustomEvent = testWindow.CustomEvent as unknown as typeof CustomEvent;
   const shown: unknown[] = [];
   testWindow.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, (event) =>
     shown.push((event as unknown as CustomEvent<{ toolCallId: string }>).detail.toolCallId)
@@ -2809,6 +2816,7 @@ test("an MCP App entry point's palette entry shows its server label and opens it
   try {
     await entry?.run();
   } finally {
+    globalThis.CustomEvent = originalCustomEvent;
     globalThis.window = originalWindow;
     testWindow.close();
   }

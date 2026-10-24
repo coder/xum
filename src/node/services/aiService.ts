@@ -55,13 +55,10 @@ import {
   type Config,
   type WorkspaceMetadataOptions,
 } from "@/node/config";
-import { ContainerManager } from "@/node/multiProject/containerManager";
-import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
-import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
-  createRuntimeContextForWorkspace,
-  createRuntimeForWorkspace,
   resolveWorkspaceExecutionPath,
   resolveWorkspaceRootPath,
   type WorkspaceRuntimeContext,
@@ -178,6 +175,8 @@ export class AIService extends EventEmitter {
   private readonly devToolsService?: DevToolsService;
   private readonly providersConfigStore: ProvidersConfigStore;
   private readonly experimentsService?: ExperimentsService;
+  /** Builds every runtime of this service and of its sessions (AgentSessionAIService). */
+  readonly runtimeFactory: RuntimeFactory;
 
   /**
    * Tracks queued DevTools run metadata by assistant message id so stream-end/abort
@@ -226,6 +225,7 @@ export class AIService extends EventEmitter {
     // disposed session that keeps its listeners) is caught by
     // workspaceService.sessionListeners.test.ts instead.
     this.setMaxListeners(0);
+    this.runtimeFactory = hostServices.runtimeFactory ?? nodeRuntimeFactory;
     this.workspaceMcpOverridesService =
       workspaceMcpOverridesService ?? new WorkspaceMcpOverridesService(config);
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
@@ -333,7 +333,7 @@ export class AIService extends EventEmitter {
       const metadataResult = await this.getWorkspaceMetadata(workspaceId);
       if (!metadataResult.success) return null;
       const metadata = metadataResult.data;
-      const runtime = createRuntimeForWorkspace(metadata);
+      const runtime = this.runtimeFactory.createRuntimeForWorkspace(metadata);
       const ctx = {
         runtime,
         checkoutCwd: "",
@@ -902,35 +902,32 @@ export class AIService extends EventEmitter {
 
     const singleProjectContext = isMultiProject(metadata)
       ? undefined
-      : createRuntimeContextForWorkspace(metadataWithPath);
+      : this.runtimeFactory.createRuntimeContextForWorkspace(metadataWithPath);
     const runtime = singleProjectContext
       ? singleProjectContext.runtime
-      : new MultiProjectRuntime(
-          new ContainerManager(getSrcBaseDir(metadata.runtimeConfig) ?? this.config.srcDir),
-          getProjects(metadata).map((project) => ({
+      : this.runtimeFactory.createMultiProjectRuntime({
+          runtimeConfig: metadata.runtimeConfig,
+          srcBaseDir: getSrcBaseDir(metadata.runtimeConfig) ?? this.config.srcDir,
+          workspaceName: metadata.name,
+          projects: getProjects(metadata).map((project) => ({
             projectPath: project.projectPath,
             projectName: project.projectName,
-            runtime: createRuntime(metadata.runtimeConfig, {
-              projectPath: project.projectPath,
-              workspaceName: metadata.name,
-              workspacePath: isSSHRuntime(metadata.runtimeConfig)
-                ? getWorkspacePathHintForProject(
-                    {
-                      workspaceId,
-                      workspaceName: metadata.name,
-                      workspacePath: workspace.workspacePath,
-                      runtimeConfig: metadata.runtimeConfig,
-                      projectPath: metadata.projectPath,
-                      projectName: metadata.projectName,
-                      projects: metadata.projects,
-                    },
-                    project.projectPath
-                  )
-                : undefined,
-            }),
+            workspacePath: isSSHRuntime(metadata.runtimeConfig)
+              ? getWorkspacePathHintForProject(
+                  {
+                    workspaceId,
+                    workspaceName: metadata.name,
+                    workspacePath: workspace.workspacePath,
+                    runtimeConfig: metadata.runtimeConfig,
+                    projectPath: metadata.projectPath,
+                    projectName: metadata.projectName,
+                    projects: metadata.projects,
+                  },
+                  project.projectPath
+                )
+              : undefined,
           })),
-          metadata.name
-        );
+        });
 
     const workspacePath =
       singleProjectContext?.workspacePath ??
