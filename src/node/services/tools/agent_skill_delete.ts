@@ -12,6 +12,7 @@ import type { AgentSkillDeleteToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
@@ -299,6 +300,7 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
       try {
         const skillCtx = resolveSkillStorageContext({
           runtime: config.runtime,
+          runtimeFactory: toolRuntimeFactory(config),
           workspacePath: config.cwd,
           xumScope: config.xumScope ?? null,
         });

@@ -2,6 +2,7 @@ import { tool } from "ai";
 
 import type { AgentSkillReadFileToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -223,6 +224,7 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
       const includeClaudeSkills = config.experiments?.claudeSkillsCompat === true;
       const skillCtx = resolveSkillStorageContext({
         runtime: config.runtime,
+        runtimeFactory: toolRuntimeFactory(config),
         workspacePath,
         xumScope: config.xumScope ?? null,
         includeClaudeSkills,
@@ -248,6 +250,7 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
         const resolvedSkill = await readAgentSkill(skillCtx.runtime, skillCtx.workspacePath, name, {
           roots: skillCtx.roots,
           containment: skillCtx.containment,
+          runtimeFactory: toolRuntimeFactory(config),
           includeClaudeSkills,
         });
 

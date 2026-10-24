@@ -2300,6 +2300,7 @@ export class TurnRequestBuilder {
       runtime,
       workspacePath,
       xumScope,
+      runtimeFactory: this.dependencies.runtimeFactory,
     });
 
     const desktopSessionManager = this.dependencies.bindings.desktopSessionManager;
@@ -2359,6 +2360,7 @@ export class TurnRequestBuilder {
     ) =>
       buildStreamSystemContext({
         runtime,
+        runtimeFactory: this.dependencies.runtimeFactory,
         metadata,
         workspacePath,
         workspaceId,
@@ -2637,6 +2639,7 @@ export class TurnRequestBuilder {
                 projectSearchRoot: workflowProjectSearchRoot,
                 projectTrusted: getWorkflowProjectTrusted(),
                 skillStorageContext: workflowSkillStorageContext,
+                runtimeFactory: this.dependencies.runtimeFactory,
               }),
             assertStoredPluginWorkflowReviewed: (stored) =>
               assertStoredPluginWorkflowReviewed({
@@ -2646,6 +2649,7 @@ export class TurnRequestBuilder {
                 projectSearchRoot: workflowProjectSearchRoot,
                 projectTrusted: getWorkflowProjectTrusted(),
                 skillStorageContext: workflowSkillStorageContext,
+                runtimeFactory: this.dependencies.runtimeFactory,
               }),
             // Background workflow tools outlive the model turn that started them. Feed the
             // terminal result back as a hidden user turn so the parent agent continues
@@ -2818,6 +2822,7 @@ export class TurnRequestBuilder {
       desktopNotifications: this.dependencies.hostServices.desktopNotifications,
       sessionLocks: this.dependencies.historyService.locks,
       sessionFiles: this.dependencies.historyService.files,
+      runtimeFactory: this.dependencies.runtimeFactory,
       // Agent-scheduled heartbeats start paid turns unattended, so they are user opt-in.
       workspaceHeartbeatService:
         this.dependencies.config.loadConfigOrDefault().agentHeartbeatsEnabled === true

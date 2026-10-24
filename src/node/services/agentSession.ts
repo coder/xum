@@ -13842,6 +13842,7 @@ export class AgentSession {
                 workspacePath: skillDiscoveryPath,
                 xumScope,
                 includeClaudeSkills,
+                runtimeFactory: this.aiService.runtimeFactory,
               })
             : null;
         lookupContext = {
@@ -13854,6 +13855,7 @@ export class AgentSession {
             includeClaudeSkills,
             // #6426: the default roots (no storage context) add project plugins only when trusted.
             projectPluginsTrusted: isWorkspaceProjectTrusted(this.config, metadata),
+            runtimeFactory: this.aiService.runtimeFactory,
           },
         };
         resolved = await readAgentSkill(

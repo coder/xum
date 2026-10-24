@@ -22,6 +22,8 @@ import type { ORPCContext } from "./context";
 import { inFlightProcedureCount } from "./inFlightProcedures";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
 import { router } from "./router";
+// The Node layer: the skill routes read through host runtimes.
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 describe("config.previewAutoModelRouting", () => {
   const PREVIEW_TIERS = {
@@ -232,6 +234,7 @@ describe("router agent skill routes", () => {
         config: new Config(tempDir),
         initStateManager: { waitForInit: mock(async () => undefined) },
         aiService: {
+          runtimeFactory: nodeRuntimeFactory,
           resolveXumToolScopeForWorkspace: mock(() => ({
             type: "project",
             xumHome: tempDir,
@@ -300,6 +303,7 @@ describe("router agent skill routes", () => {
         config: new Config(tempDir),
         initStateManager: { waitForInit: mock(async () => undefined) },
         aiService: {
+          runtimeFactory: nodeRuntimeFactory,
           resolveXumToolScopeForWorkspace: mock(() => ({
             type: "project",
             xumHome: tempDir,
@@ -369,6 +373,7 @@ describe("router agent skill routes", () => {
       });
       const context = {
         config,
+        aiService: { runtimeFactory: nodeRuntimeFactory },
         experimentsService: {
           isExperimentEnabled: mock(() => false),
         },

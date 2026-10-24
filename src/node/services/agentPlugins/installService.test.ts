@@ -69,6 +69,7 @@ import {
   discoverAgentDefinitions,
   readAgentDefinition,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 /**
  * Lifecycle tests against a real local git "remote". Local-path remotes go
@@ -1741,6 +1742,7 @@ describe("AgentPluginInstallService", () => {
           universalRoot: "",
           globalPluginRoots: [pluginsDir()],
         },
+        runtimeFactory: nodeRuntimeFactory,
       });
       const servers = await createAgentPluginsMcpProvider({ xumHome: muxRoot })({ trusted: false });
       return {
@@ -1808,6 +1810,7 @@ describe("AgentPluginInstallService", () => {
           universalRoot: "",
           globalPluginRoots: [pluginsDir()],
         },
+        runtimeFactory: nodeRuntimeFactory,
       });
     const approveReview = async () => {
       const review = await service.previewComponentReview({ name: "demo-plugin" });
@@ -1904,6 +1907,7 @@ describe("AgentPluginInstallService", () => {
             projectPluginRoots: [projectPlugins],
             globalPluginRoots: [pluginsDir()],
           },
+          runtimeFactory: nodeRuntimeFactory,
         }),
       runnerId: "runner-6629",
     });
@@ -1959,6 +1963,7 @@ describe("AgentPluginInstallService", () => {
           universalRoot: "",
           globalPluginRoots: [pluginsDir()],
         },
+        runtimeFactory: nodeRuntimeFactory,
       });
     for (const scriptPath of ["plugin://demo-plugin/~run.js", "plugin://demo-plugin/./~run.js"]) {
       await expect(resolve(scriptPath)).rejects.toThrow("must be relative");
@@ -2011,6 +2016,7 @@ describe("AgentPluginInstallService", () => {
             universalRoot: "",
             globalPluginRoots: [pluginsDir()],
           },
+          runtimeFactory: nodeRuntimeFactory,
         }),
       runnerId: "runner-6777",
     });
@@ -2063,6 +2069,7 @@ describe("AgentPluginInstallService", () => {
           workspacePath: muxRoot,
           projectTrusted: true,
           roots,
+          runtimeFactory: nodeRuntimeFactory,
         })
       );
     // A same-name user skill shadows the plugin skill in the global scope.
@@ -2103,6 +2110,7 @@ describe("AgentPluginInstallService", () => {
           workspacePath: muxRoot,
           projectTrusted: true,
           roots,
+          runtimeFactory: nodeRuntimeFactory,
         }),
       runnerId: "runner-6826",
     });
@@ -2194,6 +2202,7 @@ describe("AgentPluginInstallService", () => {
           universalRoot: "",
           globalPluginRoots: [pluginsDir()],
         },
+        runtimeFactory: nodeRuntimeFactory,
       });
     expect((await resolve("skill://greet/workflow.js")).source).toContain("name: 'greet'");
     // No review covers any other script of a managed skill, so it never runs as a workflow.
@@ -2628,6 +2637,7 @@ describe("AgentPluginInstallService", () => {
         universalRoot: "",
         globalPluginRoots: [pluginsDir()],
       },
+      runtimeFactory: nodeRuntimeFactory,
     });
     expect(
       skills
@@ -2677,6 +2687,7 @@ describe("AgentPluginInstallService", () => {
           universalRoot: "",
           globalPluginRoots: [pluginsDir()],
         },
+        runtimeFactory: nodeRuntimeFactory,
       });
     expect((await resolve("skill://demo-plugin/workflow.js")).source).toBe("'root skill';\n");
     expect((await resolve("plugin://demo-plugin/workflow.js")).source).toBe("'top level';\n");
@@ -3018,6 +3029,7 @@ describe("AgentPluginInstallService", () => {
           universalRoot: "",
           globalPluginRoots: [pluginsDir()],
         },
+        runtimeFactory: nodeRuntimeFactory,
       });
       return skills
         .filter((skill) => skill.pluginName === "demo-plugin")
@@ -3323,6 +3335,7 @@ describe("AgentPluginInstallService", () => {
         universalRoot: "",
         globalPluginRoots: [pluginsDir()],
       },
+      runtimeFactory: nodeRuntimeFactory,
     };
     const { skills } = await discoverAgentSkills(runtime, muxRoot, options);
     expect(skills.some((skill) => skill.name === "egm-bootstrap")).toBe(true);

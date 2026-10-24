@@ -12,6 +12,8 @@ import { RuntimeError } from "@/node/runtime/Runtime";
 import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import { log } from "@/node/services/log";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   AgentDefinitionRequestCache,
@@ -1278,7 +1280,7 @@ base: a
       // A warm turn lists skills and agents from the same snapshot: no remote command touches the
       // plugin folders (plain .xum/skills and .xum/agents roots keep their own reads).
       const before = runtime.commands.length;
-      await discoverAgentSkills(runtime, checkout, { projectPluginsTrusted: true });
+      await discoverAgentSkills(runtime, checkout, { projectPluginsTrusted: true, runtimeFactory });
       await discoverAgentDefinitions(runtime, checkout, { projectPluginsTrusted: true });
       const warm = runtime.commands.slice(before);
       expect(warm.some((command) => command.includes(container))).toBe(false);

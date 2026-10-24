@@ -61,6 +61,7 @@ import {
   usesInstallationScopedPlans,
 } from "@/common/utils/planStorage";
 import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
 import { getPlanFileHint, getPlanModeInstruction } from "@/common/utils/ui/modeUtils";
 import { hasStartHerePlanSummary } from "@/common/utils/messages/startHerePlanSummary";
@@ -1023,6 +1024,8 @@ export async function buildPlanInstructions(
 /** Options for building the system message context. */
 export interface BuildStreamSystemContextOptions {
   runtime: Runtime;
+  /** The session's runtime builders, for skill reads. */
+  runtimeFactory: RuntimeFactory;
   metadata: WorkspaceMetadata;
   workspacePath: string;
   workspaceId: string;
@@ -1404,6 +1407,7 @@ export async function buildStreamSystemContext(
     workspacePath,
     xumScope,
     includeClaudeSkills: opts.claudeSkillsCompatEnabled,
+    runtimeFactory: opts.runtimeFactory,
   });
 
   // The agent body, subagent frontmatter, subagent discovery, skill discovery,
@@ -1464,6 +1468,7 @@ export async function buildStreamSystemContext(
       containment: skillCtx.containment,
       // Used only for the project-runtime default-roots fallback (skillCtx.roots undefined).
       includeClaudeSkills: opts.claudeSkillsCompatEnabled,
+      runtimeFactory: opts.runtimeFactory,
     })
       .then((discovery) => {
         requireReachableSkills(discovery);

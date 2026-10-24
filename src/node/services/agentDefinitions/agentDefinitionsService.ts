@@ -14,6 +14,7 @@ import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { isAgentEffectivelyDisabled } from "./agentEnablement";
 import { resolveAgentVisibility } from "./agentVisibility";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   execBuffered,
@@ -325,7 +326,9 @@ async function buildScanCandidates(
     {
       scope: "global",
       root: roots.globalRoot,
-      runtime: resolveGlobalRuntime(runtime, workspacePath),
+      // The agent definitions service still builds host-local runtimes itself (the next PR of
+      // the stack threads the session's RuntimeFactory here), so it keeps the Node layer.
+      runtime: resolveGlobalRuntime(runtime, workspacePath, nodeRuntimeFactory),
     },
     ...globalPluginCandidates,
   ];

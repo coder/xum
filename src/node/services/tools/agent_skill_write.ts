@@ -10,6 +10,7 @@ import { FILE_EDIT_DIFF_OMITTED_MESSAGE } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { appendRefinementEventFromTool } from "@/node/services/refinement/refinementJournal";
@@ -254,6 +255,7 @@ function makeAgentSkillWriteTool(
         const relativeFilePath = filePath ?? SKILL_FILENAME;
         const skillCtx = resolveSkillStorageContext({
           runtime: config.runtime,
+          runtimeFactory: toolRuntimeFactory(config),
           workspacePath: config.cwd,
           xumScope: config.xumScope ?? null,
         });

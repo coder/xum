@@ -1482,6 +1482,7 @@ export async function resolveWorkflowContext(
     runtime,
     workspacePath,
     xumScope: context.aiService.resolveXumToolScopeForWorkspace(metadata, runtime, workspacePath),
+    runtimeFactory: context.aiService.runtimeFactory,
   });
   const workflowRuntimeTempDir = runtime.normalizePath(".xum/tmp", workspacePath);
 
@@ -1535,6 +1536,7 @@ export async function resolveWorkflowContext(
           projectSearchRoot: workspaceRootPath,
           projectTrusted: resolveWorkflowProjectTrusted(),
           skillStorageContext,
+          runtimeFactory: context.aiService.runtimeFactory,
         }),
       assertStoredPluginWorkflowReviewed: (stored) =>
         assertStoredPluginWorkflowReviewed({
@@ -1544,6 +1546,7 @@ export async function resolveWorkflowContext(
           projectSearchRoot: workspaceRootPath,
           projectTrusted: resolveWorkflowProjectTrusted(),
           skillStorageContext,
+          runtimeFactory: context.aiService.runtimeFactory,
         }),
       // Settled markers are keyed by the run's terminal generation, so a resumed run's next
       // terminal transition re-arms attention by itself; only the downgrade-compat stable
@@ -1727,6 +1730,7 @@ export async function startWorkflowRun(
     projectSearchRoot: resolved.projectSearchRoot,
     projectTrusted: resolved.projectTrusted,
     skillStorageContext: resolved.skillStorageContext,
+    runtimeFactory: context.aiService.runtimeFactory,
   });
   if (input.rawCommand != null) {
     await context.workspaceService.prepareManualWorkflowInvocation(input.workspaceId);
@@ -1795,6 +1799,7 @@ export async function listWorkflowScripts(
     projectSearchRoot: resolved.projectSearchRoot,
     projectTrusted: resolved.projectTrusted,
     skillStorageContext: resolved.skillStorageContext,
+    runtimeFactory: context.aiService.runtimeFactory,
   });
 }
 

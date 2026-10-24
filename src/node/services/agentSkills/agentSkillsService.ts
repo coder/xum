@@ -17,7 +17,7 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import { resolveAgentDiscoveryContext } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveSkillStorageContext, type SkillStorageContext } from "./skillStorageContext";
-import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
+import { readsGlobalRootsRemotely, resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { PlatformPaths } from "@/node/utils/paths.main";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { normalizeForDescendantComparison } from "@/common/utils/subProjects";
@@ -87,7 +87,7 @@ import {
   pluginSkillConsentGate,
   type ApprovedCopiesSource,
 } from "@/node/services/agentPlugins/approvedCopies";
-import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
   getCanonicalProjectMetadataRelativePath,
   LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR,
@@ -255,7 +255,7 @@ export function getDefaultAgentSkillsRoots(
     }),
     globalRoot: `${runtime.getXumHome()}/skills`,
     universalRoot: UNIVERSAL_SKILLS_ROOT,
-    legacyMuxGlobalRoot: getLegacyMuxGlobalSkillsRoot(runtime, workspacePath),
+    legacyMuxGlobalRoot: getLegacyMuxGlobalSkillsRoot(runtime),
     // Claude roots are added only when the experiment is enabled so the default
     // (off) behavior stays byte-identical to the pre-experiment scan order.
     ...(options?.includeClaudeSkills ? { globalClaudeRoot: CLAUDE_SKILLS_ROOT } : {}),
@@ -273,8 +273,8 @@ export function getProjectSkillRoots(roots: AgentSkillsRoots): string[] {
  * or in the runtime's own home (Docker). The host needs the absolute path because expandTilde
  * maps a `~/.mux` path to the Xum home.
  */
-export function getLegacyMuxGlobalSkillsRoot(runtime: Runtime, workspacePath: string): string {
-  if (isRemoteRuntime(resolveGlobalRuntime(runtime, workspacePath))) {
+export function getLegacyMuxGlobalSkillsRoot(runtime: Runtime): string {
+  if (readsGlobalRootsRemotely(runtime)) {
     return `~/${LEGACY_MUX_SKILLS_CLI_GLOBAL_DIR}`;
   }
   // The same home that universalRoot's `~/` expands to (HOME/USERPROFILE when called), not
@@ -415,12 +415,14 @@ async function buildPluginScanCandidates(args: {
    * same escape posture as .xum/skills.
    */
   projectContainmentRoot?: string;
+  /** Builds the host-local runtime that resolves the containers. */
+  runtimeFactory: RuntimeFactory;
 }): Promise<AgentSkillScanCandidate[]> {
   if (args.containers.length === 0) {
     return [];
   }
 
-  const localRuntime = new LocalRuntime(args.workspacePath);
+  const localRuntime = args.runtimeFactory.createLocalRuntime(args.workspacePath);
   const managedHome =
     args.managedHome !== undefined ? await localRuntime.resolvePath(args.managedHome) : undefined;
   const resolvedContainers: AgentPluginContainer[] = [];
@@ -490,9 +492,10 @@ async function buildScanCandidates(
   runtime: Runtime,
   workspacePath: string,
   roots: AgentSkillsRoots,
-  containment: ProjectSkillContainment
+  containment: ProjectSkillContainment,
+  runtimeFactory: RuntimeFactory
 ): Promise<AgentSkillScanCandidate[]> {
-  const globalRuntime = resolveGlobalRuntime(runtime, workspacePath);
+  const globalRuntime = resolveGlobalRuntime(runtime, workspacePath, runtimeFactory);
   // Both scans can encounter the configured home, e.g. a project rooted at the user's home.
   const managedHome = getPluginManagedHome(roots);
 
@@ -511,12 +514,14 @@ async function buildScanCandidates(
     // containment at the same checkout boundary.
     projectContainmentRoot:
       containment.kind === "local" ? containment.root : (roots.projectSearchRoot ?? workspacePath),
+    runtimeFactory,
   });
   const globalPluginCandidates = await buildPluginScanCandidates({
     containers: roots.globalPluginRoots ?? [],
     scope: "global",
     workspacePath,
     managedHome,
+    runtimeFactory,
   });
 
   return [
@@ -1137,7 +1142,7 @@ function resolveSkillRoots(
 export async function discoverAgentSkills(
   runtime: Runtime,
   workspacePath: string,
-  options?: {
+  options: {
     roots?: AgentSkillsRoots;
     containment?: ProjectSkillContainment;
     projectContainmentRoot?: string | null;
@@ -1148,6 +1153,8 @@ export async function discoverAgentSkills(
     projectSearchRoot?: string;
     /** #6426: only `true` adds project plugin containers (used only when `roots` is absent). */
     projectPluginsTrusted?: boolean;
+    /** Builds the host-local runtimes of the plugin and global scans. */
+    runtimeFactory: RuntimeFactory;
   }
 ): Promise<AgentSkillDiscoveryResult> {
   if (!workspacePath) {
@@ -1157,7 +1164,7 @@ export async function discoverAgentSkills(
   const roots = resolveSkillRoots(runtime, workspacePath, options);
 
   const containment = resolveProjectSkillContainment(options);
-  const dedupeByName = options?.dedupeByName ?? true;
+  const dedupeByName = options.dedupeByName ?? true;
 
   const byName = new Map<SkillName, AgentSkillDescriptor>();
   const discoveredSkills: AgentSkillDescriptor[] = [];
@@ -1250,7 +1257,13 @@ export async function discoverAgentSkills(
   };
 
   // Scan order encodes precedence: earlier roots win when names collide.
-  const scans = await buildScanCandidates(runtime, workspacePath, roots, containment);
+  const scans = await buildScanCandidates(
+    runtime,
+    workspacePath,
+    roots,
+    containment,
+    options.runtimeFactory
+  );
   // After one transport failure, the host's other roots fail at once instead
   // of each waiting out the same connection timeout.
   const transportFailures = new Map<Runtime, RuntimeError>();
@@ -1546,7 +1559,7 @@ export async function readAgentSkill(
   runtime: Runtime,
   workspacePath: string,
   lookupName: SkillLookupName,
-  options?: {
+  options: {
     roots?: AgentSkillsRoots;
     containment?: ProjectSkillContainment;
     projectContainmentRoot?: string | null;
@@ -1556,6 +1569,8 @@ export async function readAgentSkill(
     projectSearchRoot?: string;
     /** #6426: only `true` adds project plugin containers (used only when `roots` is absent). */
     projectPluginsTrusted?: boolean;
+    /** Builds the host-local runtimes of the plugin and global scans. */
+    runtimeFactory: RuntimeFactory;
   }
 ): Promise<ResolvedAgentSkill> {
   if (!workspacePath) {
@@ -1569,7 +1584,13 @@ export async function readAgentSkill(
   const { pluginName, skillName: name } = resolveReadLookup(lookupName);
 
   // Scan order encodes precedence: earlier roots win when names collide.
-  const candidates = await buildScanCandidates(runtime, workspacePath, roots, containment);
+  const candidates = await buildScanCandidates(
+    runtime,
+    workspacePath,
+    roots,
+    containment,
+    options.runtimeFactory
+  );
 
   for (const candidate of candidates) {
     if (!isLookupCandidate(candidate, pluginName, name)) continue;
@@ -1606,6 +1627,7 @@ async function resolveAgentSkillDiscoveryContext(
     includeClaudeSkills: context.experimentsService.isExperimentEnabled(
       EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT
     ),
+    runtimeFactory: context.aiService.runtimeFactory,
   };
   if (resolved.metadata == null) {
     const projectPath = input.projectPath ?? resolved.discoveryPath;
@@ -1668,6 +1690,7 @@ export async function listAgentSkills(
   const result = await discoverAgentSkills(skillContext.runtime, skillContext.workspacePath, {
     roots: skillContext.roots,
     containment: skillContext.containment,
+    runtimeFactory: context.aiService.runtimeFactory,
   });
   // Passes shadowedPluginSkills and skillWarnings through only when discovery set them.
   const { unavailableSources, ...rest } = result;
@@ -1695,7 +1718,11 @@ export async function getAgentSkill(
     skillContext.runtime,
     skillContext.workspacePath,
     input.skillName,
-    { roots: skillContext.roots, containment: skillContext.containment }
+    {
+      roots: skillContext.roots,
+      containment: skillContext.containment,
+      runtimeFactory: context.aiService.runtimeFactory,
+    }
   );
   return result.package;
 }
