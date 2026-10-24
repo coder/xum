@@ -35,25 +35,8 @@ import type { Logger } from "@/node/services/log";
 import { nodeClock } from "@/node/utils/hostClock";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
-
-export interface UsageLedgerState {
-  toolModelUsages: PersistedToolModelUsage[];
-  // Key of this attempt's in-flight usage file (SessionUsageService.recordInFlightUsage);
-  // set by the first finished step, cleared when the attempt settles or is discarded.
-  inFlightUsageKey?: string;
-  // Cumulative usage across all steps (for live cost display during streaming)
-  cumulativeUsage: LanguageModelV2Usage;
-  // Cumulative provider metadata across all steps (for live cost display with cache tokens)
-  cumulativeProviderMetadata?: Record<string, unknown>;
-  // Terminal model_refusal usage persisted on no-fallback error partials so live
-  // and rebuilt session costs include the refused attempt.
-  terminalRefusalUsage?: LanguageModelV2Usage;
-  terminalRefusalProviderMetadata?: Record<string, unknown>;
-  // Last step's usage (for context window display during streaming)
-  lastStepUsage?: LanguageModelV2Usage;
-  // Last step's provider metadata (for context window cache display)
-  lastStepProviderMetadata?: Record<string, unknown>;
-}
+import type { UsageLedgerState } from "@/node/services/turnEngine/types";
+export type { UsageLedgerState } from "@/node/services/turnEngine/types";
 
 /** The turn fields the ledger prices and keys usage with (all on WorkspaceStreamInfo). */
 export interface UsageTurn extends UsageLedgerState {

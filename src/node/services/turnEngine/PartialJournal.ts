@@ -25,25 +25,8 @@ import type { EffectRunner } from "@/node/services/di/effectRunner";
 import type { HistoryService } from "@/node/services/historyService";
 import { log, type Logger } from "@/node/services/log";
 import type { HostClock } from "@/node/utils/hostClock";
-
-export interface PartialJournalState {
-  // Track last partial write time for throttling
-  lastPartialWriteTime: number;
-  // Debounce fiber for throttled partial writes (Effect migration Phase 10).
-  // Non-null exactly while a delayed flush is scheduled; interrupted on re-arm,
-  // on explicit flush, and with resourceScope when the stream ends. Effect's
-  // clock registers a plain setTimeout under the hood, so scheduling semantics
-  // match the previous timer.
-  partialWriteFiber?: Fiber.Fiber<void>;
-  // Track in-flight write to serialize writes
-  partialWritePromise?: Promise<void>;
-  // Set by the completion path right before it writes the final message to
-  // chat.jsonl and deletes partial.json. From then on no partial may be written for
-  // this stream: a cancel landing between deletePartial and COMPLETED (the
-  // state flips late, see processStreamWithCleanup) would otherwise resurrect
-  // partial.json through its pre-abort flush.
-  partialRetired?: boolean;
-}
+import type { PartialJournalState } from "@/node/services/turnEngine/types";
+export type { PartialJournalState } from "@/node/services/turnEngine/types";
 
 /** One turn's partial: its workspace, its journal state and its current snapshot. */
 export interface PartialTarget {

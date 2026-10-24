@@ -44,6 +44,8 @@ import type {
   TurnEngineEventSink,
   WorkspaceId,
   WorkspaceStreamInfo,
+  DynamicToolCompletedMessagePart,
+  WorkflowRunToolAttachment,
 } from "@/node/services/turnEngine/types";
 import type {
   ExecutionScope,
@@ -51,12 +53,10 @@ import type {
 } from "@/node/services/toolCallDisplayRegistry";
 import { markProviderMetadataCostsIncluded } from "@/node/services/turnEngine/UsageLedger";
 import { nodeClock } from "@/node/utils/hostClock";
-
-export type DynamicToolCompletedMessagePart = Extract<
-  CompletedMessagePart,
-  { type: "dynamic-tool" }
->;
-export type WorkflowRunToolAttachment = NonNullable<DynamicToolCompletedMessagePart["workflowRun"]>;
+export type {
+  DynamicToolCompletedMessagePart,
+  WorkflowRunToolAttachment,
+} from "@/node/services/turnEngine/types";
 
 /** The stream fields that workflow-run attachments read and buffer on. */
 export interface TurnEventsStream {

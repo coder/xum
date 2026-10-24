@@ -14,29 +14,20 @@ import type { StreamAbortReason } from "@/common/types/stream";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { EffectRunner } from "@/node/services/di/effectRunner";
 import { log } from "@/node/services/log";
-import type {
-  ActiveStreamInfo,
-  MockStreamLifecycle,
-  StopStreamOptions,
-  WorkspaceId,
-  WorkspaceStreamInfo,
+import {
+  type ActiveStreamInfo,
+  type MockStreamLifecycle,
+  type StopStreamOptions,
+  type WorkspaceId,
+  type WorkspaceStreamInfo,
+  type StreamToken,
+  StreamState,
 } from "@/node/services/turnEngine/types";
 import type { TurnEvents } from "@/node/services/turnEngine/TurnEvents";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { nodeClock } from "@/node/utils/hostClock";
-
-// Stream state enum for exhaustive checking
-export enum StreamState {
-  IDLE = "idle",
-  STARTING = "starting",
-  STREAMING = "streaming",
-  STOPPING = "stopping",
-  COMPLETED = "completed", // Stream finished successfully (before cleanup)
-  ERROR = "error",
-}
-
-export type StreamToken = string & { __brand: "StreamToken" };
+export { StreamState, type StreamToken } from "@/node/services/turnEngine/types";
 
 export interface PendingStreamStartHandle {
   readonly abortSignal: AbortSignal;

@@ -1,17 +1,29 @@
 /**
  * Shared turn-engine contracts: the turn's identity and events, its completion,
  * the stream info a turn keeps while it runs, and the facade's stop, snapshot
- * and mock-lifecycle types. streamManager.ts and the turnEngine modules import
- * them from here, so no turnEngine module imports streamManager.ts.
+ * and mock-lifecycle types, and the turn-engine state types they are built from.
+ * A leaf: it imports no turnEngine module and not streamManager.ts. The modules
+ * that owned a moved type re-export it, so their callers do not change.
  */
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { Instructions, LanguageModel, ModelMessage, streamText, Tool } from "ai";
 import type { Fiber, Scope } from "effect";
 import type { ResolvedCallSettingsOverrides } from "@/common/config/schemas/modelParameters";
+import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
+import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
+import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import type { AutoThinkingEscalationState } from "@/node/services/autoThinkingEscalation";
+import type { ContextBudgetAnchorRequest } from "@/node/services/contextBudgetCounting";
+import type { ContinuousPrefixSwap } from "@/node/services/continuousCompactionJournal";
 import type { NestedToolCall } from "@/common/orpc/schemas/message";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
-import type { MuxMessage, MuxMetadata } from "@/common/types/message";
+import type {
+  MuxMessage,
+  MuxMetadata,
+  PersistedToolModelUsage,
+  SystemSectionRecords,
+} from "@/common/types/message";
 import type { Result } from "@/common/types/result";
 import type {
   CompletedMessagePart,
@@ -35,16 +47,11 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import type { StreamErrorPayload } from "@/node/services/utils/sendMessageError";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type {
+  ActiveTurnThinkingOverride,
   RebuildFirstStepForThinkingLevel,
   RebuildProviderOptionsForThinkingLevel,
 } from "@/node/services/thinkingOverride";
 import type { ExecutionScope } from "@/node/services/toolCallDisplayRegistry";
-import type { PartialJournalState } from "@/node/services/turnEngine/PartialJournal";
-import type { StreamRequestConfig } from "@/node/services/turnEngine/ProviderRequest";
-import type { StepMessageTracker } from "@/node/services/turnEngine/StepPreparation";
-import type { WorkflowRunToolAttachment } from "@/node/services/turnEngine/TurnEvents";
-import type { StreamState, StreamToken } from "@/node/services/turnEngine/TurnRegistry";
-import type { UsageLedgerState } from "@/node/services/turnEngine/UsageLedger";
 import type { StreamingTokenTracker } from "@/node/utils/main/StreamingTokenTracker";
 
 export type StreamTextOnChunk = NonNullable<Parameters<typeof streamText>[0]["onChunk"]>;
@@ -388,3 +395,146 @@ export interface MockStreamLifecycle {
 
 /** The token-counting surface StreamManager uses for live streaming stats. */
 export type StreamManagerTokenTracker = Pick<StreamingTokenTracker, "setModel" | "countTokens">;
+
+export interface PartialJournalState {
+  // Track last partial write time for throttling
+  lastPartialWriteTime: number;
+  // Debounce fiber for throttled partial writes (Effect migration Phase 10).
+  // Non-null exactly while a delayed flush is scheduled; interrupted on re-arm,
+  // on explicit flush, and with resourceScope when the stream ends. Effect's
+  // clock registers a plain setTimeout under the hood, so scheduling semantics
+  // match the previous timer.
+  partialWriteFiber?: Fiber.Fiber<void>;
+  // Track in-flight write to serialize writes
+  partialWritePromise?: Promise<void>;
+  // Set by the completion path right before it writes the final message to
+  // chat.jsonl and deletes partial.json. From then on no partial may be written for
+  // this stream: a cancel landing between deletePartial and COMPLETED (the
+  // state flips late, see processStreamWithCleanup) would otherwise resurrect
+  // partial.json through its pre-abort flush.
+  partialRetired?: boolean;
+}
+
+export interface UsageLedgerState {
+  toolModelUsages: PersistedToolModelUsage[];
+  // Key of this attempt's in-flight usage file (SessionUsageService.recordInFlightUsage);
+  // set by the first finished step, cleared when the attempt settles or is discarded.
+  inFlightUsageKey?: string;
+  // Cumulative usage across all steps (for live cost display during streaming)
+  cumulativeUsage: LanguageModelV2Usage;
+  // Cumulative provider metadata across all steps (for live cost display with cache tokens)
+  cumulativeProviderMetadata?: Record<string, unknown>;
+  // Terminal model_refusal usage persisted on no-fallback error partials so live
+  // and rebuilt session costs include the refused attempt.
+  terminalRefusalUsage?: LanguageModelV2Usage;
+  terminalRefusalProviderMetadata?: Record<string, unknown>;
+  // Last step's usage (for context window display during streaming)
+  lastStepUsage?: LanguageModelV2Usage;
+  // Last step's provider metadata (for context window cache display)
+  lastStepProviderMetadata?: Record<string, unknown>;
+}
+
+export interface StreamRequestConfig {
+  stopCause?: StreamStopCause;
+  cacheEnabled?: boolean;
+  budgetMetadataModel?: string;
+  model: LanguageModel;
+  modelString: string;
+  messages: ModelMessage[];
+  /** Provider-ready system instructions from TurnContextAssembler. */
+  system?: Instructions;
+  tools?: Record<string, Tool>;
+  providerOptions?: Record<string, unknown>;
+  /** Per-request HTTP headers (e.g., anthropic-beta for 1M context). */
+  headers?: Record<string, string | undefined>;
+  maxOutputTokens?: number;
+  streamCallSettings?: Omit<ResolvedCallSettingsOverrides, "maxOutputTokens">;
+  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
+  /** Optional hook for callers that need chunk-level visibility during streaming. */
+  onChunk?: StreamTextOnChunk;
+  /** Optional hook for callers that need the live prepared step transcript. */
+  onStepMessages?: (messages: ModelMessage[]) => void;
+  onStepSettled?: OnStepSettled;
+  contextBudgetLimit?: number;
+  toolPolicy?: ToolPolicy;
+  /**
+   * Tool-search deferral state. Owned and mutated by
+   * aiService/tool_catalog_search.execute; prepareStep reads it each step to
+   * compute `activeTools`. Absent when the feature is inactive.
+   */
+  toolSearchState?: ToolSearchStreamState;
+  /**
+   * Mid-turn thinking override holder — the SESSION'S object, by reference
+   * (never created inside StreamManager: a locally-created object would be
+   * invisible to AgentSession.setActiveTurnThinkingLevel). prepareStep
+   * consumes `pending` before every model step.
+   */
+  thinkingOverrideState?: ActiveTurnThinkingOverride;
+  /**
+   * Closure built by TurnRequestBuilder that re-runs the effective-level pipeline
+   * (policy clamp + resolveEffectiveThinkingLevel) and rebuilds provider
+   * options for the stream's model. `null` ⇒ not applicable / no-op.
+   */
+  rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
+  /**
+   * Step-0 message rebuild for overrides that raced stream construction; see
+   * RebuildFirstStepForThinkingLevel. Also emits the superseding envelope.
+   */
+  rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
+  /** First step must call one of these tools; later steps restore the full toolset. */
+  forcedFirstStepToolNames?: string[];
+}
+
+export interface StepMessageTracker {
+  workspaceId?: string;
+  /** The latest step's request, anchoring the next estimate on its provider usage (#4858). */
+  contextBudgetRequest?: ContextBudgetAnchorRequest;
+  pendingPrefixSwap?: ContinuousPrefixSwap;
+  consumedPrefixSwap?: ContinuousPrefixSwap;
+  prefixSwapInvalidated?: boolean;
+  prefixSwapInvalidationEmitted?: boolean;
+  latestMessages?: ModelMessage[];
+  /**
+   * Set once a step of this turn prepared a provider request. Fallback and retry streams
+   * reuse the tracker, so their step 0 is not the turn's first request (#5279).
+   */
+  providerRequestPrepared?: boolean;
+  /** Present only when Auto set this turn's thinking level; shared across fallback hops. */
+  autoThinkingEscalation?: AutoThinkingEscalationState;
+  /**
+   * Set when an in-turn prefix change made prepareStep strip earlier Anthropic thinking: the
+   * SDK step number (of the current streamText call) whose request first sent the latest
+   * strip. The stream consumer turns it into the row's replay point once that step started,
+   * so the next turn neither puts the removed blocks back nor drops the ones kept after the
+   * strip (preserved thinking). prepareStep can run a step ahead of the consumer, hence a
+   * step number and not a flag. Cleared when a retry starts a new streamText call.
+   */
+  anthropicThinkingStripStep?: number;
+  /** True once this turn holds the Anthropic thinking-repair receipt (reads initialMetadata). */
+  hasAnthropicReplayReceipt?: () => boolean;
+  /** After a step-0 rebuild: the row's system-section records and token count follow it. */
+  recordSystemSections: (rebuilt: {
+    systemRecords?: SystemSectionRecords;
+    systemMessageTokens?: number;
+  }) => void;
+}
+
+export type DynamicToolCompletedMessagePart = Extract<
+  CompletedMessagePart,
+  { type: "dynamic-tool" }
+>;
+
+export type WorkflowRunToolAttachment = NonNullable<DynamicToolCompletedMessagePart["workflowRun"]>;
+
+// Stream state enum for exhaustive checking
+export enum StreamState {
+  IDLE = "idle",
+  STARTING = "starting",
+  STREAMING = "streaming",
+  STOPPING = "stopping",
+  COMPLETED = "completed", // Stream finished successfully (before cleanup)
+  ERROR = "error",
+}
+
+export type StreamToken = string & { __brand: "StreamToken" };
