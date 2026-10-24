@@ -2151,12 +2151,18 @@ describe("Claude Code plugin discovery", () => {
       ["a", "from-codex", false],
       ["b", "from-claude", true],
     ]);
-    expect(result.diagnostics).toEqual([
-      expect.objectContaining({
-        path: path.join(container, "c", "plugin.json"),
+    expect(
+      result.diagnostics.map(({ path: diagnosticPath, severity, message }) => ({
+        diagnosticPath,
+        severity,
+        message,
+      }))
+    ).toEqual([
+      {
+        diagnosticPath: path.join(container, "c", "plugin.json"),
         severity: "error",
         message: "Invalid plugin manifest: '$schema' is required and must be a string",
-      }),
+      },
     ]);
   });
 });
