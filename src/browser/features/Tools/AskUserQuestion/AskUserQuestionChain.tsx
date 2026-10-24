@@ -71,6 +71,47 @@ function getOpenChainRows(props: AskUserQuestionChainProps): ChainRow[] {
   });
 }
 
+function toChainGroup(chainRow: ChainRow, edited: Record<string, DraftAnswers>): ChainGroup {
+  return {
+    key: chainRow.row.id,
+    row: chainRow.row,
+    questions: chainRow.questions,
+    draftKey: chainRow.draftKey,
+    drafts:
+      edited[chainRow.row.id] ??
+      getCachedDraftState(chainRow.draftKey)?.draftAnswers ??
+      createInitialDrafts(chainRow.questions, chainRow.prefilled),
+  };
+}
+
+/** Writes the open rows' drafts to the cache and drops closed rows' drafts, like the card. */
+function syncDraftCache(props: AskUserQuestionChainProps, groups: readonly ChainGroup[]): void {
+  for (const group of groups) {
+    setCachedDraftState(group.draftKey, {
+      draftAnswers: group.drafts,
+      activeIndex: getCachedDraftState(group.draftKey)?.activeIndex ?? 0,
+    });
+  }
+  const openKeys = new Set(groups.map((group) => group.key));
+  for (const row of props.rows.filter((docked) => !openKeys.has(docked.id))) {
+    deleteCachedDraftState(
+      getDraftStateKey({
+        workspaceId: props.workspaceId,
+        rowId: row.id,
+        toolCallId: row.toolCallId,
+      })
+    );
+  }
+}
+
+function applyDraftEdit(
+  current: DraftAnswers,
+  question: string,
+  update: (draft: DraftAnswer) => DraftAnswer
+): DraftAnswers {
+  return { ...current, [question]: update(current[question] ?? EMPTY_DRAFT) };
+}
+
 /**
  * Each open row's drafts: edited here, else the draft cache (a workspace switch and back), else
  * the call's prefilled answers, exactly like the single card. Written back to the cache while
@@ -85,36 +126,10 @@ function useChainGroups(props: AskUserQuestionChainProps): {
   ) => void;
 } {
   const [edited, setEdited] = useState<Record<string, DraftAnswers>>({});
-  const groups = getOpenChainRows(props).map((chainRow) => ({
-    key: chainRow.row.id,
-    row: chainRow.row,
-    questions: chainRow.questions,
-    draftKey: chainRow.draftKey,
-    drafts:
-      edited[chainRow.row.id] ??
-      getCachedDraftState(chainRow.draftKey)?.draftAnswers ??
-      createInitialDrafts(chainRow.questions, chainRow.prefilled),
-  }));
+  const groups = getOpenChainRows(props).map((chainRow) => toChainGroup(chainRow, edited));
 
-  useEffect(() => {
-    for (const group of groups) {
-      setCachedDraftState(group.draftKey, {
-        draftAnswers: group.drafts,
-        activeIndex: getCachedDraftState(group.draftKey)?.activeIndex ?? 0,
-      });
-    }
-    const openKeys = new Set(groups.map((group) => group.key));
-    for (const row of props.rows.filter((docked) => !openKeys.has(docked.id))) {
-      // Clean up once the questions are answered or closed, like the single card.
-      deleteCachedDraftState(
-        getDraftStateKey({
-          workspaceId: props.workspaceId,
-          rowId: row.id,
-          toolCallId: row.toolCallId,
-        })
-      );
-    }
-  });
+  // No deps: the module cache must follow every render's drafts and open rows.
+  useEffect(() => syncDraftCache(props, groups));
 
   const changeDraft = (
     rowId: string,
@@ -122,13 +137,10 @@ function useChainGroups(props: AskUserQuestionChainProps): {
     update: (draft: DraftAnswer) => DraftAnswer
   ) => {
     const seed = groups.find((group) => group.key === rowId)?.drafts ?? {};
-    setEdited((prev) => {
-      const current = prev[rowId] ?? seed;
-      return {
-        ...prev,
-        [rowId]: { ...current, [question]: update(current[question] ?? EMPTY_DRAFT) },
-      };
-    });
+    setEdited((prev) => ({
+      ...prev,
+      [rowId]: applyDraftEdit(prev[rowId] ?? seed, question, update),
+    }));
   };
 
   return { groups, changeDraft };

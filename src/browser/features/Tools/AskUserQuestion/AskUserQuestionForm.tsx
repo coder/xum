@@ -408,6 +408,36 @@ function FormFooter(props: {
   );
 }
 
+/** The active question, wired to the form's draft and tab callbacks. */
+function ActiveQuestion(props: {
+  entry: FormEntry;
+  onActivate: AskUserQuestionFormProps["onActivate"];
+  onDraftChange: AskUserQuestionFormProps["onDraftChange"];
+}): JSX.Element {
+  const { entry } = props;
+  const draft = entry.draft ?? EMPTY_DRAFT;
+  const updateDraft = (update: (draft: DraftAnswer) => DraftAnswer) =>
+    props.onDraftChange(entry.groupKey, entry.question.question, update);
+  const toggle = (label: string) => {
+    const isSelecting = !draft.selected.includes(label);
+    updateDraft((prev) => toggleDraftOption(entry.question, prev, label));
+    // For single-select questions, auto-advance *only* when the user selects
+    // a non-Other option (avoid useEffect auto-advance that breaks back-nav).
+    if (!entry.question.multiSelect && isSelecting && label !== OTHER_VALUE) {
+      props.onActivate(entry.index + 1);
+    }
+  };
+  return (
+    <QuestionBody
+      question={entry.question}
+      draft={draft}
+      onToggle={toggle}
+      onOtherTextChange={(value) => updateDraft((prev) => ({ ...prev, otherText: value }))}
+      onOtherSubmit={() => props.onActivate(entry.index + 1)}
+    />
+  );
+}
+
 export interface AskUserQuestionFormProps {
   /** One group per ask_user_question call, in tab order. */
   groups: readonly AskUserQuestionFormGroup[];
@@ -446,18 +476,6 @@ export function AskUserQuestionForm(props: AskUserQuestionFormProps): JSX.Elemen
     }
   }, [isOnSummary]);
 
-  const toggleOption = (entry: FormEntry, label: string) => {
-    const isSelecting = !(entry.draft ?? EMPTY_DRAFT).selected.includes(label);
-    props.onDraftChange(entry.groupKey, entry.question.question, (draft) =>
-      toggleDraftOption(entry.question, draft, label)
-    );
-    // For single-select questions, auto-advance *only* when the user selects
-    // a non-Other option (avoid useEffect auto-advance that breaks back-nav).
-    if (!entry.question.multiSelect && isSelecting && label !== OTHER_VALUE) {
-      props.onActivate(entry.index + 1);
-    }
-  };
-
   return (
     <>
       <div className="flex flex-col gap-3">
@@ -470,17 +488,10 @@ export function AskUserQuestionForm(props: AskUserQuestionFormProps): JSX.Elemen
         />
 
         {current && (
-          <QuestionBody
-            question={current.question}
-            draft={current.draft ?? EMPTY_DRAFT}
-            onToggle={(label) => toggleOption(current, label)}
-            onOtherTextChange={(value) =>
-              props.onDraftChange(current.groupKey, current.question.question, (draft) => ({
-                ...draft,
-                otherText: value,
-              }))
-            }
-            onOtherSubmit={() => props.onActivate(current.index + 1)}
+          <ActiveQuestion
+            entry={current}
+            onActivate={props.onActivate}
+            onDraftChange={props.onDraftChange}
           />
         )}
 
