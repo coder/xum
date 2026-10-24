@@ -28,8 +28,8 @@ export function LeftSidebar(props: LeftSidebarProps) {
   } = props;
   // Match the CSS gate for the mobile "overlay" sidebar (width-only, any pointer
   // type); we don't show a drag handle in that mode since CSS pins the width. Subscribed, so a
-  // window resized into the overlay width also gets the drawer's Escape handling. The same hook
-  // picks App's drawer state (useLeftSidebarState), so the two cannot disagree.
+  // window resized into the overlay width also gets the drawer's Escape handling. App's drawer
+  // state (useLeftSidebarState) reads the same query, so the two cannot disagree.
   const isMobileOverlay = useNarrowViewport();
 
   // The drawer covers the page like a modal, so Escape closes it the way a backdrop tap does
