@@ -195,6 +195,7 @@ import type {
   WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
+// Outside the agent loop: TaskService passes the host's runtimes (nodeRuntimeFactory) to agent and skill reads.
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentId } from "@/common/types/agentDefinition";
@@ -5572,7 +5573,7 @@ export class TaskService implements AgentTaskIntegration {
             discovery.runtime,
             discovery.workspacePath,
             agentId,
-            { projectPluginsTrusted }
+            { projectPluginsTrusted, runtimeFactory: nodeRuntimeFactory }
           );
           const chain = await resolveAgentInheritanceChain({
             runtime: discovery.runtime,
@@ -5581,6 +5582,7 @@ export class TaskService implements AgentTaskIntegration {
             agentDefinition,
             workspaceId: entry.workspace.id ?? workspaceName,
             projectPluginsTrusted,
+            runtimeFactory: nodeRuntimeFactory,
           });
 
           if (agentDefinition.scope === "project") {
@@ -6829,6 +6831,7 @@ export class TaskService implements AgentTaskIntegration {
       try {
         const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
           projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
         });
         const runnableIds = (
           await Promise.all(
@@ -6841,6 +6844,7 @@ export class TaskService implements AgentTaskIntegration {
                   {
                     skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
                     projectPluginsTrusted,
+                    runtimeFactory: nodeRuntimeFactory,
                   }
                 );
                 if (
@@ -6876,7 +6880,10 @@ export class TaskService implements AgentTaskIntegration {
     let frontmatterJson: string;
     try {
       const definitionRead = await this.readCancellable(
-        resolveAgentDefinition(runtime, parentWorkspacePath, agentId, { projectPluginsTrusted }),
+        resolveAgentDefinition(runtime, parentWorkspacePath, agentId, {
+          projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
+        }),
         signal
       );
       if (definitionRead.kind !== "ok") return Err(progress.interruptedError());
@@ -6927,6 +6934,7 @@ export class TaskService implements AgentTaskIntegration {
             workspacePath: parentWorkspacePath,
             workspaceId: parentWorkspaceId,
             projectPluginsTrusted,
+            runtimeFactory: nodeRuntimeFactory,
           },
         }),
         signal
@@ -7073,6 +7081,7 @@ export class TaskService implements AgentTaskIntegration {
         const definitionNowRead = await this.readCancellable(
           resolveAgentDefinition(plan.runtime, plan.parentWorkspacePath, plan.agentId, {
             projectPluginsTrusted: isWorkspaceProjectTrustedIn(cfg.projects, parentMetaNow.data),
+            runtimeFactory: nodeRuntimeFactory,
           }),
           signal
         );
@@ -8805,6 +8814,7 @@ export class TaskService implements AgentTaskIntegration {
       try {
         const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
           projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
         });
 
         const runnableIds = (
@@ -8818,6 +8828,7 @@ export class TaskService implements AgentTaskIntegration {
                   {
                     skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
                     projectPluginsTrusted,
+                    runtimeFactory: nodeRuntimeFactory,
                   }
                 );
                 if (
@@ -8853,6 +8864,7 @@ export class TaskService implements AgentTaskIntegration {
     try {
       const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId, {
         projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
         const hint = await getRunnableHint();
@@ -8905,6 +8917,7 @@ export class TaskService implements AgentTaskIntegration {
           workspacePath: parentWorkspacePath,
           workspaceId: parentWorkspaceId,
           projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
         },
       }));
     } catch (error) {
@@ -9925,6 +9938,7 @@ export class TaskService implements AgentTaskIntegration {
         workspacePath: context.workspacePath,
         workspaceId: taskId,
         projectPluginsTrusted: context.projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       },
       { abortSignal: AbortSignal.timeout(REAWAKEN_DEFINITION_READ_TIMEOUT_MS) }
     );
@@ -17303,6 +17317,7 @@ export class TaskService implements AgentTaskIntegration {
                 kind: parentEntry.workspace.kind,
                 projectPath: parentEntry.projectPath,
               }),
+              runtimeFactory: nodeRuntimeFactory,
             }
           );
           skipInitHook = frontmatter.subagent?.skip_init_hook === true;

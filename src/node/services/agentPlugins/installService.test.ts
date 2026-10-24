@@ -2271,11 +2271,19 @@ describe("AgentPluginInstallService", () => {
       globalPluginRoots: [pluginsDir()],
     };
     const listed = async () =>
-      (await discoverAgentDefinitions(runtime, muxRoot, { roots }))
+      (
+        await discoverAgentDefinitions(runtime, muxRoot, {
+          roots,
+          runtimeFactory: nodeRuntimeFactory,
+        })
+      )
         .filter((agent) => agent.pluginName === "demo-plugin")
         .map((agent) => agent.description);
     const loads = () =>
-      readAgentDefinition(runtime, muxRoot, "helper", { roots }).then(
+      readAgentDefinition(runtime, muxRoot, "helper", {
+        roots,
+        runtimeFactory: nodeRuntimeFactory,
+      }).then(
         (agent) => agent.frontmatter.description,
         () => null
       );
@@ -2337,11 +2345,19 @@ describe("AgentPluginInstallService", () => {
       globalPluginRoots: [pluginsDir()],
     };
     const listed = async () =>
-      (await discoverAgentDefinitions(runtime, muxRoot, { roots }))
+      (
+        await discoverAgentDefinitions(runtime, muxRoot, {
+          roots,
+          runtimeFactory: nodeRuntimeFactory,
+        })
+      )
         .filter((agent) => agent.pluginName === "demo-plugin")
         .map((agent) => agent.description);
     const loads = () =>
-      readAgentDefinition(runtime, muxRoot, "reviewer", { roots }).then(
+      readAgentDefinition(runtime, muxRoot, "reviewer", {
+        roots,
+        runtimeFactory: nodeRuntimeFactory,
+      }).then(
         (agent) => agent.frontmatter.description,
         () => null
       );
@@ -2396,6 +2412,7 @@ describe("AgentPluginInstallService", () => {
     };
     const loaded = await readAgentDefinition(new LocalRuntime(muxRoot), muxRoot, "helper", {
       roots,
+      runtimeFactory: nodeRuntimeFactory,
     });
     expect(loaded.frontmatter.description).toBe("Formats");
 

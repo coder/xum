@@ -9,6 +9,8 @@ import {
   resolveNodeAgentAiSettings,
   resolveNodeAgentAiSettingsWithLayers,
 } from "./resolveNodeAgentAiSettings";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 // Unrecognized providers avoid capability clamping (see resolveAgentAiSettings.test.ts).
 const MODEL_A = "custom:model-a";
@@ -152,7 +154,7 @@ describe("loadAgentDefinitionAiLayers cancellation", () => {
     const controller = new AbortController();
     const pending = loadAgentDefinitionAiLayers(
       "worker",
-      { runtime, workspacePath, workspaceId: "ws" },
+      { runtime, workspacePath, workspaceId: "ws", runtimeFactory },
       { abortSignal: controller.signal }
     );
     // Agent Plugins container discovery reads the host filesystem before the first stat.
@@ -179,7 +181,7 @@ describe("loadAgentDefinitionAiLayers cancellation", () => {
     });
     const result = await loadAgentDefinitionAiLayers(
       "worker",
-      { runtime, workspacePath, workspaceId: "ws" },
+      { runtime, workspacePath, workspaceId: "ws", runtimeFactory },
       { abortSignal: controller.signal }
     );
     expect(result).toBeNull();
@@ -194,7 +196,7 @@ describe("loadAgentDefinitionAiLayers cancellation", () => {
         [agentFile("worker")]: `---\nname: Worker\nai:\n  model: ${MODEL_B}\n---\nBody\n`,
       },
     });
-    const context = { runtime, workspacePath, workspaceId: "ws" };
+    const context = { runtime, workspacePath, workspaceId: "ws", runtimeFactory };
     // The global root probe for built-ins would hang; a live signal bounds it.
     const params = {
       agentId: "worker",
@@ -223,6 +225,7 @@ describe("loadAgentDefinitionAiLayers read failures (#4829)", () => {
     } as unknown as Runtime,
     workspacePath: "/ws",
     workspaceId: "ws",
+    runtimeFactory,
   });
 
   it("rethrows a transport failure instead of resolving without the chain", async () => {

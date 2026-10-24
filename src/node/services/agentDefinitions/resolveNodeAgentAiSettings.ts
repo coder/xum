@@ -28,6 +28,7 @@ import { log } from "@/node/services/log";
 
 import { readAgentDefinition } from "./agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "./resolveAgentInheritanceChain";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 
 /** Checkout context for reading agent definitions; omit when unavailable. */
 export interface NodeAgentDefinitionContext {
@@ -36,6 +37,8 @@ export interface NodeAgentDefinitionContext {
   workspaceId: string;
   /** #6426: only `true` lets project plugin agents (and bases) load. */
   projectPluginsTrusted?: boolean;
+  /** Builds the host-local runtimes of the definition reads. */
+  runtimeFactory: RuntimeFactory;
 }
 
 export interface ResolveNodeAgentAiSettingsParams {
@@ -156,6 +159,7 @@ export async function loadAgentDefinitionAiLayers(
       {
         ...(abortSignal != null ? { abortSignal } : {}),
         projectPluginsTrusted: context.projectPluginsTrusted,
+        runtimeFactory: context.runtimeFactory,
       }
     );
     const chain = await resolveAgentInheritanceChain({
@@ -166,6 +170,7 @@ export async function loadAgentDefinitionAiLayers(
       workspaceId: context.workspaceId,
       ...(abortSignal != null ? { abortSignal } : {}),
       projectPluginsTrusted: context.projectPluginsTrusted,
+      runtimeFactory: context.runtimeFactory,
     });
     return collectDefinitionLayers(agentId, chain);
   };

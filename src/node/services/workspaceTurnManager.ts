@@ -41,6 +41,8 @@ import {
   agentReportProgressDedupePrefix,
 } from "@/constants/agentMessaging";
 import { log } from "@/node/services/log";
+// Outside the agent loop: WorkspaceTurnManager passes the host's runtimes (nodeRuntimeFactory) to agent and skill reads.
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import {
   readAgentDefinition,
   resolveAgentFrontmatter,
@@ -1108,7 +1110,7 @@ export class WorkspaceTurnManager {
         params.runtime,
         params.workspacePath,
         parsedAgentId.data,
-        { projectPluginsTrusted: params.projectPluginsTrusted }
+        { projectPluginsTrusted: params.projectPluginsTrusted, runtimeFactory: nodeRuntimeFactory }
       );
       scope = definition.scope;
       source = definition.source;
@@ -1119,6 +1121,7 @@ export class WorkspaceTurnManager {
         agentDefinition: definition,
         workspaceId: params.workspaceId,
         projectPluginsTrusted: params.projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
       chain = resolvedChain.map((entry) => ({
         id: entry.id,
@@ -1143,7 +1146,7 @@ export class WorkspaceTurnManager {
         params.runtime,
         params.workspacePath,
         params.agentId,
-        { projectPluginsTrusted: params.projectPluginsTrusted }
+        { projectPluginsTrusted: params.projectPluginsTrusted, runtimeFactory: nodeRuntimeFactory }
       );
     } catch (error) {
       if (isRuntimeTransportError(error)) {
@@ -1267,7 +1270,10 @@ export class WorkspaceTurnManager {
         parsedAgentId.data,
         // #6426: read in the owner, but the target streams it, so the target's trust decides
         // which candidate wins (owner and target share the agent host here).
-        { projectPluginsTrusted: params.target.projectPluginsTrusted }
+        {
+          projectPluginsTrusted: params.target.projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
+        }
       );
       resolvedScope = definition.scope;
     } catch (error) {
@@ -1561,6 +1567,7 @@ export class WorkspaceTurnManager {
         agentDefinitionContext = {
           ...validation.data.validatedContext,
           workspaceId: targetWorkspaceId,
+          runtimeFactory: nodeRuntimeFactory,
         };
       }
       // Follow-up sends continue the target workspace's own last-used settings
@@ -1690,7 +1697,11 @@ export class WorkspaceTurnManager {
             { agentId: requestedAgentId, error: validation.error }
           );
         } else {
-          agentDefinitionContext = { ...ownerContext, workspaceId: ownerWorkspaceId };
+          agentDefinitionContext = {
+            ...ownerContext,
+            workspaceId: ownerWorkspaceId,
+            runtimeFactory: nodeRuntimeFactory,
+          };
         }
       }
       const slot = await ensureParallelSlot();
@@ -1794,6 +1805,7 @@ export class WorkspaceTurnManager {
           agentDefinitionContext = {
             ...validation.data.validatedContext,
             workspaceId: targetWorkspaceId,
+            runtimeFactory: nodeRuntimeFactory,
           };
         }
       }

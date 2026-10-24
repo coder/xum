@@ -100,6 +100,7 @@ import {
   isWorkspaceEvent,
   statusSetResultStatus,
 } from "@/node/services/aiServiceEventGuards";
+// Outside the agent loop: WorkspaceService passes the host's runtimes (nodeRuntimeFactory) to agent and skill reads.
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
@@ -21732,6 +21733,7 @@ export class WorkspaceService
         workspacePath: resolveWorkspaceRootPath(metadata, runtime),
         workspaceId,
         projectPluginsTrusted: isWorkspaceProjectTrusted(this.config, metadata),
+        runtimeFactory: nodeRuntimeFactory,
       };
     } catch {
       return undefined;

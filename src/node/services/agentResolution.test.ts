@@ -1063,6 +1063,7 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
       const repeatedBody = await resolveAgentBody(repeatRuntime, projectPath, "reviewer", {
         cache,
         projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
       await resolveAgentInheritanceChain({
         runtime: repeatRuntime,
@@ -1072,6 +1073,7 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
         workspaceId: again.metadata.id,
         cache,
         projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
       expect(repeatedBody).toBe(again.context.agentSystemPromptSections[0]);
       expect(repeatRuntime.definitionReads).toEqual(readsAfterTurn);
@@ -1109,16 +1111,25 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
     const runtime = new LocalRuntime(projectPath);
     const cache = new AgentDefinitionRequestCache();
 
-    const override = await readAgentDefinition(runtime, projectPath, "exec", { cache });
+    const override = await readAgentDefinition(runtime, projectPath, "exec", {
+      cache,
+      runtimeFactory: nodeRuntimeFactory,
+    });
     const base = await readAgentDefinition(runtime, projectPath, "exec", {
       cache,
       skipScopesAbove: "project",
+      runtimeFactory: nodeRuntimeFactory,
     });
 
     expect(override.scope).toBe("project");
     expect(base.scope).not.toBe("project");
     // Repeated lookups in the same request return the memoized winner.
-    expect(await readAgentDefinition(runtime, projectPath, "exec", { cache })).toBe(override);
+    expect(
+      await readAgentDefinition(runtime, projectPath, "exec", {
+        cache,
+        runtimeFactory: nodeRuntimeFactory,
+      })
+    ).toBe(override);
   });
 });
 

@@ -18,6 +18,8 @@ import { listRefinements } from "@/node/services/refinement/refinementRollback";
 import { createFileEditInsertTool } from "./tools/file_edit_insert";
 import { createFileEditReplaceStringTool } from "./tools/file_edit_replace_string";
 import { getTestDeps } from "./tools/testHelpers";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 function executableTool(description: string): Tool {
   return {
@@ -976,7 +978,8 @@ describe("token budget history policy", () => {
       const agent = await resolveAgentFrontmatter(
         new LocalRuntime(tempDir.path),
         tempDir.path,
-        agentId
+        agentId,
+        { runtimeFactory }
       );
       const policy = resolveToolPolicyForAgent({
         agents: [agent],
@@ -1074,7 +1077,8 @@ describe("models_list exposure", () => {
       const agent = await resolveAgentFrontmatter(
         new LocalRuntime(tempDir.path),
         tempDir.path,
-        agentId
+        agentId,
+        { runtimeFactory }
       );
       const policy = resolveToolPolicyForAgent({
         agents: [agent],

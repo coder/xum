@@ -36,6 +36,8 @@ import { MemoryService } from "./memoryService";
 import { SessionUsageService } from "./sessionUsageService";
 import { TestTempDir } from "./tools/testHelpers";
 import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 /**
  * Behavior under test: the orchestration rails around the runner —
@@ -1902,7 +1904,11 @@ describe("MemoryConsolidationService", () => {
     "resolves headless self-inheritance with append=%s without reading project overrides",
     async (append) => {
       using fixture = await createFixture();
-      const builtin = await resolveHeadlessAgentDefinition(fixture.xumHome, "dream");
+      const builtin = await resolveHeadlessAgentDefinition(
+        fixture.xumHome,
+        "dream",
+        runtimeFactory
+      );
       if (!builtin) throw new Error("Expected built-in dream");
       const globals = path.join(fixture.xumHome, "agents");
       const projects = path.join(fixture.xumHome, ".xum", "agents");
@@ -1916,7 +1922,11 @@ describe("MemoryConsolidationService", () => {
         path.join(globals, "dream.md"),
         `---\nname: Dream\nbase: dream\ndisabled: true\nprompt:\n  append: ${append}\nai:\n  model: private:dream\n---\nLocal memory guidance.`
       );
-      const resolved = await resolveHeadlessAgentDefinition(fixture.xumHome, "dream");
+      const resolved = await resolveHeadlessAgentDefinition(
+        fixture.xumHome,
+        "dream",
+        runtimeFactory
+      );
       expect(resolved?.body).toBe(
         append ? `${builtin.body}\n\nLocal memory guidance.` : "Local memory guidance."
       );
@@ -1948,7 +1958,7 @@ describe("MemoryConsolidationService", () => {
       path.join(globals, "dream.md"),
       "---\nname: Dream\nbase: private-base\n---\nLocal guidance."
     );
-    const resolved = await resolveHeadlessAgentDefinition(fixture.xumHome, "dream");
+    const resolved = await resolveHeadlessAgentDefinition(fixture.xumHome, "dream", runtimeFactory);
     expect(resolved?.body).toBe("Inherited protocol.\n\nLocal guidance.");
     expect(resolved?.frontmatter.disabled).toBe(true);
     const resolveModel = () =>
@@ -1986,7 +1996,9 @@ describe("MemoryConsolidationService", () => {
       path.join(globals, "loop.md"),
       "---\nname: Loop\nbase: dream\nai:\n  model: private:cycle\n---\nBase."
     );
-    expect(await resolveHeadlessAgentDefinition(fixture.xumHome, "dream")).toBeNull();
+    expect(
+      await resolveHeadlessAgentDefinition(fixture.xumHome, "dream", runtimeFactory)
+    ).toBeNull();
     expect(await resolveHeadlessAgentBody(fixture.xumHome, "dream")).toBeNull();
   });
 

@@ -2269,6 +2269,7 @@ export class TurnRequestBuilder {
     const { effectiveAdditionalInstructions, planFilePath, planContentForTransition } =
       await buildPlanInstructions({
         runtime,
+        runtimeFactory: this.dependencies.runtimeFactory,
         metadata,
         planLocation,
         workspaceId,
