@@ -237,23 +237,28 @@ const AskUserQuestionAnswerEntrySchema = z.object({
   answers: z.record(z.string(), z.string()),
 });
 
-const AskUserQuestionAnswerHolderSchema = z.object({
-  askUserQuestionAnswer: z.union([
-    AskUserQuestionAnswerEntrySchema.transform((entry) => [entry]),
-    z.array(AskUserQuestionAnswerEntrySchema).min(1),
-  ]),
-});
+const AskUserQuestionAnswerHolderSchema = z.object({ askUserQuestionAnswer: z.unknown() });
 
 /**
  * Reads `muxMetadata.askUserQuestionAnswer` as a list: one answered call (an object) or several
- * (an array, sent by the chained form). Missing, malformed or empty values read as undefined
- * (self-healing).
+ * (an array, sent by the chained form). Self-healing: each entry is checked on its own, so one
+ * malformed entry does not reopen the other calls the message answered; no valid entry reads as
+ * undefined.
  */
 export function parseAskUserQuestionAnswerMetadata(
   muxMetadata: unknown
 ): AskUserQuestionAnswerMetadata[] | undefined {
-  const parsed = AskUserQuestionAnswerHolderSchema.safeParse(muxMetadata);
-  return parsed.success ? parsed.data.askUserQuestionAnswer : undefined;
+  const holder = AskUserQuestionAnswerHolderSchema.safeParse(muxMetadata);
+  if (!holder.success) {
+    return undefined;
+  }
+  const value = holder.data.askUserQuestionAnswer;
+  const items: unknown[] = Array.isArray(value) ? value : [value];
+  const entries = items.flatMap((entry) => {
+    const parsed = AskUserQuestionAnswerEntrySchema.safeParse(entry);
+    return parsed.success ? [parsed.data] : [];
+  });
+  return entries.length > 0 ? entries : undefined;
 }
 
 export function buildAskUserQuestionSummary(answers: Record<string, string>): string {

@@ -72,9 +72,15 @@ describe("parseAskUserQuestionAnswerMetadata", () => {
   });
 
   test("drops missing, malformed or empty values", () => {
-    for (const askUserQuestionAnswer of [undefined, [], [entry, { toolCallId: "" }], "A"]) {
+    for (const askUserQuestionAnswer of [undefined, [], [{ toolCallId: "" }], "A"]) {
       expect(parseAskUserQuestionAnswerMetadata({ askUserQuestionAnswer })).toBeUndefined();
     }
+  });
+
+  test("keeps the valid entries of a partly malformed list", () => {
+    expect(
+      parseAskUserQuestionAnswerMetadata({ askUserQuestionAnswer: [entry, { toolCallId: "" }] })
+    ).toEqual([entry]);
   });
 });
 
