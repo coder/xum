@@ -112,6 +112,15 @@ function executing(row: Extract<DisplayedMessage, { type: "tool" }>): DisplayedM
 
 const ROW_A = questionRow("row-a", "ask-a", [STORAGE]);
 const ROW_B = questionRow("row-b", "ask-b", [PLATFORMS]);
+/** Another client's answer to ask-a. */
+const ANSWER_A: DisplayedMessage = {
+  type: "user",
+  id: "answer-a",
+  historyId: "history-answer-a",
+  content: "answers",
+  historySequence: 2,
+  askUserQuestionAnswers: [{ toolCallId: "ask-a", answers: { [STORAGE.question]: "" } }],
+};
 
 function dock(workspaceId: string) {
   return (
@@ -303,6 +312,21 @@ describe("AskUserQuestionDock", () => {
     expect(view.queryByText(REGION.question)).toBeNull();
   });
 
+  test("a call that returned while the workspace was away opens on its card's tab", () => {
+    const rowX = questionRow("row-x", "ask-x", [REGION, PLATFORMS]);
+    messages = [ROW_A, executing(rowX)];
+    const first = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(first.getByText("US East"));
+    expect(first.getByText(PLATFORMS.question)).toBeTruthy();
+    first.unmount();
+
+    // While away: another client answered ask-a, and ask-x returned without waiting.
+    messages = [ROW_A, ANSWER_A, rowX];
+    const second = render(dock(workspaceId), { wrapper: Wrapper });
+    expect(second.getByText(PLATFORMS.question)).toBeTruthy();
+    expect(second.queryByText(REGION.question)).toBeNull();
+  });
+
   test("a retry after a lost response resends only the sent question sets, with the same id", async () => {
     messages = [ROW_A, ROW_B];
     const view = render(dock(workspaceId), { wrapper: Wrapper });
@@ -388,18 +412,7 @@ describe("AskUserQuestionDock", () => {
     fireEvent.click(view.getByRole("button", { name: "Platforms" }));
 
     // Another client answered ask-a: its tabs leave, and ask-b's question moves to the front.
-    messages = [
-      ROW_A,
-      ROW_B,
-      {
-        type: "user",
-        id: "answer-a",
-        historyId: "history-answer-a",
-        content: "answers",
-        historySequence: 2,
-        askUserQuestionAnswers: [{ toolCallId: "ask-a", answers: { [STORAGE.question]: "" } }],
-      },
-    ];
+    messages = [ROW_A, ROW_B, ANSWER_A];
     view.rerender(dock(workspaceId));
 
     expect(view.queryByRole("button", { name: "Storage" })).toBeNull();

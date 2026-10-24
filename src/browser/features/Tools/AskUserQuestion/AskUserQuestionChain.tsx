@@ -131,11 +131,31 @@ function useChainGroups(props: AskUserQuestionChainProps) {
   return { groups, changeDraft };
 }
 
+interface QuestionEntryKey {
+  rowId: string;
+  questionIndex: number;
+}
+
 /** The active tab: a question of one row, or the Summary. Null while no question set is open. */
-type ActiveEntryKey = { rowId: string; questionIndex: number } | "summary" | null;
+type ActiveEntryKey = QuestionEntryKey | "summary" | null;
 
 // Per workspace, so the active tab survives a workspace switch (the dock remounts per workspace).
 const activeEntryByWorkspace = new Map<string, ActiveEntryKey>();
+
+function isQuestionOf(key: QuestionEntryKey, group: ChainGroup): boolean {
+  return key.rowId === group.key && key.questionIndex < group.questions.length;
+}
+
+/** Whether the key names a tab of the open groups (null does exactly while none is open). */
+function isValidEntryKey(key: ActiveEntryKey, groups: readonly ChainGroup[]): boolean {
+  if (key === null) {
+    return groups.length === 0;
+  }
+  if (key === "summary") {
+    return groups.length > 0;
+  }
+  return groups.some((group) => isQuestionOf(key, group));
+}
 
 function resolveActiveIndex(key: ActiveEntryKey, groups: readonly ChainGroup[]): number {
   const total = groups.reduce((count, group) => count + group.questions.length, 0);
@@ -144,12 +164,12 @@ function resolveActiveIndex(key: ActiveEntryKey, groups: readonly ChainGroup[]):
   }
   let offset = 0;
   for (const group of groups) {
-    if (key?.rowId === group.key && key.questionIndex < group.questions.length) {
+    if (key !== null && isQuestionOf(key, group)) {
       return offset + key.questionIndex;
     }
     offset += group.questions.length;
   }
-  // The row closed (or none is open): the first question.
+  // Only for a key that this render replaces (see useChainActiveIndex): the first question.
   return 0;
 }
 
@@ -165,9 +185,10 @@ function getActiveEntryKey(index: number, groups: readonly ChainGroup[]): Active
 }
 
 /**
- * Where the chain starts: the tab a single card left its row on, else the first question. A
- * non-blocking call has no result while it executes, so it renders as its own card until it
- * returns, then moves into the chain; that card cached its tab with its drafts.
+ * Where the chain goes when its key names no open tab (it starts, or the key's row closed): the
+ * tab a single card left its row on, else the first question. A non-blocking call has no result
+ * while it executes, so it renders as its own card until it returns, then moves into the chain;
+ * that card cached its tab with its drafts.
  */
 function getStartKey(groups: readonly ChainGroup[]): ActiveEntryKey {
   for (const group of groups) {
@@ -184,17 +205,18 @@ function getStartKey(groups: readonly ChainGroup[]): ActiveEntryKey {
 
 /**
  * The active tab, stored by row and question rather than by position: a row appended while the
- * user answers adds tabs after the current one without moving it. The chain starts where the
- * user left the card its row came from, then keeps its own tab, across a remount too.
+ * user answers adds tabs after the current one without moving it. The key always names an open
+ * tab, even when the user never moved, so a remount restores it rather than the stale tab of a
+ * card that joined later; when it names none (here or after a workspace switch), getStartKey
+ * picks the tab.
  */
 function useChainActiveIndex(workspaceId: string, groups: readonly ChainGroup[]) {
   const [activeKey, setActiveKey] = useState<ActiveEntryKey>(
-    () => activeEntryByWorkspace.get(workspaceId) ?? getStartKey(groups)
+    () => activeEntryByWorkspace.get(workspaceId) ?? null
   );
-  if ((groups.length === 0) !== (activeKey === null)) {
-    // Adjust state during render (no effect). The key is set while any question set is open, even
-    // if the user never moved: a remount must restore it rather than read the stale tab of a card
-    // that joined later. Once every set closed, the next one starts afresh.
+  if (!isValidEntryKey(activeKey, groups)) {
+    // Adjust state during render (no effect). It settles in one pass: getStartKey's key is valid,
+    // since every open row has at least one question.
     setActiveKey(getStartKey(groups));
   }
 
