@@ -2,6 +2,7 @@ import * as path from "node:path";
 import type { Config } from "@/node/config";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
 import { sideChatCapabilityGrants } from "@/node/services/sideChat";
@@ -32,6 +33,9 @@ export async function prepareWorkspaceRequestHooks(args: {
   journal: DurableEventJournal;
   /** Codex-format hooks (hooks.json) call plugin MCP servers through it; absent: none run. */
   mcpServerManager?: Pick<MCPServerManager, "callToolForPluginHook" | "canCallToolForPluginHook">;
+  /** The loop's host files and paths, for the hooks.js discovery. Absent: the Node layers. */
+  hostFiles?: HostFiles;
+  hostPaths?: HostPaths;
 }): Promise<void> {
   const pluginContext = args.hostCheckoutRoot
     ? resolveAgentPluginsMcpContext(args.metadata, args.hostCheckoutRoot)
@@ -44,6 +48,8 @@ export async function prepareWorkspaceRequestHooks(args: {
     projectRoot: pluginContext?.projectRoot,
     projectKey: pluginContext?.projectKey,
     projectTrusted: isWorkspaceProjectTrusted(args.config, args.metadata),
+    hostFiles: args.hostFiles,
+    hostPaths: args.hostPaths,
   });
   if (args.mcpServerManager !== undefined) {
     const { config, metadata } = args;

@@ -1,5 +1,6 @@
 import * as path from "path";
 import type { Stats } from "node:fs";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 
 /**
@@ -95,11 +96,14 @@ export function isPathInsideRoot(rootPath: string, targetPath: string): boolean 
  * True when two host paths name one directory, resolved through links (~/.xum can be a link to
  * ~/.mux). A path that cannot be resolved compares as written.
  */
-export async function isSameHostDirectory(a: string, b: string): Promise<boolean> {
+export async function isSameHostDirectory(
+  a: string,
+  b: string,
+  /** The host filesystem (phase 5: a RuntimeFactory's). Absent: the Node layer. */
+  files: HostFiles = nodeHostFiles
+): Promise<boolean> {
   const [realA, realB] = await Promise.all(
-    [a, b].map((target) =>
-      nodeHostFiles.promises.realpath(target).catch(() => path.resolve(target))
-    )
+    [a, b].map((target) => files.promises.realpath(target).catch(() => path.resolve(target)))
   );
   return realA === realB;
 }
@@ -107,12 +111,14 @@ export async function isSameHostDirectory(a: string, b: string): Promise<boolean
 export async function ensurePathContained(
   containmentRoot: string,
   candidatePath: string,
-  options?: { allowMissing?: boolean }
+  options?: { allowMissing?: boolean },
+  /** As in isSameHostDirectory. */
+  files: HostFiles = nodeHostFiles
 ): Promise<string> {
-  const containmentRootReal = await nodeHostFiles.promises.realpath(containmentRoot);
+  const containmentRootReal = await files.promises.realpath(containmentRoot);
   const candidateReal = options?.allowMissing
-    ? await resolveRealPathAllowMissing(candidatePath)
-    : await nodeHostFiles.promises.realpath(candidatePath);
+    ? await resolveRealPathAllowMissing(candidatePath, files)
+    : await files.promises.realpath(candidatePath);
 
   if (!isPathInsideRoot(containmentRootReal, candidateReal)) {
     throw new Error("Path resolves outside containment root after symlink resolution.");
@@ -121,13 +127,16 @@ export async function ensurePathContained(
   return candidateReal;
 }
 
-async function resolveRealPathAllowMissing(targetPath: string): Promise<string> {
+async function resolveRealPathAllowMissing(
+  targetPath: string,
+  files: HostFiles = nodeHostFiles
+): Promise<string> {
   const missingSegments: string[] = [];
   let currentPath = targetPath;
 
   while (true) {
     try {
-      const realPath = await nodeHostFiles.promises.realpath(currentPath);
+      const realPath = await files.promises.realpath(currentPath);
       return missingSegments.length === 0 ? realPath : path.join(realPath, ...missingSegments);
     } catch (error) {
       if (!hasErrorCode(error, "ENOENT")) {

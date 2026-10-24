@@ -215,7 +215,7 @@ export class AIService extends EventEmitter {
       config.rootDir
     ),
     /** Absent members: the Node layer (`new AIService(` in tests passes none). */
-    hostServices: LoopHostServices = {}
+    private readonly hostServices: LoopHostServices = {}
   ) {
     super();
     // No listener cap: every live AgentSession adds one listener per forwarded event, and a
@@ -551,6 +551,8 @@ export class AIService extends EventEmitter {
       hostCheckoutRoot: runtimeContext.data.hostCheckoutRoot,
       journal: this.durableEventJournalFor(workspaceId),
       mcpServerManager: this.turnRequestBuilderBindings.mcpServerManager,
+      hostFiles: this.hostServices.hostFiles,
+      hostPaths: this.hostServices.hostPaths,
     });
     return Ok(eventSpine.captureRequestAssembly(workspaceId));
   }

@@ -55,20 +55,17 @@ import { log } from "@/node/services/log";
 import { isProjectTrusted, projectPluginContainerPaths } from "@/node/utils/projectTrust";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { ensureRuntimePathWithinWorkspace } from "@/node/services/tools/runtimeSkillPathUtils";
-import {
-  ensurePathContained,
-  hasErrorCode,
-  isSameHostDirectory,
-} from "@/node/services/tools/skillFileUtils";
+import { hasErrorCode, isSameHostDirectory } from "@/node/services/tools/skillFileUtils";
 import { AgentSkillParseError, parseSkillMarkdown } from "./parseSkillMarkdown";
 import { getBuiltInSkillByName, getBuiltInSkillDescriptors } from "./builtInSkillDefinitions";
 import type { ProjectSkillContainment } from "./skillStorageContext";
 import {
-  discoverAgentPlugins,
+  discoverAgentPluginsOnHost,
   type AgentPluginContainer,
-  nodePluginFs,
+  hostPluginFs,
+  type PluginFileReadArgs,
+  type PluginFileReadResult,
   type PluginFs,
-  readPluginFileWithinRootCapped,
   pluginSkillFolderAlias,
   pluginSkillFolderNames,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
@@ -87,6 +84,7 @@ import {
   pluginSkillConsentGate,
   type ApprovedCopiesSource,
 } from "@/node/services/agentPlugins/approvedCopies";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
   getCanonicalProjectMetadataRelativePath,
@@ -288,7 +286,8 @@ export function getLegacyMuxGlobalSkillsRoot(runtime: Runtime): string {
 async function isLegacyMuxRootTheGlobalRoot(
   globalRuntime: Runtime,
   globalRoot: string,
-  legacyMuxRoot: string
+  legacyMuxRoot: string,
+  hostFiles: HostFiles
 ): Promise<boolean> {
   try {
     const [resolvedGlobal, resolvedLegacy] = await Promise.all(
@@ -296,7 +295,8 @@ async function isLegacyMuxRootTheGlobalRoot(
     );
     if (resolvedGlobal === resolvedLegacy) return true;
     return (
-      !isRemoteRuntime(globalRuntime) && (await isSameHostDirectory(resolvedGlobal, resolvedLegacy))
+      !isRemoteRuntime(globalRuntime) &&
+      (await isSameHostDirectory(resolvedGlobal, resolvedLegacy, hostFiles))
     );
   } catch {
     // Unresolvable: keep the root, so its scan reports why it is unavailable.
@@ -306,14 +306,16 @@ async function isLegacyMuxRootTheGlobalRoot(
 
 async function getGlobalSkillRoots(
   roots: AgentSkillsRoots,
-  globalRuntime: Runtime
+  globalRuntime: Runtime,
+  hostFiles: HostFiles
 ): Promise<string[]> {
   const legacyMuxRoot =
     roots.legacyMuxGlobalRoot != null &&
     !(await isLegacyMuxRootTheGlobalRoot(
       globalRuntime,
       roots.globalRoot,
-      roots.legacyMuxGlobalRoot
+      roots.legacyMuxGlobalRoot,
+      hostFiles
     ))
       ? roots.legacyMuxGlobalRoot
       : undefined;
@@ -362,6 +364,11 @@ interface AgentSkillScanCandidate {
    * round trip), and every path stays a remote path; `runtime` is the RemoteRuntime.
    */
   pluginFs?: PluginFs;
+  /**
+   * The host filesystem of the scan's RuntimeFactory (hostPluginFs): the listing, containment
+   * and plugin reads of a host-local root that do not go through `runtime` (phase 5).
+   */
+  hostFs: PluginFs;
 }
 
 /**
@@ -371,7 +378,8 @@ interface AgentSkillScanCandidate {
 async function buildRemotePluginScanCandidates(
   runtime: Runtime,
   roots: AgentSkillsRoots,
-  workspacePath: string
+  workspacePath: string,
+  hostFs: PluginFs
 ): Promise<AgentSkillScanCandidate[]> {
   const containers = roots.remoteProjectPluginRoots ?? [];
   if (containers.length === 0) return [];
@@ -394,6 +402,7 @@ async function buildRemotePluginScanCandidates(
               skillsOnlyPlugin: plugin.skillsOnly,
               claudePackagePlugin: plugin.claudeFallback,
               pluginFs: snapshot.fs,
+              hostFs,
             },
           ]
     )
@@ -423,6 +432,7 @@ async function buildPluginScanCandidates(args: {
   }
 
   const localRuntime = args.runtimeFactory.createLocalRuntime(args.workspacePath);
+  const hostFs = hostPluginFs(args.runtimeFactory.hostFiles);
   const managedHome =
     args.managedHome !== undefined ? await localRuntime.resolvePath(args.managedHome) : undefined;
   const resolvedContainers: AgentPluginContainer[] = [];
@@ -439,7 +449,7 @@ async function buildPluginScanCandidates(args: {
     }
   }
 
-  const { plugins } = await discoverAgentPlugins(resolvedContainers, { managedHome });
+  const { plugins } = await discoverAgentPluginsOnHost(hostFs, resolvedContainers, { managedHome });
 
   const candidates: AgentSkillScanCandidate[] = [];
   for (const plugin of plugins) {
@@ -449,7 +459,7 @@ async function buildPluginScanCandidates(args: {
 
     if (args.projectContainmentRoot != null) {
       try {
-        await ensurePathContained(args.projectContainmentRoot, plugin.rootPath);
+        await hostFs.ensureContained(args.projectContainmentRoot, plugin.rootPath);
       } catch (error) {
         log.warn(
           `Skipping project plugin '${plugin.name}' at '${plugin.rootPath}': plugin root escapes the project containment root: ${getErrorMessage(error)}`
@@ -476,6 +486,7 @@ async function buildPluginScanCandidates(args: {
         skillConsent,
         pluginConsent: plugin.componentConsent,
         pluginApprovedCopies: plugin.approvedCopies,
+        hostFs,
       }))
     );
   }
@@ -496,6 +507,7 @@ async function buildScanCandidates(
   runtimeFactory: RuntimeFactory
 ): Promise<AgentSkillScanCandidate[]> {
   const globalRuntime = resolveGlobalRuntime(runtime, workspacePath, runtimeFactory);
+  const hostFs = hostPluginFs(runtimeFactory.hostFiles);
   // Both scans can encounter the configured home, e.g. a project rooted at the user's home.
   const managedHome = getPluginManagedHome(roots);
 
@@ -525,13 +537,19 @@ async function buildScanCandidates(
   });
 
   return [
-    ...getProjectSkillRoots(roots).map((root) => ({ scope: "project" as const, root, runtime })),
+    ...getProjectSkillRoots(roots).map((root) => ({
+      scope: "project" as const,
+      root,
+      runtime,
+      hostFs,
+    })),
     ...projectPluginCandidates,
-    ...(await buildRemotePluginScanCandidates(runtime, roots, workspacePath)),
-    ...(await getGlobalSkillRoots(roots, globalRuntime)).map((root) => ({
+    ...(await buildRemotePluginScanCandidates(runtime, roots, workspacePath, hostFs)),
+    ...(await getGlobalSkillRoots(roots, globalRuntime, runtimeFactory.hostFiles)).map((root) => ({
       scope: "global" as const,
       root,
       runtime: globalRuntime,
+      hostFs,
     })),
     ...globalPluginCandidates,
   ];
@@ -559,6 +577,8 @@ function resolveProjectSkillContainment(options?: {
 
 async function assertProjectSkillContained(args: {
   runtime: Runtime;
+  /** The host filesystem of `local` containment. */
+  hostFs: PluginFs;
   containment: ProjectSkillContainment;
   skillDir: string;
   skillFilePath: string;
@@ -572,10 +592,10 @@ async function assertProjectSkillContained(args: {
   // SKILL.md symlinks back inside; the skill would then be accepted and
   // sibling files would be read from the external location.
   if (args.containment.kind === "local") {
-    await ensurePathContained(args.containment.root, args.skillDir, {
+    await args.hostFs.ensureContained(args.containment.root, args.skillDir, {
       allowMissing: true,
     });
-    await ensurePathContained(args.containment.root, args.skillFilePath, {
+    await args.hostFs.ensureContained(args.containment.root, args.skillFilePath, {
       allowMissing: true,
     });
     return;
@@ -606,11 +626,11 @@ async function isPluginSkillContained(args: {
   skillDir: string;
   skillFilePath: string;
   directoryName: string;
-  /** A remote plugin skill's snapshot; the host filesystem when absent. */
-  pluginFs?: PluginFs;
+  /** A remote plugin skill's snapshot, else the host filesystem (the candidate's hostFs). */
+  pluginFs: PluginFs;
   onEscape?: (message: string) => void;
 }): Promise<boolean> {
-  const fs = args.pluginFs ?? nodePluginFs;
+  const fs = args.pluginFs;
   try {
     // SECURITY: validate the skill directory as well as SKILL.md so a dir
     // symlink escaping the plugin root cannot hide behind a SKILL.md that
@@ -650,7 +670,7 @@ async function isCandidateSkillContained(args: {
       skillDir,
       skillFilePath,
       directoryName,
-      pluginFs: candidate.pluginFs,
+      pluginFs: candidate.pluginFs ?? candidate.hostFs,
       onEscape: (message) =>
         args.pushInvalidSkill?.(
           message,
@@ -663,6 +683,7 @@ async function isCandidateSkillContained(args: {
   try {
     await assertProjectSkillContained({
       runtime: candidate.runtime,
+      hostFs: candidate.hostFs,
       containment,
       skillDir,
       skillFilePath,
@@ -820,7 +841,7 @@ async function candidateSkillFolderNames(
 
 /** The skill folder names of a scan root: its own name when it is a single skill. */
 async function listCandidateSkillNames(
-  candidate: Pick<AgentSkillScanCandidate, "runtime" | "singleSkillName" | "pluginFs">,
+  candidate: Pick<AgentSkillScanCandidate, "runtime" | "singleSkillName" | "pluginFs" | "hostFs">,
   resolvedRoot: string,
   workspacePath: string
 ): Promise<string[]> {
@@ -828,11 +849,7 @@ async function listCandidateSkillNames(
   if (candidate.pluginFs != null) return listSkillDirectories(candidate.pluginFs, resolvedRoot);
   return isRemoteRuntime(candidate.runtime)
     ? listSkillDirectoriesFromRuntime(candidate.runtime, resolvedRoot, { cwd: workspacePath })
-    : listSkillDirectoriesFromLocalFs(resolvedRoot);
-}
-
-async function listSkillDirectoriesFromLocalFs(root: string): Promise<string[]> {
-  return listSkillDirectories(nodePluginFs, root);
+    : listSkillDirectories(candidate.hostFs, resolvedRoot);
 }
 
 async function listSkillDirectories(pluginFs: PluginFs, root: string): Promise<string[]> {
@@ -945,12 +962,14 @@ async function readRuntimeSkillFileForScan(
   }
 }
 
-/** A plugin skill file: from its remote snapshot, else the host's contained reader. */
+/** A plugin skill file: from its remote snapshot, else the host's contained reader (hostFs). */
 function readPluginSkillFile(
   pluginFs: PluginFs | undefined,
-  args: Parameters<typeof readPluginFileWithinRootCapped>[0]
-): ReturnType<typeof readPluginFileWithinRootCapped> {
-  return pluginFs != null ? pluginFs.readFileCapped(args) : readPluginFileWithinRootCapped(args);
+  hostFs: PluginFs,
+  args: PluginFileReadArgs
+): Promise<PluginFileReadResult> {
+  // mutation-equivalent: pluginFs is a PluginFs object or undefined, so ?? and || agree
+  return (pluginFs ?? hostFs).readFileCapped(args);
 }
 
 async function readSkillDescriptorFromDir(
@@ -967,6 +986,8 @@ async function readSkillDescriptorFromDir(
     pluginRoot?: string;
     /** A remote plugin skill's snapshot (AgentSkillScanCandidate.pluginFs). */
     pluginFs?: PluginFs;
+    /** The candidate's host filesystem (AgentSkillScanCandidate.hostFs). */
+    hostFs: PluginFs;
     skillConsent?: PluginSkillConsentGate;
     /** A Claude command: read `<name>.md` as SKILL.md text (plugin skills only). */
     commandSkill?: true | undefined;
@@ -993,7 +1014,7 @@ async function readSkillDescriptorFromDir(
     // and a managed update promoted in between could otherwise have the
     // stale canonical path read an outside SKILL.md.
     try {
-      const result = await readPluginSkillFile(options.pluginFs, {
+      const result = await readPluginSkillFile(options.pluginFs, options.hostFs, {
         filePath: skillFilePath,
         pluginRoot: options.pluginRoot,
         maxBytes: MAX_FILE_SIZE,
@@ -1239,6 +1260,7 @@ export async function discoverAgentSkills(
           ...(scan.pluginName !== undefined ? { pluginName: scan.pluginName } : {}),
           ...(scan.pluginRoot !== undefined ? { pluginRoot: scan.pluginRoot } : {}),
           pluginFs: scan.pluginFs,
+          hostFs: scan.hostFs,
           skillConsent: scan.skillConsent,
           commandSkill: scan.commandSkill,
         }
@@ -1410,11 +1432,13 @@ async function readAgentSkillFromDir(
   skillDir: string,
   directoryName: SkillName,
   scope: AgentSkillScope,
-  pluginRoot?: string,
-  skillConsent?: PluginSkillConsentGate,
+  pluginRoot: string | undefined,
+  skillConsent: PluginSkillConsentGate | undefined,
   /** A Claude command: read `<name>.md` as SKILL.md text (plugin skills only). */
-  commandSkill?: true,
-  pluginFs?: PluginFs
+  commandSkill: true | undefined,
+  pluginFs: PluginFs | undefined,
+  /** The candidate's host filesystem (AgentSkillScanCandidate.hostFs). */
+  hostFs: PluginFs
 ): Promise<ResolvedAgentSkill | null> {
   const skillFilePath = candidateSkillFile({ runtime, commandSkill }, skillDir, directoryName);
 
@@ -1424,7 +1448,7 @@ async function readAgentSkillFromDir(
     // Plugin skills are host-local by construction (plugin scan candidates
     // pin a LocalRuntime): bounded post-open revalidation — see the
     // pluginRoot doc on ResolvedAgentSkill.
-    const result = await readPluginSkillFile(pluginFs, {
+    const result = await readPluginSkillFile(pluginFs, hostFs, {
       filePath: skillFilePath,
       pluginRoot,
       maxBytes: MAX_FILE_SIZE,
@@ -1537,7 +1561,8 @@ async function readCandidateSkill(
         candidate.pluginRoot,
         candidate.skillConsent,
         candidate.commandSkill,
-        candidate.pluginFs
+        candidate.pluginFs,
+        candidate.hostFs
       ),
       candidate
     );

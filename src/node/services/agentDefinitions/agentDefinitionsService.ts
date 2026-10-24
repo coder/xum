@@ -44,11 +44,12 @@ import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommo
 
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
-  discoverAgentPlugins,
-  nodePluginFs,
-  readPluginFileWithinRootCapped,
+  discoverAgentPluginsOnHost,
+  hostPluginFs,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
   type AgentPluginContainer,
+  type PluginFileReadArgs,
+  type PluginFileReadResult,
   type PluginFs,
 } from "@/node/services/agentPlugins/discovery";
 import { getRemoteProjectPluginSnapshot } from "@/node/services/agentPlugins/remoteProjectPlugins";
@@ -57,7 +58,7 @@ import {
   type ComponentConsent,
 } from "@/node/services/agentPlugins/componentConsent";
 import { ambiguousPluginAgentIds, pluginAgentIdOf } from "@/node/services/agentPlugins/agentFiles";
-import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 import { getBuiltInAgentDefinitions } from "./builtInAgentDefinitions";
 import {
@@ -195,13 +196,19 @@ interface AgentDefinitionScanCandidate {
    * round trip), and every path stays a remote path; `runtime` is the RemoteRuntime.
    */
   pluginFs?: PluginFs;
+  /**
+   * The host filesystem of the scan's RuntimeFactory (hostPluginFs): the listing, containment
+   * and plugin reads of a host-local root that do not go through `runtime` (phase 5).
+   */
+  hostFs: PluginFs;
 }
 
 /** #6426: scan candidates for the plugin agents of a trusted remote checkout's snapshot. */
 async function buildRemotePluginAgentCandidates(
   runtime: Runtime,
   roots: AgentDefinitionsRoots,
-  workspacePath: string
+  workspacePath: string,
+  hostFs: PluginFs
 ): Promise<AgentDefinitionScanCandidate[]> {
   const containers = roots.remoteProjectPluginRoots ?? [];
   if (containers.length === 0) return [];
@@ -217,6 +224,7 @@ async function buildRemotePluginAgentCandidates(
             pluginRoot: plugin.rootPath,
             pluginName: plugin.name,
             pluginFs: snapshot?.fs,
+            hostFs,
           },
         ]
   );
@@ -242,6 +250,7 @@ async function buildPluginAgentScanCandidates(args: {
   }
 
   const localRuntime = args.runtimeFactory.createLocalRuntime(args.workspacePath);
+  const hostFs = hostPluginFs(args.runtimeFactory.hostFiles);
   const resolvedContainers: AgentPluginContainer[] = [];
   for (const container of args.containers) {
     try {
@@ -255,7 +264,7 @@ async function buildPluginAgentScanCandidates(args: {
     }
   }
 
-  const { plugins } = await discoverAgentPlugins(resolvedContainers, {
+  const { plugins } = await discoverAgentPluginsOnHost(hostFs, resolvedContainers, {
     managedHome: await localRuntime.resolvePath(args.managedHome),
   });
 
@@ -267,7 +276,7 @@ async function buildPluginAgentScanCandidates(args: {
 
     if (args.projectContainmentRoot != null) {
       try {
-        await ensurePathContained(args.projectContainmentRoot, plugin.rootPath);
+        await hostFs.ensureContained(args.projectContainmentRoot, plugin.rootPath);
       } catch (error) {
         log.warn(
           `Skipping project plugin '${plugin.name}' at '${plugin.rootPath}': plugin root escapes the project containment root: ${getErrorMessage(error)}`
@@ -283,6 +292,7 @@ async function buildPluginAgentScanCandidates(args: {
       pluginRoot: plugin.rootPath,
       pluginName: plugin.name,
       pluginConsent: plugin.componentConsent,
+      hostFs,
     });
   }
 
@@ -303,6 +313,7 @@ async function buildScanCandidates(
   // The registry lives in the Xum home above the global agents root (tilde form maps to the host
   // home), as plugin skill discovery derives it.
   const managedHome = path.dirname(roots.globalRoot);
+  const hostFs = hostPluginFs(runtimeFactory.hostFiles);
   const projectPluginCandidates = await buildPluginAgentScanCandidates({
     containers: roots.projectPluginRoots ?? [],
     scope: "project",
@@ -324,13 +335,15 @@ async function buildScanCandidates(
       scope: "project" as const,
       root,
       runtime,
+      hostFs,
     })),
     ...projectPluginCandidates,
-    ...(await buildRemotePluginAgentCandidates(runtime, roots, workspacePath)),
+    ...(await buildRemotePluginAgentCandidates(runtime, roots, workspacePath, hostFs)),
     {
       scope: "global",
       root: roots.globalRoot,
       runtime: resolveGlobalRuntime(runtime, workspacePath, runtimeFactory),
+      hostFs,
     },
     ...globalPluginCandidates,
   ];
@@ -364,7 +377,8 @@ async function resolvePluginAgentFile(args: {
   pluginRoot: string;
   agentsDir: string;
   agentId: AgentId;
-  pluginFs?: PluginFs;
+  /** A remote plugin's snapshot, else the host filesystem (the candidate's hostFs). */
+  pluginFs: PluginFs;
 }): Promise<string | null> {
   const names = await listAgentFiles(args.pluginFs, args.agentsDir);
   const ambiguous = warnAmbiguousPluginAgents(names);
@@ -382,11 +396,11 @@ async function isPluginAgentContained(args: {
   pluginRoot: string;
   filePath: string;
   agentId: AgentId;
-  /** A remote plugin's snapshot; the host filesystem when absent. */
-  pluginFs?: PluginFs;
+  /** A remote plugin's snapshot, else the host filesystem (the candidate's hostFs). */
+  pluginFs: PluginFs;
 }): Promise<boolean> {
   try {
-    await (args.pluginFs ?? nodePluginFs).ensureContained(args.pluginRoot, args.filePath);
+    await args.pluginFs.ensureContained(args.pluginRoot, args.filePath);
     return true;
   } catch (error) {
     if (!hasErrorCode(error, "ENOENT")) {
@@ -399,9 +413,9 @@ async function isPluginAgentContained(args: {
 }
 
 /** The agent files of a plugin agents dir: in a remote snapshot, else on the host. */
-async function listAgentFiles(pluginFs: PluginFs | undefined, root: string): Promise<string[]> {
+async function listAgentFiles(pluginFs: PluginFs, root: string): Promise<string[]> {
   try {
-    const entries = await (pluginFs ?? nodePluginFs).readdir(root);
+    const entries = await pluginFs.readdir(root);
     return entries
       .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"))
       .map((entry) => entry.name);
@@ -412,13 +426,13 @@ async function listAgentFiles(pluginFs: PluginFs | undefined, root: string): Pro
 
 /** A scan root's agent files: from its snapshot, over its remote runtime, or on the host. */
 function listCandidateAgentFiles(
-  scan: Pick<AgentDefinitionScanCandidate, "runtime" | "pluginFs">,
+  scan: Pick<AgentDefinitionScanCandidate, "runtime" | "pluginFs" | "hostFs">,
   resolvedRoot: string,
   workspacePath: string
 ): Promise<string[]> {
   return scan.pluginFs == null && isRemoteRuntime(scan.runtime)
     ? listAgentFilesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
-    : listAgentFiles(scan.pluginFs, resolvedRoot);
+    : listAgentFiles(candidateFs(scan), resolvedRoot);
 }
 
 /** A scan root, resolved. A remote plugin root is already a real remote path: no round trip. */
@@ -430,12 +444,20 @@ function resolveCandidateRoot(
     : candidate.runtime.resolvePath(candidate.root);
 }
 
-/** A plugin agent file: from its remote snapshot, else the host's contained reader. */
+/** The filesystem of a candidate's plugin reads: its remote snapshot, else the host's. */
+function candidateFs(
+  candidate: Pick<AgentDefinitionScanCandidate, "pluginFs" | "hostFs">
+): PluginFs {
+  // mutation-equivalent: pluginFs is a PluginFs object or undefined, so ?? and || agree
+  return candidate.pluginFs ?? candidate.hostFs;
+}
+
+/** A plugin agent file: from its remote snapshot, else the host's contained reader (hostFs). */
 function readPluginAgentFile(
-  pluginFs: PluginFs | undefined,
-  args: Parameters<typeof readPluginFileWithinRootCapped>[0]
-): ReturnType<typeof readPluginFileWithinRootCapped> {
-  return pluginFs != null ? pluginFs.readFileCapped(args) : readPluginFileWithinRootCapped(args);
+  pluginFs: PluginFs,
+  args: PluginFileReadArgs
+): Promise<PluginFileReadResult> {
+  return pluginFs.readFileCapped(args);
 }
 
 async function listAgentFilesFromRuntime(
@@ -521,7 +543,7 @@ async function readAgentDescriptorFromFile(
   filePath: string,
   agentId: AgentId,
   scope: Exclude<AgentDefinitionScope, "built-in">,
-  pluginName?: string,
+  pluginName: string | undefined,
   /**
    * Plugin agents (host-local by construction): the consuming read must
    * revalidate containment + file identity through a bounded post-open
@@ -531,10 +553,10 @@ async function readAgentDescriptorFromFile(
    * reads that as a capability removal, and the outside frontmatter would
    * otherwise control agent policy (runnable/base/tools).
    */
-  pluginRoot?: string,
-  pluginConsent?: ComponentConsent,
-  /** A remote plugin's snapshot (AgentDefinitionScanCandidate.pluginFs). */
-  pluginFs?: PluginFs
+  pluginRoot: string | undefined,
+  pluginConsent: ComponentConsent | undefined,
+  /** The remote snapshot or the host filesystem of a plugin agent (see readPluginAgentFile). */
+  pluginFs: PluginFs
 ): Promise<AgentDefinitionDescriptor | null> {
   let content: string;
   let byteSize: number;
@@ -697,7 +719,7 @@ export async function discoverAgentDefinitions(
           pluginRoot: scan.pluginRoot,
           filePath,
           agentId,
-          pluginFs: scan.pluginFs,
+          pluginFs: candidateFs(scan),
         });
         if (!contained) continue;
       }
@@ -710,7 +732,7 @@ export async function discoverAgentDefinitions(
         scan.pluginName,
         scan.pluginRoot,
         scan.pluginConsent,
-        scan.pluginFs
+        candidateFs(scan)
       );
       if (!descriptor) continue;
 
@@ -942,7 +964,7 @@ async function loadAgentDefinition(
         pluginRoot: candidate.pluginRoot,
         agentsDir: resolvedRoot,
         agentId,
-        pluginFs: candidate.pluginFs,
+        pluginFs: candidateFs(candidate),
       });
       if (pluginFile === null) continue;
       filePath = pluginFile;
@@ -957,7 +979,7 @@ async function loadAgentDefinition(
         // This frontmatter controls agent policy (runnable/base/tools), so a
         // replacement symlink promoted after isPluginAgentContained must not
         // have its outside target read here.
-        const result = await readPluginAgentFile(candidate.pluginFs, {
+        const result = await readPluginAgentFile(candidateFs(candidate), {
           filePath,
           pluginRoot: candidate.pluginRoot,
           maxBytes: MAX_FILE_SIZE,

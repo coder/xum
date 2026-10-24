@@ -8,6 +8,7 @@ import {
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
 import { RuntimeFactoryTag } from "@/node/services/di/tags";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import type { RuntimeFactory } from "./runtimeFactoryService";
 
 /**
@@ -33,6 +34,7 @@ export const nodeRuntimeFactory: RuntimeFactory = {
       input.workspaceName
     ),
   createLocalRuntime: (path) => new LocalRuntime(path),
+  hostFiles: nodeHostFiles,
 };
 
 /**
