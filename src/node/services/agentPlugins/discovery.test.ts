@@ -2164,7 +2164,8 @@ describe("Claude Code plugin discovery", () => {
       {
         diagnosticPath: path.join(container, "c", "plugin.json"),
         severity: "error",
-        message: "Invalid plugin manifest (plugin.json): '$schema' is required and must be a string",
+        message:
+          "Invalid plugin manifest (plugin.json): '$schema' is required and must be a string",
       },
     ]);
   });
