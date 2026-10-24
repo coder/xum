@@ -7,6 +7,7 @@ import { log } from "@/node/services/log";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { RuntimeError, isRuntimeTransportError } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import { setTodosForSessionDir } from "./todo";
 
 // Schema for propose_plan - empty object (no input parameters)
@@ -98,7 +99,8 @@ export const createProposePlanTool: ToolFactory = (config) => {
             await setTodosForSessionDir(
               config.workspaceId,
               config.workspaceSessionDir,
-              completedTodos
+              completedTodos,
+              config.sessionLocks ?? nodeSessionLocks
             );
           }
         } catch (error) {

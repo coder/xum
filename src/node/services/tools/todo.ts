@@ -8,7 +8,8 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { TodoItem } from "@/common/types/tools";
 import { MAX_TODOS } from "@/common/constants/toolLimits";
 import { getTodoFilePath, readTodosForSessionDir } from "@/node/services/todos/todoStorage";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 /**
  * Validate todo sequencing rules before persisting.
@@ -80,11 +81,12 @@ function validateTodos(todos: TodoItem[]): void {
 async function writeTodos(
   workspaceId: string,
   workspaceSessionDir: string,
-  todos: TodoItem[]
+  todos: TodoItem[],
+  locks: SessionLocks
 ): Promise<void> {
   validateTodos(todos);
 
-  await workspaceFileLocks.withLock(workspaceId, async () => {
+  await locks.workspaceFiles.withLock(workspaceId, async () => {
     const todoFile = getTodoFilePath(workspaceSessionDir);
     await fs.mkdir(path.dirname(todoFile), { recursive: true });
     await writeFileAtomic(todoFile, JSON.stringify(todos, null, 2));
@@ -102,7 +104,12 @@ export const createTodoWriteTool: ToolFactory = (config) => {
     execute: async ({ todos }) => {
       assert(config.workspaceId, "todo_write requires workspaceId");
       assert(config.workspaceSessionDir, "todo_write requires workspaceSessionDir");
-      await writeTodos(config.workspaceId, config.workspaceSessionDir, todos);
+      await writeTodos(
+        config.workspaceId,
+        config.workspaceSessionDir,
+        todos,
+        config.sessionLocks ?? nodeSessionLocks
+      );
       return {
         success: true as const,
         count: todos.length,
@@ -131,11 +138,14 @@ export const createTodoReadTool: ToolFactory = (config) => {
 
 /**
  * Set todos for a workspace session directory (propose_plan uses this to mark todos completed).
+ * `locks` gives the workspace FIFO (phase 4: SessionLocks). Both app callers pass their session's
+ * locks; tests keep the Node default.
  */
 export async function setTodosForSessionDir(
   workspaceId: string,
   workspaceSessionDir: string,
-  todos: TodoItem[]
+  todos: TodoItem[],
+  locks: SessionLocks = nodeSessionLocks
 ): Promise<void> {
-  await writeTodos(workspaceId, workspaceSessionDir, todos);
+  await writeTodos(workspaceId, workspaceSessionDir, todos, locks);
 }
