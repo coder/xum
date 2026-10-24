@@ -253,6 +253,19 @@ function parseLockToken(raw: string): HolderEvidence | null {
   return null;
 }
 
+/**
+ * Whether lockPath's lock file exists: a holder, live or dead, has it. One stat, so a caller
+ * that only needs to know if a holder may exist (branchSummary's marker reader) neither creates
+ * the lock's folder nor contends with the holder.
+ */
+export async function processFileLockExists(lockPath: string): Promise<boolean> {
+  assert(lockPath.length > 0, "processFileLockExists requires a lock path");
+  return await fs.stat(lockPath).then(
+    () => true,
+    () => false
+  );
+}
+
 export async function acquireProcessFileLock(
   options: ProcessFileLockOptions
 ): Promise<ProcessFileLock> {
