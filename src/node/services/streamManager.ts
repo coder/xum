@@ -1,4 +1,3 @@
-import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
 import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
 import {
@@ -8,11 +7,7 @@ import {
   type ContextBudgetAnchorRequest,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
-import {
-  applyCacheControl,
-  getAnthropicCacheTtl,
-  supportsAnthropicCache,
-} from "@/common/utils/ai/cacheStrategy";
+import { applyCacheControl, getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { stripMessageCacheControl, type ContinuousPrefixSwap } from "./continuousCompactionJournal";
 import type { PrefixSwapInvalidatedEvent } from "@/common/types/stream";
 import * as path from "path";
@@ -75,7 +70,6 @@ import {
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import type {
-  ActiveTurnThinkingOverride,
   RebuildFirstStepForThinkingLevel,
   RebuildProviderOptionsForThinkingLevel,
 } from "@/node/services/thinkingOverride";
@@ -106,7 +100,7 @@ import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { modelOnlyNotificationsField } from "@/common/utils/tools/internalToolResultFields";
 import { summarizeInvalidToolInputErrors } from "@/node/utils/messages/summarizeInvalidToolInputErrors";
-import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { buildRequiredToolPatterns } from "@/common/utils/tools/toolPolicy";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 import {
   collectDeferLoadingToolNames,
@@ -114,7 +108,6 @@ import {
   computeContextLoadedToolNames,
   dedupeNativeToolReferences,
   computeLoadedToolNames,
-  type ToolSearchStreamState,
 } from "@/common/utils/tools/toolCatalog";
 import { StreamingTokenTracker } from "@/node/utils/main/StreamingTokenTracker";
 import { countTokens } from "@/node/utils/main/tokenizer";
@@ -127,8 +120,6 @@ import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
 import { stripAnthropicReasoning } from "@/browser/utils/messages/modelMessageTransform";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { getModelStats, getModelStatsResolved } from "@/common/utils/tokens/modelStats";
-import { withSequentialExecution } from "@/node/services/tools/withSequentialExecution";
 import type { ResolvedCallSettingsOverrides } from "@/common/config/schemas/modelParameters";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
@@ -147,7 +138,11 @@ import {
   type PartialJournalState,
   type PartialTarget,
 } from "@/node/services/turnEngine/PartialJournal";
-import { ProviderRequest } from "@/node/services/turnEngine/ProviderRequest";
+import {
+  ProviderRequest,
+  type StreamRequestConfig,
+  type StreamRequestOptions,
+} from "@/node/services/turnEngine/ProviderRequest";
 import {
   extractErrorCode,
   extractPreviousResponseIdFromError,
@@ -365,31 +360,6 @@ export interface SettledStepOutcome {
 
 export type OnStepSettled = (step: SettledStepBudget) => Promise<SettledStepOutcome>;
 
-interface StreamRequestOptions {
-  model: LanguageModel;
-  modelString: string;
-  messages: ModelMessage[];
-  system: Instructions | undefined;
-  tools?: Record<string, Tool>;
-  providerOptions?: Record<string, unknown>;
-  maxOutputTokens?: number;
-  callSettingsOverrides?: ResolvedCallSettingsOverrides;
-  toolPolicy?: ToolPolicy;
-  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
-  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
-  headers?: Record<string, string | undefined>;
-  onChunk?: StreamTextOnChunk;
-  onStepMessages?: (messages: ModelMessage[]) => void;
-  onStepSettled?: OnStepSettled;
-  contextBudgetLimit?: number;
-  toolSearchState?: ToolSearchStreamState;
-  thinkingOverrideState?: ActiveTurnThinkingOverride;
-  rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
-  forcedFirstStepToolNames?: string[];
-  providersConfigSnapshot?: ProvidersConfigMap;
-  rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
-}
-
 export interface TurnExecutionOptions extends StreamRequestOptions {
   workspaceId: string;
   historySequence: number;
@@ -413,10 +383,6 @@ export interface TurnExecutionOptions extends StreamRequestOptions {
    */
   stopFence?: () => boolean;
 }
-
-type StreamRequestInput = StreamRequestOptions & {
-  onToolExecutionStart?: (toolCallId: string) => void;
-};
 
 /**
  * Auto's thinking claim on a routing record: stamped with the level the request runs at,
@@ -529,58 +495,6 @@ function withRebuiltSystemMetadata(
   // Every record follows the rebuild, an absent one included (it replaces an older one).
   for (const field of SYSTEM_SECTION_RECORD_FIELDS) next[field] = rebuilt.systemRecords?.[field];
   return next;
-}
-
-interface StreamRequestConfig {
-  stopCause?: StreamStopCause;
-  cacheEnabled?: boolean;
-  budgetMetadataModel?: string;
-  model: LanguageModel;
-  modelString: string;
-  messages: ModelMessage[];
-  /** Provider-ready system instructions from TurnContextAssembler. */
-  system?: Instructions;
-  tools?: Record<string, Tool>;
-  providerOptions?: Record<string, unknown>;
-  /** Per-request HTTP headers (e.g., anthropic-beta for 1M context). */
-  headers?: Record<string, string | undefined>;
-  maxOutputTokens?: number;
-  streamCallSettings?: Omit<ResolvedCallSettingsOverrides, "maxOutputTokens">;
-  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
-  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
-  /** Optional hook for callers that need chunk-level visibility during streaming. */
-  onChunk?: StreamTextOnChunk;
-  /** Optional hook for callers that need the live prepared step transcript. */
-  onStepMessages?: (messages: ModelMessage[]) => void;
-  onStepSettled?: OnStepSettled;
-  contextBudgetLimit?: number;
-  toolPolicy?: ToolPolicy;
-  /**
-   * Tool-search deferral state. Owned and mutated by
-   * aiService/tool_catalog_search.execute; prepareStep reads it each step to
-   * compute `activeTools`. Absent when the feature is inactive.
-   */
-  toolSearchState?: ToolSearchStreamState;
-  /**
-   * Mid-turn thinking override holder — the SESSION'S object, by reference
-   * (never created inside StreamManager: a locally-created object would be
-   * invisible to AgentSession.setActiveTurnThinkingLevel). prepareStep
-   * consumes `pending` before every model step.
-   */
-  thinkingOverrideState?: ActiveTurnThinkingOverride;
-  /**
-   * Closure built by TurnRequestBuilder that re-runs the effective-level pipeline
-   * (policy clamp + resolveEffectiveThinkingLevel) and rebuilds provider
-   * options for the stream's model. `null` ⇒ not applicable / no-op.
-   */
-  rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
-  /**
-   * Step-0 message rebuild for overrides that raced stream construction; see
-   * RebuildFirstStepForThinkingLevel. Also emits the superseding envelope.
-   */
-  rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
-  /** First step must call one of these tools; later steps restore the full toolset. */
-  forcedFirstStepToolNames?: string[];
 }
 
 /**
@@ -1277,6 +1191,7 @@ export class StreamManager {
       workspaceLogger: (id, turn) => this.getWorkspaceLogger(id as WorkspaceId, turn),
     });
     this.providerRequest = new ProviderRequest({
+      getProvidersConfig: this.getProvidersConfig,
       workspaceLogger: (id, turn) => this.getWorkspaceLogger(id as WorkspaceId, turn),
     });
     this.eventSink = eventSink;
@@ -2857,88 +2772,6 @@ export class StreamManager {
     }
   }
 
-  private buildStreamRequestConfig(input: StreamRequestInput): StreamRequestConfig {
-    const {
-      model,
-      modelString,
-      messages,
-      system,
-      tools,
-      providerOptions,
-      maxOutputTokens,
-      callSettingsOverrides,
-      toolPolicy,
-      hasQueuedMessages,
-      getQueuedInputStopCause,
-      headers,
-      onChunk,
-      onStepMessages,
-      onStepSettled,
-      contextBudgetLimit,
-      toolSearchState,
-      onToolExecutionStart,
-      thinkingOverrideState,
-      rebuildProviderOptionsForThinkingLevel,
-      forcedFirstStepToolNames,
-      providersConfigSnapshot,
-      rebuildFirstStepForThinkingLevel,
-    } = input;
-    // The request's pinned providers-config snapshot keeps type-derived output limits
-    // aligned with the config that created the SDK model.
-    const requestProvidersConfig = providersConfigSnapshot ?? this.getProvidersConfig();
-    // Mid-turn thinking overrides mutate providerOptions IN PLACE (the SDK's
-    // per-step deep-merge reads the object passed at streamText() time, so
-    // identity must stay stable). An initially-undefined value would make that
-    // mutation unobservable — normalize to a guaranteed mutable object.
-    const finalProviderOptions =
-      rebuildProviderOptionsForThinkingLevel != null ? (providerOptions ?? {}) : providerOptions;
-
-    // Use the runtime model's max_output_tokens if available and caller didn't
-    // specify. This must be the runtime model (not the mapped metadata model)
-    // because max_output_tokens is a request parameter sent to the provider —
-    // a custom model's provider may not support the mapped model's output cap.
-    // If no metadata exists, omit the parameter to let the provider use its
-    // default (Anthropic requires this but has low defaults).
-    const { maxOutputTokens: configMaxOutputTokens, ...streamCallSettings } =
-      callSettingsOverrides ?? {};
-
-    const runtimeModelStats = getModelStats(modelString);
-    // Fall back to resolved stats for custom aliases (e.g., provider alias mappedToModel).
-    const resolvedModelStats =
-      runtimeModelStats ?? getModelStatsResolved(modelString, requestProvidersConfig);
-    const effectiveMaxOutputTokens =
-      maxOutputTokens ?? configMaxOutputTokens ?? resolvedModelStats?.max_output_tokens;
-
-    return {
-      model,
-      modelString,
-      messages,
-      system,
-      cacheEnabled: supportsAnthropicCache(modelString, requestProvidersConfig),
-      budgetMetadataModel: resolveModelForMetadata(modelString, requestProvidersConfig),
-      // Keep provider-level parallel tool planning enabled, but serialize sibling
-      // execute() handlers inside this stream so shared mutable state cannot race.
-      tools: withSequentialExecution(tools, onToolExecutionStart),
-      providerOptions: finalProviderOptions,
-      headers,
-      maxOutputTokens: effectiveMaxOutputTokens,
-      streamCallSettings:
-        Object.keys(streamCallSettings).length > 0 ? streamCallSettings : undefined,
-      hasQueuedMessages,
-      getQueuedInputStopCause,
-      onChunk,
-      onStepMessages,
-      onStepSettled,
-      contextBudgetLimit,
-      toolPolicy,
-      toolSearchState,
-      thinkingOverrideState,
-      forcedFirstStepToolNames,
-      rebuildProviderOptionsForThinkingLevel,
-      rebuildFirstStepForThinkingLevel,
-    };
-  }
-
   private createStopWhenCondition(
     request: Pick<
       StreamRequestConfig,
@@ -3106,59 +2939,6 @@ export class StreamManager {
         return true;
       },
     ];
-  }
-
-  /**
-   * Consume a pending mid-turn thinking-level override for the next step.
-   *
-   * Consume-once: `pending` is always cleared (a failed/no-op application must
-   * not retry on every subsequent step). On success the CONTENT of
-   * `request.providerOptions` is replaced in place — object identity is
-   * preserved because the SDK's per-step deep-merge reads the reference passed
-   * at streamText() time, and deep-merge alone cannot delete keys (e.g. the
-   * Anthropic `thinking` object when moving to "off").
-   *
-   * Returns the rebuilt options (for the prepareStep return value) or
-   * undefined when there is nothing to apply.
-   */
-  private applyPendingThinkingOverride(
-    request: StreamRequestConfig,
-    beforeFirstStep: boolean
-  ): Record<string, unknown> | undefined {
-    const state = request.thinkingOverrideState;
-    const pending = state?.pending;
-    // A stage turn sends its counted payload first (#5286): the change applies after it.
-    if (state == null || pending == null || (beforeFirstStep && state.holdBeforeFirstRequest)) {
-      return undefined;
-    }
-    state.pending = undefined;
-    const rebuild = request.rebuildProviderOptionsForThinkingLevel;
-    if (rebuild == null) {
-      return undefined;
-    }
-    const rebuilt = rebuild(pending, beforeFirstStep);
-    if (rebuilt == null) {
-      log.debug("Mid-turn thinking override skipped (not applicable / no-op)", {
-        requestedLevel: pending,
-        appliedLevel: state.applied,
-      });
-      return undefined;
-    }
-    const target = request.providerOptions;
-    // buildStreamRequestConfig normalizes providerOptions to a stable object
-    // whenever a rebuild closure is present, so target must exist here.
-    assert(target != null, "providerOptions must be normalized when a rebuild closure is present");
-    for (const key of Object.keys(target)) {
-      delete target[key];
-    }
-    Object.assign(target, rebuilt.providerOptions);
-    state.applied = rebuilt.effectiveLevel;
-    state.onApplied?.(rebuilt.effectiveLevel);
-    log.debug("Mid-turn thinking override applied", {
-      requestedLevel: pending,
-      effectiveLevel: rebuilt.effectiveLevel,
-    });
-    return rebuilt.providerOptions;
   }
 
   getPrefixSwapPreparation(workspaceId: string) {
@@ -3333,7 +3113,10 @@ export class StreamManager {
         // resolves as at turn start (#5279); without a tracker, assume a step ran.
         const firstTurnRequest =
           stepTracker != null && stepNumber === 0 && !stepTracker.providerRequestPrepared;
-        const thinkingOverride = this.applyPendingThinkingOverride(request, firstTurnRequest);
+        const thinkingOverride = this.providerRequest.applyPendingThinkingOverride(
+          request,
+          firstTurnRequest
+        );
         if (stepTracker) stepTracker.providerRequestPrepared = true;
         if (escalation && escalationState) {
           // The rebuild clamps to the model's ladder and reports a no-op as "not applicable";
@@ -3563,7 +3346,7 @@ export class StreamManager {
       recordSystemSections: () => undefined,
     };
     const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
-    const request = this.buildStreamRequestConfig({
+    const request = this.providerRequest.buildStreamRequestConfig({
       ...options,
       onToolExecutionStart: (toolCallId) =>
         this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
@@ -4360,7 +4143,7 @@ export class StreamManager {
     // Build the swapped request/stream into locals first so a failure here
     // leaves streamInfo unmodified (the terminal error then names the model
     // that actually refused, not a half-applied fallback).
-    const nextRequest = this.buildStreamRequestConfig({
+    const nextRequest = this.providerRequest.buildStreamRequestConfig({
       model: prepared.data.model,
       modelString: prepared.data.modelString,
       messages: fallbackMessages,

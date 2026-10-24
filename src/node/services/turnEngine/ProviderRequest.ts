@@ -1,8 +1,13 @@
 /**
  * ProviderRequest: the one owner of opening a StreamManager turn's provider stream
- * (turn-engine layer 4a). This first slice holds the cross-turn provider state that
- * request building reads: the OpenAI previousResponseIds the provider lost, and the
- * continuous-compaction prefix swap that the next step's request applies.
+ * (turn-engine layer 4a). It holds the cross-turn provider state that request building
+ * reads (the OpenAI previousResponseIds the provider lost, and the continuous-compaction
+ * prefix swap that the next step's request applies), builds the per-attempt request
+ * config, and applies a pending mid-turn thinking override to it.
+ *
+ * StreamManager still opens the stream (createStreamResult) and builds its stop
+ * conditions (createStopWhenCondition): both are complexity hotspots that a later layer
+ * shrinks in place before they move here.
  *
  * Shape: like PartialJournal and UsageLedger, a plain class that StreamManager
  * constructs. The swap staging fields stay on each stream's step tracker
@@ -17,13 +22,31 @@
  * - swapPrefix cuts only at a unique locator; a missing or repeated locator keeps the
  *   full context (returns null).
  */
-import type { ModelMessage } from "ai";
+import type { Instructions, LanguageModel, ModelMessage, Tool } from "ai";
+
+import type { ResolvedCallSettingsOverrides } from "@/common/config/schemas/modelParameters";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
+import { supportsAnthropicCache } from "@/common/utils/ai/cacheStrategy";
+import assert from "@/common/utils/assert";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import { getModelStats, getModelStatsResolved } from "@/common/utils/tokens/modelStats";
+import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
+import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 
 import {
   stripMessageCacheControl,
   type ContinuousPrefixSwap,
 } from "@/node/services/continuousCompactionJournal";
 import { log, type Logger } from "@/node/services/log";
+// Type-only back-edge: these step-budget and chunk types still live with the stream loop.
+import type { OnStepSettled, StreamTextOnChunk } from "@/node/services/streamManager";
+import type {
+  ActiveTurnThinkingOverride,
+  RebuildFirstStepForThinkingLevel,
+  RebuildProviderOptionsForThinkingLevel,
+} from "@/node/services/thinkingOverride";
+import { withSequentialExecution } from "@/node/services/tools/withSequentialExecution";
 import { unprojectNativeToolReferences } from "@/common/utils/tools/toolCatalog";
 
 import {
@@ -31,6 +54,87 @@ import {
   extractPreviousResponseIdFromError,
   extractStatusCode,
 } from "./providerWire";
+
+export interface StreamRequestOptions {
+  model: LanguageModel;
+  modelString: string;
+  messages: ModelMessage[];
+  system: Instructions | undefined;
+  tools?: Record<string, Tool>;
+  providerOptions?: Record<string, unknown>;
+  maxOutputTokens?: number;
+  callSettingsOverrides?: ResolvedCallSettingsOverrides;
+  toolPolicy?: ToolPolicy;
+  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
+  headers?: Record<string, string | undefined>;
+  onChunk?: StreamTextOnChunk;
+  onStepMessages?: (messages: ModelMessage[]) => void;
+  onStepSettled?: OnStepSettled;
+  contextBudgetLimit?: number;
+  toolSearchState?: ToolSearchStreamState;
+  thinkingOverrideState?: ActiveTurnThinkingOverride;
+  rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
+  forcedFirstStepToolNames?: string[];
+  providersConfigSnapshot?: ProvidersConfigMap;
+  rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
+}
+
+export type StreamRequestInput = StreamRequestOptions & {
+  onToolExecutionStart?: (toolCallId: string) => void;
+};
+
+export interface StreamRequestConfig {
+  stopCause?: StreamStopCause;
+  cacheEnabled?: boolean;
+  budgetMetadataModel?: string;
+  model: LanguageModel;
+  modelString: string;
+  messages: ModelMessage[];
+  /** Provider-ready system instructions from TurnContextAssembler. */
+  system?: Instructions;
+  tools?: Record<string, Tool>;
+  providerOptions?: Record<string, unknown>;
+  /** Per-request HTTP headers (e.g., anthropic-beta for 1M context). */
+  headers?: Record<string, string | undefined>;
+  maxOutputTokens?: number;
+  streamCallSettings?: Omit<ResolvedCallSettingsOverrides, "maxOutputTokens">;
+  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
+  /** Optional hook for callers that need chunk-level visibility during streaming. */
+  onChunk?: StreamTextOnChunk;
+  /** Optional hook for callers that need the live prepared step transcript. */
+  onStepMessages?: (messages: ModelMessage[]) => void;
+  onStepSettled?: OnStepSettled;
+  contextBudgetLimit?: number;
+  toolPolicy?: ToolPolicy;
+  /**
+   * Tool-search deferral state. Owned and mutated by
+   * aiService/tool_catalog_search.execute; prepareStep reads it each step to
+   * compute `activeTools`. Absent when the feature is inactive.
+   */
+  toolSearchState?: ToolSearchStreamState;
+  /**
+   * Mid-turn thinking override holder — the SESSION'S object, by reference
+   * (never created inside StreamManager: a locally-created object would be
+   * invisible to AgentSession.setActiveTurnThinkingLevel). prepareStep
+   * consumes `pending` before every model step.
+   */
+  thinkingOverrideState?: ActiveTurnThinkingOverride;
+  /**
+   * Closure built by TurnRequestBuilder that re-runs the effective-level pipeline
+   * (policy clamp + resolveEffectiveThinkingLevel) and rebuilds provider
+   * options for the stream's model. `null` ⇒ not applicable / no-op.
+   */
+  rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
+  /**
+   * Step-0 message rebuild for overrides that raced stream construction; see
+   * RebuildFirstStepForThinkingLevel. Also emits the superseding envelope.
+   */
+  rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
+  /** First step must call one of these tools; later steps restore the full toolset. */
+  forcedFirstStepToolNames?: string[];
+}
 
 /** The step-tracker fields that stage and consume a continuous-compaction prefix swap. */
 export interface PrefixSwapTracker {
@@ -55,6 +159,7 @@ export interface LostResponseIdTurn {
 }
 
 export interface ProviderRequestDeps {
+  readonly getProvidersConfig: () => ProvidersConfigMap | null;
   readonly workspaceLogger: (
     workspaceId: string,
     turn?: Pick<LostResponseIdTurn, "workspaceName">
@@ -184,5 +289,140 @@ export class ProviderRequest {
       ...swap.prefix,
       ...stripMessageCacheControl(unprojectNativeToolReferences(messages.slice(index))),
     ];
+  }
+
+  buildStreamRequestConfig(input: StreamRequestInput): StreamRequestConfig {
+    const {
+      model,
+      modelString,
+      messages,
+      system,
+      tools,
+      providerOptions,
+      maxOutputTokens,
+      callSettingsOverrides,
+      toolPolicy,
+      hasQueuedMessages,
+      getQueuedInputStopCause,
+      headers,
+      onChunk,
+      onStepMessages,
+      onStepSettled,
+      contextBudgetLimit,
+      toolSearchState,
+      onToolExecutionStart,
+      thinkingOverrideState,
+      rebuildProviderOptionsForThinkingLevel,
+      forcedFirstStepToolNames,
+      providersConfigSnapshot,
+      rebuildFirstStepForThinkingLevel,
+    } = input;
+    // The request's pinned providers-config snapshot keeps type-derived output limits
+    // aligned with the config that created the SDK model.
+    const requestProvidersConfig = providersConfigSnapshot ?? this.deps.getProvidersConfig();
+    // Mid-turn thinking overrides mutate providerOptions IN PLACE (the SDK's
+    // per-step deep-merge reads the object passed at streamText() time, so
+    // identity must stay stable). An initially-undefined value would make that
+    // mutation unobservable — normalize to a guaranteed mutable object.
+    const finalProviderOptions =
+      rebuildProviderOptionsForThinkingLevel != null ? (providerOptions ?? {}) : providerOptions;
+
+    // Use the runtime model's max_output_tokens if available and caller didn't
+    // specify. This must be the runtime model (not the mapped metadata model)
+    // because max_output_tokens is a request parameter sent to the provider —
+    // a custom model's provider may not support the mapped model's output cap.
+    // If no metadata exists, omit the parameter to let the provider use its
+    // default (Anthropic requires this but has low defaults).
+    const { maxOutputTokens: configMaxOutputTokens, ...streamCallSettings } =
+      callSettingsOverrides ?? {};
+
+    const runtimeModelStats = getModelStats(modelString);
+    // Fall back to resolved stats for custom aliases (e.g., provider alias mappedToModel).
+    const resolvedModelStats =
+      runtimeModelStats ?? getModelStatsResolved(modelString, requestProvidersConfig);
+    const effectiveMaxOutputTokens =
+      maxOutputTokens ?? configMaxOutputTokens ?? resolvedModelStats?.max_output_tokens;
+
+    return {
+      model,
+      modelString,
+      messages,
+      system,
+      cacheEnabled: supportsAnthropicCache(modelString, requestProvidersConfig),
+      budgetMetadataModel: resolveModelForMetadata(modelString, requestProvidersConfig),
+      // Keep provider-level parallel tool planning enabled, but serialize sibling
+      // execute() handlers inside this stream so shared mutable state cannot race.
+      tools: withSequentialExecution(tools, onToolExecutionStart),
+      providerOptions: finalProviderOptions,
+      headers,
+      maxOutputTokens: effectiveMaxOutputTokens,
+      streamCallSettings:
+        Object.keys(streamCallSettings).length > 0 ? streamCallSettings : undefined,
+      hasQueuedMessages,
+      getQueuedInputStopCause,
+      onChunk,
+      onStepMessages,
+      onStepSettled,
+      contextBudgetLimit,
+      toolPolicy,
+      toolSearchState,
+      thinkingOverrideState,
+      forcedFirstStepToolNames,
+      rebuildProviderOptionsForThinkingLevel,
+      rebuildFirstStepForThinkingLevel,
+    };
+  }
+
+  /**
+   * Consume a pending mid-turn thinking-level override for the next step.
+   *
+   * Consume-once: `pending` is always cleared (a failed/no-op application must
+   * not retry on every subsequent step). On success the CONTENT of
+   * `request.providerOptions` is replaced in place — object identity is
+   * preserved because the SDK's per-step deep-merge reads the reference passed
+   * at streamText() time, and deep-merge alone cannot delete keys (e.g. the
+   * Anthropic `thinking` object when moving to "off").
+   *
+   * Returns the rebuilt options (for the prepareStep return value) or
+   * undefined when there is nothing to apply.
+   */
+  applyPendingThinkingOverride(
+    request: StreamRequestConfig,
+    beforeFirstStep: boolean
+  ): Record<string, unknown> | undefined {
+    const state = request.thinkingOverrideState;
+    const pending = state?.pending;
+    // A stage turn sends its counted payload first (#5286): the change applies after it.
+    if (state == null || pending == null || (beforeFirstStep && state.holdBeforeFirstRequest)) {
+      return undefined;
+    }
+    state.pending = undefined;
+    const rebuild = request.rebuildProviderOptionsForThinkingLevel;
+    if (rebuild == null) {
+      return undefined;
+    }
+    const rebuilt = rebuild(pending, beforeFirstStep);
+    if (rebuilt == null) {
+      log.debug("Mid-turn thinking override skipped (not applicable / no-op)", {
+        requestedLevel: pending,
+        appliedLevel: state.applied,
+      });
+      return undefined;
+    }
+    const target = request.providerOptions;
+    // buildStreamRequestConfig normalizes providerOptions to a stable object
+    // whenever a rebuild closure is present, so target must exist here.
+    assert(target != null, "providerOptions must be normalized when a rebuild closure is present");
+    for (const key of Object.keys(target)) {
+      delete target[key];
+    }
+    Object.assign(target, rebuilt.providerOptions);
+    state.applied = rebuilt.effectiveLevel;
+    state.onApplied?.(rebuilt.effectiveLevel);
+    log.debug("Mid-turn thinking override applied", {
+      requestedLevel: pending,
+      effectiveLevel: rebuilt.effectiveLevel,
+    });
+    return rebuilt.providerOptions;
   }
 }

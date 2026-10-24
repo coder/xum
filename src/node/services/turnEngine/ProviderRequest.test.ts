@@ -1,12 +1,21 @@
 import { describe, expect, test } from "bun:test";
 import { APICallError, type ModelMessage } from "ai";
 
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { getModelStats } from "@/common/utils/tokens/modelStats";
 import type { ContinuousCompactionJournal } from "@/common/orpc/schemas/continuousCompaction";
 import { createMuxMessage } from "@/common/types/message";
 import type { ContinuousPrefixSwap } from "@/node/services/continuousCompactionJournal";
 import { log, type Logger } from "@/node/services/log";
+import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 
-import { ProviderRequest, type PrefixSwapStream } from "./ProviderRequest";
+import {
+  ProviderRequest,
+  type PrefixSwapStream,
+  type StreamRequestConfig,
+  type StreamRequestOptions,
+} from "./ProviderRequest";
 
 const WORKSPACE_ID = "provider-request-ws";
 const MODEL = "anthropic:claude-sonnet-4-5";
@@ -19,7 +28,10 @@ function createProviderRequest(): { request: ProviderRequest; lostLogs: unknown[
       lostLogs.push(args);
     },
   };
-  return { request: new ProviderRequest({ workspaceLogger: () => logger }), lostLogs };
+  return {
+    request: new ProviderRequest({ getProvidersConfig: () => null, workspaceLogger: () => logger }),
+    lostLogs,
+  };
 }
 
 function apiError(statusCode: number, responseBody: string, data?: unknown): APICallError {
@@ -189,5 +201,136 @@ describe("ProviderRequest swapPrefix", () => {
   ])("keeps the full context when the locator is %s", (_label, messages) => {
     const { request } = createProviderRequest();
     expect(request.swapPrefix(messages, swapFixture())).toBeNull();
+  });
+});
+
+/** A provider config that maps the alias ollama:custom to `mappedToModel`. */
+function aliasConfig(mappedToModel: string): ProvidersConfigMap {
+  return {
+    ollama: {
+      apiKeySet: false,
+      isEnabled: true,
+      isConfigured: true,
+      models: [{ id: "custom", mappedToModel }],
+    },
+  };
+}
+
+function requestOptions(overrides: Partial<StreamRequestOptions> = {}): StreamRequestOptions {
+  return {
+    model: KNOWN_MODELS.SONNET.id,
+    modelString: KNOWN_MODELS.SONNET.id,
+    messages: [{ role: "user", content: "hi" }],
+    system: undefined,
+    ...overrides,
+  };
+}
+
+describe("ProviderRequest buildStreamRequestConfig", () => {
+  const sonnetMaxOutput = getModelStats(KNOWN_MODELS.SONNET.id)?.max_output_tokens;
+
+  test("takes the output cap from the caller, then call settings, then model stats", () => {
+    const { request } = createProviderRequest();
+    expect(sonnetMaxOutput).toBeGreaterThan(0);
+    expect(request.buildStreamRequestConfig(requestOptions()).maxOutputTokens).toBe(
+      sonnetMaxOutput
+    );
+    const fromSettings = request.buildStreamRequestConfig(
+      requestOptions({ callSettingsOverrides: { maxOutputTokens: 200, temperature: 0.5 } })
+    );
+    expect(fromSettings.maxOutputTokens).toBe(200);
+    // The cap is its own request field, so the call settings drop it.
+    expect(fromSettings.streamCallSettings).toEqual({ temperature: 0.5 });
+    const fromCaller = request.buildStreamRequestConfig(
+      requestOptions({ maxOutputTokens: 100, callSettingsOverrides: { maxOutputTokens: 200 } })
+    );
+    expect(fromCaller.maxOutputTokens).toBe(100);
+    expect(fromCaller.streamCallSettings).toBeUndefined();
+  });
+
+  test("a pinned providers-config snapshot wins over the live config", () => {
+    const request = new ProviderRequest({
+      getProvidersConfig: () => aliasConfig(KNOWN_MODELS.SONNET.id),
+      workspaceLogger: () => log,
+    });
+    const alias = { model: "ollama:custom", modelString: "ollama:custom" };
+    const live = request.buildStreamRequestConfig(requestOptions(alias));
+    expect(live.budgetMetadataModel).toBe(KNOWN_MODELS.SONNET.id);
+    // An unknown alias takes its output cap from the model it maps to.
+    expect(live.maxOutputTokens).toBe(sonnetMaxOutput);
+    const pinned = request.buildStreamRequestConfig(
+      requestOptions({ ...alias, providersConfigSnapshot: aliasConfig("anthropic:pinned") })
+    );
+    expect(pinned.budgetMetadataModel).toBe("anthropic:pinned");
+  });
+
+  test("gives a rebuildable request a mutable providerOptions object", () => {
+    const { request } = createProviderRequest();
+    expect(request.buildStreamRequestConfig(requestOptions()).providerOptions).toBeUndefined();
+    const rebuildable = request.buildStreamRequestConfig(
+      requestOptions({ rebuildProviderOptionsForThinkingLevel: () => null })
+    );
+    expect(rebuildable.providerOptions).toEqual({});
+  });
+});
+
+describe("ProviderRequest applyPendingThinkingOverride", () => {
+  function overrideRequest(
+    state: ActiveTurnThinkingOverride,
+    rebuild?: StreamRequestConfig["rebuildProviderOptionsForThinkingLevel"]
+  ): StreamRequestConfig {
+    return {
+      model: MODEL,
+      modelString: MODEL,
+      messages: [],
+      providerOptions: { anthropic: { thinking: { type: "enabled" } }, stale: true },
+      thinkingOverrideState: state,
+      rebuildProviderOptionsForThinkingLevel: rebuild,
+    };
+  }
+
+  test("replaces the provider options in place and records the applied level", () => {
+    const { request } = createProviderRequest();
+    const appliedLevels: string[] = [];
+    const state: ActiveTurnThinkingOverride = {
+      pending: "high",
+      onApplied: (level) => appliedLevels.push(level),
+    };
+    const rebuilt = { anthropic: { thinking: { type: "adaptive" } } };
+    const config = overrideRequest(state, () => ({
+      effectiveLevel: "medium",
+      providerOptions: rebuilt,
+    }));
+    const target = config.providerOptions;
+    expect(request.applyPendingThinkingOverride(config, false)).toBe(rebuilt);
+    // Same object: the SDK reads the reference it got at streamText() time.
+    expect(config.providerOptions).toBe(target);
+    expect(config.providerOptions).toEqual(rebuilt);
+    expect(state).toMatchObject({ pending: undefined, applied: "medium" });
+    expect(appliedLevels).toEqual(["medium"]);
+  });
+
+  test("holds the change until after a stage turn's first request", () => {
+    const { request } = createProviderRequest();
+    const state: ActiveTurnThinkingOverride = { pending: "high", holdBeforeFirstRequest: true };
+    const config = overrideRequest(state, () => ({ effectiveLevel: "high", providerOptions: {} }));
+    expect(request.applyPendingThinkingOverride(config, true)).toBeUndefined();
+    expect(state.pending).toBe("high");
+    expect(request.applyPendingThinkingOverride(config, false)).toEqual({});
+    expect(state.pending).toBeUndefined();
+  });
+
+  test.each([
+    ["no rebuild closure", undefined],
+    ["a no-op rebuild", () => null],
+  ])("drops the pending level once for %s", (_label, rebuild) => {
+    const { request } = createProviderRequest();
+    const state: ActiveTurnThinkingOverride = { pending: "high" };
+    const config = overrideRequest(state, rebuild);
+    const before = structuredClone(config.providerOptions);
+    expect(request.applyPendingThinkingOverride(config, false)).toBeUndefined();
+    expect(state.pending).toBeUndefined();
+    expect(state.applied).toBeUndefined();
+    expect(config.providerOptions).toEqual(before);
   });
 });
