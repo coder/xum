@@ -29,3 +29,28 @@ function getServerSnapshot(): boolean {
 export function useNarrowViewport(): boolean {
   return useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
 }
+
+let narrowSession = 0;
+let wasNarrow = false;
+
+// Counts on each read that finds the viewport narrow after a wide one. Reads without a change
+// return the same number, as useSyncExternalStore requires.
+function getNarrowSessionSnapshot(): number {
+  const narrow = getSnapshot();
+  if (narrow && !wasNarrow) narrowSession++;
+  wasNarrow = narrow;
+  return narrow ? narrowSession : 0;
+}
+
+function getServerNarrowSessionSnapshot(): number {
+  return 0;
+}
+
+/**
+ * 0 while the viewport is wide; at narrow widths a number that is new each time the viewport turns
+ * narrow, so state keyed by it resets on every return to narrow without a render-phase update or
+ * an effect.
+ */
+export function useNarrowViewportSession(): number {
+  return useSyncExternalStore(subscribe, getNarrowSessionSnapshot, getServerNarrowSessionSnapshot);
+}
