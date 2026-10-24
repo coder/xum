@@ -2131,6 +2131,34 @@ describe("Claude Code plugin discovery", () => {
       ["c", "from-claude", true],
     ]);
   });
+
+  test("a root plugin.json without $schema yields to a Codex or Claude manifest", async () => {
+    // DietrichGebert/ponytail ships `{"name":"ponytail"}` at the root for another harness, next
+    // to its .codex-plugin and .claude-plugin manifests.
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const claude = claudeManifest({ name: "from-claude" });
+    const codex = { ".codex-plugin/plugin.json": JSON.stringify({ name: "from-codex" }) };
+    const foreignRoot = { "plugin.json": JSON.stringify({ name: "from-root" }) };
+    await writeTree(path.join(container, "a"), { ...claude, ...codex, ...foreignRoot });
+    await writeTree(path.join(container, "b"), { ...claude, ...foreignRoot });
+    // Alone, the root manifest is still reported, so an author who forgot $schema learns why.
+    await writeTree(path.join(container, "c"), foreignRoot);
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins.map((p) => [p.dirName, p.name, p.claudeFallback === true])).toEqual([
+      ["a", "from-codex", false],
+      ["b", "from-claude", true],
+    ]);
+    expect(result.diagnostics).toEqual([
+      expect.objectContaining({
+        path: path.join(container, "c", "plugin.json"),
+        severity: "error",
+        message: "Invalid plugin manifest: '$schema' is required and must be a string",
+      }),
+    ]);
+  });
 });
 
 describe("generatedFrom marker (skills-only packages)", () => {

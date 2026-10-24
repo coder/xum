@@ -1049,6 +1049,37 @@ async function resolveXumComponents(args: {
   return resolved;
 }
 
+/**
+ * Pick the manifest of a plugin folder. Root plugin.json wins, then the Codex and the Claude Code
+ * manifests. Each one goes through the same caps and containment. Null when none exists.
+ *
+ * A root plugin.json with no `$schema` is not an Agent Plugins manifest: other harnesses use the
+ * same file name (DietrichGebert/ponytail ships `{"name":"ponytail"}` next to its Codex and Claude
+ * manifests). It yields to a later candidate, and is returned (so validation reports it) only
+ * when no other manifest exists. The fallback gets the narrower Codex or Claude component set.
+ */
+async function selectManifest(
+  rootReal: string
+): Promise<{ relative: string; raw: unknown } | { relative: string; error: string } | null> {
+  let schemaLessRoot: { relative: string; raw: unknown } | null = null;
+  for (const relative of [
+    PLUGIN_MANIFEST_RELATIVE_PATH,
+    CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+    CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
+  ]) {
+    const read = await readManifestCandidate(rootReal, relative);
+    if (read.status === "missing") continue;
+    if (read.status === "invalid") return { relative, error: read.message };
+    const schemaLess = isPlainObject(read.raw) && read.raw.$schema === undefined;
+    if (relative === PLUGIN_MANIFEST_RELATIVE_PATH && schemaLess) {
+      schemaLessRoot = { relative, raw: read.raw };
+      continue;
+    }
+    return { relative, raw: read.raw };
+  }
+  return schemaLessRoot;
+}
+
 async function discoverPluginAt(args: {
   pluginDir: string;
   containerPath: string;
@@ -1072,33 +1103,18 @@ async function discoverPluginAt(args: {
     return null;
   }
 
-  // Root plugin.json wins, then the Codex and the Claude Code manifests. Each one goes through
-  // the same caps and containment.
-  let manifestRelative = PLUGIN_MANIFEST_RELATIVE_PATH;
-  let manifestPath = path.join(rootReal, manifestRelative);
-  let rawManifest: unknown;
-  let found = false;
-  for (const candidate of [
-    PLUGIN_MANIFEST_RELATIVE_PATH,
-    CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
-    CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
-  ]) {
-    manifestRelative = candidate;
-    manifestPath = path.join(rootReal, candidate);
-    const read = await readManifestCandidate(rootReal, candidate);
-    if (read.status === "missing") continue;
-    if (read.status === "invalid") {
-      pushError(manifestPath, read.message);
-      return null;
-    }
-    rawManifest = read.raw;
-    found = true;
-    break;
-  }
-  if (!found) {
+  const selected = await selectManifest(rootReal);
+  if (selected === null) {
     // No manifest → not a plugin (silent skip, e.g. Codex marketplace.json entries).
     return null;
   }
+  const manifestRelative = selected.relative;
+  const manifestPath = path.join(rootReal, manifestRelative);
+  if ("error" in selected) {
+    pushError(manifestPath, selected.error);
+    return null;
+  }
+  const rawManifest = selected.raw;
 
   const codexFallback = manifestRelative === CODEX_PLUGIN_MANIFEST_RELATIVE_PATH;
   const claudeFallback = manifestRelative === CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH;
