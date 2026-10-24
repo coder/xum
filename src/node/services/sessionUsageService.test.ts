@@ -1178,13 +1178,13 @@ describe("SessionUsageService on the HistoryService's SessionFiles", () => {
       expect(recorded).toBeDefined();
 
       const names = await memory.files.promises.readdir(sessionDir);
-      expect(names).toEqual(
-        expect.arrayContaining([
-          "session-usage.json",
-          "session-usage.in-flight",
-          HEADLESS_USAGE_FILE_NAME,
-        ])
-      );
+      for (const name of [
+        "session-usage.json",
+        "session-usage.in-flight",
+        HEADLESS_USAGE_FILE_NAME,
+      ]) {
+        expect(names).toContain(name);
+      }
       expect(
         await memory.files.promises.readdir(path.join(sessionDir, "session-usage.in-flight"))
       ).toEqual(["key-a.json"]);
