@@ -109,7 +109,6 @@ import {
   normalizeUsage,
   withCacheWriteMetadata,
   withLongContextTokens,
-  type AiSdkUsageLike,
 } from "@/common/utils/tokens/usageHelpers";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -135,7 +134,6 @@ import type { SessionUsageService } from "./sessionUsageService";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
 import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
-import { countAnthropicInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
 import { stripAnthropicReasoning } from "@/browser/utils/messages/modelMessageTransform";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
@@ -249,6 +247,19 @@ interface ToolCallState {
 }
 
 type ToolCallMap = Map<string, ToolCallState>;
+
+function recordTerminalFinish(
+  streamInfo: WorkspaceStreamInfo,
+  intent: Extract<FoldIntent, { _tag: "RecordTerminalFinish" }>
+): void {
+  streamInfo.receivedTerminalEvent = true;
+  if (intent.finishReason !== undefined) {
+    streamInfo.terminalFinishReason = intent.finishReason;
+  }
+  if (intent.rawFinishReason !== undefined) {
+    streamInfo.terminalRawFinishReason = intent.rawFinishReason;
+  }
+}
 
 /** Stream-loop state of one processStreamWithCleanup turn that applyStep reads and updates. */
 interface PartLoopState {
@@ -2273,6 +2284,7 @@ export class StreamManager {
       parts: streamInfo.parts,
       currentReasoningBlock: streamInfo.currentReasoningBlock,
       lastPartTimestamp: streamInfo.lastPartTimestamp,
+      model: streamInfo.model,
       anthropicMessagesWire: isAnthropicMessagesModel(streamInfo.request.model),
       toolCalls: loop.toolCalls,
     };
@@ -2390,8 +2402,19 @@ export class StreamManager {
     loop: PartLoopState
   ): Promise<unknown> | undefined {
     switch (intent._tag) {
+      case "RecordTerminalFinish":
+        recordTerminalFinish(streamInfo, intent);
+        return undefined;
+      case "RecordStepUsage":
+        this.recordStepUsage(workspaceId, streamInfo, intent.usage, intent.providerMetadata);
+        return undefined;
+      case "RecordInFlightUsage":
+        return this.recordInFlightSessionUsage(workspaceId, streamInfo);
       case "FlushPartialWrite":
         return this.flushPartialWrite(workspaceId, streamInfo);
+      case "Fail":
+        // Capture the error and immediately throw to trigger error handling
+        throw intent.error;
       default:
         this.applyLogIntent(streamInfo, intent, loop);
         return undefined;
@@ -2404,6 +2427,9 @@ export class StreamManager {
     loop: PartLoopState
   ): void {
     switch (intent._tag) {
+      case "Log":
+        loop.workspaceLog[intent.level](intent.message, intent.fields);
+        return;
       case "LogToolCall": {
         const inputText = JSON.stringify(intent.input);
         log.debug(
@@ -2450,6 +2476,49 @@ export class StreamManager {
     if (intent.trackInBlock && streamInfo.currentReasoningBlock) {
       streamInfo.currentReasoningBlock.lastPart = intent.part;
     }
+  }
+
+  /** Adds one finish-step's usage to the stream totals, then emits usage-delta. */
+  private recordStepUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    stepUsage: LanguageModelV2Usage,
+    stepProviderMetadata: Record<string, unknown> | undefined
+  ): void {
+    // Update cumulative totals for this stream.
+    //
+    // Effect migration Phase 10: usage accounting stays in plain
+    // mutables on streamInfo by the plain-mutables rule — the only
+    // mutators are this AI-SDK fullStream loop and plain
+    // retry/reset methods, never fibers. The emit below runs with
+    // zero suspension after the mutation (emitTurnEvent invokes
+    // the sink synchronously), so downstream Effect queue bridges
+    // (SubscriptionEmit's offerUnsafe) observe usage-delta events
+    // in mutation order.
+    streamInfo.cumulativeUsage = addUsage(streamInfo.cumulativeUsage, stepUsage);
+    streamInfo.cumulativeProviderMetadata = accumulateProviderMetadata(
+      streamInfo.cumulativeProviderMetadata,
+      withLongContextTokens(stepProviderMetadata, stepUsage, streamInfo.metadataModel)
+    );
+
+    // Track last step's data for context window display
+    streamInfo.lastStepUsage = stepUsage;
+    streamInfo.lastStepProviderMetadata = stepProviderMetadata;
+
+    const usageEvent = buildUsageDeltaEvent({
+      workspaceId: workspaceId as string,
+      messageId: streamInfo.messageId,
+      // Step-level (for context window display)
+      usage: stepUsage,
+      providerMetadata: stepProviderMetadata,
+      // Cumulative (for live cost display)
+      cumulativeUsage: streamInfo.cumulativeUsage,
+      cumulativeProviderMetadata: streamInfo.cumulativeProviderMetadata,
+      // Preserve costs-included zero-cost behavior throughout the stream.
+      costsIncluded: streamInfo.initialMetadata?.costsIncluded,
+    });
+    streamInfo.currentStepStartIndex = streamInfo.parts.length;
+    this.emitTurnEvent(usageEvent);
   }
 
   private updateReasoningPart(
@@ -5263,207 +5332,12 @@ export class StreamManager {
             //   preview: "text" in part ? (part as StreamPartWithText).text?.substring(0, 50) : undefined,
             // });
 
-            switch (part.type) {
-              // Handle error parts from the stream (e.g., OpenAI context_length_exceeded)
-              case "error": {
-                // Capture the error and immediately throw to trigger error handling
-                // Error parts are structured errors from the AI SDK
-                const errorPart = part as { error: unknown };
-
-                // Try to extract error message from various possible structures
-                let errorMessage: string | undefined;
-
-                if (errorPart.error instanceof Error) {
-                  throw errorPart.error;
-                } else if (typeof errorPart.error === "object" && errorPart.error !== null) {
-                  const errorObj = errorPart.error as Record<string, unknown>;
-
-                  // Check for nested error object with message (OpenAI format)
-                  if (
-                    errorObj.error &&
-                    typeof errorObj.error === "object" &&
-                    errorObj.error !== null
-                  ) {
-                    const nestedError = errorObj.error as Record<string, unknown>;
-                    if (typeof nestedError.message === "string") {
-                      errorMessage = nestedError.message;
-                    }
-                  }
-
-                  // Fallback to direct message property
-                  errorMessage ??=
-                    typeof errorObj.message === "string" ? errorObj.message : undefined;
-
-                  // Last resort: stringify the error. getErrorMessage guards
-                  // against cyclic/BigInt payloads and undefined-returning
-                  // toJSON, where a bare JSON.stringify would throw and
-                  // replace the provider error with a serialization TypeError.
-                  errorMessage ??= getErrorMessage(errorObj);
-
-                  const error = new Error(errorMessage);
-                  // Preserve original error as cause for debugging
-                  Object.assign(error, { cause: errorObj });
-                  throw error;
-                } else {
-                  throw new Error(String(errorPart.error));
-                }
-              }
-
-              // Handle other event types as needed
-              case "start":
-              case "text-start":
-                // These events can be logged or handled if needed
-                break;
-
-              case "finish": {
-                const finishPart = part as {
-                  finishReason?: unknown;
-                  rawFinishReason?: unknown;
-                };
-                // Skip the `ai` package's synthesized-default finish part.
-                //
-                // `streamText`'s internal `runStep` initializes
-                // `stepFinishReason = "other"` and `stepRawFinishReason = undefined`,
-                // and unconditionally emits those values from its flush() at
-                // end-of-stream — even when the underlying SSE stream closed
-                // before any terminal event arrived. The OpenAI Responses,
-                // Chat Completions, and Anthropic Messages adapters all
-                // exhibit this in practice: a clean upstream EOF (no
-                // `response.completed`, no `message_stop`, no
-                // `finish_reason` delta) ends up as a synthesized
-                // `(other, undefined)` finish here.
-                //
-                // The discriminator is narrow on purpose. Every real OpenAI
-                // and Anthropic finish path that maps to `"other"` pairs it
-                // with a defined raw reason (e.g. Anthropic's `"compaction"`).
-                // The `(other, undefined)` shape is unreachable from the
-                // adapters' own finish-reason mappers and is therefore a
-                // reliable signal that the finish was synthesized.
-                //
-                // Treating it as a non-event lets the existing
-                // `!receivedTerminalEvent` branch below fire
-                // `handleTruncatedStreamCompletion`, which surfaces a
-                // retryable `stream_truncated` error instead of silently
-                // committing partial output as a normal assistant message.
-                if (
-                  finishPart.finishReason === "other" &&
-                  finishPart.rawFinishReason === undefined
-                ) {
-                  // Observability for the unaudited-adapter risk: if a future
-                  // provider adapter we haven't read source for legitimately
-                  // emits `(other, undefined)` as a real terminal finish, the
-                  // discriminator misfires and the user sees a spurious
-                  // truncated-stream retry. Surface a log so that misfires
-                  // are diagnosable instead of silent.
-                  workspaceLog.warn(
-                    "Treating synthesized-default (other, undefined) finish as truncated stream",
-                    {
-                      messageId: streamInfo.messageId,
-                      model: streamInfo.model,
-                    }
-                  );
-                  break;
-                }
-                streamInfo.receivedTerminalEvent = true;
-                if (typeof finishPart.finishReason === "string") {
-                  streamInfo.terminalFinishReason = finishPart.finishReason;
-                }
-                if (typeof finishPart.rawFinishReason === "string") {
-                  streamInfo.terminalRawFinishReason = finishPart.rawFinishReason;
-                }
-                break;
-              }
-
-              case "finish-step": {
-                // Emit usage-delta event with usage from this step
-                const finishStepPart = part as {
-                  type: "finish-step";
-                  usage: AiSdkUsageLike;
-                  providerMetadata?: Record<string, unknown>;
-                };
-
-                // Normalize AI SDK 7 nested usage into mux's persisted flat shape,
-                // re-injecting Anthropic cache-write tokens into provider metadata.
-                const stepUsage = normalizeUsage(finishStepPart.usage);
-                const stepProviderMetadata = withCacheWriteMetadata(
-                  finishStepPart.providerMetadata,
-                  finishStepPart.usage
-                );
-
-                // Preserved thinking: report thinking blocks Anthropic dropped for this
-                // step. A prefix-binding drop means Xum edited the prompt prefix, which is
-                // worth seeing at info; model/account drops and older-account
-                // "mismatch allowed" flags are expected noise.
-                const inputTransformations =
-                  countAnthropicInputTransformations(stepProviderMetadata);
-                if (inputTransformations != null) {
-                  const fields = {
-                    messageId: streamInfo.messageId,
-                    model: streamInfo.model,
-                    ...inputTransformations,
-                  };
-                  const message = "Anthropic dropped or flagged replayed thinking blocks";
-                  if (inputTransformations.dropped.prefix_binding_mismatch > 0) {
-                    workspaceLog.info(message, fields);
-                  } else {
-                    workspaceLog.debug(message, fields);
-                  }
-                }
-
-                // Update cumulative totals for this stream.
-                //
-                // Effect migration Phase 10: usage accounting stays in plain
-                // mutables on streamInfo by the plain-mutables rule — the only
-                // mutators are this AI-SDK fullStream loop and plain
-                // retry/reset methods, never fibers. The emit below runs with
-                // zero suspension after the mutation (emitTurnEvent invokes
-                // the sink synchronously), so downstream Effect queue bridges
-                // (SubscriptionEmit's offerUnsafe) observe usage-delta events
-                // in mutation order.
-                streamInfo.cumulativeUsage = addUsage(streamInfo.cumulativeUsage, stepUsage);
-                streamInfo.cumulativeProviderMetadata = accumulateProviderMetadata(
-                  streamInfo.cumulativeProviderMetadata,
-                  withLongContextTokens(stepProviderMetadata, stepUsage, streamInfo.metadataModel)
-                );
-
-                // Track last step's data for context window display
-                streamInfo.lastStepUsage = stepUsage;
-                streamInfo.lastStepProviderMetadata = stepProviderMetadata;
-
-                const usageEvent = buildUsageDeltaEvent({
-                  workspaceId: workspaceId as string,
-                  messageId: streamInfo.messageId,
-                  // Step-level (for context window display)
-                  usage: stepUsage,
-                  providerMetadata: stepProviderMetadata,
-                  // Cumulative (for live cost display)
-                  cumulativeUsage: streamInfo.cumulativeUsage,
-                  cumulativeProviderMetadata: streamInfo.cumulativeProviderMetadata,
-                  // Preserve costs-included zero-cost behavior throughout the stream.
-                  costsIncluded: streamInfo.initialMetadata?.costsIncluded,
-                });
-                streamInfo.currentStepStartIndex = streamInfo.parts.length;
-                this.emitTurnEvent(usageEvent);
-                await this.recordInFlightSessionUsage(workspaceId, streamInfo);
-                await this.checkSoftCancelStream(workspaceId, streamInfo);
-                break;
-              }
-
-              case "text-end": {
-                await this.checkSoftCancelStream(workspaceId, streamInfo);
-                break;
-              }
-
-              default: {
-                const step = partFold(
-                  this.foldView(workspaceId, streamInfo, loop),
-                  part as FoldablePart,
-                  nodeClock.nowMs()
-                );
-                await this.applyStep(workspaceId, streamInfo, step, loop);
-                break;
-              }
-            }
+            const step = partFold(
+              this.foldView(workspaceId, streamInfo, loop),
+              part as FoldablePart,
+              nodeClock.nowMs()
+            );
+            await this.applyStep(workspaceId, streamInfo, step, loop);
           }
 
           // No need to save remaining text - text-delta handler already maintains parts array
