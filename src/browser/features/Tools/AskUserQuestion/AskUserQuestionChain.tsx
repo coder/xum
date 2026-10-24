@@ -139,8 +139,26 @@ interface QuestionEntryKey {
 /** The active tab: a question of one row, or the Summary. Null while no question set is open. */
 type ActiveEntryKey = QuestionEntryKey | "summary" | null;
 
+/** A stored tab, with the rows that were open when it was stored. */
+interface StoredActiveEntry {
+  key: QuestionEntryKey | "summary";
+  rowIds: readonly string[];
+}
+
 // Per workspace, so the active tab survives a workspace switch (the dock remounts per workspace).
-const activeEntryByWorkspace = new Map<string, ActiveEntryKey>();
+const activeEntryByWorkspace = new Map<string, StoredActiveEntry>();
+
+/**
+ * The stored tab, while a row it was stored with is still open. If they all closed during the
+ * workspace switch, the chain starts afresh, as a mounted chain does once every set closed.
+ */
+function getStoredEntryKey(workspaceId: string, groups: readonly ChainGroup[]): ActiveEntryKey {
+  const stored = activeEntryByWorkspace.get(workspaceId);
+  if (stored === undefined || !groups.some((group) => stored.rowIds.includes(group.key))) {
+    return null;
+  }
+  return stored.key;
+}
 
 function isQuestionOf(key: QuestionEntryKey, group: ChainGroup): boolean {
   return key.rowId === group.key && key.questionIndex < group.questions.length;
@@ -211,8 +229,8 @@ function getStartKey(groups: readonly ChainGroup[]): ActiveEntryKey {
  * picks the tab.
  */
 function useChainActiveIndex(workspaceId: string, groups: readonly ChainGroup[]) {
-  const [activeKey, setActiveKey] = useState<ActiveEntryKey>(
-    () => activeEntryByWorkspace.get(workspaceId) ?? null
+  const [activeKey, setActiveKey] = useState<ActiveEntryKey>(() =>
+    getStoredEntryKey(workspaceId, groups)
   );
   if (!isValidEntryKey(activeKey, groups)) {
     // Adjust state during render (no effect). It settles in one pass: getStartKey's key is valid,
@@ -220,13 +238,17 @@ function useChainActiveIndex(workspaceId: string, groups: readonly ChainGroup[])
     setActiveKey(getStartKey(groups));
   }
 
+  // No deps: the stored rows must follow every render's open rows, not only tab changes.
   useEffect(() => {
     if (activeKey === null) {
       activeEntryByWorkspace.delete(workspaceId);
     } else {
-      activeEntryByWorkspace.set(workspaceId, activeKey);
+      activeEntryByWorkspace.set(workspaceId, {
+        key: activeKey,
+        rowIds: groups.map((group) => group.key),
+      });
     }
-  }, [workspaceId, activeKey]);
+  });
 
   return {
     activeIndex: resolveActiveIndex(activeKey, groups),

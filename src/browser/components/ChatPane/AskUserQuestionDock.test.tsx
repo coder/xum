@@ -436,4 +436,18 @@ describe("AskUserQuestionDock", () => {
     expect(view.getByText(PLATFORMS.question)).toBeTruthy();
     expect(view.queryByText(REGION.question)).toBeNull();
   });
+
+  test("a Summary left before a workspace switch does not open a set that arrived meanwhile", () => {
+    messages = [ROW_A];
+    const first = render(dock(workspaceId), { wrapper: Wrapper });
+    fireEvent.click(first.getByRole("button", { name: "Summary" }));
+    first.unmount();
+
+    // While away: another client answered ask-a, and ask-b arrived. Live, the form would have
+    // reset when ask-a closed, so ask-b would open on its question.
+    messages = [ROW_A, ANSWER_A, ROW_B];
+    const second = render(dock(workspaceId), { wrapper: Wrapper });
+    expect(second.getByText(PLATFORMS.question)).toBeTruthy();
+    expect(second.queryByRole("button", { name: "Submit answers" })).toBeNull();
+  });
 });
