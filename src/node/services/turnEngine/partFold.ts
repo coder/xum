@@ -20,9 +20,16 @@ import type {
 import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
+  normalizeUsage,
+  withCacheWriteMetadata,
+  type AiSdkUsageLike,
+} from "@/common/utils/tokens/usageHelpers";
+import {
   readModelOnlyToolNotifications,
   stripInternalToolResultFields,
 } from "@/common/utils/tools/internalToolResultFields";
+import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+import { countAnthropicInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
 import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
 import {
   findFirstReasoningPartIndexInTrailingRun,
@@ -66,6 +73,8 @@ export interface FoldView {
   readonly parts: readonly CompletedMessagePart[];
   readonly currentReasoningBlock: { readonly lastPart?: CompletedMessagePart } | undefined;
   readonly lastPartTimestamp: number;
+  /** For log fields. */
+  readonly model: string;
   /** The request runs on the Anthropic Messages wire (server-tool IDs are tracked). */
   readonly anthropicMessagesWire: boolean;
   /** Tool calls of the current attempt, by toolCallId. */
@@ -130,6 +139,25 @@ export type FoldIntent =
       output: unknown;
       providerExecuted: boolean | undefined;
       modelOnlyNotifications: string[] | undefined;
+    }
+  /** Mark the terminal finish event; each reason is set only when the part had a string. */
+  | { _tag: "RecordTerminalFinish"; finishReason?: string; rawFinishReason?: string }
+  /** Add the step usage to the stream totals and emit usage-delta with no await between. */
+  | {
+      _tag: "RecordStepUsage";
+      usage: LanguageModelV2Usage;
+      providerMetadata: Record<string, unknown> | undefined;
+    }
+  /** Await recordInFlightSessionUsage. */
+  | { _tag: "RecordInFlightUsage" }
+  /** Throw this error from the stream loop (an `error` part), as the inline case did. */
+  | { _tag: "Fail"; error: Error }
+  /** Workspace-logger line. */
+  | {
+      _tag: "Log";
+      level: "debug" | "info" | "warn";
+      message: string;
+      fields: Record<string, unknown>;
     }
   /** Debug-log the call with its JSON input length (JSON.stringify can throw, so the caller runs it). */
   | { _tag: "LogToolCall"; toolName: string; input: unknown }
@@ -206,6 +234,25 @@ function foldToolPart(view: FoldView, part: FoldablePart, cursor: StampCursor): 
     // These are emitted when tool execution fails (e.g., tool doesn't exist)
     case "tool-error":
       return foldToolError(part as FoldablePart & ToolPart & { error: unknown });
+    default:
+      return foldTurnPart(view, part);
+  }
+}
+
+function foldTurnPart(view: FoldView, part: FoldablePart): FoldIntent[] {
+  switch (part.type) {
+    // Handle error parts from the stream (e.g., OpenAI context_length_exceeded)
+    case "error":
+      return [{ _tag: "Fail", error: streamPartError(part.error) }];
+    case "start":
+    case "text-start":
+      return [];
+    case "finish":
+      return foldFinish(view, part);
+    case "finish-step":
+      return foldFinishStep(view, part as FoldablePart & FinishStepPart);
+    case "text-end":
+      return [{ _tag: "CheckSoftCancel" }];
     default:
       return [{ _tag: "EmitToolCallDelta", part }];
   }
@@ -495,4 +542,119 @@ function foldToolError(part: ToolPart & { error: unknown }): FoldIntent[] {
       modelOnlyNotifications: undefined,
     },
   ];
+}
+
+/**
+ * The Error an `error` part fails the stream with. Error parts are structured
+ * errors from the AI SDK; an Error instance is rethrown as-is.
+ */
+function streamPartError(error: unknown): Error {
+  if (error instanceof Error) {
+    return error;
+  }
+  if (typeof error !== "object" || error === null) {
+    return new Error(String(error));
+  }
+  const errorObj = error as Record<string, unknown>;
+  // Nested error object with message (OpenAI format), then a direct message.
+  // Last resort: stringify the error. getErrorMessage guards against
+  // cyclic/BigInt payloads and undefined-returning toJSON, where a bare
+  // JSON.stringify would throw and replace the provider error with a
+  // serialization TypeError.
+  const nested = errorObj.error;
+  const nestedMessage =
+    typeof nested === "object" && nested !== null
+      ? (nested as Record<string, unknown>).message
+      : undefined;
+  const errorMessage =
+    typeof nestedMessage === "string"
+      ? nestedMessage
+      : typeof errorObj.message === "string"
+        ? errorObj.message
+        : getErrorMessage(errorObj);
+  // Preserve original error as cause for debugging
+  return Object.assign(new Error(errorMessage), { cause: errorObj });
+}
+
+function foldFinish(view: FoldView, part: FoldablePart): FoldIntent[] {
+  // Skip the `ai` package's synthesized-default finish part.
+  //
+  // `streamText`'s internal `runStep` initializes
+  // `stepFinishReason = "other"` and `stepRawFinishReason = undefined`,
+  // and unconditionally emits those values from its flush() at
+  // end-of-stream — even when the underlying SSE stream closed
+  // before any terminal event arrived. The OpenAI Responses,
+  // Chat Completions, and Anthropic Messages adapters all
+  // exhibit this in practice: a clean upstream EOF (no
+  // `response.completed`, no `message_stop`, no
+  // `finish_reason` delta) ends up as a synthesized
+  // `(other, undefined)` finish here.
+  //
+  // The discriminator is narrow on purpose. Every real OpenAI
+  // and Anthropic finish path that maps to `"other"` pairs it
+  // with a defined raw reason (e.g. Anthropic's `"compaction"`).
+  // The `(other, undefined)` shape is unreachable from the
+  // adapters' own finish-reason mappers and is therefore a
+  // reliable signal that the finish was synthesized.
+  //
+  // Treating it as a non-event lets the `!receivedTerminalEvent`
+  // branch after the stream loop fire
+  // `handleTruncatedStreamCompletion`, which surfaces a
+  // retryable `stream_truncated` error instead of silently
+  // committing partial output as a normal assistant message.
+  if (part.finishReason === "other" && part.rawFinishReason === undefined) {
+    // Observability for the unaudited-adapter risk: if a future
+    // provider adapter we haven't read source for legitimately
+    // emits `(other, undefined)` as a real terminal finish, the
+    // discriminator misfires and the user sees a spurious
+    // truncated-stream retry. Surface a log so that misfires
+    // are diagnosable instead of silent.
+    return [
+      {
+        _tag: "Log",
+        level: "warn",
+        message: "Treating synthesized-default (other, undefined) finish as truncated stream",
+        fields: { messageId: view.messageId, model: view.model },
+      },
+    ];
+  }
+  const finish: Extract<FoldIntent, { _tag: "RecordTerminalFinish" }> = {
+    _tag: "RecordTerminalFinish",
+  };
+  if (typeof part.finishReason === "string") finish.finishReason = part.finishReason;
+  if (typeof part.rawFinishReason === "string") finish.rawFinishReason = part.rawFinishReason;
+  return [finish];
+}
+
+interface FinishStepPart {
+  usage: AiSdkUsageLike;
+  providerMetadata?: Record<string, unknown>;
+}
+
+function foldFinishStep(view: FoldView, part: FinishStepPart): FoldIntent[] {
+  // Normalize AI SDK 7 nested usage into mux's persisted flat shape,
+  // re-injecting Anthropic cache-write tokens into provider metadata.
+  const usage = normalizeUsage(part.usage);
+  const providerMetadata = withCacheWriteMetadata(part.providerMetadata, part.usage);
+  const intents: FoldIntent[] = [];
+
+  // Preserved thinking: report thinking blocks Anthropic dropped for this
+  // step. A prefix-binding drop means Xum edited the prompt prefix, which is
+  // worth seeing at info; model/account drops and older-account
+  // "mismatch allowed" flags are expected noise.
+  const inputTransformations = countAnthropicInputTransformations(providerMetadata);
+  if (inputTransformations != null) {
+    intents.push({
+      _tag: "Log",
+      level: inputTransformations.dropped.prefix_binding_mismatch > 0 ? "info" : "debug",
+      message: "Anthropic dropped or flagged replayed thinking blocks",
+      fields: { messageId: view.messageId, model: view.model, ...inputTransformations },
+    });
+  }
+  intents.push(
+    { _tag: "RecordStepUsage", usage, providerMetadata },
+    { _tag: "RecordInFlightUsage" },
+    { _tag: "CheckSoftCancel" }
+  );
+  return intents;
 }
