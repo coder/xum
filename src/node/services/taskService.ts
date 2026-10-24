@@ -5212,7 +5212,7 @@ export class TaskService implements AgentTaskIntegration {
         (this.parkedPeerSendsByTarget.get(targetId)?.length ?? 0),
     });
     this.terminalAttentionStore = terminalAttentionStore ?? new TerminalAttentionStore(config);
-    this.gitPatchArtifactService = new GitPatchArtifactService(config);
+    this.gitPatchArtifactService = new GitPatchArtifactService(config, historyService.locks);
 
     this.aiService.on("stream-end", (payload: unknown) => {
       if (!isStreamEndEvent(payload)) return;
@@ -19917,6 +19917,7 @@ export class TaskService implements AgentTaskIntegration {
       for (const ancestorWorkspaceId of ancestorWorkspaceIds) {
         try {
           await upsertSubagentFailureArtifact({
+            locks: this.historyService.locks,
             workspaceId: ancestorWorkspaceId,
             workspaceSessionDir: path.join(this.config.sessionsDir, ancestorWorkspaceId),
             childTaskId: workspaceId,
@@ -21400,6 +21401,7 @@ export class TaskService implements AgentTaskIntegration {
       try {
         const ancestorSessionDir = path.join(this.config.sessionsDir, ancestorWorkspaceId);
         await upsertSubagentReportArtifact({
+          locks: this.historyService.locks,
           workspaceId: ancestorWorkspaceId,
           workspaceSessionDir: ancestorSessionDir,
           childTaskId: childWorkspaceId,

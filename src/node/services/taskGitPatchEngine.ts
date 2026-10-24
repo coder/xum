@@ -30,6 +30,7 @@ import { log } from "@/node/services/log";
 import { Config } from "@/node/config";
 import { coerceNonEmptyString, findWorkspaceEntry } from "@/node/services/taskUtils";
 import { getWorkspaceProjectRepos } from "@/node/services/workspaceProjectRepos";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 import { streamToString } from "@/node/runtime/streamUtils";
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
@@ -39,7 +40,13 @@ export type TaskApplyGitPatchResult = z.infer<typeof TaskApplyGitPatchToolResult
 
 export type TaskGitPatchApplyConfig = Pick<
   ToolConfiguration,
-  "workspaceId" | "cwd" | "runtime" | "runtimeTempDir" | "workspaceSessionDir" | "trusted"
+  | "workspaceId"
+  | "cwd"
+  | "runtime"
+  | "runtimeTempDir"
+  | "workspaceSessionDir"
+  | "trusted"
+  | "sessionLocks"
 >;
 
 export interface GitPatchArtifactLookup {
@@ -1248,6 +1255,8 @@ async function applyProjectPatch(params: {
   expectedHeadSha?: string;
   isReplay: boolean;
   abortSignal?: AbortSignal;
+  /** The artifact workspace's FIFO for the applied watermark write. Absent: the Node layer. */
+  locks?: SessionLocks;
 }): Promise<{ success: boolean; projectResult: TaskApplyGitPatchProjectResult }> {
   const taskIdError = validatePatchRuntimePathComponent(params.taskId, "task_id");
   const storageKeyError = validatePatchRuntimePathComponent(
@@ -1668,6 +1677,7 @@ async function applyProjectPatch(params: {
         childTaskId: params.taskId,
         projectPath: params.projectArtifact.projectPath,
         appliedAtMs: Date.now(),
+        locks: params.locks,
       });
     }
 
@@ -1988,6 +1998,7 @@ async function applyPatch(
       expectedHeadSha,
       isReplay,
       abortSignal: options.abortSignal,
+      locks: config.sessionLocks,
     });
     projectResults.push(applyResult.projectResult);
     if (!applyResult.success) {

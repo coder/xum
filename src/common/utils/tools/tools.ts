@@ -155,7 +155,7 @@ export interface ToolConfiguration {
   runtime: Runtime;
   /** OS notifications for the notify tool. Absent: the Node layer (configs that tests build by hand). */
   desktopNotifications?: DesktopNotifications;
-  /** Session locks of the todo and review pane writes. Absent: the Node layer (configs that tests build by hand). */
+  /** Session locks of the todo, review pane and patch-applied watermark writes. Absent: the Node layer (configs that tests build by hand). */
   sessionLocks?: SessionLocks;
   /** Session files of the todo and review pane state. Absent: the Node layer (configs that tests build by hand). */
   sessionFiles?: SessionFiles;
