@@ -20,7 +20,11 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
-import { discoverAgentPlugins } from "@/node/services/agentPlugins/discovery";
+import {
+  discoverAgentPlugins,
+  isPluginSkillDirectory,
+  pluginSkillFolderNames,
+} from "@/node/services/agentPlugins/discovery";
 import {
   pluginSkillFileName,
   pluginSkillMarkdown,
@@ -74,6 +78,8 @@ interface ListedSkillsRoot {
   singleSkillName?: string;
   /** Plugin roots only: that skill is a Claude command, `<root>/<name>.md` (claudeCommands.ts). */
   commandSkill?: true | undefined;
+  /** Plugin roots only: snake_case folders load under kebab-case names (pluginSkillNameOfFolder). */
+  plugin?: true;
 }
 
 /**
@@ -110,13 +116,18 @@ async function getHostGlobalSkillsRoots(
 /** The skill folders of a skills root: the root itself for a single-skill plugin root. */
 async function listSkillFolders(
   skillsRoot: string,
-  singleSkillName: string | undefined
+  singleSkillName: string | undefined,
+  plugin: true | undefined
 ): Promise<Array<{ name: string; dir: string }>> {
   if (singleSkillName != null) return [{ name: singleSkillName, dir: skillsRoot }];
-  return (await listSkillDirectories(skillsRoot)).map((name) => ({
-    name,
-    dir: path.join(skillsRoot, name),
-  }));
+  const folders = await listSkillDirectories(skillsRoot);
+  const entries =
+    plugin === true
+      ? await pluginSkillFolderNames(folders, (folder) =>
+          isPluginSkillDirectory(nodeHostFiles.promises.stat(path.join(skillsRoot, folder)))
+        )
+      : folders.map((folder) => ({ folder, name: folder }));
+  return entries.map(({ folder, name }) => ({ name, dir: path.join(skillsRoot, folder) }));
 }
 
 /**
@@ -408,6 +419,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               skillConsent,
               singleSkillName: skillsRoot.name,
               commandSkill: skillsRoot.command,
+              plugin: true as const,
             }))
           );
         }
@@ -422,6 +434,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           skillConsent,
           singleSkillName,
           commandSkill,
+          plugin,
         } of roots) {
           let skillsRootReal: string;
           try {
@@ -444,7 +457,8 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
 
           for (const { name: directoryName, dir: skillDir } of await listSkillFolders(
             skillsRootReal,
-            singleSkillName
+            singleSkillName,
+            plugin
           )) {
             // Skipped plugin skills must not claim a same-named fallback in this manual scan.
             if (importedSkills != null && !importedSkills.includes(directoryName)) continue;

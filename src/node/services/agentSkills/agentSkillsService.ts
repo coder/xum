@@ -69,6 +69,8 @@ import {
   nodePluginFs,
   type PluginFs,
   readPluginFileWithinRootCapped,
+  pluginSkillFolderAlias,
+  pluginSkillFolderNames,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
 } from "@/node/services/agentPlugins/discovery";
 import { getRemoteProjectPluginSnapshot } from "@/node/services/agentPlugins/remoteProjectPlugins";
@@ -739,15 +741,45 @@ async function isCandidateSkillDirectory(
     : (await candidate.runtime.stat(skillDir)).isDirectory;
 }
 
-/** The folder of skill `name` in a scan root: the root itself when it is a single skill. */
+/** The skill folder `folder` in a scan root: the root itself when it is a single skill. */
 function candidateSkillDir(
   candidate: Pick<AgentSkillScanCandidate, "runtime" | "singleSkillName">,
   resolvedRoot: string,
-  name: SkillName
+  folder: string
 ): string {
   return candidate.singleSkillName != null
     ? resolvedRoot
-    : candidate.runtime.normalizePath(name, resolvedRoot);
+    : candidate.runtime.normalizePath(folder, resolvedRoot);
+}
+
+/**
+ * The folder of skill `name` in a scan root for a lookup. A plugin skill can live in a
+ * snake_case folder (pluginSkillNameOfFolder); the kebab-case folder wins when it is a
+ * directory, as in discovery (pluginSkillFolderNames). Plugin roots are host-local or a snapshot, so the
+ * extra stat costs no remote round trip.
+ */
+async function lookupCandidateSkillDir(
+  candidate: Pick<
+    AgentSkillScanCandidate,
+    "runtime" | "singleSkillName" | "pluginRoot" | "pluginFs"
+  >,
+  resolvedRoot: string,
+  name: SkillName
+): Promise<string> {
+  const skillDir = candidateSkillDir(candidate, resolvedRoot, name);
+  const alias =
+    candidate.pluginRoot != null && candidate.singleSkillName == null
+      ? pluginSkillFolderAlias(name)
+      : undefined;
+  if (alias === undefined) return skillDir;
+  const canonicalIsDirectory = await isCandidateSkillDirectory(candidate, skillDir).catch(
+    (error: unknown) => {
+      // An unreadable folder is not a missing one (#4438): readCandidateSkill rethrows it.
+      if (isRuntimeReadFailure(error)) throw error;
+      return false;
+    }
+  );
+  return canonicalIsDirectory ? skillDir : candidateSkillDir(candidate, resolvedRoot, alias);
 }
 
 /** The Markdown file of skill `name` in `skillDir`: SKILL.md, or a Claude command's `<name>.md`. */
@@ -759,6 +791,30 @@ function candidateSkillFile(
   return candidate.runtime.normalizePath(
     pluginSkillFileName(name, candidate.commandSkill),
     skillDir
+  );
+}
+
+/** Each folder's skill name: plugin folders can be snake_case (pluginSkillNameOfFolder). */
+async function candidateSkillFolderNames(
+  candidate: Pick<
+    AgentSkillScanCandidate,
+    "runtime" | "pluginRoot" | "singleSkillName" | "pluginFs"
+  >,
+  resolvedRoot: string,
+  folders: string[]
+): Promise<Array<{ folder: string; name: string }>> {
+  if (candidate.pluginRoot == null || candidate.singleSkillName != null) {
+    return folders.map((folder) => ({ folder, name: folder }));
+  }
+  return pluginSkillFolderNames(folders, (folder) =>
+    isCandidateSkillDirectory(
+      candidate,
+      candidate.runtime.normalizePath(folder, resolvedRoot)
+    ).catch(
+      // Like lookupCandidateSkillDir: a twin that fails to read is present (a lookup refuses
+      // it, #4438), so the snake_case folder must not load in its place here either.
+      (error: unknown) => isRuntimeReadFailure(error)
+    )
   );
 }
 
@@ -1119,10 +1175,14 @@ export async function discoverAgentSkills(
 
   const scanRoot = async (scan: AgentSkillScanCandidate): Promise<void> => {
     const resolvedRoot = await resolveCandidateRoot(scan);
-    const directoryNames = await listCandidateSkillNames(scan, resolvedRoot, workspacePath);
+    const folders = await listCandidateSkillNames(scan, resolvedRoot, workspacePath);
 
-    for (const directoryNameRaw of directoryNames) {
-      const nameParsed = SkillNameSchema.safeParse(directoryNameRaw);
+    for (const { folder: directoryNameRaw, name: skillNameRaw } of await candidateSkillFolderNames(
+      scan,
+      resolvedRoot,
+      folders
+    )) {
+      const nameParsed = SkillNameSchema.safeParse(skillNameRaw);
       if (!nameParsed.success) {
         log.warn(`Skipping invalid skill directory name '${directoryNameRaw}' in ${resolvedRoot}`);
         invalidSkills.push({
@@ -1146,7 +1206,7 @@ export async function discoverAgentSkills(
       const diagnostics: { invalidSkills: AgentSkillIssue[]; skillWarnings: AgentSkillIssue[] } =
         shadowed ? { invalidSkills: [], skillWarnings: [] } : { invalidSkills, skillWarnings };
 
-      const skillDir = candidateSkillDir(scan, resolvedRoot, directoryName);
+      const skillDir = candidateSkillDir(scan, resolvedRoot, directoryNameRaw);
       const skillFilePath = candidateSkillFile(scan, skillDir, directoryName);
       const pushInvalidSkill = (message: string, hint: string): void => {
         diagnostics.invalidSkills.push({
@@ -1453,7 +1513,7 @@ async function readCandidateSkill(
 
   // A single-skill root serves only its own name.
   if (candidate.singleSkillName != null && candidate.singleSkillName !== name) return null;
-  const skillDir = candidateSkillDir(candidate, resolvedRoot, name);
+  const skillDir = await lookupCandidateSkillDir(candidate, resolvedRoot, name);
   const skillFilePath = candidateSkillFile(candidate, skillDir, name);
 
   const contained = await isCandidateSkillContained({

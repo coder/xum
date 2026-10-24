@@ -89,3 +89,12 @@ test("agent-plugin-with-skills fits only Agent Plugin from a local path", async 
   expect(plugin.methods.map((method) => method.kind)).toEqual(["agent-plugin"]);
   expect(plugin.skills.map((skill) => skill.name).sort()).toEqual(["api-docs", "changelog-writer"]);
 });
+
+test("snake-case-skills offers each snake_case skill folder under its kebab-case name", async () => {
+  const plugin = await pluginPreview("snake-case-skills");
+  expect(plugin.skills.map((skill) => skill.name).sort()).toEqual([
+    "egm-bootstrap",
+    "egm-review-loop",
+  ]);
+  expect(plugin.warnings).toEqual([]);
+});
