@@ -31,6 +31,7 @@ import {
   buildSandboxedSvgDocument,
   finalizeSandboxedDocument,
   inlineArtifactHtmlAssets,
+  isUnstyledHtmlDocument,
   parseArtifactHtml,
 } from "./artifactDocument";
 import { pickFromFrameAnnotation, type ArtifactAnnotationPick } from "./artifactAnnotation";
@@ -57,6 +58,17 @@ interface BuiltDocument {
   srcDoc: string | null;
   notices: string[];
   error: string | null;
+  /** The page takes the theme's color scheme (isUnstyledHtmlDocument), so no white backdrop. */
+  followsColorScheme: boolean;
+}
+
+/**
+ * Whether the user's focus is in `frame`. Browsers leave focus on a frame that a `hidden`
+ * ancestor stopped rendering (the main pane's status page after a switch to the chat), so that
+ * focus does not count.
+ */
+function frameHasFocus(frame: HTMLIFrameElement | null): frame is HTMLIFrameElement {
+  return frame != null && document.activeElement === frame && frame.checkVisibility();
 }
 
 /**
@@ -64,7 +76,7 @@ interface BuiltDocument {
  * `window.xum.send` that skips the confirm strip. The artifact's script can post any of them at
  * any time, so the host honours them only while the user's
  * own click or key press inside `frame` is live: focus is on the iframe (a click or Tab into a
- * frame moves the app's activeElement to it, and a hidden frame cannot hold focus), and the app
+ * frame moves the app's activeElement to it; focus on a hidden frame does not count), and the app
  * has transient user activation (a gesture in a child frame also activates its ancestors). Each check alone is not enough: typing in the
  * composer also activates the app, and focus stays on the frame long after the click.
  * No confirm strip for openWorkspace: a switch sends nothing and reveals nothing to the frame,
@@ -77,7 +89,7 @@ interface BuiltDocument {
 function hasLiveUserGesture(frame: HTMLIFrameElement | null): boolean {
   const activation = (navigator as Navigator & { userActivation?: { isActive?: boolean } })
     .userActivation;
-  return frame != null && document.activeElement === frame && activation?.isActive === true;
+  return frameHasFocus(frame) && activation?.isActive === true;
 }
 
 /**
@@ -88,7 +100,7 @@ function hasLiveUserGesture(frame: HTMLIFrameElement | null): boolean {
  * a modal dialog); the sidebar ones also move focus to the toggle after a collapse.
  *
  * SECURITY AUDIT: the artifact's script can post the message without a key press. The host
- * honours it only while the frame holds focus (a hidden frame cannot), and the replayed event
+ * honours it only while the visible frame holds focus (frameHasFocus), and the replayed event
  * matches only the named chord's keybind. In the right sidebar's Artifacts tab, the sidebar chords
  * can only collapse the sidebar, which unmounts the frame: OPEN_ARTIFACTS_TAB collapses a sidebar
  * that shows that tab, and where a collapse refuses it selects the tab that already shows. The
@@ -99,7 +111,7 @@ function replayFrameSidebarKey(
   frame: HTMLIFrameElement | null,
   message: { chord: ArtifactFrameChord; ctrlKey: boolean; metaKey: boolean }
 ): void {
-  if (frame == null || document.activeElement !== frame) return;
+  if (!frameHasFocus(frame)) return;
   const keybind = ARTIFACT_FRAME_CHORDS[message.chord];
   const event = new KeyboardEvent("keydown", {
     key: keybind.key,
@@ -260,17 +272,24 @@ export function SandboxedArtifactFrame(props: {
   useEffect(() => {
     if (waitingForState) return;
     let cancelled = false;
+    const doc = kind === "html" ? parseArtifactHtml(content) : null;
+    const followsColorScheme = doc != null && isUnstyledHtmlDocument(doc);
     const options = {
       csp: buildArtifactCsp({ allowCdn }),
-      bridgeScript: buildArtifactBridgeScript(initialTheme, state, initialAppearance),
+      bridgeScript: buildArtifactBridgeScript(
+        initialTheme,
+        state,
+        initialAppearance,
+        followsColorScheme
+      ),
     };
     const finish = (srcDoc: string | null, notices: string[], error: string | null = null) => {
-      if (!cancelled) setBuilt({ content, allowCdn, state, srcDoc, notices, error });
+      if (cancelled) return;
+      setBuilt({ content, allowCdn, state, srcDoc, notices, error, followsColorScheme });
     };
-    if (kind === "svg") {
+    if (doc == null) {
       finish(buildSandboxedSvgDocument(content, options), []);
     } else {
-      const doc = parseArtifactHtml(content);
       const loader = createArtifactAssetLoader(path, read ?? (() => Promise.resolve(null)));
       inlineArtifactHtmlAssets(doc, loader, { allowCdn })
         .then((notices) => finish(finalizeSandboxedDocument(doc, options), notices))
@@ -399,7 +418,8 @@ export function SandboxedArtifactFrame(props: {
           postArtifactTheme(liveWindow(), theme, currentAppearance());
           if (annotating) postArtifactAnnotateMode(liveWindow(), true);
         }}
-        className={`min-h-0 w-full flex-1 border-0 bg-white ${annotating ? "cursor-crosshair" : ""}`}
+        // A page with the theme's scheme paints no canvas of its own, so the theme's shows.
+        className={`min-h-0 w-full flex-1 border-0 ${current.followsColorScheme ? "bg-background" : "bg-white"} ${annotating ? "cursor-crosshair" : ""}`}
         data-testid="artifact-frame"
       />
     </div>

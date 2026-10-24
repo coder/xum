@@ -27,6 +27,7 @@ import type {
   ArtifactReadResult,
 } from "@/common/orpc/schemas/artifacts";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isBlankHtmlDocument, parseArtifactHtml } from "./artifactDocument";
 import { useArtifactsRefreshTick } from "./useArtifactsRefreshTick";
 
 /**
@@ -142,14 +143,16 @@ function sameVersion(a: FileVersion | undefined, b: FileVersion | undefined): bo
   return a?.modifiedMs === b?.modifiedMs && a?.size === b?.size;
 }
 
-// The version of each workspace's status page that read as nothing to show (blank, binary or
-// too large). Until the file changes, the workspace counts as having no page, so the main pane
+// The version of each workspace's status page that read as nothing to show (blank, a page that
+// renders nothing, binary or too large). Until the file changes, the workspace counts as having no page, so the main pane
 // falls back to the transcript instead of a blank or "cannot be previewed" pane.
 const unshowableStatusVersions = new Map<string, FileVersion>();
 
 /** Whether a status page read has anything to show; else the pane falls back to the chat. */
 export function isStatusPageReadShowable(read: ArtifactReadResult): boolean {
-  return read.status === "ok" && read.content.trim() !== "";
+  if (read.status !== "ok" || read.content.trim() === "") return false;
+  // An empty skeleton or a comment would leave a blank (in dark themes, white) pane.
+  return read.kind !== "html" || !isBlankHtmlDocument(parseArtifactHtml(read.content));
 }
 
 /**

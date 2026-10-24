@@ -508,6 +508,38 @@ describe("buildArtifactBridgeScript", () => {
     expect(attributes.get("data-xum-theme-name")).toBe("flexoki-dark");
     expect(Object.fromEntries(properties)).toEqual({ "--xum-bg": "#100f0f" });
   });
+
+  test("gives only a page without styles of its own the theme's color scheme, kept live", () => {
+    const runWith = (followColorScheme: boolean) => {
+      type FakeMessageListener = (event: { source: unknown; data: unknown }) => void;
+      const listeners: FakeMessageListener[] = [];
+      const parent = {};
+      const style: { colorScheme?: string } = {};
+      const fakeWindow = {
+        parent,
+        addEventListener: (type: string, listener: FakeMessageListener) => {
+          if (type === "message") listeners.push(listener);
+        },
+        dispatchEvent: () => true,
+      };
+      const fakeDocument = { documentElement: { setAttribute: () => undefined, style } };
+      // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
+      const run = new Function(
+        "window",
+        "document",
+        "CustomEvent",
+        buildArtifactBridgeScript("dark", null, null, followColorScheme)
+      ) as (window: unknown, document: unknown, customEvent: unknown) => void;
+      run(fakeWindow, fakeDocument, class {});
+      const atLoad = style.colorScheme;
+      listeners.forEach((listener) =>
+        listener({ source: parent, data: { xumArtifact: 1, type: "theme", theme: "light" } })
+      );
+      return [atLoad, style.colorScheme];
+    };
+    expect(runWith(true)).toEqual(["dark", "light"]);
+    expect(runWith(false)).toEqual([undefined, undefined]);
+  });
 });
 
 describe("ArtifactHostToFrameMessageSchema theme variables", () => {

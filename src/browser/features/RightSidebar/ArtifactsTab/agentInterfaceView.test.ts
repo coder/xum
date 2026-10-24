@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { installDom } from "../../../../../tests/ui/dom";
 import type { ArtifactEntry, ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import {
   isStatusPageEntryShowable,
@@ -23,10 +24,31 @@ describe("resolveAgentInterfaceView", () => {
 
 describe("status page fallback to the transcript", () => {
   const meta = { path: "status.html", kind: "html", size: 12, modifiedMs: 1000 } as const;
+  const html = { ...meta, status: "ok", encoding: "utf8" } as const;
+  // DOMParser, for the HTML checks.
+  let cleanupDom: (() => void) | null = null;
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+  afterEach(() => {
+    cleanupDom?.();
+    cleanupDom = null;
+  });
 
   test.each<[string, ArtifactReadResult, boolean]>([
     ["an HTML page shows", { ...meta, status: "ok", encoding: "utf8", content: "<p>hi</p>" }, true],
     ["a blank page does not", { ...meta, status: "ok", encoding: "utf8", content: " \n\t" }, false],
+    [
+      "an empty HTML skeleton does not",
+      { ...html, content: "<!doctype html><html><head></head><body></body></html>" },
+      false,
+    ],
+    ["a comment-only page does not", { ...html, content: "<!-- filled in later -->" }, false],
+    [
+      "a page its script builds shows",
+      { ...html, content: "<script>document.write('hi')</script>" },
+      true,
+    ],
     ["a binary file does not", { ...meta, status: "binary" }, false],
     ["a file over the read cap does not", { ...meta, status: "too_large", maxBytes: 1 }, false],
   ])("%s", (_name, read, expected) => {

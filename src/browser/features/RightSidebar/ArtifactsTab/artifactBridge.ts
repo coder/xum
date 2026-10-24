@@ -50,7 +50,7 @@ import {
  * - Host -> frame: `{ type: "theme", theme: "dark" | "light", themeName?, variables? }`, sent
  *   after load and on theme change; the artifact may read it. The host injects no style sheets:
  *   `variables` are only `--xum-*` custom-property values, inert until the artifact's own CSS
- *   uses them.
+ *   uses them. Only a page without any styles of its own also gets the theme's `color-scheme`.
  *   `{ type: "annotate", enabled }` switches the shim's click-to-pin capture on or off (clicks
  *   are swallowed while it is on).
  * - The persisted `window.xum.state` is never posted: it is baked into the shim when the srcdoc
@@ -579,7 +579,9 @@ function sidebarKeyListener(): string {
 export function buildArtifactBridgeScript(
   initialTheme: ArtifactTheme,
   initialState: unknown = null,
-  initialAppearance: ArtifactAppearance | null = null
+  initialAppearance: ArtifactAppearance | null = null,
+  /** The page has no styles of its own (isUnstyledHtmlDocument): it takes the theme's scheme. */
+  followColorScheme = false
 ): string {
   return `(function () {
   "use strict";
@@ -590,6 +592,7 @@ export function buildArtifactBridgeScript(
   });
   var host = window.parent;
   var theme = ${JSON.stringify(initialTheme)};
+  var followColorScheme = ${JSON.stringify(followColorScheme)};
   var themeNames = ${JSON.stringify(ArtifactThemeNameSchema.options)};
   var themeVariablePattern = ${ARTIFACT_THEME_VARIABLE_NAME_PATTERN.toString()};
   var state = JSON.parse(${inlineScriptJson(JSON.stringify(initialState ?? null))});
@@ -642,7 +645,10 @@ export function buildArtifactBridgeScript(
   }
   function applyThemeAttribute() {
     var root = document.documentElement;
-    if (root) root.setAttribute("data-xum-theme", theme);
+    if (!root) return;
+    root.setAttribute("data-xum-theme", theme);
+    // Else such a page keeps a white canvas in dark themes; its default text follows the scheme.
+    if (followColorScheme && root.style) root.style.colorScheme = theme;
   }
   applyThemeAttribute();
   // Checked again here (the host validates too): own string keys matching --xum-*, string

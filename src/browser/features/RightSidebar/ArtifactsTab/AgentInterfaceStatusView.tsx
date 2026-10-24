@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
@@ -68,6 +68,8 @@ function useStatusArtifactRead(workspaceId: string): ArtifactReadResult | null {
 interface StatusViewProps {
   workspaceId: string;
   dockRef: React.RefObject<HTMLElement | null>;
+  /** Moves focus to the composer, where a switch from the status page to the chat leaves it. */
+  focusComposer: () => void;
 }
 
 /**
@@ -84,6 +86,7 @@ export function AgentInterfaceStatusView(
     <StatusPage
       workspaceId={props.workspaceId}
       dockRef={props.dockRef}
+      focusComposer={props.focusComposer}
       hidden={props.view !== "status"}
     />
   );
@@ -95,16 +98,30 @@ function StatusPage(props: StatusViewProps & { hidden: boolean }) {
   const dockHeight = useElementHeight(props.dockRef);
   // window.xum.send / setState, as in the Artifacts tab.
   const interactions = useArtifactInteractions(workspaceId, STATUS_TARGET);
+  const sectionRef = useRef<HTMLElement>(null);
+  const { hidden, focusComposer } = props;
+  // Browsers leave focus on a frame that stopped rendering, so after a switch to the chat from
+  // inside the page, keystrokes would go to the hidden page. Hand them to the composer instead.
+  useEffect(() => {
+    const section = sectionRef.current;
+    if (!hidden || section == null || !section.contains(document.activeElement)) return;
+    focusComposer();
+    // A disabled composer cannot take focus: still take it off the hidden page.
+    if (section.contains(document.activeElement) && document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+  }, [hidden, focusComposer]);
 
   return (
     <section
+      ref={sectionRef}
       aria-label="Agent status page"
       data-testid="agent-interface-status-view"
       // Over the transcript (which stays mounted, keeping its scroll position) and under the
       // composer dock (z-10). The header spacer matches the transcript region's on touch phones.
       className={cn(
         "bg-surface-primary mobile-header-spacer absolute inset-y-0 left-0 z-[5] flex flex-col",
-        props.hidden && "hidden"
+        hidden && "hidden"
       )}
       style={{
         right: "var(--chat-reserved-inline-end, 0px)",

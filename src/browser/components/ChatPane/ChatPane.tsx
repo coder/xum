@@ -1928,6 +1928,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             workspaceId={workspaceId}
             view={props.agentInterfaceView}
             dockRef={composerDockRef}
+            focusComposer={() => chatInputAPI.current?.focus()}
           />
           {transcriptContextMenu.menu}
         </div>

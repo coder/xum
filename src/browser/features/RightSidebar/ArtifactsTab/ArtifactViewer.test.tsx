@@ -386,6 +386,49 @@ describe("ArtifactViewer renderers", () => {
     }
   });
 
+  test("a chord posted by a frame that is no longer shown is not replayed, though focus stays there", async () => {
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    let replayed = 0;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.target === frame && event.key === "S") replayed++;
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    // The host builds the replayed event with the global constructor, which the DOM harness lacks.
+    const globalKeyboardEvent = globalThis.KeyboardEvent;
+    globalThis.KeyboardEvent = window.KeyboardEvent;
+    try {
+      const postChord = () =>
+        act(() => {
+          const event = new window.Event("message");
+          Object.defineProperty(event, "data", {
+            value: {
+              xumArtifact: 1,
+              type: "sidebarKey",
+              chord: "agentInterface",
+              ctrlKey: true,
+              metaKey: false,
+            },
+          });
+          Object.defineProperty(event, "source", { value: frame.contentWindow });
+          window.dispatchEvent(event);
+        });
+      act(() => frame.focus());
+      postChord();
+      expect(replayed).toBe(1);
+
+      // The main pane hides its status page with display: none and the browser leaves focus on
+      // the frame, so the page's script could keep switching the view back.
+      frame.parentElement!.style.display = "none";
+      expect(document.activeElement).toBe(frame);
+      postChord();
+      expect(replayed).toBe(1);
+    } finally {
+      globalThis.KeyboardEvent = globalKeyboardEvent;
+      window.removeEventListener("keydown", onKeyDown, true);
+    }
+  });
+
   test("warns above HTML artifacts only when agent-browser is known to be missing", async () => {
     const warning = "Not checked by the agent: agent-browser is not available on this runtime.";
     for (const value of [true, null]) {

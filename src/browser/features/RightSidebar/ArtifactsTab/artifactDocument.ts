@@ -52,6 +52,28 @@ export function parseArtifactHtml(html: string): Document {
   return new window.DOMParser().parseFromString(html, "text/html");
 }
 
+/** Whether a parsed HTML page shows nothing: no script and no body content (a skeleton, comments). */
+export function isBlankHtmlDocument(doc: Document): boolean {
+  return (
+    doc.querySelector("script") == null &&
+    doc.body.childElementCount === 0 &&
+    (doc.body.textContent ?? "").trim() === ""
+  );
+}
+
+/**
+ * Whether a parsed HTML page uses only the browser's default colors: no styles, scripts,
+ * presentational color attributes or graphics. Only such a page can take the app theme's color
+ * scheme (a dark canvas with light text) without some of its colors staying dark on dark.
+ */
+export function isUnstyledHtmlDocument(doc: Document): boolean {
+  return (
+    doc.querySelector(
+      'style, link[rel~="stylesheet"], script, [style], [bgcolor], [color], [text], img, svg, canvas, video, picture, object, embed, iframe'
+    ) == null
+  );
+}
+
 /** Final step for HTML artifacts: add the CSP + bridge preamble and serialize. */
 export function finalizeSandboxedDocument(
   doc: Document,
