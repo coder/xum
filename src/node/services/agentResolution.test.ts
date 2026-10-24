@@ -974,6 +974,7 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
       providersConfig: null,
       mcpServers: {},
       agentDefinitionCache: params.cache,
+      runtimeFactory: nodeRuntimeFactory,
     });
     const totalReads = [...runtime.definitionReads.values()].reduce((sum, n) => sum + n, 0);
     return { agent, context, metadata, reads: runtime.definitionReads, totalReads };

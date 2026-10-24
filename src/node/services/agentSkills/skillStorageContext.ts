@@ -5,7 +5,7 @@ import {
   listProjectMetadataRelativePaths,
 } from "@/common/compat/legacyMux";
 import type { XumToolScope } from "@/common/types/toolScope";
-import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { projectPluginsAllowed } from "@/node/utils/projectTrust";
 
@@ -46,7 +46,7 @@ function buildProjectLocalRoots(
     }),
     globalRoot: path.join(xumScope.xumHome, "skills"),
     universalRoot: "~/.agents/skills",
-    legacyMuxGlobalRoot: getLegacyMuxGlobalSkillsRoot(runtime, xumScope.projectRoot),
+    legacyMuxGlobalRoot: getLegacyMuxGlobalSkillsRoot(runtime),
     ...(options?.includeClaudeSkills ? { globalClaudeRoot: "~/.claude/skills" } : {}),
     // Read-only Agent Plugins containers at lowest precedence within each scope.
     // Containers anchor at the CHECKOUT root: for subProjectPath workspaces
@@ -78,7 +78,7 @@ function buildGlobalLocalRoots(input: {
     projectRoot: "",
     globalRoot: path.join(xumHome, "skills"),
     universalRoot: "~/.agents/skills",
-    legacyMuxGlobalRoot: getLegacyMuxGlobalSkillsRoot(input.runtime, xumHome),
+    legacyMuxGlobalRoot: getLegacyMuxGlobalSkillsRoot(input.runtime),
     // claude-skills-compat experiment: read-only root at lowest global precedence.
     ...(input.includeClaudeSkills ? { globalClaudeRoot: "~/.claude/skills" } : {}),
     // Read-only Agent Plugins containers at lowest global precedence.
@@ -89,11 +89,12 @@ function buildGlobalLocalRoots(input: {
 function resolveProjectLocalRuntime(input: {
   runtime: Runtime;
   xumScope: Extract<XumToolScope, { type: "project" }>;
+  runtimeFactory: RuntimeFactory;
 }): Runtime {
   if (input.runtime.location === "devcontainer") {
     // Devcontainer commands run in the container, but project-local skill roots point at
     // host paths. Use host-local I/O here so discovery can still reach host-global skills.
-    return new LocalRuntime(input.xumScope.projectRoot);
+    return input.runtimeFactory.createLocalRuntime(input.xumScope.projectRoot);
   }
 
   return input.runtime;
@@ -109,6 +110,8 @@ export function resolveSkillStorageContext(input: {
   xumScope?: XumToolScope | null;
   /** claude-skills-compat experiment: include read-only .claude/skills roots in discovery. */
   includeClaudeSkills?: boolean;
+  /** Builds the host-local runtime of a devcontainer's project-local skill roots. */
+  runtimeFactory: RuntimeFactory;
 }): SkillStorageContext {
   if (input.xumScope?.type !== "project") {
     return {
@@ -147,6 +150,7 @@ export function resolveSkillStorageContext(input: {
   const projectRuntime = resolveProjectLocalRuntime({
     runtime: input.runtime,
     xumScope: input.xumScope,
+    runtimeFactory: input.runtimeFactory,
   });
   return {
     kind: "project-local",

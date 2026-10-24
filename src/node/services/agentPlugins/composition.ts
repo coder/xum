@@ -19,6 +19,7 @@ import { discoverWorkflowScripts } from "@/node/services/workflows/workflowScrip
 import { joinPathLike } from "@/node/services/hooks";
 import { isPluginSlashCommandConsented } from "./componentConsent";
 import { discoverWorkspaceAgentPlugins, type AgentPluginInfo } from "./discovery";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 /**
  * Workspace composition inspector (the `--dump-config` analog): computes the
@@ -190,12 +191,15 @@ export async function buildWorkspaceComposition(
         }
       : undefined;
 
+  // Outside the agent loop: the plugin composition inspector reads through the host's runtimes.
+  const runtimeFactory = nodeRuntimeFactory;
   // Like the turn's skill index, the inspector must not report a composition
   // that silently lost a project root to an unreachable host.
   const skillDescriptors = requireReachableSkills(
     await discoverAgentSkills(args.runtime, args.workspacePath, {
       dedupeByName: false,
       ...(checkoutSkillRoots ?? {}),
+      runtimeFactory,
     })
   );
   const skills = markShadowed(
@@ -226,6 +230,7 @@ export async function buildWorkspaceComposition(
       runtime: args.runtime,
       workspacePath: args.workspacePath,
       projectTrusted: args.projectTrusted,
+      runtimeFactory,
     });
     workflows = availableWorkflows.map((workflow) => ({
       name: workflow.descriptor.name,

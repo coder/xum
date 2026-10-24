@@ -39,6 +39,8 @@ import {
   prepareProviderRequestMessages,
   removeMemoryGuidance,
 } from "./turnContextAssembler";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 class TestRuntime extends LocalRuntime {
   constructor(
@@ -131,6 +133,7 @@ async function buildSystemContextForTest(args: {
     tokenBudgetEnabled: args.tokenBudgetEnabled,
     workspaceMemoryWritable: args.workspaceMemoryWritable,
     instructionSources: args.instructionSources,
+    runtimeFactory,
   });
 }
 
@@ -2086,6 +2089,7 @@ describe("buildStreamSystemContext", () => {
       cfg,
       providersConfig: null,
       mcpServers: {},
+      runtimeFactory,
     });
 
     expect(result.agentSystemPromptSections.join("\n\n")).toContain(
@@ -2291,6 +2295,7 @@ describe("buildStreamSystemContext", () => {
       cfg,
       providersConfig: null,
       mcpServers: {},
+      runtimeFactory,
     });
 
     expect(result.ancestorPlanFilePaths).toEqual([scoped("child-workspace")]);

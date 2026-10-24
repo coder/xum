@@ -17,6 +17,7 @@ import {
 } from "./WorkflowService";
 import { WorkflowArgsValidationError } from "./workflowArgs";
 import { WorkflowDeclaredPhasesValidationError } from "./workflowMetadata";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 interface TestWorkspaceService {
   emitWorkflowRunActivity: ReturnType<typeof mock>;
@@ -94,6 +95,7 @@ describe("WorkflowService request orchestration", () => {
       config,
       initStateManager: { waitForInit },
       aiService: {
+        runtimeFactory: nodeRuntimeFactory,
         resolveXumToolScopeForWorkspace: mock((_metadata, _runtime, executionPath) => ({
           type: "project",
           xumHome: temp.path,

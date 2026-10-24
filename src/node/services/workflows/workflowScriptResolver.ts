@@ -7,6 +7,7 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
   discoverAgentPlugins,
   readPluginFileWithinRootCapped,
@@ -72,6 +73,8 @@ export interface ResolveWorkflowScriptInput {
   skillStorageContext?: SkillStorageContext;
   /** Shared by the resolutions of one listing: each install's approved copies are read once. */
   approvedCopiesReads?: ApprovedCopiesReads;
+  /** Builds the host-local runtimes of a `skill://` path's skill read. */
+  runtimeFactory: RuntimeFactory;
 }
 
 const SKILL_SCRIPT_PATH_PREFIX = "skill://";
@@ -162,6 +165,7 @@ function readWorkflowSkill(
       ? { roots }
       : { projectSearchRoot, projectPluginsTrusted: input.projectTrusted }),
     containment: workflowSkillContainment(input, projectSearchRoot),
+    runtimeFactory: input.runtimeFactory,
   });
 }
 

@@ -4,6 +4,7 @@ import type { InvocableSkill, SkillLookupName } from "@/common/types/agentSkill"
 import assert from "@/common/utils/assert";
 import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
+import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { isRemoteRuntime, type Runtime } from "@/node/runtime/Runtime";
 import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillDirectory } from "@/node/services/agentSkills/skillDirectory";
@@ -159,6 +160,7 @@ async function skillOwnsFile(
   const includeClaudeSkills = config.experiments?.claudeSkillsCompat === true;
   const skillCtx = resolveSkillStorageContext({
     runtime: config.runtime,
+    runtimeFactory: toolRuntimeFactory(config),
     workspacePath: config.cwd,
     xumScope: config.xumScope ?? null,
     includeClaudeSkills,
@@ -168,6 +170,7 @@ async function skillOwnsFile(
     resolved = await readAgentSkill(skillCtx.runtime, skillCtx.workspacePath, name, {
       roots: skillCtx.roots,
       containment: skillCtx.containment,
+      runtimeFactory: toolRuntimeFactory(config),
       includeClaudeSkills,
     });
   } catch (error) {

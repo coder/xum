@@ -20,6 +20,8 @@ import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsServ
 import { extractLoadedSkillSnapshotsFromMessages } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { createTestToolConfig, TestTempDir, TrueRemotePathMappedRuntime } from "./testHelpers";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -585,10 +587,12 @@ describe("agent_skill_read", () => {
         runtime: config.runtime,
         workspacePath: config.cwd,
         xumScope: config.xumScope,
+        runtimeFactory,
       });
       const discovery = await discoverAgentSkills(ctx.runtime, ctx.workspacePath, {
         roots: ctx.roots,
         containment: ctx.containment,
+        runtimeFactory,
       });
       const tool = createAgentSkillReadTool({
         ...config,

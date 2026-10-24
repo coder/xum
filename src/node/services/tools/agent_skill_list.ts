@@ -18,6 +18,7 @@ import type { AgentSkillListToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
 import { discoverAgentPlugins } from "@/node/services/agentPlugins/discovery";
 import {
@@ -277,6 +278,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
       try {
         const skillCtx = resolveSkillStorageContext({
           runtime: config.runtime,
+          runtimeFactory: toolRuntimeFactory(config),
           workspacePath: config.cwd,
           xumScope: config.xumScope ?? null,
           includeClaudeSkills,
@@ -295,6 +297,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             await discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
               roots,
               containment: skillCtx.containment,
+              runtimeFactory: toolRuntimeFactory(config),
               dedupeByName: false,
             })
           );

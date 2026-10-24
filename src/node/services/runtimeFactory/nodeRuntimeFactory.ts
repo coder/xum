@@ -35,5 +35,14 @@ export const nodeRuntimeFactory: RuntimeFactory = {
   createLocalRuntime: (path) => new LocalRuntime(path),
 };
 
+/**
+ * A tool config's runtime builders: the session's (ToolConfiguration.runtimeFactory), or this
+ * Node layer for configs that tests build by hand.
+ */
+export function toolRuntimeFactory(config: { runtimeFactory?: RuntimeFactory }): RuntimeFactory {
+  // mutation-equivalent: runtimeFactory is a RuntimeFactory object or undefined, so ?? and || agree
+  return config.runtimeFactory ?? nodeRuntimeFactory;
+}
+
 /** StoresLive provides it, so the app always gets the Node layer. */
 export const RuntimeFactoryNode = Layer.succeed(RuntimeFactoryTag)(nodeRuntimeFactory);
