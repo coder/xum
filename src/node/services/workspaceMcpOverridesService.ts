@@ -21,6 +21,7 @@ import {
   CrossProcessLockTimeoutError,
 } from "@/node/utils/main/crossProcessLock";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import type { HostClock } from "@/node/utils/hostClock";
 import { findDuplicateProperty } from "@/node/utils/main/jsoncDuplicates";
 import {
   isCanonicalPluginServerKey,
@@ -1677,6 +1678,8 @@ export class WorkspaceMcpOverridesService {
        */
       timeoutMs?: number;
       signal?: AbortSignal;
+      /** Arms the timeout. The agent loop passes its HostClock (phase 5). Absent: nodeClock. */
+      clock?: HostClock;
     }
   ): Promise<{ overrides: WorkspaceMCPOverrides; revision: string; authoritative: boolean }> {
     const snapshot = new ConfigSnapshot(this.config);
@@ -1694,6 +1697,7 @@ export class WorkspaceMcpOverridesService {
       const raced = await raceWithAbortAndTimeout(resolution, {
         ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
         ...(options.signal !== undefined ? { signal: options.signal } : {}),
+        ...(options.clock !== undefined ? { clock: options.clock } : {}),
       });
       if (raced.kind !== "ok") {
         snapshot.cancel();

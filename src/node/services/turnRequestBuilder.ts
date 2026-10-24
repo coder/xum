@@ -1160,7 +1160,11 @@ export class TurnRequestBuilder {
     // Wall clock: MCPServerManager subtracts Date.now() from the deadline (#7282).
     const readStartedAt = nodeClock.nowMs();
     const read = await this.dependencies.workspaceMcpOverridesService
-      .getOverridesForWorkspace(workspaceId, { timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS, signal })
+      .getOverridesForWorkspace(workspaceId, {
+        timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS,
+        signal,
+        clock: this.hostClock,
+      })
       .catch(() => ({ overrides: undefined, authoritative: false }));
     const projectSecrets = isMultiProject(metadata)
       ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
@@ -2156,7 +2160,11 @@ export class TurnRequestBuilder {
       // read (see above), never authoritative empty overrides.
       const read = await this.dependencies.workspaceMcpOverridesService.getOverridesForWorkspace(
         workspaceId,
-        { timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS, signal: combinedAbortSignal }
+        {
+          timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS,
+          signal: combinedAbortSignal,
+          clock: this.hostClock,
+        }
       );
       mcpOverrides = read.overrides;
       mcpOverridesAuthoritative = read.authoritative;
