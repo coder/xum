@@ -5,7 +5,11 @@ import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import { cn } from "@/common/lib/utils";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getErrorMessage } from "@/common/utils/errors";
-import { type AgentInterfaceView, useStatusArtifactEntry } from "./agentInterfaceView";
+import {
+  type AgentInterfaceView,
+  recordStatusPageRead,
+  useStatusArtifactEntry,
+} from "./agentInterfaceView";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { useArtifactInteractions } from "./useArtifactInteractions";
 
@@ -46,8 +50,10 @@ function useStatusArtifactRead(workspaceId: string): ArtifactReadResult | null {
       .then((result) => {
         if (controller.signal.aborted) return;
         // A failed re-read keeps the last good page on screen; the next change retries.
-        if (result.success) setRead(result.data);
-        else console.debug("[Agent interface] status page read failed:", result.error);
+        if (result.success) {
+          setRead(result.data);
+          recordStatusPageRead(workspaceId, result.data);
+        } else console.debug("[Agent interface] status page read failed:", result.error);
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;

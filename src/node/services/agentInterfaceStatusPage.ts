@@ -54,7 +54,7 @@ export const AGENT_INTERFACE_STATUS_TEMPLATE = `<!doctype html>
   html, body {
     margin: 0;
     min-height: 100%;
-    background: var(--xum-bg, var(--fallback-bg));
+    background: var(--xum-surface, var(--fallback-bg));
     color: var(--xum-fg, var(--fallback-fg));
     font-family: var(--xum-font-sans, system-ui, -apple-system, "Segoe UI", sans-serif);
     font-size: 14px;

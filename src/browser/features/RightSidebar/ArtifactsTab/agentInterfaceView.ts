@@ -21,7 +21,11 @@ import {
   AGENT_INTERFACE_VIEW_MAX_CHARS,
   AGENT_INTERFACE_VIEW_MAX_WORKSPACES,
 } from "@/common/constants/storage";
-import type { ArtifactEntry, ArtifactListing } from "@/common/orpc/schemas/artifacts";
+import type {
+  ArtifactEntry,
+  ArtifactListing,
+  ArtifactReadResult,
+} from "@/common/orpc/schemas/artifacts";
 import { getErrorMessage } from "@/common/utils/errors";
 import { useArtifactsRefreshTick } from "./useArtifactsRefreshTick";
 
@@ -118,10 +122,57 @@ function entryKey(entry: ArtifactEntry | null | undefined): string | undefined {
   return `${entry.kind}\u0000${entry.modifiedMs}\u0000${entry.size}`;
 }
 
+function notifyStatusListeners() {
+  for (const listener of statusListeners) listener();
+}
+
 function publishStatusEntry(workspaceId: string, entry: ArtifactEntry | null) {
   if (entryKey(statusEntries.get(workspaceId)) === entryKey(entry)) return;
   statusEntries.set(workspaceId, entry);
-  for (const listener of statusListeners) listener();
+  notifyStatusListeners();
+}
+
+/** A version of the page's file, as both a listing entry and a read result describe it. */
+interface FileVersion {
+  modifiedMs: number;
+  size: number;
+}
+
+function sameVersion(a: FileVersion | undefined, b: FileVersion | undefined): boolean {
+  return a?.modifiedMs === b?.modifiedMs && a?.size === b?.size;
+}
+
+// The version of each workspace's status page that read as nothing to show (blank, binary or
+// too large). Until the file changes, the workspace counts as having no page, so the main pane
+// falls back to the transcript instead of a blank or "cannot be previewed" pane.
+const unshowableStatusVersions = new Map<string, FileVersion>();
+
+/** Whether a status page read has anything to show; else the pane falls back to the chat. */
+export function isStatusPageReadShowable(read: ArtifactReadResult): boolean {
+  return read.status === "ok" && read.content.trim() !== "";
+}
+
+/**
+ * Whether a listed status page can be shown: an empty file never can, and a version that read
+ * as unshowable cannot until the file changes.
+ */
+export function isStatusPageEntryShowable(
+  entry: ArtifactEntry | null | undefined,
+  unshowable: FileVersion | undefined
+): boolean {
+  if (entry == null || entry.size === 0) return false;
+  return unshowable == null || !sameVersion(entry, unshowable);
+}
+
+/** Records a status page read; an unshowable one hides the page until the file changes. */
+export function recordStatusPageRead(workspaceId: string, read: ArtifactReadResult) {
+  const unshowable = isStatusPageReadShowable(read)
+    ? undefined
+    : { modifiedMs: read.modifiedMs, size: read.size };
+  if (sameVersion(unshowableStatusVersions.get(workspaceId), unshowable)) return;
+  if (unshowable == null) unshowableStatusVersions.delete(workspaceId);
+  else unshowableStatusVersions.set(workspaceId, unshowable);
+  notifyStatusListeners();
 }
 
 /** The status page's entry, or null when the workspace has none (or it is not listed yet). */
@@ -197,9 +248,12 @@ export function useAgentInterfaceView(workspaceId: string): {
   };
 }
 
-/** Whether the main pane's last listing found the workspace's status page. */
+/** Whether the main pane's last listing found a status page for the workspace that can show. */
 export function hasAgentInterfaceStatusPage(workspaceId: string): boolean {
-  return statusEntries.get(workspaceId) != null;
+  return isStatusPageEntryShowable(
+    statusEntries.get(workspaceId),
+    unshowableStatusVersions.get(workspaceId)
+  );
 }
 
 /** Flip the workspace between its status page and the transcript; a no-op without a page. */

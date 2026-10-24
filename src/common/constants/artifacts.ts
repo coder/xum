@@ -10,6 +10,9 @@ export const AGENT_INTERFACE_STATUS_ARTIFACT = "status.html";
  */
 export const ARTIFACT_THEME_VARIABLES = {
   bg: "--color-background",
+  // The main pane's and the sidebars' own surface, which differs from --color-background in
+  // Light and Dark: a page painted with it sits seamlessly in the pane.
+  surface: "--color-surface-primary",
   "bg-secondary": "--color-background-secondary",
   fg: "--color-foreground",
   muted: "--color-muted",

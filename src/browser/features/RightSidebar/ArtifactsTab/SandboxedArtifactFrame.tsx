@@ -81,17 +81,19 @@ function hasLiveUserGesture(frame: HTMLIFrameElement | null): boolean {
 }
 
 /**
- * Replays a right-sidebar chord pressed inside `frame` as a keydown on the frame element, so the
- * app's one handler for it applies its own rules: WorkspaceShell's useRightSidebarToggleKey for
- * TOGGLE_RIGHT_SIDEBAR, useArtifactsTabKey for OPEN_ARTIFACTS_TAB. Both keep the dialog block
- * (Artifacts fullscreen is a modal dialog) and the focus move to the toggle after a collapse.
+ * Replays a chord pressed inside `frame` as a keydown on the frame element, so the app's one
+ * handler for it applies its own rules: WorkspaceShell's useRightSidebarToggleKey for
+ * TOGGLE_RIGHT_SIDEBAR, useArtifactsTabKey for OPEN_ARTIFACTS_TAB, the main pane's Agent interface
+ * view handler for TOGGLE_AGENT_INTERFACE_VIEW. All keep the dialog block (Artifacts fullscreen is
+ * a modal dialog); the sidebar ones also move focus to the toggle after a collapse.
  *
  * SECURITY AUDIT: the artifact's script can post the message without a key press. The host
  * honours it only while the frame holds focus (a hidden frame cannot), and the replayed event
- * matches only the named chord's keybind. The frame lives in the right sidebar's Artifacts tab, so
- * either chord can only collapse the sidebar, which unmounts the frame: OPEN_ARTIFACTS_TAB
- * collapses a sidebar that shows that tab, and where a collapse refuses it selects the tab that
- * already shows. Like Escape, it needs no live gesture.
+ * matches only the named chord's keybind. In the right sidebar's Artifacts tab, the sidebar chords
+ * can only collapse the sidebar, which unmounts the frame: OPEN_ARTIFACTS_TAB collapses a sidebar
+ * that shows that tab, and where a collapse refuses it selects the tab that already shows. The
+ * Agent interface chord only switches the main pane between the status page and the transcript,
+ * the same as the visible toggle. Like Escape, they need no live gesture.
  */
 function replayFrameSidebarKey(
   frame: HTMLIFrameElement | null,

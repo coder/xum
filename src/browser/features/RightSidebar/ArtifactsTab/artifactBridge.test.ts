@@ -203,8 +203,8 @@ describe("bridge script keys", () => {
     expect(bridge.prevented()).toBe(2);
   });
 
-  test("the Artifacts tab chord is posted by name, and other Ctrl+Shift keys stay the artifact's", () => {
-    // The keybind's own key, so a keybind the shim cannot forward fails here.
+  test("the Artifacts tab and Agent interface chords are posted by name, and other Ctrl+Shift keys stay the artifact's", () => {
+    // The keybinds' own keys, so a keybind the shim cannot forward fails here.
     const key = KEYBINDS.OPEN_ARTIFACTS_TAB.key;
     const bridge = runBridgeScript();
     // Keys of no forwarded chord, including names every object inherits.
@@ -214,10 +214,19 @@ describe("bridge script keys", () => {
     expect(bridge.posted).toEqual([]);
     expect(bridge.prevented()).toBe(0);
     bridge.keydown(key, div, true, { ctrlKey: true });
+    // The main pane's status page is a frame too: its view switch must work after a click in it.
+    bridge.keydown(KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW.key, div, true, { ctrlKey: true });
     expect(bridge.posted).toEqual([
       { xumArtifact: 1, type: "sidebarKey", chord: "artifacts", ctrlKey: true, metaKey: false },
+      {
+        xumArtifact: 1,
+        type: "sidebarKey",
+        chord: "agentInterface",
+        ctrlKey: true,
+        metaKey: false,
+      },
     ]);
-    expect(bridge.prevented()).toBe(1);
+    expect(bridge.prevented()).toBe(2);
   });
 
   test("on macOS the right-sidebar chord is Cmd, and Ctrl stays the artifact's", () => {
@@ -259,10 +268,9 @@ describe("sidebarKey messages", () => {
       metaKey: false,
     } as const;
     expect(accept(sidebarKey)).toEqual(sidebarKey);
-    expect(accept({ ...sidebarKey, chord: "artifacts" })).toEqual({
-      ...sidebarKey,
-      chord: "artifacts",
-    });
+    for (const chord of ["artifacts", "agentInterface"] as const) {
+      expect(accept({ ...sidebarKey, chord })).toEqual({ ...sidebarKey, chord });
+    }
     for (const data of [
       { xumArtifact: 1, type: "sidebarKey", chord: "sidebar", ctrlKey: true },
       { xumArtifact: 1, type: "sidebarKey", ctrlKey: true, metaKey: false },

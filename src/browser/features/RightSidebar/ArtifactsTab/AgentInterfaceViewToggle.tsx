@@ -36,7 +36,9 @@ export function AgentInterfaceViewToggle(props: { workspaceId: string; className
       aria-label="Main pane view"
       data-testid="agent-interface-view-toggle"
       className={cn(
-        "border-border-light flex h-6 shrink-0 items-center overflow-hidden rounded border",
+        // Touch screens give buttons 44px targets (globals.css): the group grows to fit them,
+        // or its overflow clip would leave a 24px tap strip.
+        "border-border-light flex h-6 shrink-0 items-center overflow-hidden rounded border [@media(max-width:768px)_and_(pointer:coarse)]:h-11",
         props.className
       )}
     >

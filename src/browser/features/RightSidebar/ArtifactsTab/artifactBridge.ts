@@ -132,14 +132,16 @@ const ArtifactAnnotateMessageSchema = z
   .strict();
 
 /**
- * The app chords the frame forwards, by name. Both act on the right sidebar that holds the frame:
+ * The app chords the frame forwards, by name. Two act on the right sidebar that holds the frame:
  * TOGGLE_RIGHT_SIDEBAR collapses it, and OPEN_ARTIFACTS_TAB collapses it too, since the frame
  * only holds focus while the Artifacts tab shows (user request: that key toggles the tab, from
- * anywhere in it).
+ * anywhere in it). TOGGLE_AGENT_INTERFACE_VIEW switches the main pane between the status page
+ * (a frame too) and the chat, so the advertised chord also works after a click in the page.
  */
 export const ARTIFACT_FRAME_CHORDS = {
   sidebar: KEYBINDS.TOGGLE_RIGHT_SIDEBAR,
   artifacts: KEYBINDS.OPEN_ARTIFACTS_TAB,
+  agentInterface: KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW,
 } as const satisfies Record<string, Keybind>;
 export type ArtifactFrameChord = keyof typeof ARTIFACT_FRAME_CHORDS;
 
@@ -153,7 +155,7 @@ const ArtifactSidebarKeyMessageSchema = z
     ...bridgeEnvelope,
     type: z.literal("sidebarKey"),
     // The host indexes ARTIFACT_FRAME_CHORDS with it, so a name without a keybind fails typecheck.
-    chord: z.enum(["sidebar", "artifacts"]),
+    chord: z.enum(["sidebar", "artifacts", "agentInterface"]),
     ctrlKey: z.boolean(),
     metaKey: z.boolean(),
   })
