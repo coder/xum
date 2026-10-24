@@ -120,11 +120,6 @@ test("allows listed modules and fails stale entries", () => {
 // The allow map is frozen: a PR adds a (file, module) pair only when its phase plan lists it.
 // Phases 2 to 5 remove pairs until the map is empty.
 const FROZEN_ALLOW_PAIRS = [
-  "src/node/services/agentSession.ts @/node/runtime/runtimeHelpers",
-  "src/node/services/aiService.ts @/node/runtime/multiProjectRuntime",
-  "src/node/services/aiService.ts @/node/runtime/runtimeFactory",
-  "src/node/services/aiService.ts @/node/runtime/runtimeHelpers",
-  "src/node/services/contextManagement/strategies/tokenBudget.ts @/node/runtime/runtimeHelpers",
   "src/node/services/tools/review_pane.ts @/node/utils/writeFileAtomic",
   "src/node/services/tools/review_pane.ts fs/promises",
   "src/node/services/tools/todo.ts @/node/utils/writeFileAtomic",

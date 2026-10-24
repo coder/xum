@@ -1277,15 +1277,6 @@
               }
             ],
             "allow": {
-              "src/node/services/agentSession.ts": ["@/node/runtime/runtimeHelpers"],
-              "src/node/services/aiService.ts": [
-                "@/node/runtime/multiProjectRuntime",
-                "@/node/runtime/runtimeFactory",
-                "@/node/runtime/runtimeHelpers"
-              ],
-              "src/node/services/contextManagement/strategies/tokenBudget.ts": [
-                "@/node/runtime/runtimeHelpers"
-              ],
               "src/node/services/tools/review_pane.ts": [
                 "@/node/utils/writeFileAtomic",
                 "fs/promises"
