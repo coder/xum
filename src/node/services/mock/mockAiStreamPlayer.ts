@@ -282,8 +282,9 @@ export class MockAiStreamPlayer {
   }
 
   /**
-   * Canned tool calls never run, but a successful todo_write must leave the list on disk as the
-   * real tool does: AgentSession's turn-end TODO nudge reads it there (needsTodoTurnEndNudge).
+   * Canned tool calls never run, but a successful todo_write must leave the list in the session's
+   * files as the real tool does: AgentSession's turn-end TODO nudge reads it there
+   * (needsTodoTurnEndNudge).
    * Runs in the call's tool-end handler, before its tool-call-end event: a stream stopped before
    * that point writes nothing, as with a real tool. The queue awaits each handler in order, so
    * stream-end always sees the new list.
@@ -301,7 +302,8 @@ export class MockAiStreamPlayer {
       workspaceId,
       path.join(sessionsDir, workspaceId),
       todos,
-      this.deps.historyService.locks
+      this.deps.historyService.locks,
+      this.deps.historyService.files
     );
   }
 

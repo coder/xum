@@ -19,6 +19,7 @@ import { assert } from "@/common/utils/assert";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { shescape } from "@/node/runtime/streamUtils";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { resolveArtifactsLocation, writeArtifactAtLocation } from "./artifactsOperations";
@@ -473,7 +474,8 @@ export class GoalStatusBoardService {
       goal == null
         ? [[], { kind: "none" as const }]
         : await Promise.all([
-            readTodosForSessionDir(path.join(this.deps.sessionsDir, workspaceId)),
+            // Outside the agent loop: the host's session files.
+            readTodosForSessionDir(path.join(this.deps.sessionsDir, workspaceId), nodeSessionFiles),
             fetchGoalBoardPrSection(workspaceId, this.deps.runBash).catch(
               (): GoalBoardPrSection => ({ kind: "unavailable" })
             ),
