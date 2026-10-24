@@ -40,6 +40,23 @@ const CURL_ROUTE_MARKER = "XUM_CURL_ROUTE=";
 
 class WebFetchValidationError extends Error {}
 
+// parseHtmlDocument answers every request that happy-dom tries to send with this
+// status instead of sending it.
+const WEB_FETCH_REFUSED_STATUS = 403;
+const WEB_FETCH_REFUSED_STATUS_TEXT = "Forbidden";
+// A <link> tag that names a preload-type hint anywhere in it. This can strip a
+// few extra <link> tags (for example a link whose href contains the word), which
+// is harmless: <link> tags carry no text, and Readability removes them from the
+// article. LINK_TAG_PATTERN excludes "<" from the tag body so each match attempt
+// stops at the next tag: a single pattern with two [^>]* runs takes quadratic
+// time on 5MB of unclosed "<link" text.
+const LINK_TAG_PATTERN = /<link\b[^<>]*>/gi;
+const PRELOAD_HINT_PATTERN = /\b(?:preload|prefetch|modulepreload)\b/i;
+
+function stripPreloadLinks(html: string): string {
+  return html.replace(LINK_TAG_PATTERN, (tag) => (PRELOAD_HINT_PATTERN.test(tag) ? "" : tag));
+}
+
 /**
  * Strip <style> and <script> blocks before happy-dom parsing. Large minified
  * blocks add substantial parsing work, while Readability only needs DOM
@@ -56,9 +73,15 @@ function stripHeavyTags(html: string): string {
 // process rather than in the bun test runner.
 export function parseHtmlDocument(html: string, url: string): Document {
   // SECURITY: the HTML is untrusted. Parsing must never trigger network
-  // fetches from the Mux backend (subresources like iframes or external
-  // stylesheets would bypass the SSRF checks in assertWebFetchTargetAllowed).
-  // JavaScript evaluation is already disabled by default in happy-dom.
+  // fetches from the Mux backend (subresources like iframes, external
+  // stylesheets or preload links would bypass the SSRF checks in
+  // assertWebFetchTargetAllowed). JavaScript evaluation is already disabled
+  // by default in happy-dom. The settings below turn off the loaders we know
+  // about, and the fetch interceptor enforces the guarantee for every request
+  // type: happy-dom sends all of its requests (fetch, XMLHttpRequest, preload,
+  // stylesheets, scripts, frames) through Fetch/SyncFetch, which call the
+  // interceptor before they open a connection, so a refused request never
+  // reaches the network and never follows a redirect.
   const window = new Window({
     url,
     settings: {
@@ -69,9 +92,31 @@ export function parseHtmlDocument(html: string, url: string): Document {
         disableChildFrameNavigation: true,
         disableChildPageNavigation: true,
       },
+      fetch: {
+        interceptor: {
+          beforeAsyncRequest: ({ window: requestWindow }) =>
+            Promise.resolve(
+              new requestWindow.Response(null, {
+                status: WEB_FETCH_REFUSED_STATUS,
+                statusText: WEB_FETCH_REFUSED_STATUS_TEXT,
+              })
+            ),
+          beforeSyncRequest: ({ window: requestWindow, request }) => ({
+            status: WEB_FETCH_REFUSED_STATUS,
+            statusText: WEB_FETCH_REFUSED_STATUS_TEXT,
+            ok: false,
+            url: request.url,
+            redirected: false,
+            headers: new requestWindow.Headers(),
+            body: null,
+          }),
+        },
+      },
     },
   });
-  window.document.write(html);
+  // Preload hints only ask for network requests and carry no readable content.
+  // Dropping them is defense in depth behind the interceptor above.
+  window.document.write(stripPreloadLinks(html));
   // happy-dom's Document is structurally DOM-compatible but uses its own type declarations.
   const document: unknown = window.document;
   return document as Document;
