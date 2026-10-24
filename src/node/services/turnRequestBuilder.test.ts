@@ -29,6 +29,7 @@ import {
 } from "./turnRequestBuilder";
 import { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
+import type { HostClock } from "@/node/utils/hostClock";
 import type { EffectRunner } from "./di/effectRunner";
 import { Ok } from "@/common/types/result";
 import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
@@ -456,6 +457,7 @@ describe("TurnRequestBuilder MCP overrides deadline", () => {
     const getToolsForWorkspace = mock((_options: { overridesReadDeadlineAt?: number }) =>
       Promise.resolve({})
     );
+    let readClock: HostClock | undefined;
     const metadata: WorkspaceMetadata = {
       id: "workspace",
       name: "workspace",
@@ -472,8 +474,10 @@ describe("TurnRequestBuilder MCP overrides deadline", () => {
           >,
         },
         workspaceMcpOverridesService: {
-          getOverridesForWorkspace: () =>
-            Promise.resolve({ overrides: undefined, authoritative: false }),
+          getOverridesForWorkspace: (_workspaceId: string, options: { clock?: HostClock }) => {
+            readClock = options.clock;
+            return Promise.resolve({ overrides: undefined, authoritative: false });
+          },
         } as unknown as WorkspaceMcpOverridesService,
         getWorkspaceMetadata: () => Promise.resolve(Ok(metadata)),
         createWorkspaceRuntimeContext: () =>
@@ -495,6 +499,8 @@ describe("TurnRequestBuilder MCP overrides deadline", () => {
       const deadline = getToolsForWorkspace.mock.calls[0]?.[0].overridesReadDeadlineAt;
       if (deadline == null) throw new Error("expected a non-authoritative reread deadline");
       expect(deadline - Date.now()).toBeGreaterThan(0);
+      // The overrides read arms its timeout on the turn's TestClock, not on the Node clock.
+      expect(readClock?.nowMs()).toBe(clock.hostClock.nowMs());
     } finally {
       await harness.cleanup();
       await clock.dispose();
