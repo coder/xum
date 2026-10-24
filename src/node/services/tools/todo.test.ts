@@ -2,8 +2,10 @@ import { describe, it, expect, beforeEach, afterEach } from "@jest/globals";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
-import { createTodoWriteTool, setTodosForSessionDir } from "./todo";
+import { buildSessionFiles } from "@/node/services/sessionFiles/buildSessionFiles.testHarness";
+import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
+import { getTodoFilePath, readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import { createTodoReadTool, createTodoWriteTool, setTodosForSessionDir } from "./todo";
 import { createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 import type { TodoItem } from "@/common/types/tools";
 import { MAX_TODOS } from "@/common/constants/toolLimits";
@@ -328,5 +330,19 @@ describe("Todo Storage", () => {
       expect(result).toEqual({ success: true, count: 15 });
       expect(await readTodosForSessionDir(workspaceSessionDir)).toEqual(todos);
     });
+  });
+
+  it("todo_write and todo_read use the session's SessionFiles, not the disk", async () => {
+    const files = buildSessionFiles(SessionFilesMemory);
+    const sessionDir = path.join(workspaceSessionDir, "memory-session");
+    const config = { ...createTestToolConfig(sessionDir), sessionFiles: files };
+    const todos = buildTodos(3);
+
+    await createTodoWriteTool(config).execute!({ todos }, mockToolCallOptions);
+
+    const written = await files.promises.readFile(getTodoFilePath(sessionDir), "utf-8");
+    expect(JSON.parse(written)).toEqual(todos);
+    expect(await createTodoReadTool(config).execute!({}, mockToolCallOptions)).toEqual({ todos });
+    expect(await fs.readdir(workspaceSessionDir)).toEqual([]);
   });
 });

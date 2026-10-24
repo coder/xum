@@ -4320,8 +4320,8 @@ export class AgentSession {
           // any read error) as the client's baseline (#4961).
           const sessionDir = path.join(this.config.sessionsDir, this.workspaceId);
           const [todos, assistedReview] = await Promise.all([
-            readTodosForSessionDir(sessionDir),
-            readAssistedReviewForSessionDir(sessionDir),
+            readTodosForSessionDir(sessionDir, this.historyService.files),
+            readAssistedReviewForSessionDir(sessionDir, this.historyService.files),
           ]);
           windowSeed = { todos, assistedReview };
         }

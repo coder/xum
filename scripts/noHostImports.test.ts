@@ -128,10 +128,6 @@ const FROZEN_ALLOW_PAIRS = [
   "src/node/services/aiService.ts @/node/utils/fs",
   "src/node/services/aiService.ts fs/promises",
   "src/node/services/contextManagement/strategies/tokenBudget.ts @/node/runtime/runtimeHelpers",
-  "src/node/services/tools/review_pane.ts @/node/utils/writeFileAtomic",
-  "src/node/services/tools/review_pane.ts fs/promises",
-  "src/node/services/tools/todo.ts @/node/utils/writeFileAtomic",
-  "src/node/services/tools/todo.ts fs/promises",
 ];
 
 function allowMap(): Record<string, string[]> {

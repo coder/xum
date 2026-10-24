@@ -187,8 +187,6 @@ const HOST_IMPORT_ALLOW = {
   "src/node/services/contextManagement/strategies/tokenBudget.ts": [
     "@/node/runtime/runtimeHelpers",
   ],
-  "src/node/services/tools/review_pane.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
-  "src/node/services/tools/todo.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
 };
 
 const SHARED_RESTRICTED_PATHS = [AI_TOKENIZER_ENCODING_RESTRICTION];

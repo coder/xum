@@ -1,7 +1,8 @@
-import * as fs from "fs/promises";
 import * as path from "path";
 
 import type { TodoItem } from "@/common/types/tools";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 
 const TODO_FILE_NAME = "todos.json";
 
@@ -34,13 +35,17 @@ export function coerceTodoItems(value: unknown): TodoItem[] {
 }
 
 /**
- * Read todos from the workspace session directory.
+ * Read todos from the workspace session directory. `files` is the session's SessionFiles (the
+ * memory volume in the in-memory loop). Callers outside the loop keep the Node default.
  */
-export async function readTodosForSessionDir(workspaceSessionDir: string): Promise<TodoItem[]> {
+export async function readTodosForSessionDir(
+  workspaceSessionDir: string,
+  files: SessionFiles = nodeSessionFiles
+): Promise<TodoItem[]> {
   const todoFile = getTodoFilePath(workspaceSessionDir);
 
   try {
-    const content = await fs.readFile(todoFile, "utf-8");
+    const content = await files.promises.readFile(todoFile, "utf-8");
     const parsed: unknown = JSON.parse(content);
     return coerceTodoItems(parsed);
   } catch (error) {

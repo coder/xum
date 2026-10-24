@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "fs/promises";
+import * as path from "path";
 import type { ToolExecutionOptions } from "ai";
 import type { AssistedReviewHunk } from "@/common/types/review";
 import type { ReviewPaneGetToolResult, ReviewPaneUpdateToolResult } from "@/common/types/tools";
@@ -13,6 +14,8 @@ import {
   getAssistedReviewFilePath,
   readAssistedReviewForSessionDir,
 } from "@/node/services/reviewPane/assistedReviewStorage";
+import { buildSessionFiles } from "@/node/services/sessionFiles/buildSessionFiles.testHarness";
+import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
 import { TestTempDir, createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 
 type UpdateExecArgs = Parameters<
@@ -305,6 +308,33 @@ describe("review_pane tool persistence", () => {
     const paths = got.hunks.map((h) => h.path).sort();
     expect(paths).toEqual(Array.from({ length: count }, (_, i) => `src/concurrent-${i}.ts`).sort());
     expect(got.hunks).toHaveLength(count);
+  });
+
+  it("update, get and clear use the session's SessionFiles, not the disk", async () => {
+    using tempDir = new TestTempDir("review-pane-session-files");
+    const files = buildSessionFiles(SessionFilesMemory);
+    const sessionDir = path.join(tempDir.path, "memory-session");
+    const config = {
+      ...createTestToolConfig(tempDir.path, { workspaceId: "ws-files", sessionsDir: sessionDir }),
+      sessionFiles: files,
+    };
+    const update = createReviewPaneUpdateTool(config);
+    const filePath = getAssistedReviewFilePath(sessionDir);
+
+    await runUpdate(update, { operation: "replace", hunks: [{ path: "src/foo.ts" }] });
+    expect(JSON.parse(await files.promises.readFile(filePath, "utf-8"))).toEqual([
+      { path: "src/foo.ts" },
+    ]);
+    const got = await runGet(createReviewPaneGetTool(config));
+    expect(got.hunks.map((h) => h.path)).toEqual(["src/foo.ts"]);
+
+    await runUpdate(update, { operation: "replace", hunks: [] });
+    const cleared = await files.promises.readFile(filePath, "utf-8").then(
+      () => "present",
+      (error: NodeJS.ErrnoException) => error.code
+    );
+    expect(cleared).toBe("ENOENT");
+    expect(await fs.readdir(tempDir.path)).toEqual([]);
   });
 
   it("removes the on-disk file when the agent clears its hint set", async () => {

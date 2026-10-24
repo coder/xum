@@ -1,7 +1,8 @@
-import * as fs from "fs/promises";
 import * as path from "path";
 
 import type { AssistedReviewHunk } from "@/common/types/review";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 
 /**
  * On-disk format for the agent's assisted-review focus list.
@@ -69,14 +70,16 @@ export function coerceAssistedReviewHunks(value: unknown): AssistedReviewHunk[] 
 /**
  * Read the assisted-review hunks for a workspace session directory.
  * Returns `[]` on missing file or any read/parse failure so the next tool
- * call starts from a clean baseline rather than crashing.
+ * call starts from a clean baseline rather than crashing. `files` is the session's SessionFiles
+ * (the memory volume in the in-memory loop). Callers outside the loop keep the Node default.
  */
 export async function readAssistedReviewForSessionDir(
-  workspaceSessionDir: string
+  workspaceSessionDir: string,
+  files: SessionFiles = nodeSessionFiles
 ): Promise<AssistedReviewHunk[]> {
   const filePath = getAssistedReviewFilePath(workspaceSessionDir);
   try {
-    const content = await fs.readFile(filePath, "utf-8");
+    const content = await files.promises.readFile(filePath, "utf-8");
     const parsed: unknown = JSON.parse(content);
     return coerceAssistedReviewHunks(parsed);
   } catch (error) {

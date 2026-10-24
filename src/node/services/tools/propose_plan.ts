@@ -90,7 +90,10 @@ export const createProposePlanTool: ToolFactory = (config) => {
 
       if (config.workspaceId && config.workspaceSessionDir) {
         try {
-          const existingTodos = await readTodosForSessionDir(config.workspaceSessionDir);
+          const existingTodos = await readTodosForSessionDir(
+            config.workspaceSessionDir,
+            config.sessionFiles
+          );
           const completedTodos = completeInProgressTodoItems(existingTodos);
           if (completedTodos !== existingTodos) {
             // A successful propose_plan ends the planning turn immediately, so persist the
@@ -99,8 +102,9 @@ export const createProposePlanTool: ToolFactory = (config) => {
               config.workspaceId,
               config.workspaceSessionDir,
               completedTodos,
-              // Absent: setTodosForSessionDir's Node default.
-              config.sessionLocks
+              // Absent: setTodosForSessionDir's Node defaults.
+              config.sessionLocks,
+              config.sessionFiles
             );
           }
         } catch (error) {
