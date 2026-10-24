@@ -324,8 +324,9 @@ function createHttpTransport(config: MCPHttpTransportConfig): Transport {
   const url = new URL(config.url);
   // The SDK's default redirect policy (since 2.3.0) follows only redirects that stay on the
   // request's origin and keep the method (307/308, or any redirect of a GET), plus http->https on
-  // the same host with default ports, so trailing-slash and https upgrades keep working. It refuses a redirect to another origin, so custom headers (API keys) and request
-  // bodies never reach a host the user did not configure (CVE-2026-111769, #7384). Do not set
+  // the same host with default ports, so trailing-slash and https upgrades keep working. It
+  // refuses a redirect to another origin, so custom headers (API keys) and request bodies never
+  // reach a host the user did not configure (CVE-2026-111769, #7384). Do not set
   // `redirectPolicy: "follow"`: it restores that leak. A server that moves to another origin
   // needs its new URL in the config.
   const requestInit: RequestInit = {
