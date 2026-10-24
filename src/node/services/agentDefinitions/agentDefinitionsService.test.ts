@@ -8,7 +8,7 @@ import { AgentIdSchema } from "@/common/orpc/schemas";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
-import { RuntimeError } from "@/node/runtime/Runtime";
+import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
 import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import { log } from "@/node/services/log";
@@ -28,6 +28,21 @@ import { resolveToolPolicyForAgent } from "./resolveToolPolicy";
 import { resolveAgentInheritanceChain } from "./resolveAgentInheritanceChain";
 // The Node layer: these tests read through host runtimes.
 import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
+
+/** The Node layer, except that its host-local runtimes read `~/` as `home`: shows which runtime a scan used. */
+function runtimeFactoryWithHome(home: string): RuntimeFactory {
+  return {
+    ...runtimeFactory,
+    createLocalRuntime: (workspacePath) => {
+      const local = runtimeFactory.createLocalRuntime(workspacePath);
+      return Object.assign(Object.create(local) as Runtime, {
+        resolvePath: (target: string) =>
+          local.resolvePath(target.startsWith("~/") ? path.join(home, target.slice(2)) : target),
+      });
+    },
+  };
+}
 
 async function writeAgent(root: string, id: string, name: string): Promise<void> {
   await fs.mkdir(root, { recursive: true });
@@ -1022,6 +1037,29 @@ base: a
       expect(shared).toHaveLength(1);
       expect(shared[0]?.name).toBe("Shared (project)");
       expect(shared[0]?.pluginName).toBeUndefined();
+    });
+
+    test("resolves plugin containers through the host-local runtime of the RuntimeFactory it was given", async () => {
+      using home = new DisposableTempDir("agent-defs-plugin-factory");
+      await writePluginWithAgent(
+        path.join(home.path, "plugins"),
+        "probe",
+        "factory-probe",
+        "Probe"
+      );
+      const roots = {
+        projectRoots: [],
+        globalRoot: path.join(home.path, "agents"),
+        // Tilde form: only the factory's host-local runtime maps it into the temp home.
+        globalPluginRoots: ["~/plugins"],
+      };
+
+      const agents = await discoverAgentDefinitions(new LocalRuntime(home.path), home.path, {
+        roots,
+        runtimeFactory: runtimeFactoryWithHome(home.path),
+      });
+
+      expect(agents.find((a) => a.id === "factory-probe")?.pluginName).toBe("probe");
     });
 
     // #6426: project plugin agents load only in a trusted project, in the listing and in a
