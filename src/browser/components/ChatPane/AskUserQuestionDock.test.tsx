@@ -418,4 +418,22 @@ describe("AskUserQuestionDock", () => {
     expect(view.queryByRole("button", { name: "Storage" })).toBeNull();
     expect(view.getByText(PLATFORMS.question)).toBeTruthy();
   });
+
+  test("when the active question set closes, the next opens where its card was left", () => {
+    const rowX = questionRow("row-x", "ask-x", [REGION, PLATFORMS]);
+    messages = [ROW_A, executing(rowX)];
+    const view = render(dock(workspaceId), { wrapper: Wrapper });
+    // The card moves on to its second question, then its call joins the form.
+    fireEvent.click(view.getByText("US East"));
+    messages = [ROW_A, rowX];
+    view.rerender(dock(workspaceId));
+    expect(view.getByText(STORAGE.question)).toBeTruthy();
+
+    // Another client answered ask-a, the set the user is on.
+    messages = [ROW_A, rowX, ANSWER_A];
+    view.rerender(dock(workspaceId));
+
+    expect(view.getByText(PLATFORMS.question)).toBeTruthy();
+    expect(view.queryByText(REGION.question)).toBeNull();
+  });
 });
