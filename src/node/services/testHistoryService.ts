@@ -57,3 +57,14 @@ export async function createTestHistoryService(options?: {
     cleanup: () => fs.rm(tempDir, { recursive: true, force: true }),
   };
 }
+
+/**
+ * A HistoryService on an existing Config's root (no temp dir) whose locks come from `locks`: a
+ * test that runs several backends on one root gives one of them withForeignHolders.
+ */
+export function historyServiceWithLocks(
+  config: Config,
+  locks: Layer.Layer<SessionLocksTag>
+): HistoryService {
+  return new HistoryService(config, buildSessionFiles(SessionFilesNode), buildSessionLocks(locks));
+}

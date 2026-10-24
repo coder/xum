@@ -3,10 +3,9 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import {
-  acquireCrossProcessLock,
   CrossProcessLockTimeoutError,
-  inspectCrossProcessLock,
-} from "@/node/utils/main/crossProcessLock";
+  type SessionLocks,
+} from "@/node/services/sessionLocks/sessionLocks";
 import assert from "node:assert/strict";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
@@ -446,9 +445,10 @@ const WORKSPACE_TURN_OWNER_LOCK_STALE_MS = 5 * 60 * 1000;
 class OwnedWorkspaceTurnHandleStore extends TaskHandleStore {
   constructor(
     config: Config,
-    private readonly afterUpsert: (record: WorkspaceTurnTaskHandleRecord) => Promise<void>
+    private readonly afterUpsert: (record: WorkspaceTurnTaskHandleRecord) => Promise<void>,
+    locks: SessionLocks
   ) {
-    super(config);
+    super(config, locks);
   }
 
   override async upsertWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
@@ -713,8 +713,12 @@ export class WorkspaceTurnManager {
     private readonly streamManager?: StreamManager,
     private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
   ) {
-    this.taskHandleStore = new OwnedWorkspaceTurnHandleStore(config, (record) =>
-      this.afterHandleWrite(record)
+    // Phase 4: every lock of this manager (publication, live owner, its probe) comes from the
+    // history service's SessionLocks, so a test layer can play another backend's owner.
+    this.taskHandleStore = new OwnedWorkspaceTurnHandleStore(
+      config,
+      (record) => this.afterHandleWrite(record),
+      historyService.locks
     );
   }
 
@@ -737,7 +741,7 @@ export class WorkspaceTurnManager {
   private async acquireTurnOwnerLock(handleId: string): Promise<"held" | "foreign-live"> {
     if (this.turnOwnerLocks.has(handleId)) return "held";
     try {
-      const release = await acquireCrossProcessLock({
+      const release = await this.historyService.locks.acquireCrossProcessLock({
         lockPath: workspaceTurnOwnerLockPath(this.config.rootDir, handleId),
         acquireTimeoutMs: 0,
         staleMs: WORKSPACE_TURN_OWNER_LOCK_STALE_MS,
@@ -4851,7 +4855,7 @@ export class WorkspaceTurnManager {
    */
   private async keepIfOwnedElsewhere(handleId: string): Promise<"keep" | undefined> {
     if (this.turnOwnerLocks.has(handleId)) return undefined;
-    const lock = await inspectCrossProcessLock(
+    const lock = await this.historyService.locks.inspectCrossProcessLock(
       workspaceTurnOwnerLockPath(this.config.rootDir, handleId)
     );
     return lock.state === "held" ? "keep" : undefined;
