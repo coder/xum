@@ -1,10 +1,11 @@
-import React, { useSyncExternalStore } from "react";
+import React from "react";
 import { cn } from "@/common/lib/utils";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { LEFT_SIDEBAR_COLLAPSED_WIDTH_PX, LEFT_SIDEBAR_DEFAULT_WIDTH_PX } from "@/constants/layout";
 import ProjectSidebar from "../ProjectSidebar/ProjectSidebar";
 import { TitleBar } from "../TitleBar/TitleBar";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
+import { useNarrowViewport } from "@/browser/hooks/useNarrowViewport";
 
 interface LeftSidebarProps {
   collapsed: boolean;
@@ -14,18 +15,6 @@ interface LeftSidebarProps {
   onStartResize?: (e: React.PointerEvent) => void;
   sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>;
   workspaceRecency: Record<string, number>;
-}
-
-const MOBILE_OVERLAY_QUERY = "(max-width: 768px)";
-
-function readMobileOverlayQuery(): boolean {
-  return typeof window !== "undefined" && window.matchMedia(MOBILE_OVERLAY_QUERY).matches;
-}
-
-function subscribeToMobileOverlayQuery(onChange: () => void): () => void {
-  const query = window.matchMedia(MOBILE_OVERLAY_QUERY);
-  query.addEventListener("change", onChange);
-  return () => query.removeEventListener("change", onChange);
 }
 
 export function LeftSidebar(props: LeftSidebarProps) {
@@ -39,12 +28,9 @@ export function LeftSidebar(props: LeftSidebarProps) {
   } = props;
   // Match the CSS gate for the mobile "overlay" sidebar (width-only, any pointer
   // type); we don't show a drag handle in that mode since CSS pins the width. Subscribed, so a
-  // window resized into the overlay width also gets the drawer's Escape handling.
-  const isMobileOverlay = useSyncExternalStore(
-    subscribeToMobileOverlayQuery,
-    readMobileOverlayQuery,
-    () => false
-  );
+  // window resized into the overlay width also gets the drawer's Escape handling. The same hook
+  // picks App's drawer state (useLeftSidebarState), so the two cannot disagree.
+  const isMobileOverlay = useNarrowViewport();
 
   // The drawer covers the page like a modal, so Escape closes it the way a backdrop tap does
   // (#5685), unless a popover, menu or dialog inside it owns Escape.

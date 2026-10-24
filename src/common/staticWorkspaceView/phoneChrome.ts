@@ -31,7 +31,8 @@ export interface PhoneChrome {
  * The live app picks its phone layout in JavaScript: a coarse pointer and at most 480 px
  * (PHONE_HEADER_QUERY, WorkspaceMenuBar.tsx). Captured at 412 px; the generator fails unless every
  * `checked` width gives the same tree and `max` + 1 a different one. So the view must stay in
- * `min`..`max`, coarse pointer only. It is the collapsed-sidebar layout (the phone default): with
- * LEFT_SIDEBAR_COLLAPSED_KEY persisted as false the page mounts the sidebar, so no view then.
+ * `min`..`max`, coarse pointer only. It is the collapsed-sidebar layout: at phone widths the app
+ * always mounts with the sidebar drawer closed (useLeftSidebarState ignores the wide sidebar's
+ * persisted LEFT_SIDEBAR_COLLAPSED_KEY there), so the view does not depend on that key.
  */
 export const PHONE_CHROME_WIDTHS = { min: 360, max: 480, checked: [360, 390, 412, 480] } as const;

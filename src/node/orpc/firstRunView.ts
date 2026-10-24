@@ -29,9 +29,10 @@ import { VERSION } from "@/version";
  *   (`z-[1500]`).
  * - The left sidebar and the shell header come from the live 1200 px first paint (owner decision
  *   10-14), with runtime attributes and Radix ScrollArea pieces gone. Both sidebar states are here:
- *   the <style> shows the one App.tsx starts with (collapsed at or below
- *   `NARROW_VIEWPORT_MAX_WIDTH_PX`) or the saved one the early script sets in `data-sidebar`. A
- *   saved custom width is not copied (leftover).
+ *   the <style> shows the one App.tsx starts with: always collapsed at or below
+ *   `NARROW_VIEWPORT_MAX_WIDTH_PX` (the drawer starts closed and ignores the saved flag,
+ *   useLeftSidebarState), above it the saved one the early script sets in `data-sidebar`, else
+ *   expanded. A saved custom width is not copied (leftover).
  * - The logo's fill follows `data-theme` (set before the app by index.html), as ProjectSidebar picks
  *   its dark or light logo from the theme.
  * - The live wizard focuses its first button and shows a focus ring. The inert copy has none.
@@ -50,9 +51,8 @@ export function firstRunViewHtml(gitDescribe: string): string {
   const hide = "{ display: none !important }";
   return `<div id="${FIRST_RUN_VIEW_ID}" inert style="position:fixed;inset:0;z-index:1500;overflow:hidden">
   <style>
-    @media (max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px) { ${view}:not([data-sidebar="expanded"]) [data-pre="e"], ${view} [data-pre="handle"] ${hide} }
-    @media (min-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX + 1}px) { ${view}:not([data-sidebar="collapsed"]) [data-pre="c"] ${hide} }
-    ${view}[data-sidebar="collapsed"] [data-pre="e"], ${view}[data-sidebar="expanded"] [data-pre="c"] ${hide}
+    @media (max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px) { ${view} [data-pre="e"], ${view} [data-pre="handle"] ${hide} }
+    @media (min-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX + 1}px) { ${view}:not([data-sidebar="collapsed"]) [data-pre="c"], ${view}[data-sidebar="collapsed"] [data-pre="e"] ${hide} }
     ${view} [data-pre-logo] { color: #000 } :root[data-theme="dark"] ${view} [data-pre-logo], :root[data-theme$="-dark"] ${view} [data-pre-logo] { color: #fff }
   </style>
   <div class="h-full">

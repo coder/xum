@@ -54,9 +54,10 @@ export function expandRightSidebar(workspaceId: string): void {
 }
 
 /**
- * Expand the left sidebar (project tree). The app defaults it to collapsed at
- * mobile widths, so stories whose play functions click sidebar controls must
- * force it open to pass under Pixel's phone viewport.
+ * Expand the wide (inline) left sidebar. The app defaults it to collapsed when it starts at
+ * phone widths. At phone widths (<= 768 px, Pixel's phone and tablet variants) the sidebar is a
+ * drawer that ignores this saved state and starts closed: plays that click sidebar controls there
+ * open it with `openLeftSidebar()` from `storyPlayHelpers.ts`.
  */
 export function expandLeftSidebar(): void {
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, false);
