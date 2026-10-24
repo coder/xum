@@ -36,7 +36,8 @@ export async function openLeftSidebar(canvasElement: HTMLElement): Promise<void>
   );
   const toggle = canvas.queryByTestId("settings-button") ? null : openToggle();
   if (toggle) {
-    await userEvent.click(toggle);
+    // A native click: userEvent's synthetic hover could leave the toggle's tooltip in a snapshot.
+    toggle.click();
     await canvas.findByTestId("settings-button", {}, { timeout: 10000 });
   }
 }

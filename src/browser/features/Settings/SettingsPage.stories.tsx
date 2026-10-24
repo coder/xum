@@ -46,21 +46,6 @@ const SECTION_CONTENT_MATCHERS: Record<BaseSectionLabel, RegExp> = {
   Backup: /Settings backup/i,
 };
 
-async function openSettings(canvasElement: HTMLElement): Promise<HTMLElement> {
-  const canvas = within(canvasElement);
-  // Phone renders start with the left sidebar (and its settings button) collapsed.
-  await waitFor(() =>
-    expect(
-      canvas.queryByTestId("settings-button") ??
-        canvas.queryByRole("button", { name: "Open sidebar menu" })
-    ).not.toBeNull()
-  );
-  if (!canvas.queryByTestId("settings-button")) {
-    await userEvent.click(canvas.getByRole("button", { name: "Open sidebar menu" }));
-  }
-  return openSettingsDialog(canvasElement);
-}
-
 async function clickSectionButton(dialog: HTMLElement, sectionLabel: string): Promise<void> {
   await userEvent.click(
     await within(dialog).findByRole("button", { name: new RegExp(`^${sectionLabel}$`, "i") })
@@ -115,7 +100,7 @@ export const SectionsSmoke: AppStory = {
   parameters: { pixel: PIXEL_DISABLED },
   render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
-    const dialog = await openSettings(canvasElement);
+    const dialog = await openSettingsDialog(canvasElement);
 
     for (const sectionLabel of BASE_SECTION_LABELS) {
       await clickSectionButton(dialog, sectionLabel);
@@ -148,7 +133,7 @@ export const EscapeInInlineEditor: AppStory = {
     />
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
-    const dialog = await openSettings(canvasElement);
+    const dialog = await openSettingsDialog(canvasElement);
     const settings = within(dialog);
     await clickSectionButton(dialog, "Models");
 
@@ -221,7 +206,7 @@ export const HeartbeatDefaults: AppStory = {
     />
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
-    const dialog = await openSettings(canvasElement);
+    const dialog = await openSettingsDialog(canvasElement);
     await clickSectionButton(dialog, "Heartbeats");
     const settings = within(dialog);
     const threshold = await settings.findByLabelText("Default heartbeat threshold in minutes");
@@ -261,7 +246,7 @@ export const PhoneFullScreen: AppStory = {
   parameters: phoneParameters,
   play: async ({ canvasElement, parameters }) => {
     await expect(parameters.pixel).toEqual(phoneParameters.pixel);
-    const dialog = await openSettings(canvasElement);
+    const dialog = await openSettingsDialog(canvasElement);
     await clickSectionButton(dialog, "Providers");
     await assertSectionBodyRendered(dialog, "Providers");
     // Coder model routing selects switch to full width below the sm breakpoint.

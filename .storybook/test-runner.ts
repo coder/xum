@@ -127,6 +127,106 @@ async function assertTouchResizesRightSidebar(page: StoryPage) {
   }
 }
 
+// The iPhone Duo cover display keeps a status and camera column on its right edge (an 84 px
+// right safe-area inset in Apple's simulator) at a width where xum shows its phone layout.
+const SIDE_INSET_PX = 84;
+const SIDE_INSET_VIEWPORT = { width: 466, height: 700 };
+const SIDE_INSET_SHEETS: Record<string, string> = {
+  "settings-settingspage--phone-full-screen": "Settings",
+  "app-phoneviewports--i-phone-16-e-analytics-sheet": "Analytics",
+};
+const SIDE_INSET_TOAST_STORY = "app-components-activegoalswarningtoast--above-threshold";
+
+/**
+ * Phone sheets and toasts are portaled out of the app shell, which pads the side safe areas, so
+ * they must keep their controls clear of a right inset themselves, while a sheet's background
+ * still fills the width. Plays cannot set safe-area insets; CDP can (env() reads the override).
+ */
+async function assertClearsRightInset(page: StoryPage, target: { sheet: string } | "toast") {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    await client.send("Emulation.setSafeAreaInsetsOverride", {
+      insets: { top: 0, right: SIDE_INSET_PX, bottom: 34, left: 0 },
+    });
+    await page.setViewportSize(SIDE_INSET_VIEWPORT);
+    await page.waitForFunction(
+      (width) => matchMedia("(pointer: coarse)").matches && innerWidth === width,
+      SIDE_INSET_VIEWPORT.width,
+      { timeout: 5000 }
+    );
+    const root =
+      target === "toast"
+        ? page.getByRole("status").locator("..")
+        : page.getByRole("dialog", { name: target.sheet });
+    if (target !== "toast") {
+      // The md+ dialog turns into the full-width phone sheet once the new width lays out.
+      await page.waitForFunction(
+        (dialog) => dialog?.getBoundingClientRect().left === 0,
+        await root.elementHandle({ timeout: 5000 }),
+        { timeout: 5000 }
+      );
+    }
+    const problems = await root.evaluate(
+      (element, args) => {
+        const found: string[] = [];
+        const limit = innerWidth - args.inset;
+        const box = element.getBoundingClientRect();
+        if (args.toast) {
+          // max(1rem, inset) on each side: the toast's left edge stays on screen as well.
+          if (box.right > limit + 0.5) found.push(`toast ends at ${Math.round(box.right)}px`);
+          if (box.left < 16 - 0.5) found.push(`toast starts at ${Math.round(box.left)}px`);
+          return found;
+        }
+        if (Math.round(box.right) !== innerWidth) {
+          found.push(`sheet background ends at ${Math.round(box.right)}px`);
+        }
+        const controls = element.querySelectorAll<HTMLElement>(
+          "button, a[href], input, select, textarea, [role=combobox], [role=switch], [role=tab]"
+        );
+        for (const control of controls) {
+          const rect = control.getBoundingClientRect();
+          if (rect.width === 0 || getComputedStyle(control).visibility === "hidden") continue;
+          let left = rect.left;
+          let right = rect.right;
+          for (let el = control.parentElement; el; el = el.parentElement) {
+            if (getComputedStyle(el).overflowX !== "visible") {
+              const clip = el.getBoundingClientRect();
+              left = Math.max(left, clip.left);
+              right = Math.min(right, clip.right);
+            }
+            if (el === element) break;
+          }
+          // Scrolled out of its container: not on screen.
+          if (right <= left) continue;
+          if (right > limit + 0.5) {
+            const name = control.getAttribute("aria-label") ?? control.textContent ?? control.tagName;
+            found.push(`${name.trim().slice(0, 40)} ends at ${Math.round(right)}px`);
+          }
+        }
+        return found;
+      },
+      { inset: SIDE_INSET_PX, toast: target === "toast" }
+    );
+    // Compare a string: the page's array has another realm's prototype, so deepEqual always fails.
+    assert.equal(
+      problems.join("; "),
+      "",
+      `Nothing may sit under a ${SIDE_INSET_PX}px right safe-area inset (limit ${
+        SIDE_INSET_VIEWPORT.width - SIDE_INSET_PX
+      }px)`
+    );
+  } finally {
+    await client.send("Emulation.setSafeAreaInsetsOverride", {
+      insets: { top: 0, right: 0, bottom: 0, left: 0 },
+    });
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+  }
+}
+
 const config: TestRunnerConfig = {
   async preVisit(page, context) {
     // exposeFunction throws on a second registration, so register once per Playwright page.
@@ -136,6 +236,13 @@ const config: TestRunnerConfig = {
     await page.exposeFunction("__storybookUnhover", () => page.mouse.move(0, 0));
   },
   async postVisit(page, context) {
+    const insetSheet = SIDE_INSET_SHEETS[context.id];
+    if (insetSheet || context.id === SIDE_INSET_TOAST_STORY) {
+      if (page.context().browser()?.browserType().name() === "chromium") {
+        await assertClearsRightInset(page, insetSheet ? { sheet: insetSheet } : "toast");
+      }
+      return;
+    }
     if (context.id === PHONE_FOOTER_TOUCH_STORY) {
       if (page.context().browser()?.browserType().name() === "chromium") {
         await assertPhoneFooterTouchTargets(page);

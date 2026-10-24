@@ -22,10 +22,10 @@ import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js"
 import { createMockORPCClient } from "./mocks/orpc";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
+import { openLeftSidebar } from "./storyPlayHelpers";
 import {
   collapseLeftSidebar,
   collapseRightSidebar,
-  expandLeftSidebar,
   expandProjects,
   selectWorkspace,
 } from "./helpers/uiState";
@@ -81,7 +81,7 @@ function setup(largeRows = LARGE_ROWS): APIClient {
 }
 
 async function switchToLargeWorkspace(canvasElement: HTMLElement): Promise<void> {
-  expandLeftSidebar();
+  await openLeftSidebar(canvasElement);
   const row = await waitFor(async () => {
     const element = canvasElement.querySelector<HTMLElement>(
       `[data-workspace-id="${largeWorkspace.id}"][role="button"]`

@@ -8,7 +8,10 @@ import {
 } from "@/browser/stories/helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { setWorkspaceDrafts } from "@/browser/stories/helpers/drafts";
-import { waitForChatInputAutofocusDone } from "@/browser/stories/storyPlayHelpers";
+import {
+  openLeftSidebar,
+  waitForChatInputAutofocusDone,
+} from "@/browser/stories/storyPlayHelpers";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
@@ -322,8 +325,9 @@ export const FlatChatList: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        // Keep the sidebar visible at the phone width: no selected workspace
-        // (mobile shows the chat over the sidebar) and the sidebar expanded.
+        // Keep the sidebar visible: no selected workspace (mobile shows the chat
+        // over the sidebar) and the wide sidebar expanded; the play opens the
+        // phone drawer.
         clearWorkspaceSelection();
         collapseRightSidebar();
         updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, false);
@@ -382,6 +386,7 @@ export const FlatChatList: AppStory = {
   // actually on screen, so a viewport variant cannot silently snapshot the
   // wrong UI (e.g. the sidebar hidden behind a selected chat on mobile).
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    await openLeftSidebar(canvasElement);
     await waitFor(() => {
       if (!canvasElement.querySelector('[data-testid="workspace-project-avatar-alpha-pinned"]')) {
         throw new Error("Expected a project avatar on a flat-list chat row");

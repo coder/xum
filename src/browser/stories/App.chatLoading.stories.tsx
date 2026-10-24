@@ -7,12 +7,11 @@ import { createMockORPCClient } from "./mocks/orpc";
 import { createAssistantMessage } from "./mocks/messages";
 import type { ProjectConfig } from "@/common/types/project";
 import { createWorkspace, groupWorkspacesByProject, STABLE_TIMESTAMP } from "./mocks/workspaces";
-import { waitForAppFadeInDone } from "./storyPlayHelpers";
+import { openLeftSidebar, waitForAppFadeInDone } from "./storyPlayHelpers";
 import {
   clearWorkspaceSelection,
   collapseLeftSidebar,
   collapseRightSidebar,
-  expandLeftSidebar,
   expandProjects,
   selectWorkspace,
 } from "./helpers/uiState";
@@ -32,7 +31,7 @@ async function checkPhoneViewport(context: Parameters<NonNullable<AppStory["play
 }
 
 async function switchWorkspace(canvasElement: HTMLElement, workspaceId: string) {
-  expandLeftSidebar();
+  await openLeftSidebar(canvasElement);
   const row = await waitFor(async () => {
     const element = canvasElement.querySelector<HTMLElement>(
       '[data-workspace-id="' + workspaceId + '"][role="button"]'
@@ -774,7 +773,7 @@ function createCreationPendingStory(): AppStory {
     const textarea = () => canvasElement.querySelector<HTMLTextAreaElement>("textarea");
 
     await step("Open the project creation view", async () => {
-      expandLeftSidebar();
+      await openLeftSidebar(canvasElement);
       const projectRow = await waitFor(async () => {
         const element = canvasElement.querySelector<HTMLElement>(
           '[data-project-path="' + projectPath + '"][aria-controls]'
