@@ -750,8 +750,8 @@ function candidateSkillDir(
 
 /**
  * The folder of skill `name` in a scan root for a lookup. A plugin skill can live in a
- * snake_case folder (pluginSkillNameOfFolder); the kebab-case folder wins when both exist,
- * as in discovery (pluginSkillFolderNames). Plugin roots are host-local or a snapshot, so the
+ * snake_case folder (pluginSkillNameOfFolder); the kebab-case folder wins when it is a
+ * directory, as in discovery (pluginSkillFolderNames). Plugin roots are host-local or a snapshot, so the
  * extra stat costs no remote round trip.
  */
 async function lookupCandidateSkillDir(
@@ -791,13 +791,23 @@ function candidateSkillFile(
 }
 
 /** Each folder's skill name: plugin folders can be snake_case (pluginSkillNameOfFolder). */
-function candidateSkillFolderNames(
-  candidate: Pick<AgentSkillScanCandidate, "pluginRoot" | "singleSkillName">,
+async function candidateSkillFolderNames(
+  candidate: Pick<
+    AgentSkillScanCandidate,
+    "runtime" | "pluginRoot" | "singleSkillName" | "pluginFs"
+  >,
+  resolvedRoot: string,
   folders: string[]
-): Array<{ folder: string; name: string }> {
-  return candidate.pluginRoot != null && candidate.singleSkillName == null
-    ? pluginSkillFolderNames(folders)
-    : folders.map((folder) => ({ folder, name: folder }));
+): Promise<Array<{ folder: string; name: string }>> {
+  if (candidate.pluginRoot == null || candidate.singleSkillName != null) {
+    return folders.map((folder) => ({ folder, name: folder }));
+  }
+  return pluginSkillFolderNames(folders, (folder) =>
+    isCandidateSkillDirectory(
+      candidate,
+      candidate.runtime.normalizePath(folder, resolvedRoot)
+    ).catch(() => false)
+  );
 }
 
 /** The skill folder names of a scan root: its own name when it is a single skill. */
@@ -1157,8 +1167,9 @@ export async function discoverAgentSkills(
     const resolvedRoot = await resolveCandidateRoot(scan);
     const folders = await listCandidateSkillNames(scan, resolvedRoot, workspacePath);
 
-    for (const { folder: directoryNameRaw, name: skillNameRaw } of candidateSkillFolderNames(
+    for (const { folder: directoryNameRaw, name: skillNameRaw } of await candidateSkillFolderNames(
       scan,
+      resolvedRoot,
       folders
     )) {
       const nameParsed = SkillNameSchema.safeParse(skillNameRaw);

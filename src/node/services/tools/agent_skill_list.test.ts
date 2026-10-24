@@ -432,6 +432,41 @@ describe("agent_skill_list", () => {
     });
   });
 
+  it("lists a plugin skill in a snake_case folder under its kebab-case name", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-snake-home");
+    using project = new TestTempDir("test-agent-skill-list-snake-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-snake-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        // google/elephant-goldfish-model: skills/egm_bootstrap/SKILL.md has `name: egm-bootstrap`.
+        const pluginDir = await writePlugin(path.join(xumHomeDir.path, "plugins"), "egm", []);
+        const skillDir = path.join(pluginDir, "skills", "egm_bootstrap");
+        await fs.mkdir(skillDir, { recursive: true });
+        await fs.writeFile(
+          path.join(skillDir, "SKILL.md"),
+          "---\nname: egm-bootstrap\ndescription: Bootstrap\n---\nBody\n"
+        );
+
+        const tool = createAgentSkillListTool({
+          ...createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          }),
+        });
+        const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(getSkill(result.skills, "egm-bootstrap").description).toBe("Bootstrap");
+      });
+    });
+  });
+
   it("lists a plugin skills path that holds SKILL.md as one skill", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-single-home");
     using project = new TestTempDir("test-agent-skill-list-single-project");

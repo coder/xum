@@ -440,16 +440,21 @@ export function pluginSkillFolderAlias(name: string): string | undefined {
 
 /**
  * The skill name of each plugin skill folder. A snake_case folder is dropped when the root also
- * has the kebab-case folder: lookups try that folder first, so it is the one that loads.
+ * has the kebab-case folder as a directory (`isDirectory` follows symlinks): lookups try that
+ * folder first and fall back only when it is not a directory, so the two always agree.
  */
-export function pluginSkillFolderNames(
-  folders: readonly string[]
-): Array<{ folder: string; name: string }> {
+export async function pluginSkillFolderNames(
+  folders: readonly string[],
+  isDirectory: (folder: string) => Promise<boolean>
+): Promise<Array<{ folder: string; name: string }>> {
   const present = new Set(folders);
-  return folders.flatMap((folder) => {
+  const entries: Array<{ folder: string; name: string }> = [];
+  for (const folder of folders) {
     const name = pluginSkillNameOfFolder(folder);
-    return name !== folder && present.has(name) ? [] : [{ folder, name }];
-  });
+    if (name !== folder && present.has(name) && (await isDirectory(name))) continue;
+    entries.push({ folder, name });
+  }
+  return entries;
 }
 
 /**
@@ -472,7 +477,14 @@ export async function listPluginSkillFolders(
       .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
       .map((entry) => entry.name)
       .sort((a, b) => a.localeCompare(b));
-    return pluginSkillFolderNames(folders).map(({ folder, name }) => ({
+    const isDirectory = (folder: string) =>
+      pluginFs()
+        .stat(path.join(root.dir, folder))
+        .then(
+          (stat) => stat.isDirectory(),
+          () => false
+        );
+    return (await pluginSkillFolderNames(folders, isDirectory)).map(({ folder, name }) => ({
       name,
       folder,
       dir: path.join(root.dir, folder),
