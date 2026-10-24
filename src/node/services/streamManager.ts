@@ -1803,7 +1803,12 @@ export class StreamManager {
     this.tokenTracker = options.tokenTracker ?? new StreamingTokenTracker();
     this.streamTextOverride = options.streamText;
     this.turnEventEmitter = new TurnEventEmitter(this.turnEvents, {
-      tokenTracker: this.tokenTracker,
+      // Forward to the field at call time: whitebox tests replace tokenTracker after
+      // construction (Reflect.set), and the emitter must use the same tracker.
+      tokenTracker: {
+        setModel: (model, metadataModel) => this.tokenTracker.setModel(model, metadataModel),
+        countTokens: (text) => this.tokenTracker.countTokens(text),
+      },
       toolCallDisplayRegistry: this.toolCallDisplayRegistry,
       getStream: (id) => this.workspaceStreams.get(id),
       flushPartialWrite: (id, info) => this.flushPartialWrite(id, info),
