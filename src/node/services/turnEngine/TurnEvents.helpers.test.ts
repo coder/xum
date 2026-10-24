@@ -5,12 +5,9 @@ import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import { log } from "@/node/services/log";
 
-import {
-  applyNestedToolEvent,
-  buildStreamStartEvent,
-  shouldReplayPartAfter,
-  type WorkspaceId,
-} from "./streamManager";
+import type { WorkspaceId } from "@/node/services/streamManager";
+
+import { applyNestedToolEvent, buildStreamStartEvent, shouldReplayPartAfter } from "./TurnEvents";
 
 const WORKSPACE_ID = "event-helpers-ws" as WorkspaceId;
 
