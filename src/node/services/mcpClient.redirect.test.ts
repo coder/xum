@@ -89,6 +89,8 @@ test("a redirect to another origin fails and never sends the custom headers ther
     (error: unknown) => error
   );
   expect(failure).toBeInstanceOf(Error);
+  // The refusal names the target, so the user can put the final URL in the config.
+  expect((failure as Error).message).toContain(`${otherUrl}/mcp`);
   expect(otherRequests.map((headers) => headers["x-api-key"])).not.toContain("secret");
 });
 

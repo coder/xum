@@ -4899,7 +4899,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "1. **Test the command manually** — Run the command in your terminal to verify it works",
       "2. **Check dependencies** — Ensure required packages are installed (`npx -y` downloads on first run)",
       "3. **Use the Test button** — Settings → MCP shows connection errors inline",
-      "4. **Use the final URL of a remote server** — Xum follows a redirect only within the same origin (scheme, host and port; `http` to `https` on the same host also works). A redirect to another origin fails with `Redirect to <url> not followed`, so your headers never reach a host you did not configure. Put that URL in the server config.",
+      "4. **Use the final URL of a remote server** — Xum follows a redirect of a remote MCP server only when it stays on the same origin (scheme, host and port) and keeps the request method (a 307 or 308, or any redirect of a GET). `http` to `https` on the same host also works when neither URL has a port. Any other redirect fails with `Redirect to <url> not followed`, so your headers never reach a host you did not configure. Put that URL in the server config.",
       "",
       "## Claude Design experiment",
       "",
