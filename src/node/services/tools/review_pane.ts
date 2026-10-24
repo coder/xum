@@ -19,7 +19,8 @@ import {
   getAssistedReviewFilePath,
   readAssistedReviewForSessionDir,
 } from "@/node/services/reviewPane/assistedReviewStorage";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 /**
  * Persistence for the agent's assisted-review focus list.
@@ -33,7 +34,7 @@ import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks"
  * accidentally truncates prior flagged regions.
  *
  * The read/apply/write sequence (not just the write) goes through
- * `workspaceFileLocks` so concurrent `operation: "add"` calls from sibling
+ * the workspace FIFO (`SessionLocks.workspaceFiles`) so concurrent `operation: "add"` calls from sibling
  * agents cannot both read the same baseline and clobber each other.
  */
 async function writeAssistedReviewFile(
@@ -62,9 +63,10 @@ async function applyReviewPaneUpdateForSessionDir(
   workspaceId: string,
   workspaceSessionDir: string,
   args: ReviewPaneUpdateArgs,
+  locks: SessionLocks,
   pathContext?: ProjectRelativePathContext
 ): Promise<{ hunks: AssistedReviewHunk[]; rejected: string[] }> {
-  return workspaceFileLocks.withLock(workspaceId, async () => {
+  return locks.workspaceFiles.withLock(workspaceId, async () => {
     // Read prior state from disk so `operation: "add"` sees the right
     // baseline across app/backend restarts. The whole read-modify-write is
     // locked so concurrent `add` calls compose instead of last-writer-wins.
@@ -188,6 +190,8 @@ export const createReviewPaneUpdateTool: ToolFactory = (config) => {
         config.workspaceId,
         config.workspaceSessionDir,
         args,
+        // mutation-equivalent: sessionLocks is a SessionLocks object or undefined, so ?? and || agree
+        config.sessionLocks ?? nodeSessionLocks,
         {
           projectPath: config.workspaceProjectPath,
           executionRootPath: config.workspaceExecutionRootPath,

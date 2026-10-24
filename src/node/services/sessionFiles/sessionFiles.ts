@@ -27,6 +27,8 @@ export interface SessionFiles {
     | "rmdir"
     | "stat"
     | "unlink"
+    // The auto-retry preference of agentSession.ts, a plain write that tests spy on.
+    | "writeFile"
   >;
   readonly constants: typeof nodeFs.constants;
   // Sync on purpose: the callers keep no await between an ownership check and the write.

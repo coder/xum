@@ -170,10 +170,13 @@ ENV MUX_ROOT=/root/.mux
 RUN node --experimental-async-context-frame -e 'const { AsyncLocalStorage } = require("node:async_hooks"); if (!String(AsyncLocalStorage).includes("AsyncContextFrame")) { console.error("AsyncContextFrame is not active"); process.exit(1); }'
 
 # Fail the build if this Node is unsupported or affected by CVE-2026-111497 (crafted Brotli data
-# runs code). The check reuses the CLI's table of fixed releases (src/cli/nodeVersion.ts).
-COPY --from=builder /app/dist/cli/nodeVersion.js /tmp/nodeVersion.js
-RUN node -e 'const warning = require("/tmp/nodeVersion.js").nodeVersionWarning(process.versions); if (warning !== undefined) { console.error(warning); process.exit(1); }' && \
-    rm /tmp/nodeVersion.js
+# runs code). The check reuses the CLI's warning (src/cli/nodeVersion.ts) and its table of fixed
+# releases (src/node/utils/nodeBrotliFix.ts). Both files keep their dist/ paths, because the
+# compiled nodeVersion.js requires the table by a relative path.
+COPY --from=builder /app/dist/cli/nodeVersion.js /tmp/node-check/cli/nodeVersion.js
+COPY --from=builder /app/dist/node/utils/nodeBrotliFix.js /tmp/node-check/node/utils/nodeBrotliFix.js
+RUN node -e 'const warning = require("/tmp/node-check/cli/nodeVersion.js").nodeVersionWarning(process.versions); if (warning !== undefined) { console.error(warning); process.exit(1); }' && \
+    rm -rf /tmp/node-check
 
 # Expose server port
 EXPOSE 3000

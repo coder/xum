@@ -1,11 +1,8 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
-import {
-  BROTLI_FIXED_NODE_RELEASES,
-  nodeVersionWarning,
-  warnIfUnsupportedNode,
-} from "./nodeVersion";
+import { BROTLI_FIXED_NODE_RELEASES } from "@/node/utils/nodeBrotliFix";
+import { nodeVersionWarning, warnIfUnsupportedNode } from "./nodeVersion";
 
 describe("nodeVersionWarning", () => {
   test("warns on a Node older than the minimum", () => {
