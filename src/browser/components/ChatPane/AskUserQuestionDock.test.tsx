@@ -19,8 +19,9 @@ import { buildAskUserQuestionAnswerMessage } from "@/common/utils/tools/askUserQ
 // and the WorkspaceStore overlay serving this suite's transcript.
 let messages: DisplayedMessage[] = [];
 
+const sendMessageData: Record<string, never> = {};
 const sendMessage = mock((_input: unknown) =>
-  Promise.resolve({ success: true as const, data: {} as Record<string, never> })
+  Promise.resolve({ success: true as const, data: sendMessageData })
 );
 const apiClient = createTestApiClient({ workspace: { sendMessage } });
 

@@ -456,9 +456,7 @@ describe("AskUserQuestionToolCall", () => {
     test("shows the latest answers delivered in later user messages", () => {
       const answerRow = (answer: string) => ({
         type: "user",
-        askUserQuestionAnswers: [
-          { toolCallId: "ask-async", answers: { "Which option?": answer } },
-        ],
+        askUserQuestionAnswers: [{ toolCallId: "ask-async", answers: { "Which option?": answer } }],
       });
       // A correction sent after the first answer supersedes it.
       currentWorkspaceState = {
