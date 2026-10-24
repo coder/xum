@@ -148,7 +148,7 @@
     "remark-breaks": "^4.0.0",
     "remend": "1.4.0",
     "saxes": "6.0.0",
-    "sharp": "^0.34.5",
+    "sharp": "^0.35.5",
     "shescape": "^2.1.6",
     "source-map-support": "^0.5.21",
     "ssh-config": "^5.0.4",
@@ -363,6 +363,9 @@
     "ssh2",
     "unrs-resolver"
   ],
+  "overrides": {
+    "sharp": "^0.35.5"
+  },
   "patchedDependencies": {
     "@ai-sdk/xai@4.0.37": "patches/@ai-sdk%2Fxai@4.0.37.patch",
     "trpc-cli@0.12.1": "patches/trpc-cli@0.12.1.patch",
