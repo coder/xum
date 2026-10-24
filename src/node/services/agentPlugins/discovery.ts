@@ -1111,6 +1111,24 @@ async function resolveXumComponents(args: {
 }
 
 /**
+ * A root plugin.json that other harnesses use (no `$schema` member): it yields to a Codex or a
+ * Claude manifest (selectManifest).
+ */
+function isSchemaLessManifest(raw: unknown): boolean {
+  return isPlainObject(raw) && raw.$schema === undefined;
+}
+
+/**
+ * True when the root plugin.json of `rootReal` reads, through the manifest containment and size
+ * caps, as a schema-less one. installMethods uses it so the method it offers is the manifest
+ * discovery loads.
+ */
+export async function isSchemaLessRootManifest(rootReal: string): Promise<boolean> {
+  const read = await readManifestCandidate(rootReal, PLUGIN_MANIFEST_RELATIVE_PATH);
+  return read.status === "ok" && isSchemaLessManifest(read.raw);
+}
+
+/**
  * Pick the manifest of a plugin folder. Root plugin.json wins, then the Codex and the Claude Code
  * manifests. Each one goes through the same caps and containment. Null when none exists.
  *
@@ -1131,8 +1149,7 @@ async function selectManifest(
     const read = await readManifestCandidate(rootReal, relative);
     if (read.status === "missing") continue;
     if (read.status === "invalid") return { relative, error: read.message };
-    const schemaLess = isPlainObject(read.raw) && read.raw.$schema === undefined;
-    if (relative === PLUGIN_MANIFEST_RELATIVE_PATH && schemaLess) {
+    if (relative === PLUGIN_MANIFEST_RELATIVE_PATH && isSchemaLessManifest(read.raw)) {
       schemaLessRoot = { relative, raw: read.raw };
       continue;
     }

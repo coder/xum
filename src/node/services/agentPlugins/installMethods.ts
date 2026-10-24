@@ -35,6 +35,7 @@ import {
   MAX_PLUGIN_MANIFEST_BYTES,
   PLUGIN_MANIFEST_RELATIVE_PATH,
   ensurePluginPathContained,
+  isSchemaLessRootManifest,
   readPluginFileWithinRootCapped,
 } from "./discovery";
 import { normalizeClaudeManifest } from "./claudeManifest";
@@ -284,19 +285,35 @@ export interface DetectedInstallMethods {
   skillsRoots: SkillsPackageRoot[];
 }
 
+/**
+ * True when the root plugin.json is a regular file that discovery reads as schema-less, so it
+ * yields to a Claude manifest. A symlink or an unreadable file stays the own manifest: the
+ * method then names the file discovery validates and reports.
+ */
+async function rootManifestIsSchemaLess(stagedDir: string): Promise<boolean> {
+  const stat = await fsPromises
+    .lstat(path.join(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH))
+    .catch(() => null);
+  if (!stat?.isFile()) return false;
+  return isSchemaLessRootManifest(await fsPromises.realpath(stagedDir));
+}
+
 /** The install methods that fit a staged tree (see the module comment for the rules). */
 export async function detectInstallMethods(stagedDir: string): Promise<DetectedInstallMethods> {
   // An entry of any kind counts: Xum never writes over a link or a folder named plugin.json.
+  const rootEntry = await entryExists(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH);
+  const claudeManifest = await entryExists(stagedDir, CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH);
+  // Discovery loads a Claude manifest over a schema-less root plugin.json (selectManifest), so
+  // the method must be claude-plugin there, not agent-plugin.
   const ownManifest =
-    (await entryExists(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH)) ||
-    (await entryExists(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH));
+    (await entryExists(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH)) ||
+    (rootEntry && !(claudeManifest && (await rootManifestIsSchemaLess(stagedDir))));
   const skillsRoots = await findSkillsPackageRoots(stagedDir);
   if (ownManifest) return { methods: [{ kind: "agent-plugin" }], skillsRoots };
   const methods: AgentPluginInstallMethod[] = [];
-  if (await entryExists(stagedDir, CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH)) {
-    methods.push({ kind: "claude-plugin" });
-  }
-  if (skillsRoots.length > 0) methods.push({ kind: "skills" });
+  if (claudeManifest) methods.push({ kind: "claude-plugin" });
+  // A root entry that yields to the Claude manifest still blocks the generated plugin.json.
+  if (!rootEntry && skillsRoots.length > 0) methods.push({ kind: "skills" });
   return { methods, skillsRoots };
 }
 
