@@ -1274,9 +1274,15 @@
                   "getXumProjectsDir",
                   "getXumSessionsDir"
                 ]
-              }
+              },
+              "@/node/utils/concurrency/workspaceFileLocks",
+              "@/node/utils/concurrency/fileLock",
+              "@/node/utils/concurrency/processLiveness",
+              "@/node/utils/main/crossProcessLock",
+              "@/node/services/workspaceUseLeases"
             ],
             "allow": {
+              "src/node/services/agentSession.ts": ["@/node/services/workspaceUseLeases"],
               "src/node/services/tools/review_pane.ts": [
                 "@/node/utils/writeFileAtomic",
                 "fs/promises"

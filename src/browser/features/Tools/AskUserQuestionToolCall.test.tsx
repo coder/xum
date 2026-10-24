@@ -30,7 +30,7 @@ let currentWorkspaceState: {
     toolName?: string;
     toolCallId?: string;
     compactionRequest?: { parsed: unknown };
-    askUserQuestionAnswer?: { toolCallId: string; answers: Record<string, string> };
+    askUserQuestionAnswers?: Array<{ toolCallId: string; answers: Record<string, string> }>;
   }>;
 } = {
   autoRetryStatus: null,
@@ -456,7 +456,7 @@ describe("AskUserQuestionToolCall", () => {
     test("shows the latest answers delivered in later user messages", () => {
       const answerRow = (answer: string) => ({
         type: "user",
-        askUserQuestionAnswer: { toolCallId: "ask-async", answers: { "Which option?": answer } },
+        askUserQuestionAnswers: [{ toolCallId: "ask-async", answers: { "Which option?": answer } }],
       });
       // A correction sent after the first answer supersedes it.
       currentWorkspaceState = {
@@ -485,10 +485,9 @@ describe("AskUserQuestionToolCall", () => {
         messages: [
           {
             type: "user",
-            askUserQuestionAnswer: {
-              toolCallId: "ask-async",
-              answers: { "Which option?": "Second" },
-            },
+            askUserQuestionAnswers: [
+              { toolCallId: "ask-async", answers: { "Which option?": "Second" } },
+            ],
           },
         ],
       };
@@ -553,10 +552,9 @@ describe("AskUserQuestionToolCall", () => {
           { type: "tool", id: "row-2", toolName: "ask_user_question", toolCallId: "ask-async" },
           {
             type: "user",
-            askUserQuestionAnswer: {
-              toolCallId: "ask-async",
-              answers: { "Which option?": "Second" },
-            },
+            askUserQuestionAnswers: [
+              { toolCallId: "ask-async", answers: { "Which option?": "Second" } },
+            ],
           },
         ],
       };

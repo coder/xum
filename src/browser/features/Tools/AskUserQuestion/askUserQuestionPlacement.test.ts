@@ -53,7 +53,7 @@ function answer(toolCallId: string): DisplayedMessage {
     historyId: `history-answer-${toolCallId}`,
     content: "option 1",
     historySequence: 2,
-    askUserQuestionAnswer: { toolCallId, answers: {} },
+    askUserQuestionAnswers: [{ toolCallId, answers: {} }],
   };
 }
 

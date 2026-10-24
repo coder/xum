@@ -173,9 +173,17 @@ const HOST_MODULES = [
       "getXumSessionsDir",
     ],
   },
+  // The session lock modules (phase 4): loop code takes its locks through SessionLocks. Not
+  // mutexMap: tools/file_edit_operation.ts keeps a pure in-memory map.
+  "@/node/utils/concurrency/workspaceFileLocks",
+  "@/node/utils/concurrency/fileLock",
+  "@/node/utils/concurrency/processLiveness",
+  "@/node/utils/main/crossProcessLock",
+  "@/node/services/workspaceUseLeases",
 ];
 // File -> the host modules it still imports. Phase plans list the pairs they add or remove.
 const HOST_IMPORT_ALLOW = {
+  "src/node/services/agentSession.ts": ["@/node/services/workspaceUseLeases"],
   "src/node/services/tools/review_pane.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
   "src/node/services/tools/todo.ts": ["@/node/utils/writeFileAtomic", "fs/promises"],
 };
