@@ -7,6 +7,7 @@ import { partFold, type FoldablePart, type FoldIntent, type FoldStep } from "./p
 
 const WORKSPACE_ID = "ws-1";
 const MESSAGE_ID = "msg-1";
+const MODEL = "anthropic:claude-test";
 
 /**
  * In-memory stand-in for StreamManager.applyStep: it applies only the intents
@@ -63,6 +64,7 @@ function replay(
         parts: state.parts,
         currentReasoningBlock: state.block,
         lastPartTimestamp: state.lastPartTimestamp,
+        model: MODEL,
         anthropicMessagesWire: state.anthropicMessagesWire,
         toolCalls: state.toolCalls,
       },
@@ -514,6 +516,142 @@ describe("partFold", () => {
       const cyclicOutput = errorText(cyclic) as { success: boolean; error: unknown };
       expect(cyclicOutput.success).toBe(false);
       expect(typeof cyclicOutput.error).toBe("string");
+    });
+  });
+
+  describe("turn parts", () => {
+    const failure = (error: unknown): Error => {
+      const { steps } = replay([[{ type: "error", error }, 100]]);
+      expect(tags(steps[0])).toEqual(["Fail"]);
+      const fail = steps[0].intents[0];
+      if (fail._tag !== "Fail") throw new Error("expected Fail");
+      return fail.error;
+    };
+
+    test("an error part fails with the provider's Error object itself", () => {
+      const providerError = new Error("context_length_exceeded");
+      expect(failure(providerError)).toBe(providerError);
+    });
+
+    test("an error object fails with its nested message, then its own, keeping it as cause", () => {
+      const nested = { error: { message: "nested" }, message: "outer" };
+      const direct = { message: "outer" };
+      const bare = { code: 429 };
+      const errors = [failure(nested), failure(direct), failure(bare)];
+      expect(errors.map((error) => error.message.length > 0)).toEqual([true, true, true]);
+      expect(errors.slice(0, 2).map((error) => error.message)).toEqual(["nested", "outer"]);
+      expect(errors.map((error) => error.cause)).toEqual([nested, direct, bare]);
+      expect(errors[0].cause).toBe(nested);
+    });
+
+    test("a primitive error part fails with its string form and no cause", () => {
+      const error = failure("socket hang up");
+      expect(error.message).toBe("socket hang up");
+      expect(error.cause).toBeUndefined();
+    });
+
+    test("finish records the terminal reasons it carries as strings", () => {
+      const { steps } = replay([
+        [{ type: "finish", finishReason: "stop", rawFinishReason: "end_turn" }, 100],
+        [{ type: "finish", finishReason: "other", rawFinishReason: 3 }, 100],
+      ]);
+      expect(steps.map((step) => step.intents)).toEqual([
+        [{ _tag: "RecordTerminalFinish", finishReason: "stop", rawFinishReason: "end_turn" }],
+        [{ _tag: "RecordTerminalFinish", finishReason: "other" }],
+      ]);
+    });
+
+    test("the SDK's synthesized (other, undefined) finish is not a terminal event", () => {
+      const { steps } = replay([[{ type: "finish", finishReason: "other" }, 100]]);
+      expect(steps[0].intents).toEqual([
+        {
+          _tag: "Log",
+          level: "warn",
+          message: "Treating synthesized-default (other, undefined) finish as truncated stream",
+          fields: { messageId: MESSAGE_ID, model: MODEL },
+        },
+      ]);
+    });
+
+    test("finish-step normalizes usage, then records it before the in-flight usage and the soft stop", () => {
+      const { steps } = replay([
+        [
+          {
+            type: "finish-step",
+            usage: {
+              inputTokens: 10,
+              outputTokens: 4,
+              totalTokens: 14,
+              inputTokenDetails: { cacheReadTokens: 3, cacheWriteTokens: 5 },
+              outputTokenDetails: { reasoningTokens: 2 },
+            },
+            providerMetadata: { anthropic: { stopSequence: null } },
+          },
+          100,
+        ],
+      ]);
+      expect(steps[0].intents).toEqual([
+        {
+          _tag: "RecordStepUsage",
+          usage: {
+            inputTokens: 10,
+            outputTokens: 4,
+            totalTokens: 14,
+            reasoningTokens: 2,
+            cachedInputTokens: 3,
+          },
+          providerMetadata: { anthropic: { stopSequence: null, cacheCreationInputTokens: 5 } },
+        },
+        { _tag: "RecordInFlightUsage" },
+        { _tag: "CheckSoftCancel" },
+      ]);
+    });
+
+    test("finish-step reports dropped thinking first, at info only for prefix-binding drops", () => {
+      const levelFor = (reason: string) => {
+        const { steps } = replay([
+          [
+            {
+              type: "finish-step",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              providerMetadata: {
+                anthropic: {
+                  inputTransformations: [{ type: "thinking_dropped", path: "messages.1", reason }],
+                },
+              },
+            },
+            100,
+          ],
+        ]);
+        expect(tags(steps[0])).toEqual([
+          "Log",
+          "RecordStepUsage",
+          "RecordInFlightUsage",
+          "CheckSoftCancel",
+        ]);
+        const logIntent = steps[0].intents[0];
+        return logIntent._tag === "Log" ? logIntent.level : null;
+      };
+      expect([levelFor("prefix_binding_mismatch"), levelFor("model_binding_mismatch")]).toEqual([
+        "info",
+        "debug",
+      ]);
+    });
+
+    test("text-end checks for a soft stop, start parts do nothing, unknown parts go to the tool-delta emitter", () => {
+      const delta: FoldablePart = { type: "tool-call-delta", toolCallId: "c", argsTextDelta: "{" };
+      const { steps } = replay([
+        [{ type: "text-end" }, 100],
+        [{ type: "start" }, 100],
+        [{ type: "text-start" }, 100],
+        [delta, 100],
+      ]);
+      expect(steps.map((step) => step.intents)).toEqual([
+        [{ _tag: "CheckSoftCancel" }],
+        [],
+        [],
+        [{ _tag: "EmitToolCallDelta", part: delta }],
+      ]);
     });
   });
 });
