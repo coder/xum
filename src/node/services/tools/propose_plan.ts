@@ -4,11 +4,10 @@ import type { ToolFactory } from "@/common/utils/tools/tools";
 import { completeInProgressTodoItems } from "@/common/utils/todoList";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { log } from "@/node/services/log";
-import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { RuntimeError, isRuntimeTransportError } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
-import { setTodosForSessionDir } from "./todo";
+import { setTodosForSessionDir, toolSessionFiles } from "./todo";
 
 // Schema for propose_plan - empty object (no input parameters)
 // Defined locally to avoid type inference issues with `as const` in TOOL_DEFINITIONS
@@ -91,8 +90,7 @@ export const createProposePlanTool: ToolFactory = (config) => {
 
       if (config.workspaceId && config.workspaceSessionDir) {
         try {
-          // mutation-equivalent: sessionFiles is a SessionFiles object or undefined, so ?? and || agree
-          const files = config.sessionFiles ?? nodeSessionFiles;
+          const files = toolSessionFiles(config);
           const existingTodos = await readTodosForSessionDir(config.workspaceSessionDir, files);
           const completedTodos = completeInProgressTodoItems(existingTodos);
           if (completedTodos !== existingTodos) {

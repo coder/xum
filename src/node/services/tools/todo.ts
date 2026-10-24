@@ -94,6 +94,12 @@ async function writeTodos(
   });
 }
 
+/** A tool config's session files: the session's, or the Node layer for configs that tests build by hand. */
+export function toolSessionFiles(config: { sessionFiles?: SessionFiles }): SessionFiles {
+  // mutation-equivalent: sessionFiles is a SessionFiles object or undefined, so ?? and || agree
+  return config.sessionFiles ?? nodeSessionFiles;
+}
+
 /**
  * Todo write tool factory
  * Creates a tool that allows the AI to create/update the todo list
@@ -111,8 +117,7 @@ export const createTodoWriteTool: ToolFactory = (config) => {
         todos,
         // mutation-equivalent: sessionLocks is a SessionLocks object or undefined, so ?? and || agree
         config.sessionLocks ?? nodeSessionLocks,
-        // mutation-equivalent: sessionFiles is a SessionFiles object or undefined, so ?? and || agree
-        config.sessionFiles ?? nodeSessionFiles
+        toolSessionFiles(config)
       );
       return {
         success: true as const,
@@ -134,8 +139,7 @@ export const createTodoReadTool: ToolFactory = (config) => {
       assert(config.workspaceSessionDir, "todo_read requires workspaceSessionDir");
       const todos = await readTodosForSessionDir(
         config.workspaceSessionDir,
-        // mutation-equivalent: sessionFiles is a SessionFiles object or undefined, so ?? and || agree
-        config.sessionFiles ?? nodeSessionFiles
+        toolSessionFiles(config)
       );
       return {
         todos,
@@ -147,7 +151,8 @@ export const createTodoReadTool: ToolFactory = (config) => {
 /**
  * Set todos for a workspace session directory (propose_plan uses this to mark todos completed).
  * `locks` gives the workspace FIFO (phase 4: SessionLocks) and `files` the session files (phase 5:
- * SessionFiles). Both app callers pass their session's locks; tests keep the Node defaults.
+ * SessionFiles). `files` has no default, so each caller names its session files. Both app callers
+ * pass their session's locks, and tests keep the Node locks default.
  */
 export async function setTodosForSessionDir(
   workspaceId: string,
