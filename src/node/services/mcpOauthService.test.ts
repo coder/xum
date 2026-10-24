@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { createServer, Server } from "http";
+import { createServer, Server, type ServerResponse } from "http";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -2909,6 +2909,75 @@ describe("resolveOAuthScope", () => {
       );
     } finally {
       await metadata.close();
+    }
+  });
+
+  /** A 127.0.0.1 server that records each request path and lets `respond` answer it. */
+  async function startRecordingServer(respond: (path: string, res: ServerResponse) => void) {
+    const paths: string[] = [];
+    const server = createServer((req, res) => {
+      paths.push(req.url ?? "");
+      respond(req.url ?? "", res);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Failed to bind recording server");
+    }
+    return {
+      origin: `http://127.0.0.1:${address.port}`,
+      paths,
+      close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+  }
+
+  function redirectTo(res: ServerResponse, location: string): void {
+    res.writeHead(302, { Location: location });
+    res.end();
+  }
+
+  test("does not follow a PRM redirect to another origin", async () => {
+    const otherOrigin = await startRecordingServer((_path, res) => {
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ scopes_supported: ["other.origin.scope"] }));
+    });
+    const resourceServer = await startRecordingServer((_path, res) =>
+      redirectTo(res, `${otherOrigin.origin}/prm`)
+    );
+    try {
+      expect(
+        await resolveOAuthScope({
+          raw: "",
+          resourceMetadataUrl: new URL(`${resourceServer.origin}/prm`),
+        })
+      ).toBeUndefined();
+      expect(resourceServer.paths).toEqual(["/prm"]);
+      expect(otherOrigin.paths).toEqual([]);
+    } finally {
+      await resourceServer.close();
+      await otherOrigin.close();
+    }
+  });
+
+  test("follows a same-origin PRM redirect, resolving a relative Location", async () => {
+    const resourceServer = await startRecordingServer((path, res) => {
+      if (path === "/prm") {
+        redirectTo(res, "/prm/");
+        return;
+      }
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ scopes_supported: ["mcp.read"] }));
+    });
+    try {
+      expect(
+        await resolveOAuthScope({
+          raw: "",
+          resourceMetadataUrl: new URL(`${resourceServer.origin}/prm`),
+        })
+      ).toBe("mcp.read");
+      expect(resourceServer.paths).toEqual(["/prm", "/prm/"]);
+    } finally {
+      await resourceServer.close();
     }
   });
 
