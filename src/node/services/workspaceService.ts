@@ -8311,6 +8311,7 @@ export class WorkspaceService
             ),
             beforeTombstone: () =>
               this.lockedSharedMemoryHandover(workspaceId, sharedMemoryOwnerId, force),
+            locks: this.historyService.locks,
           });
           sealedForRemoval = true;
           tombstonePublished = true;
@@ -8780,6 +8781,7 @@ export class WorkspaceService
             ownerSessionDir === undefined || sealedForRemoval
               ? undefined
               : () => this.lockedSharedMemoryHandover(workspaceId, memoryOwnerId, force),
+          locks: this.historyService.locks,
         });
         tombstonePublished = true;
       } catch (error) {
@@ -15255,6 +15257,7 @@ export class WorkspaceService
           // Cross-process pending marker home (r48): lets a first send served
           // by another backend wait for the in-flight summary.
           sessionDir: path.join(this.config.sessionsDir, newWorkspaceId),
+          locks: this.historyService.locks,
           abandonedMessages: abandonedBranchMessages,
           isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
           guardTailMessageId: sourceMessageId,
