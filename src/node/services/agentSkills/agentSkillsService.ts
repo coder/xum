@@ -806,7 +806,11 @@ async function candidateSkillFolderNames(
     isCandidateSkillDirectory(
       candidate,
       candidate.runtime.normalizePath(folder, resolvedRoot)
-    ).catch(() => false)
+    ).catch(
+      // Like lookupCandidateSkillDir: a twin that fails to read is present (a lookup refuses
+      // it, #4438), so the snake_case folder must not load in its place here either.
+      (error: unknown) => isRuntimeReadFailure(error)
+    )
   );
 }
 

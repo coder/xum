@@ -1720,6 +1720,10 @@ describe("agentSkillsService agent plugins", () => {
     // A kebab-case entry that is not a directory (a broken symlink) does not hide its twin.
     await writeSkillWithName(skillsDir, "dangling_twin", "dangling-twin");
     await fs.symlink(path.join(tmp.path, "missing"), path.join(skillsDir, "dangling-twin"));
+    // A kebab-case entry that cannot be read (a symlink loop) still wins: a lookup refuses it
+    // (#4438), so discovery must not offer its twin either.
+    await writeSkillWithName(skillsDir, "loop_twin", "loop-twin");
+    await fs.symlink(path.join(skillsDir, "loop-twin"), path.join(skillsDir, "loop-twin"));
     // Mixed separators have no 1:1 mapping, so the folder stays invalid.
     await writeSkillWithName(skillsDir, "mixed_name-x", "mixed-name-x");
     await writeSkillWithName(pluginDir, "solo_skill", "solo-skill");
@@ -1741,6 +1745,7 @@ describe("agentSkillsService agent plugins", () => {
     );
     const globalIssues = invalidSkills.filter((issue) => issue.scope === "global");
     expect(globalIssues.map((issue) => issue.directoryName).sort()).toEqual([
+      "loop-twin",
       "mixed_name-x",
       "user_skill",
     ]);
@@ -1752,6 +1757,7 @@ describe("agentSkillsService agent plugins", () => {
     );
     expect((await read("both-ways")).skillDir).toBe(path.join(realSkillsDir, "both-ways"));
     expect((await read("dangling-twin")).skillDir).toBe(path.join(realSkillsDir, "dangling_twin"));
+    await expect(read("loop-twin")).rejects.toThrow();
     expect((await read("solo-skill")).package.frontmatter.name).toBe("solo-skill");
     await expect(read("user-skill")).rejects.toThrow("not found");
   });

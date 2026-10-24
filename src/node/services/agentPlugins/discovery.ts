@@ -458,9 +458,25 @@ export async function pluginSkillFolderNames(
 }
 
 /**
+ * Whether the kebab-case twin of a snake_case plugin skill folder is a directory
+ * (pluginSkillFolderNames). An entry Xum cannot stat for a reason other than absence (a symlink
+ * loop, a permission error) counts as present: a lookup refuses such a folder instead of falling
+ * back (#4438), so its snake_case twin must not load in its place anywhere.
+ */
+export function isPluginSkillDirectory(
+  stat: Promise<{ isDirectory(): boolean }>
+): Promise<boolean> {
+  return stat.then(
+    (result) => result.isDirectory(),
+    (error: unknown) => !(hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR"))
+  );
+}
+
+/**
  * The skill folders of one skills root, sorted: the root itself when it is a single skill, else
  * its subfolders, symlinks included (runtime discovery follows them, so consent must list them).
- * `name` is the skill name (pluginSkillNameOfFolder) and `folder` the folder's own name.
+ * `name` is the skill name (pluginSkillNameOfFolder). `folder` is the folder's own name in a
+ * container root, and `name` for a single root (whose review label is the root's path).
  * `file` is the skill's Markdown file (SKILL.md, or a command's `<name>.md`). Names are not
  * validated: callers report an invalid one.
  */
@@ -478,12 +494,7 @@ export async function listPluginSkillFolders(
       .map((entry) => entry.name)
       .sort((a, b) => a.localeCompare(b));
     const isDirectory = (folder: string) =>
-      pluginFs()
-        .stat(path.join(root.dir, folder))
-        .then(
-          (stat) => stat.isDirectory(),
-          () => false
-        );
+      isPluginSkillDirectory(pluginFs().stat(path.join(root.dir, folder)));
     return (await pluginSkillFolderNames(folders, isDirectory)).map(({ folder, name }) => ({
       name,
       folder,

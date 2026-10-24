@@ -21,6 +21,7 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
 import {
   discoverAgentPlugins,
+  isPluginSkillDirectory,
   pluginSkillFolderNames,
 } from "@/node/services/agentPlugins/discovery";
 import {
@@ -122,10 +123,7 @@ async function listSkillFolders(
   const entries =
     plugin === true
       ? await pluginSkillFolderNames(folders, (folder) =>
-          nodeHostFiles.promises.stat(path.join(skillsRoot, folder)).then(
-            (stat) => stat.isDirectory(),
-            () => false
-          )
+          isPluginSkillDirectory(nodeHostFiles.promises.stat(path.join(skillsRoot, folder)))
         )
       : folders.map((folder) => ({ folder, name: folder }));
   return entries.map(({ folder, name }) => ({ name, dir: path.join(skillsRoot, folder) }));
