@@ -1158,6 +1158,11 @@ async function selectManifest(
   return schemaLessRoot;
 }
 
+/** The manifest path an error shows: from `shownRoot` (default the plugin root), `/` on every OS. */
+function shownManifestPath(shownRoot: string | undefined, manifestRelative: string): string {
+  return path.posix.join(shownRoot ?? ".", manifestRelative.split(path.sep).join("/"));
+}
+
 async function discoverPluginAt(args: {
   pluginDir: string;
   containerPath: string;
@@ -1212,10 +1217,7 @@ async function discoverPluginAt(args: {
     // Name the manifest: a plugin can carry plugin.json, .codex-plugin/plugin.json and
     // .claude-plugin/plugin.json, and the user must see which one failed. Forward slashes on
     // every OS, because the path is shown, not opened.
-    const shownManifest = path.posix.join(
-      args.shownRoot ?? ".",
-      manifestRelative.split(path.sep).join("/")
-    );
+    const shownManifest = shownManifestPath(args.shownRoot, manifestRelative);
     pushError(manifestPath, `${label} (${shownManifest}): ${validation.errors.join("; ")}`);
     return null;
   }

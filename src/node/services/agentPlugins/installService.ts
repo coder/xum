@@ -1684,6 +1684,19 @@ function manifestSummary(manifest: AgentPluginManifest): AgentPluginManifestSumm
   };
 }
 
+/**
+ * The repository path of a staged plugin root, for manifest errors (discoverAgentPluginAt
+ * `shownRoot`). The staged tree is the "Plugin folder", so errors name e.g.
+ * `.codex-plugin/plugin.json`. A marketplace entry's folder sits below it, so its errors keep
+ * entry-relative paths.
+ */
+function shownStagedRoot(
+  source: Pick<AgentPluginGitSource, "subpath">,
+  marketplace: MarketplaceEntryContext | undefined
+): string | undefined {
+  return marketplace === undefined ? source.subpath : undefined;
+}
+
 export class AgentPluginInstallService {
   private mcpOauthService: Pick<McpOauthService, "logout" | "credentialKey"> | undefined;
   private readonly containerDir: string;
@@ -2720,9 +2733,7 @@ export class AgentPluginInstallService {
     const { plugin, diagnostics } = await discoverAgentPluginAt({
       pluginDir: stagedDir,
       scope: "global",
-      // The staged tree is the "Plugin folder", so errors name e.g. `.codex-plugin/plugin.json`.
-      // A marketplace entry's folder sits below it, so its errors keep entry-relative paths.
-      shownRoot: marketplace === undefined ? (source.subpath ?? undefined) : undefined,
+      shownRoot: shownStagedRoot(source, marketplace),
     });
     if (!plugin) {
       const reasons = diagnostics.map((d) => d.message);
