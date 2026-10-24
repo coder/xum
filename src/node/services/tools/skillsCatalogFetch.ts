@@ -2,11 +2,11 @@ import * as path from "path";
 
 import { SkillNameSchema } from "@/common/orpc/schemas";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
-import { execFileAsync } from "@/node/utils/disposableExec";
 
 import { MAX_FILE_SIZE } from "./fileCommon";
 import { resolveContainedSkillFilePath } from "./skillFileUtils";
 import { nodeHostFiles, nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
+import { nodeHostProcesses } from "@/node/services/hostProcesses/nodeHostProcesses";
 
 const SEARCH_TIMEOUT_MS = 10_000;
 // Display/product attribution for skills.sh; no server-side mux contract.
@@ -46,7 +46,7 @@ export async function searchSkillsCatalog(
   url.searchParams.set("q", query);
   url.searchParams.set("limit", String(limit));
 
-  const response = await fetch(url.toString(), {
+  const response = await nodeHostProcesses.fetchUrl(url.toString(), {
     headers: { "User-Agent": SEARCH_USER_AGENT },
     signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
   });
@@ -66,7 +66,7 @@ export function tryParseSource(source: string): { owner: string; repo: string } 
 
 async function assertGitAvailable(): Promise<void> {
   try {
-    using proc = execFileAsync("git", ["--version"]);
+    using proc = nodeHostProcesses.execFile("git", ["--version"]);
     await proc.result;
   } catch {
     throw new Error("git is required for skills_catalog_read but was not found in PATH");
@@ -74,7 +74,13 @@ async function assertGitAvailable(): Promise<void> {
 }
 
 async function detectBranch(repoDir: string): Promise<string> {
-  using proc = execFileAsync("git", ["-C", repoDir, "rev-parse", "--abbrev-ref", "HEAD"]);
+  using proc = nodeHostProcesses.execFile("git", [
+    "-C",
+    repoDir,
+    "rev-parse",
+    "--abbrev-ref",
+    "HEAD",
+  ]);
   const { stdout } = await proc.result;
   return stdout.trim();
 }
@@ -214,7 +220,7 @@ export async function fetchSkillContent(
     const skillsRoot = path.resolve(cloneDir, "skills");
 
     const repoUrl = `https://github.com/${owner}/${repo}.git`;
-    using cloneProc = execFileAsync("git", [
+    using cloneProc = nodeHostProcesses.execFile("git", [
       "clone",
       "--depth",
       "1",
