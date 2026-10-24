@@ -7,6 +7,8 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { LEGACY_TODO_TURN_END_NUDGES } from "@/common/utils/machineTurnPrompts";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
+import { buildSessionFiles } from "./sessionFiles/buildSessionFiles.testHarness";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 import path from "path";
 import {
   type AgentSession,
@@ -2492,6 +2494,32 @@ describe("AgentSession startup auto-retry recovery", () => {
     await clearProviderConfigFixableAbandonMarkers(config.sessionsDir, new Set());
 
     expect(await Bun.file(preferencePath).exists()).toBe(false);
+  });
+
+  // The sweep runs on the session files it gets (the memory layer here), so no host file is read.
+  test("provider config sweep reads and rewrites the session files it gets", async () => {
+    const files = buildSessionFiles(SessionFilesMemory);
+    const sessionsDir = "/sessions";
+    const preference = (workspaceId: string) =>
+      path.join(sessionsDir, workspaceId, "auto-retry-preference.json");
+    const marker = { startupAutoRetryAbandon: { reason: "authentication" } };
+    for (const [workspaceId, document] of [
+      ["opted-out", { enabled: false, ...marker }],
+      ["marker-only", marker],
+    ] as const) {
+      await files.promises.mkdir(path.join(sessionsDir, workspaceId), { recursive: true });
+      await files.promises.writeFile(preference(workspaceId), JSON.stringify(document), "utf-8");
+    }
+
+    await clearProviderConfigFixableAbandonMarkers(sessionsDir, new Set(), files);
+
+    expect(await files.promises.readFile(preference("opted-out"), "utf-8")).toBe(
+      '{"enabled":false}\n'
+    );
+    const removed = await files.promises
+      .readFile(preference("marker-only"), "utf-8")
+      .catch((error: NodeJS.ErrnoException) => error.code);
+    expect(removed).toBe("ENOENT");
   });
 
   test("provider config sweep preserves non-fixable markers and skips live sessions", async () => {

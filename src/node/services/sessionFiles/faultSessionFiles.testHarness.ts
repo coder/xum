@@ -91,6 +91,7 @@ const PROMISE_APIS = Object.keys({
   rmdir: 0,
   stat: 0,
   unlink: 0,
+  writeFile: 0,
 } satisfies Record<keyof SessionFiles["promises"], 0>) as Array<keyof SessionFiles["promises"]>;
 const MEMBER_APIS = {
   fsyncSync: "sync",
@@ -161,7 +162,10 @@ function wrapWithFaults(inner: SessionFiles, rules: FaultRules): SessionFiles {
       throw new Error(
         `fault layer: cutNextWrite does not apply to writeFileAtomic (${String(target)})`
       );
-    const cut = api === "appendFile" || api === "writeSync" ? rules.takeCut(target) : undefined;
+    const cut =
+      api === "appendFile" || api === "writeFile" || api === "writeSync"
+        ? rules.takeCut(target)
+        : undefined;
     if (cut === undefined) {
       if (api !== "open") return call(...args);
       return (call(...args) as Promise<FileHandle>).then((handle) => wrapHandle(handle, target!));
