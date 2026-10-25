@@ -29,6 +29,13 @@ interface Cleanup {
  * A TurnRegistry whose abort cleanup does what StreamManager's does to the slot:
  * it settles the turn's completion and frees the slot if the turn still owns it.
  */
+/** Finalizers registered on an open scope (its supervised occupants). */
+function finalizerCount(scope: Scope.Closeable): number {
+  const state = scope.state;
+  if (state._tag !== "Open") return 0;
+  return (state.finalizer === undefined ? 0 : 1) + (state.finalizers?.size ?? 0);
+}
+
 function createRegistry(options: { engineScope?: Scope.Closeable } = {}) {
   const events: TurnEngineEvent[] = [];
   const flushes: string[] = [];
@@ -281,6 +288,21 @@ describe("TurnRegistry", () => {
       status: "aborted",
       abortReason: "system",
     });
+  });
+
+  test("a turn that settles on its own leaves nothing in the engine scope", async () => {
+    // One supervised turn per stream: a long-running app must not keep a finalizer
+    // for every finished turn until shutdown.
+    const engineScope = Scope.makeUnsafe();
+    const { registry } = createRegistry({ engineScope });
+    const info = streamFixture();
+    registry.superviseEngine(WS, info);
+    expect(finalizerCount(engineScope)).toBe(1);
+
+    info.completionController.settle({ status: "aborted", abortReason: "user" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(finalizerCount(engineScope)).toBe(0);
   });
 
   test("without an engine scope a turn is not supervised", () => {
