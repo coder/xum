@@ -8,6 +8,7 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   createTestApiClient,
   resetTestExperiments,
@@ -114,6 +115,57 @@ function shownPage(view: ReturnType<typeof render>): string {
   const statusView = view.queryByTestId("agent-interface-status-view");
   if (statusView == null) return "";
   return within(statusView).queryByTestId("artifact-frame")?.getAttribute("srcdoc") ?? "";
+}
+
+/**
+ * Runs the bridge shim from `frame`'s srcdoc against a stand-in window whose posts reach the host
+ * as the frame's messages; returns a trusted key press inside the frame.
+ */
+function runFrameShim(frame: HTMLIFrameElement) {
+  const srcdoc = frame.getAttribute("srcdoc") ?? "";
+  const shim = new window.DOMParser().parseFromString(srcdoc, "text/html").querySelector("script");
+  const keydowns: Array<(event: unknown) => void> = [];
+  const frameWindow = {
+    parent: {
+      postMessage: (data: unknown) => {
+        const event = new window.Event("message");
+        Object.defineProperty(event, "data", { value: data });
+        Object.defineProperty(event, "source", { value: frame.contentWindow });
+        window.dispatchEvent(event);
+      },
+    },
+    addEventListener: (type: string, listener: (event: unknown) => void) => {
+      if (type === "keydown") keydowns.push(listener);
+    },
+    setTimeout: (callback: () => void) => callback(),
+  };
+  const frameDocument = {
+    documentElement: { setAttribute: () => undefined },
+    addEventListener: () => undefined,
+    querySelectorAll: () => [],
+  };
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
+  const run = new Function("window", "document", "CustomEvent", shim?.textContent ?? "") as (
+    window: unknown,
+    document: unknown,
+    customEvent: unknown
+  ) => void;
+  run(frameWindow, frameDocument, class {});
+  return (key: string, modifiers: { ctrlKey?: boolean; shiftKey?: boolean }) => {
+    const event = {
+      key,
+      target: { nodeType: 1, tagName: "DIV", isContentEditable: false },
+      isTrusted: true,
+      repeat: false,
+      ctrlKey: modifiers.ctrlKey ?? false,
+      shiftKey: modifiers.shiftKey ?? false,
+      metaKey: false,
+      altKey: false,
+      defaultPrevented: false,
+      preventDefault: () => undefined,
+    };
+    for (const listener of keydowns) listener(event);
+  };
 }
 
 describe("Agent interface status view", () => {
@@ -250,20 +302,12 @@ describe("Agent interface status view", () => {
       await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
       const frame = view.getByTestId("artifact-frame") as HTMLIFrameElement;
       act(() => frame.focus());
-      act(() => {
-        const event = new window.Event("message");
-        Object.defineProperty(event, "data", {
-          value: {
-            xumArtifact: 1,
-            type: "sidebarKey",
-            chord: "agentInterface",
-            ctrlKey: true,
-            metaKey: false,
-          },
-        });
-        Object.defineProperty(event, "source", { value: frame.contentWindow });
-        window.dispatchEvent(event);
-      });
+      // The press goes through the shim this frame's srcdoc carries (happy-dom runs no frame
+      // scripts), so a status page whose shim does not forward the chord fails here.
+      const pressInFrame = runFrameShim(frame);
+      act(() =>
+        pressInFrame(KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW.key, { ctrlKey: true, shiftKey: true })
+      );
       await waitFor(() => expect(view.queryByTestId("agent-interface-status-view")).toBeNull());
     } finally {
       globalThis.KeyboardEvent = globalKeyboardEvent;
@@ -294,6 +338,25 @@ describe("Agent interface status view", () => {
       });
       await flush();
       expect(shownPage(view)).toContain("<p>BBBBBB</p>");
+
+      // A read that fails (a reconnect) says nothing about the page: it stays ...
+      failingReads = 1;
+      const readsBefore = reads;
+      await act(async () => {
+        fakeTimers.advanceTimersByTime(3_000);
+        await Promise.resolve();
+      });
+      await flush();
+      expect(reads).toBe(readsBefore + 1);
+      expect(shownPage(view)).toContain("<p>BBBBBB</p>");
+      // ... and the next poll reads it again.
+      current = { ...page("<p>CCCCCCCC</p>"), modifiedMs: 3_000 };
+      await act(async () => {
+        fakeTimers.advanceTimersByTime(3_000);
+        await Promise.resolve();
+      });
+      await flush();
+      expect(shownPage(view)).toContain("<p>CCCCCCCC</p>");
     } finally {
       jest.useRealTimers();
     }
@@ -321,6 +384,12 @@ describe("Agent interface status view", () => {
     await settle();
     // The panel's listing, which the main pane takes instead of walking the folder again.
     expect(lists).toBe(listsBefore + 1);
+
+    // Once the panel closes, the main pane lists the folder itself again.
+    view.rerender(<MainPane workspaceId="ws-shared" />);
+    current = page("<p>CCCCCCCC</p>");
+    act(() => workspaceStore.simulateFileModifyingToolEnd("ws-shared"));
+    await waitFor(() => expect(shownPage(view)).toContain("<p>CCCCCCCC</p>"));
   });
 
   test("only a complete listing without the page switches the pane back to the chat", async () => {
