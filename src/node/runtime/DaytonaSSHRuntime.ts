@@ -62,7 +62,10 @@ import {
 
 /** The DaytonaService parts this runtime uses (tests pass an in-memory fake). */
 export interface DaytonaRuntimeService {
-  account: Pick<DaytonaAccount, "checkAvailability" | "getDefaultTarget" | "findSnapshot">;
+  account: Pick<
+    DaytonaAccount,
+    "checkAvailability" | "getDefaultTarget" | "findSnapshot" | "withPinnedAccount"
+  >;
   readiness: Pick<
     DaytonaReadiness,
     "isSandboxReady" | "markSandboxReady" | "invalidateSandboxReady" | "join"
@@ -78,6 +81,7 @@ export interface DaytonaRuntimeService {
   sandboxes: Pick<
     DaytonaSandboxes,
     | "getSandboxState"
+    | "assertOwned"
     | "buildLabels"
     | "createSandbox"
     | "resizeSandbox"
@@ -410,9 +414,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * only by a runtime that may start it. Throws when nothing was repaired.
    */
   private async repairSandbox(sandboxId: string): Promise<void> {
-    const { state } = await this.daytonaService.sandboxes.getSandboxState(sandboxId);
-    if (state === "missing") throw new SandboxMissingError();
+    const { state, sandbox } = await this.daytonaService.sandboxes.getSandboxState(sandboxId);
+    if (!sandbox) throw new SandboxMissingError();
     if (state === "started") {
+      await this.daytonaService.sandboxes.assertOwned(sandbox, sandboxId);
       log.info("An ssh command to the Daytona sandbox failed; replacing its token and retrying", {
         sandboxId,
       });
@@ -657,7 +662,11 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * sync, worktree creation and init hook. If anything fails after the create request was
    * sent, the sandbox this call created is deleted again so it cannot linger and bill.
    */
-  async postCreateSetup(params: WorkspaceInitParams): Promise<void> {
+  postCreateSetup(params: WorkspaceInitParams): Promise<void> {
+    return this.daytonaService.account.withPinnedAccount(() => this.setUpSandbox(params));
+  }
+
+  private async setUpSandbox(params: WorkspaceInitParams): Promise<void> {
     const sandboxId = this.daytonaConfig.sandboxId;
     if (!sandboxId) {
       throw new Error("Daytona sandbox id is required (should be set by finalizeConfig)");

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "async_hooks";
 import type {
   DaytonaListSnapshotsResult,
   DaytonaPublicConfig,
@@ -60,11 +61,19 @@ function toResultError(error: unknown): {
   return { ok: false, kind: "server", error: getErrorMessage(error) };
 }
 
+interface DaytonaAccountClient {
+  client: DaytonaClient;
+  credentials: DaytonaResolvedCredentials;
+}
+
 /** The Daytona settings, the API client they make, and the calls that need no sandbox. */
 export class DaytonaAccount {
   private readonly credentialsStore: DaytonaCredentialsStore;
   private readonly fetchImpl?: typeof fetch;
   private readonly onSettingsChange: DaytonaAccountOptions["onSettingsChange"];
+  private readonly pinnedClient = new AsyncLocalStorage<{
+    client?: Promise<DaytonaAccountClient>;
+  }>();
 
   constructor(options: DaytonaAccountOptions) {
     this.credentialsStore = options.credentialsStore;
@@ -121,8 +130,24 @@ export class DaytonaAccount {
     }
   }
 
+  /**
+   * Runs `operation` with every getClient() inside it on the account in effect at its first
+   * call, so a settings save cannot split a setup across two accounts (a create in the old
+   * one, its readiness check and cleanup in the new one, leaking the sandbox).
+   */
+  withPinnedAccount<T>(operation: () => Promise<T>): Promise<T> {
+    return this.pinnedClient.run({}, operation);
+  }
+
   /** Throws a `not_configured` DaytonaApiError when no API key is set. */
-  async getClient(): Promise<{ client: DaytonaClient; credentials: DaytonaResolvedCredentials }> {
+  getClient(): Promise<DaytonaAccountClient> {
+    const pin = this.pinnedClient.getStore();
+    if (!pin) return this.createClient();
+    pin.client ??= this.createClient();
+    return pin.client;
+  }
+
+  private async createClient(): Promise<DaytonaAccountClient> {
     const credentials = await this.resolveCredentials();
     if (!credentials) {
       throw new DaytonaApiError(

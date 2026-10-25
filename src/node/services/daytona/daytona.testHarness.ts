@@ -41,6 +41,8 @@ export class FakeDaytonaControlPlane {
   readonly sandboxes = new Map<string, FakeSandbox>();
   /** `METHOD /path` for every request (query strings omitted). */
   readonly calls: string[] = [];
+  /** `METHOD /path <Authorization header>` for every answered request. */
+  readonly authorizedCalls: string[] = [];
   readonly createBodies: Array<Record<string, unknown>> = [];
   readonly revokedTokens: string[] = [];
   /** The organization's snapshots; `listedOnly` ones only come with the list, not by name. */
@@ -131,6 +133,7 @@ export class FakeDaytonaControlPlane {
     const fail = (status: number, message: string) => json(status, { statusCode: status, message });
     if (this.failingRoutes.has(route)) return fail(500, "Internal error");
     const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
+    this.authorizedCalls.push(`${route} ${auth}`);
     // Only the sandbox list checks it: that is the request a connection test makes.
     if (route === "GET /sandbox" && this.apiKey !== undefined && auth !== `Bearer ${this.apiKey}`) {
       return fail(401, "Invalid credentials");

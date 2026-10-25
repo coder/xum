@@ -355,6 +355,25 @@ describe("DaytonaSSHRuntime Windows and GPU sandboxes", () => {
 });
 
 describe("DaytonaSSHRuntime.postCreateSetup", () => {
+  it("keeps a setup on the account it started with when the settings change during the create", async () => {
+    rig.plane.onRequest.set("POST /sandbox", () =>
+      rig.service.account.setConfig({ apiKey: "key-b" })
+    );
+
+    await makeRuntime({ sandboxId: "xum-switch", ...SMALL }).postCreateSetup(initParams());
+
+    const createAt = rig.plane.authorizedCalls.findIndex((call) =>
+      call.startsWith("POST /sandbox ")
+    );
+    // GET /config is public and sends no key.
+    const afterCreate = rig.plane.authorizedCalls
+      .slice(createAt)
+      .filter((c) => c.includes("Bearer"));
+    expect(afterCreate.length).toBeGreaterThan(1);
+    expect(afterCreate.filter((call) => !call.endsWith("Bearer test-key"))).toEqual([]);
+    expect((await rig.service.account.getClient()).credentials.apiKey).toBe("key-b");
+  });
+
   it("creates the sandbox with preset resources, labels and lifecycle intervals", async () => {
     await makeRuntime({ sandboxId: "xum-new", ...SMALL }).postCreateSetup(initParams());
 
@@ -952,6 +971,20 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
       'Daytona sandbox "sb-gone" no longer exists'
     );
     expect(rig.plane.countCalls("POST /sandbox/sb-gone/ssh-access")).toBe(1);
+  });
+
+  it("mints no token for a started sandbox that lost this install's label", async () => {
+    const sandbox = rig.plane.addSandbox({ id: "sb-relabeled" });
+    await rig.service.ssh.ensureSshAccess("sb-relabeled");
+    const minted = rig.plane.countCalls("POST /sandbox/sb-relabeled/ssh-access");
+    sandbox.labels = {};
+    const runtime = makeRuntime({ sandboxId: "sb-relabeled" }, rig, {
+      transport: refusingTransportWhile("sb-relabeled", () => true),
+    });
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(runtime.exec("true", { cwd: "/tmp", timeout: 10 })).rejects.toThrow();
+    expect(rig.plane.countCalls("POST /sandbox/sb-relabeled/ssh-access")).toBe(minted);
   });
 
   it("replaces a token the gateway refused and retries the command once", async () => {

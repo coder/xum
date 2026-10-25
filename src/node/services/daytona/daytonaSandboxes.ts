@@ -176,6 +176,7 @@ export class DaytonaSandboxes {
     for (;;) {
       options.signal?.throwIfAborted();
       const sandbox = await this.getSandboxForStart(client, sandboxId, options.signal);
+      await this.assertOwned(sandbox, sandboxId);
       const step = nextStartStep(sandboxId, sandbox, startRequested);
       if (step === "done") return sandbox;
       if (step === "start") {
@@ -276,7 +277,23 @@ export class DaytonaSandboxes {
       if (isDaytonaNotFound(error)) return true;
       throw error;
     }
+    return this.carriesInstanceLabel(sandbox);
+  }
+
+  private async carriesInstanceLabel(sandbox: DaytonaSandbox): Promise<boolean> {
     return sandbox.labels?.[DAYTONA_LABEL_INSTANCE] === (await this.getInstanceId());
+  }
+
+  /**
+   * Refuse to start a sandbox or give Xum ssh access to it without this install's label: its
+   * label was removed, or another sandbox took the name after the workspace's was deleted.
+   */
+  async assertOwned(sandbox: DaytonaSandbox, sandboxId: string): Promise<void> {
+    if (await this.carriesInstanceLabel(sandbox)) return;
+    throw new DaytonaApiError(
+      "bad_request",
+      `Daytona sandbox ${sandboxId} does not carry this Xum install's label, so Xum will not use it`
+    );
   }
 
   async refreshActivity(sandboxId: string): Promise<void> {

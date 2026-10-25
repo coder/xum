@@ -101,6 +101,21 @@ describe("DaytonaSandboxes", () => {
     expect(labels[DAYTONA_LABEL_PROJECT]).toBe("my-project");
   });
 
+  it("refuses to start or open a sandbox without this install's label", async () => {
+    rig.plane.addSandbox({ id: "sb-stopped-foreign", state: "stopped", labels: {} });
+    rig.plane.addSandbox({
+      id: "sb-started-foreign",
+      labels: { [DAYTONA_LABEL_INSTANCE]: "another-install" },
+    });
+
+    for (const id of ["sb-stopped-foreign", "sb-started-foreign"]) {
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      await expect(rig.service.sandboxes.ensureSandboxReady(id)).rejects.toThrow("label");
+      expect(rig.plane.countCalls(`POST /sandbox/${id}/start`)).toBe(0);
+      expect(rig.plane.countCalls(`POST /sandbox/${id}/ssh-access`)).toBe(0);
+    }
+  });
+
   it("deletes only a sandbox with this install's label, and drops Xum's access to any", async () => {
     rig.plane.addSandbox({
       id: "sb-foreign",
