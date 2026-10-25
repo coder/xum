@@ -385,33 +385,36 @@ export abstract class RemoteRuntime implements Runtime {
       },
       close: async () => {
         const nodeStdin = childProcess.stdin;
+        // A destroyed or ended stdin emits no further 'finish', so waiting would hang.
         if (!nodeStdin || nodeStdin.destroyed || nodeStdin.writableEnded) {
           return;
         }
 
         await new Promise<void>((resolve) => {
-          const onError = () => {
-            cleanup();
-            resolve();
-          };
-
-          const onFinish = () => {
+          const settle = () => {
             cleanup();
             resolve();
           };
 
           const cleanup = () => {
-            nodeStdin.removeListener("error", onError);
-            nodeStdin.removeListener("finish", onFinish);
+            nodeStdin.removeListener("error", settle);
+            nodeStdin.removeListener("finish", settle);
+            nodeStdin.removeListener("close", settle);
           };
 
-          nodeStdin.once("error", onError);
-          nodeStdin.once("finish", onFinish);
+          // Node destroys a child's stdin when the child exits. If end() is still
+          // flushing then, only 'close' fires: no 'finish' and no 'error'. Without
+          // the 'close' listener, close() never settled and execBuffered hung the
+          // caller, so a send on an SSH, Docker or devcontainer workspace could
+          // hang with no error (#7436).
+          nodeStdin.once("error", settle);
+          nodeStdin.once("finish", settle);
+          nodeStdin.once("close", settle);
 
           try {
             nodeStdin.end();
           } catch {
-            onError();
+            settle();
           }
         });
       },
