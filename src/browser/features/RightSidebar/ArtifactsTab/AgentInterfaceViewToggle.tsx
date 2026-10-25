@@ -2,11 +2,8 @@ import { LayoutDashboard, MessageSquare } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { cn } from "@/common/lib/utils";
-import {
-  type AgentInterfaceView,
-  useAgentInterfaceView,
-  writeAgentInterfaceViewChoice,
-} from "./agentInterfaceView";
+import { useAgentInterfaceView } from "./agentInterfaceView";
+import { type AgentInterfaceView, writeAgentInterfaceViewChoice } from "./agentInterfaceViewState";
 
 const VIEW_OPTIONS: ReadonlyArray<{
   view: AgentInterfaceView;

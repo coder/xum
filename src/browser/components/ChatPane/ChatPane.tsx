@@ -69,10 +69,8 @@ import {
   useWorkspaceStoreRaw,
 } from "@/browser/stores/WorkspaceStore";
 import { WorkspaceMenuBar } from "../WorkspaceMenuBar/WorkspaceMenuBar";
-import {
-  type AgentInterfaceView,
-  useMainPaneAgentInterfaceView,
-} from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceView";
+import { useMainPaneAgentInterfaceView } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceView";
+import type { AgentInterfaceView } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceViewState";
 import { AgentInterfaceStatusView } from "@/browser/features/RightSidebar/ArtifactsTab/AgentInterfaceStatusView";
 import { WorkspaceFooterBar } from "./WorkspaceFooterBar";
 import type { DisplayedMessage, QueuedMessage as QueuedMessageData } from "@/common/types/message";
