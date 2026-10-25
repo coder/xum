@@ -478,10 +478,9 @@ export function SandboxedArtifactFrame(props: {
           onAnnotate(pickFromFrameAnnotation(message, frame.getBoundingClientRect()));
           break;
         }
-        case "backdrop": {
+        case "backdrop":
           setBackdropColor(artifactBackdropColor(message.color));
           break;
-        }
       }
     };
     window.addEventListener("message", handler);

@@ -1305,7 +1305,7 @@ describe("bridge backdrop", () => {
       );
       await settle();
     };
-    return { win, posts, sendTheme, settle, close: () => win.happyDOM.close() };
+    return { win, posts, sendTheme, close: () => win.happyDOM.close() };
   }
   const posted = (color: string | null) => ({ xumArtifact: 1, type: "backdrop", color });
 
