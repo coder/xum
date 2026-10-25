@@ -29,12 +29,20 @@ export function installViewportHeightSync(): () => void {
   viewportBox.setAttribute("aria-hidden", "true");
   viewportBox.style.cssText =
     "position:fixed;inset:0;visibility:hidden;pointer-events:none;z-index:-1";
-  document.body.appendChild(viewportBox);
-  const observer =
-    typeof window.ResizeObserver === "function"
-      ? new window.ResizeObserver(syncViewportHeight)
-      : null;
-  observer?.observe(viewportBox);
+  let observer: ResizeObserver | undefined;
+  try {
+    document.body.appendChild(viewportBox);
+    if (typeof window.ResizeObserver === "function") {
+      observer = new window.ResizeObserver(syncViewportHeight);
+      observer.observe(viewportBox);
+    }
+  } catch (error) {
+    // main.tsx calls this before React mounts, and startup must never fail on the probe:
+    // keep the resize listener alone.
+    console.error("Viewport height sync: could not observe the viewport", error);
+    observer?.disconnect();
+    viewportBox.remove();
+  }
 
   return () => {
     window.removeEventListener("resize", syncViewportHeight);
