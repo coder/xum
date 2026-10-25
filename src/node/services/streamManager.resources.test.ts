@@ -1,5 +1,6 @@
 import { describe, test, expect, afterEach, mock, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
+import { getEventListeners } from "node:events";
 import { createMuxMessage } from "@/common/types/message";
 import { StreamManager, type TurnEngineEvent } from "./streamManager";
 import * as aiSdk from "ai";
@@ -246,6 +247,35 @@ describe("StreamManager - stream resource scope", () => {
 
     // A closed scope refuses late writers.
     expect(registry.set(executionScope, "late-call", snapshot)).toBe(false);
+  });
+
+  test("a finished stream stops listening to the caller's abort signal", async () => {
+    // A caller signal outlives the stream (a session's); a kept listener would
+    // pin the finished stream's controller to it.
+    const { streamManager } = createLifecycleStreamManagerForTests([
+      { type: "text-delta", text: "hello" },
+      { type: "finish", finishReason: "stop" },
+    ]);
+    const caller = new AbortController();
+    const workspaceId = "caller-signal-workspace";
+    const messageId = `${workspaceId}-msg`;
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId,
+        model: createTestLanguageModel(),
+        tools: {},
+        runtime: LOCAL_TEST_RUNTIME,
+        providedRuntimeTempDir: "",
+        abortSignal: caller.signal,
+      })
+    );
+    if (!result.success) throw new Error("Expected stream to start");
+    expect(getEventListeners(caller.signal, "abort")).toHaveLength(1);
+
+    expect((await result.data.completion).status).toBe("completed");
+    expect(getEventListeners(caller.signal, "abort")).toHaveLength(0);
   });
 
   test("a stop closes the tool-call display scope before the stream exits", async () => {
