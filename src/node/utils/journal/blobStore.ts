@@ -38,7 +38,14 @@ export class BlobStore {
    * failed-publish cleanup must never delete those (see publishWithBlob).
    */
   async put(
-    content: string | Uint8Array
+    content: string | Uint8Array,
+    /**
+     * createParentDir (default true) false: the store's parent directory (the
+     * session dir) must already exist. The store creates only its own dir and
+     * the hash-prefix dir, one level at a time, so a missing parent fails the
+     * put with ENOENT instead of being recreated (#7474).
+     */
+    options?: { createParentDir?: boolean }
   ): Promise<{ ref: BlobRef; size: number; created: boolean }> {
     const buffer =
       typeof content === "string" ? Buffer.from(content, "utf-8") : Buffer.from(content);
@@ -61,13 +68,27 @@ export class BlobStore {
       // Not present (or unreadable) yet - write below.
     }
 
-    await this.files.promises.mkdir(path.dirname(blobPath), { recursive: true });
+    if (options?.createParentDir === false) {
+      await this.mkdirIfMissing(this.dir);
+      await this.mkdirIfMissing(path.dirname(blobPath));
+    } else {
+      await this.files.promises.mkdir(path.dirname(blobPath), { recursive: true });
+    }
     // Atomic install: write to a unique temp file, then rename. Rename over an
     // existing (possibly corrupt) blob both installs and self-heals.
     const tempPath = `${blobPath}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
     await this.files.promises.writeFile(tempPath, buffer);
     await this.files.promises.rename(tempPath, blobPath);
     return { ref, size: buffer.byteLength, created: !existed };
+  }
+
+  /** Non-recursive mkdir that accepts an existing dir; a missing parent throws ENOENT. */
+  private async mkdirIfMissing(dir: string): Promise<void> {
+    try {
+      await this.files.promises.mkdir(dir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code !== "EEXIST") throw error;
+    }
   }
 
   /**

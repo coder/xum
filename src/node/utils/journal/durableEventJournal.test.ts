@@ -397,3 +397,61 @@ describe("sharedDurableEventJournal layers", () => {
     expect(await fs.readdir(tmp.path)).not.toContain(DURABLE_EVENTS_FILE_NAME);
   });
 });
+
+describe("DurableEventJournal createSessionDir: false (#7474)", () => {
+  const draft = (ref: BlobRef) => ({
+    workspaceId: "ws-removed",
+    kind: "refinement" as const,
+    data: {
+      kind: "skill" as const,
+      action: { op: "write" as const, skillName: "demo", filePath: "SKILL.md" },
+      inverse: { op: "restore-files" as const, files: [{ path: "/s/SKILL.md", blobRef: ref }] },
+      evidence: { workspaceId: "ws-removed", toolName: "agent_skill_write" },
+    },
+  });
+  const failureOf = (write: Promise<unknown>) =>
+    write.then(
+      () => null,
+      (error: unknown) => error
+    );
+  const exists = (p: string) =>
+    fs.stat(p).then(
+      () => true,
+      () => false
+    );
+
+  test("a write never recreates a session dir that removal deletes, before or during the write", async () => {
+    using tmp = new DisposableTempDir("durable-journal-test");
+    const sessionDir = path.join(tmp.path, "session");
+    await fs.mkdir(sessionDir);
+    const journal = new DurableEventJournal(sessionDir);
+    const noCreate = { createSessionDir: false };
+    const { ref } = await journal.blobs.put("live payload", { createParentDir: false });
+    await journal.append(draft(ref), noCreate);
+
+    // Removal does not take the blob lock, so it can delete the dir while a
+    // writer holds it: the put and the append inside must not recreate it.
+    await journal.withBlobLock(async () => {
+      await fs.rm(sessionDir, { recursive: true, force: true });
+      expect(
+        await failureOf(journal.blobs.put("late payload", { createParentDir: false }))
+      ).toMatchObject({ code: "ENOENT" });
+      expect(await failureOf(journal.append(draft(ref), noCreate))).toMatchObject({
+        code: "ENOENT",
+      });
+    }, noCreate);
+    expect(await exists(sessionDir)).toBe(false);
+
+    // A write that starts after removal fails at the blob lock.
+    expect(await failureOf(journal.publishWithBlob("late payload", draft, noCreate))).toMatchObject(
+      {
+        code: "ENOENT",
+      }
+    );
+    expect(await exists(sessionDir)).toBe(false);
+
+    // The default still creates the directory for callers that did not opt in.
+    await journal.publishWithBlob("first payload", draft);
+    expect(await exists(path.join(sessionDir, DURABLE_EVENTS_FILE_NAME))).toBe(true);
+  });
+});

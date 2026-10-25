@@ -115,9 +115,20 @@ export class Journal<T> {
    * result is validated against the schema before hitting disk (crash-fast on
    * programmer error rather than persisting garbage).
    */
-  async append(build: (seq: number) => T): Promise<T> {
+  async append(
+    build: (seq: number) => T,
+    /**
+     * createParentDir (default true) false: the journal's directory must
+     * already exist, and a missing one fails the append with ENOENT instead
+     * of creating it (see ProcessFileLockOptions.createParentDir).
+     */
+    options?: { createParentDir?: boolean }
+  ): Promise<T> {
+    const createParentDir = options?.createParentDir !== false;
     const task = this.writeQueue.then(async () => {
-      await this.files.promises.mkdir(path.dirname(this.filePath), { recursive: true });
+      if (createParentDir) {
+        await this.files.promises.mkdir(path.dirname(this.filePath), { recursive: true });
+      }
       // Cross-process serialization: seq derivation and the write must be one
       // exclusive unit, or a concurrent writer in another process (debug CLI
       // vs live backend) could assign the same sequence number.
@@ -125,6 +136,7 @@ export class Journal<T> {
         lockPath: this.lockPath,
         timeoutMs: this.appendLockTimeoutMs,
         label: "append lock",
+        ...(createParentDir ? {} : { createParentDir: false }),
       });
       const { seq, fileSize } = await this.nextSeqLocked();
       const row = build(seq);
