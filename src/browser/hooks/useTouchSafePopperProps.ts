@@ -8,10 +8,16 @@ const NO_INSETS: Insets = { top: 0, right: 0, left: 0 };
 
 let probe: HTMLElement | null = null;
 let lastInsets = NO_INSETS;
+// Every Popover and Select content renders this hook, open or not, and reading the probe's
+// padding forces layout, so measure only on first use and after the window resizes.
+let insetsStale = true;
+let coarsePointerQuery: MediaQueryList | null = null;
 
 // env() only resolves inside CSS, so a hidden fixed element padded by the insets exposes them.
 function readInsets(): Insets {
+  if (!insetsStale) return lastInsets;
   if (typeof document === "undefined" || document.body == null) return NO_INSETS;
+  insetsStale = false;
   if (probe?.isConnected !== true) {
     probe = document.createElement("div");
     probe.setAttribute("aria-hidden", "true");
@@ -34,8 +40,12 @@ function readInsets(): Insets {
 function subscribe(onChange: () => void): () => void {
   if (typeof window === "undefined") return () => undefined;
   // Insets change with rotation and when a folding phone switches displays; both resize the window.
-  window.addEventListener("resize", onChange);
-  return () => window.removeEventListener("resize", onChange);
+  const handleResize = () => {
+    insetsStale = true;
+    onChange();
+  };
+  window.addEventListener("resize", handleResize);
+  return () => window.removeEventListener("resize", handleResize);
 }
 
 function getServerSnapshot(): Insets {
@@ -43,7 +53,9 @@ function getServerSnapshot(): Insets {
 }
 
 function isCoarsePointer(): boolean {
-  return typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)").matches === true;
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
+  coarsePointerQuery ??= window.matchMedia("(pointer: coarse)");
+  return coarsePointerQuery.matches;
 }
 
 /**
