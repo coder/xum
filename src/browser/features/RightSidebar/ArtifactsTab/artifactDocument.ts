@@ -100,10 +100,12 @@ export function buildSandboxedHtmlDocument(
 /**
  * iOS WebKit autosizes (inflates) long text blocks inside iframes, and the host's own
  * text-size-adjust in globals.css does not reach the srcdoc document, so status pages became
- * unreadable on phones. `:where` keeps zero specificity and the rule comes before any artifact
- * markup, so every artifact rule still overrides it.
+ * unreadable on phones. The anonymous, first-declared `@layer` ranks below every artifact layer
+ * and unlayered rule (an unlayered host rule would beat layered artifact rules), and `:where`
+ * keeps zero specificity, so every artifact rule still overrides it.
  */
-const TEXT_SIZE_ADJUST_STYLE = ":where(html){-webkit-text-size-adjust:100%;text-size-adjust:100%}";
+const TEXT_SIZE_ADJUST_STYLE =
+  "@layer{:where(html){-webkit-text-size-adjust:100%;text-size-adjust:100%}}";
 
 const SVG_FRAME_STYLE =
   "html,body{margin:0;height:100%}" +
