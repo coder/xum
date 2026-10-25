@@ -261,13 +261,18 @@ function liveFrameWindow(
 /**
  * A page with the theme's scheme paints no canvas of its own, so the backdrop shows: the pane
  * surface (main pane and right sidebar alike), so the page sits seamlessly in the pane. Any other
- * page gets the browser's default white canvas, until it reports the color it paints
- * (backdropColor).
+ * page gets the color it reports (backdropColor), or the browser's default white canvas once it
+ * reports none. Before its first report the frame stays clear and the pane shows through, so a
+ * dark page does not load over a white flash.
  */
-function frameClassName(followsColorScheme: boolean, annotating: boolean): string {
+function frameClassName(
+  followsColorScheme: boolean,
+  annotating: boolean,
+  backdropColor: string | null | undefined
+): string {
   return cn(
     "min-h-0 w-full flex-1 border-0",
-    followsColorScheme ? "bg-surface-primary" : "bg-white",
+    followsColorScheme ? "bg-surface-primary" : backdropColor === null && "bg-white",
     annotating && "cursor-crosshair"
   );
 }
@@ -380,11 +385,12 @@ export function SandboxedArtifactFrame(props: {
       : null;
   const guard = useFrameNavigationGuard(current?.srcDoc ?? null);
   const { navigatedRef } = guard;
-  // The canvas color the frame last reported (the bridge's backdrop message). It outlives the
-  // document that reported it: a rewritten or reloaded page keeps the previous color until it
-  // reports its own (the bridge always reports after load), so a dark page is not followed by
-  // a flash of frameClassName's white.
-  const [backdropColor, setBackdropColor] = useState<string | null>(null);
+  // The canvas color the frame last reported (the bridge's backdrop message): undefined until
+  // its first report, null when it paints none. It outlives the document that reported it: a
+  // rewritten or reloaded page keeps the previous color until it reports its own (the bridge
+  // always reports after load), so a dark page is not followed by a flash of frameClassName's
+  // white.
+  const [backdropColor, setBackdropColor] = useState<string | null | undefined>(undefined);
   const liveWindow = () => liveFrameWindow(navigatedRef, frameRef);
 
   useEffect(() => {
@@ -545,7 +551,7 @@ export function SandboxedArtifactFrame(props: {
           postArtifactTheme(liveWindow(), theme, currentAppearance());
           if (annotating) postArtifactAnnotateMode(liveWindow(), true);
         }}
-        className={frameClassName(current.followsColorScheme, annotating)}
+        className={frameClassName(current.followsColorScheme, annotating, backdropColor)}
         // SECURITY AUDIT: the frame's script picks this color. It only ever reaches this one CSS
         // property through React's style object, bounded in length, limited to a plain computed
         // color (no var(), url() or keywords) and checked with CSS.supports

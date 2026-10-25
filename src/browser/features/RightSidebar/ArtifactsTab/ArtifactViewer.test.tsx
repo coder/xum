@@ -286,7 +286,8 @@ describe("ArtifactViewer renderers", () => {
         Object.defineProperty(event, "source", { value: target.contentWindow });
         window.dispatchEvent(event);
       });
-    expect(frame.className).toContain("bg-white");
+    // Until the page reports, the pane shows through: no white flash while a dark page loads.
+    expect(frame.className).not.toContain("bg-white");
     expect(frame.style.backgroundColor).toBe("");
 
     postBackdrop(frame, "rgb(16, 15, 15)");
@@ -294,9 +295,11 @@ describe("ArtifactViewer renderers", () => {
     // A transparent canvas, or none, falls back to the white backdrop.
     postBackdrop(frame, "rgba(0, 0, 0, 0)");
     expect(frame.style.backgroundColor).toBe("");
+    expect(frame.className).toContain("bg-white");
     postBackdrop(frame, "rgb(16, 15, 15)");
     postBackdrop(frame, null);
     expect(frame.style.backgroundColor).toBe("");
+    expect(frame.className).toContain("bg-white");
 
     // Only a plain computed color passes: CSS.supports alone also takes these.
     for (const color of [

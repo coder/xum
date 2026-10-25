@@ -54,8 +54,8 @@ import {
  *   reaches it.
  * - Frame -> host: `{ type: "backdrop", color }`, the color the page's canvas paints (the root
  *   element's computed background, else the body's; null when both are transparent), posted
- *   after load, after each theme message (and the page's deferred restyling), on background
- *   transitionend, resize and scroll, only when it changed. The host paints it behind the
+ *   after load and after each theme message (and the page's deferred restyling of either),
+ *   only when it changed. The host paints it behind the
  *   frame (SandboxedArtifactFrame.tsx), since WebKit shows the iframe element's own background
  *   wherever the canvas is not painted yet (overscroll, a frame that just grew). The host accepts
  *   only a bounded, plain computed color that CSS.supports (artifactBackdropColor).
@@ -834,22 +834,17 @@ export function buildArtifactBridgeScript(
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "backdrop", color: color }, "*");
   }
   // Read again after the page's own deferred restyling: a listener that restyles in a
-  // microtask, a timer or the next frame (each queued before ours runs), and a background
-  // transition, whose computed color only reaches its end value at transitionend.
+  // microtask, a timer or the next frame (each queued before ours runs).
   function settleBackdrop() {
     postBackdrop();
     setTimeout(postBackdrop, 0);
     if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(postBackdrop);
   }
-  // A task after load, so the artifact's own load handlers have styled the page.
+  // Only after load and theme messages: reading on scroll or resize let a page whose background
+  // follows them flood the bridge's rate limit, which then drops its other messages too. A page
+  // that restyles its background later on its own keeps the old backdrop until the next theme
+  // message. A task after load, so the artifact's own load handlers have styled the page.
   window.addEventListener("load", function () { setTimeout(settleBackdrop, 0); }, { once: true });
-  window.addEventListener("transitionend", function (event) {
-    if (event.target === document.documentElement || event.target === document.body) postBackdrop();
-  });
-  // The backdrop shows when the frame grows or overscrolls: check it then too, so a page that
-  // restyled itself later (a timer after load) still gets its color. Posts only on change.
-  window.addEventListener("resize", postBackdrop);
-  window.addEventListener("scroll", postBackdrop, { passive: true });
   window.addEventListener("message", function (event) {
     if (event.source !== host) return;
     var data = event.data;

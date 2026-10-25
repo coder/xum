@@ -1330,7 +1330,7 @@ describe("bridge backdrop", () => {
     await page.close();
   });
 
-  test("reads the color again after the page's deferred restyling", async () => {
+  test("reads the color again after a theme listener's deferred restyling", async () => {
     const page = await runWithPage("<style>html { background: var(--xum-bg) }</style>");
     const root = page.win.document.documentElement;
     // A theme listener that restyles in a microtask, after the shim's synchronous read.
@@ -1339,16 +1339,6 @@ describe("bridge backdrop", () => {
     });
     await page.sendTheme("#fffcf0");
     expect(page.posts.at(-1)).toEqual(posted("#223344"));
-
-    // A background transition reaches its end color only at transitionend.
-    root.style.setProperty("background", "#334455");
-    root.dispatchEvent(new page.win.Event("transitionend", { bubbles: true }));
-    expect(page.posts.at(-1)).toEqual(posted("#334455"));
-
-    // A later restyle (a timer after load) is picked up when the frame grows.
-    root.style.setProperty("background", "#445566");
-    page.win.dispatchEvent(new page.win.Event("resize"));
-    expect(page.posts.at(-1)).toEqual(posted("#445566"));
     await page.close();
   });
 });
