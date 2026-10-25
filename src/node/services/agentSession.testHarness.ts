@@ -261,7 +261,18 @@ export async function createAgentSessionHarness(
   const testHistory = options.historyService ? undefined : await createTestHistoryService();
   const historyService = options.historyService ?? testHistory!.historyService;
   const config = options.config ?? testHistory!.config;
-  const cleanup = testHistory?.cleanup ?? (() => Promise.resolve());
+  const removeTempDir = testHistory?.cleanup ?? (() => Promise.resolve());
+  // Dispose before removing the folder: a session left alive keeps its RetryManager retrying
+  // (up to every 60 s) after its file ends, and each retry takes workspace use leases while
+  // later files in the same bun process run (#7526, #7518). dispose() is idempotent, so tests
+  // that already dispose their session can keep doing so.
+  const cleanup = async () => {
+    try {
+      await session.dispose();
+    } finally {
+      await removeTempDir();
+    }
+  };
   const fake = options.aiService
     ? undefined
     : createAgentSessionAIServiceFake({
