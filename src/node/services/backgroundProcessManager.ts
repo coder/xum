@@ -2304,7 +2304,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // reusing a settled one may clobber a record the other backend still tracks (see
     // recordDirIsFree). Host-local records are probed on the local filesystem; all other
     // layouts (SSH/Coder, Docker, devcontainer) live in the runtime's exec namespace and are
-    // claimed through the runtime with an atomic mkdir instead (claimRuntimeSpawnDir).
+    // claimed through the runtime with an exclusive marker create instead (claimRuntimeSpawnDir).
     // Cross-process claim (#4873): two backends on one XUM_ROOT (desktop + `xum server`) have
     // separate in-memory reservations but share the host records root, so both could probe a
     // name as free and spawn into one directory. Host-local spawns therefore hold a
