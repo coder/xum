@@ -19,11 +19,12 @@ import {
   type ActiveStreamInfo,
   type MockStreamLifecycle,
   type StopStreamOptions,
+  type TurnCompletion,
   type WorkspaceId,
   type StreamToken,
   StreamState,
 } from "@/node/services/turnEngine/types";
-import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
+import type { TurnSlot, WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import type { TurnEvents } from "@/node/services/turnEngine/TurnEvents";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -150,7 +151,7 @@ export class TurnRegistry {
 
   private async cancelStreamSafely(
     workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
+    streamInfo: WorkspaceStreamInfo & TurnSlot,
     abortReason: StreamAbortReason,
     abandonPartial?: boolean
   ): Promise<void> {
@@ -193,11 +194,35 @@ export class TurnRegistry {
     return streamInfo.cancelPromise;
   }
 
+  /** Records the promise of the turn's attempt loop; the abort settle waits for it. */
+  static trackProcessing(
+    streamInfo: WorkspaceStreamInfo & TurnSlot,
+    processing: Promise<void>
+  ): void {
+    streamInfo.processingPromise = processing;
+  }
+
+  /** Moves the turn to a state its attempt loop reached (STOPPING is the stop's own). */
+  static setState(
+    streamInfo: WorkspaceStreamInfo & TurnSlot,
+    state: StreamState.STREAMING | StreamState.COMPLETED | StreamState.ERROR
+  ): void {
+    streamInfo.state = state;
+  }
+
+  /** Records the turn's terminal outcome. Later stops and the lost-race guards read it. */
+  static recordTerminal(
+    streamInfo: WorkspaceStreamInfo & TurnSlot,
+    completion: TurnCompletion
+  ): void {
+    streamInfo.terminalCompletion = completion;
+  }
+
   // Checks if a soft interrupt is necessary, and performs one if so
   // Similar to cancelStreamSafely but performs cleanup without blocking
   async checkSoftCancelStream(
     workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo
+    streamInfo: WorkspaceStreamInfo & TurnSlot
   ): Promise<void> {
     if (!streamInfo.softInterrupt.pending) return;
     try {
@@ -252,7 +277,7 @@ export class TurnRegistry {
    * is not supervised — nothing durable exists for it yet and `stopStream`
    * already aborts pending controllers.
    */
-  superviseEngine(workspaceId: WorkspaceId, streamInfo: WorkspaceStreamInfo): void {
+  superviseEngine(workspaceId: WorkspaceId, streamInfo: WorkspaceStreamInfo & TurnSlot): void {
     if (this.deps.engineScope === undefined) {
       return;
     }
@@ -391,7 +416,7 @@ export class TurnRegistry {
   /** A soft stop latches the interrupt for the next boundary; a hard stop cancels now. */
   private stopEngine(
     workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
+    streamInfo: WorkspaceStreamInfo & TurnSlot,
     options: StopStreamOptions | undefined
   ): Promise<void> | undefined {
     const abortReason = options?.abortReason ?? "system";
