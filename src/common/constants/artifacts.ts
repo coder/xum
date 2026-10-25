@@ -29,7 +29,8 @@ export const ARTIFACT_THEME_VARIABLES = {
 
 export type ArtifactThemeVariableKey = keyof typeof ARTIFACT_THEME_VARIABLES;
 
-/** Status page agent (artifacts-status-page-agent): bounds of one headless run and its queue. */
+// Status page agent (artifacts-status-page-agent): bounds of one headless run and its queue.
+
 /** Model steps per run: a few edits plus the closing line. */
 export const STATUS_PAGE_AGENT_MAX_STEPS = 8;
 /** Largest page the agent reads or writes; status pages are small, so larger ones are refused. */

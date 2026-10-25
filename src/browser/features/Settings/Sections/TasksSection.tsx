@@ -59,11 +59,11 @@ const OFFLINE_SAVE_MESSAGE =
   "Not connected to the Xum server. Your changes save after it reconnects.";
 
 // Agents whose requests run outside the send path (raw streamText: Dream in
-// memoryConsolidation, Name Workspace in workspaceTitleGenerator, Status Page in
-// statusPageAgent) and never apply reasoningMode. Never offer a Pro/Cyber toggle
-// that cannot affect requests. Compact stays eligible: compaction goes through
-// the send path, which threads reasoningMode.
-const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace", "status_page"]);
+// memoryConsolidation, Name Workspace in workspaceTitleGenerator) and never
+// apply reasoningMode. Never offer a Pro/Cyber toggle that cannot affect requests.
+// Compact stays eligible: compaction goes through the send path, which
+// threads reasoningMode.
+const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace"]);
 /** The status page agent runs with thinking off (raw streamText, no provider options). */
 const NO_REASONING_AGENT_IDS = new Set(["status_page"]);
 
