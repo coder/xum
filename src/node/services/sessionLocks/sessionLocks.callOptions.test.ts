@@ -8,6 +8,9 @@
  * prototype and the shared MutexMap). In Bun they also reach the named
  * imports of the callers, so the record sees each call before and after the
  * move. Calls from test files (the scenarios' own foreign holders) are left out.
+ * So are calls from outside the scenarios' async context: bun runs a unit shard's
+ * files in one process, and an AgentSession that an earlier file never disposed
+ * keeps retrying its failed stream and taking its turn use lease (#7518).
  *
  * Record again after an intended change:
  * UPDATE_FIXTURE=1 bun test ./src/node/services/sessionLocks/sessionLocks.callOptions.test.ts
@@ -15,6 +18,7 @@
  */
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import assert from "node:assert";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -241,7 +245,10 @@ function recordLockCalls() {
   /** Each call in order, unmasked: the scenarios name their roots while they run. */
   const calls: Array<{ site: string; step: string | undefined; fn: string; args: unknown[] }> = [];
   const waiters: Array<{ lockPath: string; resolve: () => void }> = [];
+  /** Set inside `run`: a call made outside it comes from another file's leftover work. */
+  const scenarios = new AsyncLocalStorage<true>();
   const add = (fn: string, args: unknown[], lockPath?: string) => {
+    if (scenarios.getStore() !== true) return;
     const site = callSite();
     // Function names on the stack change with the process state (another test file in the
     // same bun process changes the frame format), so a scenario names its step instead.
@@ -300,6 +307,8 @@ function recordLockCalls() {
 
   return {
     names,
+    /** Runs the scenarios: only the lock calls of their async work are recorded. */
+    run: <T>(fn: () => Promise<T>) => scenarios.run(true, fn),
     /** Resolves at the next lock call on lockPath after this call. */
     nextLockCall: (lockPath: string) =>
       new Promise<void>((resolve) => waiters.push({ lockPath, resolve })),
@@ -321,35 +330,38 @@ afterEach(() => {
 
 test("moved lock calls keep their options", async () => {
   const record = recordLockCalls();
-  await oneTurn(record.names); // history writes, turn use lease, todo_write, review pane, blob lock
-  // hold() publishes its use-lease file, then inspects the mutation gate (#7326): the other order
-  // lets a mutator's lease scan and the turn's gate probe both pass. The sorted rows cannot show it.
-  const leaseOrder = record
-    .callsFrom(0)
-    .map(
-      (call) => /\/locks\/(workspace-use|workspace-mutation)\//.exec(JSON.stringify(call.args))?.[1]
-    )
-    .filter((kind) => kind !== undefined);
-  expect(leaseOrder).toEqual(["workspace-use", "workspace-mutation"]);
-  await oneRefusal(record.names); // a live gate: hold() refuses. A live turn owner: inspect says held.
-  const removalFrom = record.callCount();
-  await oneRemoval(record.names); // removeSessionDirUnderMemoryLocks: refine, target, history lock
-  // Removal takes refine, then target, then history: another order can deadlock against an
-  // apply that holds refine and waits for history. The sorted rows cannot show the order.
-  const removalLocks = record
-    .callsFrom(removalFrom)
-    .filter((call) => call.fn === "acquireProcessFileLock")
-    .map((call) => /\/locks\/([a-z-]+?)-<hash:/.exec(JSON.stringify(call.args))?.[1])
-    // One target lock per memory target: keep the kind once.
-    .filter((kind, index, kinds) => kind !== kinds[index - 1]);
-  expect(removalLocks).toEqual(["refine-apply", "target", "history"]);
-  await oneRefineApply(record.names); // the staging lock of a pass, the apply lock
-  await oneFork(record.names, record.nextLockCall); // the branch summary marker and its wait
-  await oneUsageAndGoal(record.names); // usage (with the headless target lock), timing and goal files
-  await oneChildReport(record.names); // the subagent artifact indexes, the turn publication lock
-  await oneInitAndPlan(record.names); // the init record lock seen by two backends, plan migration
-  await oneWorkspaceRefine(record.names); // a full clear under the refine serialization lock
-  await oneArtifactAndRun(record.names); // pins, artifact versions, workflow run locks, rollback, journal
+  await record.run(async () => {
+    await oneTurn(record.names); // history writes, turn use lease, todo_write, review pane, blob lock
+    // hold() publishes its use-lease file, then inspects the mutation gate (#7326): the other order
+    // lets a mutator's lease scan and the turn's gate probe both pass. The sorted rows cannot show it.
+    const leaseOrder = record
+      .callsFrom(0)
+      .map(
+        (call) =>
+          /\/locks\/(workspace-use|workspace-mutation)\//.exec(JSON.stringify(call.args))?.[1]
+      )
+      .filter((kind) => kind !== undefined);
+    expect(leaseOrder).toEqual(["workspace-use", "workspace-mutation"]);
+    await oneRefusal(record.names); // a live gate: hold() refuses. A live turn owner: inspect says held.
+    const removalFrom = record.callCount();
+    await oneRemoval(record.names); // removeSessionDirUnderMemoryLocks: refine, target, history lock
+    // Removal takes refine, then target, then history: another order can deadlock against an
+    // apply that holds refine and waits for history. The sorted rows cannot show the order.
+    const removalLocks = record
+      .callsFrom(removalFrom)
+      .filter((call) => call.fn === "acquireProcessFileLock")
+      .map((call) => /\/locks\/([a-z-]+?)-<hash:/.exec(JSON.stringify(call.args))?.[1])
+      // One target lock per memory target: keep the kind once.
+      .filter((kind, index, kinds) => kind !== kinds[index - 1]);
+    expect(removalLocks).toEqual(["refine-apply", "target", "history"]);
+    await oneRefineApply(record.names); // the staging lock of a pass, the apply lock
+    await oneFork(record.names, record.nextLockCall); // the branch summary marker and its wait
+    await oneUsageAndGoal(record.names); // usage (with the headless target lock), timing and goal files
+    await oneChildReport(record.names); // the subagent artifact indexes, the turn publication lock
+    await oneInitAndPlan(record.names); // the init record lock seen by two backends, plan migration
+    await oneWorkspaceRefine(record.names); // a full clear under the refine serialization lock
+    await oneArtifactAndRun(record.names); // pins, artifact versions, workflow run locks, rollback, journal
+  });
 
   const actual = record.normalized();
   if (process.env.UPDATE_FIXTURE === "1") {
