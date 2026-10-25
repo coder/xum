@@ -19,7 +19,9 @@ import {
   readArtifactIndex,
   readArtifactVersionBytes,
   recordArtifactVersion,
+  type RecordArtifactVersionParams,
 } from "./artifactVersionStore";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 let root: string;
 let sessionDir: string;
@@ -410,6 +412,41 @@ describe("recordArtifactVersion pin", () => {
     const cleared = await recordArtifactVersion({ ...base, bytes: Buffer.from("2"), pin: null });
     expect(cleared.pin).toBeNull();
     expect((await readArtifactIndex(sessionDir, getArtifactId("p.md")))?.pin).toBeNull();
+  });
+});
+
+// Each test kills a mutant that the phase 4 mutation runs left alive (#7475).
+describe("recordArtifactVersion results", () => {
+  const record = (bytes: string, extra: Partial<RecordArtifactVersionParams> = {}) =>
+    recordArtifactVersion({
+      sessionDir,
+      relPath: "r.md",
+      label: null,
+      bytes: Buffer.from(bytes),
+      ...extra,
+    });
+
+  test("a new version reports created, its kind and a zero nowMs", async () => {
+    const result = await record("1", { kind: "html", nowMs: 0 });
+    expect(result.created).toBe(true);
+    expect(result.version.kind).toBe("html");
+    expect(result.version.createdAtMs).toBe(0);
+  });
+
+  test("re-pinning the latest bytes keeps every older version", async () => {
+    await record("1");
+    await record("2");
+    const repinned = await record("2", { pin: "project" });
+    expect(repinned.created).toBe(false);
+    expect((await versionsOf("r.md")).map((v) => v.version)).toEqual([1, 2]);
+  });
+
+  test("a failed lock acquire without an abort signal rethrows its own error", async () => {
+    const locks = {
+      ...nodeSessionLocks,
+      acquireCrossProcessLock: () => Promise.reject(new Error("lock store down")),
+    };
+    await expect(record("1", { locks })).rejects.toThrow("lock store down");
   });
 });
 
