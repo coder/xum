@@ -250,34 +250,37 @@ export class DaytonaSandboxes {
    * sandbox that is already gone counts as deleted.
    *
    * A workspace's config is not proof that Xum created the sandbox it names, so one without this
-   * install's label is kept (only Xum's access to it goes) and logged.
+   * install's label is kept (only Xum's access to it goes) and logged. The config holds the
+   * sandbox's name, which another sandbox can take once this one is gone, so the delete goes to
+   * the id the label check saw, and a sandbox already gone gets no delete.
    */
   async deleteSandbox(sandboxId: string): Promise<void> {
     const { client } = await this.account.getClient();
-    const owned = await this.isOwned(client, sandboxId);
+    const sandbox = await this.findSandbox(client, sandboxId);
     // Revoke first: Daytona refuses to revoke a token of a sandbox that no longer exists.
     await this.ssh.releaseSshAccess(sandboxId);
-    if (!owned) {
+    if (!sandbox) return;
+    if (!(await this.carriesInstanceLabel(sandbox))) {
       log.warn("Keeping a Daytona sandbox without this install's label", { sandboxId });
       return;
     }
     try {
-      await client.deleteSandbox(sandboxId);
+      await client.deleteSandbox(sandbox.id);
     } catch (error) {
       if (!isDaytonaNotFound(error)) throw error;
     }
   }
 
-  /** A sandbox that is already gone counts as owned: its delete is a no-op. */
-  private async isOwned(client: DaytonaClient, sandboxId: string): Promise<boolean> {
-    let sandbox: DaytonaSandbox;
+  private async findSandbox(
+    client: DaytonaClient,
+    sandboxId: string
+  ): Promise<DaytonaSandbox | undefined> {
     try {
-      sandbox = await client.getSandbox(sandboxId);
+      return await client.getSandbox(sandboxId);
     } catch (error) {
-      if (isDaytonaNotFound(error)) return true;
+      if (isDaytonaNotFound(error)) return undefined;
       throw error;
     }
-    return this.carriesInstanceLabel(sandbox);
   }
 
   private async carriesInstanceLabel(sandbox: DaytonaSandbox): Promise<boolean> {

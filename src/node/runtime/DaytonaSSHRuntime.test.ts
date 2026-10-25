@@ -449,7 +449,12 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
         ["xum-persistent", true],
       ] as const) {
         rig.writer.writeError = new Error("No space left on device");
-        rig.plane.failingRoutes.add(`DELETE /sandbox/${sandboxId}`);
+        // The delete goes to the id of the sandbox the setup created, not to its name.
+        rig.plane.onRequest.set(`GET /sandbox/${sandboxId}`, () => {
+          const created = rig.plane.find(sandboxId);
+          if (created) rig.plane.failingRoutes.add(`DELETE /sandbox/${created.id}`);
+          return Promise.resolve();
+        });
         const daytona = { sandboxId, ...SMALL };
 
         // eslint-disable-next-line @typescript-eslint/await-thenable
@@ -459,6 +464,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
         expect(rig.plane.find(sandboxId)).toBeDefined();
 
         // The persisted workspace still names the sandbox; removing it deletes the sandbox.
+        rig.plane.onRequest.clear();
         rig.plane.failingRoutes.clear();
         if (!force) rig.writer.writeError = undefined;
         const removal = await makeRuntime(daytona).deleteWorkspace(

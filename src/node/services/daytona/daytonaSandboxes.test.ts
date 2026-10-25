@@ -136,4 +136,24 @@ describe("DaytonaSandboxes", () => {
     await rig.service.sandboxes.deleteSandbox("sb-own");
     expect(rig.plane.find("sb-own")).toBeUndefined();
   });
+
+  it("never deletes a sandbox that took the name after the ownership check", async () => {
+    rig.plane.addSandbox({ id: "id-old", name: "ws-1" });
+    await rig.service.ssh.ensureSshAccess("ws-1");
+    // The revoke runs between the check and the delete: the sandbox goes, another takes its name.
+    rig.plane.onRequest.set("DELETE /sandbox/ws-1/ssh-access", () => {
+      rig.plane.sandboxes.delete("id-old");
+      rig.plane.addSandbox({ id: "id-new", name: "ws-1", labels: {} });
+      return Promise.resolve();
+    });
+
+    await rig.service.sandboxes.deleteSandbox("ws-1");
+    expect(rig.plane.find("id-new")).toBeDefined();
+    expect(rig.plane.countCalls("DELETE /sandbox/ws-1")).toBe(0);
+  });
+
+  it("sends no delete for a sandbox that is already gone", async () => {
+    await rig.service.sandboxes.deleteSandbox("ws-gone");
+    expect(rig.plane.countCalls("DELETE /sandbox/ws-gone")).toBe(0);
+  });
 });
