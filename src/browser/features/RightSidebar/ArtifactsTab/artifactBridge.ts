@@ -558,7 +558,7 @@ const ANNOTATE_KEY_LISTENER =
  */
 const INTERRUPT_KEY_LISTENER = `
   function escapeClosesLayer() {
-    var selectors = ["dialog:modal", ":popover-open:not([popover=manual])"];
+    var selectors = ["dialog:modal", ":popover-open:not([popover=manual i])"];
     for (var i = 0; i < selectors.length; i++) {
       try {
         if (document.querySelector(selectors[i]) !== null) return true;
