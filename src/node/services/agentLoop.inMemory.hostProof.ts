@@ -12,8 +12,8 @@ import * as path from "node:path";
 import { IN_MEMORY_WORKSPACE_PATH, makeInMemoryLoop } from "./agentLoop.inMemory.testHarness";
 import { createMemoryHost } from "./hostFiles/memoryHostFiles.testHarness";
 import { hostTrapOrThrow, type HostTrapRow } from "./hostTrap/hostTrap.testHarness";
+import { allowedOnDisk } from "./agentLoop.inMemory.diskRule.testHarness";
 import { closeLogFile, getLogFilePath } from "./log";
-import { isPathInsideDir } from "@/node/utils/pathUtils";
 
 // Throws at once with plain bun test: the trap loads only with tests/hostProof.bunfig.toml.
 const trap = hostTrapOrThrow();
@@ -50,62 +50,6 @@ function toolThenAnswer(toolName: string, input: unknown): MockLanguageModelV3 {
   });
 }
 
-// isPathInsideDir resolves both paths first, so a `..` segment cannot leave the root.
-const isInside = isPathInsideDir;
-
-interface DiskRule {
-  configRoot: string;
-  /** Under the config root, but on test layers: the session dirs and the worktrees. */
-  layered: string[];
-  logsDir: string;
-}
-
-function allowedPath(rule: DiskRule, api: string, target: string): boolean {
-  return (
-    (isInside(rule.configRoot, target) && !rule.layered.some((dir) => isInside(dir, target))) ||
-    (api === "fs.lstatSync" && isInside(target, rule.configRoot)) ||
-    isLogSinkPath(rule.logsDir, target)
-  );
-}
-
-/** The log sink's own paths: its dir, mux.log and the rotated mux.<n>.log. Nothing else in the dir. */
-function isLogSinkPath(logsDir: string, target: string): boolean {
-  const resolved = path.resolve(target);
-  if (resolved === path.resolve(logsDir)) return true;
-  return (
-    path.dirname(resolved) === path.resolve(logsDir) &&
-    /^mux(\.\d+)?\.log$/.test(path.basename(resolved))
-  );
-}
-
-/** Calls that may write stdout or stderr by fd: the console sink. Not net.connect(1). */
-const STD_FD_APIS = /^(fs\.|Bun\.(file|write)$)/;
-
-/**
- * The disk rule of claim 4.3: Config's calls under its root and the log file. Nothing else.
- * - Config and its stores (config.json, providers.jsonc, secrets.json, the plugin registry and
- *   journals of the managed container) stay on the disk until #7209. Config checks each
- *   ancestor of its root for links (lstat). The session dirs and worktrees under the root are
- *   not Config's: a call there fails the proof.
- * - The log sink writes XUM_ROOT/logs/mux.log (#7209), and its console sink writes stdout. The
- *   file stream writes by fd. An fd row is allowed for stdout and stderr, or when the trap saw
- *   the fd open while armed and its path passes this rule. An fd opened before arm() fails.
- */
-function allowedOnDisk(configRoot: string): (row: HostTrapRow) => boolean {
-  const rule: DiskRule = {
-    configRoot,
-    layered: [path.join(configRoot, "sessions"), path.join(configRoot, "src")],
-    logsDir: path.dirname(getLogFilePath()),
-  };
-  return (row) => {
-    // A two-path call (rename, copyFile, ...) does host I/O at both paths.
-    if (row.arg2 !== undefined && !allowedPath(rule, row.api, row.arg2)) return false;
-    if (!/^fd\/\d+$/.test(row.arg)) return allowedPath(rule, row.api, row.arg);
-    if (row.arg === "fd/1" || row.arg === "fd/2") return STD_FD_APIS.test(row.api);
-    return row.fdPath !== undefined && allowedPath(rule, row.api, row.fdPath);
-  };
-}
-
 let disallowed: (row: HostTrapRow) => boolean = () => false;
 let configRoot: string | undefined;
 let disposeClock: (() => Promise<void>) | undefined;
@@ -116,7 +60,7 @@ test("one turn with one tool call runs on test layers only", async () => {
   await host.files.promises.writeFile(`${IN_MEMORY_WORKSPACE_PATH}/README.md`, "# hello\n");
   // The test's own setup, before the trap: the empty dir that Config uses as its root.
   configRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "xum-host-proof-"));
-  const allowed = allowedOnDisk(configRoot);
+  const allowed = allowedOnDisk(configRoot, path.dirname(getLogFilePath()));
   disallowed = (row) => !allowed(row);
   // The trap stays armed until afterAll, so a late callback after the test still adds a row.
   trap.arm(); // before the loop is built: constructors count too
