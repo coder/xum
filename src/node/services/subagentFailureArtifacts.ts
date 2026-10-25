@@ -5,7 +5,6 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
-import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 /**
@@ -176,11 +175,10 @@ export async function upsertSubagentFailureArtifact(params: {
   workflowOwnedAncestorWorkspaceIds?: string[];
   model?: string;
   nowMs?: number;
-  /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
-  locks?: SessionLocks;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }): Promise<void> {
-  // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
-  const fileLocks = (params.locks ?? nodeSessionLocks).workspaceFiles;
+  const fileLocks = params.locks.workspaceFiles;
   await fileLocks.withLock(params.workspaceId, async () => {
     const nowMs = params.nowMs ?? Date.now();
 

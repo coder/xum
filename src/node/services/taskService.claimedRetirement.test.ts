@@ -25,6 +25,7 @@ import {
   stubStableIds,
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 /**
  * G2 PR B (TaskService side): the cross-process classifier branch, the workflow claim that
@@ -144,6 +145,7 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
       const config = await setupChild("reportedtoo");
       await writeReceipt(config, midId, "reportedtoo");
       await upsertSubagentReportArtifact({
+        locks: nodeSessionLocks,
         workspaceId: midId,
         workspaceSessionDir: path.join(config.sessionsDir, midId),
         childTaskId: "reportedtoo",
@@ -167,6 +169,7 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
       });
       await fsPromises.rm(failures);
       await upsertSubagentFailureArtifact({
+        locks: nodeSessionLocks,
         workspaceId: midId,
         workspaceSessionDir: path.join(config.sessionsDir, midId),
         childTaskId: "refused",

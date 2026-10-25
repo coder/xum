@@ -35,6 +35,7 @@ import {
 } from "@/node/services/taskService.shared.testHarness";
 import type { Config } from "@/node/config";
 import { settleArchivedSharedDesktopTask } from "@/node/services/desktop/DesktopInputCoordinator";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 // Sub-agent goals: TaskService alone drives a child's turns, so the child's goal loop (continue,
 // silent completion, one budget wrap-up, report) is arbitrated at the task's stream end, before
@@ -1378,6 +1379,7 @@ describe("TaskService child goals", () => {
       taskDesktopOwnerWorkspaceId: parentId,
     });
     const earlierReport = {
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(t.config.sessionsDir, parentId),
       childTaskId: childId,
@@ -1446,6 +1448,7 @@ describe("TaskService child goals", () => {
     taskAttemptId?: string
   ) => {
     const params = {
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(t.config.sessionsDir, parentId),
       childTaskId: childId,

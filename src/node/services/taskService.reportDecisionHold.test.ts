@@ -38,6 +38,7 @@ import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import { WorkspaceService } from "@/node/services/workspaceService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 /**
  * A child task's stream-end decision (TaskService.StreamEndDecision) against the REAL host —
@@ -984,6 +985,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           });
         }
         const otherBackendReport = {
+          locks: nodeSessionLocks,
           workspaceId: rootId,
           workspaceSessionDir: path.join(config.sessionsDir, rootId),
           childTaskId: childId,

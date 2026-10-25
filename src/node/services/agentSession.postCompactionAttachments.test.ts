@@ -25,6 +25,7 @@ import { recordArtifactVersion } from "./artifactVersionStore";
 import { upsertSubagentReportArtifact } from "./subagentReportArtifacts";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import type { EffectRunner } from "./di/effectRunner";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 function createSuccessfulFileEditMessage(id: string, filePath: string, diff: string): MuxMessage {
   return {
@@ -345,6 +346,7 @@ describe("AgentSession post-compaction attachments", () => {
     const sessionDir = path.join(config.sessionsDir, WORKSPACE_ID);
     await writePendingPostCompactionState({ sessionDir, diffs: [], loadedSkills: [] });
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: WORKSPACE_ID,
       workspaceSessionDir: sessionDir,
       childTaskId: "task-before-compaction",

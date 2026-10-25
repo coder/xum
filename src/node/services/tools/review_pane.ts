@@ -19,7 +19,6 @@ import {
 } from "@/node/services/reviewPane/assistedReviewStorage";
 import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
-import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 /**
@@ -192,8 +191,7 @@ export const createReviewPaneUpdateTool: ToolFactory = (config) => {
         config.workspaceId,
         config.workspaceSessionDir,
         args,
-        // mutation-equivalent: sessionLocks is a SessionLocks object or undefined, so ?? and || agree
-        config.sessionLocks ?? nodeSessionLocks,
+        config.sessionLocks,
         // mutation-equivalent: sessionFiles is a SessionFiles object or undefined, so ?? and || agree
         config.sessionFiles ?? nodeSessionFiles,
         {

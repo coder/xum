@@ -317,7 +317,7 @@ export async function oneFork(
         getWorkspaceMetadata: () => Promise.resolve(Err("no metadata in this scenario")),
       },
       workspaceId,
-      sessionDir,
+      marker: { sessionDir, locks: historyService.locks },
       abandonedMessages: [],
       guardTailMessageId: "none",
     });
@@ -329,7 +329,10 @@ export async function oneFork(
       label: "scenario branch summary marker",
     });
     const waitCall = nextLockCall(path.join(sessionDir, "branch-summary.lock"));
-    const waiting = awaitPendingBranchSummary("ws-record-fork-foreign", sessionDir);
+    const waiting = awaitPendingBranchSummary("ws-record-fork-foreign", {
+      sessionDir,
+      locks: historyService.locks,
+    });
     await waitCall;
     await marker[Symbol.asyncDispose]();
     await waiting;
@@ -390,13 +393,19 @@ export async function oneChildReport(names: LockNames): Promise<void> {
       childTaskId: "ws-record-child",
       parentWorkspaceId: workspaceId,
       ancestorWorkspaceIds: [workspaceId],
+      locks: nodeSessionLocks,
     };
     // subagentReportArtifacts.ts has two lock calls: a step name keeps them apart.
     await step("upsert report", () =>
       upsertSubagentReportArtifact({ ...child, reportMarkdown: "Done." })
     );
     await upsertSubagentFailureArtifact({ ...child, errorType: "unknown", errorMessage: "down" });
-    const unchanged = { workspaceId, workspaceSessionDir, update: () => undefined };
+    const unchanged = {
+      workspaceId,
+      workspaceSessionDir,
+      update: () => undefined,
+      locks: nodeSessionLocks,
+    };
     await step("update reports", () => updateSubagentReportArtifactsFile(unchanged));
     await updateSubagentTranscriptArtifactsFile(unchanged);
     await updateSubagentGitPatchArtifactsFile(unchanged);
