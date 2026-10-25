@@ -24,9 +24,8 @@ import {
 import { generateBranchName } from "../../ipc/helpers";
 import { detectDefaultTrunkBranch } from "../../../src/node/git";
 
-import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
-import { cleanupView, openProjectCreationView, setupWorkspaceView } from "../helpers";
+import { cleanupView, openProjectCreationView, setupTestDom, setupWorkspaceView } from "../helpers";
 
 async function findQuickArchiveButton(params: {
   container: HTMLElement;
@@ -60,7 +59,10 @@ describeIntegration("Workspace Creation (UI)", () => {
   test("workspace selection persists after clicking workspace in sidebar", async () => {
     // Use withSharedWorkspace to get a properly created workspace
     await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
-      const cleanupDom = installDom();
+      // setupTestDom (here and in every render below) turns the first-run tutorial off: its
+      // bubble opens 300 ms after the workspace view mounts and takes focus, which closed an open
+      // workspace actions menu before the test could click Archive (#7436).
+      const cleanupDom = setupTestDom();
 
       const view = renderApp({
         apiClient: env.orpc,
@@ -153,7 +155,7 @@ describeIntegration("Workspace Archive (UI)", () => {
     const secondWorkspace = secondResult.metadata;
     const firstDisplayTitle = firstWorkspace.title ?? firstWorkspace.name;
 
-    const cleanupDom = installDom();
+    const cleanupDom = setupTestDom();
     const view = renderApp({
       apiClient: env.orpc,
       metadata: firstWorkspace,
@@ -224,7 +226,7 @@ describeIntegration("Workspace Archive (UI)", () => {
       const projectPath = metadata.projectPath;
       const displayTitle = metadata.title ?? metadata.name;
 
-      const cleanupDom = installDom();
+      const cleanupDom = setupTestDom();
       const view = renderApp({
         apiClient: env.orpc,
         metadata,
@@ -348,7 +350,7 @@ describeIntegration("Workspace Archive List Reactivity (UI)", () => {
     // Archive the first workspace so the archive section will be visible
     await env.orpc.workspace.archive({ workspaceId: firstWorkspace.id });
 
-    const cleanupDom = installDom();
+    const cleanupDom = setupTestDom();
     const view = renderApp({
       apiClient: env.orpc,
       metadata: secondWorkspace,
@@ -493,7 +495,7 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
 
     await env.orpc.workspace.archive({ workspaceId });
 
-    const cleanupDom = installDom();
+    const cleanupDom = setupTestDom();
     const view = renderApp({
       apiClient: env.orpc,
       metadata,
@@ -595,7 +597,7 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
 
     await env.orpc.workspace.archive({ workspaceId });
 
-    const cleanupDom = installDom();
+    const cleanupDom = setupTestDom();
     const view = renderApp({
       apiClient: env.orpc,
       metadata,
