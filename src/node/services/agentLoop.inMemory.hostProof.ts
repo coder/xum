@@ -13,6 +13,7 @@ import { IN_MEMORY_WORKSPACE_PATH, makeInMemoryLoop } from "./agentLoop.inMemory
 import { createMemoryHost } from "./hostFiles/memoryHostFiles.testHarness";
 import { hostTrapOrThrow, type HostTrapRow } from "./hostTrap/hostTrap.testHarness";
 import { closeLogFile, getLogFilePath } from "./log";
+import { isPathInsideDir } from "@/node/utils/pathUtils";
 
 // Throws at once with plain bun test: the trap loads only with tests/hostProof.bunfig.toml.
 const trap = hostTrapOrThrow();
@@ -49,8 +50,22 @@ function toolThenAnswer(toolName: string, input: unknown): MockLanguageModelV3 {
   });
 }
 
-function isInside(root: string, target: string): boolean {
-  return target === root || target.startsWith(root + path.sep);
+// isPathInsideDir resolves both paths first, so a `..` segment cannot leave the root.
+const isInside = isPathInsideDir;
+
+interface DiskRule {
+  configRoot: string;
+  /** Under the config root, but on test layers: the session dirs and the worktrees. */
+  layered: string[];
+  logsDir: string;
+}
+
+function allowedPath(rule: DiskRule, api: string, target: string): boolean {
+  return (
+    (isInside(rule.configRoot, target) && !rule.layered.some((dir) => isInside(dir, target))) ||
+    (api === "fs.lstatSync" && isInside(target, rule.configRoot)) ||
+    isInside(rule.logsDir, target)
+  );
 }
 
 /**
@@ -60,62 +75,71 @@ function isInside(root: string, target: string): boolean {
  *   ancestor of its root for links (lstat). The session dirs and worktrees under the root are
  *   not Config's: a call there fails the proof.
  * - The log sink writes XUM_ROOT/logs/mux.log (#7209), and its console sink writes stdout. The
- *   file stream writes by fd. Every other fd comes from an open row that this rule checks by
- *   its path, so an fd row needs no path.
+ *   file stream writes by fd. An fd row is allowed for stdout and stderr, or when the trap saw
+ *   the fd open while armed and its path passes this rule. An fd opened before arm() fails.
  */
 function allowedOnDisk(configRoot: string): (row: HostTrapRow) => boolean {
-  const logsDir = path.dirname(getLogFilePath());
-  // The config root also holds the session dirs and the worktrees: those stay on test layers.
-  const layered = [path.join(configRoot, "sessions"), path.join(configRoot, "src")];
-  return (row) =>
-    (isInside(configRoot, row.arg) && !layered.some((dir) => isInside(dir, row.arg))) ||
-    (row.api === "fs.lstatSync" && isInside(row.arg, configRoot)) ||
-    isInside(logsDir, row.arg) ||
-    /^fd\/\d+$/.test(row.arg);
+  const rule: DiskRule = {
+    configRoot,
+    layered: [path.join(configRoot, "sessions"), path.join(configRoot, "src")],
+    logsDir: path.dirname(getLogFilePath()),
+  };
+  return (row) => {
+    if (!/^fd\/\d+$/.test(row.arg)) return allowedPath(rule, row.api, row.arg);
+    if (row.arg === "fd/1" || row.arg === "fd/2") return true;
+    return row.fdPath !== undefined && allowedPath(rule, row.api, row.fdPath);
+  };
 }
 
 let disallowed: (row: HostTrapRow) => boolean = () => false;
+let configRoot: string | undefined;
+let disposeClock: (() => Promise<void>) | undefined;
 
 test("one turn with one tool call runs on test layers only", async () => {
   const host = createMemoryHost();
   await host.files.promises.mkdir(IN_MEMORY_WORKSPACE_PATH, { recursive: true });
   await host.files.promises.writeFile(`${IN_MEMORY_WORKSPACE_PATH}/README.md`, "# hello\n");
   // The test's own setup, before the trap: the empty dir that Config uses as its root.
-  const configRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "xum-host-proof-"));
+  configRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "xum-host-proof-"));
   const allowed = allowedOnDisk(configRoot);
   disallowed = (row) => !allowed(row);
+  // The trap stays armed until afterAll, so a late callback after the test still adds a row.
+  trap.arm(); // before the loop is built: constructors count too
+  const loop = await makeInMemoryLoop({
+    host,
+    configRoot,
+    model: toolThenAnswer("file_read", { path: "README.md" }),
+  });
+  disposeClock = () => loop.clock.dispose();
   try {
-    trap.arm(); // before the loop is built: constructors count too
-    const loop = await makeInMemoryLoop({
-      host,
-      configRoot,
-      model: toolThenAnswer("file_read", { path: "README.md" }),
-    });
-    try {
-      await loop.send("Read the README.");
-      await loop.waitForStreamEnd();
-    } finally {
-      await loop.dispose();
-    }
-    await host.runtime.idle(); // the `void runtime.exec` of the stream's temp dir cleanup
-    closeLogFile(); // else its WriteStream stays open
-    await trap.drain(); // open host work of the turn: none, or it fails and names it
-    trap.disarm();
-    await loop.clock.dispose();
-
-    expect(loop.toolResult("file_read")).toMatchObject({
-      success: true,
-      content: "1\t# hello\n2\t",
-    });
-    expect(await loop.chatRoles()).toEqual(["user", "assistant"]);
-    // The one exec of the turn: the cleanup of the stream's temp dir.
-    expect(host.runtime.execs.every((command) => command.startsWith("rm -rf '"))).toBe(true);
-    expect(trap.rows().filter(disallowed)).toEqual([]);
+    await loop.send("Read the README.");
+    await loop.waitForStreamEnd();
   } finally {
-    trap.disarm();
-    await fsp.rm(configRoot, { recursive: true, force: true });
+    await loop.dispose();
   }
+  await host.runtime.idle(); // the `void runtime.exec` of the stream's temp dir cleanup
+  closeLogFile(); // else its WriteStream stays open
+  await trap.drain(); // open host work of the turn: none, or it fails and names it
+
+  // One tool call: a second run of the same call fails here.
+  const results = loop.toolResults("file_read");
+  expect(results).toHaveLength(1);
+  expect(results[0]).toMatchObject({ success: true, content: "1\t# hello\n2\t" });
+  expect(await loop.chatRoles()).toEqual(["user", "assistant"]);
+  // The one exec of the turn: the cleanup of the stream's temp dir.
+  expect(host.runtime.execs).toHaveLength(1);
+  expect(host.runtime.execs[0]).toStartWith("rm -rf '");
+  expect(trap.rows().filter(disallowed)).toEqual([]);
 }, 60_000);
 
-// A host call after the test (a late callback) also fails the proof.
-afterAll(() => expect(trap.rows().filter(disallowed)).toEqual([]));
+// A host call after the test (a late callback) also fails the proof. The rows are read after a
+// second drain() and before disarm(). The test's own cleanup runs after it: the clock's runtime (its bounded teardown
+// sets a real timer) and the config root.
+afterAll(async () => {
+  await trap.drain(); // host work that a late callback opened after the test's own drain()
+  const late = trap.rows().filter(disallowed);
+  trap.disarm();
+  await disposeClock?.();
+  if (configRoot !== undefined) await fsp.rm(configRoot, { recursive: true, force: true });
+  expect(late).toEqual([]);
+});

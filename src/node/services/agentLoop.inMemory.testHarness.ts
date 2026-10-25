@@ -40,8 +40,8 @@ export interface InMemoryLoop {
   send(text: string): Promise<void>;
   /** Resolves once the turn's stream ended. */
   waitForStreamEnd(): Promise<void>;
-  /** The result of the first call of `toolName`. */
-  toolResult(toolName: string): unknown;
+  /** The results of every `tool-call-end` event of `toolName`, in order. */
+  toolResults(toolName: string): unknown[];
   chatRoles(): Promise<string[]>;
   /** Stops the session and Config's and ProviderService's file watches. Not the clock. */
   dispose(): Promise<void>;
@@ -157,9 +157,10 @@ export async function makeInMemoryLoop(input: {
         await clock.adjust(10);
       }
     },
-    toolResult(toolName) {
-      return events().find((event) => event.type === "tool-call-end" && event.toolName === toolName)
-        ?.result;
+    toolResults(toolName) {
+      return events()
+        .filter((event) => event.type === "tool-call-end" && event.toolName === toolName)
+        .map((event) => event.result);
     },
     async chatRoles() {
       return (await messages()).map((message) => message.role);

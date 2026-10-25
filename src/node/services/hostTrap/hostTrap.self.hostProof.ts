@@ -195,6 +195,30 @@ test("fs callbacks and fs streams", async () => {
     expect(apis).toContain(api);
 });
 
+test("an fd row carries the path of an fd opened while armed, and none before arm()", async () => {
+  const before = fsNs.openSync(FILE, "r");
+  try {
+    await within(async () => {
+      fsNs.readSync(before, Buffer.alloc(1));
+      const syncFd = fsNs.openSync(FILE, "r");
+      fsNs.closeSync(syncFd);
+      const callbackFd = await new Promise<number>((resolve, reject) =>
+        fsNs.open(FILE, "r", (error, fd) => (error ? reject(error) : resolve(fd)))
+      );
+      fsNs.closeSync(callbackFd);
+      const handle = await fsp.open(FILE, "r");
+      await handle.read(Buffer.alloc(1), 0, 1, 0);
+      await handle.close();
+    });
+  } finally {
+    fsNs.closeSync(before);
+  }
+  const fdRows = trap
+    .rows()
+    .filter((row) => row.api === "fs.readSync" || row.api === "fs.closeSync");
+  expect(fdRows.map((row) => row.fdPath)).toEqual([undefined, FILE, FILE]);
+});
+
 test("child_process, Bun.spawn, Bun.spawnSync and fetch", async () => {
   const apis = await within(async () => {
     await new Promise<void>((resolve) => execFile("true", () => resolve()));
