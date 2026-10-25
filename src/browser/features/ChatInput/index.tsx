@@ -222,6 +222,7 @@ import { useComposerDraft } from "./useComposerDraft";
 import { getDraftStore, type SendOutcome } from "@/browser/stores/DraftStore";
 import { useComposerTypingLock } from "./useComposerTypingLock";
 import { useSendMarkEditTracking } from "./useSendMarkEditTracking";
+import { useWorkspaceSwitchAutoFocus } from "./useWorkspaceSwitchAutoFocus";
 import { useReportCreationSendBlocked } from "./useReportCreationSendBlocked";
 import { assert } from "@/common/utils/assert";
 import { acceptedSendIds, isEditSendAccepted } from "./sendAcceptance";
@@ -1930,62 +1931,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     };
   }, [voiceInput, pushToast, voiceInputUnavailableMessage, paneScope]);
 
-  // Auto-focus chat input when workspace changes (workspace only).
-  const workspaceIdForFocus = variant === "workspace" ? props.workspaceId : null;
-  useEffect(() => {
-    if (variant !== "workspace") return;
-
-    const maxFrames = 10;
-    setChatInputAutoFocusState("pending");
-
-    let cancelled = false;
-    let rafId: number | null = null;
-    let attempts = 0;
-
-    const step = () => {
-      if (cancelled) return;
-
-      attempts += 1;
-
-      const input = inputRef.current;
-      const active = document.activeElement;
-
-      if (
-        active instanceof HTMLElement &&
-        active !== document.body &&
-        active !== document.documentElement
-      ) {
-        const isWithinChatInput = !!chatInputSectionRef.current?.contains(active);
-        const isInput = !!input && active === input;
-        if (!isWithinChatInput && !isInput) {
-          setChatInputAutoFocusState("done");
-          return;
-        }
-      }
-
-      focusMessageInput();
-
-      const isFocused = !!input && document.activeElement === input;
-      const isDone = isFocused || attempts >= maxFrames;
-
-      if (isDone) {
-        setChatInputAutoFocusState("done");
-        return;
-      }
-
-      rafId = requestAnimationFrame(step);
-    };
-
-    rafId = requestAnimationFrame(step);
-
-    return () => {
-      cancelled = true;
-      if (rafId !== null) {
-        cancelAnimationFrame(rafId);
-      }
-      setChatInputAutoFocusState("done");
-    };
-  }, [variant, workspaceIdForFocus, focusMessageInput, setChatInputAutoFocusState]);
+  useWorkspaceSwitchAutoFocus({
+    workspaceId: variant === "workspace" ? props.workspaceId : null,
+    inputRef,
+    sectionRef: chatInputSectionRef,
+    focusInput: focusMessageInput,
+    setAutoFocusState: setChatInputAutoFocusState,
+  });
 
   // Shared slash command execution for creation + workspace inputs.
   const commandWorkspaceId = variant === "workspace" ? props.workspaceId : undefined;
