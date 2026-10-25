@@ -150,7 +150,7 @@ describe("needsStatusPageTurnEndNudge", () => {
       nudge: true,
     },
     {
-      name: "an MCP tool call (no success marker) left the page unchanged",
+      name: "a tool call with an MCP-shaped result (no success marker) left the page unchanged",
       agentPage: true,
       parts: [toolCall({ content: [{ type: "text", text: "Created CODAGT-12" }] })],
       nudge: true,

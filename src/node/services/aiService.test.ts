@@ -842,6 +842,7 @@ describe("AIService status page turn-end nudge", () => {
         const resolved = resolvedAgentResultFor(metadata);
         if (!resolved.success) throw new Error("Expected resolved agent");
         resolved.data.effectiveAgentId = "planner";
+        resolved.data.agentDefinition.id = "planner";
         resolved.data.agentIsPlanLike = true;
         resolved.data.effectiveMode = "plan";
         spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(resolved);
