@@ -588,12 +588,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     coderTemplatesResult,
     coderPresetsResult = new Map<string, CoderListPresetsResult>(),
     coderWorkspacesResult,
-    daytonaConfig: initialDaytonaConfig = {
-      apiKeySet: false,
-      apiKeySource: null,
-      apiUrl: "https://app.daytona.io/api",
-      target: null,
-    },
+    daytonaConfig: initialDaytonaConfig = { apiKeySet: false, apiKeySource: null },
     daytonaTestConnectionResult = { ok: true },
     daytonaSnapshotsResult = { ok: true, snapshots: [] },
     agentSkills = [],
@@ -2431,14 +2426,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     },
     daytona: {
       getConfig: () => Promise.resolve(daytonaConfig),
-      setConfig: (input: { apiKey?: string; apiUrl?: string; target?: string }) => {
+      setConfig: (input: { apiKey?: string }) => {
         const keyCleared = input.apiKey === "";
         const keySet = input.apiKey !== undefined && !keyCleared;
         daytonaConfig = {
           apiKeySet: keySet || (!keyCleared && daytonaConfig.apiKeySet),
           apiKeySource: keySet ? "settings" : keyCleared ? null : daytonaConfig.apiKeySource,
-          apiUrl: input.apiUrl?.trim() ? input.apiUrl.trim() : daytonaConfig.apiUrl,
-          target: input.target === undefined ? daytonaConfig.target : input.target.trim() || null,
         };
         return Promise.resolve(daytonaConfig);
       },

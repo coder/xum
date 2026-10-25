@@ -10,7 +10,6 @@ import {
   DAYTONA_RUNTIME_PLACEHOLDER,
   isManagedSshPlaceholder,
 } from "@/common/types/runtime";
-import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
 import { DaytonaCreationForm } from "../Runtime/DaytonaControls";
 import type { RuntimeAvailabilityMap, RuntimeAvailabilityState } from "./useCreationWorkspace";
 import {
@@ -112,8 +111,6 @@ interface CreationControlsProps {
   coderConfigFallback: CoderWorkspaceConfig;
   /** Fallback SSH host to restore when leaving Coder. */
   sshHostFallback: string;
-  /** Project Daytona defaults (snapshot, size) to start a Daytona selection from. */
-  daytonaConfigFallback: DaytonaSandboxConfig;
   defaultRuntimeMode: RuntimeChoice;
   /** Set the currently selected runtime (discriminated union) */
   onSelectedRuntimeChange: (runtime: ParsedRuntime) => void;
@@ -503,7 +500,6 @@ interface RuntimeChoiceContext {
   selectedRuntime: ParsedRuntime;
   sshHostFallback: string;
   coderConfigFallback: CoderWorkspaceConfig;
-  daytonaConfigFallback: DaytonaSandboxConfig;
   runtimeAvailabilityState: RuntimeAvailabilityState;
 }
 
@@ -516,11 +512,7 @@ const RUNTIME_FOR_CHOICE: Record<RuntimeChoice, (context: RuntimeChoiceContext) 
       host: CODER_RUNTIME_PLACEHOLDER,
       coder: context.coderConfigFallback,
     }),
-    daytona: (context) => ({
-      mode: "ssh",
-      host: DAYTONA_RUNTIME_PLACEHOLDER,
-      daytona: context.daytonaConfigFallback,
-    }),
+    daytona: () => ({ mode: "ssh", host: DAYTONA_RUNTIME_PLACEHOLDER, daytona: {} }),
     [RUNTIME_MODE.SSH]: ({ selectedRuntime: current, sshHostFallback }) => ({
       mode: "ssh",
       host:
@@ -583,7 +575,6 @@ function CreationControlsContent(props: CreationControlsProps) {
     selectedRuntime,
     sshHostFallback: props.sshHostFallback,
     coderConfigFallback: props.coderConfigFallback,
-    daytonaConfigFallback: props.daytonaConfigFallback,
     runtimeAvailabilityState,
   };
   const coderInfo = props.coderInfo ?? props.coderProps?.coderInfo ?? null;
@@ -675,7 +666,6 @@ function CreationControlsContent(props: CreationControlsProps) {
         selectedRuntime,
         sshHostFallback: props.sshHostFallback,
         coderConfigFallback: props.coderConfigFallback,
-        daytonaConfigFallback: props.daytonaConfigFallback,
         runtimeAvailabilityState,
       })
     );
@@ -687,7 +677,6 @@ function CreationControlsContent(props: CreationControlsProps) {
     props.runtimeEnablement,
     props.sshHostFallback,
     props.coderConfigFallback,
-    props.daytonaConfigFallback,
     runtimeAvailabilityState,
     availabilityMap,
     runtimeChoice,
@@ -1141,7 +1130,6 @@ export function CreationControls(props: CreationControlsProps) {
       selectedRuntime={props.selectedRuntime}
       coderConfigFallback={props.coderConfigFallback}
       sshHostFallback={props.sshHostFallback}
-      daytonaConfigFallback={props.daytonaConfigFallback}
       defaultRuntimeMode={props.defaultRuntimeMode}
       onSelectedRuntimeChange={props.onSelectedRuntimeChange}
       disabled={props.disabled}

@@ -21,8 +21,6 @@ export const DAYTONA_CREDENTIALS_FILE = "daytona.json";
 
 export interface DaytonaStoredCredentials {
   apiKey?: string;
-  apiUrl?: string;
-  target?: string;
 }
 
 /** Credentials ready for a client call. Only node code ever sees `apiKey`. */
@@ -33,11 +31,9 @@ export interface DaytonaResolvedCredentials {
   target?: string;
 }
 
-/** Each field: undefined = unchanged, empty (after trim) = cleared. */
+/** undefined = unchanged, empty (after trim) = cleared. */
 export interface DaytonaCredentialsPatch {
   apiKey?: string;
-  apiUrl?: string;
-  target?: string;
 }
 
 function nonEmpty(value: unknown): string | undefined {
@@ -60,20 +56,20 @@ function parseApiUrl(value: string): URL {
   try {
     parsed = new URL(value);
   } catch {
-    throw new DaytonaConfigError(`Daytona API URL is not a valid URL: ${value}`);
+    throw new DaytonaConfigError(`DAYTONA_API_URL is not a valid URL: ${value}`);
   }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-    throw new DaytonaConfigError("Daytona API URL must use http or https");
+    throw new DaytonaConfigError("DAYTONA_API_URL must use http or https");
   }
   // `new URL` turns "http:///api" and "https:api" into host "api": require a written host.
   if (!/^https?:\/\/[^/?#\\]/i.test(value)) {
-    throw new DaytonaConfigError(`Daytona API URL has no host: ${value}`);
+    throw new DaytonaConfigError(`DAYTONA_API_URL has no host: ${value}`);
   }
   // Every authenticated call sends the API key as a bearer token: over plain http anyone on
   // the network path could read it. Only a loopback host keeps it on this machine.
   if (parsed.protocol === "http:" && !isLoopbackHost(parsed.hostname)) {
     throw new DaytonaConfigError(
-      "Daytona API URL must use https (http is accepted only for localhost and 127.0.0.1)"
+      "DAYTONA_API_URL must use https (http is accepted only for localhost and 127.0.0.1)"
     );
   }
   return parsed;
@@ -83,67 +79,30 @@ function normalizeApiUrl(value: string): string {
   const parsed = parseApiUrl(value);
   if (parsed.username || parsed.password || parsed.search || parsed.hash) {
     throw new DaytonaConfigError(
-      "Daytona API URL must not contain credentials, a query or a fragment"
+      "DAYTONA_API_URL must not contain credentials, a query or a fragment"
     );
   }
   return parsed.toString().replace(/\/+$/, "");
 }
 
-/** Why an API URL cannot be used; undefined when it is unset or valid. */
-function apiUrlProblem(value: string | undefined): string | undefined {
-  if (!value) return undefined;
+/** The saved key, or undefined when the file does not hold one. */
+function parseStoredKey(raw: string): string | undefined {
   try {
-    normalizeApiUrl(value);
-    return undefined;
-  } catch (error) {
-    return getErrorMessage(error);
-  }
-}
-
-const CREDENTIAL_FIELDS = ["apiKey", "apiUrl", "target"] as const;
-
-/** The non-empty string fields of a credentials file, or undefined when it is not an object. */
-function parseStoredCredentials(raw: string): DaytonaStoredCredentials | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(raw);
+    return isPlainObject(parsed) ? nonEmpty(parsed.apiKey) : undefined;
   } catch {
     return undefined;
   }
-  if (!isPlainObject(parsed)) return undefined;
-  const stored: DaytonaStoredCredentials = {};
-  for (const field of CREDENTIAL_FIELDS) {
-    const value = nonEmpty(parsed[field]);
-    if (value) stored[field] = value;
-  }
-  return stored;
 }
 
-/** `stored` with the patch's fields set; an empty string clears a field. */
-function applyPatch(
-  stored: DaytonaStoredCredentials,
-  patch: DaytonaCredentialsPatch
-): DaytonaStoredCredentials {
-  const next = { ...stored };
-  for (const field of CREDENTIAL_FIELDS) {
-    const value = patch[field];
-    if (value === undefined) continue;
-    const trimmed = nonEmpty(value);
-    if (trimmed === undefined) {
-      delete next[field];
-    } else {
-      next[field] = field === "apiUrl" ? normalizeApiUrl(trimmed) : trimmed;
-    }
-  }
-  return next;
-}
-
+/**
+ * Only the API key is saved here. The deployment URL and the default target (region) come from
+ * the Xum server's environment (DAYTONA_API_URL, DAYTONA_TARGET).
+ */
 export class DaytonaCredentialsStore {
   readonly filePath: string;
   private readonly rootDir: string;
   private readonly env: NodeJS.ProcessEnv;
-  // Serializes read-modify-write updates; writeFileAtomic alone only orders the final writes.
-  private updateChain: Promise<unknown> = Promise.resolve();
 
   constructor(rootDir?: string, env: NodeJS.ProcessEnv = process.env) {
     this.rootDir = rootDir ?? getXumHome();
@@ -151,79 +110,50 @@ export class DaytonaCredentialsStore {
     this.env = env;
   }
 
-  /**
-   * A missing or malformed file reads as empty (self-healing): the user can re-enter the key.
-   * A read that fails for another reason (an I/O error, a permission problem) throws, for every
-   * caller: an update writes the whole file back, and a resolve that took it as empty would
-   * fall back to DAYTONA_API_KEY, another account than the one the saved settings select.
-   */
+  /** A missing, unreadable or malformed file reads as empty (self-healing): the user can re-enter the key. */
   async read(): Promise<DaytonaStoredCredentials> {
     let raw: string;
     try {
       raw = await fs.readFile(this.filePath, "utf-8");
     } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) return {};
-      throw new Error(
-        `Could not read the Daytona settings in ${this.filePath}: ${getErrorMessage(error)}`,
-        { cause: error }
-      );
-    }
-    const stored = parseStoredCredentials(raw);
-    if (!stored) {
-      // Never log the content: it holds the API key.
-      log.warn("Ignoring malformed Daytona credentials file", { filePath: this.filePath });
+      if (!isErrnoWithCode(error, "ENOENT")) {
+        log.warn("Could not read the Daytona credentials file", {
+          filePath: this.filePath,
+          error: getErrorMessage(error),
+        });
+      }
       return {};
     }
-    return stored;
+    const apiKey = parseStoredKey(raw);
+    return apiKey ? { apiKey } : {};
   }
 
-  update(patch: DaytonaCredentialsPatch): Promise<void> {
-    const run = this.updateChain.then(() => this.applyUpdate(patch));
-    // The caller gets the rejection through `run`; the chain only needs to keep going.
-    this.updateChain = run.catch((error: unknown) => {
-      log.debug("Daytona credentials update failed", { error: getErrorMessage(error) });
-    });
-    return run;
-  }
-
-  private async applyUpdate(patch: DaytonaCredentialsPatch): Promise<void> {
+  async update(patch: DaytonaCredentialsPatch): Promise<void> {
+    if (patch.apiKey === undefined) return;
+    const apiKey = nonEmpty(patch.apiKey);
     await ensurePrivateDir(this.rootDir);
-    const next = applyPatch(await this.read(), patch);
-    await writeFileAtomic(this.filePath, JSON.stringify(next, null, 2), {
+    await writeFileAtomic(this.filePath, JSON.stringify(apiKey ? { apiKey } : {}, null, 2), {
       encoding: "utf-8",
       mode: 0o600,
     });
   }
 
   /**
-   * Settings win over the Xum server's own environment (DAYTONA_API_KEY / DAYTONA_API_URL), so a
-   * key entered in the UI is the one used. Returns null when no API key is available.
+   * A key saved in Settings wins over DAYTONA_API_KEY, so a key entered in the UI is the one
+   * used. Returns null when no API key is available. An invalid DAYTONA_API_URL throws instead of
+   * falling back to the default, which would send the key to another deployment.
    */
   async resolve(): Promise<DaytonaResolvedCredentials | null> {
     const stored = await this.read();
-    const envKey = nonEmpty(this.env.DAYTONA_API_KEY);
-    const apiKey = stored.apiKey ?? envKey;
+    const apiKey = stored.apiKey ?? nonEmpty(this.env.DAYTONA_API_KEY);
     if (!apiKey) return null;
-    // The URL in use (saved, else DAYTONA_API_URL) names the deployment the key belongs to: an
-    // invalid one (an http URL saved before http was refused, a hand edit, a typo in the env)
-    // must not fall back to another URL or the default, which would send the key elsewhere.
-    // So Daytona stays unusable until the user fixes it.
-    const { source, value } = this.configuredApiUrl(stored);
-    const problem = apiUrlProblem(value);
-    if (problem) {
-      throw new DaytonaConfigError(
-        source === "settings"
-          ? `The Daytona API URL saved in Settings cannot be used (${problem}); ` +
-              "fix or clear it in Settings > Runtimes"
-          : `DAYTONA_API_URL cannot be used (${problem}); ` +
-              "fix it, or set the API URL in Settings > Runtimes"
-      );
-    }
+    const envUrl = nonEmpty(this.env.DAYTONA_API_URL);
+    const target = nonEmpty(this.env.DAYTONA_TARGET);
     return {
       apiKey,
       apiKeySource: stored.apiKey ? "settings" : "env",
-      apiUrl: this.resolveApiUrl(stored),
-      ...(stored.target ? { target: stored.target } : {}),
+      apiUrl: envUrl ? normalizeApiUrl(envUrl) : DAYTONA_DEFAULT_API_URL,
+      ...(target ? { target } : {}),
     };
   }
 
@@ -234,25 +164,6 @@ export class DaytonaCredentialsStore {
     return {
       apiKeySet: stored.apiKey !== undefined || envKeySet,
       apiKeySource: stored.apiKey ? "settings" : envKeySet ? "env" : null,
-      apiUrl: this.resolveApiUrl(stored),
-      target: stored.target ?? null,
     };
-  }
-
-  /** The saved URL wins over DAYTONA_API_URL; neither set means Daytona's default. */
-  private configuredApiUrl(stored: DaytonaStoredCredentials): {
-    source: "settings" | "env" | "default";
-    value?: string;
-  } {
-    if (stored.apiUrl) return { source: "settings", value: stored.apiUrl };
-    const envUrl = nonEmpty(this.env.DAYTONA_API_URL);
-    return envUrl ? { source: "env", value: envUrl } : { source: "default" };
-  }
-
-  /** An invalid URL is shown as written, so the user sees what to fix (resolve refuses it). */
-  private resolveApiUrl(stored: DaytonaStoredCredentials): string {
-    const { value } = this.configuredApiUrl(stored);
-    if (!value) return DAYTONA_DEFAULT_API_URL;
-    return apiUrlProblem(value) ? value : normalizeApiUrl(value);
   }
 }

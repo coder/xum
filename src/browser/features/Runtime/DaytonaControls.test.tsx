@@ -1,12 +1,16 @@
 import "../../../../tests/ui/dom";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
-import type { DaytonaResources } from "@/browser/hooks/useDaytonaResources";
-import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
+import { APIProvider } from "@/browser/contexts/API";
+import { createTestApiClient } from "@/browser/testUtils";
+import type {
+  DaytonaListSnapshotsResult,
+  DaytonaSandboxConfig,
+} from "@/common/orpc/schemas/daytona";
 import { installDom } from "../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../tests/ui/selectPrimitiveDouble";
-import { DaytonaSandboxForm } from "./DaytonaControls";
+import { DaytonaCreationForm } from "./DaytonaControls";
 
 // Capture before installing the module mock; mock.restore() does not undo it.
 const actualSelectPrimitiveModule = { ...ActualSelectPrimitiveModule };
@@ -14,20 +18,12 @@ void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
   createSelectPrimitiveDouble()
 );
 
-const READY: DaytonaResources = {
-  config: {
-    apiKeySet: true,
-    apiKeySource: "settings",
-    apiUrl: "https://app.daytona.io/api",
-    target: null,
-  },
-  configError: null,
-  snapshots: ["base", "node"],
-  snapshotsError: null,
-  loadingSnapshots: false,
+const LISTED: DaytonaListSnapshotsResult = {
+  ok: true,
+  snapshots: [{ name: "base" }, { name: "node" }],
 };
 
-describe("DaytonaSandboxForm snapshot row", () => {
+describe("DaytonaCreationForm snapshot row", () => {
   let cleanupDom: (() => void) | null = null;
 
   afterAll(async () => {
@@ -47,50 +43,43 @@ describe("DaytonaSandboxForm snapshot row", () => {
     cleanupDom = null;
   });
 
-  function renderForm(config: DaytonaSandboxConfig, resources: Partial<DaytonaResources> = {}) {
+  async function renderForm(config: DaytonaSandboxConfig, listed = LISTED) {
     const onConfigChange = mock((_config: DaytonaSandboxConfig) => undefined);
+    const client = createTestApiClient({
+      daytona: {
+        getConfig: () => Promise.resolve({ apiKeySet: true, apiKeySource: "settings" as const }),
+        listSnapshots: () => Promise.resolve(listed),
+      },
+    });
     const view = render(
-      <DaytonaSandboxForm
-        config={config}
-        onConfigChange={onConfigChange}
-        resources={{ ...READY, ...resources }}
-      />
+      <APIProvider client={client}>
+        <DaytonaCreationForm config={config} onConfigChange={onConfigChange} />
+      </APIProvider>
     );
-    const open = () => fireEvent.pointerDown(view.getByTestId("daytona-snapshot-select"));
+    const select = await waitFor(() => view.getByTestId("daytona-snapshot-select"));
+    const open = () => fireEvent.pointerDown(select);
     return { view, onConfigChange, open };
   }
 
-  test("shows no snapshot picker while the list loads", () => {
-    const { view } = renderForm({}, { loadingSnapshots: true });
-    expect(view.queryByTestId("daytona-snapshot-select")).toBeNull();
-  });
-
-  test("keeps a saved snapshot the list no longer has, and reports a failed list", () => {
-    const { view, open } = renderForm(
+  test("keeps a saved snapshot the list no longer has, and reports a failed list", async () => {
+    const { view, open } = await renderForm(
       { snapshot: "gone" },
-      { snapshots: [], snapshotsError: "boom" }
+      { ok: false, kind: "server", error: "boom" }
     );
     expect(view.getByTestId("daytona-snapshot-select").textContent).toBe("gone");
-    expect(view.getByRole("alert").textContent).toContain("boom");
+    await waitFor(() => expect(view.getByRole("alert").textContent).toContain("boom"));
     open();
     expect(view.getByRole("button", { name: "gone" })).toBeTruthy();
   });
 
-  test("lists a saved snapshot once when the list has it", () => {
-    const { view, open } = renderForm({ snapshot: "node" });
-    open();
-    expect(view.getAllByRole("button", { name: "node" })).toHaveLength(1);
-    expect(view.queryByRole("alert")).toBeNull();
-  });
-
-  test("picking a snapshot sets it, and picking the default clears it", () => {
-    const picked = renderForm({ cpu: 2 });
+  test("picking a snapshot sets it, and picking the default clears it", async () => {
+    const picked = await renderForm({ cpu: 2 });
     picked.open();
     fireEvent.click(picked.view.getByRole("button", { name: "base" }));
     expect(picked.onConfigChange).toHaveBeenLastCalledWith({ cpu: 2, snapshot: "base" });
     cleanup();
 
-    const cleared = renderForm({ snapshot: "base" });
+    const cleared = await renderForm({ snapshot: "base" });
     cleared.open();
     fireEvent.click(cleared.view.getByRole("button", { name: "Daytona default" }));
     expect(cleared.onConfigChange).toHaveBeenLastCalledWith({ snapshot: undefined });

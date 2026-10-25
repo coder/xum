@@ -40,8 +40,6 @@ export type DaytonaApiKeySource = z.infer<typeof DaytonaApiKeySourceSchema>;
 export const DaytonaPublicConfigSchema = z.object({
   apiKeySet: z.boolean(),
   apiKeySource: DaytonaApiKeySourceSchema.nullable(),
-  apiUrl: z.string(),
-  target: z.string().nullable(),
 });
 
 export type DaytonaPublicConfig = z.infer<typeof DaytonaPublicConfigSchema>;
@@ -97,12 +95,8 @@ export const daytona = {
     output: DaytonaPublicConfigSchema,
   },
   setConfig: {
-    // Each field: omitted = unchanged, empty string = cleared.
-    input: z.object({
-      apiKey: z.string().optional(),
-      apiUrl: z.string().optional(),
-      target: z.string().optional(),
-    }),
+    // apiKey: omitted = unchanged, empty string = cleared.
+    input: z.object({ apiKey: z.string().optional() }),
     output: DaytonaPublicConfigSchema,
   },
   testConnection: {

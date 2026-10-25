@@ -1,9 +1,8 @@
 /**
  * Daytona sandbox controls for the SSH-based Daytona runtime: create a sandbox from a snapshot
- * at a size preset. Used by workspace creation and by the project defaults in Settings > Runtimes.
+ * at a size preset, on workspace creation.
  */
 import { Loader2 } from "lucide-react";
-import { cn } from "@/common/lib/utils";
 import {
   DAYTONA_DEFAULT_SIZE_PRESET_ID,
   DAYTONA_SIZE_PRESETS,
@@ -155,34 +154,31 @@ function SizeRow(props: {
   );
 }
 
-export interface DaytonaSandboxFormProps {
+/**
+ * The workspace-creation form. Mounted only while Daytona is the picked runtime, so the
+ * snapshot list (an account API call) loads only then.
+ */
+export function DaytonaCreationForm(props: {
   config: DaytonaSandboxConfig;
   onConfigChange: (config: DaytonaSandboxConfig) => void;
-  resources: DaytonaResources;
   disabled?: boolean;
-  className?: string;
-}
-
-export function DaytonaSandboxForm(props: DaytonaSandboxFormProps) {
-  const ready = props.resources.config?.apiKeySet === true;
+}) {
+  const resources = useDaytonaResources();
+  const ready = resources.config?.apiKeySet === true;
 
   return (
     <div
-      className={cn(
-        "flex w-full flex-col gap-1.5 rounded-md border p-2",
-        props.className ?? "max-w-[22rem]",
-        "border-border-medium"
-      )}
+      className="border-border-medium flex w-full max-w-[22rem] flex-col gap-1.5 rounded-md border p-2"
       data-testid="daytona-sandbox-form"
     >
       {!ready ? (
-        <DaytonaAccessNotice resources={props.resources} />
+        <DaytonaAccessNotice resources={resources} />
       ) : (
         <>
           <SnapshotRow
             config={props.config}
             onConfigChange={props.onConfigChange}
-            resources={props.resources}
+            resources={resources}
             disabled={props.disabled}
           />
           <SizeRow
@@ -194,13 +190,4 @@ export function DaytonaSandboxForm(props: DaytonaSandboxFormProps) {
       )}
     </div>
   );
-}
-
-/**
- * The workspace-creation form. Mounted only while Daytona is the picked runtime, so the
- * snapshot list (an account API call) loads only then.
- */
-export function DaytonaCreationForm(props: Omit<DaytonaSandboxFormProps, "resources">) {
-  const resources = useDaytonaResources();
-  return <DaytonaSandboxForm {...props} resources={resources} />;
 }

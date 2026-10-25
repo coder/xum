@@ -184,7 +184,7 @@ export class DaytonaAccount {
     };
   }
 
-  /** The default target (region) from Settings > Runtimes, if one is set. */
+  /** The default target (region) from DAYTONA_TARGET, if one is set. */
   async getDefaultTarget(): Promise<string | undefined> {
     return (await this.resolveCredentials())?.target;
   }

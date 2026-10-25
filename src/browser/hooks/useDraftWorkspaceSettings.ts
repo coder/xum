@@ -15,7 +15,6 @@ import {
 import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import {
-  readDaytonaOptionDefaults,
   readOptionField,
   readSshOptionDefaults,
   type RuntimeOptionDefaults,
@@ -171,21 +170,6 @@ const mergeRememberedRuntimeConfig = (
   }
 };
 
-/** The draft's last Daytona choice, else the project's Daytona defaults. */
-function readDraftDaytonaFallback(
-  execution: { lastDaytona?: DaytonaSandboxConfig } | null | undefined,
-  defaults: RuntimeOptionDefaults
-): DaytonaSandboxConfig {
-  return execution?.lastDaytona ?? readDaytonaOptionDefaults(defaults);
-}
-
-/** Only in the draft: Daytona project defaults change only in Settings > Runtimes. */
-function rememberedDaytonaPatch(runtime: ParsedRuntime): { lastDaytona?: DaytonaSandboxConfig } {
-  return runtime.mode === RUNTIME_MODE.SSH && runtime.daytona
-    ? { lastDaytona: runtime.daytona }
-    : {};
-}
-
 /** The default runtime-type button: Coder and Daytona are SSH sub-choices. */
 const resolveDefaultRuntimeChoice = (
   settingsDefaultRuntime: RuntimeChoice,
@@ -263,8 +247,6 @@ export function useDraftWorkspaceSettings(
   coderConfigFallback: CoderWorkspaceConfig;
   /** Preserves the last SSH host when leaving Coder so the input stays populated. */
   sshHostFallback: string;
-  /** Project Daytona defaults (Settings > Runtimes) that start a Daytona selection. */
-  daytonaConfigFallback: DaytonaSandboxConfig;
   /** Set the currently selected runtime (discriminated union) */
   setSelectedRuntime: (runtime: ParsedRuntime) => void;
   setTrunkBranch: (branch: string) => void;
@@ -451,14 +433,12 @@ export function useDraftWorkspaceSettings(
   // `setSelectedRuntime` changed on every keystroke and re-rendered CreationControls (#5937).
   // useDraftWorkspaceSettings.compiler.test.tsx guards their identity.
   // Uses discriminated union: SSH has host, Docker has image.
-  // Parsed into a fresh object, so it too must follow the last hook to keep its identity.
-  const daytonaConfigFallback = readDraftDaytonaFallback(execution, lastRuntimeConfigs);
   const defaultRuntime = buildRuntimeForMode(
     defaultRuntimeMode,
     {
       host: defaultSshHost,
       coder: defaultSshCoder,
-      daytona: daytonaDefault ? daytonaConfigFallback : undefined,
+      daytona: daytonaDefault ? {} : undefined,
     },
     defaultDockerImage,
     lastShareCredentials,
@@ -484,10 +464,7 @@ export function useDraftWorkspaceSettings(
       devcontainerShareCredentials: lastDevcontainerShareCredentials,
     });
 
-    getCreationDraftStore().updateExecution(draftId, {
-      runtime: mergedRuntime,
-      ...rememberedDaytonaPatch(mergedRuntime),
-    });
+    getCreationDraftStore().updateExecution(draftId, { runtime: mergedRuntime });
 
     // Persist host/image/coder so they're remembered when switching modes.
     // Avoid wiping the remembered value when the UI switches modes with an empty field.
@@ -541,7 +518,6 @@ export function useDraftWorkspaceSettings(
     },
     coderConfigFallback,
     sshHostFallback,
-    daytonaConfigFallback,
     setSelectedRuntime,
     setTrunkBranch,
     getRuntimeString,

@@ -3,7 +3,6 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { DAYTONA_DEFAULT_API_URL } from "@/common/constants/daytona";
-import { createDaytonaTestRig } from "@/node/services/daytona/daytona.testHarness";
 import { DaytonaCredentialsStore } from "./daytonaCredentialsStore";
 
 const KEY = "test-key-not-real";
@@ -21,47 +20,45 @@ describe("DaytonaCredentialsStore", () => {
 
   it("stores the key in a 0600 file and never exposes it through the public config", async () => {
     const store = new DaytonaCredentialsStore(rootDir, {});
-    await store.update({ apiKey: KEY, apiUrl: "https://byoc.example.com/api/", target: "eu" });
+    await store.update({ apiKey: KEY });
 
     const stat = await fs.stat(path.join(rootDir, "daytona.json"));
     expect(stat.mode & 0o777).toBe(0o600);
 
     const publicConfig = await store.getPublicConfig();
-    expect(publicConfig).toEqual({
-      apiKeySet: true,
-      apiKeySource: "settings",
-      apiUrl: "https://byoc.example.com/api",
-      target: "eu",
-    });
+    expect(publicConfig).toEqual({ apiKeySet: true, apiKeySource: "settings" });
     expect(JSON.stringify(publicConfig)).not.toContain(KEY);
     expect((await store.resolve())?.apiKey).toBe(KEY);
   });
 
-  it("leaves omitted fields alone and clears fields set to an empty string", async () => {
+  it("leaves an omitted key alone and clears a key set to an empty string", async () => {
     const store = new DaytonaCredentialsStore(rootDir, {});
-    await store.update({ apiKey: KEY, target: "us" });
-    await store.update({ target: "" });
+    await store.update({ apiKey: KEY });
+    await store.update({});
     expect(await store.read()).toEqual({ apiKey: KEY });
     await store.update({ apiKey: "  " });
-    expect(await store.getPublicConfig()).toEqual({
-      apiKeySet: false,
-      apiKeySource: null,
-      apiUrl: DAYTONA_DEFAULT_API_URL,
-      target: null,
-    });
+    expect(await store.getPublicConfig()).toEqual({ apiKeySet: false, apiKeySource: null });
   });
 
-  it("falls back to the server environment, and a key from settings wins over it", async () => {
-    const env = { DAYTONA_API_KEY: "env-key", DAYTONA_API_URL: "https://env.example.com/api" };
+  it("takes the URL and target from the environment, and a key from settings wins over it", async () => {
+    const env = {
+      DAYTONA_API_KEY: "env-key",
+      DAYTONA_API_URL: "https://env.example.com/api/",
+      DAYTONA_TARGET: "eu",
+    };
     const store = new DaytonaCredentialsStore(rootDir, env);
     expect(await store.resolve()).toEqual({
       apiKey: "env-key",
       apiKeySource: "env",
       apiUrl: "https://env.example.com/api",
+      target: "eu",
     });
 
     await store.update({ apiKey: KEY });
     expect(await store.resolve()).toMatchObject({ apiKey: KEY, apiKeySource: "settings" });
+    expect((await new DaytonaCredentialsStore(rootDir, {}).resolve())?.apiUrl).toBe(
+      DAYTONA_DEFAULT_API_URL
+    );
   });
 
   it("reads a corrupted file as empty so the user can re-enter the key", async () => {
@@ -72,144 +69,31 @@ describe("DaytonaCredentialsStore", () => {
     expect((await store.resolve())?.apiKey).toBe(KEY);
   });
 
-  it("keeps the saved settings when the file cannot be read for an update", async () => {
-    const store = new DaytonaCredentialsStore(rootDir, {});
-    await store.update({ apiKey: KEY, apiUrl: "https://byoc.example.com/api", target: "eu" });
-    const file = path.join(rootDir, "daytona.json");
-
-    // A read that fails for another reason than absence (here: a permission problem).
-    await fs.chmod(file, 0o000);
-    let refusal: unknown;
-    try {
-      await store.update({ target: "us" });
-    } catch (error) {
-      refusal = error;
-    } finally {
-      await fs.chmod(file, 0o600);
-    }
-
-    expect(refusal).toBeInstanceOf(Error);
-    expect(await store.resolve()).toMatchObject({
-      apiKey: KEY,
-      apiUrl: "https://byoc.example.com/api",
-      target: "eu",
-    });
-  });
-
-  // The file selects account A; DAYTONA_API_KEY/DAYTONA_API_URL name account B. Taking an
-  // unreadable file as empty would silently run create, start and delete on B.
-  it("refuses to fall back to the environment when the saved settings cannot be read", async () => {
-    const env = { DAYTONA_API_KEY: "env-key", DAYTONA_API_URL: "https://env.example.com/api" };
-    const store = new DaytonaCredentialsStore(rootDir, env);
-    await store.update({ apiKey: KEY, apiUrl: "https://byoc.example.com/api" });
-    const file = path.join(rootDir, "daytona.json");
-
-    await fs.chmod(file, 0o000);
-    try {
-      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
-      await expect(store.resolve()).rejects.toThrow(/Could not read the Daytona settings/);
-      // Settings shows the read error instead of claiming the environment's key is in use.
-      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
-      await expect(store.getPublicConfig()).rejects.toThrow(/Could not read the Daytona settings/);
-    } finally {
-      await fs.chmod(file, 0o600);
-    }
-    expect(await store.resolve()).toMatchObject({ apiKey: KEY, apiKeySource: "settings" });
-  });
-
-  it("runs no Daytona operation on the environment's account after a failed settings read", async () => {
-    const rig = await createDaytonaTestRig({ apiKey: "env-key" });
-    try {
-      const saved = rig.addAccount(KEY);
-      await rig.service.account.setConfig({ apiKey: KEY });
-      const file = path.join(rig.rootDir, "daytona.json");
-      await fs.chmod(file, 0o000);
-      try {
-        // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
-        await expect(
-          rig.service.account.withAccountLease(() => rig.service.sandboxes.listInstanceSandboxes())
-        ).rejects.toThrow(/Could not read the Daytona settings/);
-        expect((await rig.service.account.listSnapshots()).ok).toBe(false);
-      } finally {
-        await fs.chmod(file, 0o600);
-      }
-      expect(rig.plane.calls).toEqual([]);
-      await rig.service.account.withAccountLease(() =>
-        rig.service.sandboxes.listInstanceSandboxes()
-      );
-      expect(saved.calls.length).toBeGreaterThan(0);
-      expect(rig.plane.calls).toEqual([]);
-    } finally {
-      await rig.cleanup();
-    }
-  });
-
-  it("refuses a stored API URL that does not validate instead of sending the key elsewhere", async () => {
-    for (const apiUrl of ["not a url", "http://byoc.example.com/api"]) {
-      await fs.writeFile(
-        path.join(rootDir, "daytona.json"),
-        JSON.stringify({ apiKey: KEY, apiUrl }),
-        "utf-8"
-      );
-      for (const env of [{}, { DAYTONA_API_URL: "https://env.example.com/api" }]) {
-        const store = new DaytonaCredentialsStore(rootDir, env);
-        // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
-        await expect(store.resolve()).rejects.toThrow(/saved in Settings/);
-        // Shown as written, so the user sees what to fix.
-        expect((await store.getPublicConfig()).apiUrl).toBe(apiUrl);
-      }
-    }
-
-    // Clearing it is the user's choice of the default deployment.
-    const store = new DaytonaCredentialsStore(rootDir, {});
-    await store.update({ apiUrl: "" });
-    expect((await store.resolve())?.apiUrl).toBe(DAYTONA_DEFAULT_API_URL);
-  });
-
-  it("accepts plain http only for a loopback host, where no network sees the key", async () => {
-    const store = new DaytonaCredentialsStore(rootDir, {});
-    for (const apiUrl of ["http://byoc.example.com/api", "http://10.0.0.5/api"]) {
-      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
-      await expect(store.update({ apiUrl })).rejects.toThrow(/https/);
-    }
-    for (const apiUrl of [
-      "http://127.0.0.1:3000/api",
-      "http://localhost/api",
-      "http://[::1]:8080/api",
-    ]) {
-      await store.update({ apiUrl });
-      expect((await store.read()).apiUrl).toBe(apiUrl);
-    }
-  });
-
-  it("refuses every DAYTONA_API_URL that does not validate instead of using the default", async () => {
-    await fs.writeFile(
-      path.join(rootDir, "daytona.json"),
-      JSON.stringify({ apiKey: KEY }),
-      "utf-8"
-    );
-    // The environment names the deployment, so another one must not get the key instead.
-    for (const envUrl of ["http://byoc.example.com/api", "not a url", "ftp://byoc.example.com"]) {
-      const fromEnv = new DaytonaCredentialsStore(rootDir, { DAYTONA_API_URL: envUrl });
-      // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
-      await expect(fromEnv.resolve()).rejects.toThrow(/DAYTONA_API_URL/);
-      expect((await fromEnv.getPublicConfig()).apiUrl).toBe(envUrl);
-    }
-  });
-
-  it("rejects an API URL that is not plain http(s)", async () => {
-    const store = new DaytonaCredentialsStore(rootDir, {});
+  it("refuses a DAYTONA_API_URL that is not https or a loopback http host", async () => {
+    const resolveWith = (apiUrl: string) =>
+      new DaytonaCredentialsStore(rootDir, {
+        DAYTONA_API_KEY: KEY,
+        DAYTONA_API_URL: apiUrl,
+      }).resolve();
     for (const apiUrl of [
       "not a url",
-      "file:///etc/passwd",
+      "ftp://byoc.example.com",
+      "http://byoc.example.com/api",
+      "http://10.0.0.5/api",
       "https://user:pw@example.com/api",
       // WHATWG URL parsing reads these as host "api".
       "http:///api",
       "https:api",
     ]) {
       // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
-      await expect(store.update({ apiUrl })).rejects.toThrow(/Daytona API URL/);
+      await expect(resolveWith(apiUrl)).rejects.toThrow(/DAYTONA_API_URL/);
     }
-    expect(await store.read()).toEqual({});
+    for (const apiUrl of [
+      "http://127.0.0.1:3000/api",
+      "http://localhost/api",
+      "http://[::1]:8080/api",
+    ]) {
+      expect((await resolveWith(apiUrl))?.apiUrl).toBe(apiUrl);
+    }
   });
 });

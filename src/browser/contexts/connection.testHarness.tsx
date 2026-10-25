@@ -118,30 +118,3 @@ export function createConnectionHarness(
 }
 
 export type ConnectionHarness = ReturnType<typeof createConnectionHarness>;
-
-/**
- * A connection that starts reconnecting and comes back with the same client object, as the
- * provider may keep it across a reconnect. The client's calls are the test's to fail meanwhile.
- */
-export function createKeptClientConnection(client: APIClient) {
-  const state = (status: "connected" | "reconnecting"): UseAPIResult =>
-    status === "connected"
-      ? connected(client)
-      : { status, api: client, error: null, attempt: 1, authenticate: noop, retry: noop };
-  let latest = state("reconnecting");
-  let publish: ((value: UseAPIResult) => void) | null = null;
-
-  function Wrapper(props: { children: ReactNode }) {
-    const [value, setValue] = useState<UseAPIResult>(() => latest);
-    publish = setValue;
-    return <APIContext.Provider value={value}>{props.children}</APIContext.Provider>;
-  }
-
-  return {
-    Wrapper,
-    setStatus(status: "connected" | "reconnecting"): void {
-      latest = state(status);
-      if (publish != null) act(() => publish?.(latest));
-    },
-  };
-}

@@ -975,7 +975,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           selectedRuntime: creationState.selectedRuntime,
           coderConfigFallback: creationState.coderConfigFallback,
           sshHostFallback: creationState.sshHostFallback,
-          daytonaConfigFallback: creationState.daytonaConfigFallback,
           defaultRuntimeMode: creationState.defaultRuntimeMode,
           onSelectedRuntimeChange: creationState.setSelectedRuntime,
           disabled: isSendInFlight,

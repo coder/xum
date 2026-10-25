@@ -73,7 +73,7 @@ describe("DaytonaSsh", () => {
 
   it("revokes the SSH tokens it holds when the settings change", async () => {
     const held = await service.ssh.getSshToken("sb-1");
-    await service.account.setConfig({ target: "eu" });
+    await service.account.setConfig({ apiKey: "k" });
     expect(plane.revoked).toEqual([held.token]);
     // The next request mints a fresh token instead of reusing the revoked one.
     expect((await service.ssh.getSshToken("sb-1")).token).not.toBe(held.token);
@@ -84,7 +84,7 @@ describe("DaytonaSsh", () => {
     plane.revokeEchoesRequest = true;
     const warn = spyOn(log, "warn");
     try {
-      await service.account.setConfig({ target: "eu" });
+      await service.account.setConfig({ apiKey: "k" });
       const logged = JSON.stringify(warn.mock.calls);
       expect(logged).toContain("Failed to revoke a Daytona SSH token");
       expect(logged).not.toContain(held.token);
@@ -144,7 +144,7 @@ describe("DaytonaSsh", () => {
 
     const access = held.service.ssh.ensureSshAccess("sb-1");
     await held.started;
-    const refusal = await held.service.account.setConfig({ target: "eu" }).then(
+    const refusal = await held.service.account.setConfig({ apiKey: "k" }).then(
       () => undefined,
       (error: unknown) => error
     );
@@ -153,7 +153,7 @@ describe("DaytonaSsh", () => {
     await access;
 
     expect(held.written).toEqual(["tok1"]);
-    expect((await held.service.account.setConfig({ target: "eu" })).target).toBe("eu");
+    expect((await held.service.account.setConfig({ apiKey: "k" })).apiKeySource).toBe("settings");
     // The change revokes the old settings' token.
     expect(plane.revoked).toEqual(["tok1"]);
   });
@@ -232,7 +232,7 @@ describe("DaytonaSsh", () => {
 
     const access = racing.ssh.ensureSshAccess("sb-1");
     await fetched;
-    const refusal = await racing.account.setConfig({ target: "eu" }).then(
+    const refusal = await racing.account.setConfig({ apiKey: "k" }).then(
       () => undefined,
       (error: unknown) => error
     );
@@ -377,7 +377,7 @@ describe("DaytonaSsh", () => {
     expect(includeFile.has("sb-1")).toBe(true);
 
     // A failed revoke would otherwise leave a working old-account token behind the alias.
-    await changing.account.setConfig({ target: "eu" });
+    await changing.account.setConfig({ apiKey: "k" });
     expect(includeFile.has("sb-1")).toBe(false);
   });
 
@@ -418,7 +418,7 @@ describe("DaytonaSsh", () => {
     expect(plane.revoked).toEqual(["earlier-process-token"]);
 
     // After another restart, a settings change revokes what it loaded.
-    await (await startProcess()).account.setConfig({ target: "eu" });
+    await (await startProcess()).account.setConfig({ apiKey: "k" });
     expect(plane.revoked).toEqual(["earlier-process-token", minted ?? ""]);
   });
 

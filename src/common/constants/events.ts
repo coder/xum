@@ -188,13 +188,6 @@ export const CUSTOM_EVENTS = {
    * Detail: { enabled: boolean }
    */
   LLM_DEBUG_LOGS_CHANGED: "mux:llmDebugLogsChanged",
-
-  /**
-   * Event emitted when Daytona access (API key, URL or target) is saved in Settings. Settings
-   * covers views that stay mounted, such as the creation controls, which reload from it.
-   * Detail: none
-   */
-  DAYTONA_CONFIG_CHANGED: "mux:daytonaConfigChanged",
 } as const;
 
 /**
@@ -247,7 +240,6 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.CLOSE_AGENT_PICKER]: never; // No payload
   [CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED]: never; // No payload
   [CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED]: never; // No payload
-  [CUSTOM_EVENTS.DAYTONA_CONFIG_CHANGED]: never; // No payload
   [CUSTOM_EVENTS.OPEN_MODEL_SELECTOR]: never; // No payload
   [CUSTOM_EVENTS.MUX_GATEWAY_SESSION_EXPIRED]: never; // No payload
   [CUSTOM_EVENTS.WORKSPACE_FORK_SWITCH]: {

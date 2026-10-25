@@ -6,10 +6,6 @@ import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
 import { CODER_RUNTIME_PLACEHOLDER } from "@/common/types/runtime";
-import {
-  readDaytonaOptionDefaults,
-  readRuntimeOptionDefaults,
-} from "@/browser/utils/runtimeOptionDefaults";
 import { useDraftWorkspaceSettings } from "./useDraftWorkspaceSettings";
 import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
 import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
@@ -359,35 +355,6 @@ describe("useDraftWorkspaceSettings", () => {
     await waitFor(() => {
       expect(result.current.coderConfigFallback).toEqual(savedCoderConfig);
     });
-  });
-
-  test("restores the draft's Daytona choices after switching runtimes, without saving them as defaults", async () => {
-    const projectPath = "/tmp/project";
-    const projectDefaults = {
-      ssh: { daytona: { snapshot: "base", cpu: 2, memoryGiB: 4, diskGiB: 10 } },
-    };
-    const wrapper = createWrapper(projectPath, runtimeConfigPrefs(projectPath, projectDefaults));
-    const { result } = renderHook(
-      () => useDraftWorkspaceSettings(projectPath, ["main"], "main", draftId),
-      { wrapper }
-    );
-    await waitFor(() => expect(result.current.daytonaConfigFallback.snapshot).toBe("base"));
-
-    // A larger sandbox picked in this draft, then another runtime.
-    const picked = { snapshot: "base", cpu: 4, memoryGiB: 8, diskGiB: 20 };
-    act(() => {
-      result.current.setSelectedRuntime({ mode: "ssh", host: "placeholder", daytona: picked });
-    });
-    act(() => {
-      result.current.setSelectedRuntime({ mode: "worktree" });
-    });
-
-    // Switching back to Daytona starts from this fallback.
-    expect(result.current.daytonaConfigFallback).toEqual(picked);
-    // The draft's pick never becomes a project default.
-    expect(readDaytonaOptionDefaults(readRuntimeOptionDefaults(projectPath))).toEqual(
-      projectDefaults.ssh.daytona
-    );
   });
 
   test("exposes persisted SSH host as fallback when leaving Coder", async () => {
