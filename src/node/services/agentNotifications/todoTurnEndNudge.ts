@@ -42,23 +42,22 @@ export async function needsTodoTurnEndNudge(input: {
 }
 
 /**
- * Whether a message the user sent starts the stream that is about to run, given how it was sent.
- * Only those turns earn the nudge. A transcript audit (2026-10-25, 571 nudges) found that machine
- * wakes (monitor matches, sub-agent reports, heartbeats, peer messages, goal continuations) caused
- * about 90% of nudges. Their open items almost always wait on purpose, so the nudged turn only
- * repeated the wait. Each wake counts as its own user turn, so a coordinator got one nudge per wake.
+ * Whether a message the user sent starts the stream that is about to run: a manual send that is
+ * not synthetic. Only those turns earn the nudge. A transcript audit (2026-10-25, 571 nudges) found
+ * that machine wakes (monitor matches, sub-agent reports, heartbeats, peer messages, goal
+ * continuations) caused about 90% of nudges. Their open items almost always wait on purpose, so the
+ * nudged turn only repeated the wait. Each wake counts as its own user turn, so a coordinator got
+ * one nudge per wake.
  *
- * An auto-compaction request (on-send or mid-stream) and a compaction follow-up continue the
- * turn that asked for them, so they keep `previous`: a user message compacted on send stays a user
- * turn. An idle or heartbeat compaction is a fresh synthetic send, so it starts a machine turn.
+ * Compaction requests and their follow-ups are automatic, so they start machine turns too: a user
+ * turn that compacts loses its one nudge. Inheriting the earlier origin instead mislabeled wakes
+ * that compacted before their send, and skipping one nudge is cheaper than nudging a machine turn.
  */
 export function streamStartedByUserMessage(input: {
-  previous: boolean;
+  automatic: boolean;
   synthetic: boolean;
-  continuesCompaction: boolean;
 }): boolean {
-  if (!input.synthetic) return true;
-  return input.continuesCompaction ? input.previous : false;
+  return !input.automatic && !input.synthetic;
 }
 
 /**

@@ -865,6 +865,12 @@ describe("todo turn-end nudge", () => {
       text: "[Heartbeat] Check on the workspace.",
       internal: { acceptanceOrigin: "automatic", synthetic: true },
     },
+    // A visible automatic send (a task brief) is not a message the user sent either.
+    {
+      name: "an automatic visible send",
+      text: "Work on the task.",
+      internal: { acceptanceOrigin: "automatic" },
+    },
   ] as const)("a turn $name started gets no nudge", async (row) => {
     const { h, streams } = await setup({ parts: todoWriteThenReply });
     await writeTodos(h, openTodos);
@@ -880,13 +886,13 @@ describe("todo turn-end nudge", () => {
     expect((await userTexts(h)).slice(1)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
   });
 
-  // After a user turn, a heartbeat's compaction (idle-compaction) starts a machine turn, while an
-  // auto-compaction (on-send or mid-stream) continues the user's turn into its follow-up.
+  // Compaction requests are automatic: after a user turn, neither a heartbeat's compaction
+  // (idle-compaction) nor an auto-compaction passes the user origin on to its follow-up.
   test.each([
     { source: "idle-compaction", nudged: false },
-    { source: "auto-compaction", nudged: true },
+    { source: "auto-compaction", nudged: false },
   ] as const)(
-    "after a user turn, a compaction request with source $source sets its follow-up's origin",
+    "after a user turn, a compaction request with source $source starts a machine turn",
     async (row) => {
       // Only the follow-up (turn 3) writes todos.
       const { h, streams } = await setup({
@@ -961,15 +967,15 @@ describe("todo turn-end nudge", () => {
     expect((await userTexts(h)).includes(TODO_TURN_END_NUDGE)).toBe(row.nudged);
   });
 
-  // A compaction follow-up is sent as a synthetic row but continues the turn that compacted.
+  // A compaction follow-up is an automatic synthetic send: a machine turn, even after a user turn.
   test.each([
-    { name: "a user turn", internal: undefined, nudged: true },
+    { name: "a user turn", internal: undefined, nudged: false },
     {
       name: "a machine wake",
       internal: { acceptanceOrigin: "automatic", synthetic: true },
       nudged: false,
     },
-  ] as const)("a compaction follow-up after $name keeps its origin", async (row) => {
+  ] as const)("a compaction follow-up after $name gets no nudge", async (row) => {
     // Only the follow-up (turn 2) writes todos, so turn 1 itself is never nudged.
     const { h, streams } = await setup({
       parts: (turn) => (turn === 2 ? todoWriteThenReply() : [{ type: "text", text: "ok" }]),

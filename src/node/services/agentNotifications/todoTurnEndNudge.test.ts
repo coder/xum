@@ -3,27 +3,18 @@ import { resumedStreamStartedByUserMessage, streamStartedByUserMessage } from ".
 
 describe("streamStartedByUserMessage", () => {
   test.each([
-    // A message the user sent starts a user turn, whatever came before.
-    { synthetic: false, continuesCompaction: false, previous: false, expected: true },
-    // A manual /compact is a user turn too.
-    { synthetic: false, continuesCompaction: true, previous: false, expected: true },
-    // A machine wake starts a machine turn, even right after a user turn.
-    { synthetic: true, continuesCompaction: false, previous: true, expected: false },
-    // A compaction request or its follow-up continues the turn that asked for it.
-    { synthetic: true, continuesCompaction: true, previous: true, expected: true },
-    { synthetic: true, continuesCompaction: true, previous: false, expected: false },
-  ])(
-    "synthetic=$synthetic continuesCompaction=$continuesCompaction previous=$previous -> $expected",
-    (row) => {
-      expect(
-        streamStartedByUserMessage({
-          previous: row.previous,
-          synthetic: row.synthetic,
-          continuesCompaction: row.continuesCompaction,
-        })
-      ).toBe(row.expected);
-    }
-  );
+    // Only a manual send that is not synthetic is a message the user sent.
+    { automatic: false, synthetic: false, expected: true },
+    // A machine wake, a goal continuation, a compaction request or follow-up.
+    { automatic: true, synthetic: true, expected: false },
+    // An automatic send that stays visible (a task brief, a delegated workspace turn).
+    { automatic: true, synthetic: false, expected: false },
+    { automatic: false, synthetic: true, expected: false },
+  ])("automatic=$automatic synthetic=$synthetic -> $expected", (row) => {
+    expect(streamStartedByUserMessage({ automatic: row.automatic, synthetic: row.synthetic })).toBe(
+      row.expected
+    );
+  });
 });
 
 describe("resumedStreamStartedByUserMessage", () => {

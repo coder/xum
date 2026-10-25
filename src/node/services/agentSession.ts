@@ -1825,8 +1825,7 @@ export class AgentSession {
    * Whether a message the user sent started the current turn (streamStartedByUserMessage). Set
    * when a sent message or a resume starts its stream (an automatic resume that is not a retry is
    * a machine wake; retries and manual resumes keep it). Only those turns earn the todo turn-end
-   * nudge. Starts false: a follow-up dispatched after a restart has lost its origin,
-   * and skipping one nudge is cheaper than nudging a machine turn.
+   * nudge. Starts false, so a turn whose origin is unknown gets no nudge.
    */
   private turnStartedByUserMessage = false;
 
@@ -6588,7 +6587,7 @@ export class AgentSession {
         return Ok(undefined);
       }
 
-      this.noteStreamStartOrigin(internal, typedMuxMetadata);
+      this.noteStreamStartOrigin(internal);
       // Raw terminals reserve COMPLETING; delivered completion runs terminal policy.
       const streamResult = await this.streamWithHistory(
         preparedTurn,
@@ -10932,21 +10931,11 @@ export class AgentSession {
     return nudges;
   }
 
-  /**
-   * Records whether the sent message whose stream starts now began a user turn. Only an
-   * auto-compaction request (on-send or mid-stream) continues the current turn: an idle or
-   * heartbeat compaction (`idle-compaction`) is a fresh machine turn.
-   */
-  private noteStreamStartOrigin(
-    internal: SendMessageInternalOptions | undefined,
-    muxMetadata: MuxMessageMetadata | undefined
-  ): void {
-    const autoCompaction =
-      muxMetadata?.type === "compaction-request" && muxMetadata.source === "auto-compaction";
+  /** Records whether the sent message whose stream starts now began a user turn. */
+  private noteStreamStartOrigin(internal: SendMessageInternalOptions | undefined): void {
     this.turnStartedByUserMessage = streamStartedByUserMessage({
-      previous: this.turnStartedByUserMessage,
+      automatic: (internal?.acceptanceOrigin ?? "manual") === "automatic",
       synthetic: internal?.synthetic === true,
-      continuesCompaction: autoCompaction || internal?.compactionFollowUpSummary != null,
     });
   }
 
