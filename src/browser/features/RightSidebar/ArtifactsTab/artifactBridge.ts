@@ -54,10 +54,11 @@ import {
  *   reaches it.
  * - Frame -> host: `{ type: "backdrop", color }`, the color the page's canvas paints (the root
  *   element's computed background, else the body's; null when both are transparent), posted
- *   after load and after each theme message, only when it changed. The host paints it behind the
+ *   after load, after each theme message (and the page's deferred restyling), on background
+ *   transitionend, resize and scroll, only when it changed. The host paints it behind the
  *   frame (SandboxedArtifactFrame.tsx), since WebKit shows the iframe element's own background
  *   wherever the canvas is not painted yet (overscroll, a frame that just grew). The host accepts
- *   only a bounded string that CSS.supports as a color (artifactBackdropColor).
+ *   only a bounded, plain computed color that CSS.supports (artifactBackdropColor).
  * - Host -> frame: `{ type: "theme", theme: "dark" | "light", themeName?, variables? }`, sent
  *   after load and on theme change; the artifact may read it. Besides the SVG wrapper's layout,
  *   the only host style sheet is the zero-specificity text-size-adjust rule
@@ -214,6 +215,14 @@ export const ARTIFACT_BACKDROP_COLOR_MAX_CHARS = 64;
 const TRANSPARENT_COLOR_PATTERN =
   /^(?:transparent|rgba?\((?:[^,]*,){3}\s*0(?:\.0*)?%?\s*\)|.*\/\s*0(?:\.0*)?%?\s*\))$/i;
 
+/**
+ * The shape of a computed color (what getComputedStyle reports): one color function holding
+ * only numbers, units, separators and `none` (color() adds its color space name). No nested
+ * function, so no var(), url(), calc() or light-dark(), and no keyword such as inherit.
+ */
+const COMPUTED_COLOR_PATTERN =
+  /^(?:(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch)\((?:[-+\d.e%,/\s]|none)*\)|color\([a-z\d-]+(?:[-+\d.e%,/\s]|none)*\))$/i;
+
 const ArtifactBackdropMessageSchema = z
   .object({
     ...bridgeEnvelope,
@@ -279,11 +288,14 @@ export type ArtifactHostToFrameMessage = z.infer<typeof ArtifactHostToFrameMessa
 
 /**
  * The backdrop color the host may paint behind a frame, or null for the fallback. SECURITY: the
- * frame's script chooses the string, so only a value the browser parses as a color, with some
- * paint, passes; it reaches nothing but a CSS property (React's style object).
+ * frame's script chooses the string, so only a plain computed color (COMPUTED_COLOR_PATTERN)
+ * that the browser parses, with some paint, passes; it reaches nothing but a CSS property
+ * (React's style object).
  */
 export function artifactBackdropColor(color: string | null): string | null {
   if (color == null || TRANSPARENT_COLOR_PATTERN.test(color)) return null;
+  // CSS.supports alone also passes var(), light-dark(), currentcolor and CSS-wide keywords.
+  if (!COMPUTED_COLOR_PATTERN.test(color)) return null;
   if (typeof window.CSS === "undefined" || typeof window.CSS.supports !== "function") return null;
   return window.CSS.supports("color", color) ? color : null;
 }
@@ -821,8 +833,23 @@ export function buildArtifactBridgeScript(
     postedBackdrop = color;
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "backdrop", color: color }, "*");
   }
+  // Read again after the page's own deferred restyling: a listener that restyles in a
+  // microtask, a timer or the next frame (each queued before ours runs), and a background
+  // transition, whose computed color only reaches its end value at transitionend.
+  function settleBackdrop() {
+    postBackdrop();
+    setTimeout(postBackdrop, 0);
+    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(postBackdrop);
+  }
   // A task after load, so the artifact's own load handlers have styled the page.
-  window.addEventListener("load", function () { setTimeout(postBackdrop, 0); }, { once: true });
+  window.addEventListener("load", function () { setTimeout(settleBackdrop, 0); }, { once: true });
+  window.addEventListener("transitionend", function (event) {
+    if (event.target === document.documentElement || event.target === document.body) postBackdrop();
+  });
+  // The backdrop shows when the frame grows or overscrolls: check it then too, so a page that
+  // restyled itself later (a timer after load) still gets its color. Posts only on change.
+  window.addEventListener("resize", postBackdrop);
+  window.addEventListener("scroll", postBackdrop, { passive: true });
   window.addEventListener("message", function (event) {
     if (event.source !== host) return;
     var data = event.data;
@@ -832,7 +859,7 @@ export function buildArtifactBridgeScript(
       applyThemeAttribute();
       applyAppearance(data.themeName, data.variables);
       window.dispatchEvent(new CustomEvent("xumthemechange", { detail: { theme: theme } }));
-      postBackdrop();
+      settleBackdrop();
     } else if (data.type === "annotate") {
       annotating = data.enabled === true;
     }

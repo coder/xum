@@ -273,7 +273,7 @@ describe("ArtifactViewer renderers", () => {
     expect(await view.findByTestId("artifact-frame")).toBeTruthy();
   });
 
-  test("a styled page's reported canvas color replaces the white backdrop, for that frame only", async () => {
+  test("a styled page's reported canvas color replaces the white backdrop", async () => {
     const html = "<style>body { background: #100f0f }</style><p>hi</p>";
     const view = renderArtifact("page.html", { "page.html": ok("page.html", html) });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
@@ -298,12 +298,20 @@ describe("ArtifactViewer renderers", () => {
     postBackdrop(frame, null);
     expect(frame.style.backgroundColor).toBe("");
 
-    // A reloaded frame starts again from the fallback until its new document reports.
+    // Only a plain computed color passes: CSS.supports alone also takes these.
+    for (const color of ["var(--color-danger)", "inherit", "currentcolor", "light-dark(red, blue)"]) {
+      postBackdrop(frame, color);
+      expect(frame.style.backgroundColor).toBe("");
+    }
+
+    // A reloaded frame keeps the last color until its new document reports, so no white flash.
     postBackdrop(frame, "rgb(16, 15, 15)");
     fireEvent.load(frame);
     fireEvent.load(frame);
     fireEvent.click(await view.findByRole("button", { name: "Reload" }));
     const reloaded = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    expect(reloaded.style.backgroundColor).toBe("rgb(16, 15, 15)");
+    postBackdrop(reloaded, null);
     expect(reloaded.style.backgroundColor).toBe("");
   });
 
