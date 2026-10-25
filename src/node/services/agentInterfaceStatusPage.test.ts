@@ -176,10 +176,33 @@ describe("needsStatusPageTurnEndNudge", () => {
     );
   });
 
-  test("a page the agent deleted gets the nudge", async () => {
+  test("a page the agent deleted is seeded again and gets the nudge", async () => {
     const turn = await startTurn();
     await fs.rm(statusPath());
     expect(await needsStatusPageTurnEndNudge({ turn: turn ?? undefined, parts: textOnly })).toBe(
+      true
+    );
+    expect(await fs.readFile(statusPath(), "utf8")).toBe(AGENT_INTERFACE_STATUS_TEMPLATE);
+  });
+
+  test("a folder at the page's path gets no nudge", async () => {
+    const turn = await startTurn();
+    await fs.rm(statusPath());
+    await fs.mkdir(statusPath());
+    expect(await needsStatusPageTurnEndNudge({ turn: turn ?? undefined, parts: ranTools })).toBe(
+      false
+    );
+  });
+
+  test.each([
+    { name: "a small page", bytes: 64 },
+    { name: "an oversize page", bytes: 1024 * 1024 + 1 },
+  ])("a turn that only touched $name gets the nudge", async (row) => {
+    await writePage(`<p>${"x".repeat(row.bytes)}</p>`);
+    const turn = await startTurn();
+    const later = new Date(Date.now() + 60_000);
+    await fs.utimes(statusPath(), later, later);
+    expect(await needsStatusPageTurnEndNudge({ turn: turn ?? undefined, parts: ranTools })).toBe(
       true
     );
   });

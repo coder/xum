@@ -96,7 +96,7 @@ export const AGENT_INTERFACE_STATUS_TEMPLATE = `<!doctype html>
 </html>
 `;
 
-/** Bigger pages are fingerprinted by size and mtime instead of their bytes. */
+/** Bigger pages are fingerprinted by their size instead of their bytes. */
 const STATUS_PAGE_SNAPSHOT_MAX_BYTES = 1024 * 1024;
 /** The turn-end read runs after the stream ended, outside its abort signal. */
 const STATUS_PAGE_TURN_END_READ_TIMEOUT_MS = 10_000;
@@ -145,9 +145,10 @@ export async function prepareAgentInterfaceStatusPage(args: {
 
 /**
  * At turn end: whether the status page the user sees needs the turn-end nudge. True when the page
- * is missing or still the seeded placeholder, or when the turn made a successful tool call (it
- * did work) and left the page as it was at turn start. False when the view was inactive this
- * turn, and when the page cannot be read: a nudge must never rest on a guess.
+ * is missing (it is seeded again) or still the seeded placeholder, or when the turn made a
+ * successful tool call (it did work) and left the page as it was at turn start. False when the
+ * view was inactive this turn, and when the page cannot be read or is not a regular file: a nudge
+ * must never rest on a guess.
  */
 export async function needsStatusPageTurnEndNudge(input: {
   turn: AgentInterfaceStatusPageTurn | undefined;
@@ -157,18 +158,19 @@ export async function needsStatusPageTurnEndNudge(input: {
   const abortSignal = AbortSignal.timeout(STATUS_PAGE_TURN_END_READ_TIMEOUT_MS);
   const location = await resolveStatusPageLocation(input.turn.resolveLocation, abortSignal);
   if (location == null) return false;
-  const page = await readStatusPage(location, abortSignal);
-  switch (page.kind) {
-    case "missing":
-      return true;
-    case "unreadable":
-      return false;
-    case "page":
-      return (
-        page.placeholder ||
-        (page.fingerprint === input.turn.startFingerprint && madeSuccessfulToolCall(input.parts))
-      );
+  let page = await readStatusPage(location, abortSignal);
+  if (page.kind === "missing") {
+    // Seed it again so the nudge's in-place edit has a page to edit. A folder, symlink or other
+    // non-regular file at the path also reads as missing, but the createOnly seed leaves it, so
+    // it still reads as missing below and gets no nudge.
+    await seedStatusPage(location, abortSignal);
+    page = await readStatusPage(location, abortSignal);
   }
+  if (page.kind !== "page") return false;
+  return (
+    page.placeholder ||
+    (page.fingerprint === input.turn.startFingerprint && madeSuccessfulToolCall(input.parts))
+  );
 }
 
 function isSuccessfulToolCall(call: { state: string; output?: unknown }): boolean {
@@ -244,9 +246,11 @@ async function readStatusPage(
           placeholder: outcome.bytes.equals(TEMPLATE_BYTES),
         };
       case "too_large":
+        // Size only, not mtime: a touch must not count as an update at any size, as for hashed
+        // pages. The tradeoff is that an edit that keeps an oversize page's size looks unchanged.
         return {
           kind: "page",
-          fingerprint: `too-large:${outcome.size}:${outcome.modifiedMs}`,
+          fingerprint: `too-large:${outcome.size}`,
           placeholder: false,
         };
       case "missing":
