@@ -521,7 +521,7 @@ describe("SSHRuntime authoritative sync contract", () => {
       override async exec(command: string, options: ExecOptions): Promise<ExecStream> {
         const stream = await super.exec(command, options);
         const git = spawned[0];
-        if (git && git.exitCode === null) await once(git, "exit");
+        if (git?.exitCode === null) await once(git, "exit");
         await new Promise((resolve) => setImmediate(resolve));
         return {
           ...stream,
