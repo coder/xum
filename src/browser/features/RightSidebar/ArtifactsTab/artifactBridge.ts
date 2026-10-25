@@ -551,36 +551,54 @@ const ANNOTATE_KEY_LISTENER =
  * The stream-interrupt keys (ARTIFACT_FRAME_INTERRUPT_KEYS), forwarded by name like the annotate
  * key: once every handler in the artifact has run, so a page whose script uses the key
  * (preventDefault) keeps it. Escape typed in a text field stays the field's, as in the chat, and
- * so does an Escape whose default action closes the page's own modal dialog or popover, as the
- * app's Escape closes its own dialog before it stops the stream. That layer is checked during the
- * press, while it is still open. Ctrl+C (Vim mode) interrupts from anywhere, as in the chat. Keys
- * the page's script dispatched itself are not forwarded.
+ * so does an Escape that closes one of the page's dialogs or popovers, as the app's Escape closes
+ * its own dialog before it stops the stream. Whether Escape closes a layer depends on the browser
+ * (closedby, popover types, a cancel handler), so the open layers are read before the page's
+ * handlers run and again once the press and its default action are done: a layer that closed in
+ * between was the page's use of the key. Layers inside shadow roots and overlays the page builds
+ * from other elements are not seen. Ctrl+C (Vim mode) interrupts from anywhere, as in the chat.
+ * Keys the page's script dispatched itself are not forwarded.
  */
 const INTERRUPT_KEY_LISTENER = `
-  function escapeClosesLayer() {
-    var selectors = ["dialog:modal", ":popover-open:not([popover=manual i])"];
-    for (var i = 0; i < selectors.length; i++) {
+  var LAYER_SELECTORS = ["dialog[open]", ":popover-open"];
+  // The page's open layers at the current trusted press, each with the selector that found it.
+  var pressLayers = [];
+  function openLayers() {
+    var layers = [];
+    for (var i = 0; i < LAYER_SELECTORS.length; i++) {
       try {
-        if (document.querySelector(selectors[i]) !== null) return true;
+        var found = document.querySelectorAll(LAYER_SELECTORS[i]);
+        for (var j = 0; j < found.length; j++) layers.push({ element: found[j], selector: LAYER_SELECTORS[i] });
       } catch (error) {
-        // A browser without the selector cannot have that layer open.
-        console.debug("[xum] artifact bridge: unsupported selector", selectors[i], error);
+        // A browser without popovers cannot have one open.
+        console.debug("[xum] artifact bridge: unsupported selector", LAYER_SELECTORS[i], error);
       }
+    }
+    return layers;
+  }
+  function closedLayer(layers) {
+    for (var i = 0; i < layers.length; i++) {
+      if (!layers[i].element.isConnected || !layers[i].element.matches(layers[i].selector)) return true;
     }
     return false;
   }
+  // Capture: this listener runs before any of the page's own handlers.
+  window.addEventListener("keydown", function (event) {
+    if (event.isTrusted) pressLayers = event.key === ${JSON.stringify(KEYBINDS.INTERRUPT_STREAM_NORMAL.key)} ? openLayers() : [];
+  }, true);
   window.addEventListener("keydown", function (event) {
     if (!event.isTrusted || event.repeat || event.metaKey || event.altKey || event.shiftKey) return;
     if (typeof event.key !== "string") return;
     var keybind = null;
     if (!event.ctrlKey && event.key === ${JSON.stringify(KEYBINDS.INTERRUPT_STREAM_NORMAL.key)}) {
-      if (!isEditable(keyTarget(event)) && !escapeClosesLayer()) keybind = "normal";
+      if (!isEditable(keyTarget(event))) keybind = "normal";
     } else if (event.ctrlKey && event.key.toLowerCase() === ${JSON.stringify(KEYBINDS.INTERRUPT_STREAM_VIM.key)}) {
       keybind = "vim";
     }
     if (keybind === null) return;
+    var layers = pressLayers;
     window.setTimeout(function () {
-      if (event.defaultPrevented) return;
+      if (event.defaultPrevented || closedLayer(layers)) return;
       host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "interruptKey", keybind: keybind }, "*");
     }, 0);
   });`;

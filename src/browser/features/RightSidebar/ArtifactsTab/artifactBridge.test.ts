@@ -73,11 +73,14 @@ describe("acceptArtifactFrameMessage", () => {
   });
 });
 
-/** Run the bridge script against a minimal window; returns its keydown handler and posts. */
-/** `querySelector`: the page's document.querySelector (default: matches nothing). */
-function runBridgeScript(options: { querySelector?: (selector: string) => unknown } = {}) {
-  // Every listener, in registration order: keys use a capture listener and a bubble one.
-  const listeners: Array<{ type: string; listener: (event: unknown) => void }> = [];
+/**
+ * Run the bridge script against a minimal window; returns its keydown handler and posts.
+ * `querySelectorAll`: the page's document.querySelectorAll (default: finds nothing).
+ */
+function runBridgeScript(options: { querySelectorAll?: (selector: string) => unknown[] } = {}) {
+  // Every listener, in registration order: keys use capture listeners and bubble ones.
+  const listeners: Array<{ type: string; capture: boolean; listener: (event: unknown) => void }> =
+    [];
   const posted: unknown[] = [];
   // window.setTimeout callbacks, run once a key press has gone through every listener.
   const timers: Array<() => void> = [];
@@ -85,8 +88,8 @@ function runBridgeScript(options: { querySelector?: (selector: string) => unknow
   let prevented = 0;
   const fakeWindow: { xum?: { openWorkspace: (id: unknown) => void } } & Record<string, unknown> = {
     parent: { postMessage: (message: unknown) => posted.push(message) },
-    addEventListener: (type: string, listener: (event: unknown) => void) => {
-      listeners.push({ type, listener });
+    addEventListener: (type: string, listener: (event: unknown) => void, capture?: unknown) => {
+      listeners.push({ type, capture: capture === true, listener });
     },
     setTimeout: (callback: () => void) => timers.push(callback),
   };
@@ -94,7 +97,7 @@ function runBridgeScript(options: { querySelector?: (selector: string) => unknow
   const fakeDocument = {
     documentElement: { setAttribute: () => undefined },
     addEventListener: () => undefined,
-    querySelector: options.querySelector ?? (() => null),
+    querySelectorAll: options.querySelectorAll ?? (() => []),
   };
   // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
   const run = new Function(
@@ -105,8 +108,9 @@ function runBridgeScript(options: { querySelector?: (selector: string) => unknow
   ) as (window: unknown, document: unknown, customEvent: unknown) => void;
   run(fakeWindow, fakeDocument, class {});
   /**
-   * One key press through every keydown listener, then the timers. `defaultPrevented`: a
-   * handler the artifact registered after the bridge's listeners kept the key.
+   * One key press as the browser dispatches it to the window: the capture listeners, the page's
+   * own handlers, the bubble listeners, the key's default action, then the timers.
+   * `defaultPrevented`: a handler the artifact registered after the bridge's listeners kept the key.
    */
   const keydown = (
     key: string,
@@ -121,6 +125,10 @@ function runBridgeScript(options: { querySelector?: (selector: string) => unknow
       composedPath?: unknown[];
       /** False for a key the page's own script dispatched. */
       isTrusted?: boolean;
+      /** The page's keydown handlers on the target or the document. */
+      pageHandler?: () => void;
+      /** Runs unless the key was prevented, like Escape's close request. */
+      defaultAction?: () => void;
     } = {}
   ) => {
     const event = {
@@ -138,8 +146,16 @@ function runBridgeScript(options: { querySelector?: (selector: string) => unknow
       },
       ...(extra.composedPath ? { composedPath: () => extra.composedPath } : {}),
     };
-    for (const entry of listeners) if (entry.type === "keydown") entry.listener(event);
+    const dispatch = (capture: boolean) => {
+      for (const entry of listeners) {
+        if (entry.type === "keydown" && entry.capture === capture) entry.listener(event);
+      }
+    };
+    dispatch(true);
+    extra.pageHandler?.();
+    dispatch(false);
     event.defaultPrevented = extra.defaultPrevented ?? false;
+    if (!event.defaultPrevented) extra.defaultAction?.();
     for (const timer of timers.splice(0)) timer();
   };
   return { keydown, posted, xum: fakeWindow.xum, prevented: () => prevented };
@@ -308,30 +324,105 @@ describe("bridge script interrupt keys", () => {
     expect(interrupts(bridge.posted)).toEqual([]);
   });
 
-  test("Escape that closes the page's own modal dialog or popover stays the page's", () => {
+  /**
+   * One of the page's dialogs or popovers. The page's querySelectorAll finds it while it is open
+   * and in the document, by its kind, as the browser's selectors would (happy-dom matches no
+   * :popover-open).
+   */
+  const pageLayer = (kind: "dialog" | "popover") => {
+    const layer = {
+      open: true,
+      isConnected: true,
+      matches: (selector: string): boolean =>
+        layer.open && selector.includes(kind === "dialog" ? "dialog" : "popover-open"),
+    };
+    return layer;
+  };
+  const findLayers =
+    (...layers: Array<ReturnType<typeof pageLayer>>) =>
+    (selector: string) =>
+      layers.filter((layer) => layer.isConnected && layer.matches(selector));
+
+  test("Escape that closes one of the page's dialogs or popovers stays the page's", () => {
     const escape = KEYBINDS.INTERRUPT_STREAM_NORMAL.key;
     const vimKey = KEYBINDS.INTERRUPT_STREAM_VIM.key;
-    // happy-dom matches neither pseudo-class, so the page's open layer is what its
-    // document.querySelector reports during the press.
-    for (const layer of [":modal", ":popover-open"]) {
-      const bridge = runBridgeScript({
-        querySelector: (selector) => (selector.includes(layer) ? div : null),
+    for (const kind of ["dialog", "popover"] as const) {
+      const layer = pageLayer(kind);
+      const bridge = runBridgeScript({ querySelectorAll: findLayers(layer) });
+      // The browser's close request closes it ...
+      bridge.keydown(escape, div, false, {
+        defaultAction: () => {
+          layer.open = false;
+        },
       });
-      bridge.keydown(escape, div);
-      // Ctrl+C closes no layer.
-      bridge.keydown(vimKey, div, false, { ctrlKey: true });
+      // ... or the page's own handler does, before the bridge's bubble listener runs ...
+      layer.open = true;
+      bridge.keydown(escape, div, false, {
+        pageHandler: () => {
+          layer.open = false;
+        },
+      });
+      // ... or the page's handler removes it ...
+      layer.open = true;
+      bridge.keydown(escape, div, false, {
+        pageHandler: () => {
+          layer.isConnected = false;
+        },
+      });
+      // ... or closes it and dispatches a key of its own, which leaves the press's layers alone.
+      layer.isConnected = true;
+      bridge.keydown(escape, div, false, {
+        pageHandler: () => {
+          layer.open = false;
+          bridge.keydown(escape, div, false, { isTrusted: false });
+        },
+      });
+      expect(interrupts(bridge.posted)).toEqual([]);
+      // Only Escape closes layers: Ctrl+C interrupts whatever the page does with it.
+      layer.open = true;
+      bridge.keydown(vimKey, div, false, {
+        ctrlKey: true,
+        pageHandler: () => {
+          layer.open = false;
+        },
+      });
       expect(interrupts(bridge.posted)).toEqual([
         { xumArtifact: 1, type: "interruptKey", keybind: "vim" },
       ]);
     }
-    // A browser without these selectors has no such layer open, so Escape still interrupts.
+  });
+
+  test("Escape that leaves the page's dialogs and popovers open interrupts", () => {
+    // A manual popover, or a dialog that Escape does not close (closedby="none", or a cancel
+    // handler that prevents it): the press did nothing in the page.
+    const bridge = runBridgeScript({
+      querySelectorAll: findLayers(pageLayer("dialog"), pageLayer("popover")),
+    });
+    bridge.keydown(KEYBINDS.INTERRUPT_STREAM_NORMAL.key, div);
+    expect(interrupts(bridge.posted)).toEqual([
+      { xumArtifact: 1, type: "interruptKey", keybind: "normal" },
+    ]);
+  });
+
+  test("a browser without popovers still sees the dialog that Escape closes", () => {
+    const escape = KEYBINDS.INTERRUPT_STREAM_NORMAL.key;
     const debug = spyOn(console, "debug").mockImplementation(() => undefined);
     try {
+      const dialog = pageLayer("dialog");
+      const find = findLayers(dialog);
       const bridge = runBridgeScript({
-        querySelector: () => {
-          throw new SyntaxError("unsupported selector");
+        querySelectorAll: (selector) => {
+          if (selector.includes("popover")) throw new SyntaxError("unsupported selector");
+          return find(selector);
         },
       });
+      bridge.keydown(escape, div, false, {
+        defaultAction: () => {
+          dialog.open = false;
+        },
+      });
+      expect(interrupts(bridge.posted)).toEqual([]);
+      dialog.open = true;
       bridge.keydown(escape, div);
       expect(interrupts(bridge.posted)).toEqual([
         { xumArtifact: 1, type: "interruptKey", keybind: "normal" },
