@@ -16,7 +16,7 @@ import {
   foldThinkingOverrideForFallback,
   resolveNextFallbackModel,
   withModelFallbackRecord,
-} from "./streamManager";
+} from "./RefusalFallback";
 
 const MODEL = "anthropic:claude-sonnet-4-5";
 
