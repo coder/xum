@@ -136,7 +136,8 @@ const ArtifactAnnotateMessageSchema = z
  * TOGGLE_RIGHT_SIDEBAR collapses it, and OPEN_ARTIFACTS_TAB collapses it too, since the frame
  * only holds focus while the Artifacts tab shows (user request: that key toggles the tab, from
  * anywhere in it). TOGGLE_AGENT_INTERFACE_VIEW switches the main pane between the status page
- * (a frame too) and the chat, so the advertised chord also works after a click in the page.
+ * (a frame too) and the chat, so the advertised chord also leaves the page after a click in it;
+ * from a frame it only ever switches to the chat (useMainPaneAgentInterfaceView).
  */
 export const ARTIFACT_FRAME_CHORDS = {
   sidebar: KEYBINDS.TOGGLE_RIGHT_SIDEBAR,

@@ -260,14 +260,24 @@ export function hasAgentInterfaceStatusPage(workspaceId: string): boolean {
 }
 
 /** Flip the workspace between its status page and the transcript; a no-op without a page. */
-export function toggleAgentInterfaceView(workspaceId: string) {
+export function toggleAgentInterfaceView(workspaceId: string, onlyToChat = false) {
   if (!hasAgentInterfaceStatusPage(workspaceId)) return;
   const stored = choiceFrom(
     readPersistedState<unknown>(AGENT_INTERFACE_VIEW_KEY, EMPTY_CHOICES),
     workspaceId
   );
   const current = resolveAgentInterfaceView({ enabled: true, statusExists: true, stored });
-  writeAgentInterfaceViewChoice(workspaceId, current === "status" ? "chat" : "status");
+  const next = toggledAgentInterfaceView(current, onlyToChat);
+  if (next != null) writeAgentInterfaceViewChoice(workspaceId, next);
+}
+
+/** The view a switch leads to; null when it changes nothing (`onlyToChat` on the chat). */
+export function toggledAgentInterfaceView(
+  current: AgentInterfaceView,
+  onlyToChat: boolean
+): AgentInterfaceView | null {
+  if (current === "status") return "chat";
+  return onlyToChat ? null : "status";
 }
 
 /**
@@ -288,7 +298,12 @@ export function useMainPaneAgentInterfaceView(workspaceId: string): AgentInterfa
       e.preventDefault();
       // A held chord would flip the view on every key repeat.
       if (e.repeat) return;
-      toggleAgentInterfaceView(workspaceId);
+      // SECURITY AUDIT: a chord replayed from an artifact frame (dispatched on the iframe) may
+      // come from the page's own script, which no gesture check reliably tells apart from the
+      // user. It only ever leaves the status page for the transcript, the safe default, and the
+      // main pane's status frame unmounts on that switch, so a script cannot flip the view back.
+      const fromFrame = (e.target as Partial<Element> | null)?.tagName === "IFRAME";
+      toggleAgentInterfaceView(workspaceId, fromFrame);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);

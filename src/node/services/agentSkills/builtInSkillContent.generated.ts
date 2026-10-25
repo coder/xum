@@ -10458,7 +10458,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "**Agent interface view** is a sub-experiment of Artifacts. Turn it on under the Artifacts row in **Settings > Experiments**. When it is on, the main pane shows the agent's status page, `status.html` in the artifacts folder, instead of the chat transcript. The message box stays at the bottom, so you can send messages from the status page.",
       "",
       "- At the start of each turn, if `status.html` does not exist, Xum writes a starter page that uses the [theme variables](#theme-variables). Xum never replaces a page that exists. The agent is told to keep the page current.",
-      "- Switch between the status page and the chat with the **Status** and **Chat** buttons in the workspace header, `Ctrl+Shift+S` (`Cmd+Shift+S` on macOS), or **Switch Status Page / Chat** in the command palette.",
+      "- Switch between the status page and the chat with the **Status** and **Chat** buttons in the workspace header, `Ctrl+Shift+S` (`Cmd+Shift+S` on macOS), or **Switch Status Page / Chat** in the command palette. With focus inside the status page, the shortcut only switches to the chat.",
       "- Xum remembers your choice for each workspace. A workspace where you made no choice shows the status page.",
       "- When the workspace has no status page, or the page is empty or cannot be shown (for example a binary file), the main pane shows the chat transcript.",
       "- Buttons on the status page that call `window.xum.send` work as they do in the Artifacts tab.",

@@ -5,6 +5,7 @@ import {
   isStatusPageEntryShowable,
   isStatusPageReadShowable,
   resolveAgentInterfaceView,
+  toggledAgentInterfaceView,
   type AgentInterfaceView,
 } from "./agentInterfaceView";
 
@@ -19,6 +20,15 @@ describe("resolveAgentInterfaceView", () => {
     ["the experiment off shows the transcript", false, true, "status", "chat"],
   ])("%s", (_name, enabled, statusExists, stored, expected) => {
     expect(resolveAgentInterfaceView({ enabled, statusExists, stored })).toBe(expected);
+  });
+});
+
+describe("toggledAgentInterfaceView", () => {
+  test("the user's chord flips both ways; a frame's chord only leaves the status page", () => {
+    expect(toggledAgentInterfaceView("status", false)).toBe("chat");
+    expect(toggledAgentInterfaceView("chat", false)).toBe("status");
+    expect(toggledAgentInterfaceView("status", true)).toBe("chat");
+    expect(toggledAgentInterfaceView("chat", true)).toBeNull();
   });
 });
 
