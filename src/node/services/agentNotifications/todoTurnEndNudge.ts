@@ -61,6 +61,19 @@ export function streamStartedByUserMessage(input: {
   return input.continuesCompaction ? input.previous : false;
 }
 
+/**
+ * streamStartedByUserMessage for a resumed stream (no new message). An automatic resume that is
+ * not a retry is a machine wake, such as the prompt-free resume after a sub-agent report. An
+ * automatic retry and a manual resume (Retry, an answered question) continue the current turn.
+ */
+export function resumedStreamStartedByUserMessage(input: {
+  previous: boolean;
+  automatic: boolean;
+  retry: boolean;
+}): boolean {
+  return input.automatic && !input.retry ? false : input.previous;
+}
+
 export interface TurnStopContinuation {
   prompt: string;
 }

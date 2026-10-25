@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { streamStartedByUserMessage } from "./todoTurnEndNudge";
+import { resumedStreamStartedByUserMessage, streamStartedByUserMessage } from "./todoTurnEndNudge";
 
 describe("streamStartedByUserMessage", () => {
   test.each([
@@ -24,4 +24,25 @@ describe("streamStartedByUserMessage", () => {
       ).toBe(row.expected);
     }
   );
+});
+
+describe("resumedStreamStartedByUserMessage", () => {
+  test.each([
+    // An automatic resume that is not a retry is a machine wake (a sub-agent report drain).
+    { automatic: true, retry: false, previous: true, expected: false },
+    // An automatic retry continues the current turn.
+    { automatic: true, retry: true, previous: true, expected: true },
+    { automatic: true, retry: true, previous: false, expected: false },
+    // A manual resume (Retry, an answered question) continues the current turn.
+    { automatic: false, retry: false, previous: true, expected: true },
+    { automatic: false, retry: false, previous: false, expected: false },
+  ])("automatic=$automatic retry=$retry previous=$previous -> $expected", (row) => {
+    expect(
+      resumedStreamStartedByUserMessage({
+        previous: row.previous,
+        automatic: row.automatic,
+        retry: row.retry,
+      })
+    ).toBe(row.expected);
+  });
 });

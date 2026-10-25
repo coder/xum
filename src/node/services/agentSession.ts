@@ -124,6 +124,7 @@ import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import {
   mergeTurnStopContinuation,
   needsTodoTurnEndNudge,
+  resumedStreamStartedByUserMessage,
   TODO_TURN_END_NUDGE,
   streamStartedByUserMessage,
   type TurnStopContinuation,
@@ -1822,8 +1823,9 @@ export class AgentSession {
 
   /**
    * Whether a message the user sent started the current turn (streamStartedByUserMessage). Set
-   * when a sent message starts its stream; retries and resumes keep it. Only those turns earn the
-   * todo turn-end nudge. Starts false: a follow-up dispatched after a restart has lost its origin,
+   * when a sent message or a resume starts its stream (an automatic resume that is not a retry is
+   * a machine wake; retries and manual resumes keep it). Only those turns earn the todo turn-end
+   * nudge. Starts false: a follow-up dispatched after a restart has lost its origin,
    * and skipping one nudge is cheaper than nudging a machine turn.
    */
   private turnStartedByUserMessage = false;
@@ -6789,6 +6791,7 @@ export class AgentSession {
       // preparation publication; the coordinator expires the holder when the turn becomes idle).
       const turnThinkingOverride: ActiveTurnThinkingOverride = {};
       this.coordinator.acceptThinkingOverride(turnThinkingOverride, preparedTurn);
+      this.noteResumeOrigin(internal);
       // Must await here so the finally block runs after streaming completes,
       // not immediately when the Promise is returned.
       const result = await this.streamWithHistory(
@@ -10938,6 +10941,17 @@ export class AgentSession {
       previous: this.turnStartedByUserMessage,
       synthetic: internal?.synthetic === true,
       continuesCompaction: isCompactionRequest || internal?.compactionFollowUpSummary != null,
+    });
+  }
+
+  /** Records whether the resumed stream that starts now continues a user turn. */
+  private noteResumeOrigin(
+    internal: { acceptanceOrigin?: TurnAcceptanceOrigin; retrySignal?: AbortSignal } | undefined
+  ): void {
+    this.turnStartedByUserMessage = resumedStreamStartedByUserMessage({
+      previous: this.turnStartedByUserMessage,
+      automatic: internal?.acceptanceOrigin === "automatic",
+      retry: internal?.retrySignal != null,
     });
   }
 

@@ -880,6 +880,31 @@ describe("todo turn-end nudge", () => {
     expect((await userTexts(h)).slice(1)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
   });
 
+  // A resume starts a stream without a new message: an automatic one (the prompt-free resume after
+  // a sub-agent report) is a machine wake, and a manual one continues the user's turn.
+  test.each([
+    { name: "an automatic resume", internal: { acceptanceOrigin: "automatic" }, nudged: false },
+    { name: "a manual resume", internal: { acceptanceOrigin: "manual" }, nudged: true },
+  ] as const)("$name after a user turn keeps the right origin", async (row) => {
+    // Only the resumed stream (turn 2) writes todos, so turn 1 itself is never nudged.
+    const { h, streams } = await setup({
+      parts: (turn) => (turn === 2 ? todoWriteThenReply() : [{ type: "text", text: "ok" }]),
+    });
+    await writeTodos(h, openTodos);
+    await h.session.sendMessage("first", options);
+    await settle(h);
+
+    const resumed = await h.session.resumeStream(options, {
+      ...row.internal,
+      agentInitiated: true,
+    });
+    assert(resumed.success);
+    await settle(h);
+
+    expect(streams()).toBe(row.nudged ? 3 : 2);
+    expect((await userTexts(h)).includes(TODO_TURN_END_NUDGE)).toBe(row.nudged);
+  });
+
   // A compaction follow-up is sent as a synthetic row but continues the turn that compacted.
   test.each([
     { name: "a user turn", internal: undefined, nudged: true },
