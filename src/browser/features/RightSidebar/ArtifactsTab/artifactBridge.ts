@@ -53,7 +53,8 @@ import {
  *   (SandboxedArtifactFrame.tsx). The frame never gets a reply, so no workspace list or title
  *   reaches it.
  * - Frame -> host: `{ type: "backdrop", color }`, the color the page's canvas paints (the root
- *   element's computed background, else the body's; null when both are transparent), posted
+ *   element's computed background color, else the body's when the root has no background image;
+ *   null when neither applies), posted
  *   after load and after each theme message (and the page's deferred restyling of either),
  *   only when it changed. The host paints it behind the
  *   frame (SandboxedArtifactFrame.tsx), since WebKit shows the iframe element's own background
@@ -210,8 +211,8 @@ export const ARTIFACT_BACKDROP_COLOR_MAX_CHARS = 64;
 
 /**
  * A computed color with no paint: `transparent`, or a zero alpha in the legacy four-argument
- * rgba() form or the modern `/ alpha` form. The frame's shim skips such a root background for
- * the body's, as CSS background propagation does.
+ * rgba() form or the modern `/ alpha` form. The frame's shim skips such a root color for the
+ * body's (unless the root has a background image), as CSS background propagation does.
  */
 const TRANSPARENT_COLOR_PATTERN =
   /^(?:transparent|rgba?\((?:[^,]*,){3}\s*0(?:\.0*)?%?\s*\)|.*\/\s*0(?:\.0*)?%?\s*\))$/i;
@@ -825,7 +826,8 @@ export function buildArtifactBridgeScript(
   var initialAppearance = JSON.parse(${inlineScriptJson(JSON.stringify(initialAppearance))});
   if (initialAppearance) applyAppearance(initialAppearance.themeName, initialAppearance.variables);
   // The color the page's canvas paints, picked as CSS background propagation does: the root
-  // element's background, else the body's. The host paints it behind the frame.
+  // element's background color, else the body's, but only when the root has no background
+  // image either. The host paints it behind the frame.
   var transparentColorPattern = ${TRANSPARENT_COLOR_PATTERN.toString()};
   var postedBackdrop;
   function paintedBackground(element) {
@@ -834,9 +836,16 @@ export function buildArtifactBridgeScript(
     if (typeof color !== "string" || !color || transparentColorPattern.test(color)) return null;
     return color.length > ${ARTIFACT_BACKDROP_COLOR_MAX_CHARS} ? null : color;
   }
+  // Every image in a computed background-image is a function (url(), a gradient); none is not.
+  function hasBackgroundImage(element) {
+    var image = element ? window.getComputedStyle(element).backgroundImage : null;
+    return typeof image === "string" && image.indexOf("(") !== -1;
+  }
   function postBackdrop() {
     if (typeof window.getComputedStyle !== "function") return;
-    var color = paintedBackground(document.documentElement) || paintedBackground(document.body);
+    var root = document.documentElement;
+    var color = paintedBackground(root);
+    if (!color && !hasBackgroundImage(root)) color = paintedBackground(document.body);
     if (color === postedBackdrop) return;
     postedBackdrop = color;
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "backdrop", color: color }, "*");

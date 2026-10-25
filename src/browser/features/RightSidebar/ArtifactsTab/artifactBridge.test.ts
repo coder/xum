@@ -1314,6 +1314,11 @@ describe("bridge backdrop", () => {
       ["<style>html { background: #123456 } body { background: red }</style>", "#123456"],
       ['<body style="background-color: red"><p>hi</p></body>', "red"],
       ['<style>html { background: rgba(0, 0, 0, 0) }</style><body style="background: red">', "red"],
+      // A root image keeps the body's background off the canvas (CSS background propagation).
+      [
+        "<style>html { background-image: linear-gradient(transparent, blue) } body { background: red }</style>",
+        null,
+      ],
       ["<p>no background</p>", null],
     ] as const) {
       const page = await runWithPage(html);
