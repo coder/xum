@@ -1056,14 +1056,14 @@ function withEffectiveHeartbeatInterval(
   return { ...settings, intervalMs: settings.intervalMs ?? defaultIntervalMs };
 }
 
+// Daytona auto-stops and archives idle sandboxes; both are "stopped" (the next turn starts it).
 const DAYTONA_RUNTIME_STATUS: Record<DaytonaSandboxState, WorkspaceRuntimeStatus> = {
   started: "running",
   stopped: "stopped",
-  starting: "starting",
-  archived: "archived",
-  error: "error",
-  // Deleted outside Xum: ensureReady refuses it, so show it as an error, not unknown.
-  missing: "error",
+  archived: "stopped",
+  starting: "unknown",
+  error: "unknown",
+  missing: "unknown",
 };
 
 /**
