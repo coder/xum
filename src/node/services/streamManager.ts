@@ -48,6 +48,7 @@ import {
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import { rebaseAutoThinkingEscalation } from "@/node/services/autoThinkingEscalation";
+import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   coerceStreamErrorTypeForMessage,
@@ -121,6 +122,7 @@ import type {
   OnStepSettled,
   ModelFallbackPrepareOptions,
   ModelFallbackOptions,
+  PreparedModelFallback,
   WorkspaceStreamInfo,
   StopStreamOptions,
   ActiveStreamInfo,
@@ -446,6 +448,143 @@ function summarizeToolResultForLog(output: unknown): Record<string, unknown> {
 
 function hasIncompleteToolCallPart(parts: CompletedMessagePart[]): boolean {
   return parts.some((part) => part.type === "dynamic-tool" && part.state !== "output-available");
+}
+
+type ModelFallbackState = NonNullable<WorkspaceStreamInfo["modelFallback"]>;
+
+/** Outcome of a refusal-fallback attempt (see tryModelFallbackAfterRefusal). */
+type RefusalFallbackOutcome = { kind: "swapped" } | { kind: "terminal"; terminalNote?: string };
+
+/** Returns the metadata with the chain's current refusal record (requested + refused models). */
+export function withModelFallbackRecord(
+  metadata: Partial<MuxMetadata> | undefined,
+  fallbackState: Pick<ModelFallbackState, "requestedModel" | "refusedModels">
+): Partial<MuxMetadata> {
+  return {
+    ...metadata,
+    modelFallback: {
+      requestedModel: fallbackState.requestedModel,
+      refusedModels: [...fallbackState.refusedModels],
+    },
+  };
+}
+
+/**
+ * Picks the chain's next model after the latest refusal, or the terminal note
+ * when the chain is exhausted or the refused partial output cannot continue.
+ */
+export function resolveNextFallbackModel(
+  fallbackState: Pick<ModelFallbackState, "options" | "refusedModels">,
+  preserveParts: boolean,
+  parts: CompletedMessagePart[]
+): { kind: "next"; modelString: string } | { kind: "terminal"; terminalNote: string } {
+  const nextModelString = fallbackState.options.chain[fallbackState.refusedModels.length - 1];
+  if (nextModelString === undefined) {
+    return {
+      kind: "terminal",
+      terminalNote: `Model fallback chain exhausted; refused models: ${fallbackState.refusedModels.join(", ")}.`,
+    };
+  }
+
+  if (preserveParts && hasIncompleteToolCallPart(parts)) {
+    return {
+      kind: "terminal",
+      terminalNote:
+        "Model fallback was skipped because the refused partial response had an incomplete tool call.",
+    };
+  }
+  return { kind: "next", modelString: nextModelString };
+}
+
+/**
+ * Fold a mid-turn thinking override (pending or already applied) into the
+ * fallback's baseline so the hop doesn't silently revert the user's
+ * mid-turn change. Pending is cleared here — prepare() re-clamps it for
+ * the fallback model and bakes it into the rebuilt provider options.
+ */
+export function foldThinkingOverrideForFallback(
+  overrideHolder: ActiveTurnThinkingOverride | undefined
+): ThinkingLevel | undefined {
+  const thinkingLevelOverride = overrideHolder?.pending ?? overrideHolder?.applied;
+  if (overrideHolder?.pending != null) {
+    overrideHolder.pending = undefined;
+  }
+  if (overrideHolder != null && thinkingLevelOverride != null) {
+    // Keep the override visible to later hops: prepare() bakes it into this
+    // hop's baseline, but a second hop re-folds from `applied`.
+    overrideHolder.applied = thinkingLevelOverride;
+  }
+  return thinkingLevelOverride;
+}
+
+/** The prepare() options for a fallback hop, or undefined when it has none. */
+export function buildFallbackPrepareOptions(
+  continuationMessage: MuxMessage | undefined,
+  thinkingLevelOverride: ThinkingLevel | undefined
+): ModelFallbackPrepareOptions | undefined {
+  return continuationMessage != null || thinkingLevelOverride != null
+    ? {
+        ...(continuationMessage != null
+          ? { continuation: { assistantMessage: continuationMessage } }
+          : {}),
+        ...(thinkingLevelOverride != null ? { thinkingLevelOverride } : {}),
+      }
+    : undefined;
+}
+
+/**
+ * Whether the fallback request may keep the continuous-compaction prefix swap.
+ * Fallback preparation can combine consecutive tool-only steps from the live
+ * Mux row. An internal cut is no longer a provable wire-message boundary.
+ */
+export function canReuseFallbackPrefix(
+  family: string | undefined,
+  consumedSwap: ContinuousPrefixSwap,
+  preparedThinkingLevel: string | undefined,
+  nextRequest: Pick<StreamRequestConfig, "tools">
+): boolean {
+  return (
+    family === consumedSwap.journal.providerFamily &&
+    consumedSwap.journal.liveTailCopySpec.partIndex === 0 &&
+    (preparedThinkingLevel ?? "off") === consumedSwap.journal.preparation.effectiveThinkingLevel &&
+    // The swapped prefix references only the parent's native deferred tools (#5262).
+    [...collectDeferLoadingToolNames(nextRequest.tools ?? {})].sort().join("\n") ===
+      [...(consumedSwap.journal.preparation.deferLoadingToolNames ?? [])].sort().join("\n")
+  );
+}
+
+/** The fallback request's system messages plus the swap's conversation prefix. */
+export function buildFallbackPrefix(
+  consumedSwap: ContinuousPrefixSwap,
+  nextRequest: Pick<StreamRequestConfig, "messages" | "cacheEnabled" | "providerOptions">
+): ModelMessage[] {
+  const conversation = stripMessageCacheControl(
+    consumedSwap.prefix.filter((message) => message.role !== "system")
+  );
+  return [
+    ...nextRequest.messages.filter((message) => message.role === "system"),
+    ...(nextRequest.cacheEnabled
+      ? applyCacheControl(
+          conversation,
+          "anthropic:prefix",
+          getAnthropicCacheTtl(nextRequest.providerOptions)
+        )
+      : conversation),
+  ];
+}
+
+/** One refusal-fallback hop's inputs, shared by the swap steps. */
+interface RefusalFallbackSwap {
+  workspaceId: WorkspaceId;
+  streamInfo: WorkspaceStreamInfo;
+  fallbackState: ModelFallbackState;
+  nextModelString: string;
+  /** Canonical refusing model (the display list and chain bookkeeping). */
+  refusedModel: string;
+  refusalFinishReason: string;
+  preserveParts: boolean;
+  /** Cloned partial assistant turn when continuing after partial output. */
+  continuationMessage: MuxMessage | undefined;
 }
 
 // Ensure per-stream part timestamps are strictly monotonic.
@@ -2364,7 +2503,7 @@ export class StreamManager {
     streamInfo: WorkspaceStreamInfo,
     refusalFinishReason: string,
     options?: { preserveParts?: boolean }
-  ): Promise<{ kind: "swapped" } | { kind: "terminal"; terminalNote?: string }> {
+  ): Promise<RefusalFallbackOutcome> {
     const fallbackState = streamInfo.modelFallback;
     const preserveParts = options?.preserveParts === true;
     const refusedModel = normalizeToCanonical(streamInfo.model);
@@ -2381,13 +2520,7 @@ export class StreamManager {
     }
 
     fallbackState.refusedModels.push(refusedModel);
-    streamInfo.initialMetadata = {
-      ...streamInfo.initialMetadata,
-      modelFallback: {
-        requestedModel: fallbackState.requestedModel,
-        refusedModels: [...fallbackState.refusedModels],
-      },
-    };
+    streamInfo.initialMetadata = withModelFallbackRecord(streamInfo.initialMetadata, fallbackState);
 
     if (streamInfo.abortController.signal.aborted || streamInfo.softInterrupt.pending) {
       await this.recordRefusedAttemptUsage(workspaceId, streamInfo, refusedModelForUsage);
@@ -2400,181 +2533,70 @@ export class StreamManager {
     // hop's tokens from session usage / cost accounting.
     await this.recordRefusedAttemptUsage(workspaceId, streamInfo, refusedModelForUsage);
 
-    const nextModelString = fallbackState.options.chain[fallbackState.refusedModels.length - 1];
-    if (nextModelString === undefined) {
-      return {
-        kind: "terminal",
-        terminalNote: `Model fallback chain exhausted; refused models: ${fallbackState.refusedModels.join(", ")}.`,
-      };
+    const next = resolveNextFallbackModel(fallbackState, preserveParts, streamInfo.parts);
+    if (next.kind === "terminal") {
+      return next;
     }
 
-    if (preserveParts && hasIncompleteToolCallPart(streamInfo.parts)) {
-      return {
-        kind: "terminal",
-        terminalNote:
-          "Model fallback was skipped because the refused partial response had an incomplete tool call.",
-      };
-    }
-
-    const continuation = preserveParts
-      ? this.buildPartialRefusalContinuationMessage(streamInfo, refusalFinishReason)
-      : undefined;
-    if (continuation != null && !continuation.success) {
+    const continuation = this.buildRefusalContinuation(
+      streamInfo,
+      preserveParts,
+      refusalFinishReason
+    );
+    if (!continuation.success) {
       return {
         kind: "terminal",
         terminalNote: `Model fallback was skipped because ${continuation.error}.`,
       };
     }
 
+    return this.swapToFallbackModel({
+      workspaceId,
+      streamInfo,
+      fallbackState,
+      nextModelString: next.modelString,
+      refusedModel,
+      refusalFinishReason,
+      preserveParts,
+      continuationMessage: continuation.data,
+    });
+  }
+
+  /** The cloned partial turn to continue from, or undefined when parts are not preserved. */
+  private buildRefusalContinuation(
+    streamInfo: WorkspaceStreamInfo,
+    preserveParts: boolean,
+    refusalFinishReason: string
+  ): Result<MuxMessage | undefined, string> {
+    return preserveParts
+      ? this.buildPartialRefusalContinuationMessage(streamInfo, refusalFinishReason)
+      : Ok(undefined);
+  }
+
+  /** Prepares, builds and starts the fallback request, then commits the swap. */
+  private async swapToFallbackModel(swap: RefusalFallbackSwap): Promise<RefusalFallbackOutcome> {
+    const { workspaceId, streamInfo, nextModelString } = swap;
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-    // A throw out of prepare() must not escape to the generic stream-error path:
-    // it would be categorized as a retryable api/unknown error and re-enter the
-    // unbounded auto-retry loop this feature exists to prevent. Aborts rethrow so
-    // a user interrupt during prepare stays an abort instead of a refusal.
-    // Fold a mid-turn thinking override (pending or already applied) into the
-    // fallback's baseline so the hop doesn't silently revert the user's
-    // mid-turn change. Pending is cleared here — prepare() re-clamps it for
-    // the fallback model and bakes it into the rebuilt provider options.
     const overrideHolder = streamInfo.request.thinkingOverrideState;
-    const thinkingLevelOverride = overrideHolder?.pending ?? overrideHolder?.applied;
-    if (overrideHolder?.pending != null) {
-      overrideHolder.pending = undefined;
-    }
-    if (overrideHolder != null && thinkingLevelOverride != null) {
-      // Keep the override visible to later hops: prepare() bakes it into this
-      // hop's baseline, but a second hop re-folds from `applied`.
-      overrideHolder.applied = thinkingLevelOverride;
-    }
-    const prepareCallOptions: ModelFallbackPrepareOptions | undefined =
-      continuation?.success === true || thinkingLevelOverride != null
-        ? {
-            ...(continuation?.success === true
-              ? { continuation: { assistantMessage: continuation.data } }
-              : {}),
-            ...(thinkingLevelOverride != null ? { thinkingLevelOverride } : {}),
-          }
-        : undefined;
+    const thinkingLevelOverride = foldThinkingOverrideForFallback(overrideHolder);
+    const prepareCallOptions = buildFallbackPrepareOptions(
+      swap.continuationMessage,
+      thinkingLevelOverride
+    );
     streamInfo.stepTracker.pendingPrefixSwap = undefined;
-    let prepared: Awaited<ReturnType<ModelFallbackOptions["prepare"]>>;
-    try {
-      prepared = await fallbackState.options.prepare(nextModelString, prepareCallOptions);
-    } catch (error) {
-      if (streamInfo.abortController.signal.aborted) {
-        throw error;
-      }
-      return {
-        kind: "terminal",
-        terminalNote: `Configured fallback model ${nextModelString} could not be started: ${getErrorMessage(error)}`,
-      };
-    }
+    const prepared = await this.prepareFallbackModel(swap, prepareCallOptions);
     if (!prepared.success) {
-      if (typeof prepared.error !== "string") throw new ContextBudgetExceededError(prepared.error);
-      return {
-        kind: "terminal",
-        terminalNote: `Configured fallback model ${nextModelString} could not be started: ${prepared.error}`,
-      };
+      return { kind: "terminal", terminalNote: prepared.error };
     }
 
     const fallbackMessages = applyTurnReplayReceipt(streamInfo.stepTracker, prepared.data.messages);
     // Build the swapped request/stream into locals first so a failure here
     // leaves streamInfo unmodified (the terminal error then names the model
     // that actually refused, not a half-applied fallback).
-    const nextRequest = this.providerRequest.buildStreamRequestConfig({
-      model: prepared.data.model,
-      modelString: prepared.data.modelString,
-      messages: fallbackMessages,
-      system: prepared.data.system,
-      tools: prepared.data.tools,
-      providerOptions: prepared.data.providerOptions,
-      maxOutputTokens: fallbackState.original.maxOutputTokens,
-      callSettingsOverrides: prepared.data.callSettingsOverrides,
-      toolPolicy: streamInfo.request.toolPolicy,
-      hasQueuedMessages: streamInfo.request.hasQueuedMessages,
-      getQueuedInputStopCause: streamInfo.request.getQueuedInputStopCause,
-      headers: prepared.data.headers,
-      onChunk: streamInfo.request.onChunk,
-      onStepMessages: streamInfo.request.onStepMessages,
-      onStepSettled: streamInfo.request.onStepSettled,
-      contextBudgetLimit: prepared.data.contextBudgetLimit,
-      // Same state object: aiService's fallback prepare() rebuilt it in place
-      // against the fallback toolset, so prepareStep keeps reading live state.
-      toolSearchState: streamInfo.request.toolSearchState,
-      onToolExecutionStart: (toolCallId) =>
-        this.handleToolExecutionStart(workspaceId, streamInfo.messageId, toolCallId),
-      // Same holder object (the session's setter keeps working across the
-      // hop) with a closure bound to the FALLBACK model. Attached before
-      // createStreamResult below in case the SDK eagerly prepares step 1.
-      thinkingOverrideState: streamInfo.request.thinkingOverrideState,
-      rebuildProviderOptionsForThinkingLevel: prepared.data.rebuildProviderOptionsForThinkingLevel,
-      forcedFirstStepToolNames: prepared.data.forcedFirstStepToolNames,
-      providersConfigSnapshot: prepared.data.providersConfig,
-      rebuildFirstStepForThinkingLevel: prepared.data.rebuildFirstStepForThinkingLevel,
-    });
+    const nextRequest = this.buildFallbackStreamRequest(swap, prepared.data, fallbackMessages);
     const consumedSwap = streamInfo.stepTracker.consumedPrefixSwap;
     if (consumedSwap) {
-      const family = this.resolveMetadataModel(
-        prepared.data.modelString,
-        prepared.data.providersConfig
-      ).split(":", 1)[0];
-      // Fallback preparation can combine consecutive tool-only steps from the live
-      // Mux row. An internal cut is no longer a provable wire-message boundary.
-      let messages: ModelMessage[] | null = null;
-      if (
-        family === consumedSwap.journal.providerFamily &&
-        consumedSwap.journal.liveTailCopySpec.partIndex === 0 &&
-        (prepared.data.thinkingLevel ?? "off") ===
-          consumedSwap.journal.preparation.effectiveThinkingLevel &&
-        // The swapped prefix references only the parent's native deferred tools (#5262).
-        [...collectDeferLoadingToolNames(nextRequest.tools ?? {})].sort().join("\n") ===
-          [...(consumedSwap.journal.preparation.deferLoadingToolNames ?? [])].sort().join("\n")
-      ) {
-        const conversation = stripMessageCacheControl(
-          consumedSwap.prefix.filter((message) => message.role !== "system")
-        );
-        const prefix = [
-          ...nextRequest.messages.filter((message) => message.role === "system"),
-          ...(nextRequest.cacheEnabled
-            ? applyCacheControl(
-                conversation,
-                "anthropic:prefix",
-                getAnthropicCacheTtl(nextRequest.providerOptions)
-              )
-            : conversation),
-        ];
-        const swapped = this.providerRequest.swapPrefix(nextRequest.messages, {
-          ...consumedSwap,
-          prefix,
-        });
-        if (swapped) {
-          const appliedThinking = nextRequest.thinkingOverrideState?.applied;
-          const isCurrent = () =>
-            streamInfo.stepTracker.consumedPrefixSwap === consumedSwap &&
-            !streamInfo.abortController.signal.aborted &&
-            nextRequest.thinkingOverrideState?.pending == null &&
-            nextRequest.thinkingOverrideState?.applied === appliedThinking;
-          const journal = await this.historyService
-            .getContinuousCompactionJournal(workspaceId)
-            .recordFallbackPrefix(
-              consumedSwap.journal,
-              {
-                modelString: prepared.data.modelString,
-                prefix,
-                providerOptions: nextRequest.providerOptions,
-                system: nextRequest.system,
-              },
-              isCurrent,
-              (committed) => {
-                consumedSwap.journal = committed;
-              }
-            );
-          if (journal && isCurrent()) {
-            consumedSwap.journal = journal;
-            messages = swapped;
-          }
-        }
-      }
-      if (messages) nextRequest.messages = messages;
-      else streamInfo.stepTracker.prefixSwapInvalidated = true;
+      await this.applyFallbackPrefixSwap(swap, consumedSwap, nextRequest, prepared.data);
     }
     // createStreamResult may eagerly prepare the first fallback step and update
     // latestMessages. Clear stale source-step messages before starting it so a
@@ -2598,17 +2620,192 @@ export class StreamManager {
       };
     }
 
+    await this.commitFallbackSwap(swap, {
+      prepared: prepared.data,
+      fallbackMessages,
+      nextRequest,
+      nextStreamResult,
+      consumedSwap,
+      overrideHolder,
+      workspaceLog,
+    });
+    return { kind: "swapped" };
+  }
+
+  /**
+   * Runs the chain's prepare() for the next model. The error is the terminal note.
+   *
+   * A throw out of prepare() must not escape to the generic stream-error path:
+   * it would be categorized as a retryable api/unknown error and re-enter the
+   * unbounded auto-retry loop this feature exists to prevent. Aborts rethrow so
+   * a user interrupt during prepare stays an abort instead of a refusal.
+   */
+  private async prepareFallbackModel(
+    swap: RefusalFallbackSwap,
+    prepareCallOptions: ModelFallbackPrepareOptions | undefined
+  ): Promise<Result<PreparedModelFallback, string>> {
+    const { streamInfo, fallbackState, nextModelString } = swap;
+    let prepared: Awaited<ReturnType<ModelFallbackOptions["prepare"]>>;
+    try {
+      prepared = await fallbackState.options.prepare(nextModelString, prepareCallOptions);
+    } catch (error) {
+      if (streamInfo.abortController.signal.aborted) {
+        throw error;
+      }
+      return Err(
+        `Configured fallback model ${nextModelString} could not be started: ${getErrorMessage(error)}`
+      );
+    }
+    if (!prepared.success) {
+      if (typeof prepared.error !== "string") throw new ContextBudgetExceededError(prepared.error);
+      return Err(
+        `Configured fallback model ${nextModelString} could not be started: ${prepared.error}`
+      );
+    }
+    return prepared;
+  }
+
+  /** The fallback model's request config; the live hooks and holders carry over. */
+  private buildFallbackStreamRequest(
+    swap: RefusalFallbackSwap,
+    prepared: PreparedModelFallback,
+    fallbackMessages: ModelMessage[]
+  ): StreamRequestConfig {
+    const { workspaceId, streamInfo, fallbackState } = swap;
+    return this.providerRequest.buildStreamRequestConfig({
+      model: prepared.model,
+      modelString: prepared.modelString,
+      messages: fallbackMessages,
+      system: prepared.system,
+      tools: prepared.tools,
+      providerOptions: prepared.providerOptions,
+      maxOutputTokens: fallbackState.original.maxOutputTokens,
+      callSettingsOverrides: prepared.callSettingsOverrides,
+      toolPolicy: streamInfo.request.toolPolicy,
+      hasQueuedMessages: streamInfo.request.hasQueuedMessages,
+      getQueuedInputStopCause: streamInfo.request.getQueuedInputStopCause,
+      headers: prepared.headers,
+      onChunk: streamInfo.request.onChunk,
+      onStepMessages: streamInfo.request.onStepMessages,
+      onStepSettled: streamInfo.request.onStepSettled,
+      contextBudgetLimit: prepared.contextBudgetLimit,
+      // Same state object: aiService's fallback prepare() rebuilt it in place
+      // against the fallback toolset, so prepareStep keeps reading live state.
+      toolSearchState: streamInfo.request.toolSearchState,
+      onToolExecutionStart: (toolCallId) =>
+        this.handleToolExecutionStart(workspaceId, streamInfo.messageId, toolCallId),
+      // Same holder object (the session's setter keeps working across the
+      // hop) with a closure bound to the FALLBACK model. Attached before
+      // createStreamResult below in case the SDK eagerly prepares step 1.
+      thinkingOverrideState: streamInfo.request.thinkingOverrideState,
+      rebuildProviderOptionsForThinkingLevel: prepared.rebuildProviderOptionsForThinkingLevel,
+      forcedFirstStepToolNames: prepared.forcedFirstStepToolNames,
+      providersConfigSnapshot: prepared.providersConfig,
+      rebuildFirstStepForThinkingLevel: prepared.rebuildFirstStepForThinkingLevel,
+    });
+  }
+
+  /**
+   * Keeps the continuous-compaction prefix swap on the fallback request when the
+   * fallback's wire still matches the journal, else marks the swap invalidated.
+   */
+  private async applyFallbackPrefixSwap(
+    swap: RefusalFallbackSwap,
+    consumedSwap: ContinuousPrefixSwap,
+    nextRequest: StreamRequestConfig,
+    prepared: PreparedModelFallback
+  ): Promise<void> {
+    const family = this.resolveMetadataModel(prepared.modelString, prepared.providersConfig).split(
+      ":",
+      1
+    )[0];
+    let messages: ModelMessage[] | null = null;
+    if (canReuseFallbackPrefix(family, consumedSwap, prepared.thinkingLevel, nextRequest)) {
+      messages = await this.recordFallbackPrefixSwap(
+        swap,
+        consumedSwap,
+        nextRequest,
+        prepared.modelString
+      );
+    }
+    if (messages) nextRequest.messages = messages;
+    else swap.streamInfo.stepTracker.prefixSwapInvalidated = true;
+  }
+
+  /**
+   * Swaps the fallback request's prefix and records it in the journal. Returns
+   * the swapped messages, or null when the swap fails or goes stale meanwhile.
+   */
+  private async recordFallbackPrefixSwap(
+    swap: RefusalFallbackSwap,
+    consumedSwap: ContinuousPrefixSwap,
+    nextRequest: StreamRequestConfig,
+    modelString: string
+  ): Promise<ModelMessage[] | null> {
+    const { workspaceId, streamInfo } = swap;
+    const prefix = buildFallbackPrefix(consumedSwap, nextRequest);
+    const swapped = this.providerRequest.swapPrefix(nextRequest.messages, {
+      ...consumedSwap,
+      prefix,
+    });
+    if (!swapped) {
+      return null;
+    }
+    const appliedThinking = nextRequest.thinkingOverrideState?.applied;
+    const isCurrent = () =>
+      streamInfo.stepTracker.consumedPrefixSwap === consumedSwap &&
+      !streamInfo.abortController.signal.aborted &&
+      nextRequest.thinkingOverrideState?.pending == null &&
+      nextRequest.thinkingOverrideState?.applied === appliedThinking;
+    const journal = await this.historyService
+      .getContinuousCompactionJournal(workspaceId)
+      .recordFallbackPrefix(
+        consumedSwap.journal,
+        {
+          modelString,
+          prefix,
+          providerOptions: nextRequest.providerOptions,
+          system: nextRequest.system,
+        },
+        isCurrent,
+        (committed) => {
+          consumedSwap.journal = committed;
+        }
+      );
+    if (journal && isCurrent()) {
+      consumedSwap.journal = journal;
+      return swapped;
+    }
+    return null;
+  }
+
+  /** Points the live stream at the started fallback request (the swap succeeded). */
+  private async commitFallbackSwap(
+    swap: RefusalFallbackSwap,
+    started: {
+      prepared: PreparedModelFallback;
+      fallbackMessages: ModelMessage[];
+      nextRequest: StreamRequestConfig;
+      nextStreamResult: WorkspaceStreamInfo["streamResult"];
+      consumedSwap: ContinuousPrefixSwap | undefined;
+      overrideHolder: ActiveTurnThinkingOverride | undefined;
+      workspaceLog: Logger;
+    }
+  ): Promise<void> {
+    const { workspaceId, streamInfo, fallbackState, preserveParts } = swap;
+    const { prepared, workspaceLog } = started;
+
     // Before any await: the stream may already be preparing its first step, and a step-0
     // thinking rebuild there records a newer volatile-tail plan (recordSystemSections),
     // which must win over the patch's baseline. That rebuild always runs after an await.
     streamInfo.initialMetadata = {
       ...streamInfo.initialMetadata,
-      ...prepared.data.initialMetadataPatch,
+      ...prepared.initialMetadataPatch,
     };
 
     // The fallback stream exists now; durable side effects describing this
     // request identity (superseding turn envelope) may be recorded.
-    await prepared.data.onStreamConstructed?.();
+    await prepared.onStreamConstructed?.();
 
     workspaceLog.warn(
       preserveParts
@@ -2616,9 +2813,9 @@ export class StreamManager {
         : "Model refused with no output; retrying on configured fallback model",
       {
         messageId: streamInfo.messageId,
-        refusedModel,
-        nextModel: prepared.data.modelString,
-        refusalFinishReason,
+        refusedModel: swap.refusedModel,
+        nextModel: prepared.modelString,
+        refusalFinishReason: swap.refusalFinishReason,
         chain: fallbackState.options.chain,
         preservedPartCount: preserveParts ? streamInfo.parts.length : 0,
       }
@@ -2634,32 +2831,49 @@ export class StreamManager {
     streamInfo.reasoningBackfillStartIndex = preserveParts ? streamInfo.parts.length : undefined;
     // The receipt strip also removed this row's preserved thinking, so the receipt's point
     // moves to the fallback's first step. It rides on the fallback's first partial write.
-    if (fallbackMessages !== prepared.data.messages) {
+    if (started.fallbackMessages !== prepared.messages) {
       this.moveAnthropicThinkingReplayPoint(streamInfo, streamInfo.stepStartIndices.length - 1);
     }
 
-    streamInfo.model = prepared.data.modelString;
+    this.adoptFallbackModelIdentity(streamInfo, fallbackState, prepared, started.overrideHolder);
+    // Release the refused model's transport resources now: the stream-exit
+    // finally only cleans the final request's model, so without this the
+    // refused model (e.g. an OpenAI WS transport socket) would leak per hop.
+    runLanguageModelCleanup(streamInfo.request.model);
+    streamInfo.request = started.nextRequest;
+    streamInfo.streamResult = started.nextStreamResult;
+    publishLiveRouting(streamInfo);
+    await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
+    if (started.consumedSwap) {
+      this.emitPrefixSwapInvalidationOnce(workspaceId, streamInfo);
+    }
+  }
+
+  /** Moves the stream's model, metadata and Auto routing onto the fallback model. */
+  private adoptFallbackModelIdentity(
+    streamInfo: WorkspaceStreamInfo,
+    fallbackState: ModelFallbackState,
+    prepared: PreparedModelFallback,
+    overrideHolder: ActiveTurnThinkingOverride | undefined
+  ): void {
+    streamInfo.model = prepared.modelString;
     streamInfo.metadataModel = this.resolveMetadataModel(
-      prepared.data.modelString,
-      prepared.data.providersConfig
+      prepared.modelString,
+      prepared.providersConfig
     );
-    if (prepared.data.thinkingLevel !== undefined) {
-      streamInfo.thinkingLevel = prepared.data.thinkingLevel;
+    if (prepared.thinkingLevel !== undefined) {
+      streamInfo.thinkingLevel = prepared.thinkingLevel;
     }
     // Final stream-end metadata spreads initialMetadata, so route attribution
     // corrections (the patch, applied above) and the fallback record propagate automatically.
     streamInfo.initialMetadata = {
-      ...streamInfo.initialMetadata,
-      modelFallback: {
-        requestedModel: fallbackState.requestedModel,
-        refusedModels: [...fallbackState.refusedModels],
-      },
+      ...withModelFallbackRecord(streamInfo.initialMetadata, fallbackState),
       // The routing record names the model that actually answered, not the refused tier model,
       // and (when Auto set it) the thinking level the fallback preparation clamped to.
       ...(streamInfo.initialMetadata?.autoModelRouting != null && {
         autoModelRouting: withAutoThinkingClaim(
-          { ...streamInfo.initialMetadata.autoModelRouting, model: prepared.data.modelString },
-          coerceThinkingLevel(prepared.data.thinkingLevel),
+          { ...streamInfo.initialMetadata.autoModelRouting, model: prepared.modelString },
+          coerceThinkingLevel(prepared.thinkingLevel),
           overrideHolder?.manual
         ),
       }),
@@ -2672,16 +2886,14 @@ export class StreamManager {
     if (escalationState && claimedLevel != null) {
       rebaseAutoThinkingEscalation(escalationState, claimedLevel);
     }
-    // Release the refused model's transport resources now: the stream-exit
-    // finally only cleans the final request's model, so without this the
-    // refused model (e.g. an OpenAI WS transport socket) would leak per hop.
-    runLanguageModelCleanup(streamInfo.request.model);
-    streamInfo.request = nextRequest;
-    streamInfo.streamResult = nextStreamResult;
-    publishLiveRouting(streamInfo);
-    await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
+  }
+
+  /** Tells the session once per turn that the fallback hop dropped the prefix swap. */
+  private emitPrefixSwapInvalidationOnce(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo
+  ): void {
     if (
-      consumedSwap &&
       streamInfo.stepTracker.prefixSwapInvalidated &&
       !streamInfo.stepTracker.prefixSwapInvalidationEmitted
     ) {
@@ -2692,8 +2904,6 @@ export class StreamManager {
         messageId: streamInfo.messageId,
       });
     }
-
-    return { kind: "swapped" };
   }
 
   private async handleTruncatedStreamCompletion(

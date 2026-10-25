@@ -1,7 +1,7 @@
 import { describe, test, expect, mock } from "bun:test";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import {
   DEFAULT_MODEL_FALLBACKS,
@@ -12,8 +12,13 @@ import type {
   ModelFallbackPrepareOptions,
   StreamManager,
 } from "./streamManager";
+import { attachLanguageModelCleanup } from "./languageModelCleanup";
 import type { SessionUsageService } from "./sessionUsageService";
-import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
+import {
+  createStreamManagerForTests,
+  fakeStreamText,
+  onTurnEngineEvent,
+} from "./streamManager.testHarness";
 import {
   installStreamManagerTestHistory,
   historyService,
@@ -492,5 +497,201 @@ describe("StreamManager - default refusal fallback chains", () => {
     expect(completion.status).toBe("completed");
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(prepare.mock.calls[0]?.[0]).toBe(sonnet5);
+  });
+});
+
+describe("StreamManager - fallback swap edges", () => {
+  const refused: ScriptedAttempt = { chunks: [REFUSAL_FINISH], usage: NO_USAGE };
+  const answered: ScriptedAttempt = {
+    chunks: [{ type: "text-delta", text: "fallback answer" }, STOP_FINISH],
+    usage: NO_USAGE,
+  };
+
+  test("a chain that ends on a refusal keeps every refused model on the error row", async () => {
+    const { chain, prepare } = preparedFallback();
+    const workspaceId = "fallback-edges-terminal-record";
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([refused, refused]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      modelFallback: { chain, prepare },
+    });
+    expect(completion.status).toBe("failed");
+    const partial = await historyService.readPartial(workspaceId);
+    expect(partial?.metadata?.modelFallback).toEqual({
+      requestedModel: KNOWN_MODELS.SONNET.id,
+      refusedModels: [KNOWN_MODELS.SONNET.id, chain[0]],
+    });
+  });
+
+  test("an interrupt while prepare() runs ends the turn as aborted, not as a refusal", async () => {
+    const workspaceId = "fallback-edges-abort-in-prepare";
+    let stopping: Promise<unknown> | undefined;
+    const streamManager: StreamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([refused]),
+    });
+    // The user interrupts while the fallback is being prepared, and prepare() then throws.
+    // The caller's signal aborts the provider request at once; stopStream settles the turn.
+    const controller = new AbortController();
+    const prepare = mock(() => {
+      controller.abort();
+      stopping = streamManager.stopStream(workspaceId);
+      return Promise.reject(new Error("prepare interrupted"));
+    });
+    const errors: unknown[] = [];
+    onTurnEngineEvent(streamManager, "error", (data) => errors.push(data));
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      abortSignal: controller.signal,
+      modelFallback: { chain: [KNOWN_MODELS.GPT.id], prepare },
+    });
+    await stopping;
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(completion.status).toBe("aborted");
+    expect(errors).toEqual([]);
+  });
+
+  test("a context-budget Err from prepare() fails the turn on the budget, not as a refusal", async () => {
+    const fallbackModel = KNOWN_MODELS.GPT.id;
+    const prepare = mock(() =>
+      Promise.resolve(
+        Err({
+          type: "context_budget_exceeded" as const,
+          model: fallbackModel,
+          estimate: 64000,
+          hardCeiling: 55808,
+        })
+      )
+    );
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([refused]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "fallback-edges-budget",
+      modelFallback: { chain: [fallbackModel], prepare },
+    });
+    // The fallback's oversized request is a budget stop, which the session can roll over from.
+    expect(completion).toMatchObject({
+      status: "failed",
+      streamError: {
+        errorType: "context_budget_blocked",
+        contextBudgetExceeded: { model: fallbackModel, estimate: 64000, hardCeiling: 55808 },
+      },
+    });
+  });
+
+  test("the fallback request keeps the turn's maxOutputTokens", async () => {
+    const scripted = scriptedStreamText([refused, answered]);
+    const maxOutputTokens: unknown[] = [];
+    const streamText = fakeStreamText((request) => {
+      maxOutputTokens.push(request.maxOutputTokens);
+      return (scripted as unknown as (options: typeof request) => unknown)(request);
+    });
+    const { chain, prepare } = preparedFallback();
+    const streamManager = createStreamManagerForTests(historyService, { streamText });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "fallback-edges-max-output",
+      maxOutputTokens: 1234,
+      modelFallback: { chain, prepare },
+    });
+    expect(completion.status).toBe("completed");
+    expect(maxOutputTokens).toEqual([1234, 1234]);
+  });
+
+  test("a fallback stream that fails to start releases the fallback model", async () => {
+    const cleanup = mock(() => undefined);
+    const fallbackModel = createTestLanguageModel("fallback-model");
+    attachLanguageModelCleanup(fallbackModel, cleanup);
+    const prepare = mock((modelString: string) =>
+      Promise.resolve(
+        Ok({
+          model: fallbackModel,
+          modelString,
+          messages: [],
+          system: "system",
+          tools: undefined,
+        })
+      )
+    );
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([refused, new Error("fallback stream failed to start")]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "fallback-edges-start-cleanup",
+      modelFallback: { chain: [KNOWN_MODELS.GPT.id], prepare },
+    });
+    expect(completion.status).toBe("failed");
+    // The prepared model never became the stream's request model, so only the swap can release it.
+    expect(cleanup).toHaveBeenCalledTimes(1);
+  });
+
+  test("a receipt strip of the fallback's messages moves the receipt to the fallback's first step", async () => {
+    // A thinking-replay receipt is in force (here from the caller's metadata), so the swap strips
+    // the prepared messages' Anthropic thinking. The fallback's first step is row step 2.
+    const workspaceId = "fallback-edges-replay-point";
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([
+        {
+          chunks: [
+            { type: "start-step" },
+            { type: "text-delta", text: "step one" },
+            { type: "finish-step", usage: NO_USAGE },
+            { type: "start-step" },
+            { type: "text-delta", text: "step two" },
+            REFUSAL_FINISH,
+          ],
+          usage: NO_USAGE,
+        },
+        {
+          chunks: [
+            { type: "start-step" },
+            { type: "text-delta", text: "fallback answer" },
+            { type: "finish-step", usage: NO_USAGE },
+            STOP_FINISH,
+          ],
+          usage: NO_USAGE,
+        },
+      ]),
+    });
+    const { messageId, completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      model: createTestLanguageModel("claude-opus-5-5", "anthropic.messages"),
+      modelString: "anthropic:claude-opus-5-5",
+      initialMetadata: { anthropicThinkingReplay: "off", anthropicThinkingReplayFromStep: 0 },
+      modelFallback: {
+        chain: ["anthropic:claude-sonnet-5"],
+        prepare: (modelString) =>
+          Promise.resolve(
+            Ok({
+              model: createTestLanguageModel("claude-sonnet-5", "anthropic.messages"),
+              modelString,
+              messages: [
+                { role: "user", content: "hello" },
+                {
+                  role: "assistant",
+                  content: [
+                    {
+                      type: "reasoning",
+                      text: "signed thinking",
+                      providerOptions: { anthropic: { signature: "sig" } },
+                    },
+                    { type: "text", text: "step one" },
+                  ],
+                },
+              ],
+              system: "system",
+              tools: undefined,
+            })
+          ),
+      },
+    });
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const row = history.data.find((message) => message.id === messageId);
+    expect(completion.status).toBe("completed");
+    expect(row?.metadata?.stepStartPartIndices).toEqual([0, 1, 2]);
+    expect(row?.metadata?.anthropicThinkingReplay).toBe("off");
+    expect(row?.metadata?.anthropicThinkingReplayFromStep).toBe(2);
   });
 });
