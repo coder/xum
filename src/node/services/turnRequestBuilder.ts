@@ -78,7 +78,10 @@ import type { InitStateManager } from "./initStateManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
 import { isStatusPageAgentMode, prepareAgentInterfaceStatusPage } from "./agentInterfaceStatusPage";
-import { isStatusPageAgentEnabledInSettings } from "./statusPageAgentService";
+import {
+  isStatusPageAgentEnabledInSettings,
+  type StatusPageAgentService,
+} from "./statusPageAgentService";
 import { resolveArtifactsLocation } from "./artifactsOperations";
 import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
 import type { StreamManager } from "./streamManager";
@@ -299,7 +302,7 @@ export function resolveXumToolScope(
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
-import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -915,11 +918,36 @@ interface SystemPromptToolset {
   statusUpdateToolAvailable: boolean;
 }
 
-function systemPromptToolsetOf(tools: Record<string, Tool>): SystemPromptToolset {
+/**
+ * `activeToolPolicy` matters because the advertised union keeps a tool the active agent or the
+ * caller denies as a refusal stub (#5253): presence alone does not mean the turn may call it.
+ * Memory is never stubbed (toolAssembly canRefuseAtExecution), so its presence is enough.
+ */
+function systemPromptToolsetOf(
+  tools: Record<string, Tool>,
+  activeToolPolicy: ToolPolicy | undefined
+): SystemPromptToolset {
   return {
     memoryToolAvailable: tools.memory !== undefined,
-    statusUpdateToolAvailable: tools.status_update !== undefined,
+    statusUpdateToolAvailable:
+      tools.status_update !== undefined &&
+      applyToolPolicyToNames(["status_update"], activeToolPolicy).length > 0,
   };
+}
+
+/**
+ * A main-chat turn without status page agent mode hands the page back to the main agent, so
+ * updates still queued (or carried from a failed run) and the last failure are stale: without
+ * this they would be applied, and reported, once the mode comes back. Side chats and compaction
+ * never get the mode, so they leave the main chat's queue alone.
+ */
+function discardStatusUpdatesWithoutMode(
+  queue: TurnRequestBuilderBindings["statusPageAgent"],
+  workspaceId: string,
+  turn: { statusPageAgentActive: boolean; sideChat: boolean; compaction: boolean }
+): void {
+  if (turn.statusPageAgentActive || turn.sideChat || turn.compaction) return;
+  queue?.discard(workspaceId);
 }
 
 function sameSystemPromptToolset(a: SystemPromptToolset, b: SystemPromptToolset): boolean {
@@ -936,7 +964,7 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   memoryService?: MemoryService;
   timelineService?: ToolConfiguration["timelineService"];
   /** Status page agent queue behind the status_update tool (artifacts-status-page-agent). */
-  statusPageAgent?: ToolConfiguration["statusPageAgent"];
+  statusPageAgent?: Pick<StatusPageAgentService, "enqueue" | "discard">;
   extraTools?: Record<string, Tool>;
   onWorkflowRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
   workflowResultContinuationSender?: WorkflowResultContinuationSender;
@@ -2429,6 +2457,11 @@ export class TurnRequestBuilder {
       enabledInSettings: isStatusPageAgentEnabledInSettings(cfg),
       queueAvailable: this.dependencies.bindings.statusPageAgent !== undefined,
     });
+    discardStatusUpdatesWithoutMode(this.dependencies.bindings.statusPageAgent, workspaceId, {
+      statusPageAgentActive,
+      sideChat: isSideChat,
+      compaction: isCompactionRequest,
+    });
     // Filled by the first build: later rebuilds in this turn (tool policy,
     // model fallback) reuse the same instruction snapshot instead of re-reading.
     const turnInstructionSources: { current?: InstructionSources } = {};
@@ -3194,7 +3227,7 @@ export class TurnRequestBuilder {
           }
         }
 
-        const attemptToolset = systemPromptToolsetOf(attemptTools);
+        const attemptToolset = systemPromptToolsetOf(attemptTools, effectiveToolPolicy);
         const canReuseSystemContext =
           options.reusePrePolicySystemContext &&
           mcpServers === mcpServersAtPrePolicy &&

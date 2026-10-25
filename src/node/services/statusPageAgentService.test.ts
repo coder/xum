@@ -4,7 +4,10 @@ import * as path from "node:path";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 
-import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
+import {
+  AGENT_INTERFACE_STATUS_ARTIFACT,
+  STATUS_PAGE_AGENT_MAX_PENDING_UPDATES,
+} from "@/common/constants/artifacts";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { Ok } from "@/common/types/result";
 import { Config } from "@/node/config";
@@ -14,8 +17,9 @@ import { TestTempDir } from "./tools/testHelpers";
 
 /**
  * Behavior under test: the host queue around the status page runner: batching of updates that
- * arrive during a pass, the experiment and workspace gates, error hand-back on the next enqueue,
- * the write-only-on-change rule and the Settings > Agents model choice.
+ * arrive during a pass, the experiment and workspace gates, error and drop hand-back on the next
+ * enqueue, concurrent page edits, the write-only-on-change rule and the Settings > Agents model
+ * choice.
  */
 
 const WORKSPACE_ID = "ws-status";
@@ -281,6 +285,88 @@ describe("StatusPageAgentService", () => {
     expect(await fixture.readPage()).toBe("<p>pass 2</p>");
     expect(fixture.enqueue("third update").previousError).toBeUndefined();
     await fixture.whenIdle();
+  });
+
+  it("keeps an edit made to the page during a pass and applies the updates on top later", async () => {
+    using fixture = await createFixture();
+    await fsPromises.mkdir(path.dirname(fixture.pagePath), { recursive: true });
+    await fsPromises.writeFile(fixture.pagePath, "<p>before</p>");
+    let release!: () => void;
+    fixture.state.gate = new Promise((resolve) => (release = resolve));
+    const modelRequested = new Promise<void>(
+      (resolve) => (fixture.state.onModelRequested = resolve)
+    );
+    fixture.enqueue("first update");
+    await modelRequested;
+    await fsPromises.writeFile(fixture.pagePath, "<p>edited by the main agent</p>");
+    release();
+    await fixture.whenIdle();
+    expect(await fixture.readPage()).toBe("<p>edited by the main agent</p>");
+
+    fixture.state.gate = null;
+    expect(fixture.enqueue("second update").previousError).toContain("changed");
+    await fixture.whenIdle();
+    expect(fixture.prompts[1]).toContain("edited by the main agent");
+    expect(fixture.prompts[1]).toContain("first update");
+    expect(await fixture.readPage()).toBe("<p>pass 2</p>");
+  });
+
+  it("reports updates the queue caps dropped once, on the enqueue that dropped them", async () => {
+    using fixture = await createFixture();
+    let release!: () => void;
+    fixture.state.gate = new Promise((resolve) => (release = resolve));
+    // The first update starts a pass at once; the next ones wait in the queue behind it.
+    fixture.enqueue("running update");
+    const results = Array.from({ length: STATUS_PAGE_AGENT_MAX_PENDING_UPDATES + 2 }, (_, i) =>
+      fixture.enqueue(`queued update ${i}`)
+    );
+    release();
+    await fixture.whenIdle();
+
+    expect(results.map((result) => result.discardedUpdates ?? 0)).toEqual([
+      ...Array<number>(STATUS_PAGE_AGENT_MAX_PENDING_UPDATES).fill(0),
+      1,
+      1,
+    ]);
+    expect(fixture.enqueue("later update").discardedUpdates).toBeUndefined();
+    await fixture.whenIdle();
+  });
+
+  it("reports the updates of a pass cut short by a closed gate and never applies them", async () => {
+    using fixture = await createFixture();
+    let release!: () => void;
+    fixture.state.gate = new Promise((resolve) => (release = resolve));
+    const modelRequested = new Promise<void>(
+      (resolve) => (fixture.state.onModelRequested = resolve)
+    );
+    fixture.enqueue("cut short update");
+    await modelRequested;
+    fixture.state.enabled.delete(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT);
+    release();
+    await fixture.whenIdle();
+    expect(await fixture.readPage()).toBeNull();
+
+    fixture.state.enabled.add(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT);
+    fixture.state.gate = null;
+    expect(fixture.enqueue("next update").discardedUpdates).toBe(1);
+    await fixture.whenIdle();
+    expect(fixture.prompts[1]).not.toContain("cut short update");
+  });
+
+  it("drops a failed pass's updates and error on discard, reporting only the drop", async () => {
+    using fixture = await createFixture();
+    fixture.state.behavior = "fail";
+    fixture.enqueue("failed update");
+    await fixture.whenIdle();
+
+    fixture.service.discard(WORKSPACE_ID);
+    fixture.state.behavior = "write";
+    const result = fixture.enqueue("after the mode came back");
+    await fixture.whenIdle();
+
+    expect(result).toEqual({ queued: true, discardedUpdates: 1 });
+    expect(fixture.prompts[1]).not.toContain("failed update");
+    expect(fixture.prompts[1]).toContain("after the mode came back");
   });
 
   it("writes nothing when the agent leaves the page unchanged", async () => {

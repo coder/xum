@@ -38,14 +38,26 @@ function createStatusUpdateTool(config: ToolConfiguration, fallbackModel: string
         update: text,
         fallbackModel,
       });
-      if (result.previousError === undefined) return { success: true, queued: true };
-      // Provider messages often end with a period already.
-      const error = result.previousError.replace(/[\s.]+$/, "");
-      return {
-        success: true,
-        queued: true,
-        note: `The status page agent's last update failed: ${error}. Its updates are retried with this one, but the page may be out of date; edit it yourself if this keeps happening.`,
-      };
+      const notes = [failureNote(result.previousError), discardNote(result.discardedUpdates)];
+      const note = notes.filter((part) => part !== undefined).join(" ");
+      return note.length === 0
+        ? { success: true, queued: true }
+        : { success: true, queued: true, note };
     },
   });
+}
+
+function failureNote(previousError: string | undefined): string | undefined {
+  if (previousError === undefined) return undefined;
+  // Provider messages often end with a period already.
+  const error = previousError.replace(/[\s.]+$/, "");
+  return `The status page agent's last update failed: ${error}. Its updates are retried with this one, but the page may be out of date; edit it yourself if this keeps happening.`;
+}
+
+/** Updates dropped unapplied (queue caps, a pass cut short, the mode switched off). */
+function discardNote(discardedUpdates: number | undefined): string | undefined {
+  if (discardedUpdates === undefined) return undefined;
+  const earlier =
+    discardedUpdates === 1 ? "1 earlier update was" : `${discardedUpdates} earlier updates were`;
+  return `${earlier} dropped without being applied (the queue was full, or the status page agent was switched off or the workspace archived before it ran); repeat anything that still matters.`;
 }

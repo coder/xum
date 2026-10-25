@@ -10,7 +10,9 @@
  * model), and writes the page back once when it changed.
  *
  * Failures never reach the main agent's turn: they are logged and kept as the workspace's last
- * error, which the next enqueue() returns once so the main agent can take over the page.
+ * error, which the next enqueue() returns once so the main agent can take over the page. Updates
+ * dropped unapplied (queue caps, a pass cut short by a closed gate, discard()) are counted and
+ * reported the same way, so the main agent knows to repeat what still matters.
  */
 import type { LanguageModel } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
@@ -85,10 +87,15 @@ export interface StatusPageEnqueueResult {
   queued: true;
   /** The last failed pass's error, returned once. */
   previousError?: string;
+  /** How many earlier updates were dropped without being applied, returned once. */
+  discardedUpdates?: number;
 }
 
 /** The narrow surface the status_update tool needs. */
 export type StatusPageAgentQueue = Pick<StatusPageAgentService, "enqueue">;
+
+/** What a pass did with its batch. */
+type PassOutcome = "applied" | "discarded";
 
 interface PendingBatch {
   updates: StatusPageUpdate[];
@@ -105,16 +112,19 @@ function isGone(metadata: StatusPageWorkspaceMetadata | null): boolean {
   return metadata == null || isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt);
 }
 
-/** Keep the newest updates within both caps; the newest one is always kept. */
-function trimPending(updates: StatusPageUpdate[]): void {
+/** Keep the newest updates within both caps; the newest one is always kept. Returns the drop count. */
+function trimPending(updates: StatusPageUpdate[]): number {
   let chars = updates.reduce((total, update) => total + update.text.length, 0);
+  let dropped = 0;
   while (
     updates.length > 1 &&
     (updates.length > STATUS_PAGE_AGENT_MAX_PENDING_UPDATES ||
       chars > STATUS_PAGE_AGENT_MAX_PENDING_CHARS)
   ) {
     chars -= updates.shift()?.text.length ?? 0;
+    dropped++;
   }
+  return dropped;
 }
 
 export class StatusPageAgentService {
@@ -123,6 +133,8 @@ export class StatusPageAgentService {
   private readonly lastError = new Map<string, string>();
   /** Updates of the last failed pass, applied with the next update instead of being lost. */
   private readonly failedUpdates = new Map<string, StatusPageUpdate[]>();
+  /** Updates dropped without being applied since the last enqueue() reported them. */
+  private readonly discarded = new Map<string, number>();
 
   constructor(private readonly deps: StatusPageAgentServiceDeps) {}
 
@@ -132,14 +144,38 @@ export class StatusPageAgentService {
     const batch = this.pending.get(workspaceId) ?? { updates: [], fallbackModel: "" };
     batch.updates.push({ text: input.update, atMs: Date.now() });
     batch.fallbackModel = input.fallbackModel;
-    trimPending(batch.updates);
+    this.countDiscarded(workspaceId, trimPending(batch.updates));
     this.pending.set(workspaceId, batch);
     if (!this.running.has(workspaceId)) this.startDrain(workspaceId);
 
+    const result: StatusPageEnqueueResult = { queued: true };
     const previousError = this.lastError.get(workspaceId);
-    if (previousError === undefined) return { queued: true };
+    if (previousError !== undefined) result.previousError = previousError;
+    const discardedUpdates = this.discarded.get(workspaceId);
+    if (discardedUpdates !== undefined) result.discardedUpdates = discardedUpdates;
     this.lastError.delete(workspaceId);
-    return { queued: true, previousError };
+    this.discarded.delete(workspaceId);
+    return result;
+  }
+
+  /**
+   * Drop queued and failed updates and the last error: the main agent owns the page again (the
+   * mode is off for its turn), so they are stale once the mode comes back. The drop is counted
+   * so the first update after that says earlier ones were not applied. A running pass is left
+   * alone; it re-checks the gates before it writes.
+   */
+  discard(workspaceId: string): void {
+    const queued =
+      (this.pending.get(workspaceId)?.updates.length ?? 0) +
+      (this.failedUpdates.get(workspaceId)?.length ?? 0);
+    this.pending.delete(workspaceId);
+    this.failedUpdates.delete(workspaceId);
+    this.lastError.delete(workspaceId);
+    this.countDiscarded(workspaceId, queued);
+  }
+
+  private countDiscarded(workspaceId: string, count: number): void {
+    if (count > 0) this.discarded.set(workspaceId, (this.discarded.get(workspaceId) ?? 0) + count);
   }
 
   /** Resolves once no pass is running for the workspace (tests and shutdown). */
@@ -163,8 +199,11 @@ export class StatusPageAgentService {
       const batch = this.takeBatch(workspaceId);
       if (batch === undefined) return;
       try {
-        await this.runPass(workspaceId, batch);
-        // A later pass recovered the page: the main agent must not be told to take over.
+        if ((await this.runPass(workspaceId, batch)) === "discarded") {
+          this.countDiscarded(workspaceId, batch.updates.length);
+        }
+        // A later pass recovered the page (or the gate closed): the main agent must not be told
+        // to take over.
         this.lastError.delete(workspaceId);
       } catch (error) {
         const message = getErrorMessage(error);
@@ -189,7 +228,7 @@ export class StatusPageAgentService {
     if (carried !== undefined) {
       this.failedUpdates.delete(workspaceId);
       batch.updates.unshift(...carried);
-      trimPending(batch.updates);
+      this.countDiscarded(workspaceId, trimPending(batch.updates));
     }
     return batch;
   }
@@ -210,10 +249,13 @@ export class StatusPageAgentService {
     return isGone(metadata) ? null : metadata;
   }
 
-  /** One pass over a batch. Throws on failure; drain() keeps the error for the next enqueue. */
-  private async runPass(workspaceId: string, batch: PendingBatch): Promise<void> {
+  /**
+   * One pass over a batch. Throws on failure; drain() keeps the error for the next enqueue.
+   * "discarded" when a closed gate cut the pass short before its draft was written.
+   */
+  private async runPass(workspaceId: string, batch: PendingBatch): Promise<PassOutcome> {
     const metadata = await this.writableMetadata(workspaceId);
-    if (metadata == null) return;
+    if (metadata == null) return "discarded";
 
     const abortSignal = AbortSignal.timeout(STATUS_PAGE_AGENT_RUN_TIMEOUT_MS);
     const location = await resolveArtifactsLocation(
@@ -240,11 +282,19 @@ export class StatusPageAgentService {
     if (result.streamError !== undefined) {
       throw new Error(`${agent.modelString}: ${result.streamError}`);
     }
-    if (result.page === null) return;
+    if (result.page === null) return "applied";
     // The run took a while: the user may have switched the experiments off or archived or
     // removed the workspace meanwhile. The writers also refuse to recreate a deleted scratch or
     // session dir, which covers a removal that finishes between this check and the write.
-    if ((await this.writableMetadata(workspaceId)) == null) return;
+    if ((await this.writableMetadata(workspaceId)) == null) return "discarded";
+    // Someone (often the main agent, after a failure note) edited the page during the run: keep
+    // that edit, and let the next pass apply these updates on top of it. Not a lock: an edit
+    // between this read and the write below can still be lost.
+    if ((await readCurrentPage(location, abortSignal)) !== currentPage) {
+      throw new Error(
+        `${AGENT_INTERFACE_STATUS_ARTIFACT} changed while the status page agent ran, so its draft was dropped to keep that edit`
+      );
+    }
     await writeArtifactAtLocation(location, AGENT_INTERFACE_STATUS_ARTIFACT, result.page, {
       abortSignal,
     });
@@ -254,6 +304,7 @@ export class StatusPageAgentService {
       updates: batch.updates.length,
       summary: result.summary,
     });
+    return "applied";
   }
 
   /**

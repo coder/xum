@@ -18,7 +18,7 @@ import {
 import { createTestHistoryService } from "./testHistoryService";
 import { createMemoryHost } from "@/node/services/hostFiles/memoryHostFiles.testHarness";
 import { fakeRuntimeFactory } from "@/node/services/runtimeFactory/fakeRuntimeFactory.testHarness";
-import { buildRequiredToolPatterns } from "@/common/utils/tools/toolPolicy";
+import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { HistoryService } from "./historyService";
 import { CompactionCancellation } from "./compactionCancellation";
 import { InitStateManager } from "./initStateManager";
@@ -103,6 +103,7 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import { buildReplayRequest } from "@/node/services/replay/replayRequestBuilder";
 import { MemoryService, projectMemoryDirName } from "@/node/services/memoryService";
 import * as toolAssembly from "./toolAssembly";
+import * as agentInterfaceStatusPage from "./agentInterfaceStatusPage";
 import type { WorkspaceHeartbeatToolService } from "@/common/utils/tools/tools";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import * as toolsModule from "@/common/utils/tools/tools";
@@ -1314,6 +1315,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     preparedToolNamesForSentinel: string[][];
     streamSystemContextMuxScopes: XumToolScope[];
     streamSystemContextMemoryToolFlags: Array<boolean | undefined>;
+    streamSystemContextStatusPageFlags: Array<boolean | undefined>;
     /** Snapshot passed into each system-context build (undefined = load from disk). */
     streamSystemContextInstructionInputs: Array<InstructionSources | undefined>;
     /** Snapshot each system-context build returned. */
@@ -1365,6 +1367,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const preparedToolNamesForSentinel: string[][] = [];
     const streamSystemContextMuxScopes: XumToolScope[] = [];
     const streamSystemContextMemoryToolFlags: Array<boolean | undefined> = [];
+    const streamSystemContextStatusPageFlags: Array<boolean | undefined> = [];
     const streamSystemContextInstructionInputs: Array<InstructionSources | undefined> = [];
     const streamSystemContextInstructionOutputs: InstructionSources[] = [];
     const toolInstructionSources: InstructionSources[] = [];
@@ -1396,6 +1399,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         }
         streamSystemContextMuxScopes.push(contextArgs.xumScope);
         streamSystemContextMemoryToolFlags.push(contextArgs.memoryToolAvailable);
+        streamSystemContextStatusPageFlags.push(contextArgs.statusPageAgent);
       },
       onPrepareMessagesForProvider: (pipelineArgs) => {
         preparedPayloadMessageIds.push(
@@ -1421,6 +1425,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       preparedToolNamesForSentinel,
       streamSystemContextMuxScopes,
       streamSystemContextMemoryToolFlags,
+      streamSystemContextStatusPageFlags,
       streamSystemContextInstructionInputs,
       streamSystemContextInstructionOutputs,
       toolInstructionSources,
@@ -2965,6 +2970,56 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(result.success).toBe(true);
     expect(harness.streamSystemContextMemoryToolFlags).toEqual([true, false]);
     expect(memoryCalls).toEqual(["openai:gpt-5.2"]);
+  });
+
+  it("keeps the classic status page guidance when the active policy denies status_update, and drops queued updates once the mode is off", async () => {
+    using xumHome = new DisposableTempDir("ai-service-status-update-policy");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-status-update-policy";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for status_update gating
+    const stubTool: Tool = {} as never;
+    // The scratch dir and status.html seeding are not under test: the view is on for the turn.
+    spyOn(agentInterfaceStatusPage, "prepareAgentInterfaceStatusPage").mockResolvedValue(true);
+    const experimentsService = await experimentsServiceWith(xumHome.path, [
+      EXPERIMENT_IDS.ARTIFACTS,
+      EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
+      EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT,
+    ]);
+    const harness = createHarness(xumHome.path, metadata, {
+      experimentsService,
+      allTools: { status_update: stubTool },
+      // A denied status_update stays in the advertised union as a refusal stub (#5253).
+      postPolicyTools: { status_update: stubTool },
+    });
+    // The active agent's policy (a custom agent's tools.remove, or a caller's disable rule).
+    let activePolicy: ToolPolicy | undefined;
+    spyOn(agentResolution, "resolveAgentForStream").mockImplementation(() => {
+      const resolved = resolvedAgentResultFor(metadata);
+      if (resolved.success) resolved.data.effectiveToolPolicy = activePolicy;
+      return Promise.resolve(resolved);
+    });
+    const discarded: string[] = [];
+    harness.service.turnRequestBuilderBindings.statusPageAgent = {
+      enqueue: () => ({ queued: true }),
+      discard: (id) => discarded.push(id),
+    };
+
+    await startTestStream(harness, workspaceId);
+    expect(harness.streamSystemContextStatusPageFlags).toEqual([true]);
+
+    harness.streamSystemContextStatusPageFlags.length = 0;
+    activePolicy = [{ regex_match: "status_update", action: "disable" }];
+    await startTestStream(harness, workspaceId);
+    expect(harness.streamSystemContextStatusPageFlags).toEqual([true, false]);
+    // The mode itself stayed on, so the queue keeps the main chat's updates.
+    expect(discarded).toEqual([]);
+
+    // The mode is off for a main-chat turn: the main agent owns the page again.
+    await experimentsService.setOverride(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT, false);
+    await startTestStream(harness, workspaceId);
+    expect(discarded).toEqual([workspaceId]);
   });
 
   it("sends MCP Apps model context at the start of the newest user message, not in the system prompt", async () => {

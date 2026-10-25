@@ -79,4 +79,17 @@ describe("status_update tool", () => {
     expect(result.success).toBe(true);
     expect(result.success && result.note).toContain("provider exploded");
   });
+
+  test("tells the main agent how many earlier updates were dropped unapplied", async () => {
+    using tempDir = new TestTempDir("status-update-discarded");
+    const { queue } = fakeQueue({ queued: true, previousError: "timeout", discardedUpdates: 3 });
+    const tools = await toolsFor(tempDir.path, queue, true);
+
+    const result = await execute(tools.status_update, "Tests pass");
+
+    expect(result.success).toBe(true);
+    // Both notes reach the main agent: neither may hide the other.
+    expect(result.success && result.note).toContain("timeout");
+    expect(result.success && result.note).toContain("3 earlier updates");
+  });
 });
