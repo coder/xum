@@ -31,6 +31,7 @@ import {
   ProviderRequest,
   type StreamRequestOptions,
 } from "@/node/services/turnEngine/ProviderRequest";
+import { StepApply } from "@/node/services/turnEngine/StepApply";
 import { convertToSendMessageError } from "@/node/services/turnEngine/streamErrors";
 import { TurnRegistry } from "@/node/services/turnEngine/TurnRegistry";
 import type { TurnResources, TurnStartup } from "@/node/services/turnEngine/TurnResources";
@@ -267,7 +268,10 @@ export function wireStepTrackerHooks(streamInfo: WorkspaceStreamInfo): void {
   stepTracker.hasAnthropicReplayReceipt = () =>
     streamInfo.initialMetadata?.anthropicThinkingReplay === "off";
   stepTracker.recordSystemSections = (rebuilt) => {
-    streamInfo.initialMetadata = withRebuiltSystemMetadata(streamInfo.initialMetadata, rebuilt);
+    StepApply.setInitialMetadata(
+      streamInfo,
+      withRebuiltSystemMetadata(streamInfo.initialMetadata, rebuilt)
+    );
   };
 }
 
@@ -290,10 +294,10 @@ export function wireThinkingOverride(
       ProviderRequest.setThinkingLevel(streamInfo, level);
       const autoModelRouting = streamInfo.initialMetadata?.autoModelRouting;
       if (holder.manual && autoModelRouting != null) {
-        streamInfo.initialMetadata = {
+        StepApply.setInitialMetadata(streamInfo, {
           ...streamInfo.initialMetadata,
           autoModelRouting: withAutoThinkingClaim(autoModelRouting, undefined, true),
-        };
+        });
       }
       publishLiveRouting(streamInfo);
     };
@@ -320,10 +324,10 @@ function wireAutoThinkingEscalation(
       (escalations) => {
         const autoModelRouting = streamInfo.initialMetadata?.autoModelRouting;
         if (autoModelRouting == null) return;
-        streamInfo.initialMetadata = {
+        StepApply.setInitialMetadata(streamInfo, {
           ...streamInfo.initialMetadata,
           autoModelRouting: { ...autoModelRouting, escalations },
-        };
+        });
         publishLiveRouting(streamInfo);
       }
     );

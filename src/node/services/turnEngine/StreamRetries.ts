@@ -15,6 +15,7 @@ import {
   extractPreviousResponseIdFromError,
   extractStatusCode,
 } from "@/node/services/turnEngine/providerWire";
+import { StepApply } from "@/node/services/turnEngine/StepApply";
 import type { StepMessageTracker } from "@/node/services/turnEngine/StepPreparation";
 import { getReasoningReplayRejection } from "@/node/services/turnEngine/streamErrors";
 import type { WorkspaceId } from "@/node/services/turnEngine/types";
@@ -42,14 +43,6 @@ export interface ReasoningReplayRetryPlan {
   rejectedNamespace: "openai" | "anthropic";
   /** The request transcript without the rejected namespace's reasoning. */
   messages: ModelMessage[];
-}
-
-export function recordStepStart(streamInfo: WorkspaceStreamInfo): void {
-  const start = streamInfo.parts.length;
-  // Retries may discard parts. Drop stale/duplicate starts before reseeding.
-  streamInfo.stepStartIndices = streamInfo.stepStartIndices.filter((index) => index < start);
-  streamInfo.stepStartIndices.push(start);
-  streamInfo.currentStepStartIndex = start;
 }
 
 export function getOpenAIPreviousResponseId(
@@ -231,24 +224,13 @@ export class StreamRetries {
     streamInfo.stepTracker.pendingPrefixSwap = undefined;
     // The next streamText call numbers its steps from 0 again.
     streamInfo.stepTracker.anthropicThinkingStripStep = undefined;
-    streamInfo.streamStepOrdinals = [];
+    StepApply.restartStepNumbering(streamInfo);
     const preserveParts = options?.preserveParts ?? false;
     const preserveUsage = options?.preserveUsage ?? false;
 
     await this.deps.partialJournal.resetForRetry(streamInfo);
 
-    if (!preserveParts) {
-      streamInfo.parts = [];
-    }
-    if (!preserveParts) {
-      streamInfo.reasoningBackfillStartIndex = undefined;
-    }
-    // A retried attempt starts with no open reasoning block.
-    streamInfo.currentReasoningBlock = undefined;
-    recordStepStart(streamInfo);
-    streamInfo.receivedTerminalEvent = false;
-    streamInfo.terminalFinishReason = undefined;
-    streamInfo.terminalRawFinishReason = undefined;
+    StepApply.resetForRetry(streamInfo, { preserveParts });
 
     if (!preserveUsage) {
       await this.deps.usageLedger.resetForRetry(workspaceId, streamInfo);

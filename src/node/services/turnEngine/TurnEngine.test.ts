@@ -11,6 +11,7 @@ import {
   type StreamRequestConfig,
   type StreamToken,
 } from "@/node/services/turnEngine/types";
+import { StepApply } from "@/node/services/turnEngine/StepApply";
 import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 
 import {
@@ -119,12 +120,12 @@ describe("wireStepTrackerHooks", () => {
     wireStepTrackerHooks(info);
 
     expect(info.stepTracker.hasAnthropicReplayReceipt?.()).toBe(false);
-    info.initialMetadata = { ...info.initialMetadata, anthropicThinkingReplay: "off" };
+    StepApply.setInitialMetadata(info, { ...info.initialMetadata, anthropicThinkingReplay: "off" });
     expect(info.stepTracker.hasAnthropicReplayReceipt?.()).toBe(true);
 
     info.stepTracker.recordSystemSections({ systemMessageTokens: 25 });
-    expect(info.initialMetadata.systemMessageTokens).toBe(25);
-    expect(info.initialMetadata.anthropicThinkingReplay).toBe("off");
+    expect(info.initialMetadata?.systemMessageTokens).toBe(25);
+    expect(info.initialMetadata?.anthropicThinkingReplay).toBe("off");
   });
 });
 
