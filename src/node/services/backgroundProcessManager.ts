@@ -46,6 +46,9 @@ const SPAWN_NAME_LOCK_TIMEOUT_MS = 30_000;
 // Candidate names one non-host claim exec tries in order (#5485): a name used in k earlier
 // sessions costs ceil((k + 1) / batch) exec round-trips instead of k + 1.
 const RUNTIME_SPAWN_NAME_CLAIM_BATCH = 8;
+// Empty file whose exclusive create inside a non-host record directory decides the name claim
+// (claimRuntimeSpawnDir). Record readers only look for meta.json and exit_code, so it is inert.
+const RUNTIME_SPAWN_CLAIM_MARKER_FILENAME = ".spawn-claim";
 // Upper bound on a fail-closed cleanup() (archive, removal) waiting for pending spawns and
 // migrations, shared by both of its drains (#5477). Each wait is normally bounded by its own
 // steps (the 30 s name lock, 10 s claim execs), but a hung runtime probe or spawnProcess call
@@ -2301,7 +2304,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // reusing a settled one may clobber a record the other backend still tracks (see
     // recordDirIsFree). Host-local records are probed on the local filesystem; all other
     // layouts (SSH/Coder, Docker, devcontainer) live in the runtime's exec namespace and are
-    // claimed through the runtime with an atomic mkdir instead (claimRuntimeSpawnDir).
+    // claimed through the runtime with an exclusive marker create instead (claimRuntimeSpawnDir).
     // Cross-process claim (#4873): two backends on one XUM_ROOT (desktop + `xum server`) have
     // separate in-memory reservations but share the host records root, so both could probe a
     // name as free and spawn into one directory. Host-local spawns therefore hold a
@@ -3441,9 +3444,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * records are NOT host-local (SSH/Coder, Docker, devcontainer, multi-project — see
    * spawnRecordsAreHostLocal): the record layout lives in the runtime's exec namespace, so the
    * name is claimed through the runtime. No host file lock can serialise backends there, so
-   * the claim is a plain `mkdir` (no -p) of the record directory: it is atomic on the target
-   * filesystem, so of two backends spawning the same name (or one spawning after the other)
-   * exactly one creates the directory, and the other moves on to a suffixed name (#4889).
+   * the claim is an exclusive create of an empty marker file in the record directory: the
+   * shell's noclobber redirect (`set -C`) opens it with O_EXCL, so of two backends spawning
+   * the same name (or one spawning after the other) exactly one creates the marker, and the
+   * other moves on to a suffixed name (#4889). `mkdir` only makes the directory and never
+   * decides the claim: uutils coreutils mkdir before 0.11.0 (Ubuntu 25.10 and 26.04) can exit 0
+   * for both of two concurrent creates of one directory (uutils/coreutils#13970, #7256).
    *
    * An existing directory is never reused, not even a settled one with an exit marker: nothing
    * on the runtime says which backend spawned it, another backend on this Xum root may still
@@ -3470,13 +3476,20 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     try {
       const tempDir = await runtime.tempDir();
       const workspaceDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
-      // `[ -L ]` too: a dangling symlink planted at the name makes mkdir fail but `[ -e ]` false.
-      // Any other mkdir failure exits 1, so the caller aborts instead of skipping the name.
+      // A name that exists before the claim is held, whatever made it: the check comes first
+      // because a buggy mkdir can exit 0 for a directory that exists. `[ -L ]` too: a dangling
+      // symlink planted at the name makes mkdir fail but `[ -e ]` false. A directory that
+      // appeared between the check and the mkdir is held by whoever created its marker.
+      // Any other mkdir or marker failure exits 1, so the caller aborts instead of skipping
+      // the name. A backend without the marker (older Xum) still claims with mkdir alone.
+      const marker = `"$1"/${RUNTIME_SPAWN_CLAIM_MARKER_FILENAME}`;
       const script = [
         `mkdir -p ${quotePathForShell(workspaceDir)} || exit 1`,
         `claim() {`,
-        `  if mkdir "$1" 2>/dev/null; then echo "__MUX_SPAWN_NAME_CLAIMED__:$2:"; exit 0; fi`,
-        `  [ -e "$1" ] || [ -L "$1" ] || exit 1`,
+        `  if [ -e "$1" ] || [ -L "$1" ]; then return 0; fi`,
+        `  if ! mkdir "$1" 2>/dev/null; then [ -e "$1" ] || [ -L "$1" ] || exit 1; return 0; fi`,
+        `  if (set -C; : > ${marker}) 2>/dev/null; then echo "__MUX_SPAWN_NAME_CLAIMED__:$2:"; exit 0; fi`,
+        `  [ -e ${marker} ] || [ -L ${marker} ] || exit 1`,
         `}`,
         ...candidates.map(
           (candidate, index) =>
@@ -3508,8 +3521,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /**
-   * Undo claimRuntimeSpawnDir for a spawn that is refused before anything ran. `rmdir` removes
-   * only an empty directory, so it cannot delete output another process wrote. Best-effort: a
+   * Undo claimRuntimeSpawnDir for a spawn that is refused before anything ran: remove the claim
+   * marker, then `rmdir`, which removes only an empty directory, so it cannot delete output
+   * another process wrote. Best-effort: a
    * leftover empty directory only costs a suffixed name and fails the remote orphan probe closed.
    */
   private async releaseRuntimeSpawnDir(
@@ -3520,7 +3534,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     try {
       const tempDir = await runtime.tempDir();
       const processDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}/${processId}`;
-      await execBuffered(runtime, `rmdir ${quotePathForShell(processDir)}`, {
+      const marker = `${processDir}/${RUNTIME_SPAWN_CLAIM_MARKER_FILENAME}`;
+      const script = `rm -f -- ${quotePathForShell(marker)}; rmdir -- ${quotePathForShell(processDir)}`;
+      await execBuffered(runtime, script, {
         cwd: "/tmp",
         timeout: 10,
       });
