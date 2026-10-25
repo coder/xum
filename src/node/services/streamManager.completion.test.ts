@@ -97,11 +97,22 @@ describe("StreamManager - exact step indices", () => {
     const streamInfo = createStreamInfoForTests({
       parts: [{ type: "text", text: "discarded", timestamp: 1 }],
       stepStartIndices: [0, 1, 3],
+      currentStepStartIndex: 1,
+      streamStepOrdinals: [0, 1],
+      reasoningBackfillStartIndex: 1,
+      currentReasoningBlock: {},
+      receivedTerminalEvent: true,
+      terminalFinishReason: "stop",
     });
     const reset = engineInternals(streamManager).resetStreamStateForRetry;
     await reset.call(streamManager, "step-reset-workspace", streamInfo, { preserveParts: false });
     expect(streamInfo.stepStartIndices).toEqual([0]);
     expect(streamInfo.currentStepStartIndex).toBe(0);
+    // The retried streamText numbers its steps from 0 and has no reasoning or finish yet.
+    expect(streamInfo.streamStepOrdinals).toEqual([]);
+    expect(streamInfo.reasoningBackfillStartIndex).toBeUndefined();
+    expect(streamInfo.currentReasoningBlock).toBeUndefined();
+    expect(streamInfo.terminalFinishReason).toBeUndefined();
     const buildPartial = engineInternals(streamManager).buildPartialAssistantMessage;
     const partial = buildPartial.call(streamManager, streamInfo);
     expect(partial.metadata?.stepStartPartIndices).toEqual([]);
