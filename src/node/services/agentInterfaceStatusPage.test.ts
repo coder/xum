@@ -220,38 +220,14 @@ describe("needsStatusPageTurnEndNudge", () => {
     ).toBe(false);
   });
 
-  test.each([
-    { name: "sent status_update", parts: [statusUpdate({ success: true, queued: true })] },
-    {
-      name: "sent status_update from code_execution",
-      parts: [
-        {
-          type: "dynamic-tool",
-          toolCallId: "code-1",
-          toolName: "code_execution",
-          input: { code: "" },
-          state: "output-available",
-          output: { success: true },
-          nestedCalls: [
-            {
-              toolCallId: "status-1",
-              toolName: "status_update",
-              input: { update: "Fixing the build" },
-              state: "output-available",
-              output: { success: true, queued: true },
-            },
-          ],
-        } satisfies CompletedMessagePart,
-      ],
-    },
-  ])("in status page agent mode, a turn that $name gets no nudge", async (row) => {
+  test("in status page agent mode, a turn that sent status_update gets no nudge", async () => {
     // The placeholder at turn end: the status page agent may not have applied the update yet.
     const turn = await startTurn();
     expect(
       await needsStatusPageTurnEndNudge({
         viewEnabled: true,
         turn: turn == null ? undefined : { ...turn, statusPageAgent: true },
-        parts: [...ranTools, ...row.parts],
+        parts: [...ranTools, statusUpdate({ success: true, queued: true })],
       })
     ).toBe(false);
   });

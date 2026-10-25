@@ -3051,6 +3051,7 @@ export const TOOL_DEFINITIONS = {
     // description keeps the tool block cache-stable. Who edits the page belongs in the system
     // prompt, not here: a tool policy that denies this tool keeps the description on a refusal
     // stub (#5253) while the prompt tells the agent to edit the page itself.
+    ptcExcluded: "Top-level presence selects the status page agent guidance",
     description:
       "Send the status page agent an update for the status page the user sees instead of this chat. " +
       "It edits the page with its own model in the background, and this call returns at once. " +

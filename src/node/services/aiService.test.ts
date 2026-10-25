@@ -3037,7 +3037,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(memoryCalls).toEqual(["openai:gpt-5.2"]);
   });
 
-  it("keeps the classic status page guidance and nudge when the active policy denies status_update, and drops queued updates once the mode is off", async () => {
+  it("keeps the classic status page guidance and nudge when the active policy or middleware drops status_update, and drops queued updates once the mode is off", async () => {
     using xumHome = new DisposableTempDir("ai-service-status-update-policy");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
@@ -3094,12 +3094,49 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     );
     expect(harness.streamSystemContextStatusPageFlags).toEqual([true]);
 
+    // Switched off before the turn ended: the update it sent is dropped, so it gets no pass.
+    const sent = await startTestStream(harness, workspaceId);
+    if (!sent.success) throw new Error(JSON.stringify(sent.error));
+    await experimentsService.setOverride(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT, false);
+    expect(
+      await harness.service.statusPageTurnEndNudge(workspaceId, {
+        messageId: sent.data.messageId,
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "status-1",
+            toolName: "status_update",
+            input: { update: "Fixing the build" },
+            state: "output-available",
+            output: { success: true, queued: true },
+          },
+        ],
+      })
+    ).toBe(STATUS_PAGE_TURN_END_NUDGE);
+    await experimentsService.setOverride(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT, true);
+
     harness.streamSystemContextStatusPageFlags.length = 0;
     active.policy = [{ regex_match: "status_update", action: "disable" }];
     expect(await nudgeFor(startTestStream(harness, workspaceId))).toBe(STATUS_PAGE_TURN_END_NUDGE);
     expect(harness.streamSystemContextStatusPageFlags).toEqual([true, false]);
     // The mode itself stayed on, so the queue keeps the main chat's updates.
     expect(discarded).toEqual([]);
+
+    // request.assemble middleware drops status_update after the prompt was built: the main
+    // agent owns the page for that turn, so it gets the classic nudge too.
+    active.policy = undefined;
+    const removeHook = eventSpine.useBefore("request.assemble", (ctx) => {
+      if (ctx.workspaceId !== workspaceId) return;
+      const { status_update: _dropped, ...rest } = ctx.tools;
+      ctx.tools = rest;
+    });
+    try {
+      expect(await nudgeFor(startTestStream(harness, workspaceId))).toBe(
+        STATUS_PAGE_TURN_END_NUDGE
+      );
+    } finally {
+      removeHook();
+    }
 
     // The mode is off for a main-chat turn: the main agent owns the page again.
     await experimentsService.setOverride(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT, false);

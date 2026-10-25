@@ -1426,7 +1426,16 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
       const cancelInFlightRefinePass = mock((workspaceId: string) => {
         // The drained pass settles and records its spend against the child.
         usageByWorkspace.set(workspaceId, {
+          ...usageByWorkspace.get(workspaceId),
           "anthropic:claude-sonnet-4-5": { input: { tokens: 42, cost_usd: 0.01 } },
+        });
+        return Promise.resolve();
+      });
+      // A status page agent pass records its usage as it settles too.
+      const cancelInFlightPass = mock((workspaceId: string) => {
+        usageByWorkspace.set(workspaceId, {
+          ...usageByWorkspace.get(workspaceId),
+          "anthropic:claude-haiku-5-5": { input: { tokens: 7, cost_usd: 0.001 } },
         });
         return Promise.resolve();
       });
@@ -1438,6 +1447,7 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
         { path: projectDir, id: childId, name: childId, parentWorkspaceId: parentId },
       ]);
       service.setRefinePassCanceller({ cancelInFlightRefinePass });
+      service.setStatusPageAgentCanceller({ cancelInFlightPass });
 
       const result = await service.remove(childId);
       expect(result.success).toBe(true);
@@ -1447,7 +1457,10 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
       expect(rollupCalls).toHaveLength(1);
       expect(rollupCalls[0].parent).toBe(parentId);
       expect(rollupCalls[0].child).toBe(childId);
-      expect(Object.keys(rollupCalls[0].byModel)).toContain("anthropic:claude-sonnet-4-5");
+      expect(Object.keys(rollupCalls[0].byModel).sort()).toEqual([
+        "anthropic:claude-haiku-5-5",
+        "anthropic:claude-sonnet-4-5",
+      ]);
     } finally {
       await fsPromises.rm(projectDir, { recursive: true, force: true });
     }

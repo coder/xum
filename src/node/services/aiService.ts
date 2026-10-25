@@ -107,6 +107,7 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import { needsStatusPageTurnEndNudge } from "./agentInterfaceStatusPage";
+import { isStatusPageAgentEnabledInSettings } from "./statusPageAgentService";
 import {
   STATUS_PAGE_AGENT_TURN_END_NUDGE,
   STATUS_PAGE_TURN_END_NUDGE,
@@ -623,10 +624,16 @@ export class AIService extends EventEmitter {
     workspaceId: string,
     input: { messageId: string; parts: readonly CompletedMessagePart[] }
   ): Promise<string | null> {
-    const turn = this.turnRequestBuilder.takeAgentInterfaceStatusPageTurn(
+    const taken = this.turnRequestBuilder.takeAgentInterfaceStatusPageTurn(
       workspaceId,
       input.messageId
     );
+    // Switched off since the turn started: the status page agent drops its queued updates, so
+    // a status_update the turn sent counts for nothing and the agent must edit the page.
+    const turn = taken && {
+      ...taken,
+      statusPageAgent: taken.statusPageAgent === true && this.isStatusPageAgentStillOn(),
+    };
     const needed = await needsStatusPageTurnEndNudge({
       turn,
       viewEnabled:
@@ -638,6 +645,13 @@ export class AIService extends EventEmitter {
     return turn?.statusPageAgent === true
       ? STATUS_PAGE_AGENT_TURN_END_NUDGE
       : STATUS_PAGE_TURN_END_NUDGE;
+  }
+
+  private isStatusPageAgentStillOn(): boolean {
+    return (
+      this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT) &&
+      isStatusPageAgentEnabledInSettings(this.config.loadConfigOrDefault())
+    );
   }
 
   /** The lazy hook setup of request building, fail-soft: the hooks already loaded still run. */

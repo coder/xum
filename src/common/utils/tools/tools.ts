@@ -236,6 +236,12 @@ export interface ToolConfiguration {
    * chat or compaction, scratch dir set) and the artifacts-status-page-agent experiment is on.
    */
   statusPageAgentActive?: boolean;
+  /**
+   * The turn's model as the user selected it (its route: a Coder instance, a custom provider),
+   * which status_update queues for an Inherit Status Page model. The tools' model string is a
+   * normalized identity that the model factory could route elsewhere.
+   */
+  statusUpdateFallbackModel?: string;
   /** Per-scope memory write policy for the current agent (defaults to read-only). */
   memoryAccess?: MemoryScopeAccess;
   /** Memory scopes the tool serves (see resolveMemoryScopes); defaults to no session scope. */

@@ -12,10 +12,15 @@ export function isStatusUpdateEnabled(config: ToolConfiguration): boolean {
 /** `{ status_update }` while the tool is enabled for this turn, else no tools. */
 export function createStatusUpdateTools(
   config: ToolConfiguration,
-  fallbackModel: string
+  modelString: string
 ): Record<string, Tool> {
   return isStatusUpdateEnabled(config)
-    ? { status_update: createStatusUpdateTool(config, fallbackModel) }
+    ? {
+        status_update: createStatusUpdateTool(
+          config,
+          config.statusUpdateFallbackModel ?? modelString
+        ),
+      }
     : {};
 }
 

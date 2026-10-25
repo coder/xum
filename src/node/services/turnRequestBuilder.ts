@@ -121,7 +121,7 @@ import type { SessionUsageService } from "./sessionUsageService";
 import { sideChatCapabilityGrants, withSideChatInstructions } from "./sideChat";
 import type { EvaluationService } from "./evaluation/evaluationService";
 import type { InstructionSources } from "@/common/types/instructions";
-import { extractToolInstructionsFromSources } from "./systemMessage";
+import { extractToolInstructionsFromSources, removeStatusPageAgentGuidance } from "./systemMessage";
 import { createAssistantMessageId } from "./utils/messageIds";
 import { createErrorEvent, formatSendMessageError } from "./utils/sendMessageError";
 
@@ -1186,6 +1186,28 @@ export class TurnRequestBuilder {
     } else {
       this.agentInterfaceTurns.delete(workspaceId);
     }
+  }
+
+  /**
+   * request.assemble middleware may filter status_update after the prompt was built. Then the
+   * page goes back to the main agent: the classic guidance replaces the status page agent's, and
+   * the turn-end nudge asks for a page edit, not a status_update call. Each attempt (a model
+   * fallback reruns the middleware) sets the nudge from its own prompt.
+   */
+  private followStatusUpdateAfterMiddleware(
+    workspaceId: string,
+    messageId: string,
+    systemMessage: string,
+    statusUpdate: { prompted: boolean; present: boolean }
+  ): string {
+    const entry = this.agentInterfaceTurns.get(workspaceId);
+    if (entry?.messageId === messageId) {
+      this.agentInterfaceTurns.set(workspaceId, {
+        messageId,
+        turn: { ...entry.turn, statusPageAgent: statusUpdate.prompted && statusUpdate.present },
+      });
+    }
+    return statusUpdate.present ? systemMessage : removeStatusPageAgentGuidance(systemMessage);
   }
 
   /**
@@ -3020,6 +3042,7 @@ export class TurnRequestBuilder {
       goalService: workspaceGoalService,
       goalDefaults: effectiveGoalDefaults,
       goalKickoffModel: modelString,
+      statusUpdateFallbackModel: modelString,
       goalToolContext,
       // Only child workspaces (tasks) can report to a parent.
       enableAgentReport: Boolean(metadata.parentWorkspaceId),
@@ -3187,6 +3210,7 @@ export class TurnRequestBuilder {
             // Per attempt: a fallback model that calls set_goal must price and
             // kick off the goal on itself, not on the primary it replaced.
             goalKickoffModel: seed.rawModelString,
+            statusUpdateFallbackModel: seed.rawModelString,
             openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
             xaiNativeToolsEnabled: seed.routeProvider === "xai",
             anthropicNativeWebFetchEnabled: anthropicNativeWebFetchRouteAvailable(
@@ -3343,6 +3367,15 @@ export class TurnRequestBuilder {
           assembleCtx.systemMessage = removeMemoryGuidance(
             assembleCtx.systemMessage,
             attemptTools.memory !== undefined
+          );
+          assembleCtx.systemMessage = this.followStatusUpdateAfterMiddleware(
+            workspaceId,
+            assistantMessageId,
+            assembleCtx.systemMessage,
+            {
+              prompted: attemptToolset.statusUpdateToolAvailable,
+              present: attemptTools.status_update !== undefined,
+            }
           );
           if (assembleCtx.systemMessage !== attemptSystem) {
             attemptSystem = assembleCtx.systemMessage;

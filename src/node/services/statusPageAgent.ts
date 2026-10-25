@@ -37,6 +37,9 @@ export interface StatusPageAgentResult {
   streamError?: string;
 }
 
+type StreamTextArgs = Parameters<typeof streamText>[0];
+export type StatusPageProviderOptions = NonNullable<StreamTextArgs["providerOptions"]>;
+
 type PageToolResult = { success: true; bytes: number } | { success: false; error: string };
 
 interface PageDraft {
@@ -140,6 +143,9 @@ async function readSummary(
  */
 export async function runStatusPageAgent(args: {
   model: LanguageModel;
+  /** Request options of the route the model was created on (thinking off). */
+  providerOptions?: StatusPageProviderOptions;
+  headers?: StreamTextArgs["headers"];
   /** Resolved status_page agent system prompt body. */
   agentBody: string;
   currentPage: string;
@@ -168,6 +174,8 @@ export async function runStatusPageAgent(args: {
 
   const stream = streamText({
     model: args.model,
+    providerOptions: args.providerOptions,
+    headers: args.headers,
     system: args.agentBody,
     prompt: buildPrompt(args.currentPage, args.updates),
     tools: createStatusPageTools(draft),

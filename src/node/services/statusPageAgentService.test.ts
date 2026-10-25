@@ -29,7 +29,7 @@ const USAGE = {
   outputTokens: { total: 2, text: 2, reasoning: 0 },
 };
 
-type Behavior = "write" | "noop" | "fail";
+type Behavior = "write" | "noop" | "fail" | "hang";
 
 function userPromptText(options: LanguageModelV3CallOptions): string {
   return options.prompt
@@ -49,12 +49,34 @@ function finishWithText(text: string): LanguageModelV3StreamPart[] {
 }
 
 /** One pass's model: "write" rewrites the page to name the pass, then finishes. */
-function passModel(behavior: Behavior, pass: number, prompts: string[]): MockLanguageModelV3 {
+function passModel(
+  behavior: Behavior,
+  pass: number,
+  prompts: string[],
+  providerOptions: Array<LanguageModelV3CallOptions["providerOptions"]>,
+  onStreamStarted: ((abortSignal: AbortSignal | undefined) => void) | null
+): MockLanguageModelV3 {
   let call = 0;
   return new MockLanguageModelV3({
     doStream: (options) => {
-      if (call === 0) prompts.push(userPromptText(options));
+      if (call === 0) {
+        prompts.push(userPromptText(options));
+        providerOptions.push(options.providerOptions);
+      }
       call++;
+      onStreamStarted?.(options.abortSignal);
+      if (behavior === "hang") {
+        // Ends only when the request is aborted, like a provider that never answers.
+        return Promise.resolve({
+          stream: new ReadableStream<LanguageModelV3StreamPart>({
+            start(controller) {
+              options.abortSignal?.addEventListener("abort", () =>
+                controller.error(options.abortSignal?.reason)
+              );
+            },
+          }),
+        });
+      }
       if (behavior === "fail") {
         return Promise.resolve({
           stream: new ReadableStream<LanguageModelV3StreamPart>({
@@ -124,9 +146,11 @@ async function createFixture() {
     gate: null as Promise<void> | null,
     /** Called when a pass asks for its model, before it waits on the gate. */
     onModelRequested: null as (() => void) | null,
+    onStreamStarted: null as ((abortSignal: AbortSignal | undefined) => void) | null,
   };
   const modelStrings: string[] = [];
   const prompts: string[] = [];
+  const providerOptions: Array<LanguageModelV3CallOptions["providerOptions"]> = [];
   const usageRecords: Array<{ model: string; source: string | undefined }> = [];
 
   const service = new StatusPageAgentService({
@@ -135,13 +159,22 @@ async function createFixture() {
     getWorkspaceMetadata: () => Promise.resolve(metadata),
     isWorkspaceRemoving: () => state.removing,
     modelFactory: {
-      createModelWithPinnedMetadata: async (modelString) => {
+      createModelWithPinnedOptions: async (modelString) => {
         modelStrings.push(modelString);
         state.onModelRequested?.();
         if (state.gate) await state.gate;
         return Ok({
-          model: passModel(state.behavior, modelStrings.length, prompts),
+          model: passModel(
+            state.behavior,
+            modelStrings.length,
+            prompts,
+            providerOptions,
+            state.onStreamStarted
+          ),
           metadataModel: modelString,
+          optionsModelString: modelString,
+          optionsProvidersConfig: {},
+          optionsMuxProviderOptions: {},
         });
       },
     },
@@ -160,6 +193,7 @@ async function createFixture() {
     metadata,
     modelStrings,
     prompts,
+    providerOptions,
     usageRecords,
     pagePath,
     enqueue: (update: string) =>
@@ -259,7 +293,7 @@ describe("StatusPageAgentService", () => {
     expect(await fixture.readPage()).toBe("<p>before</p>");
     expect(fixture.usageRecords).toHaveLength(0);
 
-    fixture.state.behavior = "noop";
+    fixture.state.behavior = "write";
     expect(fixture.enqueue("next update").previousError).toContain("provider exploded");
     // Still before the retry pass ends: the error was handed over already.
     expect(fixture.enqueue("another update").previousError).toBeUndefined();
@@ -399,16 +433,52 @@ describe("StatusPageAgentService", () => {
     }
   });
 
-  it("writes nothing when the agent leaves the page unchanged", async () => {
+  it("writes nothing and retries the updates when the agent leaves the page unchanged", async () => {
     using fixture = await createFixture();
     fixture.state.behavior = "noop";
-    fixture.enqueue("an update");
+    fixture.enqueue("UNAPPLIED-1");
     await fixture.whenIdle();
 
     expect(fixture.modelStrings).toHaveLength(1);
     // The pass started from the seeded template because the page was missing; an unchanged
     // draft must not materialize it.
     expect(await fixture.readPage()).toBeNull();
+
+    fixture.state.behavior = "write";
+    expect(fixture.enqueue("next update").previousError).toContain("unchanged");
+    await fixture.whenIdle();
+    expect(fixture.prompts[1]).toContain("UNAPPLIED-1");
+  });
+
+  it("asks the Status Page model for thinking off", async () => {
+    using fixture = await createFixture();
+    await fixture.config.editConfig((cfg) => ({
+      ...cfg,
+      agentAiDefaults: { status_page: { modelString: "anthropic:claude-haiku-5-5" } },
+    }));
+    fixture.enqueue("an update");
+    await fixture.whenIdle();
+
+    // Omitted options would leave Haiku 5.5 on its adaptive-thinking default.
+    expect(fixture.providerOptions[0]?.anthropic?.thinking).toEqual({ type: "disabled" });
+  });
+
+  it("aborts a running pass on workspace removal and keeps nothing for the workspace", async () => {
+    using fixture = await createFixture();
+    fixture.state.behavior = "hang";
+    const streamStarted = new Promise<AbortSignal | undefined>((resolve) => {
+      fixture.state.onStreamStarted = resolve;
+    });
+    fixture.enqueue("an update");
+    const requestSignal = await streamStarted;
+    // Without the abort this waits for the 2-minute pass timeout.
+    await fixture.service.cancelInFlightPass(WORKSPACE_ID);
+
+    expect(requestSignal?.aborted).toBe(true);
+    expect(fixture.usageRecords).toHaveLength(0);
+    fixture.state.behavior = "write";
+    expect(fixture.enqueue("after removal")).toEqual({ queued: true });
+    await fixture.whenIdle();
   });
 
   it("runs on the Status Page model from Settings, else on the main agent's model", async () => {

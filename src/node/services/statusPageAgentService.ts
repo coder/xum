@@ -14,9 +14,9 @@
  * dropped unapplied (queue caps, a pass cut short by a closed gate, discard()) are counted and
  * reported the same way, so the main agent knows to repeat what still matters.
  */
-import type { LanguageModel } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { assert } from "@/common/utils/assert";
+import { buildProviderOptions, buildRequestHeaders } from "@/common/utils/ai/providerOptions";
 import {
   AGENT_INTERFACE_STATUS_ARTIFACT,
   STATUS_PAGE_AGENT_MAX_PAGE_BYTES,
@@ -27,6 +27,7 @@ import {
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
+import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -40,12 +41,17 @@ import {
   writeArtifactAtLocation,
 } from "./artifactsOperations";
 import { log } from "./log";
+import type { PinnedModelOptions } from "./providerModelFactory";
 import {
   resolveHeadlessAgentBody,
   resolveHeadlessAgentSettings,
 } from "./memoryConsolidationService";
 import type { SessionUsageService } from "./sessionUsageService";
-import { runStatusPageAgent, type StatusPageUpdate } from "./statusPageAgent";
+import {
+  runStatusPageAgent,
+  type StatusPageProviderOptions,
+  type StatusPageUpdate,
+} from "./statusPageAgent";
 
 export const STATUS_PAGE_AGENT_ID = "status_page";
 export const STATUS_PAGE_AGENT_ANALYTICS_SOURCE = "status_page_agent";
@@ -54,14 +60,28 @@ type StatusPageWorkspaceMetadata = Parameters<typeof resolveArtifactsLocation>[2
   Partial<Pick<FrontendWorkspaceMetadata, "archivedAt" | "unarchivedAt">>;
 
 /**
- * AIService.createModelWithPinnedMetadata: usage is attributed to the pricing identity the model
- * was created for, not to a re-resolution that a Coder catalog refresh can change.
+ * AIService.createModelWithPinnedOptions: usage is attributed to the pricing identity the model
+ * was created for, and the request options follow the route it was created on, not a
+ * re-resolution that a Coder catalog refresh can change.
  */
 interface StatusPageModelFactory {
-  createModelWithPinnedMetadata(
+  createModelWithPinnedOptions(
     modelString: string,
-    opts?: { agentInitiated?: boolean; workspaceId?: string }
-  ): Promise<Result<{ model: LanguageModel; metadataModel: string }, { type: string }>>;
+    opts?: { agentInitiated?: boolean; workspaceId?: string; thinkingLevel?: "off" }
+  ): Promise<
+    Result<
+      Pick<
+        PinnedModelOptions,
+        | "model"
+        | "metadataModel"
+        | "optionsModelString"
+        | "optionsProvidersConfig"
+        | "optionsMuxProviderOptions"
+        | "optionsRouteProvider"
+      >,
+      { type: string }
+    >
+  >;
 }
 
 export interface StatusPageAgentServiceDeps {
@@ -137,6 +157,8 @@ export class StatusPageAgentService {
   private readonly discarded = new Map<string, number>();
   /** Bumped by discard(), so a pass that was running then knows its batch went stale. */
   private readonly discardEpochs = new Map<string, number>();
+  /** Aborts the running drain's model call (cancelInFlightPass). */
+  private readonly cancels = new Map<string, AbortController>();
 
   constructor(private readonly deps: StatusPageAgentServiceDeps) {}
 
@@ -175,7 +197,25 @@ export class StatusPageAgentService {
     this.failedUpdates.delete(workspaceId);
     this.lastError.delete(workspaceId);
     this.countDiscarded(workspaceId, queued);
-    this.discardEpochs.set(workspaceId, this.discardEpoch(workspaceId) + 1);
+    // Only a running pass can go stale; startDrain drops the entry once its drain settles, so
+    // idle workspaces keep none.
+    if (this.running.has(workspaceId)) {
+      this.discardEpochs.set(workspaceId, this.discardEpoch(workspaceId) + 1);
+    }
+  }
+
+  /**
+   * Workspace removal: abort a running pass and wait for it, so no model call or usage record
+   * outlives the removal (it reads the usage once and deletes the session dir), then forget the
+   * workspace. Never rejects.
+   */
+  async cancelInFlightPass(workspaceId: string): Promise<void> {
+    this.pending.delete(workspaceId);
+    this.cancels.get(workspaceId)?.abort();
+    await this.whenIdle(workspaceId);
+    this.failedUpdates.delete(workspaceId);
+    this.lastError.delete(workspaceId);
+    this.discarded.delete(workspaceId);
   }
 
   private discardEpoch(workspaceId: string): number {
@@ -194,27 +234,33 @@ export class StatusPageAgentService {
   }
 
   private startDrain(workspaceId: string): void {
-    const run = this.drain(workspaceId).finally(() => {
+    const cancel = new AbortController();
+    this.cancels.set(workspaceId, cancel);
+    const run = this.drain(workspaceId, cancel.signal).finally(() => {
       this.running.delete(workspaceId);
+      this.cancels.delete(workspaceId);
+      this.discardEpochs.delete(workspaceId);
       // An update that landed after the drain's last check but before this callback.
       if (this.pending.has(workspaceId)) this.startDrain(workspaceId);
     });
     this.running.set(workspaceId, run);
   }
 
-  private async drain(workspaceId: string): Promise<void> {
-    for (;;) {
+  private async drain(workspaceId: string, cancelSignal: AbortSignal): Promise<void> {
+    while (!cancelSignal.aborted) {
       const batch = this.takeBatch(workspaceId);
       if (batch === undefined) return;
       const epoch = this.discardEpoch(workspaceId);
       try {
-        if ((await this.runPass(workspaceId, batch, epoch)) === "discarded") {
+        if ((await this.runPass(workspaceId, batch, epoch, cancelSignal)) === "discarded") {
           this.countDiscarded(workspaceId, batch.updates.length);
         }
         // A later pass recovered the page (or the gate closed): the main agent must not be told
         // to take over.
         this.lastError.delete(workspaceId);
       } catch (error) {
+        // Workspace removal (cancelInFlightPass) forgets the workspace anyway.
+        if (cancelSignal.aborted) return;
         if (this.discardEpoch(workspaceId) !== epoch) {
           // discard() ran during the pass: this failure is as stale as the batch.
           this.countDiscarded(workspaceId, batch.updates.length);
@@ -271,12 +317,16 @@ export class StatusPageAgentService {
   private async runPass(
     workspaceId: string,
     batch: PendingBatch,
-    epoch: number
+    epoch: number,
+    cancelSignal: AbortSignal
   ): Promise<PassOutcome> {
     const metadata = await this.writableMetadata(workspaceId);
     if (metadata == null) return "discarded";
 
-    const abortSignal = AbortSignal.timeout(STATUS_PAGE_AGENT_RUN_TIMEOUT_MS);
+    const abortSignal = AbortSignal.any([
+      cancelSignal,
+      AbortSignal.timeout(STATUS_PAGE_AGENT_RUN_TIMEOUT_MS),
+    ]);
     const location = await resolveArtifactsLocation(
       this.deps.config.sessionsDir,
       workspaceId,
@@ -291,6 +341,8 @@ export class StatusPageAgentService {
 
     const result = await runStatusPageAgent({
       model: agent.model,
+      providerOptions: agent.providerOptions,
+      headers: agent.headers,
       pricingModel: agent.metadataModel,
       agentBody: agent.body,
       currentPage,
@@ -301,7 +353,6 @@ export class StatusPageAgentService {
     if (result.streamError !== undefined) {
       throw new Error(`${agent.modelString}: ${result.streamError}`);
     }
-    if (result.page === null) return "applied";
     // The run took a while: the user may have switched the experiments off or archived or
     // removed the workspace meanwhile. The writers also refuse to recreate a deleted scratch or
     // session dir, which covers a removal that finishes between this check and the write.
@@ -310,6 +361,11 @@ export class StatusPageAgentService {
       this.discardEpoch(workspaceId) !== epoch
     ) {
       return "discarded";
+    }
+    // Each update reports something new, so an unchanged page means the agent did not apply
+    // them (it only replied, or every edit failed): retry them and tell the main agent.
+    if (result.page === null) {
+      throw new Error("the status page agent left the page unchanged");
     }
     // Someone (often the main agent, after a failure note) edited the page during the run: keep
     // that edit, and let the next pass apply these updates on top of it. Not a lock: an edit
@@ -344,14 +400,49 @@ export class StatusPageAgentService {
       STATUS_PAGE_AGENT_ID,
       fallbackModel
     ).model;
-    const created = await this.deps.modelFactory.createModelWithPinnedMetadata(modelString, {
+    const created = await this.deps.modelFactory.createModelWithPinnedOptions(modelString, {
       agentInitiated: true,
       workspaceId,
+      thinkingLevel: "off",
     });
     if (!created.success) {
       throw new Error(`could not create model ${modelString}: ${created.error.type}`);
     }
-    return { body, modelString, ...created.data };
+    const pinned = created.data;
+    // Thinking off as far as the model allows (its card has no reasoning control). A request
+    // without options would get the provider's default, which is on for some models.
+    const thinkingLevel = enforceThinkingPolicy(
+      pinned.optionsModelString,
+      "off",
+      undefined,
+      pinned.optionsProvidersConfig
+    );
+    const providerOptions = buildProviderOptions(
+      pinned.optionsModelString,
+      thinkingLevel,
+      undefined,
+      undefined,
+      pinned.optionsMuxProviderOptions,
+      workspaceId,
+      undefined,
+      pinned.optionsProvidersConfig,
+      pinned.optionsRouteProvider
+    ) as StatusPageProviderOptions;
+    const headers = buildRequestHeaders(
+      pinned.optionsModelString,
+      pinned.optionsMuxProviderOptions,
+      workspaceId,
+      pinned.optionsProvidersConfig,
+      pinned.optionsRouteProvider
+    );
+    return {
+      body,
+      modelString,
+      model: pinned.model,
+      metadataModel: pinned.metadataModel,
+      providerOptions,
+      headers,
+    };
   }
 
   private usageRecorder(workspaceId: string, modelString: string, metadataModel: string) {

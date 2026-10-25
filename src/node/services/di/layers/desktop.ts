@@ -733,7 +733,7 @@ export const DesktopWiringLive: Layer.Layer<
     );
     // Status page agent (artifacts-status-page-agent): status_update queues the main agent's
     // updates and a host-run headless agent applies them to status.html in the background.
-    turnRequestBuilderBindings.statusPageAgent = new StatusPageAgentService({
+    const statusPageAgent = new StatusPageAgentService({
       config,
       isExperimentEnabled: (experimentId) => experimentsService.isExperimentEnabled(experimentId),
       getWorkspaceMetadata: (workspaceId) => workspaceService.getInfo(workspaceId),
@@ -746,6 +746,8 @@ export const DesktopWiringLive: Layer.Layer<
         workspaceService.emit("analyticsIngest", { workspaceId });
       },
     });
+    turnRequestBuilderBindings.statusPageAgent = statusPageAgent;
+    workspaceService.setStatusPageAgentCanceller(statusPageAgent);
     turnRequestBuilderBindings.timelineService = timelineService;
     timelineService.subscribeToWorkspace(workspaceService);
 

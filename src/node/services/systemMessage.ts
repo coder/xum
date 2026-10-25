@@ -269,6 +269,21 @@ Still answer in chat as usual.
 }
 
 /**
+ * request.assemble middleware may filter status_update after the prompt was built: swap the
+ * status page agent guidance for the classic edit-the-page guidance and keep everything else.
+ */
+export function removeStatusPageAgentGuidance(systemMessage: string): string {
+  const agentGuidance = buildAgentInterfaceContext({
+    agentInterfaceView: true,
+    statusPageAgent: true,
+  });
+  const classicGuidance = buildAgentInterfaceContext({ agentInterfaceView: true });
+  // A replacer function: the guidance names $XUM_SCRATCH_DIR, and `$` patterns in a replacement
+  // string are special.
+  return systemMessage.replace(agentGuidance, () => classicGuidance);
+}
+
+/**
  * Extract tool-specific instructions from instruction sources.
  * Searches agent instructions first, then context (workspace/project), then global.
  *

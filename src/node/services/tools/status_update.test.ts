@@ -27,7 +27,8 @@ function fakeQueue(result: StatusPageEnqueueResult = { queued: true }) {
 async function toolsFor(
   tempDir: string,
   statusPageAgent: StatusPageAgentQueue | undefined,
-  statusPageAgentActive: boolean
+  statusPageAgentActive: boolean,
+  statusUpdateFallbackModel?: string
 ): Promise<Record<string, Tool>> {
   return getToolsForModel(
     TURN_MODEL,
@@ -35,6 +36,7 @@ async function toolsFor(
       ...createTestToolConfig(tempDir, { workspaceId: WORKSPACE_ID }),
       statusPageAgent,
       statusPageAgentActive,
+      statusUpdateFallbackModel,
     },
     WORKSPACE_ID,
     getTestDeps().initStateManager
@@ -67,6 +69,11 @@ describe("status_update tool", () => {
     expect(calls).toEqual([
       { workspaceId: WORKSPACE_ID, update: "Started the build", fallbackModel: TURN_MODEL },
     ]);
+
+    // The selected route, not the normalized tools model, so Inherit keeps the user's provider.
+    const routed = await toolsFor(tempDir.path, queue, true, "coder:anthropic/turn-model");
+    await execute(routed.status_update, "Tests pass");
+    expect(calls[1]?.fallbackModel).toBe("coder:anthropic/turn-model");
   });
 
   test("tells the main agent when the previous status page run failed", async () => {

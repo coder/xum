@@ -6,6 +6,7 @@ import {
   extractToolInstructions,
   extractToolInstructionsFromSources,
   loadWorkspaceInstructionSources,
+  removeStatusPageAgentGuidance,
   type BuildSystemMessageFromSourcesOptions,
 } from "./systemMessage";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -405,6 +406,28 @@ Use clear examples.
     expect(await agentInterfaceFor(true, false)).not.toContain("status_update");
     // The tool alone never adds the section: the Agent interface view gates it.
     expect(await agentInterfaceFor(false, true)).toBeNull();
+  });
+
+  test("hands the page back to the main agent when middleware drops status_update", async () => {
+    const metadata: WorkspaceMetadata = {
+      id: "test-workspace",
+      name: "test-workspace",
+      projectName: "test-project",
+      projectPath: projectDir,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const build = (statusPageAgent: boolean) =>
+      buildSystemMessage(metadata, runtime, workspaceDir, undefined, undefined, undefined, {
+        scratchDirSet: true,
+        agentInterfaceView: true,
+        statusPageAgent,
+      });
+    const pluginContext = "\nPlugin context with $XUM_SCRATCH_DIR and $&.";
+    const classic = (await build(false)) + pluginContext;
+
+    // Exactly the prompt the turn would have had without the tool, plugin additions kept.
+    expect(removeStatusPageAgentGuidance((await build(true)) + pluginContext)).toBe(classic);
+    expect(removeStatusPageAgentGuidance(classic)).toBe(classic);
   });
 
   describe("Claude global instruction compatibility", () => {
