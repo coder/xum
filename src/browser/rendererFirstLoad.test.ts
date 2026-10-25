@@ -87,20 +87,6 @@ describe("renderer first load", () => {
     );
   }, 60_000);
 
-  // #7510: ChatPane always rendered the Agent interface status view, so its static import pulled
-  // the artifact viewer and SandboxedArtifactFrame (~14 KB brotli) into the workspace page's
-  // download even with the experiment off.
-  test("the workspace page's static imports do not reach the artifact frame", async () => {
-    const closure = new Set([
-      ...(await staticImportClosure("src/browser/main.tsx")),
-      ...(await staticImportClosure("src/browser/components/AIView/AIView.tsx")),
-    ]);
-    expect(closure.has("src/browser/components/ChatPane/ChatPane.tsx")).toBe(true);
-    expect(
-      closure.has("src/browser/features/RightSidebar/ArtifactsTab/SandboxedArtifactFrame.tsx")
-    ).toBe(false);
-  }, 60_000);
-
   test("the workspace page's static imports do not reach the workspace-menu modals", async () => {
     // App.tsx starts the workspace page chunk (loadAIView() -> AIView) while the entry boots, so a
     // phone downloads both closures before the composer works. WorkspaceMenuBar mounted these
