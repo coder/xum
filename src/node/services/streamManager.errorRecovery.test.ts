@@ -27,6 +27,8 @@ import {
   REFUSAL_FINISH,
 } from "./streamManager.suite.testHarness";
 import { Ok } from "@/common/types/result";
+import { clampErrorMessage } from "@/common/utils/errors";
+import { ERROR_MESSAGE_CLAMP_MAX_CHARS } from "@/constants/errors";
 
 installStreamManagerTestHistory();
 
@@ -955,6 +957,20 @@ describe("StreamManager - stream error classification", () => {
     expect(partial?.metadata?.errorType).toBe(harness.errors()[0]?.errorType);
     return harness.errors()[0]?.errorType;
   }
+
+  test("clamps a huge provider error message before it is persisted and emitted", async () => {
+    const harness = createRecoveryHarness();
+    const huge = `head ${"x".repeat(ERROR_MESSAGE_CLAMP_MAX_CHARS * 2)} tail`;
+    await harness.run({
+      workspaceId: "clamp-error",
+      attempts: [failingAttempt(new Error(huge))],
+    });
+    const emitted = harness.errors()[0]?.error ?? "";
+    expect(emitted).toBe(clampErrorMessage(huge));
+    expect(emitted.length).toBeLessThan(huge.length);
+    const partial = await historyService.readPartial("clamp-error");
+    expect(partial?.metadata?.error).toBe(emitted);
+  });
 
   test("unwraps RetryError.lastError to classify model_not_found", async () => {
     const apiError = createApiCallErrorForTests({
