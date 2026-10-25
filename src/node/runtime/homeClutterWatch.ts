@@ -101,8 +101,11 @@ export class ClutterScanner {
     this.readDir = readDir;
   }
 
-  /** The in-flight scan, or a new one when none is running. */
-  scan(now = Date.now()): Promise<ClutterSnapshot> {
+  /**
+   * The in-flight scan, or a new one when none is running. `now` comes from the caller's
+   * clock (no Date.now() default), so `busyForMs` compares times of one clock (#7282).
+   */
+  scan(now: number): Promise<ClutterSnapshot> {
     if (this.inFlight != null) return this.inFlight.scan;
     const scan = snapshotClutterRoots(this.roots, this.readDir)
       .then((fresh) => {
@@ -121,7 +124,7 @@ export class ClutterScanner {
   }
 
   /** How long the current scan has been running (0 when idle). */
-  busyForMs(now = Date.now()): number {
+  busyForMs(now: number): number {
     return this.inFlight == null ? 0 : now - this.inFlight.startedAt;
   }
 }

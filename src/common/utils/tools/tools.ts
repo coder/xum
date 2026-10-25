@@ -1,5 +1,5 @@
 import type { HistoryService } from "@/node/services/historyService";
-import type { HostClock } from "@/node/utils/hostClock";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { createSessionHistoryTool } from "@/node/services/tools/session_history";
 import { createNewContextTool } from "@/node/services/tools/new_context";
 import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
@@ -436,7 +436,9 @@ function augmentToolDescription(baseTool: Tool, additionalInstructions: string):
 function wrapToolExecuteWithModelOnlyNotifications(
   toolName: string,
   baseTool: Tool,
-  engine: NotificationEngine
+  engine: NotificationEngine,
+  // The session's clock, so a poll's `now` and the sources' own times read one clock (#7282).
+  clock: HostClock
 ): Tool {
   // Access the tool as a record to get its properties.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any, local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
@@ -465,7 +467,7 @@ function wrapToolExecuteWithModelOnlyNotifications(
           toolName,
           toolSucceeded: true,
           resultCanCarryNotifications: canCarryModelOnlyToolNotifications(result),
-          now: Date.now(),
+          now: clock.nowMs(),
         });
       } catch (error) {
         log.debug("[getToolsForModel] notification poll failed", { error, toolName });
@@ -477,7 +479,7 @@ function wrapToolExecuteWithModelOnlyNotifications(
         await engine.pollAfterToolCall({
           toolName,
           toolSucceeded: false,
-          now: Date.now(),
+          now: clock.nowMs(),
         });
       } catch (pollError) {
         log.debug("[getToolsForModel] notification poll failed", { pollError, toolName });
@@ -619,7 +621,12 @@ function wrapToolsWithModelOnlyNotifications(
 
   const wrappedTools: Record<string, Tool> = {};
   for (const [toolName, tool] of Object.entries(tools)) {
-    wrappedTools[toolName] = wrapToolExecuteWithModelOnlyNotifications(toolName, tool, engine);
+    wrappedTools[toolName] = wrapToolExecuteWithModelOnlyNotifications(
+      toolName,
+      tool,
+      engine,
+      config.clock ?? nodeClock
+    );
   }
 
   return wrappedTools;
