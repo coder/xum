@@ -169,7 +169,7 @@ describe("Agent interface status view", () => {
     await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
   });
 
-  test("the interrupt key pressed in the page reaches the chat's handler only during the user's gesture", async () => {
+  test("the interrupt key pressed in the page is replayed only during the user's gesture and for the active keybind", async () => {
     let activation = { isActive: false };
     Object.defineProperty(window.navigator, "userActivation", {
       configurable: true,
@@ -178,11 +178,12 @@ describe("Agent interface status view", () => {
     // The host builds the replayed event with the global constructor, which the DOM harness lacks.
     const globalKeyboardEvent = globalThis.KeyboardEvent;
     globalThis.KeyboardEvent = window.KeyboardEvent;
-    let interrupts = 0;
+    // Every key replayed on the frame, so a replayed keybind the chat would not match counts too.
+    const replayed: string[] = [];
     let frame: HTMLIFrameElement | null = null;
     // Where useAIViewKeybinds listens: window, bubble phase.
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.target === frame && event.key === "Escape") interrupts++;
+      if (event.target === frame) replayed.push(`${event.ctrlKey ? "Ctrl+" : ""}${event.key}`);
     };
     window.addEventListener("keydown", onKeyDown);
     try {
@@ -203,14 +204,14 @@ describe("Agent interface status view", () => {
       post("normal");
       act(() => frame?.focus());
       post("normal");
-      expect(interrupts).toBe(0);
+      expect(replayed).toEqual([]);
 
-      // The user's key press in the page; only the keybind for the Vim setting (off) counts.
+      // The user's key press in the page; only the keybind for the Vim setting (off) is replayed.
       activation = { isActive: true };
       post("vim");
-      expect(interrupts).toBe(0);
+      expect(replayed).toEqual([]);
       post("normal");
-      expect(interrupts).toBe(1);
+      expect(replayed).toEqual(["Escape"]);
     } finally {
       window.removeEventListener("keydown", onKeyDown);
       globalThis.KeyboardEvent = globalKeyboardEvent;
