@@ -3107,6 +3107,58 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(discarded).toEqual([workspaceId]);
   });
 
+  it("gives no status page agent mode with the Status Page switch off, and a side chat leaves the main chat's queue alone", async () => {
+    using xumHome = new DisposableTempDir("ai-service-status-page-mode-gates");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const experimentsService = await experimentsServiceWith(xumHome.path, [
+      EXPERIMENT_IDS.ARTIFACTS,
+      EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
+      EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT,
+    ]);
+    const discarded: string[] = [];
+    const startWith = async (metadata: WorkspaceMetadata) => {
+      const harness = createHarness(xumHome.path, metadata, { experimentsService });
+      harness.service.turnRequestBuilderBindings.statusPageAgent = {
+        enqueue: () => ({ queued: true }),
+        discard: (id) => discarded.push(id),
+      };
+      await startTestStream(harness, metadata.id);
+      // The spy outlives each harness, so read this turn's (the latest) tool configuration.
+      const toolConfig = harness.getToolsForModelSpy.mock.calls.at(-1)?.[1];
+      return { harness, active: toolConfig?.statusPageAgentActive };
+    };
+
+    // The real seeding gives a side chat no Agent interface turn; the queue it shares with its
+    // main chat must keep the main chat's updates.
+    await startWith(
+      createLocalWorkspaceMetadata("status-page-side-chat", projectPath, {
+        sideChatParentWorkspaceId: "status-page-main",
+      })
+    );
+    expect(discarded).toEqual([]);
+
+    const artifactsDir = path.join(xumHome.path, "artifacts");
+    await fs.mkdir(artifactsDir, { recursive: true });
+    spyOn(agentInterfaceStatusPage, "prepareAgentInterfaceStatusPage").mockResolvedValue({
+      resolveLocation: () => Promise.resolve({ kind: "host", dir: artifactsDir }),
+      startFingerprint: null,
+    });
+    const main = createLocalWorkspaceMetadata("status-page-main", projectPath);
+    const on = await startWith(main);
+    expect(on.active).toBe(true);
+    expect(discarded).toEqual([]);
+
+    // Settings > Agents > Status Page switched off: no status_update, and the main agent owns
+    // the page again, so its queued updates are stale.
+    await on.harness.config.editConfig((cfg) => ({
+      ...cfg,
+      agentAiDefaults: { status_page: { enabled: false } },
+    }));
+    expect((await startWith(main)).active).toBe(false);
+    expect(discarded).toEqual([main.id]);
+  });
+
   it("sends MCP Apps model context at the start of the newest user message, not in the system prompt", async () => {
     using xumHome = new DisposableTempDir("ai-mcp-app-context");
     const metadata = createLocalWorkspaceMetadata("mcp-app-context", xumHome.path);

@@ -261,6 +261,8 @@ describe("StatusPageAgentService", () => {
 
     fixture.state.behavior = "noop";
     expect(fixture.enqueue("next update").previousError).toContain("provider exploded");
+    // Still before the retry pass ends: the error was handed over already.
+    expect(fixture.enqueue("another update").previousError).toBeUndefined();
     await fixture.whenIdle();
     expect(fixture.enqueue("later update").previousError).toBeUndefined();
     await fixture.whenIdle();
