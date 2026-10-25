@@ -34,7 +34,7 @@ function expectTextSizeAdjustBeforeArtifactStyles(srcdoc: string) {
   expect(host?.parentElement).toBe(doc.head);
   expect(host?.previousElementSibling).not.toBeNull();
   // Unlayered, it would outrank artifact rules declared inside @layer.
-  expect(host?.textContent).toMatch(/^@layer\s*\{/);
+  expect(host?.textContent).toMatch(/^@layer\s*\{\s*:where\(html\)\s*\{[^}]*\}\s*\}$/);
   // iOS WebKit, where the autosizing happens, needs the -webkit- prefixed property.
   expect(host?.textContent).toMatch(/:where\(html\)\s*\{[^}]*-webkit-text-size-adjust:\s*100%/);
   expect(host?.textContent).toMatch(
@@ -301,7 +301,7 @@ describe("inlineArtifactHtmlAssets", () => {
     expect(scripts).toHaveLength(1);
     expect(scripts[0]?.textContent).toContain("window.ok = 1;");
     const styles = Array.from(reparsed.querySelectorAll("style")).filter(
-      (s) => !(s.textContent ?? "").startsWith("@layer{:where(html)")
+      (s) => !(s.textContent ?? "").includes(":where(html)")
     );
     expect(styles).toHaveLength(1);
     expect(reparsed.querySelector("b, i")).toBeNull();
