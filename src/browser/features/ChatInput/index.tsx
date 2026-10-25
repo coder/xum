@@ -3662,8 +3662,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     }
                     // Creation favors prompt space; workspaces keep a one-line floor because the
                     // user asked for a shorter chat box. Workspaces hide the shortcut hints, so a
-                    // taller floor reserved for them would only be dead space.
-                    className={variant === "creation" ? "min-h-36" : "min-h-9"}
+                    // taller floor reserved for them would only be dead space. Long placeholders
+                    // (tips, edit/compacting hints) stay on that one line instead of wrapping into
+                    // a second line the empty one-line box would clip.
+                    className={variant === "creation" ? "min-h-36" : "min-h-9 placeholder:truncate"}
                   />
                   {/* Shortcut hints only show in creation, which has room below the prompt. */}
                   {variant === "creation" && input.trim() === "" && !editingMessageForUi && (
