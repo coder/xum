@@ -5,8 +5,11 @@
  * the step's reasoning and step-start intents move the receipt.
  */
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+import type { ToolCallEndEvent } from "@/common/types/stream";
 import assert from "@/common/utils/assert";
+import { modelOnlyNotificationsField } from "@/common/utils/tools/internalToolResultFields";
 import { log, type Logger } from "@/node/services/log";
+import type { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry";
 import type { FoldIntent, FoldStep, FoldView } from "@/node/services/turnEngine/partFold";
 import { isAnthropicMessagesModel } from "@/node/services/turnEngine/StepPreparation";
 import { recordStepStart } from "@/node/services/turnEngine/StreamRetries";
@@ -144,8 +147,94 @@ export function moveAnthropicThinkingReplayPoint(
   return true;
 }
 
+const MAX_ORPHAN_TOOL_RESULT_WARNINGS_PER_STREAM = 3;
+const ORPHAN_TOOL_RESULT_PREVIEW_CHARS = 160;
+const ORPHAN_TOOL_RESULT_MAX_KEYS = 8;
+
+/**
+ * The orphan tool-result warning's view of the output: its shape and a short
+ * preview, never the whole (possibly huge) output. Exported for its unit test.
+ */
+export function summarizeToolResultForLog(output: unknown): Record<string, unknown> {
+  if (output === null) {
+    return { outputType: "null" };
+  }
+
+  if (typeof output === "string") {
+    return {
+      outputType: "string",
+      outputLength: output.length,
+      outputPreview: output.slice(0, ORPHAN_TOOL_RESULT_PREVIEW_CHARS),
+    };
+  }
+
+  if (typeof output === "number" || typeof output === "boolean") {
+    return {
+      outputType: typeof output,
+      outputPreview: String(output),
+    };
+  }
+
+  if (Array.isArray(output)) {
+    return {
+      outputType: "array",
+      outputLength: output.length,
+      firstItemType:
+        output.length > 0 && output[0] !== null
+          ? typeof output[0]
+          : output.length > 0
+            ? "null"
+            : undefined,
+    };
+  }
+
+  if (typeof output === "object") {
+    const outputRecord = output as Record<string, unknown>;
+    const keys = Object.keys(outputRecord);
+    const summary: Record<string, unknown> = {
+      outputType: "object",
+      outputKeyCount: keys.length,
+      outputKeys: keys.slice(0, ORPHAN_TOOL_RESULT_MAX_KEYS),
+    };
+
+    if (typeof outputRecord.type === "string") {
+      summary.outputFormat = outputRecord.type;
+    }
+
+    if (Array.isArray(outputRecord.value)) {
+      summary.outputValueLength = outputRecord.value.length;
+    }
+
+    return summary;
+  }
+
+  return {
+    outputType: typeof output,
+    outputPreview: JSON.stringify(output),
+  };
+}
+
+// Ensure per-stream part timestamps are strictly monotonic.
+//
+// Date.now() is millisecond-granularity, so two distinct chunks with identical text emitted in the
+// same millisecond can otherwise collide on (timestamp, delta) during reconnect replay buffering.
+//
+// Part timestamps are record times (stored in history, shown and replayed), so they read the
+// wall clock until #7282 moves their consumers to HostClock.
+export function nextPartTimestamp(streamInfo: WorkspaceStreamInfo): number {
+  const now = nodeClock.nowMs();
+  const last = streamInfo.lastPartTimestamp;
+  const timestamp = now <= last ? last + 1 : now;
+  streamInfo.lastPartTimestamp = timestamp;
+  return timestamp;
+}
+
 export interface StepApplyDeps {
-  readonly turnEvents: Pick<TurnEvents<WorkspaceStreamInfo>, "emitTurnEvent">;
+  readonly turnEvents: Pick<
+    TurnEvents<WorkspaceStreamInfo>,
+    "emitTurnEvent" | "takePendingWorkflowRunAttachment" | "emitWorkflowRunAttachedFromAttachment"
+  >;
+  readonly toolCallDisplayRegistry: Pick<ToolCallDisplayRegistry, "take">;
   readonly turnRegistry: Pick<TurnRegistry, "checkSoftCancelStream">;
   readonly usageLedger: Pick<UsageLedger, "recordInFlight" | "recordStep">;
   readonly turnEventEmitter: Pick<TurnEventEmitter, "appendPartAndEmit">;
@@ -158,25 +247,6 @@ export interface StepApplyDeps {
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo
   ) => Promise<void>;
-  /** StreamManager's tool-call completion (the part update, partial flush and events). */
-  readonly finishToolCall: (
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    toolCalls: ToolCallMap,
-    toolCallId: string,
-    toolName: string,
-    output: unknown,
-    providerExecuted?: boolean,
-    modelOnlyNotifications?: string[]
-  ) => Promise<void>;
-  readonly logOrphanToolResult: (
-    workspaceLog: Logger,
-    streamInfo: WorkspaceStreamInfo,
-    part: { toolCallId: string; toolName: string },
-    output: unknown,
-    orphanCount: number,
-    trackedToolCallCount: number
-  ) => void;
 }
 
 export class StepApply {
@@ -267,7 +337,7 @@ export class StepApply {
       }
       case "FinishToolCall":
         // Use shared completion logic (await to ensure partial is flushed before event)
-        return this.deps.finishToolCall(
+        return this.finishToolCall(
           workspaceId,
           streamInfo,
           loop.toolCalls,
@@ -331,7 +401,7 @@ export class StepApply {
       }
       case "LogOrphanToolResult":
         loop.orphanToolResultCount += 1;
-        this.deps.logOrphanToolResult(
+        this.logOrphanToolResult(
           loop.workspaceLog,
           streamInfo,
           { toolCallId: intent.toolCallId, toolName: intent.toolName },
@@ -472,5 +542,155 @@ export class StepApply {
     });
 
     return true;
+  }
+
+  /**
+   * Complete a tool call by updating its part and emitting tool-call-end event.
+   * CRITICAL: Flushes partial to disk BEFORE emitting event to prevent race conditions
+   * where listeners (e.g., sendQueuedMessages) read stale partial data.
+   */
+  private async completeToolCall(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    toolCalls: ToolCallMap,
+    toolCallId: string,
+    toolName: string,
+    output: unknown,
+    providerExecuted?: boolean,
+    modelOnlyNotifications?: string[]
+  ): Promise<void> {
+    // Find and update the existing tool part
+    const existingPartIndex = streamInfo.parts.findIndex(
+      (p) => p.type === "dynamic-tool" && p.toolCallId === toolCallId
+    );
+    const pendingAttachment = this.deps.turnEvents.takePendingWorkflowRunAttachment(
+      streamInfo,
+      toolCallId
+    );
+    const mcpServer = streamInfo.executionScope
+      ? this.deps.toolCallDisplayRegistry.take(streamInfo.executionScope, toolCallId)
+      : undefined;
+
+    if (existingPartIndex !== -1) {
+      const existingPart = streamInfo.parts[existingPartIndex];
+      if (existingPart.type === "dynamic-tool") {
+        streamInfo.parts[existingPartIndex] = {
+          ...existingPart,
+          ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
+          ...(mcpServer ? { mcpServer } : {}),
+          state: "output-available" as const,
+          output,
+          // Set even when undefined: an earlier completion's notes must not outlive it (#6665).
+          modelOnlyNotifications,
+        };
+      }
+    } else {
+      // Fallback: if the matching tool-call part is missing, still persist output so the UI
+      // does not stay stuck in input-available. Input may be missing for provider-native tools.
+      const toolCall = toolCalls.get(toolCallId);
+      streamInfo.parts.push({
+        type: "dynamic-tool" as const,
+        toolCallId,
+        toolName,
+        state: "output-available" as const,
+        input: toolCall?.input ?? null,
+        output,
+        ...modelOnlyNotificationsField(modelOnlyNotifications),
+        ...(mcpServer ? { mcpServer } : {}),
+        timestamp: nextPartTimestamp(streamInfo),
+        ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
+      });
+    }
+
+    // CRITICAL: Flush partial to disk BEFORE emitting event
+    // This ensures listeners (like sendQueuedMessages) see the tool result when they
+    // read partial.json via commitPartial. Without this await, there's a race condition
+    // where the partial is read before the tool result is written, causing "amnesia".
+    await this.deps.flushPartialWrite(workspaceId, streamInfo);
+    if (pendingAttachment != null) {
+      this.deps.turnEvents.emitWorkflowRunAttachedFromAttachment({
+        workspaceId,
+        messageId: streamInfo.messageId,
+        toolCallId,
+        attachment: pendingAttachment,
+      });
+    }
+
+    // Emit tool-call-end event (listeners can now safely read partial)
+    const completionTimestamp = nextPartTimestamp(streamInfo);
+    streamInfo.toolCompletionTimestamps ??= new Map();
+    streamInfo.toolCompletionTimestamps.set(toolCallId, completionTimestamp);
+    this.deps.turnEvents.emitTurnEvent({
+      type: "tool-call-end",
+      workspaceId: workspaceId as string,
+      messageId: streamInfo.messageId,
+      toolCallId,
+      toolName,
+      result: output,
+      ...(mcpServer ? { mcpServer } : {}),
+      ...(providerExecuted === true ? { providerExecuted: true } : {}),
+      timestamp: completionTimestamp,
+    } as ToolCallEndEvent);
+  }
+
+  private async finishToolCall(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    toolCalls: ToolCallMap,
+    toolCallId: string,
+    toolName: string,
+    output: unknown,
+    providerExecuted?: boolean,
+    modelOnlyNotifications?: string[]
+  ): Promise<void> {
+    await this.completeToolCall(
+      workspaceId,
+      streamInfo,
+      toolCalls,
+      toolCallId,
+      toolName,
+      output,
+      providerExecuted,
+      modelOnlyNotifications
+    );
+    await this.deps.turnRegistry.checkSoftCancelStream(workspaceId, streamInfo);
+  }
+
+  private logOrphanToolResult(
+    workspaceLog: Logger,
+    streamInfo: WorkspaceStreamInfo,
+    part: { toolCallId: string; toolName: string },
+    output: unknown,
+    orphanCount: number,
+    trackedToolCallCount: number
+  ): void {
+    if (orphanCount > MAX_ORPHAN_TOOL_RESULT_WARNINGS_PER_STREAM) {
+      return;
+    }
+
+    workspaceLog.warn(
+      "[streamManager] Received tool-result without matching tool-call map entry; persisting fallback output",
+      {
+        messageId: streamInfo.messageId,
+        model: streamInfo.model,
+        toolCallId: part.toolCallId,
+        toolName: part.toolName,
+        orphanCount,
+        trackedToolCallCount,
+        isWebSearch: part.toolName === "web_search",
+        ...summarizeToolResultForLog(output),
+      }
+    );
+
+    if (orphanCount === MAX_ORPHAN_TOOL_RESULT_WARNINGS_PER_STREAM) {
+      workspaceLog.warn(
+        "[streamManager] Suppressing additional orphan tool-result warnings for this stream",
+        {
+          messageId: streamInfo.messageId,
+          model: streamInfo.model,
+          suppressedAfter: orphanCount,
+        }
+      );
+    }
   }
 }

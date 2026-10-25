@@ -16,7 +16,6 @@ import { log, type Logger } from "./log";
 import type {
   StreamAbortEvent,
   StreamAbortReason,
-  ToolCallEndEvent,
   ToolCallExecutionStartEvent,
   CompletedMessagePart,
   WorkflowRunAttachedEvent,
@@ -33,7 +32,6 @@ import {
   normalizeUsage,
   withCacheWriteMetadata,
 } from "@/common/utils/tokens/usageHelpers";
-import { modelOnlyNotificationsField } from "@/common/utils/tools/internalToolResultFields";
 import { buildRequiredToolPatterns } from "@/common/utils/tools/toolPolicy";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 import {
@@ -117,9 +115,9 @@ import { RefusalFallback } from "@/node/services/turnEngine/RefusalFallback";
 import { StreamRetries } from "@/node/services/turnEngine/StreamRetries";
 import {
   moveAnthropicThinkingReplayPoint,
+  nextPartTimestamp,
   StepApply,
   turnReplayOffAfterServerTool,
-  type ToolCallMap,
 } from "@/node/services/turnEngine/StepApply";
 import { TurnResources } from "@/node/services/turnEngine/TurnResources";
 import { TurnEngine, type TurnExecutionOptions } from "@/node/services/turnEngine/TurnEngine";
@@ -130,84 +128,6 @@ export {
 
 // Disable noisy AI SDK warning logging.
 globalThis.AI_SDK_LOG_WARNINGS = false;
-
-const MAX_ORPHAN_TOOL_RESULT_WARNINGS_PER_STREAM = 3;
-const ORPHAN_TOOL_RESULT_PREVIEW_CHARS = 160;
-const ORPHAN_TOOL_RESULT_MAX_KEYS = 8;
-
-function summarizeToolResultForLog(output: unknown): Record<string, unknown> {
-  if (output === null) {
-    return { outputType: "null" };
-  }
-
-  if (typeof output === "string") {
-    return {
-      outputType: "string",
-      outputLength: output.length,
-      outputPreview: output.slice(0, ORPHAN_TOOL_RESULT_PREVIEW_CHARS),
-    };
-  }
-
-  if (typeof output === "number" || typeof output === "boolean") {
-    return {
-      outputType: typeof output,
-      outputPreview: String(output),
-    };
-  }
-
-  if (Array.isArray(output)) {
-    return {
-      outputType: "array",
-      outputLength: output.length,
-      firstItemType:
-        output.length > 0 && output[0] !== null
-          ? typeof output[0]
-          : output.length > 0
-            ? "null"
-            : undefined,
-    };
-  }
-
-  if (typeof output === "object") {
-    const outputRecord = output as Record<string, unknown>;
-    const keys = Object.keys(outputRecord);
-    const summary: Record<string, unknown> = {
-      outputType: "object",
-      outputKeyCount: keys.length,
-      outputKeys: keys.slice(0, ORPHAN_TOOL_RESULT_MAX_KEYS),
-    };
-
-    if (typeof outputRecord.type === "string") {
-      summary.outputFormat = outputRecord.type;
-    }
-
-    if (Array.isArray(outputRecord.value)) {
-      summary.outputValueLength = outputRecord.value.length;
-    }
-
-    return summary;
-  }
-
-  return {
-    outputType: typeof output,
-    outputPreview: JSON.stringify(output),
-  };
-}
-
-// Ensure per-stream part timestamps are strictly monotonic.
-//
-// Date.now() is millisecond-granularity, so two distinct chunks with identical text emitted in the
-// same millisecond can otherwise collide on (timestamp, delta) during reconnect replay buffering.
-//
-// Part timestamps are record times (stored in history, shown and replayed), so they read the
-// wall clock until #7282 moves their consumers to HostClock.
-function nextPartTimestamp(streamInfo: WorkspaceStreamInfo): number {
-  const now = nodeClock.nowMs();
-  const last = streamInfo.lastPartTimestamp;
-  const timestamp = now <= last ? last + 1 : now;
-  streamInfo.lastPartTimestamp = timestamp;
-  return timestamp;
-}
 
 /**
  * Optional collaborators for StreamManager. Production omits both; tests
@@ -602,49 +522,14 @@ export class StreamManager {
       turnRegistry: this.turnRegistry,
       usageLedger: this.usageLedger,
       turnEventEmitter: this.turnEventEmitter,
+      toolCallDisplayRegistry: this.toolCallDisplayRegistry,
       // Forward at call time: whitebox tests replace tokenTracker after construction
-      // (Reflect.set), and tool completion stays in StreamManager.
+      // (Reflect.set).
       tokenTracker: { countTokens: (text) => this.tokenTracker.countTokens(text) },
       schedulePartialWrite: (workspaceId, streamInfo) =>
         this.schedulePartialWrite(workspaceId, streamInfo),
       flushPartialWrite: (workspaceId, streamInfo) =>
         this.flushPartialWrite(workspaceId, streamInfo),
-      finishToolCall: (
-        workspaceId,
-        streamInfo,
-        toolCalls,
-        toolCallId,
-        toolName,
-        output,
-        providerExecuted,
-        modelOnlyNotifications
-      ) =>
-        this.finishToolCall(
-          workspaceId,
-          streamInfo,
-          toolCalls,
-          toolCallId,
-          toolName,
-          output,
-          providerExecuted,
-          modelOnlyNotifications
-        ),
-      logOrphanToolResult: (
-        workspaceLog,
-        streamInfo,
-        part,
-        output,
-        orphanCount,
-        trackedToolCallCount
-      ) =>
-        this.logOrphanToolResult(
-          workspaceLog,
-          streamInfo,
-          part,
-          output,
-          orphanCount,
-          trackedToolCallCount
-        ),
     });
   }
 
@@ -1368,156 +1253,6 @@ export class StreamManager {
     stepTracker?: StepMessageTracker
   ): Awaited<ReturnType<typeof streamText>> {
     return this.stepPreparation.createStreamResult(request, abortController, stepTracker);
-  }
-
-  /**
-   * Complete a tool call by updating its part and emitting tool-call-end event.
-   * CRITICAL: Flushes partial to disk BEFORE emitting event to prevent race conditions
-   * where listeners (e.g., sendQueuedMessages) read stale partial data.
-   */
-  private async completeToolCall(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    toolCalls: ToolCallMap,
-    toolCallId: string,
-    toolName: string,
-    output: unknown,
-    providerExecuted?: boolean,
-    modelOnlyNotifications?: string[]
-  ): Promise<void> {
-    // Find and update the existing tool part
-    const existingPartIndex = streamInfo.parts.findIndex(
-      (p) => p.type === "dynamic-tool" && p.toolCallId === toolCallId
-    );
-    const pendingAttachment = this.turnEvents.takePendingWorkflowRunAttachment(
-      streamInfo,
-      toolCallId
-    );
-    const mcpServer = streamInfo.executionScope
-      ? this.toolCallDisplayRegistry.take(streamInfo.executionScope, toolCallId)
-      : undefined;
-
-    if (existingPartIndex !== -1) {
-      const existingPart = streamInfo.parts[existingPartIndex];
-      if (existingPart.type === "dynamic-tool") {
-        streamInfo.parts[existingPartIndex] = {
-          ...existingPart,
-          ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
-          ...(mcpServer ? { mcpServer } : {}),
-          state: "output-available" as const,
-          output,
-          // Set even when undefined: an earlier completion's notes must not outlive it (#6665).
-          modelOnlyNotifications,
-        };
-      }
-    } else {
-      // Fallback: if the matching tool-call part is missing, still persist output so the UI
-      // does not stay stuck in input-available. Input may be missing for provider-native tools.
-      const toolCall = toolCalls.get(toolCallId);
-      streamInfo.parts.push({
-        type: "dynamic-tool" as const,
-        toolCallId,
-        toolName,
-        state: "output-available" as const,
-        input: toolCall?.input ?? null,
-        output,
-        ...modelOnlyNotificationsField(modelOnlyNotifications),
-        ...(mcpServer ? { mcpServer } : {}),
-        timestamp: nextPartTimestamp(streamInfo),
-        ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
-      });
-    }
-
-    // CRITICAL: Flush partial to disk BEFORE emitting event
-    // This ensures listeners (like sendQueuedMessages) see the tool result when they
-    // read partial.json via commitPartial. Without this await, there's a race condition
-    // where the partial is read before the tool result is written, causing "amnesia".
-    await this.flushPartialWrite(workspaceId, streamInfo);
-    if (pendingAttachment != null) {
-      this.turnEvents.emitWorkflowRunAttachedFromAttachment({
-        workspaceId,
-        messageId: streamInfo.messageId,
-        toolCallId,
-        attachment: pendingAttachment,
-      });
-    }
-
-    // Emit tool-call-end event (listeners can now safely read partial)
-    const completionTimestamp = nextPartTimestamp(streamInfo);
-    streamInfo.toolCompletionTimestamps ??= new Map();
-    streamInfo.toolCompletionTimestamps.set(toolCallId, completionTimestamp);
-    this.turnEvents.emitTurnEvent({
-      type: "tool-call-end",
-      workspaceId: workspaceId as string,
-      messageId: streamInfo.messageId,
-      toolCallId,
-      toolName,
-      result: output,
-      ...(mcpServer ? { mcpServer } : {}),
-      ...(providerExecuted === true ? { providerExecuted: true } : {}),
-      timestamp: completionTimestamp,
-    } as ToolCallEndEvent);
-  }
-
-  private async finishToolCall(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    toolCalls: ToolCallMap,
-    toolCallId: string,
-    toolName: string,
-    output: unknown,
-    providerExecuted?: boolean,
-    modelOnlyNotifications?: string[]
-  ): Promise<void> {
-    await this.completeToolCall(
-      workspaceId,
-      streamInfo,
-      toolCalls,
-      toolCallId,
-      toolName,
-      output,
-      providerExecuted,
-      modelOnlyNotifications
-    );
-    await this.turnRegistry.checkSoftCancelStream(workspaceId, streamInfo);
-  }
-
-  private logOrphanToolResult(
-    workspaceLog: Logger,
-    streamInfo: WorkspaceStreamInfo,
-    part: { toolCallId: string; toolName: string },
-    output: unknown,
-    orphanCount: number,
-    trackedToolCallCount: number
-  ): void {
-    if (orphanCount > MAX_ORPHAN_TOOL_RESULT_WARNINGS_PER_STREAM) {
-      return;
-    }
-
-    workspaceLog.warn(
-      "[streamManager] Received tool-result without matching tool-call map entry; persisting fallback output",
-      {
-        messageId: streamInfo.messageId,
-        model: streamInfo.model,
-        toolCallId: part.toolCallId,
-        toolName: part.toolName,
-        orphanCount,
-        trackedToolCallCount,
-        isWebSearch: part.toolName === "web_search",
-        ...summarizeToolResultForLog(output),
-      }
-    );
-
-    if (orphanCount === MAX_ORPHAN_TOOL_RESULT_WARNINGS_PER_STREAM) {
-      workspaceLog.warn(
-        "[streamManager] Suppressing additional orphan tool-result warnings for this stream",
-        {
-          messageId: streamInfo.messageId,
-          model: streamInfo.model,
-          suppressedAfter: orphanCount,
-        }
-      );
-    }
   }
 
   /** Emit a PTC code_execution nested tool event (TurnEventEmitter.emitNestedToolEvent). */
