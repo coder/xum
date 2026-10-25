@@ -790,40 +790,79 @@ const localPlugin = {
         const allowed = context.options[0]?.allow?.[relFile] ?? 0;
         const found = [];
         const TIMERS = new Set(["setTimeout", "setInterval"]);
-        // Local names bound to a timer by an import from "timers" or "timers/promises"
-        // (`import { setTimeout as delay } from "node:timers/promises"`), and the namespace or
-        // default bindings of those modules (`timers.setTimeout`).
-        const timerAliases = new Set();
-        const timerModules = new Set();
-        const isTimer = (node) =>
-          node.type === "Identifier" && (TIMERS.has(node.name) || timerAliases.has(node.name));
-        const memberOf = (node, object) =>
+        const TIMER_MODULES = new Set(["timers", "timers/promises"]);
+        // Declaring identifiers of the bindings that the "timers" and "timers/promises" modules
+        // give: a timer under any name (`import { setTimeout as delay }`,
+        // `const { setTimeout: delay } = require(...)`), or the module itself (`import * as
+        // timers`, `import timers = require(...)`, `const timers = require(...)`).
+        const timerBindings = new Set();
+        const moduleBindings = new Set();
+        const isTimerModule = (source) =>
+          source?.type === "Literal" &&
+          typeof source.value === "string" &&
+          TIMER_MODULES.has(source.value.replace(/^node:/, ""));
+        const isRequireOfTimers = (node) =>
+          node?.type === "CallExpression" &&
+          node.callee.type === "Identifier" &&
+          node.callee.name === "require" &&
+          isTimerModule(node.arguments[0]);
+        // `globalThis` or Node's `global`: both name the global object.
+        const isGlobalObject = (node) =>
+          node.type === "Identifier" && (node.name === "globalThis" || node.name === "global");
+        const globalMember = (node, name) =>
           node.type === "MemberExpression" &&
           !node.computed &&
-          node.object.type === "Identifier" &&
-          node.object.name === object;
-        // `Date` or `globalThis.Date`: both name the host clock.
+          isGlobalObject(node.object) &&
+          node.property.name === name;
+        // `Date`, `globalThis.Date` or `global.Date`: each names the host clock.
         const isDate = (node) =>
-          (node.type === "Identifier" && node.name === "Date") ||
-          (memberOf(node, "globalThis") && node.property.name === "Date");
+          (node.type === "Identifier" && node.name === "Date") || globalMember(node, "Date");
+        // A call whose callee needs its binding checked at the end: `id` must resolve to one of
+        // `bindings`, so a parameter or local that shadows the import is not a timer.
+        const viaBinding = (node, what, id, bindings) =>
+          found.push({ node, what, check: { id, bindings } });
+        const resolvesTo = ({ id, bindings }) =>
+          resolveVariable(context.sourceCode, id)?.identifiers.some((def) => bindings.has(def)) ??
+          false;
         return {
-          // Imports are scanned first, so a call above a (hoisted) import still counts.
-          Program(program) {
-            for (const statement of program.body) {
-              if (statement.type !== "ImportDeclaration" || statement.importKind === "type") {
-                continue;
+          ImportDeclaration(node) {
+            if (node.importKind === "type" || !isTimerModule(node.source)) return;
+            for (const specifier of node.specifiers) {
+              if (specifier.type !== "ImportSpecifier") {
+                moduleBindings.add(specifier.local);
+              } else if (
+                specifier.importKind !== "type" &&
+                TIMERS.has(specifier.imported.name ?? specifier.imported.value)
+              ) {
+                timerBindings.add(specifier.local);
               }
-              const module = String(statement.source.value).replace(/^node:/, "");
-              if (module !== "timers" && module !== "timers/promises") continue;
-              for (const specifier of statement.specifiers) {
-                if (specifier.type !== "ImportSpecifier") {
-                  timerModules.add(specifier.local.name);
-                } else if (
-                  specifier.importKind !== "type" &&
-                  TIMERS.has(specifier.imported.name ?? specifier.imported.value)
-                ) {
-                  timerAliases.add(specifier.local.name);
-                }
+            }
+          },
+          // `import timers = require("node:timers")` (TypeScript import assignment).
+          TSImportEqualsDeclaration(node) {
+            if (
+              node.importKind !== "type" &&
+              node.moduleReference.type === "TSExternalModuleReference" &&
+              isTimerModule(node.moduleReference.expression)
+            ) {
+              moduleBindings.add(node.id);
+            }
+          },
+          VariableDeclarator(node) {
+            if (!isRequireOfTimers(node.init)) return;
+            if (node.id.type === "Identifier") {
+              moduleBindings.add(node.id);
+              return;
+            }
+            if (node.id.type !== "ObjectPattern") return;
+            for (const property of node.id.properties) {
+              if (
+                property.type === "Property" &&
+                !property.computed &&
+                TIMERS.has(property.key.name ?? property.key.value) &&
+                property.value.type === "Identifier"
+              ) {
+                timerBindings.add(property.value);
               }
             }
           },
@@ -839,25 +878,35 @@ const localPlugin = {
             } else if (isDate(callee)) {
               // `Date()` without `new` returns the current time as a string.
               found.push({ node, what: "Date()" });
-            } else if (isTimer(callee)) {
+            } else if (callee.type === "Identifier" && TIMERS.has(callee.name)) {
               found.push({ node, what: `${callee.name}()` });
-            } else if (memberOf(callee, "globalThis") && TIMERS.has(callee.property.name)) {
-              found.push({ node, what: `globalThis.${callee.property.name}()` });
+            } else if (callee.type === "Identifier") {
+              viaBinding(node, `${callee.name}()`, callee, timerBindings);
             } else if (
               callee.type === "MemberExpression" &&
               !callee.computed &&
-              callee.object.type === "Identifier" &&
-              timerModules.has(callee.object.name) &&
-              TIMERS.has(callee.property.name)
+              TIMERS.has(callee.property.name) &&
+              isGlobalObject(callee.object)
             ) {
               found.push({ node, what: `${callee.object.name}.${callee.property.name}()` });
             } else if (
               callee.type === "MemberExpression" &&
               !callee.computed &&
+              TIMERS.has(callee.property.name) &&
+              callee.object.type === "Identifier"
+            ) {
+              viaBinding(
+                node,
+                `${callee.object.name}.${callee.property.name}()`,
+                callee.object,
+                moduleBindings
+              );
+            } else if (
+              callee.type === "MemberExpression" &&
+              !callee.computed &&
               callee.property.name === "timeout" &&
               ((callee.object.type === "Identifier" && callee.object.name === "AbortSignal") ||
-                (memberOf(callee.object, "globalThis") &&
-                  callee.object.property.name === "AbortSignal"))
+                globalMember(callee.object, "AbortSignal"))
             ) {
               // A host timer that aborts the signal: the TestClock cannot reach it.
               found.push({ node, what: "AbortSignal.timeout()" });
@@ -871,14 +920,16 @@ const localPlugin = {
           "Program:exit"(program) {
             // The allow entry is an exact count, so it can only go down: a move PR that
             // removes reads must lower its entry, and a new read fails.
-            for (const { node, what } of found.slice(allowed)) {
+            // Bindings are known only now: an import or require can follow the call.
+            const reads = found.filter(({ check }) => check === undefined || resolvesTo(check));
+            for (const { node, what } of reads.slice(allowed)) {
               context.report({ node, messageId: "raw", data: { what } });
             }
-            if (found.length < allowed) {
+            if (reads.length < allowed) {
               context.report({
                 node: program,
                 messageId: "lowerAllow",
-                data: { found: String(found.length), allowed: String(allowed) },
+                data: { found: String(reads.length), allowed: String(allowed) },
               });
             }
           },
@@ -929,12 +980,13 @@ const localPlugin = {
           // `Date.now = () => t` (or `globalThis.Date.now = ...`) replaces the clock directly.
           AssignmentExpression(node) {
             const left = node.left;
+            // `Date`, `globalThis.Date` or Node's `global.Date`: one process-wide clock.
             const isDateObject = (object) =>
               (object.type === "Identifier" && object.name === "Date") ||
               (object.type === "MemberExpression" &&
                 !object.computed &&
                 object.object.type === "Identifier" &&
-                object.object.name === "globalThis" &&
+                (object.object.name === "globalThis" || object.object.name === "global") &&
                 object.property.name === "Date");
             if (
               left.type === "MemberExpression" &&

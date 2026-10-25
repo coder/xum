@@ -85,6 +85,34 @@ test("reports timers imported from the timers modules under another name", () =>
   ]);
 });
 
+test("reports timers that CommonJS forms load from the timers modules", () => {
+  expect(rawClock(`import timers = require("node:timers");\ntimers.setTimeout(fire, 10);`)).toEqual(
+    ["raw"]
+  );
+  expect(rawClock(`const timers = require("timers");\ntimers.setInterval(tick, 10);`)).toEqual([
+    "raw",
+  ]);
+  expect(
+    rawClock(`const { setTimeout: delay } = require("node:timers/promises");\nawait delay(10);`)
+  ).toEqual(["raw"]);
+});
+
+test("passes a local name that shadows an imported timer", () => {
+  const imported = `import { setTimeout as delay } from "node:timers/promises";\n`;
+  expect(rawClock(`${imported}function run(delay: () => void) {\n  delay();\n}`)).toEqual([]);
+  expect(rawClock(`${imported}{\n  const delay = () => 1;\n  delay();\n}`)).toEqual([]);
+  const namespace = `import * as timers from "node:timers";\n`;
+  expect(rawClock(`${namespace}function run(timers: T) {\n  timers.setTimeout(f, 1);\n}`)).toEqual(
+    []
+  );
+});
+
+test("reports Node's global object like globalThis", () => {
+  expect(rawClock(`const t = global.Date.now();`)).toEqual(["raw"]);
+  expect(rawClock(`global.setTimeout(() => undefined, 10);`)).toEqual(["raw"]);
+  expect(rawClock(`const signal = global.AbortSignal.timeout(10);`)).toEqual(["raw"]);
+});
+
 test("passes non-timer imports from the timers modules and other abort signals", () => {
   expect(
     rawClock(`import { setImmediate as yieldNow } from "node:timers/promises";\nawait yieldNow();`)
@@ -132,6 +160,7 @@ test("reports a direct Date.now assignment in tests that moved to the TestClock"
   const patch = (code: string) => ids("no-global-clock-patch", code);
   expect(patch(`Date.now = () => 1;`)).toEqual(["patch"]);
   expect(patch(`globalThis.Date.now = () => 1;`)).toEqual(["patch"]);
+  expect(patch(`global.Date.now = () => 1;`)).toEqual(["patch"]);
   expect(patch(`Date["now"] = () => 1;`)).toEqual(["patch"]);
   expect(patch(`const now = Date.now;`)).toEqual([]);
   expect(patch(`clock.now = () => 1;`)).toEqual([]);
