@@ -46,7 +46,10 @@ function unstartableFallback(): ModelFallbackOptions {
 }
 
 function preparedFallback(
-  overrides: { onStreamConstructed?: () => Promise<void> } = {}
+  overrides: {
+    onStreamConstructed?: () => Promise<void>;
+    initialMetadataPatch?: { systemMessageTokens: number };
+  } = {}
 ): ModelFallbackOptions & { prepare: ReturnType<typeof mock> } {
   const prepare = mock((nextModelString: string, _options?: ModelFallbackPrepareOptions) =>
     Promise.resolve(
@@ -381,6 +384,27 @@ describe("StreamManager - fallback construction callbacks", () => {
 });
 
 describe("StreamManager - fallback volatile-tail record (mechanism 10)", () => {
+  test("the fallback's metadata patch reaches the committed row", async () => {
+    // The patch describes the fallback's request (system tokens, route), not the refused one's.
+    const fallback = preparedFallback({ initialMetadataPatch: { systemMessageTokens: 42 } });
+    const workspaceId = "fallback-metadata-patch-workspace";
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([
+        { chunks: [REFUSAL_FINISH], usage: NO_USAGE },
+        { chunks: [{ type: "text-delta", text: "fallback answer" }, STOP_FINISH], usage: NO_USAGE },
+      ]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      modelString: KNOWN_MODELS.SONNET.id,
+      modelFallback: fallback,
+    });
+    expect(completion.status).toBe("completed");
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    expect(history.data.at(-1)?.metadata?.systemMessageTokens).toBe(42);
+  });
+
   test("a step-0 thinking rebuild on the fallback keeps its newer tail record", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6srL1S): the fallback stream may prepare its first step before
     // activation finishes. A thinking change consumed there rebuilds the request and records
