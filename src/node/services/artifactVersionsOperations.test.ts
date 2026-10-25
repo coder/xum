@@ -446,7 +446,11 @@ describe("recordArtifactVersion results", () => {
       ...nodeSessionLocks,
       acquireCrossProcessLock: () => Promise.reject(new Error("lock store down")),
     };
-    await expect(record("1", { locks })).rejects.toThrow("lock store down");
+    const failure = await record("1", { locks }).then(
+      () => "resolved",
+      (error: unknown) => (error as Error).message
+    );
+    expect(failure).toBe("lock store down");
   });
 });
 
