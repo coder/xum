@@ -71,7 +71,7 @@ function createStatusPageTools(draft: PageDraft): Record<"edit_page" | "write_pa
         if (first === -1) {
           return { success: false, error: "old_string was not found in the page." };
         }
-        if (draft.current.indexOf(old_string, first + 1) !== -1) {
+        if (draft.current.includes(old_string, first + 1)) {
           return {
             success: false,
             error: "old_string appears more than once; include more surrounding text.",
