@@ -32,6 +32,7 @@ import type { BlobStore } from "@/node/utils/journal/blobStore";
 import {
   sharedDurableEventJournal,
   type DurableEventJournal,
+  type DurableEventWriteOptions,
 } from "@/node/utils/journal/durableEventJournal";
 import {
   canDeleteEvictedBlob,
@@ -76,6 +77,12 @@ export interface RefinementEmitArgs {
    * which only applies inverses to the host filesystem.
    */
   runtime?: "remote";
+  /**
+   * false: never create the session dir, so a missing one drops the row
+   * (ENOENT, logged). Default true. The tool path passes false (see
+   * appendRefinementEventFromTool).
+   */
+  createSessionDir?: boolean;
 }
 
 /** Shared by the rollback engine to compare current files against `postState`. */
@@ -107,7 +114,8 @@ function inverseQuotaCharge(sizeBytes: number): number {
  */
 export async function resolveRefinementInverse(
   blobs: BlobStore,
-  draft: RefinementInverseDraft
+  draft: RefinementInverseDraft,
+  putOptions?: { createParentDir?: boolean }
 ): Promise<{ inverse: RefinementInverse; publishedBlobs: BlobQuotaEntry[] }> {
   if (draft.op !== "restore-files") {
     return { inverse: draft, publishedBlobs: [] };
@@ -115,7 +123,7 @@ export async function resolveRefinementInverse(
   const publishedBlobs: BlobQuotaEntry[] = [];
   const files = await Promise.all(
     draft.files.map(async (file) => {
-      const { ref, size } = await blobs.put(file.content);
+      const { ref, size } = await blobs.put(file.content, putOptions);
       publishedBlobs.push({ ref, size: inverseQuotaCharge(size) });
       return { path: file.path, blobRef: ref };
     })
@@ -165,7 +173,8 @@ const reclamationStates = new WeakMap<DurableEventJournal, RefinementReclamation
  */
 export async function reclaimExcessRefinementInverseBlobs(
   journal: DurableEventJournal,
-  published: BlobQuotaEntry[]
+  published: BlobQuotaEntry[],
+  writeOptions?: DurableEventWriteOptions
 ): Promise<void> {
   await journal.withBlobLock(async () => {
     let state = reclamationStates.get(journal);
@@ -219,7 +228,7 @@ export async function reclaimExcessRefinementInverseBlobs(
       if (!deletable) continue;
       await journal.deleteBlobUnderLock(ref);
     }
-  });
+  }, writeOptions);
 }
 
 /**
@@ -231,12 +240,15 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
     assert(args.sessionDir.length > 0, "refinement journal requires a session dir");
     assert(args.workspaceId.length > 0, "refinement journal requires a workspace id");
     const journal = sharedDurableEventJournal(args.sessionDir);
+    const writeOptions: DurableEventWriteOptions = { createSessionDir: args.createSessionDir };
     // Inverse blob puts and the append referencing them run under the journal
     // blob lock: a concurrent reclamation pass must never observe the
     // put→append window (see DurableEventJournal.withBlobLock).
     let publishedBlobs: BlobQuotaEntry[] = [];
     await journal.withBlobLock(async () => {
-      const resolved = await resolveRefinementInverse(journal.blobs, args.inverse);
+      const resolved = await resolveRefinementInverse(journal.blobs, args.inverse, {
+        createParentDir: args.createSessionDir,
+      });
       const inverse = resolved.inverse;
       publishedBlobs = resolved.publishedBlobs;
       // Optional fields are spread conditionally: an explicit `undefined` value
@@ -256,24 +268,27 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
               })),
             }
           : undefined;
-      await journal.append({
-        workspaceId: args.workspaceId,
-        kind: "refinement",
-        data: {
-          kind: args.kind,
-          action: args.action,
-          inverse,
-          evidence,
-          ...(postState !== undefined ? { postState } : {}),
-          ...(args.runtime !== undefined ? { runtime: args.runtime } : {}),
+      await journal.append(
+        {
+          workspaceId: args.workspaceId,
+          kind: "refinement",
+          data: {
+            kind: args.kind,
+            action: args.action,
+            inverse,
+            evidence,
+            ...(postState !== undefined ? { postState } : {}),
+            ...(args.runtime !== undefined ? { runtime: args.runtime } : {}),
+          },
         },
-      });
-    });
+        writeOptions
+      );
+    }, writeOptions);
     // Bound retained inverse payloads per session AFTER releasing the publish
     // lock (reclaim takes it itself; the mutex is non-reentrant). Best-effort:
     // failure must never fail the mutation this row describes.
     try {
-      await reclaimExcessRefinementInverseBlobs(journal, publishedBlobs);
+      await reclaimExcessRefinementInverseBlobs(journal, publishedBlobs, writeOptions);
     } catch (error) {
       log.debug("[refinement] inverse blob reclamation failed; continuing", { error });
     }
@@ -305,5 +320,11 @@ export async function appendRefinementEventFromTool(
     ...args,
     sessionDir: config.workspaceSessionDir,
     workspaceId: config.workspaceId,
+    // A tool call can outlive its turn: an aborted turn leaves a slow
+    // agent_skill_write/agent_skill_delete running, and workspace removal can
+    // delete the session dir before the tool journals here (#7474). A live
+    // turn's session dir always exists (its chat rows are in it), so never
+    // creating it only drops a row that lands after removal.
+    createSessionDir: false,
   });
 }
