@@ -428,6 +428,11 @@ describe("ArtifactViewer renderers", () => {
       postChord();
       expect(replayed).toBe(1);
 
+      // A click in the app also activates it; the page's script can then take focus itself.
+      fireEvent.pointerDown(document.body);
+      postChord();
+      expect(replayed).toBe(1);
+
       // A frame that stopped rendering keeps focus in the browser; that focus does not count.
       frame.parentElement!.style.display = "none";
       expect(document.activeElement).toBe(frame);

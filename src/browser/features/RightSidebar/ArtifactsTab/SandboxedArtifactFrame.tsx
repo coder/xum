@@ -71,6 +71,9 @@ function frameHasFocus(frame: HTMLIFrameElement | null): frame is HTMLIFrameElem
   return frame != null && document.activeElement === frame && frame.checkVisibility();
 }
 
+/** Chromium's transient user activation lasts 5 s. */
+const TRANSIENT_ACTIVATION_MS = 5000;
+
 /**
  * SECURITY AUDIT: gate for `window.xum.openWorkspace`, the frame's "C" (annotate) key and a
  * `window.xum.send` that skips the confirm strip. The artifact's script can post any of them at
@@ -86,10 +89,35 @@ function frameHasFocus(frame: HTMLIFrameElement | null): frame is HTMLIFrameElem
  * artifact. The gate cannot tell a click handler from a timer that fires soon after the click,
  * so the message text is page data the user did not review (the agent is told so).
  */
-function hasLiveUserGesture(frame: HTMLIFrameElement | null): boolean {
+function hasLiveUserGesture(frame: HTMLIFrameElement | null, lastAppInputAt: number): boolean {
   const activation = (navigator as Navigator & { userActivation?: { isActive?: boolean } })
     .userActivation;
-  return frameHasFocus(frame) && activation?.isActive === true;
+  // The page's script can take focus itself (window.focus()) right after a click or key press
+  // in the app, whose activation then still looks live. Input inside the frame never reaches the
+  // app's listeners, so activation counts only when no app input could have caused it.
+  const appInputMayBeTheGesture = Date.now() - lastAppInputAt < TRANSIENT_ACTIVATION_MS;
+  return frameHasFocus(frame) && activation?.isActive === true && !appInputMayBeTheGesture;
+}
+
+/**
+ * When the user last pressed a pointer or key in the app itself (not in a frame), for
+ * hasLiveUserGesture. Replayed frame chords are dispatched on the iframe and do not count.
+ */
+function useLastAppInputAt(): { current: number } {
+  const lastAppInputAtRef = useRef(Number.NEGATIVE_INFINITY);
+  useEffect(() => {
+    const onInput = (event: Event) => {
+      if ((event.target as Partial<Element> | null)?.tagName === "IFRAME") return;
+      lastAppInputAtRef.current = Date.now();
+    };
+    window.addEventListener("pointerdown", onInput, true);
+    window.addEventListener("keydown", onInput, true);
+    return () => {
+      window.removeEventListener("pointerdown", onInput, true);
+      window.removeEventListener("keydown", onInput, true);
+    };
+  }, []);
+  return lastAppInputAtRef;
 }
 
 /**
@@ -107,9 +135,10 @@ function hasLiveUserGesture(frame: HTMLIFrameElement | null): boolean {
  */
 function replayFrameSidebarKey(
   frame: HTMLIFrameElement | null,
-  message: { chord: ArtifactFrameChord; ctrlKey: boolean; metaKey: boolean }
+  message: { chord: ArtifactFrameChord; ctrlKey: boolean; metaKey: boolean },
+  lastAppInputAt: number
 ): void {
-  if (!hasLiveUserGesture(frame) || frame == null) return;
+  if (!hasLiveUserGesture(frame, lastAppInputAt) || frame == null) return;
   const keybind = ARTIFACT_FRAME_CHORDS[message.chord];
   const event = new KeyboardEvent("keydown", {
     key: keybind.key,
@@ -132,9 +161,10 @@ function replayFrameSidebarKey(
 function takeFrameSendOrigin(
   frame: HTMLIFrameElement | null,
   lastClickSendAt: { current: number | null },
+  lastAppInputAt: number,
   now = Date.now()
 ): ArtifactSendOrigin {
-  if (!hasLiveUserGesture(frame)) return "ask";
+  if (!hasLiveUserGesture(frame, lastAppInputAt)) return "ask";
   const last = lastClickSendAt.current;
   if (last != null && now - last < ARTIFACT_CLICK_SEND_WINDOW_MS) return "ask";
   lastClickSendAt.current = now;
@@ -150,16 +180,17 @@ type ArtifactFrameKeyMessage = Extract<
 function handleFrameKeyMessage(
   message: ArtifactFrameKeyMessage,
   frame: HTMLIFrameElement | null,
-  onFrameKey: ((key: ArtifactFrameKey) => void) | undefined
+  onFrameKey: ((key: ArtifactFrameKey) => void) | undefined,
+  lastAppInputAt: number
 ): void {
   if (message.type === "sidebarKey") {
-    replayFrameSidebarKey(frame, message);
+    replayFrameSidebarKey(frame, message, lastAppInputAt);
     return;
   }
   // "C" (the annotate shortcut) can turn annotate mode on, so, like openWorkspace, it needs the
   // user's own key press in this frame: the artifact's script could post it at any time.
   // "Escape" and "F" only ever exit, so they need no gesture.
-  if (message.key === "C" && !hasLiveUserGesture(frame)) return;
+  if (message.key === "C" && !hasLiveUserGesture(frame, lastAppInputAt)) return;
   onFrameKey?.(message.key);
 }
 
@@ -300,6 +331,7 @@ export function SandboxedArtifactFrame(props: {
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   // When this frame last sent without the strip (see ARTIFACT_CLICK_SEND_WINDOW_MS).
   const lastClickSendAtRef = useRef<number | null>(null);
+  const lastAppInputAtRef = useLastAppInputAt();
   const { kind, content, path } = props;
   // SECURITY AUDIT: the persisted state goes into the srcdoc, never through postMessage (which
   // must target "*" and could reach a page the frame navigated to). So an interactive artifact
@@ -364,7 +396,7 @@ export function SandboxedArtifactFrame(props: {
       switch (message.type) {
         case "key":
         case "sidebarKey":
-          handleFrameKeyMessage(message, frameRef.current, onFrameKey);
+          handleFrameKeyMessage(message, frameRef.current, onFrameKey, lastAppInputAtRef.current);
           break;
         case "send":
           // A live click or key in this frame sends at once, one message per click; any other
@@ -372,7 +404,7 @@ export function SandboxedArtifactFrame(props: {
           interactions?.requestSend(
             message.text,
             message.data,
-            takeFrameSendOrigin(frameRef.current, lastClickSendAtRef)
+            takeFrameSendOrigin(frameRef.current, lastClickSendAtRef, lastAppInputAtRef.current)
           );
           break;
         case "setState":
@@ -382,7 +414,12 @@ export function SandboxedArtifactFrame(props: {
           // Like send/setState, only for interactive artifacts: pinned checkout files and shelf
           // copies stay read-only. Ignored without a gesture, with no notice, so a script cannot
           // spam the notice either.
-          if (interactions == null || !hasLiveUserGesture(frameRef.current)) break;
+          if (
+            interactions == null ||
+            !hasLiveUserGesture(frameRef.current, lastAppInputAtRef.current)
+          ) {
+            break;
+          }
           openWorkspace(message.workspaceId);
           break;
         }
@@ -397,7 +434,15 @@ export function SandboxedArtifactFrame(props: {
     };
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
-  }, [allowMessage, onFrameKey, interactions, onAnnotate, navigatedRef, openWorkspace]);
+  }, [
+    allowMessage,
+    onFrameKey,
+    interactions,
+    onAnnotate,
+    navigatedRef,
+    openWorkspace,
+    lastAppInputAtRef,
+  ]);
 
   const annotating = onAnnotate != null;
   useEffect(() => {
