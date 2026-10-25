@@ -126,6 +126,69 @@ export {
   type TurnExecutionOptions,
 } from "@/node/services/turnEngine/TurnEngine";
 
+/** What an aborted stream reports and stamps: its tracked usage, timing and metadata. */
+interface AbortedStreamUsage {
+  usage: LanguageModelV2Usage | undefined;
+  contextUsage: LanguageModelV2Usage | undefined;
+  contextProviderMetadata: Record<string, unknown> | undefined;
+  providerMetadata: Record<string, unknown> | undefined;
+  duration: number;
+}
+
+/** The stream-abort event of a canceled stream. */
+function buildStreamAbortEvent(
+  workspaceId: WorkspaceId,
+  streamInfo: Pick<
+    WorkspaceStreamInfo,
+    "messageId" | "model" | "metadataModel" | "toolModelUsages" | "initialMetadata"
+  >,
+  abortUsage: AbortedStreamUsage,
+  abortReason: StreamAbortReason,
+  abandonPartial: boolean | undefined
+): StreamAbortEvent {
+  const { usage, contextUsage, duration, providerMetadata, contextProviderMetadata } = abortUsage;
+  return {
+    type: "stream-abort",
+    workspaceId,
+    messageId: streamInfo.messageId,
+    metadata: {
+      usage,
+      contextUsage,
+      duration,
+      providerMetadata,
+      contextProviderMetadata,
+      model: streamInfo.model,
+      metadataModel: streamInfo.metadataModel,
+      // Same tool-model usage the committed partial gets, so the renderer's
+      // per-turn cost views match history replay without a reload.
+      ...(streamInfo.toolModelUsages.length > 0
+        ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
+        : {}),
+    },
+    abortReason,
+    abandonPartial,
+    acpPromptId: streamInfo.initialMetadata?.acpPromptId,
+  };
+}
+
+/** The usage metadata an aborted turn's partial carries into chat.jsonl. */
+function abortedPartialMetadata(
+  streamInfo: Pick<WorkspaceStreamInfo, "toolModelUsages">,
+  abortUsage: AbortedStreamUsage
+): Partial<MuxMetadata> {
+  const { usage, providerMetadata, contextUsage, contextProviderMetadata, duration } = abortUsage;
+  return {
+    ...(usage !== undefined ? { usage: cloneUsage(usage) } : {}),
+    ...(providerMetadata !== undefined ? { providerMetadata } : {}),
+    ...(contextUsage !== undefined ? { contextUsage } : {}),
+    ...(contextProviderMetadata !== undefined ? { contextProviderMetadata } : {}),
+    duration,
+    ...(streamInfo.toolModelUsages.length > 0
+      ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
+      : {}),
+  };
+}
+
 // Disable noisy AI SDK warning logging.
 globalThis.AI_SDK_LOG_WARNINGS = false;
 
@@ -952,38 +1015,25 @@ export class StreamManager {
       ? streamInfo.cumulativeUsage
       : undefined;
 
-    // For context window display, use last step's usage (inputTokens = current context size)
-    const contextUsage = streamInfo.lastStepUsage;
-    const contextProviderMetadata = streamInfo.lastStepProviderMetadata;
-
-    // Include provider metadata for accurate cost calculation
-    const providerMetadata = markProviderMetadataCostsIncluded(
-      streamInfo.cumulativeProviderMetadata,
-      streamInfo.initialMetadata?.costsIncluded
-    );
-
-    const streamAbort: StreamAbortEvent = {
-      type: "stream-abort",
-      workspaceId,
-      messageId: streamInfo.messageId,
-      metadata: {
-        usage,
-        contextUsage,
-        duration,
-        providerMetadata,
-        contextProviderMetadata,
-        model: streamInfo.model,
-        metadataModel: streamInfo.metadataModel,
-        // Same tool-model usage the committed partial gets below, so the renderer's
-        // per-turn cost views match history replay without a reload.
-        ...(streamInfo.toolModelUsages.length > 0
-          ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
-          : {}),
-      },
-      abortReason,
-      abandonPartial,
-      acpPromptId: streamInfo.initialMetadata?.acpPromptId,
+    const abortUsage: AbortedStreamUsage = {
+      usage,
+      // For context window display, use last step's usage (inputTokens = current context size)
+      contextUsage: streamInfo.lastStepUsage,
+      contextProviderMetadata: streamInfo.lastStepProviderMetadata,
+      // Include provider metadata for accurate cost calculation
+      providerMetadata: markProviderMetadataCostsIncluded(
+        streamInfo.cumulativeProviderMetadata,
+        streamInfo.initialMetadata?.costsIncluded
+      ),
+      duration,
     };
+    const streamAbort = buildStreamAbortEvent(
+      workspaceId,
+      streamInfo,
+      abortUsage,
+      abortReason,
+      abandonPartial
+    );
     try {
       try {
         await this.backfillReasoningTokensFromParts(streamInfo, usage);
@@ -998,57 +1048,56 @@ export class StreamManager {
         workspaceId,
         streamInfo,
         usage,
-        providerMetadata,
+        abortUsage.providerMetadata,
         "Failed to record session usage on abort",
         "error"
       );
 
-      // Stamp the aborted turn's usage onto the partial message BEFORE committing
-      // it and delivering stream-abort. Analytics
-      // prices history rows from metadata.usage, so without this every
-      // interrupted turn — user Esc, queued tool-end preemption, monitor wakes —
-      // would ingest as $0 even though the provider billed all completed steps.
-      if (!abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
-        try {
-          await this.partialJournal.awaitPending(streamInfo);
-          const partialMessage = this.buildPartialAssistantMessage(streamInfo, {
-            metadata: {
-              ...(usage !== undefined ? { usage: cloneUsage(usage) } : {}),
-              ...(providerMetadata !== undefined ? { providerMetadata } : {}),
-              ...(contextUsage !== undefined ? { contextUsage } : {}),
-              ...(contextProviderMetadata !== undefined ? { contextProviderMetadata } : {}),
-              duration,
-              ...(streamInfo.toolModelUsages.length > 0
-                ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
-                : {}),
-            },
-          });
-          await this.partialJournal.writeAbortPartial(workspaceId as string, partialMessage);
+      await this.persistAbortedStreamUsage(workspaceId, streamInfo, abortUsage, abandonPartial);
+    } catch (error) {
+      log.error("Failed abort bookkeeping; delivering preserved terminal metadata", { error });
+    } finally {
+      await this.finishAbortedStream(
+        workspaceId,
+        streamInfo,
+        streamAbort,
+        abortReason,
+        abandonPartial
+      );
+    }
+  }
 
-          // Tool-only aborts (Esc while a tool is still running): commitPartial
-          // refuses to commit partials whose only parts are input-available tool
-          // calls, so the usage stamped above would die with the deleted
-          // partial. Route that spend through the headless-usage sidecar
-          // instead. Same predicate commitPartial applies, so exactly one of
-          // {chat row, sidecar row} carries this turn's usage.
-          if (!hasCommitWorthyParts(partialMessage.parts)) {
-            await this.usageLedger.recordDroppedPartialUsage(
-              workspaceId,
-              streamInfo,
-              usage,
-              providerMetadata,
-              "aborted_stream"
-            );
-          }
-        } catch (error) {
-          log.error("Failed to persist aborted-stream usage on partial message", { error });
-        }
-      } else if (abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
-        // Abandoned aborts (edit/discard of the streaming turn): the partial is
-        // deliberately dropped and its content never reaches chat.jsonl, but
-        // the provider still billed every completed step. The sidecar is the
-        // only route to the events table for this spend.
-        try {
+  /**
+   * Stamps the aborted turn's usage onto its partial, or routes it to the
+   * headless-usage sidecar when the partial will not reach chat.jsonl.
+   */
+  private async persistAbortedStreamUsage(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    abortUsage: AbortedStreamUsage,
+    abandonPartial: boolean | undefined
+  ): Promise<void> {
+    const { usage, providerMetadata } = abortUsage;
+    // Stamp the aborted turn's usage onto the partial message BEFORE committing
+    // it and delivering stream-abort. Analytics
+    // prices history rows from metadata.usage, so without this every
+    // interrupted turn — user Esc, queued tool-end preemption, monitor wakes —
+    // would ingest as $0 even though the provider billed all completed steps.
+    if (!abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+      try {
+        await this.partialJournal.awaitPending(streamInfo);
+        const partialMessage = this.buildPartialAssistantMessage(streamInfo, {
+          metadata: abortedPartialMetadata(streamInfo, abortUsage),
+        });
+        await this.partialJournal.writeAbortPartial(workspaceId as string, partialMessage);
+
+        // Tool-only aborts (Esc while a tool is still running): commitPartial
+        // refuses to commit partials whose only parts are input-available tool
+        // calls, so the usage stamped above would die with the deleted
+        // partial. Route that spend through the headless-usage sidecar
+        // instead. Same predicate commitPartial applies, so exactly one of
+        // {chat row, sidecar row} carries this turn's usage.
+        if (!hasCommitWorthyParts(partialMessage.parts)) {
           await this.usageLedger.recordDroppedPartialUsage(
             workspaceId,
             streamInfo,
@@ -1056,49 +1105,75 @@ export class StreamManager {
             providerMetadata,
             "aborted_stream"
           );
-        } catch (error) {
-          log.error("Failed to record abandoned-abort usage in headless sidecar", { error });
         }
+      } catch (error) {
+        log.error("Failed to persist aborted-stream usage on partial message", { error });
       }
-    } catch (error) {
-      log.error("Failed abort bookkeeping; delivering preserved terminal metadata", { error });
-    } finally {
+    } else if (abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+      // Abandoned aborts (edit/discard of the streaming turn): the partial is
+      // deliberately dropped and its content never reaches chat.jsonl, but
+      // the provider still billed every completed step. The sidecar is the
+      // only route to the events table for this spend.
       try {
-        // Cancellation owns this attempt through disk cleanup and raw delivery. Keeping
-        // the registration until then makes replacement startup join the same fence.
-        const result = await this.partialJournal.settleAbort(
+        await this.usageLedger.recordDroppedPartialUsage(
           workspaceId,
-          streamInfo.messageId,
-          abandonPartial === true
+          streamInfo,
+          usage,
+          providerMetadata,
+          "aborted_stream"
         );
-        // commitPartial already deletes on success. On failure retain recovery data;
-        // an unconditional delete here would silently discard an uncommitted answer.
-        if (!result.success)
-          log.error("Failed partial cleanup during stream-abort", {
-            workspaceId,
-            error: result.error,
-          });
       } catch (error) {
-        log.error("Failed partial cleanup during stream-abort", { workspaceId, error });
+        log.error("Failed to record abandoned-abort usage in headless sidecar", { error });
       }
-      try {
-        await this.turnEvents.deliver(streamAbort);
-      } catch (error) {
-        log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
-      } finally {
-        if (this.workspaceStreams.get(workspaceId) === streamInfo) {
-          this.workspaceStreams.delete(workspaceId);
-        }
-        streamInfo.terminalCompletion = {
-          status: "aborted",
-          abortReason,
-          streamAbort,
-          systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens,
-        };
-        // Session policy consumes this promise separately. It may start a replacement,
-        // so neither this fence nor the raw sink may join that policy.
-        streamInfo.completionController?.settle(streamInfo.terminalCompletion);
+    }
+  }
+
+  /**
+   * The abort's terminal steps: end the partial, deliver stream-abort, then
+   * unregister the stream and settle its completion.
+   */
+  private async finishAbortedStream(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    streamAbort: StreamAbortEvent,
+    abortReason: StreamAbortReason,
+    abandonPartial: boolean | undefined
+  ): Promise<void> {
+    try {
+      // Cancellation owns this attempt through disk cleanup and raw delivery. Keeping
+      // the registration until then makes replacement startup join the same fence.
+      const result = await this.partialJournal.settleAbort(
+        workspaceId,
+        streamInfo.messageId,
+        abandonPartial === true
+      );
+      // commitPartial already deletes on success. On failure retain recovery data;
+      // an unconditional delete here would silently discard an uncommitted answer.
+      if (!result.success)
+        log.error("Failed partial cleanup during stream-abort", {
+          workspaceId,
+          error: result.error,
+        });
+    } catch (error) {
+      log.error("Failed partial cleanup during stream-abort", { workspaceId, error });
+    }
+    try {
+      await this.turnEvents.deliver(streamAbort);
+    } catch (error) {
+      log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
+    } finally {
+      if (this.workspaceStreams.get(workspaceId) === streamInfo) {
+        this.workspaceStreams.delete(workspaceId);
       }
+      streamInfo.terminalCompletion = {
+        status: "aborted",
+        abortReason,
+        streamAbort,
+        systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens,
+      };
+      // Session policy consumes this promise separately. It may start a replacement,
+      // so neither this fence nor the raw sink may join that policy.
+      streamInfo.completionController?.settle(streamInfo.terminalCompletion);
     }
   }
 
