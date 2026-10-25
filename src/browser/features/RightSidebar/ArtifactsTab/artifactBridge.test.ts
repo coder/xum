@@ -160,9 +160,14 @@ function runBridgeScript(options: { querySelectorAll?: (selector: string) => unk
     if (!event.defaultPrevented) extra.defaultAction?.();
     if (extra.holdTimers !== true) for (const timer of timers.splice(0)) timer();
   };
-  /** An event the page's window sees, such as a dialog's cancel event. */
+  /**
+   * A non-bubbling event at an element in the page, such as a dialog's cancel event: window sees
+   * it only in the capture phase.
+   */
   const fire = (type: string) => {
-    for (const entry of listeners) if (entry.type === type) entry.listener({ type });
+    for (const entry of listeners) {
+      if (entry.type === type && entry.capture) entry.listener({ type });
+    }
   };
   return { keydown, fire, posted, xum: fakeWindow.xum, prevented: () => prevented };
 }
@@ -424,12 +429,15 @@ describe("bridge script interrupt keys", () => {
       defaultAction: () => bridge.fire("cancel"),
     });
     expect(interrupts(bridge.posted)).toEqual([]);
+    // The next Escape gets no cancel event: the dialog ignored it, so it interrupts.
+    bridge.keydown(KEYBINDS.INTERRUPT_STREAM_NORMAL.key, div);
     // Ctrl+C sends no close request: a cancel event during it does not keep it.
     bridge.keydown(KEYBINDS.INTERRUPT_STREAM_VIM.key, div, false, {
       ctrlKey: true,
       pageHandler: () => bridge.fire("cancel"),
     });
     expect(interrupts(bridge.posted)).toEqual([
+      { xumArtifact: 1, type: "interruptKey", keybind: "normal" },
       { xumArtifact: 1, type: "interruptKey", keybind: "vim" },
     ]);
   });
