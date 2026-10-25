@@ -671,7 +671,11 @@ else:
                 )
                 # Completed informational envelopes and in-progress summaries keep
                 # polling for approval; unknown reports remain failures under the CI policy.
-                expected = 10 if fixture["expected_exit_code"] in (0, 10) else 1
+                # A fixture can name its own readiness result: the clean code-review
+                # receipt is approval, and the account notice is a failed review.
+                expected = fixture.get(
+                    "wait_exit_code", 10 if fixture["expected_exit_code"] in (0, 10) else 1
+                )
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
     def test_in_progress_review_fails_fast_on_older_blockers(self):
