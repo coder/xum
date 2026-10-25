@@ -26,7 +26,7 @@ import type { Instructions, LanguageModel, ModelMessage, Tool } from "ai";
 
 import type { ResolvedCallSettingsOverrides } from "@/common/config/schemas/modelParameters";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
+import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { supportsAnthropicCache } from "@/common/utils/ai/cacheStrategy";
 import assert from "@/common/utils/assert";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
@@ -39,8 +39,11 @@ import {
   type ContinuousPrefixSwap,
 } from "@/node/services/continuousCompactionJournal";
 import { log, type Logger } from "@/node/services/log";
-// Type-only back-edge: these step-budget and chunk types still live with the stream loop.
-import type { OnStepSettled, StreamTextOnChunk } from "@/node/services/streamManager";
+import type {
+  OnStepSettled,
+  StreamTextOnChunk,
+  StreamRequestConfig,
+} from "@/node/services/turnEngine/types";
 import type {
   ActiveTurnThinkingOverride,
   RebuildFirstStepForThinkingLevel,
@@ -54,6 +57,7 @@ import {
   extractPreviousResponseIdFromError,
   extractStatusCode,
 } from "./providerWire";
+export type { StreamRequestConfig } from "@/node/services/turnEngine/types";
 
 export interface StreamRequestOptions {
   model: LanguageModel;
@@ -83,58 +87,6 @@ export interface StreamRequestOptions {
 export type StreamRequestInput = StreamRequestOptions & {
   onToolExecutionStart?: (toolCallId: string) => void;
 };
-
-export interface StreamRequestConfig {
-  stopCause?: StreamStopCause;
-  cacheEnabled?: boolean;
-  budgetMetadataModel?: string;
-  model: LanguageModel;
-  modelString: string;
-  messages: ModelMessage[];
-  /** Provider-ready system instructions from TurnContextAssembler. */
-  system?: Instructions;
-  tools?: Record<string, Tool>;
-  providerOptions?: Record<string, unknown>;
-  /** Per-request HTTP headers (e.g., anthropic-beta for 1M context). */
-  headers?: Record<string, string | undefined>;
-  maxOutputTokens?: number;
-  streamCallSettings?: Omit<ResolvedCallSettingsOverrides, "maxOutputTokens">;
-  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
-  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
-  /** Optional hook for callers that need chunk-level visibility during streaming. */
-  onChunk?: StreamTextOnChunk;
-  /** Optional hook for callers that need the live prepared step transcript. */
-  onStepMessages?: (messages: ModelMessage[]) => void;
-  onStepSettled?: OnStepSettled;
-  contextBudgetLimit?: number;
-  toolPolicy?: ToolPolicy;
-  /**
-   * Tool-search deferral state. Owned and mutated by
-   * aiService/tool_catalog_search.execute; prepareStep reads it each step to
-   * compute `activeTools`. Absent when the feature is inactive.
-   */
-  toolSearchState?: ToolSearchStreamState;
-  /**
-   * Mid-turn thinking override holder — the SESSION'S object, by reference
-   * (never created inside StreamManager: a locally-created object would be
-   * invisible to AgentSession.setActiveTurnThinkingLevel). prepareStep
-   * consumes `pending` before every model step.
-   */
-  thinkingOverrideState?: ActiveTurnThinkingOverride;
-  /**
-   * Closure built by TurnRequestBuilder that re-runs the effective-level pipeline
-   * (policy clamp + resolveEffectiveThinkingLevel) and rebuilds provider
-   * options for the stream's model. `null` ⇒ not applicable / no-op.
-   */
-  rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
-  /**
-   * Step-0 message rebuild for overrides that raced stream construction; see
-   * RebuildFirstStepForThinkingLevel. Also emits the superseding envelope.
-   */
-  rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
-  /** First step must call one of these tools; later steps restore the full toolset. */
-  forcedFirstStepToolNames?: string[];
-}
 
 /** The step-tracker fields that stage and consume a continuous-compaction prefix swap. */
 export interface PrefixSwapTracker {

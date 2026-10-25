@@ -38,27 +38,25 @@ import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getErrorMessage } from "@/common/utils/errors";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { log } from "@/node/services/log";
-// Type-only back-edge: the event union, workspace ID brand, stream info and token
-// tracker type still live in streamManager.ts.
 import type {
   StreamManagerTokenTracker,
   TurnEngineEvent,
   TurnEngineEventSink,
   WorkspaceId,
   WorkspaceStreamInfo,
-} from "@/node/services/streamManager";
+  DynamicToolCompletedMessagePart,
+  WorkflowRunToolAttachment,
+} from "@/node/services/turnEngine/types";
 import type {
   ExecutionScope,
   ToolCallDisplayRegistry,
 } from "@/node/services/toolCallDisplayRegistry";
 import { markProviderMetadataCostsIncluded } from "@/node/services/turnEngine/UsageLedger";
 import { nodeClock } from "@/node/utils/hostClock";
-
-export type DynamicToolCompletedMessagePart = Extract<
-  CompletedMessagePart,
-  { type: "dynamic-tool" }
->;
-export type WorkflowRunToolAttachment = NonNullable<DynamicToolCompletedMessagePart["workflowRun"]>;
+export type {
+  DynamicToolCompletedMessagePart,
+  WorkflowRunToolAttachment,
+} from "@/node/services/turnEngine/types";
 
 /** The stream fields that workflow-run attachments read and buffer on. */
 export interface TurnEventsStream {

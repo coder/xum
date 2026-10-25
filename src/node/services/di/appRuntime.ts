@@ -97,7 +97,7 @@
  *   fibers forked into it with `Effect.forkIn` are interrupted *and awaited*
  *   by `closeScopeBounded` early in `dispose()`, while every dependency they
  *   might touch during finalization is still alive. Occupant: the stream
- *   engine (`StreamManager.superviseEngine`, Wave 4 PR 1) — one supervisor
+ *   engine (`TurnRegistry.superviseEngine`, Wave 4 PR 1) — one supervisor
  *   fiber per stream, forked at registration and living until the turn's
  *   completion settles; the stream's AbortSignal stays the cancellation
  *   transport and interruption

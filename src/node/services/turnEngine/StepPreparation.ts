@@ -20,7 +20,6 @@ import {
 } from "ai";
 import type { ProviderOptions } from "@ai-sdk/provider-utils";
 import { stripAnthropicReasoning } from "@/browser/utils/messages/modelMessageTransform";
-import type { SystemSectionRecords } from "@/common/types/message";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   computeActiveToolNames,
@@ -56,6 +55,8 @@ import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/
 import { stripReasoningReplay } from "@/node/utils/messages/reasoningProviderOptions";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
 import { summarizeInvalidToolInputErrors } from "@/node/utils/messages/summarizeInvalidToolInputErrors";
+import type { StepMessageTracker } from "@/node/services/turnEngine/types";
+export type { StepMessageTracker } from "@/node/services/turnEngine/types";
 
 /**
  * Same-turn message transforms applied before every provider step: strip workflow run records
@@ -88,40 +89,6 @@ function sendsBetweenToolsThinking(providerOptions: Record<string, unknown> | un
     "type" in thinking &&
     thinking.type === "between_tools"
   );
-}
-
-export interface StepMessageTracker {
-  workspaceId?: string;
-  /** The latest step's request, anchoring the next estimate on its provider usage (#4858). */
-  contextBudgetRequest?: ContextBudgetAnchorRequest;
-  pendingPrefixSwap?: ContinuousPrefixSwap;
-  consumedPrefixSwap?: ContinuousPrefixSwap;
-  prefixSwapInvalidated?: boolean;
-  prefixSwapInvalidationEmitted?: boolean;
-  latestMessages?: ModelMessage[];
-  /**
-   * Set once a step of this turn prepared a provider request. Fallback and retry streams
-   * reuse the tracker, so their step 0 is not the turn's first request (#5279).
-   */
-  providerRequestPrepared?: boolean;
-  /** Present only when Auto set this turn's thinking level; shared across fallback hops. */
-  autoThinkingEscalation?: AutoThinkingEscalationState;
-  /**
-   * Set when an in-turn prefix change made prepareStep strip earlier Anthropic thinking: the
-   * SDK step number (of the current streamText call) whose request first sent the latest
-   * strip. The stream consumer turns it into the row's replay point once that step started,
-   * so the next turn neither puts the removed blocks back nor drops the ones kept after the
-   * strip (preserved thinking). prepareStep can run a step ahead of the consumer, hence a
-   * step number and not a flag. Cleared when a retry starts a new streamText call.
-   */
-  anthropicThinkingStripStep?: number;
-  /** True once this turn holds the Anthropic thinking-repair receipt (reads initialMetadata). */
-  hasAnthropicReplayReceipt?: () => boolean;
-  /** After a step-0 rebuild: the row's system-section records and token count follow it. */
-  recordSystemSections: (rebuilt: {
-    systemRecords?: SystemSectionRecords;
-    systemMessageTokens?: number;
-  }) => void;
 }
 
 /**

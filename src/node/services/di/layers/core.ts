@@ -313,7 +313,7 @@ export const StreamManagerLive = Layer.effect(
       yield* EffectRunnerTag,
       // The stream engine is the AppFiberScope's occupant: dispose() closes the
       // scope before the explicit teardown steps, which aborts and awaits every
-      // in-flight stream (StreamManager.superviseEngine).
+      // in-flight stream (TurnRegistry.superviseEngine).
       yield* AppFiberScopeTag,
       yield* ToolCallDisplayRegistryTag,
       { hostClock: yield* HostClockTag }

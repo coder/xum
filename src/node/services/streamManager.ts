@@ -7,18 +7,15 @@ import {
 } from "./contextBudgetCounting";
 import { applyCacheControl, getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { stripMessageCacheControl, type ContinuousPrefixSwap } from "./continuousCompactionJournal";
-import type { PrefixSwapInvalidatedEvent } from "@/common/types/stream";
 import * as path from "path";
-import { Effect, Exit, type Fiber, Scope } from "effect";
+import { Effect, Exit, Scope } from "effect";
 import { PlatformPaths } from "@/common/utils/paths";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import {
   type streamText,
   type stepCountIs,
   type ModelMessage,
-  type Instructions,
   type LanguageModel,
-  type Tool,
   LoadAPIKeyError,
   APICallError,
   RetryError,
@@ -30,19 +27,11 @@ import assert from "@/common/utils/assert";
 import { Ok, Err } from "@/common/types/result";
 import { log, type Logger } from "./log";
 import type {
-  StreamStartEvent,
-  StreamDeltaEvent,
   StreamEndEvent,
   StreamAbortEvent,
   StreamAbortReason,
-  ErrorEvent,
-  UsageDeltaEvent,
-  ToolCallStartEvent,
-  ToolCallDeltaEvent,
   ToolCallEndEvent,
   ToolCallExecutionStartEvent,
-  ReasoningDeltaEvent,
-  ReasoningEndEvent,
   CompletedMessagePart,
   WorkflowRunAttachedEvent,
 } from "@/common/types/stream";
@@ -65,15 +54,10 @@ import {
   coerceThinkingLevel,
   type ThinkingLevel,
 } from "@/common/types/thinking";
-import type {
-  RebuildFirstStepForThinkingLevel,
-  RebuildProviderOptionsForThinkingLevel,
-} from "@/node/services/thinkingOverride";
 import {
   createAutoThinkingEscalationState,
   rebaseAutoThinkingEscalation,
 } from "@/node/services/autoThinkingEscalation";
-import type { NestedToolCall } from "@/common/orpc/schemas/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
@@ -89,7 +73,6 @@ import {
   withCacheWriteMetadata,
 } from "@/common/utils/tokens/usageHelpers";
 import { linkAbortSignal } from "@/node/utils/abort";
-import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { modelOnlyNotificationsField } from "@/common/utils/tools/internalToolResultFields";
 import { buildRequiredToolPatterns } from "@/common/utils/tools/toolPolicy";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
@@ -106,7 +89,6 @@ import { ToolCallDisplayRegistry, type ExecutionScope } from "./toolCallDisplayR
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { SessionUsageService } from "./sessionUsageService";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
-import type { ResolvedCallSettingsOverrides } from "@/common/config/schemas/modelParameters";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
@@ -117,13 +99,8 @@ import {
   cloneUsage,
   markProviderMetadataCostsIncluded,
   UsageLedger,
-  type UsageLedgerState,
 } from "@/node/services/turnEngine/UsageLedger";
-import {
-  PartialJournal,
-  type PartialJournalState,
-  type PartialTarget,
-} from "@/node/services/turnEngine/PartialJournal";
+import { PartialJournal, type PartialTarget } from "@/node/services/turnEngine/PartialJournal";
 import {
   ProviderRequest,
   type StreamRequestConfig,
@@ -147,9 +124,49 @@ import {
   TurnEventEmitter,
   TurnEvents,
   type NestedToolEvent,
-  type WorkflowRunToolAttachment,
 } from "@/node/services/turnEngine/TurnEvents";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
+import type {
+  WorkspaceId,
+  TurnEngineEventSink,
+  TurnCompletion,
+  TurnStreamHandle,
+  TurnCompletionController,
+  SettledStepOutcome,
+  OnStepSettled,
+  ModelFallbackPrepareOptions,
+  ModelFallbackOptions,
+  WorkspaceStreamInfo,
+  StopStreamOptions,
+  ActiveStreamInfo,
+  MockStreamLifecycle,
+  StreamManagerTokenTracker,
+} from "@/node/services/turnEngine/types";
+export type {
+  StreamTextOnChunk,
+  WorkspaceId,
+  TurnEngineEvent,
+  TurnEngineEventSink,
+  TurnCompletion,
+  TurnStreamHandle,
+  SettledStepBudget,
+  ContextBudgetStepDecision,
+  SettledStepOutcome,
+  OnStepSettled,
+  ModelFallbackPrepareOptions,
+  ModelFallbackOptions,
+  WorkspaceStreamInfo,
+  StopStreamOptions,
+  ActiveStreamInfo,
+  MockStreamLifecycle,
+  StreamManagerTokenTracker,
+} from "@/node/services/turnEngine/types";
+import {
+  StreamState,
+  TurnRegistry,
+  type PendingStreamStartHandle,
+  type StreamToken,
+} from "@/node/services/turnEngine/TurnRegistry";
 import { shellQuote } from "@/common/utils/shell";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
@@ -171,8 +188,6 @@ import {
 
 // Disable noisy AI SDK warning logging.
 globalThis.AI_SDK_LOG_WARNINGS = false;
-
-export type StreamTextOnChunk = NonNullable<Parameters<typeof streamText>[0]["onChunk"]>;
 
 const EMPTY_STREAM_OUTPUT_ERROR_MESSAGE =
   "The model ended the stream before producing any assistant-visible output. This usually means the upstream stream was dropped rather than completed normally. Xum will retry automatically when possible, and if retries keep failing you should try again or switch models.";
@@ -267,49 +282,6 @@ interface PartLoopState {
   orphanToolResultCount: number;
 }
 
-export type WorkspaceId = string & { __brand: "WorkspaceId" };
-type StreamToken = string & { __brand: "StreamToken" };
-
-export type TurnEngineEvent =
-  | StreamStartEvent
-  | StreamDeltaEvent
-  | StreamEndEvent
-  | StreamAbortEvent
-  | ErrorEvent
-  | UsageDeltaEvent
-  | ToolCallStartEvent
-  | ToolCallExecutionStartEvent
-  | ToolCallDeltaEvent
-  | ToolCallEndEvent
-  | ReasoningDeltaEvent
-  | ReasoningEndEvent
-  | WorkflowRunAttachedEvent
-  | PrefixSwapInvalidatedEvent;
-
-export type TurnEngineEventSink = (event: TurnEngineEvent) => void | Promise<void>;
-
-// Turn identity lives on TurnStreamHandle.messageId; completions cannot diverge from it.
-export type TurnCompletion =
-  | { status: "completed"; streamEnd: Omit<StreamEndEvent, "messageId"> }
-  | {
-      status: "aborted";
-      abortReason: StreamAbortReason;
-      // Absent for startup cancellation / cleanup without a delivered terminal event.
-      streamAbort?: Omit<StreamAbortEvent, "messageId" | "abortReason">;
-      systemMessageTokens?: number;
-    }
-  | { status: "failed"; streamError: StreamErrorPayload & { errorType: StreamErrorType } };
-
-export interface TurnStreamHandle {
-  messageId: string;
-  completion: Promise<TurnCompletion>;
-}
-
-interface TurnCompletionController {
-  promise: Promise<TurnCompletion>;
-  settle: (completion: TurnCompletion) => void;
-}
-
 export function createTurnCompletionController(): TurnCompletionController {
   let settled = false;
   let resolveCompletion!: (completion: TurnCompletion) => void;
@@ -328,39 +300,6 @@ export function createTurnCompletionController(): TurnCompletionController {
 
 // Request-construction options shared by the primary turn and model-fallback
 // hops (fallbacks rebuild these from the prepared fallback request).
-export interface SettledStepBudget {
-  model: string;
-  usage: LanguageModelV2Usage | undefined;
-  providerMetadata?: Record<string, unknown>;
-  toolResultChars: number;
-  imageParts: number;
-  toolResultTokens?: number;
-  /**
-   * Assembled estimate of the next step's provider request, computed exactly as that step's
-   * preflight will compute it. Absent when no context budget applies.
-   */
-  nextRequestTokens?: number;
-  sessionHistoryAvailable: boolean;
-  /** The step's request advertised `new_context`, so the final prompt can be acted on. */
-  newContextAvailable: boolean;
-  /** A successful `new_context` result settled in this step (its siblings included). */
-  newContextRequested?: boolean;
-}
-
-export type ContextBudgetStepDecision = "continue" | "warn" | "rollover" | "block";
-
-/**
- * Budget verdict for a settled step. `continuationEntryId` is the exact queue entry the session
- * designated to continue the turn when it decided to stop (its enqueued "Continue"); absent when
- * the stop hands over to nothing in particular.
- */
-export interface SettledStepOutcome {
-  decision: ContextBudgetStepDecision;
-  continuationEntryId?: string;
-}
-
-export type OnStepSettled = (step: SettledStepBudget) => Promise<SettledStepOutcome>;
-
 export interface TurnExecutionOptions extends StreamRequestOptions {
   workspaceId: string;
   historySequence: number;
@@ -430,98 +369,6 @@ function withRebuiltSystemMetadata(
   // Every record follows the rebuild, an absent one included (it replaces an older one).
   for (const field of SYSTEM_SECTION_RECORD_FIELDS) next[field] = rebuilt.systemRecords?.[field];
   return next;
-}
-
-/**
- * Per-model request pieces for a refusal-fallback swap, rebuilt by TurnRequestBuilder so
- * provider-specific message preparation, provider options, and headers match a
- * first-class send of the fallback model (reusing the source model's request
- * verbatim would leak provider-specific options/messages across providers).
- */
-interface PreparedModelFallback {
-  contextBudgetLimit?: number;
-  model: LanguageModel;
-  /** Canonical model string of the fallback attempt (drives metadata + tokenizer). */
-  modelString: string;
-  /** Messages re-prepared for the fallback model's provider. */
-  messages: ModelMessage[];
-  /** Provider-ready system prompt rebuilt for the fallback model. */
-  system: Instructions | undefined;
-  /**
-   * Tools rebuilt for the fallback model. Required (even if undefined for a
-   * tool-less stream) so callers cannot silently reuse the source model's
-   * provider-specific tools (e.g. Anthropic web tools, unsanitized MCP schemas
-   * that OpenAI rejects).
-   */
-  tools: Record<string, Tool> | undefined;
-  providerOptions?: Record<string, unknown>;
-  headers?: Record<string, string | undefined>;
-  callSettingsOverrides?: ResolvedCallSettingsOverrides;
-  thinkingLevel?: string;
-  /** Route attribution corrections (routeProvider, costsIncluded). */
-  initialMetadataPatch?: Partial<MuxMetadata>;
-  /**
-   * Rebuild closure bound to the FALLBACK model so mid-turn thinking changes
-   * keep working after a fallback hop (the source model's closure would build
-   * options for the wrong model).
-   */
-  rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
-  /** Step-0 message rebuild bound to the fallback request's build inputs. */
-  rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
-  forcedFirstStepToolNames?: string[];
-  /**
-   * Invoked once the fallback stream has been constructed successfully (but
-   * before it is consumed). Durable side effects that must describe the
-   * request that actually streams — e.g. the superseding turn envelope —
-   * belong here, not in prepare(): a prepare that succeeds but whose stream
-   * construction fails must leave no trace, or replay verification would
-   * attribute an unstarted fallback identity. Must not throw.
-   */
-  onStreamConstructed?: () => Promise<void>;
-  /**
-   * Providers-config snapshot the fallback request was built from (the
-   * factory's creation-time read, see TurnRequestBuilder). The swap's request-config
-   * rebuild and metadata resolution must read THIS snapshot, not the live
-   * config: a catalog refresh between prepare() and the swap could retag the
-   * instance and hand the prepared SDK model another wire's output limits or
-   * usage identity.
-   */
-  providersConfig?: ProvidersConfigMap;
-}
-
-export interface ModelFallbackPrepareOptions {
-  /**
-   * In-memory partial assistant turn to include when continuing after a
-   * mid-turn refusal. This must be cloned from the stream state before prepare()
-   * receives it so provider-message preparation cannot mutate live UI parts.
-   */
-  continuation?: { assistantMessage: MuxMessage };
-  /**
-   * Mid-turn thinking level to fold into the fallback's baseline: pending (not
-   * yet applied) or already-applied override from the refused stream. The
-   * fallback prepare re-clamps it for the next model.
-   */
-  thinkingLevelOverride?: ThinkingLevel;
-}
-
-export interface ModelFallbackOptions {
-  /** Ordered refusal-fallback chain (canonical model strings); one attempt each. */
-  chain: string[];
-  /**
-   * Rebuilds the full request for a fallback model. An Err result fails the
-   * turn terminally as model_refusal (never a retryable error): silently
-   * skipping an unstartable fallback would effectively create fallback on
-   * auth/config errors, which is explicitly out of scope.
-   */
-  prepare: (
-    nextModelString: string,
-    options?: ModelFallbackPrepareOptions
-  ) => Promise<
-    Result<
-      PreparedModelFallback,
-      string | Extract<SendMessageError, { type: "context_budget_exceeded" }>
-    >
-  >;
 }
 
 function isKnownProviderName(provider: string): provider is keyof typeof PROVIDER_DEFINITIONS {
@@ -628,16 +475,6 @@ function isOpenAIResponsesModel(model: LanguageModel): boolean {
   return model.provider === "openai.responses";
 }
 
-// Stream state enum for exhaustive checking
-enum StreamState {
-  IDLE = "idle",
-  STARTING = "starting",
-  STREAMING = "streaming",
-  STOPPING = "stopping",
-  COMPLETED = "completed", // Stream finished successfully (before cleanup)
-  ERROR = "error",
-}
-
 const MAX_ORPHAN_TOOL_RESULT_WARNINGS_PER_STREAM = 3;
 const ORPHAN_TOOL_RESULT_PREVIEW_CHARS = 160;
 const ORPHAN_TOOL_RESULT_MAX_KEYS = 8;
@@ -705,138 +542,6 @@ function hasIncompleteToolCallPart(parts: CompletedMessagePart[]): boolean {
   return parts.some((part) => part.type === "dynamic-tool" && part.state !== "output-available");
 }
 
-// Comprehensive stream info
-interface WorkspaceStreamInfo extends PartialJournalState, Readonly<UsageLedgerState> {
-  state: StreamState;
-  streamResult: Awaited<ReturnType<typeof streamText>>;
-  unlinkAbortSignal?: () => void;
-  abortController: AbortController;
-  workspaceName?: string;
-  messageId: string;
-  token: StreamToken;
-  executionScope?: ExecutionScope;
-  startTime: number;
-
-  // Used to ensure part timestamps are strictly monotonic, even when multiple deltas land in the
-  // same millisecond. This avoids collisions in reconnect replay dedupe logic which keys off of
-  // (messageId, timestamp, delta).
-  lastPartTimestamp: number;
-
-  // Timestamp when each tool call reached output-available (tool-call-end emission).
-  // Needed for reconnect replay filtering because dynamic-tool parts keep their
-  // original start timestamp even after they gain output.
-  toolCompletionTimestamps: Map<string, number>;
-
-  // Anthropic server tools (web_search, ...) called in this row (#5887). Xum stores them as
-  // client tool calls without their encrypted results, so history replays them as a
-  // tool_use/tool_result pair: thinking after one is bound to a prefix never sent again.
-  anthropicServerToolCallIds?: Set<string>;
-
-  // Workflow tools can create the durable run before their stream part is stored. Keep the exact
-  // attachment and apply it as soon as the matching dynamic-tool part lands.
-  pendingWorkflowRunAttachments: Map<string, WorkflowRunToolAttachment>;
-
-  // Kernel-nested tool events can arrive before the fullStream consumer stores the parent
-  // code_execution part (same race as pendingToolExecutionStarts). Buffer the nested records
-  // by parent toolCallId and merge them when the parent part lands, so an interrupt in that
-  // window doesn't lose the nested calls (or their workflow run identity) from partial.json.
-  pendingNestedCalls: Map<string, NestedToolCall[]>;
-
-  // execute() can begin (lock acquired in withSequentialExecution) before the fullStream
-  // consumer has stored the matching dynamic-tool part. Keep the execution-start timestamp
-  // and apply it as soon as the part lands.
-  pendingToolExecutionStarts: Map<string, number>;
-
-  model: string;
-  /** Metadata model resolved from provider mapping for cost/token metadata lookups. */
-  metadataModel: string;
-  /** Effective thinking level after model policy clamping */
-  thinkingLevel?: string;
-  initialMetadata?: Partial<MuxMetadata>;
-  request: StreamRequestConfig;
-  // Track last prepared step messages for safe retries after tool steps
-  stepTracker: StepMessageTracker;
-  // Track if a previousResponseId retry happened after a step completed so
-  // stream-end uses cumulative usage instead of the retried step's totalUsage.
-  didRetryPreviousResponseIdAtStep: boolean;
-  // Track when Xum restarted the stream after an empty-output completion so
-  // stream-end prefers cumulative usage across attempts instead of the final
-  // attempt's totalUsage only.
-  didRetryAfterEmptyOutput?: boolean;
-  // Same for a step-boundary retry without rejected reasoning replay.
-  didRetryReasoningReplayAtStep?: boolean;
-  // Refusal-fallback chain state. `original` keeps the pre-wrap request inputs
-  // (as passed by TurnRequestBuilder) that prepare() does not rebuild, so the request can
-  // be rebuilt for a different model. System, tools, and messages are rebuilt
-  // per fallback model by prepare() via the prompt assembler because they are
-  // model-keyed (cache wrapping, provider web tools, MCP sanitization, model
-  // sections) and must not leak across providers.
-  modelFallback?: {
-    options: ModelFallbackOptions;
-    /** Canonical model originally requested for this turn (the chain source). */
-    requestedModel: string;
-    /** Canonical models that refused during this turn, in order. */
-    refusedModels: string[];
-    original: { maxOutputTokens?: number };
-  };
-  // Provider streams must prove semantic completion with a terminal SDK finish part.
-  // A clean EOF can be a proxy/provider drop and must not finalize partial assistant text.
-  receivedTerminalEvent: boolean;
-  terminalFinishReason?: string;
-  // Provider-raw finish reason (e.g. Anthropic's "refusal") kept alongside the
-  // unified one so refusal classification can match either representation.
-  terminalRawFinishReason?: string;
-  // Index into parts where the current step started (used to ensure safe retries)
-  currentStepStartIndex: number;
-  // Exact SDK step starts; part shapes cannot distinguish consecutive tool-only steps.
-  stepStartIndices: number[];
-  // Row step (index into stepStartIndices) of each SDK step the current streamText call
-  // started, by SDK step number. Maps stepTracker.anthropicThinkingStripStep to the row.
-  streamStepOrdinals: number[];
-  historySequence: number;
-  // Track accumulated parts for partial message (includes reasoning, text, and tools)
-  parts: CompletedMessagePart[];
-  // The reasoning block opened by the latest reasoning-start, and the last part
-  // created for it (undefined until the block has a part). Anthropic replays each
-  // thinking block with its own signature, so a metadata-only signature delta may
-  // only attach to a part of the SAME block; otherwise it is its own (empty) block.
-  currentReasoningBlock?: { lastPart?: CompletedMessagePart };
-  // Reasoning parts before this index belong to refused fallback attempts whose
-  // usage was already attributed separately; stream-end backfill must not bill
-  // them again under the answering model.
-  reasoningBackfillStartIndex?: number;
-  // Track background processing promise for guaranteed cleanup
-  processingPromise: Promise<void>;
-  // Latched by the first cancelStreamSafely call (synchronously, before its
-  // first await) so concurrent cancellers — a user stop racing shutdown's
-  // engine supervisor — join one cleanup: exactly one stream-abort, one settle.
-  cancelPromise?: Promise<void>;
-  // Supervisor fiber in the app's AppFiberScope (superviseEngine); set only when
-  // the manager was constructed with an engine scope.
-  engineFiber?: Fiber.Fiber<void>;
-  // Soft-interrupt state: when pending, stream will end at next block boundary
-  softInterrupt:
-    | { pending: false }
-    | { pending: true; abandonPartial: boolean; abortReason: StreamAbortReason };
-  // Temporary directory for tool outputs (auto-cleaned when stream ends)
-  runtimeTempDir: string;
-  // Runtime for temp directory cleanup
-  runtime: Runtime;
-  // Owns this stream's Effect-managed resources: the temp-dir release
-  // finalizer (registered via acquireRelease in startStream) and the
-  // scope-tied partial-write debounce fiber. Closed exactly once — by
-  // processStreamWithCleanup's finally after registration, or by startStream
-  // when registration fails. Optional: whitebox test fixtures register stream
-  // infos without a resource scope.
-  resourceScope?: Scope.Closeable;
-  resourceCleanup?: Promise<void>;
-  completionController: TurnCompletionController;
-  terminalCompletion?: TurnCompletion;
-}
-
-/** Type-only export: test fixtures type hand-built stream state against it. */
-export type { WorkspaceStreamInfo };
-
 // Ensure per-stream part timestamps are strictly monotonic.
 //
 // Date.now() is millisecond-granularity, so two distinct chunks with identical text emitted in the
@@ -851,66 +556,6 @@ function nextPartTimestamp(streamInfo: WorkspaceStreamInfo): number {
   streamInfo.lastPartTimestamp = timestamp;
   return timestamp;
 }
-
-/**
- * StreamManager - Handles all streaming operations with type safety and atomic operations
- *
- * Key invariants:
- * - Only one active stream per workspace at any time
- * - Atomic stream creation/cancellation operations
- * - Guaranteed resource cleanup in all code paths
- */
-interface PendingStreamStartHandle {
-  readonly abortSignal: AbortSignal;
-  readonly syntheticMessageId: string;
-  /** Cancel this start before its provider request (startup abort settles it). */
-  abort(reason: StreamAbortReason): void;
-  finish(): void;
-}
-
-export interface StopStreamOptions {
-  soft?: boolean;
-  abandonPartial?: boolean;
-  abortReason?: StreamAbortReason;
-  /** Teardown of an already-settled attempt must not manufacture a second raw terminal. */
-  emitIfMissing?: boolean;
-  /**
-   * Execution the caller captured when it decided to stop. When the workspace's current
-   * registered (or pending) start is a DIFFERENT message, the call is a no-op success: a late
-   * stop must never cancel a replacement admitted after the caller's capture. Defense in depth
-   * only — admission barriers, not this guard, keep replacements from starting mid-stop.
-   */
-  expectedMessageId?: string;
-}
-
-/** Snapshot of an active stream, as returned by StreamManager.getStreamInfo. */
-export interface ActiveStreamInfo {
-  messageId: string;
-  model: string;
-  historySequence: number;
-  startTime: number;
-  parts: CompletedMessagePart[];
-  currentStepStartIndex: number;
-  stepStartIndices: number[];
-  initialMetadata?: Pick<
-    MuxMetadata,
-    "systemMessageTokens" | "anthropicThinkingReplay" | "anthropicThinkingReplayFromStep"
-  >;
-  toolCompletionTimestamps: Map<string, number>;
-  muxMetadata?: unknown;
-}
-
-interface MockStreamLifecycle {
-  isStreaming(workspaceId: string): boolean;
-  stop(workspaceId: string, options?: StopStreamOptions): Promise<void>;
-  // Mock streams are not registered in workspaceStreams; reconnect replay needs both of these
-  // to see them (#4542).
-  getStreamInfo(workspaceId: string, includeFinalizing: boolean): ActiveStreamInfo | undefined;
-  replayStream(workspaceId: string, opts?: { afterTimestamp?: number }): Promise<void>;
-}
-
-/** The token-counting surface StreamManager uses for live streaming stats. */
-export type StreamManagerTokenTracker = Pick<StreamingTokenTracker, "setModel" | "countTokens">;
 
 /**
  * Optional collaborators for StreamManager. Production omits both; tests
@@ -1218,20 +863,20 @@ export function resolveStreamEndFinishReason(
     : (streamInfo.terminalFinishReason ?? providerFinishReason);
 }
 
+/**
+ * StreamManager - Handles all streaming operations with type safety and atomic operations
+ *
+ * Key invariants:
+ * - Only one active stream per workspace at any time
+ * - Atomic stream creation/cancellation operations
+ * - Guaranteed resource cleanup in all code paths
+ */
 export class StreamManager {
-  private workspaceStreams = new Map<WorkspaceId, WorkspaceStreamInfo>();
-  private readonly pendingStreamStarts = new Map<
-    string,
-    {
-      abortController: AbortController;
-      startTime: number;
-      syntheticMessageId: string;
-      abortDelivery?: Promise<void>;
-      acpPromptId?: string;
-    }
-  >();
+  // TurnRegistry's slot map. Whitebox tests seed and read it through this name.
+  private readonly workspaceStreams: Map<WorkspaceId, WorkspaceStreamInfo>;
+  // Owns the slot, the start lock, the completion fence and stop (turnEngine/TurnRegistry.ts).
+  private readonly turnRegistry: TurnRegistry;
   private mockStreamLifecycle?: MockStreamLifecycle;
-  private streamLocks = new Map<WorkspaceId, AsyncMutex>();
   private readonly PARTIAL_WRITE_THROTTLE_MS = 500;
   private readonly historyService: HistoryService;
   // Owns this manager's partial.json and final-message writes (turnEngine/PartialJournal.ts).
@@ -1262,18 +907,6 @@ export class StreamManager {
    * to AgentSession and TurnRequestBuilder like `effectRunner`.
    */
   public readonly hostClock: HostClock;
-  /**
-   * Supervised scope for the stream engine (the app runtime's `AppFiberScope`,
-   * di/appFiberScope.ts). When set, every started stream is wrapped in a
-   * supervisor fiber forked here (`superviseEngine`), so
-   * `ServiceContainer.dispose()`/the CLI cleanup lists interrupt **and await**
-   * in-flight streams — aborted as `"system"`, partial flushed and committed —
-   * before the bridges and sessions are torn down. `undefined` (direct
-   * construction in tests, `aiService.ts` compat path) keeps streams
-   * unsupervised: they die with the process and are recovered from
-   * partial.json on next load.
-   */
-  private readonly engineScope?: Scope.Closeable;
   // Token tracker for live streaming statistics
   private readonly tokenTracker: StreamManagerTokenTracker;
   // Injected stream factory; undefined uses the AI SDK's streamText, resolved at
@@ -1312,7 +945,16 @@ export class StreamManager {
       clock: this.hostClock,
       throttleMs: this.PARTIAL_WRITE_THROTTLE_MS,
     });
-    this.engineScope = engineScope;
+    this.turnRegistry = new TurnRegistry({
+      effectRunner: runner,
+      engineScope,
+      turnEvents: this.turnEvents,
+      mockStreamLifecycle: () => this.mockStreamLifecycle,
+      flushPartialWrite: (id, info) => this.flushPartialWrite(id, info),
+      cleanupAbortedStream: (id, info, abortReason, abandonPartial) =>
+        this.cleanupAbortedStream(id, info, abortReason, abandonPartial),
+    });
+    this.workspaceStreams = this.turnRegistry.workspaceStreams;
     this.tokenTracker = options.tokenTracker ?? new StreamingTokenTracker();
     this.streamTextOverride = options.streamText;
     this.stepPreparation = new StepPreparation({
@@ -1378,44 +1020,13 @@ export class StreamManager {
   }
 
   getStartupAbortReason(signal?: AbortSignal): StreamAbortReason {
-    const reason: unknown = signal?.reason;
-    return reason === "user" || reason === "system" || reason === "startup" ? reason : "startup";
+    return this.turnRegistry.getStartupAbortReason(signal);
   }
 
-  beginStreamStart(input: {
-    workspaceId: string;
-    abortSignal?: AbortSignal;
-    acpPromptId?: string;
-  }): PendingStreamStartHandle {
-    const abortController = new AbortController();
-    // Record time: wall clock until #7282 moves its consumers to HostClock.
-    const startTime = nodeClock.nowMs();
-    const syntheticMessageId =
-      "starting-" + startTime + "-" + Math.random().toString(36).substring(2, 11);
-    const unlinkAbortSignal = linkAbortSignal(input.abortSignal, abortController);
-
-    this.pendingStreamStarts.set(input.workspaceId, {
-      abortController,
-      startTime,
-      syntheticMessageId,
-      acpPromptId: input.acpPromptId,
-    });
-
-    let finished = false;
-    return {
-      abortSignal: abortController.signal,
-      syntheticMessageId,
-      abort: (reason) => abortController.abort(reason),
-      finish: () => {
-        if (finished) return;
-        finished = true;
-        unlinkAbortSignal();
-        const pending = this.pendingStreamStarts.get(input.workspaceId);
-        if (pending?.abortController === abortController) {
-          this.pendingStreamStarts.delete(input.workspaceId);
-        }
-      },
-    };
+  beginStreamStart(
+    input: Parameters<TurnRegistry["beginStreamStart"]>[0]
+  ): PendingStreamStartHandle {
+    return this.turnRegistry.beginStreamStart(input);
   }
 
   recordToolModelUsage(
@@ -1525,29 +1136,9 @@ export class StreamManager {
     await this.partialJournal.flush(this.partialTarget(workspaceId, streamInfo), terminalPartial);
   }
 
-  /**
-   * Atomically ensures stream safety by cancelling any existing stream
-   * @param workspaceId The workspace to ensure stream safety for
-   * @returns A unique stream token for the new stream
-   */
-  private async ensureStreamSafety(workspaceId: WorkspaceId): Promise<StreamToken> {
-    const existing = this.workspaceStreams.get(workspaceId);
-
-    if (existing && existing.state !== StreamState.IDLE) {
-      await this.cancelStreamSafely(workspaceId, existing, "system", undefined);
-    }
-
-    // Generate unique token for this stream (8 hex chars for context efficiency)
-    return Math.random().toString(16).substring(2, 10) as StreamToken;
-  }
-
-  /**
-   * Generate a unique stream token (8 hex characters)
-   * Used by callers that need to prepare resources (like tools) before starting the stream
-   * Uses 8 hex chars instead of UUID for context efficiency (shorter paths in agent output)
-   */
+  /** Used by callers that prepare resources (like tools) before starting the stream. */
   public generateStreamToken(): StreamToken {
-    return Math.random().toString(16).substring(2, 10) as StreamToken;
+    return this.turnRegistry.generateStreamToken();
   }
 
   /**
@@ -1918,7 +1509,7 @@ export class StreamManager {
         this.turnEvents.emitTurnEvent(intent.event);
         return undefined;
       case "CheckSoftCancel":
-        return this.checkSoftCancelStream(workspaceId, streamInfo);
+        return this.turnRegistry.checkSoftCancelStream(workspaceId, streamInfo);
       default:
         return this.applyToolIntent(workspaceId, streamInfo, intent, loop);
     }
@@ -2184,84 +1775,6 @@ export class StreamManager {
       anthropicThinkingReplayFromStep: next,
     };
     return true;
-  }
-
-  private async cancelStreamSafely(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    abortReason: StreamAbortReason,
-    abandonPartial?: boolean
-  ): Promise<void> {
-    // If stream already completed normally (emitted stream-end), wait for its
-    // finally block to finish before returning. This happens when ensureStreamSafety
-    // is called for a new stream after the previous one finished but before it was
-    // removed from workspaceStreams.
-    // Without this guard, we'd emit stream-abort after stream-end, causing the
-    // frontend to incorrectly flip the message back to partial:true.
-    // We must NOT delete workspaceStreams here — the finally block does that.
-    // If we delete early, the finally block's delete could race with a new stream
-    // being registered and delete the new stream's entry instead.
-    if (streamInfo.state === StreamState.COMPLETED) {
-      await streamInfo.processingPromise;
-      return;
-    }
-
-    // Idempotent for concurrent cancellers (a user stop racing the shutdown
-    // supervisor's "system" cancel): the latch is checked and assigned here,
-    // synchronously, with no suspension before it — an await ahead of this
-    // point would let both callers reach cleanupAbortedStream and emit two
-    // stream-aborts. Later callers join the first cancel; its abortReason and
-    // abandonPartial are the ones delivered.
-    if (streamInfo.cancelPromise) {
-      return streamInfo.cancelPromise;
-    }
-    streamInfo.cancelPromise = (async () => {
-      streamInfo.state = StreamState.STOPPING;
-      try {
-        // A failed best-effort flush must not prevent the provider from being stopped.
-        await this.flushPartialWrite(workspaceId, streamInfo);
-      } catch (error) {
-        log.error("Failed to flush partial before cancellation", { error });
-      } finally {
-        streamInfo.abortController.abort();
-        // Unlike checkSoftCancelStream, await cleanup (blocking).
-        await this.cleanupAbortedStream(workspaceId, streamInfo, abortReason, abandonPartial);
-      }
-    })();
-    return streamInfo.cancelPromise;
-  }
-
-  // Checks if a soft interrupt is necessary, and performs one if so
-  // Similar to cancelStreamSafely but performs cleanup without blocking
-  private async checkSoftCancelStream(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo
-  ): Promise<void> {
-    if (!streamInfo.softInterrupt.pending) return;
-    try {
-      streamInfo.state = StreamState.STOPPING;
-
-      // Flush any pending partial write immediately (preserves work on interruption)
-      await this.flushPartialWrite(workspaceId, streamInfo);
-    } catch (error) {
-      log.error("Failed to flush partial before soft cancellation", { error });
-    } finally {
-      streamInfo.abortController.abort();
-
-      // Return back to the stream loop so we can wait for it to finish before
-      // sending the stream abort event. Not awaited: cleanupAbortedStream waits
-      // for processingPromise, i.e. for the loop this runs inside of.
-      // Shares cancelStreamSafely's latch: a hard cancel that lands during the
-      // flush above already owns the abort bookkeeping (keep its promise), and a
-      // hard cancel arriving later joins this one — one stream-abort either way.
-      const { abandonPartial, abortReason } = streamInfo.softInterrupt;
-      streamInfo.cancelPromise ??= this.cleanupAbortedStream(
-        workspaceId,
-        streamInfo,
-        abortReason,
-        abandonPartial
-      );
-    }
   }
 
   private closeStreamResources(streamInfo: WorkspaceStreamInfo): Promise<void> {
@@ -2921,7 +2434,7 @@ export class StreamManager {
       providerExecuted,
       modelOnlyNotifications
     );
-    await this.checkSoftCancelStream(workspaceId, streamInfo);
+    await this.turnRegistry.checkSoftCancelStream(workspaceId, streamInfo);
   }
 
   private logOrphanToolResult(
@@ -4831,7 +4344,7 @@ export class StreamManager {
       try {
         // Step 1: Cancel any existing stream before proceeding
         // This must happen regardless of whether a token was provided
-        const generatedStreamToken = await this.ensureStreamSafety(typedWorkspaceId);
+        const generatedStreamToken = await this.turnRegistry.ensureStreamSafety(typedWorkspaceId);
 
         // Step 2: Use provided stream token or the generated one
         const streamToken = providedStreamToken ?? generatedStreamToken;
@@ -4903,7 +4416,7 @@ export class StreamManager {
           });
           registeredStream.unlinkAbortSignal = unlinkAbortSignal;
           // Scope close must own STARTING streams before the fence's release can await.
-          this.superviseEngine(typedWorkspaceId, registeredStream);
+          this.turnRegistry.superviseEngine(typedWorkspaceId, registeredStream);
         };
         if (options.withAdmissionCurrent) await options.withAdmissionCurrent(construct);
         else construct();
@@ -4988,74 +4501,6 @@ export class StreamManager {
   }
 
   /**
-   * Make the engine scope (`AppFiberScope`) supervise this stream: one fiber
-   * per stream that lives exactly as long as the turn is unsettled (it waits on
-   * `completionController.promise`) and, when interrupted by the scope closing
-   * during shutdown, cancels the stream through the user-stop path
-   * (`cancelStreamSafely`, abort reason `"system"`) and waits for the turn to
-   * settle — i.e. for the partial to be flushed with usage, `stream-abort`
-   * delivered after attempt-owned partial persistence, and `completion` resolved.
-   * `closeScopeBounded` awaits that
-   * finalizer, so dispose() proceeds to tear down bridges and sessions only once
-   * every in-flight stream is durably settled. Supervision starts at
-   * registration (before the awaited turn-envelope write), so a STARTING stream
-   * is covered too: cancelling it takes the same hard-interrupt path a user stop
-   * takes during that write.
-   *
-   * The fiber is the ownership unit only; the stream's AbortSignal stays the
-   * sole cancellation transport (the loop, the AI SDK, soft interrupts and
-   * `stopStream` all key off it), so interruption meets the stream at exactly
-   * one point — this finalizer. A turn that settles on its own resolves the
-   * promise and the fiber exits, which removes its finalizer from the scope
-   * (no per-stream residue). A stream started after the scope closed is
-   * interrupted synchronously by `forkIn` and thus aborted right away (pinned in
-   * appFiberScope.test.ts); the pre-registration window (`pendingStreamStarts`)
-   * is not supervised — nothing durable exists for it yet and `stopStream`
-   * already aborts pending controllers.
-   */
-  private superviseEngine(workspaceId: WorkspaceId, streamInfo: WorkspaceStreamInfo): void {
-    if (this.engineScope === undefined) {
-      return;
-    }
-    assert(streamInfo.engineFiber === undefined, "stream engine already supervised");
-    // Zero-arity thunk on purpose: Effect.promise allocates an internal
-    // AbortController only when the thunk declares a `signal` parameter; the
-    // stream's own controller must stay the only signal in play.
-    const supervisor = Effect.promise(() => streamInfo.completionController.promise).pipe(
-      Effect.onInterrupt(() =>
-        // Finalizers already run uninterruptibly; explicit per house doctrine so
-        // the cancel → settle sequence is visibly atomic under a second interrupt.
-        Effect.uninterruptible(
-          Effect.promise(async () => {
-            const startedAt = performance.now();
-            await this.cancelStreamSafely(workspaceId, streamInfo, "system");
-            // The engine fence includes persistence and raw delivery, never session policy.
-            await streamInfo.completionController.promise;
-            // Per-stream cost inside the AppFiberScope close (shutdownStep style).
-            log.debug("[shutdown] streamManager.abortStream", {
-              workspaceId,
-              messageId: streamInfo.messageId,
-              ms: Math.round(performance.now() - startedAt),
-            });
-          })
-        )
-      ),
-      Effect.catchDefect((defect) =>
-        Effect.sync(() => {
-          log.warn("[stream] engine supervisor defect", { workspaceId, error: defect });
-        })
-      ),
-      Effect.asVoid
-    );
-    // startImmediately: the fiber reaches its (only) suspension point — the
-    // promise wait — before forkIn registers it with the scope, so a scope that
-    // is already closed interrupts it right here, synchronously.
-    streamInfo.engineFiber = this.effectRunner.runSync(
-      Effect.forkIn(supervisor, this.engineScope, { startImmediately: true })
-    );
-  }
-
-  /**
    * Check if a previousResponseId has been marked as lost
    * Called by buildProviderOptions to filter out invalid IDs
    */
@@ -5068,174 +4513,27 @@ export class StreamManager {
    * If soft is true, performs a soft interrupt (cancels at next block boundary)
    */
   async stopStream(workspaceId: string, options?: StopStreamOptions): Promise<Result<void>> {
-    const typedWorkspaceId = workspaceId as WorkspaceId;
-    // Capture every target before abort callbacks or raw startup delivery can reenter and
-    // register a replacement. Never look up a new engine after an asynchronous stop step.
-    const pending = this.pendingStreamStarts.get(workspaceId);
-    const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
-    if (options?.expectedMessageId != null) {
-      const currentMessageId = streamInfo?.messageId ?? pending?.syntheticMessageId;
-      if (currentMessageId != null && currentMessageId !== options.expectedMessageId) {
-        log.debug("stopStream: skipping stop of a replacement execution", {
-          workspaceId,
-          expectedMessageId: options.expectedMessageId,
-          currentMessageId,
-        });
-        return Ok(undefined);
-      }
-    }
-    const mockLifecycle = this.mockStreamLifecycle;
-    const isActuallyStreaming = mockLifecycle
-      ? mockLifecycle.isStreaming(workspaceId)
-      : this.isStreaming(workspaceId);
-
-    try {
-      // Invoke against the captured mock before pending abort can synchronously start another.
-      const mockStop = mockLifecycle?.stop(workspaceId, options);
-      let engineStop: Promise<void> | undefined;
-      if (!mockLifecycle && streamInfo) {
-        const abortReason = options?.abortReason ?? "system";
-        if (options?.soft) {
-          streamInfo.softInterrupt = {
-            pending: true,
-            abandonPartial: options.abandonPartial ?? false,
-            abortReason,
-          };
-        } else {
-          engineStop = this.cancelStreamSafely(
-            typedWorkspaceId,
-            streamInfo,
-            abortReason,
-            options?.abandonPartial
-          );
-        }
-      }
-      let startupDelivery: Promise<void> | undefined;
-      if (pending) {
-        if (!isActuallyStreaming && !streamInfo && !pending.abortDelivery) {
-          const delivery = Promise.withResolvers<void>();
-          pending.abortDelivery = delivery.promise;
-          pending.abortController.abort(options?.abortReason ?? "startup");
-          this.turnEvents
-            .emitStreamAbort(
-              typedWorkspaceId,
-              pending.syntheticMessageId,
-              // Duration from the wall-clock pending.startTime.
-              { duration: nodeClock.nowMs() - pending.startTime },
-              this.getStartupAbortReason(pending.abortController.signal),
-              options?.abandonPartial,
-              pending.acpPromptId
-            )
-            .then(delivery.resolve, delivery.reject);
-        } else {
-          pending.abortController.abort(options?.abortReason ?? "startup");
-        }
-        startupDelivery = pending.abortDelivery;
-      }
-
-      if (!mockLifecycle && !streamInfo && !pending && options?.emitIfMissing !== false) {
-        startupDelivery = this.turnEvents.emitStreamAbort(
-          typedWorkspaceId,
-          "",
-          {},
-          options?.abortReason ?? "startup",
-          options?.abandonPartial
-        );
-      }
-      const outcomes = await Promise.allSettled([startupDelivery, engineStop, mockStop]);
-      const failure = outcomes.find((outcome) => outcome.status === "rejected");
-      if (failure?.status === "rejected") throw failure.reason;
-      return Ok(undefined);
-    } catch (error) {
-      return Err("Failed to stop stream: " + getErrorMessage(error));
-    }
+    return this.turnRegistry.stopStream(workspaceId, options);
   }
 
-  /**
-   * Gets the current stream state for a workspace
-   */
   getStreamState(workspaceId: string): StreamState {
-    const typedWorkspaceId = workspaceId as WorkspaceId;
-    const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
-    return streamInfo?.state ?? StreamState.IDLE;
+    return this.turnRegistry.getStreamState(workspaceId);
   }
 
-  /**
-   * Checks if a workspace currently has an active stream
-   */
   isStreaming(workspaceId: string): boolean {
-    if (this.mockStreamLifecycle) {
-      return this.mockStreamLifecycle.isStreaming(workspaceId);
-    }
-    const state = this.getStreamState(workspaceId);
-    return state === StreamState.STARTING || state === StreamState.STREAMING;
+    return this.turnRegistry.isStreaming(workspaceId);
   }
 
-  /**
-   * Gets all active workspace streams (for debugging/monitoring)
-   */
   getActiveStreams(): string[] {
-    return Array.from(this.workspaceStreams.keys()).map((id) => id as string);
+    return this.turnRegistry.getActiveStreams();
   }
 
-  /** Serialize idle recovery with stream startup, including terminal persistence. */
   async acquireStreamStartLock(workspaceId: string) {
-    const id = workspaceId as WorkspaceId;
-    let mutex = this.streamLocks.get(id);
-    if (mutex == null) {
-      mutex = new AsyncMutex();
-      this.streamLocks.set(id, mutex);
-    }
-    return mutex.acquire();
+    return this.turnRegistry.acquireStreamStartLock(workspaceId);
   }
 
-  /**
-   * Gets the current stream info for a workspace if actively streaming.
-   * Include finalizing streams when checking whether recovery can proceed.
-   */
   getStreamInfo(workspaceId: string, includeFinalizing = false): ActiveStreamInfo | undefined {
-    if (this.mockStreamLifecycle) {
-      return this.mockStreamLifecycle.getStreamInfo(workspaceId, includeFinalizing);
-    }
-    const typedWorkspaceId = workspaceId as WorkspaceId;
-    const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
-
-    // Only return info if stream is actively running
-    if (
-      streamInfo &&
-      (includeFinalizing ||
-        streamInfo.state === StreamState.STARTING ||
-        streamInfo.state === StreamState.STREAMING)
-    ) {
-      const {
-        systemMessageTokens,
-        anthropicThinkingReplay,
-        anthropicThinkingReplayFromStep,
-        muxMetadata,
-      } = streamInfo.initialMetadata ?? {};
-      return {
-        messageId: streamInfo.messageId,
-        model: streamInfo.model,
-        historySequence: streamInfo.historySequence,
-        startTime: streamInfo.startTime,
-        toolCompletionTimestamps: streamInfo.toolCompletionTimestamps ?? new Map(),
-        parts: streamInfo.parts,
-        currentStepStartIndex: streamInfo.currentStepStartIndex,
-        stepStartIndices: streamInfo.stepStartIndices.slice(),
-        // Continuous compaction reads the running turn's receipt from here (#5996).
-        initialMetadata: {
-          systemMessageTokens,
-          anthropicThinkingReplay,
-          anthropicThinkingReplayFromStep,
-        },
-        // Correlation metadata for delegated work (e.g. workspace-turn
-        // continuations); lets TaskService match a live continuation stream
-        // to its still-open workspace-turn handle.
-        muxMetadata,
-      };
-    }
-
-    return undefined;
+    return this.turnRegistry.getStreamInfo(workspaceId, includeFinalizing);
   }
 
   /**
