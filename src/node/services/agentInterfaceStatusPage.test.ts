@@ -105,7 +105,8 @@ describe("needsStatusPageTurnEndNudge", () => {
       toolName: "code_execution",
       input: { code: "" },
       state: "output-available",
-      output: { result: 1 },
+      // The code failed after its nested call succeeded: the nested call alone counts.
+      output: { success: false, error: "TypeError" },
       nestedCalls: [
         {
           toolCallId: "bash-1",
@@ -146,6 +147,12 @@ describe("needsStatusPageTurnEndNudge", () => {
       name: "a nested tool call left the page unchanged",
       agentPage: true,
       parts: nestedTools,
+      nudge: true,
+    },
+    {
+      name: "an MCP tool call (no success marker) left the page unchanged",
+      agentPage: true,
+      parts: [toolCall({ content: [{ type: "text", text: "Created CODAGT-12" }] })],
       nudge: true,
     },
     {

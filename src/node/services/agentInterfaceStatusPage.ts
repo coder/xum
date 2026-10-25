@@ -6,8 +6,8 @@ import { createHash } from "node:crypto";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import type { ArtifactsLocation, AvailableArtifactsLocation } from "./artifactsOperations";
 import { readArtifactBytesAtLocation, writeArtifactAtLocation } from "./artifactsOperations";
-import { isSuccessfulToolResult } from "./aiServiceEventGuards";
 import { log } from "./log";
+import { isSuccessfulToolOutput } from "./streamManager";
 
 const THEME_VARIABLE_NAMES = Object.keys(ARTIFACT_THEME_VARIABLES)
   .map((key) => `--xum-${key}`)
@@ -176,7 +176,8 @@ export async function needsStatusPageTurnEndNudge(input: {
 }
 
 function isSuccessfulToolCall(call: { state: string; output?: unknown }): boolean {
-  return call.state === "output-available" && isSuccessfulToolResult(call.output);
+  // Not isSuccessfulToolResult: MCP results carry no success marker, and MCP work counts too.
+  return call.state === "output-available" && isSuccessfulToolOutput(call.output);
 }
 
 function madeSuccessfulToolCall(parts: readonly CompletedMessagePart[]): boolean {
