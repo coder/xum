@@ -2,7 +2,7 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
-import { act, cleanup, render, waitFor } from "@testing-library/react";
+import { act, cleanup, render, waitFor, within } from "@testing-library/react";
 import { useRef, useState, type ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -18,6 +18,7 @@ import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ArtifactListing, ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { AgentInterfaceStatusView } from "./AgentInterfaceStatusView";
+import { ArtifactsPanel } from "./ArtifactsPanel";
 import { useMainPaneAgentInterfaceView } from "./agentInterfaceView";
 
 function page(content: string): ArtifactReadResult {
@@ -66,6 +67,20 @@ function Wrapper(props: { children: ReactNode }) {
         return Promise.resolve({ success: true as const, data: current });
       },
       getState: () => Promise.resolve({ success: true as const, data: { state: null } }),
+      // What the Artifacts panel lists besides the folder: nothing.
+      listPinned: () =>
+        Promise.resolve({ success: true as const, data: { available: true as const, files: [] } }),
+      listShelf: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { project: { available: true as const, entries: [] }, global: [] },
+        }),
+      listVersions: (input: { workspaceId: string; path: string }) =>
+        Promise.resolve({
+          success: true as const,
+          data: { artifactId: input.path, path: input.path, pin: null, versions: [] },
+        }),
+      capabilities: () => Promise.resolve({ agentBrowserAvailable: true }),
     },
   };
   const [client] = useState(() => createTestApiClient(api));
@@ -94,8 +109,11 @@ function MainPane(props: { workspaceId: string }) {
   );
 }
 
+/** The page the main pane's status view shows (the Artifacts panel may show it too). */
 function shownPage(view: ReturnType<typeof render>): string {
-  return view.queryByTestId("artifact-frame")?.getAttribute("srcdoc") ?? "";
+  const statusView = view.queryByTestId("agent-interface-status-view");
+  if (statusView == null) return "";
+  return within(statusView).queryByTestId("artifact-frame")?.getAttribute("srcdoc") ?? "";
 }
 
 describe("Agent interface status view", () => {
@@ -251,6 +269,58 @@ describe("Agent interface status view", () => {
       globalThis.KeyboardEvent = globalKeyboardEvent;
       Reflect.deleteProperty(window.navigator, "userActivation");
     }
+  });
+
+  test("a page that truncated listings leave out still shows, and so do its later versions", async () => {
+    // bun-types lacks advanceTimersByTime; bun implements it.
+    const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+    const flush = () =>
+      act(async () => {
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      });
+    // A crowded folder: past the listing caps, the page is in no listing at all.
+    listed = "truncated";
+    jest.useFakeTimers();
+    try {
+      const view = render(<MainPane workspaceId="ws-crowded" />, { wrapper: Wrapper });
+      await flush();
+      expect(shownPage(view)).toContain("<p>AAAA</p>");
+
+      // A rewrite no tool call reported, found by the next poll alone.
+      current = { ...page("<p>BBBBBB</p>"), modifiedMs: 2_000 };
+      await act(async () => {
+        fakeTimers.advanceTimersByTime(3_000);
+        await Promise.resolve();
+      });
+      await flush();
+      expect(shownPage(view)).toContain("<p>BBBBBB</p>");
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("with the Artifacts panel open, the folder is listed once per change and the page follows it", async () => {
+    const view = render(
+      <>
+        <MainPane workspaceId="ws-shared" />
+        <ArtifactsPanel workspaceId="ws-shared" />
+      </>,
+      { wrapper: Wrapper }
+    );
+    await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+    const settle = () =>
+      act(async () => {
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      });
+    await settle();
+
+    current = page("<p>BBBBBB</p>");
+    const listsBefore = lists;
+    act(() => workspaceStore.simulateFileModifyingToolEnd("ws-shared"));
+    await waitFor(() => expect(shownPage(view)).toContain("<p>BBBBBB</p>"));
+    await settle();
+    // The panel's listing, which the main pane takes instead of walking the folder again.
+    expect(lists).toBe(listsBefore + 1);
   });
 
   test("only a complete listing without the page switches the pane back to the chat", async () => {

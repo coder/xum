@@ -201,6 +201,38 @@ function findStatusEntry(listing: ArtifactListing): ArtifactEntry | null | undef
   return entry ?? (listing.truncated ? undefined : null);
 }
 
+function entryFromRead(read: ArtifactReadResult): ArtifactEntry {
+  return { path: read.path, kind: read.kind, size: read.size, modifiedMs: read.modifiedMs };
+}
+
+// Successful listings of each workspace's artifacts folder: the main pane's own, or an open
+// Artifacts panel's, which lists the same folder on the same signals. While a panel lists it, the
+// main pane takes the panel's listings instead of walking the folder a second time (on a remote
+// runtime each listing is a shell walk).
+const folderListingListeners = new Set<(workspaceId: string, listing: ArtifactListing) => void>();
+// How many Artifacts panels list each workspace's folder now.
+const listingPanels = new Map<string, number>();
+
+/** Hands a successful listing of the workspace's artifacts folder to the Agent interface view. */
+export function shareArtifactListing(workspaceId: string, listing: ArtifactListing) {
+  for (const listener of folderListingListeners) listener(workspaceId, listing);
+}
+
+/**
+ * For the Artifacts panel, which shares each listing (shareArtifactListing): while it is mounted,
+ * the main pane's poll does not list the workspace's folder itself.
+ */
+export function useArtifactsPanelListing(workspaceId: string) {
+  useEffect(() => {
+    listingPanels.set(workspaceId, (listingPanels.get(workspaceId) ?? 0) + 1);
+    return () => {
+      const left = (listingPanels.get(workspaceId) ?? 1) - 1;
+      if (left > 0) listingPanels.set(workspaceId, left);
+      else listingPanels.delete(workspaceId);
+    };
+  }, [workspaceId]);
+}
+
 // Called after each successful listing with whether a file-modifying tool call ended since the
 // last one, so a status page read that failed or may be stale retries then: remote runtimes list
 // whole-second mtimes, so a same-size rewrite can keep the listed version.
@@ -287,27 +319,71 @@ function useUnshowableStatusRecheck(workspaceId: string, enabled: boolean) {
 }
 
 /**
+ * Takes each listing of the workspace's folder, the main pane's or an Artifacts panel's: publishes
+ * the status page's entry, and tells the listing listeners whether a file-modifying tool call
+ * ended since the last listing. A truncated listing that leaves the page out says nothing about
+ * it, so the page is read to learn its version; else a crowded folder would hide it for good. A
+ * failed read keeps the last entry.
+ */
+function useStatusListings(workspaceId: string, enabled: boolean) {
+  const { api } = useAPI();
+  useEffect(() => {
+    if (!api || !enabled) return;
+    const controller = new AbortController();
+    let toolWrote = false;
+    let reading = false;
+    const unsubscribeTools = workspaceStore.subscribeFileModifyingTool(() => {
+      toolWrote = true;
+    }, workspaceId);
+    const onListing = (listedId: string, listing: ArtifactListing) => {
+      if (listedId !== workspaceId) return;
+      const afterToolWrite = toolWrote;
+      toolWrote = false;
+      const entry = findStatusEntry(listing);
+      if (entry !== undefined) {
+        publishStatusEntry(workspaceId, entry);
+      } else if (!reading) {
+        reading = true;
+        readStatusPage(api, workspaceId, controller.signal, {
+          onRead: (read) => {
+            reading = false;
+            recordStatusPageRead(workspaceId, read);
+            publishStatusEntry(workspaceId, entryFromRead(read));
+          },
+          onFailure: () => {
+            reading = false;
+          },
+        });
+      }
+      for (const listener of listingListeners) listener(workspaceId, afterToolWrite);
+    };
+    folderListingListeners.add(onListing);
+    return () => {
+      folderListingListeners.delete(onListing);
+      unsubscribeTools();
+      controller.abort();
+    };
+  }, [api, workspaceId, enabled]);
+}
+
+/**
  * Lists the artifacts folder for the status page while the view is enabled, on the same signals
- * as the Artifacts panel. Mount once per main pane. A failed or truncated listing keeps the last
- * entry, so a reconnect or a crowded folder does not flip the pane back to the transcript.
+ * as the Artifacts panel, unless a panel lists it (useArtifactsPanelListing). Mount once per main
+ * pane. A failed listing keeps the last entry, so a reconnect does not flip the pane back to the
+ * transcript.
  */
 function useStatusArtifactPoll(workspaceId: string, enabled: boolean) {
   const { api } = useAPI();
   const listInFlightRef = useRef(false);
-  const toolWroteRef = useRef(false);
   const [refreshTick] = useArtifactsRefreshTick(workspaceId, {
     online: api != null,
     listInFlightRef,
     enabled,
   });
+  useStatusListings(workspaceId, enabled);
   useEffect(() => {
-    if (!enabled) return;
-    return workspaceStore.subscribeFileModifyingTool(() => {
-      toolWroteRef.current = true;
-    }, workspaceId);
-  }, [workspaceId, enabled]);
-  useEffect(() => {
-    if (!api || !enabled) return;
+    // The panel lists on these same ticks and shares each listing.
+    if (!api || !enabled || listingPanels.has(workspaceId)) return;
     const controller = new AbortController();
     listInFlightRef.current = true;
     api.artifacts
@@ -321,11 +397,7 @@ function useStatusArtifactPoll(workspaceId: string, enabled: boolean) {
           console.debug("[Agent interface] status page listing failed:", result.error);
           return;
         }
-        const afterToolWrite = toolWroteRef.current;
-        toolWroteRef.current = false;
-        const entry = findStatusEntry(result.data);
-        if (entry !== undefined) publishStatusEntry(workspaceId, entry);
-        for (const listener of listingListeners) listener(workspaceId, afterToolWrite);
+        shareArtifactListing(workspaceId, result.data);
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;

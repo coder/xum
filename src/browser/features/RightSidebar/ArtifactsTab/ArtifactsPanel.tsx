@@ -53,6 +53,7 @@ import {
   type ArtifactAnnotationPick,
 } from "./artifactAnnotation";
 import { ArtifactAnnotationPopover } from "./ArtifactAnnotationPopover";
+import { shareArtifactListing, useArtifactsPanelListing } from "./agentInterfaceView";
 import { downloadArtifact } from "./artifactDownload";
 import { ArtifactVersionMenu } from "./ArtifactVersionMenu";
 import { useArtifactInteractions } from "./useArtifactInteractions";
@@ -388,6 +389,7 @@ export function ArtifactsPanel(props: {
     setSelection({ scope: next.scope, path: next.path, version: null });
   };
 
+  useArtifactsPanelListing(props.workspaceId);
   useEffect(() => {
     if (!api) return;
     const controller = new AbortController();
@@ -405,6 +407,8 @@ export function ArtifactsPanel(props: {
         }
         setListError(null);
         setListing(result.data);
+        // The main pane's Agent interface view takes it instead of listing the folder again.
+        shareArtifactListing(props.workspaceId, result.data);
         if (readFailedRef.current) {
           readFailedRef.current = false;
           setRetryTick((tick) => tick + 1);
