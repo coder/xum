@@ -33,6 +33,8 @@ export interface HostTrapRow {
   site: string;
   /** For an fd argument: the path that opened the fd while the trap was armed. */
   fdPath?: string;
+  /** The second path of a two-path fs call (rename, copyFile, link, symlink, cp). */
+  arg2?: string;
 }
 
 export interface HostTrap {
@@ -98,7 +100,7 @@ function createTrap(installedBeforeSetup: boolean) {
   const realSetImmediate = globalThis.setImmediate;
 
   /** Adds a row and returns its id, or null when the trap is not armed. */
-  function record(api: string, arg: unknown): number | null {
+  function record(api: string, arg: unknown, arg2?: unknown): number | null {
     if (!armed || recording) return null;
     // A host call inside the bookkeeping below must not record itself.
     recording = true;
@@ -109,6 +111,7 @@ function createTrap(installedBeforeSetup: boolean) {
         arg: argText(arg),
         site: callSite(),
         ...(fdPath === undefined ? {} : { fdPath }),
+        ...(arg2 === undefined ? {} : { arg2: argText(arg2) }),
       });
       return nextId++;
     } finally {
@@ -172,13 +175,17 @@ function createTrap(installedBeforeSetup: boolean) {
 
 type Recorder = ReturnType<typeof createTrap>;
 
+/** fs calls whose second argument is a path too. */
+const TWO_PATH_FUNCTIONS = /^(rename|copyFile|link|symlink|cp)(Sync)?$/;
+
 /** Child-process functions that return a ChildProcess, which emits "close". */
 const CHILD_FUNCTIONS = new Set(["spawn", "exec", "execFile", "fork"]);
 
 function wrapFunction(rec: Recorder, original: AnyFunction, api: string, promiseApi: boolean) {
   const name = api.slice(api.indexOf(".") + 1);
   const wrapped = function (this: unknown, ...args: unknown[]): unknown {
-    const id = rec.record(api, args[0]);
+    const twoPaths = api.startsWith("fs") && TWO_PATH_FUNCTIONS.test(name);
+    const id = rec.record(api, args[0], twoPaths ? args[1] : undefined);
     // fs.watch takes an event listener, not a completion callback: the watcher is open until
     // it closes (below).
     if (id !== null && !promiseApi && !name.endsWith("Sync") && api !== "fs.watch") {

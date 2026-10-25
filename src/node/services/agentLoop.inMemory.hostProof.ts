@@ -85,6 +85,8 @@ function allowedOnDisk(configRoot: string): (row: HostTrapRow) => boolean {
     logsDir: path.dirname(getLogFilePath()),
   };
   return (row) => {
+    // A two-path call (rename, copyFile, ...) does host I/O at both paths.
+    if (row.arg2 !== undefined && !allowedPath(rule, row.api, row.arg2)) return false;
     if (!/^fd\/\d+$/.test(row.arg)) return allowedPath(rule, row.api, row.arg);
     if (row.arg === "fd/1" || row.arg === "fd/2") return true;
     return row.fdPath !== undefined && allowedPath(rule, row.api, row.fdPath);
@@ -105,11 +107,8 @@ test("one turn with one tool call runs on test layers only", async () => {
   disallowed = (row) => !allowed(row);
   // The trap stays armed until afterAll, so a late callback after the test still adds a row.
   trap.arm(); // before the loop is built: constructors count too
-  const loop = await makeInMemoryLoop({
-    host,
-    configRoot,
-    model: toolThenAnswer("file_read", { path: "README.md" }),
-  });
+  const model = toolThenAnswer("file_read", { path: "README.md" });
+  const loop = await makeInMemoryLoop({ host, configRoot, model });
   disposeClock = () => loop.clock.dispose();
   try {
     await loop.send("Read the README.");
@@ -126,6 +125,9 @@ test("one turn with one tool call runs on test layers only", async () => {
   expect(results).toHaveLength(1);
   expect(results[0]).toMatchObject({ success: true, content: "1\t# hello\n2\t" });
   expect(await loop.chatRoles()).toEqual(["user", "assistant"]);
+  // The turn goes on after the tool result: a second model call gives the answer.
+  expect(model.doStreamCalls).toHaveLength(2);
+  expect(await loop.lastAssistantText()).toBe("done");
   // The one exec of the turn: the cleanup of the stream's temp dir.
   expect(host.runtime.execs).toHaveLength(1);
   expect(host.runtime.execs[0]).toStartWith("rm -rf '");

@@ -219,6 +219,24 @@ test("an fd row carries the path of an fd opened while armed, and none before ar
   expect(fdRows.map((row) => row.fdPath)).toEqual([undefined, FILE, FILE]);
 });
 
+test("a two-path fs call records its second path too", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "host-trap-two-paths-"));
+  try {
+    await within(async () => {
+      await fsp.copyFile(FILE, path.join(dir, "a"));
+      fsNs.renameSync(path.join(dir, "a"), path.join(dir, "b"));
+      statSync(path.join(dir, "b"));
+    });
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+  expect(trap.rows().map((row) => [row.api, row.arg2])).toEqual([
+    ["fsp.copyFile", path.join(dir, "a")],
+    ["fs.renameSync", path.join(dir, "b")],
+    ["fs.statSync", undefined],
+  ]);
+});
+
 test("child_process, Bun.spawn, Bun.spawnSync and fetch", async () => {
   const apis = await within(async () => {
     await new Promise<void>((resolve) => execFile("true", () => resolve()));

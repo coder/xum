@@ -43,6 +43,8 @@ export interface InMemoryLoop {
   /** The results of every `tool-call-end` event of `toolName`, in order. */
   toolResults(toolName: string): unknown[];
   chatRoles(): Promise<string[]>;
+  /** The text parts of the last assistant message. */
+  lastAssistantText(): Promise<string>;
   /** Stops the session and Config's and ProviderService's file watches. Not the clock. */
   dispose(): Promise<void>;
 }
@@ -164,6 +166,12 @@ export async function makeInMemoryLoop(input: {
     },
     async chatRoles() {
       return (await messages()).map((message) => message.role);
+    },
+    async lastAssistantText() {
+      const assistant = (await messages()).findLast((message) => message.role === "assistant");
+      return (assistant?.parts ?? [])
+        .map((part) => (part.type === "text" ? part.text : ""))
+        .join("");
     },
     async dispose() {
       await harness.session.dispose();
