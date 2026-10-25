@@ -2359,6 +2359,7 @@ export class TurnRequestBuilder {
       artifactsEnabled: artifactsExperimentEnabled,
       agentInterfaceEnabled: isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
       sideChat: isSideChat,
+      compactionRequest: isCompactionRequest,
       resolveLocation: () =>
         resolveArtifactsLocation(
           this.dependencies.config.sessionsDir,

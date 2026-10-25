@@ -93,23 +93,29 @@ export const AGENT_INTERFACE_STATUS_TEMPLATE = `<!doctype html>
 `;
 
 /**
- * At turn start: whether the Agent interface view is active this turn (both flags on, not a side
- * chat, and XUM_SCRATCH_DIR set, so the agent can edit what was seeded), seeding the status page
- * first when it is active and the page does not exist yet. Side chats keep their transcript:
- * they cannot write files, and on narrow layouts they fill the main pane. Never overwrites (the
- * agent owns the page once it exists) and never throws: a failed seed is logged and the turn
- * goes on.
+ * At turn start: whether the Agent interface view is active this turn (both flags on, neither a
+ * side chat nor a compaction, and XUM_SCRATCH_DIR set, so the agent can edit what was seeded),
+ * seeding the status page first when it is active and the page does not exist yet. Side chats
+ * keep their transcript: they cannot write files, and on narrow layouts they fill the main pane.
+ * A compaction must answer with a tool-free summary (builtinAgents/compact.md), which guidance to
+ * edit the page would contaminate. Never overwrites (the agent owns the page once it exists) and
+ * never throws: a failed seed is logged and the turn goes on.
  */
 export async function prepareAgentInterfaceStatusPage(args: {
   scratchDirSet: boolean;
   artifactsEnabled: boolean;
   agentInterfaceEnabled: boolean;
   sideChat: boolean;
+  compactionRequest: boolean;
   resolveLocation: () => Promise<ArtifactsLocation>;
   abortSignal?: AbortSignal;
 }): Promise<boolean> {
   const active =
-    args.scratchDirSet && args.artifactsEnabled && args.agentInterfaceEnabled && !args.sideChat;
+    args.scratchDirSet &&
+    args.artifactsEnabled &&
+    args.agentInterfaceEnabled &&
+    !args.sideChat &&
+    !args.compactionRequest;
   if (active) await seedStatusPage(args.resolveLocation, args.abortSignal);
   return active;
 }

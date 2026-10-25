@@ -15,6 +15,7 @@ const ALL_ON = {
   artifactsEnabled: true,
   agentInterfaceEnabled: true,
   sideChat: false,
+  compactionRequest: false,
 };
 
 describe("prepareAgentInterfaceStatusPage", () => {
@@ -52,8 +53,9 @@ describe("prepareAgentInterfaceStatusPage", () => {
     { ...ALL_ON, agentInterfaceEnabled: false },
     { ...ALL_ON, scratchDirSet: false },
     { ...ALL_ON, sideChat: true },
+    { ...ALL_ON, compactionRequest: true },
   ])(
-    "is inactive and writes nothing unless both flags are on in a main chat with a scratch dir (%o)",
+    "is inactive and writes nothing unless both flags are on in a main chat turn that is not a compaction, with a scratch dir (%o)",
     async (flags) => {
       expect(await prepare(flags)).toBe(false);
       expect(existsSync(statusPath())).toBe(false);
