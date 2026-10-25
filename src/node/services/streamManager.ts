@@ -25,10 +25,6 @@ import type {
 import type { SendMessageError } from "@/common/types/errors";
 import type { MuxMetadata, MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
 import { hasTokenUsage } from "@/common/types/message";
-import {
-  laterAnthropicThinkingReplayPoint,
-  type AnthropicThinkingReplayPoint,
-} from "@/node/utils/messages/anthropicThinkingReplay";
 import { ThinkingLevelSchema, type ThinkingLevel } from "@/common/types/thinking";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { hasCommitWorthyParts, type HistoryService } from "./historyService";
@@ -68,13 +64,11 @@ import {
   type StreamRequestConfig,
 } from "@/node/services/turnEngine/ProviderRequest";
 import {
-  isAnthropicMessagesModel,
   StepPreparation,
   transformStepMessages,
   type StepMessageTracker,
 } from "@/node/services/turnEngine/StepPreparation";
 import {
-  buildUsageDeltaEvent,
   metadataModelIdentity,
   TurnEventEmitter,
   TurnEvents,
@@ -118,36 +112,24 @@ import {
   type PendingStreamStartHandle,
   type StreamToken,
 } from "@/node/services/turnEngine/TurnRegistry";
-import {
-  AttemptLoop,
-  type PartLoopState,
-  type ToolCallMap,
-} from "@/node/services/turnEngine/AttemptLoop";
+import { AttemptLoop } from "@/node/services/turnEngine/AttemptLoop";
 import { RefusalFallback } from "@/node/services/turnEngine/RefusalFallback";
-import { recordStepStart, StreamRetries } from "@/node/services/turnEngine/StreamRetries";
+import { StreamRetries } from "@/node/services/turnEngine/StreamRetries";
+import {
+  moveAnthropicThinkingReplayPoint,
+  StepApply,
+  turnReplayOffAfterServerTool,
+  type ToolCallMap,
+} from "@/node/services/turnEngine/StepApply";
 import { TurnResources } from "@/node/services/turnEngine/TurnResources";
 import { TurnEngine, type TurnExecutionOptions } from "@/node/services/turnEngine/TurnEngine";
 export {
   createTurnCompletionController,
   type TurnExecutionOptions,
 } from "@/node/services/turnEngine/TurnEngine";
-import type { FoldIntent, FoldStep, FoldView } from "@/node/services/turnEngine/partFold";
 
 // Disable noisy AI SDK warning logging.
 globalThis.AI_SDK_LOG_WARNINGS = false;
-
-function recordTerminalFinish(
-  streamInfo: WorkspaceStreamInfo,
-  intent: Extract<FoldIntent, { _tag: "RecordTerminalFinish" }>
-): void {
-  streamInfo.receivedTerminalEvent = true;
-  if (intent.finishReason !== undefined) {
-    streamInfo.terminalFinishReason = intent.finishReason;
-  }
-  if (intent.rawFinishReason !== undefined) {
-    streamInfo.terminalRawFinishReason = intent.rawFinishReason;
-  }
-}
 
 const MAX_ORPHAN_TOOL_RESULT_WARNINGS_PER_STREAM = 3;
 const ORPHAN_TOOL_RESULT_PREVIEW_CHARS = 160;
@@ -408,6 +390,7 @@ export class StreamManager {
   private readonly refusalFallback: RefusalFallback;
   private readonly attemptLoop: AttemptLoop;
   private readonly streamRetries: StreamRetries;
+  private readonly stepApply: StepApply;
   // Read by TurnResources at call time; coreServicesRoot.test.ts reads this field.
   private mcpServerManager?: MCPServerManager;
   private mockStreamLifecycle?: MockStreamLifecycle;
@@ -525,8 +508,7 @@ export class StreamManager {
         this.getWorkspaceLogger(workspaceId, streamInfo),
       createStreamResult: (request, abortController, stepTracker) =>
         this.createStreamResult(request, abortController, stepTracker),
-      moveAnthropicThinkingReplayPoint: (streamInfo, point) =>
-        this.moveAnthropicThinkingReplayPoint(streamInfo, point),
+      moveAnthropicThinkingReplayPoint,
       flushPartialWrite: (workspaceId, streamInfo) =>
         this.flushPartialWrite(workspaceId, streamInfo),
     });
@@ -550,8 +532,7 @@ export class StreamManager {
         this.createStreamResult(request, abortController, stepTracker),
       resetStreamStateForRetry: (workspaceId, streamInfo, options) =>
         this.resetStreamStateForRetry(workspaceId, streamInfo, options),
-      moveAnthropicThinkingReplayPoint: (streamInfo, point) =>
-        this.moveAnthropicThinkingReplayPoint(streamInfo, point),
+      moveAnthropicThinkingReplayPoint,
       getStreamMetadata: (streamInfo) => this.getStreamMetadata(streamInfo),
       backfillReasoningTokensFromParts: (streamInfo, usage) =>
         this.backfillReasoningTokensFromParts(streamInfo, usage),
@@ -588,9 +569,8 @@ export class StreamManager {
         this.emitStreamStart(workspaceId, streamInfo, historySequence),
       flushPartialWrite: (workspaceId, streamInfo, terminalPartial) =>
         this.flushPartialWrite(workspaceId, streamInfo, terminalPartial),
-      foldView: (workspaceId, streamInfo, loop) => this.foldView(workspaceId, streamInfo, loop),
       applyStep: (workspaceId, streamInfo, step, loop) =>
-        this.applyStep(workspaceId, streamInfo, step, loop),
+        this.stepApply.applyStep(workspaceId, streamInfo, step, loop),
       buildPartialAssistantMessage: (streamInfo, options) =>
         this.buildPartialAssistantMessage(streamInfo, options),
       discardUnsettledSessionUsage: (workspaceId, streamInfo) =>
@@ -615,7 +595,56 @@ export class StreamManager {
       getStream: (id) => this.workspaceStreams.get(id),
       flushPartialWrite: (id, info) => this.flushPartialWrite(id, info),
       schedulePartialWrite: (id, info) => this.schedulePartialWrite(id, info),
-      turnReplayOffAfterServerTool: (info) => this.turnReplayOffAfterServerTool(info),
+      turnReplayOffAfterServerTool,
+    });
+    this.stepApply = new StepApply({
+      turnEvents: this.turnEvents,
+      turnRegistry: this.turnRegistry,
+      usageLedger: this.usageLedger,
+      turnEventEmitter: this.turnEventEmitter,
+      // Forward at call time: whitebox tests replace tokenTracker after construction
+      // (Reflect.set), and tool completion stays in StreamManager.
+      tokenTracker: { countTokens: (text) => this.tokenTracker.countTokens(text) },
+      schedulePartialWrite: (workspaceId, streamInfo) =>
+        this.schedulePartialWrite(workspaceId, streamInfo),
+      flushPartialWrite: (workspaceId, streamInfo) =>
+        this.flushPartialWrite(workspaceId, streamInfo),
+      finishToolCall: (
+        workspaceId,
+        streamInfo,
+        toolCalls,
+        toolCallId,
+        toolName,
+        output,
+        providerExecuted,
+        modelOnlyNotifications
+      ) =>
+        this.finishToolCall(
+          workspaceId,
+          streamInfo,
+          toolCalls,
+          toolCallId,
+          toolName,
+          output,
+          providerExecuted,
+          modelOnlyNotifications
+        ),
+      logOrphanToolResult: (
+        workspaceLog,
+        streamInfo,
+        part,
+        output,
+        orphanCount,
+        trackedToolCallCount
+      ) =>
+        this.logOrphanToolResult(
+          workspaceLog,
+          streamInfo,
+          part,
+          output,
+          orphanCount,
+          trackedToolCallCount
+        ),
     });
   }
 
@@ -797,45 +826,6 @@ export class StreamManager {
    * Usage is only available after stream completes naturally.
    * On abort, the usage promise may hang - we use a timeout to return quickly.
    */
-  private async emitToolCallDeltaIfPresent(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    part: unknown
-  ): Promise<boolean> {
-    const maybeDelta = part as { type?: string } | undefined;
-    if (maybeDelta?.type !== "tool-call-delta") {
-      return false;
-    }
-
-    const toolDelta = part as {
-      toolCallId: string;
-      toolName: string;
-      argsTextDelta: string;
-    };
-
-    const deltaText = String(toolDelta.argsTextDelta ?? "");
-    if (deltaText.length === 0) {
-      return true;
-    }
-
-    const tokens = await this.tokenTracker.countTokens(deltaText);
-    // Record time: wall clock until #7282 moves its consumers to HostClock.
-    const timestamp = nodeClock.nowMs();
-
-    this.turnEvents.emitTurnEvent({
-      type: "tool-call-delta",
-      workspaceId: workspaceId as string,
-      messageId: streamInfo.messageId,
-      toolCallId: toolDelta.toolCallId,
-      toolName: toolDelta.toolName,
-      delta: toolDelta.argsTextDelta,
-      tokens,
-      timestamp,
-    });
-
-    return true;
-  }
-
   private async getStreamMetadata(
     streamInfo: WorkspaceStreamInfo,
     timeoutMs = 1000
@@ -1032,345 +1022,6 @@ export class StreamManager {
    * This ensures the old stream fully exits before a new stream can start,
    * preventing concurrent streams and race conditions.
    */
-  /** Read-only snapshot of the stream state that partFold reads. */
-  private foldView(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    loop: PartLoopState
-  ): FoldView {
-    return {
-      workspaceId: workspaceId as string,
-      messageId: streamInfo.messageId,
-      parts: streamInfo.parts,
-      currentReasoningBlock: streamInfo.currentReasoningBlock,
-      lastPartTimestamp: streamInfo.lastPartTimestamp,
-      model: streamInfo.model,
-      anthropicMessagesWire: isAnthropicMessagesModel(streamInfo.request.model),
-      toolCalls: loop.toolCalls,
-    };
-  }
-
-  /**
-   * Runs partFold's intents in order with the existing helpers. Synchronous
-   * intents run without a yield between them, awaited helpers stay awaited, and
-   * schedulePartialWrite stays fire-and-forget, as when the fold was inline.
-   */
-  private async applyStep(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    step: FoldStep,
-    loop: PartLoopState
-  ): Promise<void> {
-    // Store before the first await: tool execution starts stamp parts while
-    // the intents below await, and part timestamps must stay monotonic.
-    streamInfo.lastPartTimestamp = step.lastPartTimestamp;
-    if (step.ignoredTextDelta) {
-      log.debug("[streamManager] Ignoring non-string text-delta payload", {
-        workspaceId,
-        model: streamInfo.model,
-        ...step.ignoredTextDelta,
-      });
-    }
-    for (const intent of step.intents) {
-      const pending = this.applyIntent(workspaceId, streamInfo, intent, loop);
-      if (pending !== undefined) {
-        await pending;
-      }
-    }
-  }
-
-  /** Returns the helper's promise for intents the stream loop must await (its value is unused). */
-  private applyIntent(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    intent: FoldIntent,
-    loop: PartLoopState
-  ): Promise<unknown> | undefined {
-    switch (intent._tag) {
-      case "StartStep":
-        recordStepStart(streamInfo);
-        streamInfo.streamStepOrdinals.push(streamInfo.stepStartIndices.length - 1);
-        return this.writeInTurnThinkingStripReceipt(workspaceId, streamInfo);
-      case "OpenReasoningBlock":
-        streamInfo.currentReasoningBlock = {};
-        return undefined;
-      case "Append":
-        return this.appendFoldedPart(workspaceId, streamInfo, intent);
-      case "UpdateReasoningPart":
-        this.updateReasoningPart(streamInfo, intent);
-        return undefined;
-      case "Emit":
-        this.turnEvents.emitTurnEvent(intent.event);
-        return undefined;
-      case "CheckSoftCancel":
-        return this.turnRegistry.checkSoftCancelStream(workspaceId, streamInfo);
-      default:
-        return this.applyToolIntent(workspaceId, streamInfo, intent, loop);
-    }
-  }
-
-  private applyToolIntent(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    intent: FoldIntent,
-    loop: PartLoopState
-  ): Promise<unknown> | undefined {
-    switch (intent._tag) {
-      case "RecordToolCall":
-        // Tool call started - store in map for later lookup
-        loop.toolCalls.set(intent.toolCallId, {
-          toolCallId: intent.toolCallId,
-          toolName: intent.toolName,
-          input: intent.input,
-        });
-        if (intent.anthropicServerTool) {
-          (streamInfo.anthropicServerToolCallIds ??= new Set()).add(intent.toolCallId);
-        }
-        return undefined;
-      case "SetToolCallOutput": {
-        const toolCall = loop.toolCalls.get(intent.toolCallId);
-        assert(toolCall != null, "partFold sets output only on a tracked tool call");
-        toolCall.output = intent.output;
-        return undefined;
-      }
-      case "FinishToolCall":
-        // Use shared completion logic (await to ensure partial is flushed before event)
-        return this.finishToolCall(
-          workspaceId,
-          streamInfo,
-          loop.toolCalls,
-          intent.toolCallId,
-          intent.toolName,
-          intent.output,
-          intent.providerExecuted,
-          intent.modelOnlyNotifications
-        );
-      case "EmitToolCallDelta":
-        return this.emitToolCallDeltaIfPresent(workspaceId, streamInfo, intent.part);
-      case "SchedulePartialWrite":
-        void this.schedulePartialWrite(workspaceId, streamInfo);
-        return undefined;
-      default:
-        return this.applyTurnIntent(workspaceId, streamInfo, intent, loop);
-    }
-  }
-
-  private applyTurnIntent(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    intent: FoldIntent,
-    loop: PartLoopState
-  ): Promise<unknown> | undefined {
-    switch (intent._tag) {
-      case "RecordTerminalFinish":
-        recordTerminalFinish(streamInfo, intent);
-        return undefined;
-      case "RecordStepUsage":
-        this.recordStepUsage(workspaceId, streamInfo, intent.usage, intent.providerMetadata);
-        return undefined;
-      case "RecordInFlightUsage":
-        return this.usageLedger.recordInFlight(workspaceId, streamInfo);
-      case "FlushPartialWrite":
-        return this.flushPartialWrite(workspaceId, streamInfo);
-      case "Fail":
-        // Capture the error and immediately throw to trigger error handling
-        throw intent.error;
-      default:
-        this.applyLogIntent(streamInfo, intent, loop);
-        return undefined;
-    }
-  }
-
-  private applyLogIntent(
-    streamInfo: WorkspaceStreamInfo,
-    intent: FoldIntent,
-    loop: PartLoopState
-  ): void {
-    switch (intent._tag) {
-      case "Log":
-        loop.workspaceLog[intent.level](intent.message, intent.fields);
-        return;
-      case "LogToolCall": {
-        const inputText = JSON.stringify(intent.input);
-        log.debug(
-          `[StreamManager] tool-call: toolName=${intent.toolName}, input length=${inputText.length}`
-        );
-        return;
-      }
-      case "LogOrphanToolResult":
-        loop.orphanToolResultCount += 1;
-        this.logOrphanToolResult(
-          loop.workspaceLog,
-          streamInfo,
-          { toolCallId: intent.toolCallId, toolName: intent.toolName },
-          intent.output,
-          loop.orphanToolResultCount,
-          loop.toolCalls.size
-        );
-        return;
-      case "LogToolError": {
-        const logLevel = streamInfo.abortController.signal.aborted ? log.debug : log.error;
-        logLevel(`Tool execution error for '${intent.toolName}'`, {
-          toolCallId: intent.toolCallId,
-          error: intent.error,
-        });
-        return;
-      }
-      default:
-        assert(false, `applyStep has no handler for ${intent._tag}`);
-    }
-  }
-
-  private async appendFoldedPart(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    intent: Extract<FoldIntent, { _tag: "Append" }>
-  ): Promise<void> {
-    await this.turnEventEmitter.appendPartAndEmit(
-      workspaceId,
-      streamInfo,
-      intent.part,
-      intent.skipPartialWrite !== true
-    );
-    // The same object appendPartAndEmit pushed: signature deltas compare by reference.
-    if (intent.trackInBlock && streamInfo.currentReasoningBlock) {
-      streamInfo.currentReasoningBlock.lastPart = intent.part;
-    }
-  }
-
-  /** Adds one finish-step's usage to the stream totals, then emits usage-delta. */
-  private recordStepUsage(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    stepUsage: LanguageModelV2Usage,
-    stepProviderMetadata: Record<string, unknown> | undefined
-  ): void {
-    // Update cumulative totals for this stream. The emit below runs with
-    // zero suspension after the mutation (emitTurnEvent invokes
-    // the sink synchronously), so downstream Effect queue bridges
-    // (SubscriptionEmit's offerUnsafe) observe usage-delta events
-    // in mutation order.
-    this.usageLedger.recordStep(streamInfo, stepUsage, stepProviderMetadata);
-
-    const usageEvent = buildUsageDeltaEvent({
-      workspaceId: workspaceId as string,
-      messageId: streamInfo.messageId,
-      // Step-level (for context window display)
-      usage: stepUsage,
-      providerMetadata: stepProviderMetadata,
-      // Cumulative (for live cost display)
-      cumulativeUsage: streamInfo.cumulativeUsage,
-      cumulativeProviderMetadata: streamInfo.cumulativeProviderMetadata,
-      // Preserve costs-included zero-cost behavior throughout the stream.
-      costsIncluded: streamInfo.initialMetadata?.costsIncluded,
-    });
-    streamInfo.currentStepStartIndex = streamInfo.parts.length;
-    this.turnEvents.emitTurnEvent(usageEvent);
-  }
-
-  private updateReasoningPart(
-    streamInfo: WorkspaceStreamInfo,
-    intent: Extract<FoldIntent, { _tag: "UpdateReasoningPart" }>
-  ): void {
-    const target = streamInfo.parts[intent.index];
-    // partFold read the index from this array in the same synchronous turn.
-    assert(target?.type === "reasoning", "partFold updates only reasoning parts");
-    if (intent.signature) {
-      target.signature = intent.signature;
-    }
-    target.providerOptions = intent.providerOptions;
-    if (intent.trackInBlock && streamInfo.currentReasoningBlock) {
-      streamInfo.currentReasoningBlock.lastPart = target;
-    }
-  }
-
-  /**
-   * #5887 containment: thinking that follows an Anthropic server tool in this row cannot
-   * replay as the API returned it (see anthropicServerToolCallIds). Write the receipt with
-   * the point at the row's end, so later requests in the context segment send no thinking
-   * up to and including this row (removing every thinking block is valid; a gap or a
-   * put-back block is not). Rows after it replay theirs. It wins over a step point and
-   * never moves back. It rides on the partial write that stores this reasoning part (every
-   * reasoning append schedules one).
-   */
-  private turnReplayOffAfterServerTool(streamInfo: WorkspaceStreamInfo): void {
-    const serverToolIds = streamInfo.anthropicServerToolCallIds;
-    if (
-      serverToolIds == null ||
-      streamInfo.initialMetadata?.anthropicThinkingReplayFromStep === "end"
-    ) {
-      return;
-    }
-    // Only Anthropic reasoning is bound to the native prefix: a refusal fallback to another
-    // provider keeps the parts (and the IDs) but its reasoning replays nothing Anthropic.
-    if (!isAnthropicMessagesModel(streamInfo.request.model)) return;
-    // Read the parts, not only the ID set: a retry that drops parts drops the server tool too.
-    const followsServerTool = streamInfo.parts.some(
-      (part) => part.type === "dynamic-tool" && serverToolIds.has(part.toolCallId)
-    );
-    if (!followsServerTool) {
-      // Every recorded server tool's part is gone. The tool-call case records an ID and
-      // stores its part before any later reasoning, so the IDs are stale: drop them, or
-      // every later reasoning delta would scan all parts again (perf).
-      streamInfo.anthropicServerToolCallIds = undefined;
-      return;
-    }
-    this.moveAnthropicThinkingReplayPoint(streamInfo, "end");
-  }
-
-  /**
-   * Preserved thinking: once the step whose request stripped earlier Anthropic thinking
-   * (stepTracker.anthropicThinkingStripStep) has started, write the receipt with that step as
-   * the point, or the next turn replays the removed blocks and gets a 400. Persisted with the
-   * next partial write; a crash before it only costs one repair (fail-safe).
-   */
-  private async writeInTurnThinkingStripReceipt(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo
-  ): Promise<void> {
-    const stripStep = streamInfo.stepTracker.anthropicThinkingStripStep;
-    // prepareStep may already have prepared a later step: wait until that step started.
-    if (stripStep == null || stripStep >= streamInfo.streamStepOrdinals.length) return;
-    streamInfo.stepTracker.anthropicThinkingStripStep = undefined;
-    if (
-      this.moveAnthropicThinkingReplayPoint(streamInfo, streamInfo.streamStepOrdinals[stripStep])
-    ) {
-      await this.schedulePartialWrite(workspaceId, streamInfo);
-    }
-  }
-
-  /**
-   * Write or move this row's thinking-replay receipt (MuxMetadata.anthropicThinkingReplay).
-   * A second strip in the same turn moves the point forward: it removed everything the
-   * earlier one did, and its later blocks are bound to the new prefix. initialMetadata feeds
-   * the partial, error partial and final row alike. Returns whether anything changed; the
-   * caller persists it.
-   */
-  private moveAnthropicThinkingReplayPoint(
-    streamInfo: WorkspaceStreamInfo,
-    point: AnthropicThinkingReplayPoint
-  ): boolean {
-    const current = streamInfo.initialMetadata;
-    const next = laterAnthropicThinkingReplayPoint(
-      current?.anthropicThinkingReplay === "off"
-        ? current.anthropicThinkingReplayFromStep
-        : undefined,
-      point
-    );
-    if (
-      current?.anthropicThinkingReplay === "off" &&
-      current.anthropicThinkingReplayFromStep === next
-    ) {
-      return false;
-    }
-    streamInfo.initialMetadata = {
-      ...current,
-      anthropicThinkingReplay: "off",
-      anthropicThinkingReplayFromStep: next,
-    };
-    return true;
-  }
-
   private async cleanupAbortedStream(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
