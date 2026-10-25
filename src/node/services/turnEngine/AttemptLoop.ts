@@ -6,7 +6,6 @@
  * through StreamManager.processStreamWithCleanup.
  */
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
-import type { ModelMessage } from "ai";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import type { StreamErrorType } from "@/common/types/errors";
 import type { MuxMessage } from "@/common/types/message";
@@ -32,6 +31,12 @@ import {
 import type { RefusalFallback } from "./RefusalFallback";
 import type { StepMessageTracker } from "./StepPreparation";
 import {
+  getOpenAIPreviousResponseId,
+  planPreviousResponseIdRetry,
+  planReasoningReplayRetry,
+  type StreamRetries,
+} from "./StreamRetries";
+import {
   buildStreamErrorPayload,
   EmptyStreamOutputError,
   ModelRefusalError,
@@ -46,27 +51,6 @@ import {
   markProviderMetadataCostsIncluded,
   type UsageLedger,
 } from "./UsageLedger";
-
-/** What planPreviousResponseIdRetry found; its executor consumes it unchanged. */
-export interface PreviousResponseIdRetryPlan {
-  /** Retry the current step only (keep parts and usage) instead of the whole stream. */
-  hasParts: boolean;
-  previousResponseId: string;
-  stepMessages: WorkspaceStreamInfo["stepTracker"]["latestMessages"];
-  /** The request's provider options without previousResponseId. */
-  providerOptions: Record<string, unknown> | undefined;
-  errorCode: string | undefined;
-  statusCode: number | undefined;
-}
-
-/** What planReasoningReplayRetry found; its executor consumes it unchanged. */
-export interface ReasoningReplayRetryPlan {
-  /** Retry the current step only (keep parts and usage) instead of the whole stream. */
-  hasParts: boolean;
-  rejectedNamespace: "openai" | "anthropic";
-  /** The request transcript without the rejected namespace's reasoning. */
-  messages: ModelMessage[];
-}
 
 // Tool-call tracking + branded types
 export interface ToolCallState {
@@ -232,14 +216,8 @@ export interface AttemptLoopDeps {
   readonly resolveProviderMetadataForStreamEnd: (
     streamInfo: WorkspaceStreamInfo
   ) => Promise<Record<string, unknown> | undefined>;
-  readonly getOpenAIPreviousResponseId: (
-    providerOptions?: Record<string, unknown>
-  ) => string | undefined;
-  readonly resetStreamStateForRetry: (
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    options?: { preserveParts?: boolean; preserveUsage?: boolean; workspaceLog?: Logger }
-  ) => Promise<void>;
+  /** The retry state reset and recoveryPolicy's retry executors. */
+  readonly streamRetries: StreamRetries;
   /** StreamManager.createStreamResult, read at call time (whitebox tests replace it). */
   readonly createStreamResult: (
     request: StreamRequestConfig,
@@ -267,27 +245,6 @@ export interface AttemptLoopDeps {
     step: FoldStep,
     loop: PartLoopState
   ) => Promise<void>;
-  /** StreamManager's retry plans and their executors; recoveryPolicy picks one. */
-  readonly planPreviousResponseIdRetry: (
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown
-  ) => PreviousResponseIdRetryPlan | null;
-  readonly planReasoningReplayRetry: (
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown
-  ) => ReasoningReplayRetryPlan | null;
-  readonly retryStreamWithoutPreviousResponseId: (
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown,
-    plan: PreviousResponseIdRetryPlan
-  ) => Promise<void>;
-  readonly retryStreamWithoutReasoningReplay: (
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown,
-    plan: ReasoningReplayRetryPlan
-  ) => Promise<void>;
   /** StreamManager's error persistence (the error partial and event). */
   readonly persistStreamError: (
     workspaceId: WorkspaceId,
@@ -311,9 +268,7 @@ export class AttemptLoop {
     const streamMeta = await this.deps.getStreamMetadata(streamInfo);
     const totalUsage = this.deps.endUsage(streamInfo, streamMeta.totalUsage);
     const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
-    const previousResponseId = this.deps.getOpenAIPreviousResponseId(
-      streamInfo.request.providerOptions
-    );
+    const previousResponseId = getOpenAIPreviousResponseId(streamInfo.request.providerOptions);
 
     // Surface silent provider drops instead of leaving an empty assistant placeholder behind.
     // Recent gpt-5.4-pro stalls only logged stream startup, so future occurrences need an
@@ -365,9 +320,7 @@ export class AttemptLoop {
     const streamMeta = await this.deps.getStreamMetadata(streamInfo);
     const totalUsage = this.deps.endUsage(streamInfo, streamMeta.totalUsage);
     const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
-    const previousResponseId = this.deps.getOpenAIPreviousResponseId(
-      streamInfo.request.providerOptions
-    );
+    const previousResponseId = getOpenAIPreviousResponseId(streamInfo.request.providerOptions);
     const providerDisplayName = getStreamProviderDisplayName(streamInfo.model);
 
     // Do not treat iterator EOF as success. Anthropic and OpenAI Responses both
@@ -404,11 +357,11 @@ export class AttemptLoop {
       model: streamInfo.model,
       nextAttempt: emptyStreamRecoveryAttempts + 1,
       maxAttempts: MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS,
-      previousResponseId: this.deps.getOpenAIPreviousResponseId(streamInfo.request.providerOptions),
+      previousResponseId: getOpenAIPreviousResponseId(streamInfo.request.providerOptions),
     });
 
     streamInfo.didRetryAfterEmptyOutput = true;
-    await this.deps.resetStreamStateForRetry(workspaceId, streamInfo, {
+    await this.deps.streamRetries.resetStreamStateForRetry(workspaceId, streamInfo, {
       preserveUsage: true,
       workspaceLog,
     });
@@ -525,10 +478,8 @@ export class AttemptLoop {
       const aborted = streamInfo.abortController.signal.aborted;
       const previousResponseIdPlan = aborted
         ? null
-        : this.deps.planPreviousResponseIdRetry(streamInfo, error);
-      const reasoningReplayPlan = aborted
-        ? null
-        : this.deps.planReasoningReplayRetry(streamInfo, error);
+        : planPreviousResponseIdRetry(streamInfo, error);
+      const reasoningReplayPlan = aborted ? null : planReasoningReplayRetry(streamInfo, error);
       const decision = recoveryPolicy(
         {
           _tag: "Errored",
@@ -548,7 +499,7 @@ export class AttemptLoop {
       }
       if (decision.change === "dropPreviousResponseId") {
         assert(previousResponseIdPlan != null, "policy retried without a plan");
-        await this.deps.retryStreamWithoutPreviousResponseId(
+        await this.deps.streamRetries.retryStreamWithoutPreviousResponseId(
           workspaceId,
           streamInfo,
           error,
@@ -558,7 +509,7 @@ export class AttemptLoop {
       } else {
         assert(decision.change === "dropReasoningReplay", "errors never retry as empty output");
         assert(reasoningReplayPlan != null, "policy retried without a plan");
-        await this.deps.retryStreamWithoutReasoningReplay(
+        await this.deps.streamRetries.retryStreamWithoutReasoningReplay(
           workspaceId,
           streamInfo,
           error,
