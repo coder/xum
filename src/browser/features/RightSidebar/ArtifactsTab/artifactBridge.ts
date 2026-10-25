@@ -553,16 +553,19 @@ const ANNOTATE_KEY_LISTENER =
  * (preventDefault) keeps it. Escape typed in a text field stays the field's, as in the chat, and
  * so does an Escape that closes one of the page's dialogs or popovers, as the app's Escape closes
  * its own dialog before it stops the stream. Whether Escape closes a layer depends on the browser
- * (closedby, popover types, a cancel handler), so the open layers are read before the page's
- * handlers run and again once the press and its default action are done: a layer that closed in
- * between was the page's use of the key. Layers inside shadow roots and overlays the page builds
- * from other elements are not seen. Ctrl+C (Vim mode) interrupts from anywhere, as in the chat.
- * Keys the page's script dispatched itself are not forwarded.
+ * (closedby, popover types) and on the page (its own key handler), so the bridge watches the press
+ * instead of guessing: the open layers are read before the page's handlers run and again once the
+ * press and its default action are done, and a layer that closed in between was the page's use of
+ * the key. So is a dialog's cancel event, Escape's close request reaching the dialog, which a page
+ * may cancel to close the dialog itself after an animation. Layers inside shadow roots and
+ * overlays the page builds from other elements are not seen. Ctrl+C (Vim mode) interrupts from
+ * anywhere, as in the chat. Keys the page's script dispatched itself are not forwarded.
  */
 const INTERRUPT_KEY_LISTENER = `
   var LAYER_SELECTORS = ["dialog[open]", ":popover-open"];
-  // The page's open layers at the current trusted press, each with the selector that found it.
-  var pressLayers = [];
+  // The current trusted Escape press (null for other keys): the page's open layers then, each
+  // with the selector that found it, and whether a dialog got a cancel event since.
+  var press = null;
   function openLayers() {
     var layers = [];
     for (var i = 0; i < LAYER_SELECTORS.length; i++) {
@@ -582,9 +585,12 @@ const INTERRUPT_KEY_LISTENER = `
     }
     return false;
   }
-  // Capture: this listener runs before any of the page's own handlers.
+  // Capture: these listeners run before any of the page's own handlers.
   window.addEventListener("keydown", function (event) {
-    if (event.isTrusted) pressLayers = event.key === ${JSON.stringify(KEYBINDS.INTERRUPT_STREAM_NORMAL.key)} ? openLayers() : [];
+    if (event.isTrusted) press = event.key === ${JSON.stringify(KEYBINDS.INTERRUPT_STREAM_NORMAL.key)} ? { layers: openLayers(), cancelled: false } : null;
+  }, true);
+  window.addEventListener("cancel", function () {
+    if (press !== null) press.cancelled = true;
   }, true);
   window.addEventListener("keydown", function (event) {
     if (!event.isTrusted || event.repeat || event.metaKey || event.altKey || event.shiftKey) return;
@@ -596,9 +602,10 @@ const INTERRUPT_KEY_LISTENER = `
       keybind = "vim";
     }
     if (keybind === null) return;
-    var layers = pressLayers;
+    var current = press;
     window.setTimeout(function () {
-      if (event.defaultPrevented || closedLayer(layers)) return;
+      if (event.defaultPrevented) return;
+      if (current !== null && (current.cancelled || closedLayer(current.layers))) return;
       host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "interruptKey", keybind: keybind }, "*");
     }, 0);
   });`;

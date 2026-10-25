@@ -160,7 +160,11 @@ function runBridgeScript(options: { querySelectorAll?: (selector: string) => unk
     if (!event.defaultPrevented) extra.defaultAction?.();
     if (extra.holdTimers !== true) for (const timer of timers.splice(0)) timer();
   };
-  return { keydown, posted, xum: fakeWindow.xum, prevented: () => prevented };
+  /** An event the page's window sees, such as a dialog's cancel event. */
+  const fire = (type: string) => {
+    for (const entry of listeners) if (entry.type === type) entry.listener({ type });
+  };
+  return { keydown, fire, posted, xum: fakeWindow.xum, prevented: () => prevented };
 }
 
 describe("bridge script keys", () => {
@@ -412,9 +416,27 @@ describe("bridge script interrupt keys", () => {
     ]);
   });
 
+  test("Escape whose close request a dialog's page cancels stays the page's", () => {
+    // The page cancels the cancel event and closes the dialog itself after an animation, so the
+    // dialog is still open when the bridge checks.
+    const bridge = runBridgeScript({ querySelectorAll: findLayers(pageLayer("dialog")) });
+    bridge.keydown(KEYBINDS.INTERRUPT_STREAM_NORMAL.key, div, false, {
+      defaultAction: () => bridge.fire("cancel"),
+    });
+    expect(interrupts(bridge.posted)).toEqual([]);
+    // Ctrl+C sends no close request: a cancel event during it does not keep it.
+    bridge.keydown(KEYBINDS.INTERRUPT_STREAM_VIM.key, div, false, {
+      ctrlKey: true,
+      pageHandler: () => bridge.fire("cancel"),
+    });
+    expect(interrupts(bridge.posted)).toEqual([
+      { xumArtifact: 1, type: "interruptKey", keybind: "vim" },
+    ]);
+  });
+
   test("Escape that leaves the page's dialogs and popovers open interrupts", () => {
-    // A manual popover, or a dialog that Escape does not close (closedby="none", or a cancel
-    // handler that prevents it): the press did nothing in the page.
+    // A manual popover, or a dialog that Escape does not close (closedby="none" gives it no
+    // close request): the press did nothing in the page.
     const bridge = runBridgeScript({
       querySelectorAll: findLayers(pageLayer("dialog"), pageLayer("popover")),
     });
