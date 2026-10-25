@@ -2188,6 +2188,16 @@ describe("Focus Background Processes palette action (#5197)", () => {
   });
 });
 
+test("the status page / chat switch needs the Agent interface view and hides without a status page", () => {
+  const find = (agentInterfaceViewEnabled: boolean) =>
+    getActions({ agentInterfaceViewEnabled }).find(
+      (action) => action.id === "nav:toggle-agent-interface-view"
+    );
+  expect(find(false)).toBeUndefined();
+  // No status page has been listed for the workspace, so there is nothing to switch to.
+  expect(find(true)?.visible?.()).toBe(false);
+});
+
 test("artifact palette commands follow the experiment and pin the typed path", async () => {
   expect(getActions().some((action) => action.id === CommandIds.navOpenFileAsArtifact())).toBe(
     false

@@ -355,6 +355,28 @@ Use clear examples.
     }
   });
 
+  test("describes the agent interface status page only while that view is active", async () => {
+    const metadata: WorkspaceMetadata = {
+      id: "test-workspace",
+      name: "test-workspace",
+      projectName: "test-project",
+      projectPath: projectDir,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const agentInterfaceFor = async (agentInterfaceView: boolean | undefined) =>
+      extractTagContent(
+        await buildSystemMessage(metadata, runtime, workspaceDir, undefined, undefined, undefined, {
+          scratchDirSet: true,
+          agentInterfaceView,
+        }),
+        "agent-interface"
+      );
+
+    expect(await agentInterfaceFor(true)).toContain("$XUM_SCRATCH_DIR/artifacts/");
+    expect(await agentInterfaceFor(false)).toBeNull();
+    expect(await agentInterfaceFor(undefined)).toBeNull();
+  });
+
   describe("Claude global instruction compatibility", () => {
     const metadata = (): WorkspaceMetadata => ({
       id: "test-workspace",

@@ -11,10 +11,13 @@ import {
   ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND,
   ARTIFACT_STATE_POST_INTERVAL_MS,
   ARTIFACT_WORKSPACE_ID_MAX_CHARS,
-  ArtifactHostToFrameMessageSchema,
   buildArtifactBridgeScript,
   createBridgeRateLimiter,
 } from "./artifactBridge";
+import {
+  ARTIFACT_THEME_VARIABLE_VALUE_MAX_CHARS,
+  ARTIFACT_THEME_VARIABLES_MAX_COUNT,
+} from "./appStyleVariables";
 import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { mcpAppPreambleScript } from "./mcpAppCsp";
 
@@ -507,6 +510,32 @@ describe("buildArtifactBridgeScript", () => {
     );
     expect(attributes.get("data-xum-theme-name")).toBe("flexoki-dark");
     expect(Object.fromEntries(properties)).toEqual({ "--xum-bg": "#100f0f" });
+
+    // The frame bounds what a theme message may set: too many names set none, and an over-long
+    // value is skipped.
+    const sendVariables = (variables: Record<string, string>) =>
+      listeners.forEach((listener) =>
+        listener({
+          source: parent,
+          data: { xumArtifact: 1, type: "theme", theme: "dark", variables },
+        })
+      );
+    sendVariables(
+      Object.fromEntries(
+        Array.from({ length: ARTIFACT_THEME_VARIABLES_MAX_COUNT + 1 }, (_, i) => [
+          `--xum-v${i}`,
+          "#000",
+        ])
+      )
+    );
+    sendVariables({
+      "--xum-fg": "x".repeat(ARTIFACT_THEME_VARIABLE_VALUE_MAX_CHARS + 1),
+      "--xum-muted": "#888",
+    });
+    expect(Object.fromEntries(properties)).toEqual({
+      "--xum-bg": "#100f0f",
+      "--xum-muted": "#888",
+    });
   });
 
   test("gives only a page without styles of its own the theme's color scheme, kept live", () => {
@@ -539,28 +568,6 @@ describe("buildArtifactBridgeScript", () => {
     };
     expect(runWith(true)).toEqual(["dark", "light"]);
     expect(runWith(false)).toEqual([undefined, undefined]);
-  });
-});
-
-describe("ArtifactHostToFrameMessageSchema theme variables", () => {
-  const theme = { xumArtifact: 1, type: "theme", theme: "dark", themeName: "dark" } as const;
-
-  test("accepts --xum-* string variables", () => {
-    expect(
-      ArtifactHostToFrameMessageSchema.safeParse({ ...theme, variables: { "--xum-bg": "#000" } })
-        .success
-    ).toBe(true);
-  });
-
-  test.each([
-    ["a name outside --xum-*", { "--color-background": "#000" }],
-    ["a non-string value", { "--xum-bg": 0 }],
-    [
-      "too many variables",
-      Object.fromEntries(Array.from({ length: 33 }, (_, i) => [`--xum-v${i}`, "#000"])),
-    ],
-  ])("rejects %s", (_name, variables) => {
-    expect(ArtifactHostToFrameMessageSchema.safeParse({ ...theme, variables }).success).toBe(false);
   });
 });
 

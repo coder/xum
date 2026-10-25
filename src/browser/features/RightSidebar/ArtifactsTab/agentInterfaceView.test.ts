@@ -1,11 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  AGENT_INTERFACE_VIEW_KEY,
+  AGENT_INTERFACE_VIEW_MAX_WORKSPACES,
+} from "@/common/constants/storage";
 import type { ArtifactEntry, ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import {
   isStatusPageEntryShowable,
   isStatusPageReadShowable,
   resolveAgentInterfaceView,
   toggledAgentInterfaceView,
+  writeAgentInterfaceViewChoice,
   type AgentInterfaceView,
 } from "./agentInterfaceView";
 
@@ -29,6 +35,40 @@ describe("toggledAgentInterfaceView", () => {
     expect(toggledAgentInterfaceView("chat", false)).toBe("status");
     expect(toggledAgentInterfaceView("status", true)).toBe("chat");
     expect(toggledAgentInterfaceView("chat", true)).toBeNull();
+  });
+});
+
+describe("agent interface view choice storage", () => {
+  let cleanupDom: (() => void) | null = null;
+  beforeEach(() => {
+    cleanupDom = installDom();
+    window.localStorage.clear();
+  });
+  afterEach(() => {
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+  const stored = () => readPersistedState<Record<string, unknown>>(AGENT_INTERFACE_VIEW_KEY, {});
+
+  test("keeps each workspace's choice, drops invalid entries and the least recently used", () => {
+    window.localStorage.setItem(
+      AGENT_INTERFACE_VIEW_KEY,
+      JSON.stringify({ "ws-bad": "transcript", "ws-old": "chat" })
+    );
+    writeAgentInterfaceViewChoice("ws-a", "chat");
+    writeAgentInterfaceViewChoice("ws-b", "status");
+    expect(stored()).toEqual({ "ws-old": "chat", "ws-a": "chat", "ws-b": "status" });
+
+    // Touching ws-old again makes it the newest, so the overflow drops ws-a first.
+    writeAgentInterfaceViewChoice("ws-old", "status");
+    for (let i = 0; i < AGENT_INTERFACE_VIEW_MAX_WORKSPACES - 2; i++) {
+      writeAgentInterfaceViewChoice(`ws-${i}`, "chat");
+    }
+    const map = stored();
+    expect(Object.keys(map)).toHaveLength(AGENT_INTERFACE_VIEW_MAX_WORKSPACES);
+    expect(map["ws-a"]).toBeUndefined();
+    expect(map["ws-b"]).toBe("status");
+    expect(map["ws-old"]).toBe("status");
   });
 });
 
@@ -56,7 +96,12 @@ describe("status page fallback to the transcript", () => {
     ["a comment-only page does not", { ...html, content: "<!-- filled in later -->" }, false],
     [
       "a page its script builds shows",
-      { ...html, content: "<script>document.write('hi')</script>" },
+      // In the head, as a browser parses a leading script, so the body stays empty.
+      {
+        ...html,
+        content:
+          "<!doctype html><html><head><script>document.write('hi')</script></head><body></body></html>",
+      },
       true,
     ],
     ["a binary file does not", { ...meta, status: "binary" }, false],
