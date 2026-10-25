@@ -18,13 +18,28 @@ function describeKey(config: DaytonaPublicConfig | null): string {
   return config.apiKeySource === "env" ? "Key set (env)" : "Key set (settings)";
 }
 
+function useDaytonaConnectionTest(api: ReturnType<typeof useAPI>["api"]) {
+  const [test, setTest] = useState<TestState>({ status: "idle" });
+  const runTest = async () => {
+    if (!api) return;
+    setTest({ status: "testing" });
+    try {
+      const outcome = await api.daytona.testConnection();
+      setTest(outcome.ok ? { status: "ok" } : { status: "error", message: outcome.error });
+    } catch (testError) {
+      setTest({ status: "error", message: getErrorMessage(testError) });
+    }
+  };
+  return { test, setTest, runTest };
+}
+
 /** The saved public config (never the key itself) plus the save and test-connection calls. */
 function useDaytonaAccess() {
   const { api } = useAPI();
   const [config, setConfig] = useState<DaytonaPublicConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [test, setTest] = useState<TestState>({ status: "idle" });
+  const { test, setTest, runTest } = useDaytonaConnectionTest(api);
 
   useEffect(() => {
     if (!api) return;
@@ -56,17 +71,6 @@ function useDaytonaAccess() {
       return false;
     } finally {
       setSaving(false);
-    }
-  };
-
-  const runTest = async () => {
-    if (!api) return;
-    setTest({ status: "testing" });
-    try {
-      const outcome = await api.daytona.testConnection();
-      setTest(outcome.ok ? { status: "ok" } : { status: "error", message: outcome.error });
-    } catch (testError) {
-      setTest({ status: "error", message: getErrorMessage(testError) });
     }
   };
 
