@@ -6,14 +6,14 @@ import {
   AGENT_INTERFACE_VIEW_MAX_WORKSPACES,
 } from "@/common/constants/storage";
 import type { ArtifactEntry, ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
+import { isStatusPageReadShowable } from "./agentInterfaceView";
 import {
   isStatusPageEntryShowable,
-  isStatusPageReadShowable,
   resolveAgentInterfaceView,
   toggledAgentInterfaceView,
   writeAgentInterfaceViewChoice,
   type AgentInterfaceView,
-} from "./agentInterfaceView";
+} from "./agentInterfaceViewState";
 
 describe("resolveAgentInterfaceView", () => {
   test.each<[string, boolean, boolean, AgentInterfaceView | null, AgentInterfaceView]>([

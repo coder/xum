@@ -43,7 +43,7 @@ import {
 import {
   hasAgentInterfaceStatusPage,
   toggleAgentInterfaceView,
-} from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceView";
+} from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceViewState";
 import {
   appViewDetails,
   appViewServerNames,

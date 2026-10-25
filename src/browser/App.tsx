@@ -123,7 +123,7 @@ import { WindowsToolchainBanner } from "./components/WindowsToolchainBanner/Wind
 import { RosettaBanner } from "./components/RosettaBanner/RosettaBanner";
 
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { useAgentInterfaceEnabled } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceView";
+import { useAgentInterfaceEnabled } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceViewState";
 import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";

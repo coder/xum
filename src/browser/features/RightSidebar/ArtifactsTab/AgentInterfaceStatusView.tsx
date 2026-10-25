@@ -5,12 +5,12 @@ import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import type { ChatInputAPI } from "@/browser/features/ChatInput/types";
 import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
-  type AgentInterfaceView,
   readStatusPage,
   recordStatusPageRead,
   subscribeStatusListings,
   useStatusArtifactEntry,
 } from "./agentInterfaceView";
+import type { AgentInterfaceView } from "./agentInterfaceViewState";
 import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { useArtifactInteractions } from "./useArtifactInteractions";
