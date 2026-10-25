@@ -1,4 +1,6 @@
 import { describe, test, expect, mock } from "bun:test";
+import { tool, type ToolExecutionOptions } from "ai";
+import { z } from "zod";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { Err, Ok } from "@/common/types/result";
@@ -693,5 +695,103 @@ describe("StreamManager - fallback swap edges", () => {
     expect(row?.metadata?.stepStartPartIndices).toEqual([0, 1, 2]);
     expect(row?.metadata?.anthropicThinkingReplay).toBe("off");
     expect(row?.metadata?.anthropicThinkingReplayFromStep).toBe(2);
+  });
+
+  test("the swap points the live token tracker at the fallback model", async () => {
+    const setModel = mock((_model: string, _metadataModel?: string) => Promise.resolve());
+    const { chain, prepare } = preparedFallback();
+    const streamManager = createStreamManagerForTests(historyService, {
+      tokenTracker: { setModel, countTokens: () => Promise.resolve(0) },
+      streamText: scriptedStreamText([refused, answered]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "fallback-edges-token-tracker",
+      modelFallback: { chain, prepare },
+    });
+    expect(completion.status).toBe("completed");
+    expect(setModel.mock.calls.at(-1)?.[0]).toBe(chain[0]);
+  });
+
+  test("a tool the fallback stream runs reports its execution start", async () => {
+    const workspaceId = "fallback-edges-tool-execution-start";
+    let fallbackRequest: { tools?: Record<string, unknown>; abortSignal?: AbortSignal } = {};
+    let calls = 0;
+    const scripted = scriptedStreamText([
+      refused,
+      {
+        chunks: [
+          { type: "tool-call", toolCallId: "call-1", toolName: "probe", input: {} },
+          // The SDK runs the tool through the request's wrapped execute().
+          async () => {
+            const probe = fallbackRequest.tools?.probe as {
+              execute: (input: unknown, options: ToolExecutionOptions<unknown>) => Promise<unknown>;
+            };
+            await probe.execute(
+              {},
+              {
+                toolCallId: "call-1",
+                messages: [],
+                context: undefined,
+                abortSignal: fallbackRequest.abortSignal,
+              }
+            );
+          },
+          { type: "tool-result", toolCallId: "call-1", toolName: "probe", input: {}, output: "ok" },
+          STOP_FINISH,
+        ],
+        usage: NO_USAGE,
+      },
+    ]);
+    const streamText = fakeStreamText((request) => {
+      if (++calls === 2) fallbackRequest = request;
+      return (scripted as unknown as (options: typeof request) => unknown)(request);
+    });
+    const prepare = mock((modelString: string) =>
+      Promise.resolve(
+        Ok({
+          model: createTestLanguageModel("fallback-model"),
+          modelString,
+          messages: [],
+          system: "system",
+          tools: { probe: tool({ inputSchema: z.object({}), execute: () => "ok" }) },
+        })
+      )
+    );
+    const streamManager = createStreamManagerForTests(historyService, { streamText });
+    const starts: unknown[] = [];
+    onTurnEngineEvent(streamManager, "tool-call-execution-start", (data) => starts.push(data));
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      modelFallback: { chain: [KNOWN_MODELS.GPT.id], prepare },
+    });
+    expect(completion.status).toBe("completed");
+    expect(starts).toMatchObject([{ toolCallId: "call-1" }]);
+  });
+
+  test("a refused hop without live provider metadata records the steps' metadata", async () => {
+    const usage = createUsageRecorder();
+    const stepMetadata = { anthropic: { cacheCreationInputTokens: 7 } };
+    const streamManager = createStreamManagerForTests(historyService, {
+      sessionUsageService: usage.sessionUsageService,
+      streamText: scriptedStreamText([
+        {
+          chunks: [REFUSAL_FINISH],
+          usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+          steps: [
+            {
+              usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+              providerMetadata: stepMetadata,
+            },
+          ],
+        },
+      ]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "fallback-edges-step-metadata",
+      modelFallback: unstartableFallback(),
+    });
+    expect(completion.status).toBe("failed");
+    // No finish-step metadata reached the stream, so the snapshot reads the result's steps.
+    expect(usage.recordHeadlessUsage.mock.calls.map((call) => call[3])).toEqual([stepMetadata]);
   });
 });
