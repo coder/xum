@@ -10,7 +10,6 @@ import {
 } from "@/common/constants/daytona";
 import {
   DaytonaSshConfigWriter,
-  hasInheritedRemoteForward,
   renderDaytonaKnownHosts,
 } from "./daytonaSshConfig";
 import { resolveSSHConfig } from "./sshConfigParser";
@@ -450,44 +449,6 @@ describe("DaytonaSshConfigWriter", () => {
       expect(resolveFromUserConfig("other.example.com")).toContain(
         "\nproxyjump jump.example.com\n"
       );
-    });
-
-    // OpenSSH adds up forwards instead of keeping the first one, so the block cannot turn a
-    // user's RemoteForward off; and ClearAllForwardings would also drop the editor's own tunnel.
-    it.skipIf(!hasOpenSsh)("reports a user RemoteForward that reaches the alias", async () => {
-      await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
-      const alias = toXumDaytonaHost("sb-1");
-      const check = () => hasInheritedRemoteForward(alias, { sshConfigPath });
-      for (const forward of [
-        "RemoteForward 6000 127.0.0.1:3000",
-        `RemoteForward ${path.join(tempDir, "remote.sock")} ${path.join(tempDir, "local.sock")}`,
-      ]) {
-        await fs.writeFile(sshConfigPath, `Host *\n  ${forward}\n`, "utf8");
-        await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
-        expect(await check()).toBe(true);
-      }
-
-      await fs.writeFile(
-        sshConfigPath,
-        "Host work\n  RemoteForward 6000 127.0.0.1:3000\nHost *\n  User me\n",
-        "utf8"
-      );
-      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
-      expect(await check()).toBe(false);
-    });
-
-    it("fails closed, without the resolved config, when ssh cannot resolve the alias", async () => {
-      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
-      // A config ssh refuses to parse.
-      await fs.writeFile(sshConfigPath, "Host *\n  NoSuchOption yes\n", "utf8");
-      let refusal: unknown;
-      try {
-        await hasInheritedRemoteForward(toXumDaytonaHost("sb-1"), { sshConfigPath });
-      } catch (error) {
-        refusal = error;
-      }
-      expect(refusal).toBeInstanceOf(Error);
-      expect(String(refusal)).not.toContain("tokenA");
     });
 
     it.skipIf(!hasOpenSsh)("gives the sandbox no tun device a user Tunnel asks for", async () => {

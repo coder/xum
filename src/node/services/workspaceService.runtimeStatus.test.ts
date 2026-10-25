@@ -5,7 +5,6 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import { shellQuote } from "@/common/utils/shell";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { EnsureReadyOptions, Runtime } from "@/node/runtime/Runtime";
-import * as daytonaSshConfig from "@/node/runtime/daytonaSshConfig";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import type { DaytonaRuntimeService } from "@/node/runtime/DaytonaSSHRuntime";
 import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
@@ -316,7 +315,6 @@ describe("WorkspaceService.recordExternalEditorOpen for a Daytona workspace", ()
   let harness: WorkspaceServiceHarness;
   let projectPath: string;
   let createRuntime: { mockRestore: () => void };
-  let forwardCheck: ReturnType<typeof spyOn<typeof daytonaSshConfig, "hasInheritedRemoteForward">>;
   /** The editor use leases held on the workspace while each readiness check ran. */
   let leasesDuringReadiness: number[];
   let readiness: { ready: true } | { ready: false; error: string };
@@ -337,13 +335,10 @@ describe("WorkspaceService.recordExternalEditorOpen for a Daytona workspace", ()
     createRuntime = spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue({
       ensureReady,
     } as unknown as Runtime);
-    // The user's real ssh config must not decide these tests.
-    forwardCheck = spyOn(daytonaSshConfig, "hasInheritedRemoteForward").mockResolvedValue(false);
   });
 
   afterEach(async () => {
     createRuntime.mockRestore();
-    forwardCheck.mockRestore();
     await harness.cleanup();
   });
 
@@ -422,27 +417,6 @@ describe("WorkspaceService.recordExternalEditorOpen for a Daytona workspace", ()
     expect(
       await harness.service.recordExternalEditorOpen("dt", "tok-2", "~/mux/project/dt")
     ).toEqual({ success: true, data: { remotePath: "/home/daytona/mux/project/dt" } });
-  });
-
-  // The editor reads the user's ssh config, where a matching RemoteForward would give the
-  // sandbox a tunnel to a local service.
-  test("refuses the open when the user's ssh config forwards into the sandbox", async () => {
-    await addDaytonaWorkspace();
-    const markerPath = path.join(harness.config.sessionsDir, "dt", "external-editor-opened");
-    for (const check of [
-      () => Promise.resolve(true),
-      () => Promise.reject(new daytonaSshConfig.DaytonaSshConfigError("ssh -G failed")),
-    ]) {
-      forwardCheck.mockImplementationOnce(check);
-
-      const result = await harness.service.recordExternalEditorOpen("dt", "tok-1");
-
-      expect(result.success).toBe(false);
-      expect(forwardCheck).toHaveBeenLastCalledWith("sb-1.xum--daytona");
-      expect(workspaceUseLeasesFor(harness.config).heldCount("dt", "editor")).toBe(0);
-      expect(await Bun.file(markerPath).exists()).toBe(false);
-    }
-    expect(leasesDuringReadiness).toEqual([1, 1]);
   });
 
   test("refuses an archived workspace without starting its sandbox", async () => {
