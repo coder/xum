@@ -30,8 +30,8 @@ function markInsetsChanged() {
   window.requestAnimationFrame(notifyListeners);
 }
 
-// env() only resolves inside CSS, so hidden zero-size elements padded by the insets expose them,
-// and their border boxes resize exactly when an inset changes. A ResizeObserver on them, not the
+// env() only resolves inside CSS, so hidden elements with an empty content box, padded by the
+// insets, expose them, and their border boxes resize exactly when an inset changes. A ResizeObserver on them, not the
 // window's resize event, reports the changes: when a folding phone switches displays the window
 // can resize before the insets change, and a half turn of a landscape phone swaps the side insets
 // with no resize at all. That swap keeps the sum of the side insets, so the right one has its own
@@ -78,6 +78,8 @@ function readInsets(): Insets {
   return lastInsets;
 }
 
+// dry-duplicate-ok: the usual useSyncExternalStore subscribe over this module's own listeners; the
+// other stores with this shape own other listener sets and change apart.
 function subscribe(onChange: () => void): () => void {
   listeners.add(onChange);
   return () => {
@@ -94,39 +96,18 @@ function sidePadding(padding: CollisionPadding, side: Side): number {
   return typeof padding === "number" ? padding : (padding[side] ?? 0);
 }
 
-function isCoarsePointer(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(pointer: coarse)").matches
-  );
-}
-
 /**
- * Positioning props for portaled Radix menus (Popover, Select) on phones and tablets.
- *
- * - Collision padding includes the top and side safe areas. The app shell pads them (App.tsx),
- *   but menus portal to <body>; on an iPhone Duo cover display the top inset sits under an opaque
- *   status area, which hid the first rows of a menu Radix fitted to the viewport edge. The bottom
- *   inset stays out, as in the app shell (globals.css).
- * - Touch devices re-measure every frame. Tapping a menu trigger while the composer has focus
- *   starts the software keyboard closing, so Radix measures against the keyboard-shrunk visual
- *   viewport. iOS can report the keyboard's exit only through visualViewport events, which Radix's
- *   default update strategy ignores, so such a menu could keep a flipped side or a tiny height
- *   until a scroll re-measured it (iPhone Duo home-screen app).
+ * Collision padding for portaled Radix menus (Popover, Select) that also clears the top and side
+ * safe areas. The app shell pads them (App.tsx), but menus portal to <body>; on an iPhone Duo cover
+ * display the top inset sits under an opaque status area, which hid the first rows of a menu Radix
+ * fitted to the viewport edge. The bottom inset stays out, as in the app shell (globals.css).
  */
-export function useTouchSafePopperProps(padding: CollisionPadding = 0): {
-  collisionPadding: Partial<Record<Side, number>>;
-  updatePositionStrategy: "optimized" | "always";
-} {
+export function useSafeAreaCollisionPadding(padding: CollisionPadding = 0): Record<Side, number> {
   const insets = useSyncExternalStore(subscribe, readInsets, getServerSnapshot);
   return {
-    collisionPadding: {
-      top: sidePadding(padding, "top") + insets.top,
-      right: sidePadding(padding, "right") + insets.right,
-      bottom: sidePadding(padding, "bottom"),
-      left: sidePadding(padding, "left") + insets.left,
-    },
-    updatePositionStrategy: isCoarsePointer() ? "always" : "optimized",
+    top: sidePadding(padding, "top") + insets.top,
+    right: sidePadding(padding, "right") + insets.right,
+    bottom: sidePadding(padding, "bottom"),
+    left: sidePadding(padding, "left") + insets.left,
   };
 }

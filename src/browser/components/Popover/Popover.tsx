@@ -2,7 +2,7 @@ import * as React from "react";
 import * as PopoverPrimitive from "@radix-ui/react-popover";
 
 import { cn } from "@/common/lib/utils";
-import { useTouchSafePopperProps } from "@/browser/hooks/useTouchSafePopperProps";
+import { useSafeAreaCollisionPadding } from "@/browser/hooks/useSafeAreaCollisionPadding";
 
 const Popover = PopoverPrimitive.Root;
 
@@ -18,14 +18,14 @@ const PopoverContent = React.forwardRef<
     { className, align = "center", sideOffset = 4, collisionPadding, onEscapeKeyDown, ...props },
     ref
   ) => {
-    const popperProps = useTouchSafePopperProps(collisionPadding);
+    const safeCollisionPadding = useSafeAreaCollisionPadding(collisionPadding);
     return (
       <PopoverPrimitive.Portal>
         <PopoverPrimitive.Content
           ref={ref}
           align={align}
           sideOffset={sideOffset}
-          {...popperProps}
+          collisionPadding={safeCollisionPadding}
           onEscapeKeyDown={(e) => {
             // Prevent Escape from propagating to global handlers (e.g., stream interrupt).
             e.stopPropagation();

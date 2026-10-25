@@ -3,7 +3,7 @@ import * as SelectPrimitive from "@radix-ui/react-select";
 import { Check, ChevronDown, ChevronUp } from "lucide-react";
 
 import { cn } from "@/common/lib/utils";
-import { useTouchSafePopperProps } from "@/browser/hooks/useTouchSafePopperProps";
+import { useSafeAreaCollisionPadding } from "@/browser/hooks/useSafeAreaCollisionPadding";
 
 const Select = SelectPrimitive.Root;
 
@@ -66,12 +66,12 @@ const SelectContent = React.forwardRef<
     ref
   ) => {
     // 10px is Radix Select's own default.
-    const popperProps = useTouchSafePopperProps(collisionPadding);
+    const safeCollisionPadding = useSafeAreaCollisionPadding(collisionPadding);
     return (
       <SelectPrimitive.Portal>
         <SelectPrimitive.Content
           ref={ref}
-          {...popperProps}
+          collisionPadding={safeCollisionPadding}
           onEscapeKeyDown={(e) => {
             // Prevent Escape from propagating to global handlers (e.g., stream interrupt).
             e.stopPropagation();
