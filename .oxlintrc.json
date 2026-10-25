@@ -1242,6 +1242,8 @@
               "net",
               "child_process",
               "electron",
+              "timers",
+              "timers/promises",
               "@/node/utils/writeFileAtomic",
               {
                 "module": "@/node/utils/fs",
@@ -1310,7 +1312,8 @@
           "error",
           {
             "allow": {
-              "src/node/services/tools/bash.ts": 1
+              "src/node/services/tools/bash.ts": 1,
+              "src/node/services/tools/skillsCatalogFetch.ts": 1
             }
           }
         ]

@@ -127,6 +127,10 @@ const CLOCK_PATCH_FREE_TESTS = [
 // moves the file onto the HostClock service, and the rule fails an entry that is too high.
 const RAW_CLOCK_ALLOW = {
   "src/node/services/tools/bash.ts": 1,
+  // AbortSignal.timeout() on the skills.sh search request (#7282). The file calls the
+  // module-level node host services, not injected ones, so it has no HostClock to arm the
+  // deadline on. It bounds a network request, not loop time.
+  "src/node/services/tools/skillsCatalogFetch.ts": 1,
 };
 // The rule strips "node:" and resolves relative specifiers to "@/..." forms.
 const HOST_MODULES = [
@@ -136,6 +140,9 @@ const HOST_MODULES = [
   "net",
   "child_process",
   "electron",
+  // Host timers. Loop code arms timers through the HostClock service (phase 3).
+  "timers",
+  "timers/promises",
   "@/node/utils/writeFileAtomic",
   { module: "@/node/utils/fs", names: ["ensurePrivateDir", "ensurePrivateDirSync"] },
   // Concrete runtimes. The Runtime interface (runtime/Runtime.ts) stays allowed.

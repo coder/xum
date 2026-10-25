@@ -764,7 +764,7 @@ const localPlugin = {
         type: "problem",
         docs: {
           description:
-            "Disallow raw clock reads (Date.now(), new Date(), setTimeout(), setInterval()) in agent-loop code",
+            "Disallow raw clock reads (Date.now(), Date(), new Date(), setTimeout(), setInterval(), AbortSignal.timeout()) in agent-loop code",
         },
         schema: [
           {
@@ -789,8 +789,14 @@ const localPlugin = {
         const relFile = path.relative(context.cwd, context.filename).split(path.sep).join("/");
         const allowed = context.options[0]?.allow?.[relFile] ?? 0;
         const found = [];
+        const TIMERS = new Set(["setTimeout", "setInterval"]);
+        // Local names bound to a timer by an import from "timers" or "timers/promises"
+        // (`import { setTimeout as delay } from "node:timers/promises"`), and the namespace or
+        // default bindings of those modules (`timers.setTimeout`).
+        const timerAliases = new Set();
+        const timerModules = new Set();
         const isTimer = (node) =>
-          node.type === "Identifier" && (node.name === "setTimeout" || node.name === "setInterval");
+          node.type === "Identifier" && (TIMERS.has(node.name) || timerAliases.has(node.name));
         const memberOf = (node, object) =>
           node.type === "MemberExpression" &&
           !node.computed &&
@@ -801,6 +807,26 @@ const localPlugin = {
           (node.type === "Identifier" && node.name === "Date") ||
           (memberOf(node, "globalThis") && node.property.name === "Date");
         return {
+          // Imports are scanned first, so a call above a (hoisted) import still counts.
+          Program(program) {
+            for (const statement of program.body) {
+              if (statement.type !== "ImportDeclaration" || statement.importKind === "type") {
+                continue;
+              }
+              const module = String(statement.source.value).replace(/^node:/, "");
+              if (module !== "timers" && module !== "timers/promises") continue;
+              for (const specifier of statement.specifiers) {
+                if (specifier.type !== "ImportSpecifier") {
+                  timerModules.add(specifier.local.name);
+                } else if (
+                  specifier.importKind !== "type" &&
+                  TIMERS.has(specifier.imported.name ?? specifier.imported.value)
+                ) {
+                  timerAliases.add(specifier.local.name);
+                }
+              }
+            }
+          },
           CallExpression(node) {
             const callee = node.callee;
             if (
@@ -810,10 +836,31 @@ const localPlugin = {
               callee.property.name === "now"
             ) {
               found.push({ node, what: "Date.now()" });
+            } else if (isDate(callee)) {
+              // `Date()` without `new` returns the current time as a string.
+              found.push({ node, what: "Date()" });
             } else if (isTimer(callee)) {
               found.push({ node, what: `${callee.name}()` });
-            } else if (memberOf(callee, "globalThis") && isTimer(callee.property)) {
+            } else if (memberOf(callee, "globalThis") && TIMERS.has(callee.property.name)) {
               found.push({ node, what: `globalThis.${callee.property.name}()` });
+            } else if (
+              callee.type === "MemberExpression" &&
+              !callee.computed &&
+              callee.object.type === "Identifier" &&
+              timerModules.has(callee.object.name) &&
+              TIMERS.has(callee.property.name)
+            ) {
+              found.push({ node, what: `${callee.object.name}.${callee.property.name}()` });
+            } else if (
+              callee.type === "MemberExpression" &&
+              !callee.computed &&
+              callee.property.name === "timeout" &&
+              ((callee.object.type === "Identifier" && callee.object.name === "AbortSignal") ||
+                (memberOf(callee.object, "globalThis") &&
+                  callee.object.property.name === "AbortSignal"))
+            ) {
+              // A host timer that aborts the signal: the TestClock cannot reach it.
+              found.push({ node, what: "AbortSignal.timeout()" });
             }
           },
           NewExpression(node) {
@@ -877,6 +924,26 @@ const localPlugin = {
               method.value === "now"
             ) {
               context.report({ node, messageId: "patch", data: { what: 'spyOn(Date, "now")' } });
+            }
+          },
+          // `Date.now = () => t` (or `globalThis.Date.now = ...`) replaces the clock directly.
+          AssignmentExpression(node) {
+            const left = node.left;
+            const isDateObject = (object) =>
+              (object.type === "Identifier" && object.name === "Date") ||
+              (object.type === "MemberExpression" &&
+                !object.computed &&
+                object.object.type === "Identifier" &&
+                object.object.name === "globalThis" &&
+                object.property.name === "Date");
+            if (
+              left.type === "MemberExpression" &&
+              isDateObject(left.object) &&
+              (left.computed
+                ? left.property.type === "Literal" && left.property.value === "now"
+                : left.property.name === "now")
+            ) {
+              context.report({ node, messageId: "patch", data: { what: "Date.now = ..." } });
             }
           },
         };
