@@ -152,6 +152,22 @@ describe("DaytonaSandboxes", () => {
     expect(rig.plane.countCalls("DELETE /sandbox/ws-1")).toBe(0);
   });
 
+  it("never starts a sandbox that took the name after the label check", async () => {
+    rig.plane.addSandbox({ id: "id-a", name: "ws-s", state: "stopped" });
+    const swap = () => {
+      if (rig.plane.sandboxes.delete("id-a")) {
+        rig.plane.addSandbox({ id: "id-b", name: "ws-s", state: "stopped", labels: {} });
+      }
+      return Promise.resolve();
+    };
+    rig.plane.onRequest.set("POST /sandbox/ws-s/start", swap);
+    rig.plane.onRequest.set("POST /sandbox/id-a/start", swap);
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(rig.service.sandboxes.ensureSandboxReady("ws-s")).rejects.toThrow();
+    expect(rig.plane.find("id-b")?.state).toBe("stopped");
+  });
+
   it("sends no delete for a sandbox that is already gone", async () => {
     await rig.service.sandboxes.deleteSandbox("ws-gone");
     expect(rig.plane.countCalls("DELETE /sandbox/ws-gone")).toBe(0);

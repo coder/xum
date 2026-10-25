@@ -181,7 +181,8 @@ export class DaytonaSandboxes {
       if (step === "done") return sandbox;
       if (step === "start") {
         options.onStarting?.();
-        await client.startSandbox(sandboxId, options.signal);
+        // The id the label check saw: another sandbox can take the name in the meantime.
+        await client.startSandbox(sandbox.id, options.signal);
         startRequested = true;
       }
       const remaining = deadline - this.now();

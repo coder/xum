@@ -419,6 +419,31 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     }
   );
 
+  it("never stops or resizes a sandbox that took the name during the resize", async () => {
+    Object.assign(rig.plane, {
+      rejectCreateResources: true,
+      snapshotResources: { cpu: 1, memory: 1, disk: 3 },
+    });
+    // At the stop the created sandbox goes, and an unlabeled one takes its name.
+    const swap = () => {
+      const created = rig.plane.find("xum-swap");
+      if (created && created.id !== "id-other") {
+        rig.plane.sandboxes.delete(created.id);
+        rig.plane.addSandbox({ id: "id-other", name: "xum-swap", labels: {}, disk: 50 });
+      }
+      return Promise.resolve();
+    };
+    rig.plane.onRequest.set("POST /sandbox/xum-swap/stop", swap);
+    rig.plane.onRequest.set("POST /sandbox/sb-1/stop", swap);
+
+    const daytona = { sandboxId: "xum-swap", snapshot: "fixed-snap", cpu: 4, memoryGiB: 8 };
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      makeRuntime({ ...daytona, diskGiB: 20 }).postCreateSetup(initParams())
+    ).rejects.toThrow("setup failed");
+    expect(rig.plane.find("id-other")).toMatchObject({ state: "started", cpu: 2, disk: 50 });
+  });
+
   it("deletes the sandbox it created when setup fails afterwards", async () => {
     rig.writer.writeError = new Error("No space left on device");
     const params = initParams();

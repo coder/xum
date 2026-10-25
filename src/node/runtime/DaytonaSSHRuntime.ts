@@ -768,8 +768,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
           `creating with the snapshot's size and resizing to ${preset.label}...`
       );
     }
-    await this.daytonaService.sandboxes.createSandbox(base);
-    await this.resizeToPreset(sandboxId, preset);
+    const created = await this.daytonaService.sandboxes.createSandbox(base);
+    // By id: another sandbox can take the name while this one stops and resizes.
+    await this.resizeToPreset(created.id, preset);
   }
 
   private async resolveTarget(): Promise<{ target?: string }> {
