@@ -28,7 +28,7 @@ import { runLanguageModelCleanup } from "@/node/services/languageModelCleanup";
 import type { Logger } from "@/node/services/log";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { AnthropicThinkingReplayPoint } from "@/node/utils/messages/anthropicThinkingReplay";
-import type { ProviderRequest, StreamRequestConfig } from "./ProviderRequest";
+import { ProviderRequest, type StreamRequestConfig } from "./ProviderRequest";
 import { applyTurnReplayReceipt, type StepMessageTracker } from "./StepPreparation";
 import { publishLiveRouting, withAutoThinkingClaim } from "./TurnEngine";
 import type { TurnEvents } from "./TurnEvents";
@@ -680,8 +680,7 @@ export class RefusalFallback {
     // finally only cleans the final request's model, so without this the
     // refused model (e.g. an OpenAI WS transport socket) would leak per hop.
     runLanguageModelCleanup(streamInfo.request.model);
-    streamInfo.request = started.nextRequest;
-    streamInfo.streamResult = started.nextStreamResult;
+    ProviderRequest.beginAttempt(streamInfo, started.nextRequest, () => started.nextStreamResult);
     publishLiveRouting(streamInfo);
     await this.deps.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
     if (started.consumedSwap) {
@@ -696,14 +695,11 @@ export class RefusalFallback {
     prepared: PreparedModelFallback,
     overrideHolder: ActiveTurnThinkingOverride | undefined
   ): void {
-    streamInfo.model = prepared.modelString;
-    streamInfo.metadataModel = this.deps.resolveMetadataModel(
-      prepared.modelString,
-      prepared.providersConfig
-    );
-    if (prepared.thinkingLevel !== undefined) {
-      streamInfo.thinkingLevel = prepared.thinkingLevel;
-    }
+    ProviderRequest.adoptModel(streamInfo, {
+      modelString: prepared.modelString,
+      metadataModel: this.deps.resolveMetadataModel(prepared.modelString, prepared.providersConfig),
+      thinkingLevel: prepared.thinkingLevel,
+    });
     // Final stream-end metadata spreads initialMetadata, so route attribution
     // corrections (the patch, applied above) and the fallback record propagate automatically.
     streamInfo.initialMetadata = {

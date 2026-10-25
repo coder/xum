@@ -221,7 +221,7 @@ export interface WorkspaceStreamInfo
   extends
     TurnState,
     Readonly<TurnSlot>,
-    AttemptRequest,
+    Readonly<AttemptRequest>,
     Readonly<TurnHandles>,
     Readonly<PartialJournalState>,
     Readonly<UsageLedgerState> {}

@@ -23,7 +23,7 @@ import { createErrorEvent, type StreamErrorPayload } from "@/node/services/utils
 import { nodeClock } from "@/node/utils/hostClock";
 import { partFold, type FoldablePart, type FoldStep } from "./partFold";
 import type { PartialJournal } from "./PartialJournal";
-import type { ProviderRequest, StreamRequestConfig } from "./ProviderRequest";
+import { ProviderRequest, type StreamRequestConfig } from "./ProviderRequest";
 import {
   MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS,
   recoveryPolicy,
@@ -411,15 +411,13 @@ export class AttemptLoop {
       previousResponseId: getOpenAIPreviousResponseId(streamInfo.request.providerOptions),
     });
 
-    streamInfo.didRetryAfterEmptyOutput = true;
+    ProviderRequest.markRetry(streamInfo, "afterEmptyOutput");
     await this.deps.streamRetries.resetStreamStateForRetry(workspaceId, streamInfo, {
       preserveUsage: true,
       workspaceLog,
     });
-    streamInfo.streamResult = this.deps.createStreamResult(
-      streamInfo.request,
-      streamInfo.abortController,
-      streamInfo.stepTracker
+    ProviderRequest.beginAttempt(streamInfo, streamInfo.request, (request) =>
+      this.deps.createStreamResult(request, streamInfo.abortController, streamInfo.stepTracker)
     );
   }
 
