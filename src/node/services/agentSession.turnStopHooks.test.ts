@@ -15,6 +15,7 @@ import { TURN_STOP_PROMPT_MAX_CHARS } from "./agentPlugins/promptHooks";
 import { TODO_TURN_END_NUDGE } from "@/node/services/agentNotifications/todoTurnEndNudge";
 import { STATUS_PAGE_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
 import { Ok } from "@/common/types/result";
+import { createMuxMessage } from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { AgentSessionAIService } from "./agentSession";
 import { eventSpine, type TurnStopContext } from "./events/eventSpine";
@@ -850,6 +851,67 @@ describe("todo turn-end nudge", () => {
     await settle(h);
 
     expect(streams()).toBe(1);
+  });
+
+  test.each([
+    {
+      name: "a background wake",
+      text: "Background sub-agent task(s) have completed.",
+      internal: { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true },
+    },
+    // Heartbeats carry no agentInitiated, so the gate must not rely on it.
+    {
+      name: "a heartbeat",
+      text: "[Heartbeat] Check on the workspace.",
+      internal: { acceptanceOrigin: "automatic", synthetic: true },
+    },
+  ] as const)("a turn $name started gets no nudge", async (row) => {
+    const { h, streams } = await setup({ parts: todoWriteThenReply });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage(row.text, options, row.internal);
+    await settle(h);
+    expect(streams()).toBe(1);
+
+    // The next message the user sends is a user turn again and gets its nudge.
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+    expect(streams()).toBe(3);
+    expect((await userTexts(h)).slice(1)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
+  });
+
+  // A compaction follow-up is sent as a synthetic row but continues the turn that compacted.
+  test.each([
+    { name: "a user turn", internal: undefined, nudged: true },
+    {
+      name: "a machine wake",
+      internal: { acceptanceOrigin: "automatic", synthetic: true },
+      nudged: false,
+    },
+  ] as const)("a compaction follow-up after $name keeps its origin", async (row) => {
+    // Only the follow-up (turn 2) writes todos, so turn 1 itself is never nudged.
+    const { h, streams } = await setup({
+      parts: (turn) => (turn === 2 ? todoWriteThenReply() : [{ type: "text", text: "ok" }]),
+    });
+    await writeTodos(h, openTodos);
+    await h.session.sendMessage("first", options, row.internal);
+    await settle(h);
+    const summary = createMuxMessage("summary", "assistant", "compacted summary", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+      muxMetadata: {
+        type: "compaction-summary",
+        pendingFollowUp: { text: "fix the bug", model, agentId: "exec" },
+      },
+    });
+    assert((await h.historyService.appendToHistory(workspaceId, summary)).success);
+
+    expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+    await settle(h);
+
+    expect(streams()).toBe(row.nudged ? 3 : 2);
+    expect((await userTexts(h)).includes(TODO_TURN_END_NUDGE)).toBe(row.nudged);
   });
 });
 

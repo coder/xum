@@ -125,6 +125,7 @@ import {
   mergeTurnStopContinuation,
   needsTodoTurnEndNudge,
   TODO_TURN_END_NUDGE,
+  streamStartedByUserMessage,
   type TurnStopContinuation,
 } from "@/node/services/agentNotifications/todoTurnEndNudge";
 import { STATUS_PAGE_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
@@ -725,6 +726,8 @@ interface StopContinuationProvenance {
   externallyOwnedTurn: boolean;
   /** See activeStreamContext.admissionStopEpoch (the current epoch when it had no context). */
   admissionStopEpoch: number;
+  /** A message the user sent started the turn (see AgentSession.turnStartedByUserMessage). */
+  startedByUserMessage: boolean;
 }
 
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
@@ -1816,6 +1819,14 @@ export class AgentSession {
 
   /** Tracks the user message id that initiated the currently active stream (for retry guards). */
   private activeStreamUserMessageId?: string;
+
+  /**
+   * Whether a message the user sent started the current turn (streamStartedByUserMessage). Set
+   * when a sent message starts its stream; retries and resumes keep it. Only those turns earn the
+   * todo turn-end nudge. Starts false: a follow-up dispatched after a restart has lost its origin,
+   * and skipping one nudge is cheaper than nudging a machine turn.
+   */
+  private turnStartedByUserMessage = false;
 
   /** Track user message ids that already retried without post-compaction injection. */
   private readonly postCompactionRetryAttempts = new Set<string>();
@@ -6575,6 +6586,7 @@ export class AgentSession {
         return Ok(undefined);
       }
 
+      this.noteStreamStartOrigin(internal, isCompactionRequest);
       // Raw terminals reserve COMPLETING; delivered completion runs terminal policy.
       const streamResult = await this.streamWithHistory(
         preparedTurn,
@@ -10861,8 +10873,9 @@ export class AgentSession {
    * The turn.stop continuation: the plugin hooks' reasons plus Xum's nudges, or null when nothing
    * continues. Each nudge fires at most once per user turn: only before any continuation (so
    * never after a nudge itself), never against a plugin's halt, and never in Plan mode (where the
-   * todo list is the plan). The nudged turn keeps the turn's tools, so it can also finish open
-   * items.
+   * todo list is the plan). The TODO nudge also fires only for a turn that a message the user sent
+   * started, never a machine wake. The nudged turn keeps the turn's tools, so it can also finish
+   * open items.
    */
   private async readTurnStopContinuation(
     payload: StreamEndEvent,
@@ -10880,7 +10893,7 @@ export class AgentSession {
     )) ?? { kind: "none" };
     return mergeTurnStopContinuation({
       hookPrompt: hookOutcome.kind === "continue" ? hookOutcome.prompt : null,
-      nudges: await this.readTurnEndNudges(hookOutcome, options, payload),
+      nudges: await this.readTurnEndNudges(hookOutcome, options, payload, provenance),
     });
   }
 
@@ -10888,7 +10901,8 @@ export class AgentSession {
   private async readTurnEndNudges(
     hookOutcome: TurnStopHookOutcome,
     options: SendMessageOptions | undefined,
-    payload: StreamEndEvent
+    payload: StreamEndEvent,
+    provenance: StopContinuationProvenance
   ): Promise<string[]> {
     if (
       hookOutcome.kind === "halted" ||
@@ -10899,11 +10913,13 @@ export class AgentSession {
       return [];
     }
     const nudges: string[] = [];
-    const todoNudge = await needsTodoTurnEndNudge({
-      sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
-      parts: payload.parts,
-      files: this.historyService.files,
-    });
+    const todoNudge =
+      provenance.startedByUserMessage &&
+      (await needsTodoTurnEndNudge({
+        sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
+        parts: payload.parts,
+        files: this.historyService.files,
+      }));
     if (todoNudge) nudges.push(TODO_TURN_END_NUDGE);
     const statusPageNudge = await this.aiService.needsStatusPageTurnEndNudge?.(this.workspaceId, {
       messageId: payload.messageId,
@@ -10911,6 +10927,18 @@ export class AgentSession {
     });
     if (statusPageNudge === true) nudges.push(STATUS_PAGE_TURN_END_NUDGE);
     return nudges;
+  }
+
+  /** Records whether the sent message whose stream starts now began a user turn. */
+  private noteStreamStartOrigin(
+    internal: SendMessageInternalOptions | undefined,
+    isCompactionRequest: boolean
+  ): void {
+    this.turnStartedByUserMessage = streamStartedByUserMessage({
+      previous: this.turnStartedByUserMessage,
+      synthetic: internal?.synthetic === true,
+      continuesCompaction: isCompactionRequest || internal?.compactionFollowUpSummary != null,
+    });
   }
 
   /** The ending stream's provenance for a turn.stop continuation (read before its reset). */
@@ -10928,6 +10956,7 @@ export class AgentSession {
       delegatedWorkspaceTurn: context.workspaceTurnMetadata != null,
       externallyOwnedTurn: this.isExternallyOwnedTurn(payload, context.options),
       admissionStopEpoch: context.admissionStopEpoch ?? this.getStopEpoch(),
+      startedByUserMessage: this.turnStartedByUserMessage,
     };
   }
 
