@@ -1702,4 +1702,31 @@ describe("StreamManager - stream start", () => {
     expect(completion.status).toBe("completed");
     expect(setModel.mock.calls[0]?.[0]).toBe(KNOWN_MODELS.SONNET.id);
   });
+
+  test("a running turn reports streaming, and a failed one reports error while it settles", async () => {
+    // isStreaming() reads this state: queued sends wait while a turn streams, and
+    // a failing turn must stop counting as streaming before its error event.
+    const workspaceId = "stream-state-lifecycle";
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([
+        {
+          chunks: [
+            { type: "text-delta", text: "partial" },
+            () => Promise.reject(new Error("provider exploded")),
+          ],
+        },
+      ]),
+    });
+    const states: string[] = [];
+    onTurnEngineEvent(streamManager, "stream-start", () =>
+      states.push(`start:${streamManager.getStreamState(workspaceId)}`)
+    );
+    onTurnEngineEvent(streamManager, "error", () =>
+      states.push(`error:${streamManager.getStreamState(workspaceId)}`)
+    );
+
+    const { completion } = await runTurnForTests(streamManager, { workspaceId });
+    expect(completion.status).toBe("failed");
+    expect(states).toEqual(["start:streaming", "error:error"]);
+  });
 });
