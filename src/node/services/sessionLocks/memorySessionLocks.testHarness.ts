@@ -201,13 +201,16 @@ function acquireInMemory(
  * would take the earlier caller's place (phase 4 saw that in 14 of 1500 runs). A failed mkdir
  * rejects as the Node locks do, and gives up the place or the lock. So does an abort of signal
  * (the caller's) during the mkdir: the Node locks check it after their mkdir.
+ * createParentDir false (a file lock's option): no mkdir, and a missing folder rejects with
+ * ENOENT, as the Node lock's first write into the folder does.
  */
 async function acquireAfterFolder(
   table: MemoryLockTable,
   files: HostFiles,
   lockPath: string,
   acquire: (giveUp: AbortSignal) => Promise<Entry>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  createParentDir = true
 ): Promise<Entry> {
   const giveUp = new AbortController();
   // Settled into a value at once: an early refusal must not reject unhandled during the mkdir.
@@ -223,7 +226,11 @@ async function acquireAfterFolder(
     throw error;
   };
   try {
-    await files.promises.mkdir(path.dirname(lockPath), { recursive: true });
+    if (createParentDir) {
+      await files.promises.mkdir(path.dirname(lockPath), { recursive: true });
+    } else {
+      await files.promises.access(path.dirname(lockPath));
+    }
   } catch (error) {
     return await abandon(error);
   }
@@ -327,18 +334,24 @@ export function memorySessionLocks(
       assert(lockPath.length > 0, "acquireProcessFileLock requires a lock path");
       assert(timeoutMs > 0, "acquireProcessFileLock timeoutMs must be positive");
       // The folder as fileLock.ts makes it, but no lock file.
-      const entry = await acquireAfterFolder(table, files, lockPath, (giveUp) =>
-        acquireInMemory(
-          table,
-          lockPath,
-          timeoutMs,
-          clock,
-          (blocker) => {
-            const { why, ...holder } = blocker;
-            return new Error(fileLockTimeoutMessage(label, lockPath, timeoutMs, { holder, why }));
-          },
-          giveUp
-        )
+      const entry = await acquireAfterFolder(
+        table,
+        files,
+        lockPath,
+        (giveUp) =>
+          acquireInMemory(
+            table,
+            lockPath,
+            timeoutMs,
+            clock,
+            (blocker) => {
+              const { why, ...holder } = blocker;
+              return new Error(fileLockTimeoutMessage(label, lockPath, timeoutMs, { holder, why }));
+            },
+            giveUp
+          ),
+        undefined,
+        options.createParentDir !== false
       );
       return {
         assertStillOwned: () => {

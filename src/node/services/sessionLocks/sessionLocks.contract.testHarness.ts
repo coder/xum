@@ -246,6 +246,29 @@ export function describeSessionLocksContract(
         await lock[Symbol.asyncDispose]();
       }));
 
+    test("a file lock with createParentDir false on a missing parent rejects with ENOENT", () =>
+      withLayer(async (locks, t) => {
+        const lockPath = path.join(t.dir, "removed-session", "blobs.lock");
+        const error = await locks
+          .acquireProcessFileLock({
+            lockPath,
+            timeoutMs: SHORT_MS,
+            label: "contract lock",
+            createParentDir: false,
+          })
+          .then(
+            () => null,
+            (caught: unknown) => caught
+          );
+        expect((error as NodeJS.ErrnoException).code).toBe("ENOENT");
+        expect(
+          await fs.stat(path.dirname(lockPath)).then(
+            () => true,
+            () => false
+          )
+        ).toBe(false);
+      }));
+
     test("a record lock creates its missing parent by default", () =>
       withLayer(async (locks, t) => {
         const lockPath = path.join(t.dir, "new-dir", "record.lock");
