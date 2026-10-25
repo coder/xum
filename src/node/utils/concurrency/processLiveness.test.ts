@@ -59,7 +59,7 @@ describe("probeProcessBirth without /proc", () => {
     const read = spyOn(fs, "readFileSync").mockImplementation((() => {
       if (stat !== undefined) return stat;
       throw Object.assign(new Error("ENOENT: no /proc"), { code: "ENOENT" });
-    }) as typeof fs.readFileSync);
+    }) as unknown as typeof fs.readFileSync);
     const runPs = spyOn(childProcess, "spawnSync").mockImplementation(
       (() => ps) as unknown as typeof childProcess.spawnSync
     );
