@@ -821,8 +821,9 @@ describe("AIService status page turn-end nudge", () => {
   // The turn start (TurnRequestBuilder) and the turn end (AgentSession) meet only here: keyed by
   // the streamed messageId, taken once, and read under the flags at turn end.
   it.each([
-    { name: "the view still on", viewOnAtEnd: true },
-    { name: "the view switched off", viewOnAtEnd: false },
+    { name: "the view still on", viewOnAtEnd: true, planLike: false, nudge: true },
+    { name: "the view switched off", viewOnAtEnd: false, planLike: false, nudge: false },
+    { name: "a custom plan-like agent", viewOnAtEnd: true, planLike: true, nudge: false },
   ])("a placeholder page at turn end with $name", async (row) => {
     const testHistory = await createTestHistoryService();
     try {
@@ -836,6 +837,15 @@ describe("AIService status page turn-end nudge", () => {
         experimentsService,
       });
       stubCommonStreamMessageDependencies({ ...harness, metadata });
+      if (row.planLike) {
+        // A custom agent based on Plan keeps its own ID but resolves as plan-like.
+        const resolved = resolvedAgentResultFor(metadata);
+        if (!resolved.success) throw new Error("Expected resolved agent");
+        resolved.data.effectiveAgentId = "planner";
+        resolved.data.agentIsPlanLike = true;
+        resolved.data.effectiveMode = "plan";
+        spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(resolved);
+      }
       const result = await harness.service.streamMessage({
         messages: [createMuxMessage("user", "user", "Fix the build")],
         workspaceId: metadata.id,
@@ -851,7 +861,7 @@ describe("AIService status page turn-end nudge", () => {
         harness.service.needsStatusPageTurnEndNudge(metadata.id, { messageId: id, parts: [] });
 
       expect(await nudge("another-turn")).toBe(false);
-      expect(await nudge(messageId)).toBe(row.viewOnAtEnd);
+      expect(await nudge(messageId)).toBe(row.nudge);
       expect(await nudge(messageId)).toBe(false);
     } finally {
       await testHistory.cleanup();

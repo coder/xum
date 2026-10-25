@@ -1109,10 +1109,11 @@ export class TurnRequestBuilder {
     workspaceId: string,
     messageId: string,
     turn: AgentInterfaceStatusPageTurn | null,
-    subagentWorkspace: boolean
+    agent: { subagentWorkspace: boolean; planLike: boolean }
   ): void {
-    // Only root workspaces get the turn-end status page nudge (AgentSession.runTurnStopHooks).
-    if (turn != null && !subagentWorkspace) {
+    // Only root workspaces get the turn-end status page nudge (AgentSession.runTurnStopHooks), and
+    // no plan-like agent (a custom one included): it may edit only its plan file.
+    if (turn != null && !agent.subagentWorkspace && !agent.planLike) {
       this.agentInterfaceTurns.set(workspaceId, { messageId, turn });
     } else {
       this.agentInterfaceTurns.delete(workspaceId);
@@ -2854,12 +2855,10 @@ export class TurnRequestBuilder {
     // assistant turn. The placeholder is appended to history below
     // (after the abort check).
     const assistantMessageId = createAssistantMessageId();
-    this.recordAgentInterfaceTurn(
-      workspaceId,
-      assistantMessageId,
-      agentInterfaceTurn,
-      isSubagentWorkspace
-    );
+    this.recordAgentInterfaceTurn(workspaceId, assistantMessageId, agentInterfaceTurn, {
+      subagentWorkspace: isSubagentWorkspace,
+      planLike: agentIsPlanLike,
+    });
     // Bind ownership before cached MCP tools are captured by the PTC bridge.
     // A queued invocation must keep this turn's identity after a replacement starts.
     const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };
