@@ -12,6 +12,8 @@ describe("useSafeAreaCollisionPadding", () => {
   let insetReads = 0;
   let observers: FakeResizeObserver[] = [];
   let frames: FrameRequestCallback[] = [];
+  let touchScreen = true;
+  let touchQueryListeners: Array<() => void> = [];
 
   class FakeResizeObserver {
     readonly targets: Element[] = [];
@@ -62,6 +64,22 @@ describe("useSafeAreaCollisionPadding", () => {
     insetReads = 0;
     observers = [];
     frames = [];
+    touchScreen = true;
+    touchQueryListeners = [];
+    Object.defineProperty(domWindow, "matchMedia", {
+      configurable: true,
+      value: (query: string) => ({
+        get matches() {
+          return query === "(pointer: coarse)" && touchScreen;
+        },
+        addEventListener: (_type: string, listener: () => void) => {
+          touchQueryListeners.push(listener);
+        },
+        removeEventListener: (_type: string, listener: () => void) => {
+          touchQueryListeners = touchQueryListeners.filter((l) => l !== listener);
+        },
+      }),
+    });
     Object.defineProperty(domWindow, "ResizeObserver", {
       configurable: true,
       value: FakeResizeObserver,
@@ -213,5 +231,22 @@ describe("useSafeAreaCollisionPadding", () => {
       bottom: 0,
       left: 6,
     });
+  });
+
+  it("leaves mouse and trackpad devices alone until the device reports a touch screen", () => {
+    touchScreen = false;
+    insets = { top: 21, right: 84, left: 6 };
+
+    const menu = renderHook(() => useSafeAreaCollisionPadding(10));
+
+    expect(menu.result.current).toEqual({ top: 10, right: 10, bottom: 10, left: 10 });
+    expect(observers).toHaveLength(0);
+    expect(insetReads).toBe(0);
+
+    touchScreen = true;
+    act(() => {
+      for (const listener of touchQueryListeners) listener();
+    });
+    expect(menu.result.current).toEqual({ top: 31, right: 94, bottom: 10, left: 16 });
   });
 });

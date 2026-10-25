@@ -78,13 +78,27 @@ function readInsets(): Insets {
   return lastInsets;
 }
 
-// dry-duplicate-ok: the usual useSyncExternalStore subscribe over this module's own listeners; the
-// other stores with this shape own other listener sets and change apart.
+// Safe areas belong to phones and tablets, so mouse and trackpad devices keep Radix's plain
+// padding and never create the probes, observe them, or re-render menus when they change.
+const TOUCH_QUERY = "(pointer: coarse)";
+
+function isTouchScreen(): boolean {
+  return typeof window.matchMedia === "function" && window.matchMedia(TOUCH_QUERY).matches;
+}
+
 function subscribe(onChange: () => void): () => void {
   listeners.add(onChange);
+  const touchQuery =
+    typeof window.matchMedia === "function" ? window.matchMedia(TOUCH_QUERY) : null;
+  touchQuery?.addEventListener("change", onChange);
   return () => {
     listeners.delete(onChange);
+    touchQuery?.removeEventListener("change", onChange);
   };
+}
+
+function getSnapshot(): Insets {
+  return isTouchScreen() ? readInsets() : NO_INSETS;
 }
 
 function getServerSnapshot(): Insets {
@@ -103,7 +117,7 @@ function sidePadding(padding: CollisionPadding, side: Side): number {
  * fitted to the viewport edge. The bottom inset stays out, as in the app shell (globals.css).
  */
 export function useSafeAreaCollisionPadding(padding: CollisionPadding = 0): Record<Side, number> {
-  const insets = useSyncExternalStore(subscribe, readInsets, getServerSnapshot);
+  const insets = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
   return {
     top: sidePadding(padding, "top") + insets.top,
     right: sidePadding(padding, "right") + insets.right,

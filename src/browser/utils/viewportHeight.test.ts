@@ -102,6 +102,42 @@ describe("iOS standalone viewport", () => {
     window.dispatchEvent(new window.Event("resize"));
     expect(appViewportHeight()).toBe("");
   });
+
+  test("syncs again when the rotated layout resizes the viewport after a stale resize event", () => {
+    const callbacks: Array<() => void> = [];
+    const originalResizeObserver = window.ResizeObserver;
+    Object.defineProperty(window, "ResizeObserver", {
+      configurable: true,
+      value: class {
+        constructor(callback: () => void) {
+          callbacks.push(callback);
+        }
+        observe() {
+          return undefined;
+        }
+        disconnect() {
+          return undefined;
+        }
+      },
+    });
+    try {
+      setStandalone(true);
+      setInnerHeight(820);
+      cleanupSync = installViewportHeightSync();
+
+      // iPad landscape to portrait: the resize event still sees the landscape height.
+      window.dispatchEvent(new window.Event("resize"));
+      setInnerHeight(1180);
+      for (const callback of callbacks) callback();
+
+      expect(appViewportHeight()).toBe("1180px");
+    } finally {
+      Object.defineProperty(window, "ResizeObserver", {
+        configurable: true,
+        value: originalResizeObserver,
+      });
+    }
+  });
 });
 
 describe("iOS focus-zoom guard", () => {

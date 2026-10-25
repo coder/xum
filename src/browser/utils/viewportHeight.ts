@@ -22,8 +22,24 @@ export function installViewportHeightSync(): () => void {
   syncViewportHeight();
   window.addEventListener("resize", syncViewportHeight);
 
+  // Turning an iPad from landscape to portrait can fire resize while innerHeight still holds the
+  // landscape height, and no later resize follows, so the app kept filling only the old height.
+  // A fixed box spanning the viewport resizes once the rotated layout exists; sync again then.
+  const viewportBox = document.createElement("div");
+  viewportBox.setAttribute("aria-hidden", "true");
+  viewportBox.style.cssText =
+    "position:fixed;inset:0;visibility:hidden;pointer-events:none;z-index:-1";
+  document.body.appendChild(viewportBox);
+  const observer =
+    typeof window.ResizeObserver === "function"
+      ? new window.ResizeObserver(syncViewportHeight)
+      : null;
+  observer?.observe(viewportBox);
+
   return () => {
     window.removeEventListener("resize", syncViewportHeight);
+    observer?.disconnect();
+    viewportBox.remove();
     document.documentElement.style.removeProperty(APP_VIEWPORT_HEIGHT_PROPERTY);
   };
 }
