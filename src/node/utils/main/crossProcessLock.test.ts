@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import * as fsPromises from "node:fs/promises";
@@ -17,8 +17,18 @@ import {
   inspectCrossProcessLock,
 } from "./crossProcessLock";
 
+/** The folders that tempLockPath() made in the current test; afterEach removes them (#7326). */
+const tempLockDirs: string[] = [];
+
+afterEach(async () => {
+  for (const dir of tempLockDirs.splice(0)) {
+    await fsPromises.rm(dir, { recursive: true, force: true });
+  }
+});
+
 async function tempLockPath(): Promise<string> {
   const dir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "cross-process-lock-"));
+  tempLockDirs.push(dir);
   return path.join(dir, "test.lock");
 }
 
@@ -796,17 +806,28 @@ describe("takeover and ownership edges", () => {
   test("a try-lock makes one attempt, even within the deadline's millisecond", async () => {
     const lockPath = await tempLockPath();
     const release = await acquireCrossProcessLock({ lockPath, ...baseOptions });
-    const now = spyOn(Date, "now").mockReturnValue(Date.now());
+    const frozen = Date.now();
+    const now = spyOn(Date, "now").mockReturnValue(frozen);
+    // Count the attempts (each one links a record onto lockPath) instead of
+    // racing a timer, so host load cannot change the result (#7326). A retry
+    // moves the clock past the deadline, so a retrying build still ends.
+    const realLink = fsPromises.link;
+    let attempts = 0;
+    const linkSpy = spyOn(fsPromises, "link").mockImplementation((from, to) => {
+      if (String(to) === lockPath) {
+        attempts += 1;
+        if (attempts > 1) now.mockReturnValue(frozen + 1);
+      }
+      return realLink(from, to);
+    });
     try {
-      const outcome = await Promise.race([
-        expectRefused(lockPath, 0).then(() => "refused"),
-        sleep(1_000).then(() => "retried"),
-      ]);
-      expect(outcome).toBe("refused");
+      await expectRefused(lockPath, 0);
     } finally {
+      linkSpy.mockRestore();
       now.mockRestore();
       await release();
     }
+    expect(attempts).toBe(1);
   });
 
   test("malformed records read as corrupt; valid edge records read as holders", async () => {
