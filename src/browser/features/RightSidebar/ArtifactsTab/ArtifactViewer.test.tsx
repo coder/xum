@@ -299,7 +299,12 @@ describe("ArtifactViewer renderers", () => {
     expect(frame.style.backgroundColor).toBe("");
 
     // Only a plain computed color passes: CSS.supports alone also takes these.
-    for (const color of ["var(--color-danger)", "inherit", "currentcolor", "light-dark(red, blue)"]) {
+    for (const color of [
+      "var(--color-danger)",
+      "inherit",
+      "currentcolor",
+      "light-dark(red, blue)",
+    ]) {
       postBackdrop(frame, color);
       expect(frame.style.backgroundColor).toBe("");
     }
