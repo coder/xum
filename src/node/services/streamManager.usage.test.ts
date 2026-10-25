@@ -963,4 +963,85 @@ describe("StreamManager - aborted stream usage persistence", () => {
       await cleanup();
     }
   });
+
+  test("the committed partial gets the abort event's duration, context metadata and tool-model usage", async () => {
+    const workspaceId = "abort-partial-metadata";
+    const messageId = "abort-partial-metadata-message";
+    const events: TurnEngineEvent[] = [];
+    const stepProviderMetadata = { anthropic: { cacheCreationInputTokens: 42 } };
+    const { streamManager, completion } = await startHeldTurnForTests({
+      workspaceId,
+      messageId,
+      events,
+      chunks: (activeManager) => [
+        partialText,
+        finishStep(ABORT_STEP_USAGE, stepProviderMetadata),
+        () =>
+          activeManager().recordToolModelUsage(workspaceId, messageId, {
+            toolName: "task",
+            timestamp: 1,
+            model: KNOWN_MODELS.SONNET.id,
+            usage: { inputTokens: 70, outputTokens: 7, totalTokens: 77 },
+          }),
+        // The turn runs for a measurable time before the stop.
+        () => new Promise<void>((resolve) => setTimeout(resolve, 5)),
+      ],
+    });
+
+    await streamManager.stopStream(workspaceId, { abortReason: "user" });
+    expect((await completion).status).toBe("aborted");
+
+    const event = StreamAbortEventSchema.parse(events.find((e) => e.type === "stream-abort"));
+    expect(event.metadata?.duration).toBeGreaterThanOrEqual(5);
+    expect(event.metadata?.contextProviderMetadata).toEqual(stepProviderMetadata);
+    const partial = await readHistoryMessage(historyService, workspaceId, messageId);
+    expect(partial.metadata?.duration).toBe(event.metadata?.duration);
+    expect(partial.metadata?.contextProviderMetadata).toEqual(stepProviderMetadata);
+    expect(partial.metadata?.toolModelUsages?.map((usage) => usage.usage.inputTokens)).toEqual([
+      70,
+    ]);
+  });
+
+  test("the abort event keeps the stop's abandon flag, the ACP prompt id and the costs-included mark", async () => {
+    const workspaceId = "abort-event-fields";
+    const events: TurnEngineEvent[] = [];
+    const { streamManager, completion } = await startHeldTurnForTests({
+      workspaceId,
+      messageId: "abort-event-fields-message",
+      events,
+      chunks: [partialText, finishStep(ABORT_STEP_USAGE)],
+      options: { initialMetadata: { costsIncluded: true, acpPromptId: "acp-prompt-1" } },
+    });
+
+    await streamManager.stopStream(workspaceId, { abortReason: "user", abandonPartial: true });
+    expect((await completion).status).toBe("aborted");
+
+    expect(events.find((e) => e.type === "stream-abort")).toMatchObject({
+      abandonPartial: true,
+      acpPromptId: "acp-prompt-1",
+      metadata: { providerMetadata: { mux: { costsIncluded: true } } },
+    });
+  });
+
+  test("an aborted turn backfills reasoning tokens the provider did not report", async () => {
+    const workspaceId = "abort-reasoning-backfill";
+    const messageId = "abort-reasoning-backfill-message";
+    const reasoningText = "Thinking through tradeoffs";
+    const { streamManager } = await startHeldTurnForTests({
+      workspaceId,
+      messageId,
+      chunks: [
+        { type: "reasoning-delta", text: reasoningText },
+        partialText,
+        finishStep(ABORT_STEP_USAGE),
+      ],
+    });
+
+    await streamManager.stopStream(workspaceId, { abortReason: "user" });
+
+    const partial = await readHistoryMessage(historyService, workspaceId, messageId);
+    expect(partial.metadata?.usage?.reasoningTokens).toBe(
+      await countTokens(KNOWN_MODELS.SONNET.id, reasoningText)
+    );
+  });
 });
