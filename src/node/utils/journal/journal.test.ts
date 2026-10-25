@@ -193,3 +193,41 @@ describe("Journal", () => {
     expect(ok.seq).toBe(0);
   });
 });
+
+// Each test kills a mutant that the phase 4 mutation runs left alive (#7475).
+describe("Journal option bounds and append sizes", () => {
+  const options = (filePath: string, appendLockTimeoutMs?: number) => ({
+    filePath,
+    schema: RowSchema,
+    getSeq: (row: Row) => row.seq,
+    getId: (row: Row) => row.id,
+    appendLockTimeoutMs,
+  });
+
+  test("the constructor rejects an empty path and a zero lock timeout", () => {
+    expect(() => new Journal<Row>(options(""))).toThrow("Journal requires a file path");
+    expect(() => new Journal<Row>(options("j", 0))).toThrow(
+      "Journal appendLockTimeoutMs must be positive"
+    );
+    // One character and one millisecond are the smallest valid values.
+    expect(() => new Journal<Row>(options("j", 1))).not.toThrow();
+  });
+
+  test("onAppended reports the file size after each append", async () => {
+    using tmp = new DisposableTempDir("journal-test");
+    const filePath = path.join(tmp.path, "test.jsonl");
+    const sizes: Array<{ preAppendFileSize: number; postAppendFileSize: number }> = [];
+    const journal = new Journal<Row>({
+      ...options(filePath),
+      onAppended: (_row, observed) => sizes.push(observed),
+    });
+    await journal.append((seq) => ({ seq, id: "a", value: "first" }));
+    const afterFirst = (await fs.stat(filePath)).size;
+    await journal.append((seq) => ({ seq, id: "b", value: "second" }));
+    const afterSecond = (await fs.stat(filePath)).size;
+    expect(sizes).toEqual([
+      { preAppendFileSize: 0, postAppendFileSize: afterFirst },
+      { preAppendFileSize: afterFirst, postAppendFileSize: afterSecond },
+    ]);
+  });
+});
