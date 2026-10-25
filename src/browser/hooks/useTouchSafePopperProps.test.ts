@@ -51,19 +51,28 @@ describe("useTouchSafePopperProps", () => {
   it("adds the top and side safe-area insets to the caller's padding, never the bottom one", () => {
     insets = { top: 21, right: 84, left: 6 };
 
+    const none = renderHook(() => useTouchSafePopperProps());
     const uniform = renderHook(() => useTouchSafePopperProps(10));
-    const perSide = renderHook(() => useTouchSafePopperProps({ top: 4 }));
+    const top = renderHook(() => useTouchSafePopperProps({ top: 4 }));
+    const bottom = renderHook(() => useTouchSafePopperProps({ bottom: 8 }));
 
+    expect(none.result.current.collisionPadding).toEqual({
+      top: 21,
+      right: 84,
+      bottom: 0,
+      left: 6,
+    });
     expect(uniform.result.current.collisionPadding).toEqual({
       top: 31,
       right: 94,
       bottom: 10,
       left: 16,
     });
-    expect(perSide.result.current.collisionPadding).toEqual({
-      top: 25,
+    expect(top.result.current.collisionPadding).toEqual({ top: 25, right: 84, bottom: 0, left: 6 });
+    expect(bottom.result.current.collisionPadding).toEqual({
+      top: 21,
       right: 84,
-      bottom: 0,
+      bottom: 8,
       left: 6,
     });
   });
@@ -80,19 +89,62 @@ describe("useTouchSafePopperProps", () => {
 
   it("re-reads the insets after a resize, including one while no menu is mounted", () => {
     const menu = renderHook(() => useTouchSafePopperProps(10));
-    expect(menu.result.current.collisionPadding).toMatchObject({ top: 10, right: 10 });
+    expect(menu.result.current.collisionPadding).toEqual({
+      top: 10,
+      right: 10,
+      bottom: 10,
+      left: 10,
+    });
 
     // Folding to the iPhone Duo cover display resizes the window and brings in the insets.
     insets = { top: 21, right: 84, left: 0 };
     resizeWindow();
-    expect(menu.result.current.collisionPadding).toMatchObject({ top: 31, right: 94 });
+    expect(menu.result.current.collisionPadding).toEqual({
+      top: 31,
+      right: 94,
+      bottom: 10,
+      left: 10,
+    });
     menu.unmount();
 
     // Unfolding while every menu is closed and unmounted.
     insets = { top: 0, right: 0, left: 0 };
     resizeWindow();
     const reopened = renderHook(() => useTouchSafePopperProps(10));
-    expect(reopened.result.current.collisionPadding).toMatchObject({ top: 10, right: 10 });
+    expect(reopened.result.current.collisionPadding).toEqual({
+      top: 10,
+      right: 10,
+      bottom: 10,
+      left: 10,
+    });
+  });
+
+  it("notices a change to any one inset", () => {
+    const menu = renderHook(() => useTouchSafePopperProps());
+
+    for (const next of [
+      { top: 21, right: 0, left: 0 },
+      { top: 21, right: 84, left: 0 },
+      { top: 21, right: 84, left: 6 },
+    ]) {
+      insets = next;
+      resizeWindow();
+      expect(menu.result.current.collisionPadding).toEqual({ ...next, bottom: 0 });
+    }
+  });
+
+  it("does not re-render menus on a resize that keeps the insets", () => {
+    let renders = 0;
+    renderHook(() => {
+      renders += 1;
+      return useTouchSafePopperProps();
+    });
+
+    // Dragging a desktop window's edge fires resize events in a stream.
+    resizeWindow();
+    resizeWindow();
+
+    expect(renders).toBe(1);
   });
 
   it("re-measures menu positions every frame only on touch screens", () => {

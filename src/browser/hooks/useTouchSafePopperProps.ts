@@ -21,6 +21,7 @@ function createProbe(): HTMLElement {
   const element = document.createElement("div");
   element.setAttribute("aria-hidden", "true");
   element.style.cssText =
+    // mutation-equivalent: unit tests cannot see env(); Chromium's assertMenuClearsSafeArea can.
     "position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;" +
     "padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) 0 env(safe-area-inset-left,0px)";
   document.body.appendChild(element);
@@ -30,21 +31,25 @@ function createProbe(): HTMLElement {
   return element;
 }
 
-function readInsets(): Insets {
-  if (typeof document === "undefined" || document.body == null) return NO_INSETS;
-  if (probe == null || !document.body.contains(probe)) {
-    probe = createProbe();
-    insetsStale = true;
-  }
-  if (!insetsStale) return lastInsets;
-  insetsStale = false;
-  const style = window.getComputedStyle(probe);
+function measureInsets(element: HTMLElement): Insets {
+  const style = window.getComputedStyle(element);
   const top = parseFloat(style.paddingTop) || 0;
   const right = parseFloat(style.paddingRight) || 0;
   const left = parseFloat(style.paddingLeft) || 0;
   // useSyncExternalStore needs the same snapshot object while the insets are unchanged.
-  if (top !== lastInsets.top || right !== lastInsets.right || left !== lastInsets.left) {
-    lastInsets = { top, right, left };
+  return top === lastInsets.top && right === lastInsets.right && left === lastInsets.left
+    ? lastInsets
+    : { top, right, left };
+}
+
+function readInsets(): Insets {
+  if (probe == null || !document.body.contains(probe)) {
+    probe = createProbe();
+    insetsStale = true;
+  }
+  if (insetsStale) {
+    insetsStale = false;
+    lastInsets = measureInsets(probe);
   }
   return lastInsets;
 }
@@ -60,6 +65,11 @@ function subscribe(onChange: () => void): () => void {
 
 function getServerSnapshot(): Insets {
   return NO_INSETS;
+}
+
+function sidePadding(padding: CollisionPadding, side: Side): number {
+  // mutation-equivalent: a side is a number, so ?? and || differ only for NaN, which no caller passes.
+  return typeof padding === "number" ? padding : (padding[side] ?? 0);
 }
 
 function isCoarsePointer(): boolean {
@@ -88,16 +98,12 @@ export function useTouchSafePopperProps(padding: CollisionPadding = 0): {
   updatePositionStrategy: "optimized" | "always";
 } {
   const insets = useSyncExternalStore(subscribe, readInsets, getServerSnapshot);
-  const base: Partial<Record<Side, number>> =
-    typeof padding === "number"
-      ? { top: padding, right: padding, bottom: padding, left: padding }
-      : padding;
   return {
     collisionPadding: {
-      top: (base.top ?? 0) + insets.top,
-      right: (base.right ?? 0) + insets.right,
-      bottom: base.bottom ?? 0,
-      left: (base.left ?? 0) + insets.left,
+      top: sidePadding(padding, "top") + insets.top,
+      right: sidePadding(padding, "right") + insets.right,
+      bottom: sidePadding(padding, "bottom"),
+      left: sidePadding(padding, "left") + insets.left,
     },
     updatePositionStrategy: isCoarsePointer() ? "always" : "optimized",
   };
