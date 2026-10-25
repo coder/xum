@@ -242,7 +242,7 @@ export function SettingsPage(props: { focusReturn: ReturnType<typeof useModalFoc
         aria-describedby={undefined}
         onOpenAutoFocus={props.focusReturn.onOpenAutoFocus}
         onCloseAutoFocus={props.focusReturn.onCloseAutoFocus}
-        className="max-md:ios-standalone:top-px max-md:ios-standalone:h-[calc(100%-1px)] top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] max-md:pr-[env(safe-area-inset-right)] max-md:pl-[env(safe-area-inset-left)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:flex-row md:rounded-lg md:border"
+        className="max-md:ios-standalone:top-px max-md:ios-standalone:h-[calc(100%-1px)] top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] max-md:pr-[env(safe-area-inset-right)] max-md:pl-[env(safe-area-inset-left)] md:top-[50%] md:left-[calc(50%_+_(env(safe-area-inset-left,0px)_-_env(safe-area-inset-right,0px))/2)] md:h-[min(880px,88vh)] md:w-[min(1100px,calc((100vw_-_env(safe-area-inset-left,0px)_-_env(safe-area-inset-right,0px))*0.92))] md:translate-x-[-50%] md:translate-y-[-50%] md:flex-row md:rounded-lg md:border"
       >
         <div className="border-border-medium flex min-w-0 shrink-0 flex-col border-b md:w-48 md:border-r md:border-b-0">
           <div className="border-border-medium flex h-12 shrink-0 items-center border-b px-4">

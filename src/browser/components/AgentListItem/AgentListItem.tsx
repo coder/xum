@@ -175,6 +175,12 @@ export interface DraftAgentListItemProps extends AgentListItemBaseProps {
 const LIST_ITEM_BASE_CLASSES =
   "bg-surface-primary relative flex items-start gap-1.5 rounded-l-sm py-2 pr-1.5 select-none transition-all duration-150";
 
+// The button reveal must stay behind the hover media query, like Tailwind's own `hover:`. iOS
+// applies :hover on the tap itself, and when that fades a hidden button in, WebKit treats the tap
+// as a hover and drops its click: opening a workspace from the phone drawer took two taps.
+const ROW_HOVER_CLASSES =
+  "pl-1 hover:bg-surface-secondary [@media(hover:hover)]:[&:hover_button]:opacity-100";
+
 const HIDE_INLINE_ACTIONS_ON_MOBILE_TOUCH =
   "[@media(max-width:768px)_and_(hover:none)_and_(pointer:coarse)]:invisible [@media(max-width:768px)_and_(hover:none)_and_(pointer:coarse)]:pointer-events-none";
 const SHOW_INLINE_ACTIONS_ON_WIDE_TOUCH =
@@ -795,7 +801,7 @@ function getRegularRowClasses(opts: {
     // Section members get a small indent for visual grouping.
     opts.sectionId != null ? "ml-2" : "ml-0",
     // Keep hover styles enabled for initializing workspaces so the row feels interactive.
-    !opts.isArchiving && "pl-1 hover:bg-surface-secondary [&:hover_button]:opacity-100",
+    !opts.isArchiving && ROW_HOVER_CLASSES,
     getRowStateClasses(opts),
     opts.isHighlighted && "bg-surface-secondary"
   );
@@ -935,7 +941,7 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
           : cn(
               LIST_ITEM_BASE_CLASSES,
               sectionId != null ? "ml-2" : "ml-0",
-              "pl-1 hover:bg-surface-secondary [&:hover_button]:opacity-100",
+              ROW_HOVER_CLASSES,
               isSelected && "bg-surface-secondary"
             ),
         "cursor-pointer"

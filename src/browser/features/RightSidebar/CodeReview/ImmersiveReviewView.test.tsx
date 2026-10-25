@@ -69,6 +69,7 @@ void mock.module("@/browser/utils/clipboard", () => ({
 }));
 
 import { ImmersiveReviewView, shouldPreserveImmersiveContextCursor } from "./ImmersiveReviewView";
+import { PinnedViewToolbarSpacerProvider } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 
 function createHunk(overrides: Partial<DiffHunk> = {}): DiffHunk {
   return {
@@ -200,6 +201,40 @@ describe("ImmersiveReviewView", () => {
     globalThis.requestAnimationFrame = originalRequestAnimationFrame;
     globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
     globalThis.HTMLElement = originalHTMLElement;
+  });
+
+  test("keeps the Back button clear of the collapsed left sidebar's toggle bar", () => {
+    // The fixed toggle bar sits over the workspace shell's top-left corner while the left sidebar
+    // is collapsed; a tap on the Back button under it opened the sidebar instead.
+    for (const leftSidebarCollapsed of [true, false]) {
+      const hunk = createHunk();
+      const view = renderWithApi(
+        <PinnedViewToolbarSpacerProvider leftSidebarCollapsed={leftSidebarCollapsed}>
+          <ThemeProvider forcedTheme="dark">
+            <ImmersiveReviewView
+              workspaceId="workspace-1"
+              fileTree={createFileTree(hunk.filePath)}
+              hunks={[hunk]}
+              allHunks={[hunk]}
+              isRead={() => false}
+              onToggleRead={mock(() => undefined)}
+              onMarkFileAsRead={mock(() => undefined)}
+              selectedHunkId={hunk.id}
+              onSelectHunk={mock(() => undefined)}
+              onExit={mock(() => undefined)}
+              isTouchImmersive={true}
+              reviewsByFilePath={new Map()}
+              firstSeenMap={{}}
+            />
+          </ThemeProvider>
+        </PinnedViewToolbarSpacerProvider>
+      );
+      const header = view.getByLabelText("Exit immersive review").parentElement!;
+      const spacer = header.querySelector(".left-sidebar-toggle-host");
+      expect(spacer != null).toBe(leftSidebarCollapsed);
+      if (spacer != null) expect(header.firstElementChild).toBe(spacer);
+      view.unmount();
+    }
   });
 
   test("only preserves context cursors while overlay content is unchanged", () => {

@@ -801,7 +801,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               Workspace details ({formatKeybind(KEYBINDS.SHOW_WORKSPACE_DETAILS)})
             </TooltipContent>
           </Tooltip>
-          <PopoverContent align="start" className="flex flex-col gap-0.5 p-2 text-xs">
+          {/* Paths have no spaces to wrap at: they ran past the popover, and on a phone off
+              screen and under the side safe area. */}
+          <PopoverContent
+            align="start"
+            className="flex w-max max-w-[min(32rem,var(--radix-popover-content-available-width))] flex-col gap-0.5 p-2 text-xs [overflow-wrap:anywhere]"
+          >
             <span className="font-mono">{projectLabel}</span>
             <span>{workspaceName}</span>
             <span className="text-muted">{namedWorkspacePath}</span>
