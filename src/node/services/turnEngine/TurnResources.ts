@@ -68,6 +68,20 @@ export class TurnResources {
   }
 
   /**
+   * openStartup as a resource of the enclosing scope (TurnEngine.start's): `release`
+   * runs when that scope closes, before the start lock is released.
+   */
+  startup(
+    abortSignal: AbortSignal | undefined,
+    release: (startup: TurnStartup) => Promise<void>
+  ): Effect.Effect<TurnStartup, never, Scope.Scope> {
+    return Effect.acquireRelease(
+      Effect.sync(() => this.openStartup(abortSignal)),
+      (startup) => Effect.promise(async () => release(startup))
+    );
+  }
+
+  /**
    * Release a start's resources: a stream that registered owns them now, so its
    * teardown runs; otherwise the model, the signal link and the scope close here.
    */
@@ -106,26 +120,36 @@ export class TurnResources {
     providedRuntimeTempDir: string | undefined
   ): Promise<string> {
     return Effect.runPromise(
-      Scope.provide(resourceScope)(
-        Effect.acquireRelease(
-          Effect.tryPromise({
-            // Async thunk: createTempDirForStream failures follow the same
-            // rejection path into startStream's catch as the previous
-            // plain await.
-            try: async () =>
-              providedRuntimeTempDir ??
-              (await this.deps.createTempDirForStream(streamToken, runtime)),
-            catch: (error) => error,
-          }),
-          (dir) =>
-            Effect.sync(() => {
-              // Whitebox tests pass providedRuntimeTempDir: "" to skip
-              // cleanup; mirror the previous falsy guard.
-              if (dir) {
-                this.deps.cleanupStreamTempDir(runtime, dir);
-              }
-            })
-        )
+      this.tempDir(resourceScope, streamToken, runtime, providedRuntimeTempDir)
+    );
+  }
+
+  /** acquireTempDir as an Effect: TurnEngine.start runs it on its own fiber. */
+  tempDir(
+    resourceScope: Scope.Closeable,
+    streamToken: StreamToken,
+    runtime: Runtime,
+    providedRuntimeTempDir: string | undefined
+  ): Effect.Effect<string, unknown> {
+    return Scope.provide(resourceScope)(
+      Effect.acquireRelease(
+        Effect.tryPromise({
+          // Async thunk: createTempDirForStream failures follow the same
+          // rejection path into startStream's catch as the previous
+          // plain await.
+          try: async () =>
+            providedRuntimeTempDir ??
+            (await this.deps.createTempDirForStream(streamToken, runtime)),
+          catch: (error) => error,
+        }),
+        (dir) =>
+          Effect.sync(() => {
+            // Whitebox tests pass providedRuntimeTempDir: "" to skip
+            // cleanup; mirror the previous falsy guard.
+            if (dir) {
+              this.deps.cleanupStreamTempDir(runtime, dir);
+            }
+          })
       )
     );
   }

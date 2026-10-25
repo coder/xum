@@ -490,6 +490,17 @@ export class TurnRegistry {
     return Array.from(this.workspaceStreams.keys()).map((id) => id as string);
   }
 
+  /**
+   * Holds the workspace's start lock until the enclosing scope closes (TurnEngine.start's),
+   * after the start's own resources are released.
+   */
+  claimStartLock(workspaceId: string): Effect.Effect<void, never, Scope.Scope> {
+    return Effect.acquireRelease(
+      Effect.promise(async () => this.acquireStreamStartLock(workspaceId)),
+      (lock) => Effect.promise(async () => lock[Symbol.asyncDispose]())
+    ).pipe(Effect.asVoid);
+  }
+
   /** Serialize idle recovery with stream startup, including terminal persistence. */
   async acquireStreamStartLock(workspaceId: string) {
     const id = workspaceId as WorkspaceId;

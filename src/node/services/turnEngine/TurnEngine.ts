@@ -6,7 +6,7 @@
  * StreamManager.startStream delegates here, and the attempt loop
  * (processStreamWithCleanup) still runs in StreamManager.
  */
-import type { Scope } from "effect";
+import { Effect, type Scope } from "effect";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { SendMessageError } from "@/common/types/errors";
@@ -20,6 +20,7 @@ import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import assert from "@/common/utils/assert";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { EffectRunner } from "@/node/services/di/effectRunner";
 import { createAutoThinkingEscalationState } from "@/node/services/autoThinkingEscalation";
 import { log } from "@/node/services/log";
 import type {
@@ -335,6 +336,8 @@ function wireAutoThinkingEscalation(
 }
 
 export interface TurnEngineDeps {
+  /** Runs start's Effect (StreamManager's runner). */
+  readonly effectRunner: EffectRunner;
   readonly turnRegistry: TurnRegistry;
   readonly turnResources: TurnResources;
   readonly providerRequest: Pick<ProviderRequest, "buildStreamRequestConfig">;
@@ -362,10 +365,27 @@ export interface TurnEngineDeps {
   ) => Promise<void>;
 }
 
+/** One awaited start step: a rejection fails start's Effect and reaches failStreamStart. */
+function attempt<A>(step: () => Promise<A>): Effect.Effect<A, unknown> {
+  return Effect.tryPromise({ try: async () => step(), catch: (error) => error });
+}
+
 export class TurnEngine {
   constructor(private readonly deps: TurnEngineDeps) {}
 
-  async start(options: TurnExecutionOptions): Promise<Result<TurnStreamHandle, SendMessageError>> {
+  start(options: TurnExecutionOptions): Promise<Result<TurnStreamHandle, SendMessageError>> {
+    return this.deps.effectRunner.runPromise(this.startTurn(options));
+  }
+
+  /**
+   * start's steps as one Effect. The start lock and the startup resources belong to
+   * its scope: on exit the startup resources are released first (unless processing
+   * took them), then the lock. Uninterruptible like the Promise it replaces: a stop
+   * cancels a start through its AbortSignal, never by interrupting this fiber.
+   */
+  private startTurn(
+    options: TurnExecutionOptions
+  ): Effect.Effect<Result<TurnStreamHandle, SendMessageError>> {
     const { workspaceId, messages, modelString, historySequence, messageId, abortSignal } = options;
     const completionController = createTurnCompletionController();
     const start: StreamStart = {
@@ -377,33 +397,37 @@ export class TurnEngine {
     };
 
     if (messages.length === 0) {
-      return Err({
-        type: "unknown",
-        raw: "Invalid prompt: messages must not be empty",
-      });
-    }
-
-    try {
-      // Acquire lock - guarantees only one startStream per workspace
-      // Lock is automatically released when scope exits via Symbol.asyncDispose
-      await using _lock = await this.deps.turnRegistry.acquireStreamStartLock(workspaceId);
-
-      // DEBUG: Log stream start
-      log.debug(
-        `[STREAM START] workspaceId=${workspaceId} historySequence=${historySequence} model=${modelString}`
+      return Effect.succeed(
+        Err({
+          type: "unknown",
+          raw: "Invalid prompt: messages must not be empty",
+        })
       );
-
-      // Owns this stream's abort controller and Effect-managed resources (temp dir,
-      // debounce fiber) until the stream registers (TurnResources.openStartup).
-      const startup = this.deps.turnResources.openStartup(abortSignal);
-      try {
-        return await this.runStreamStartup(start, startup);
-      } finally {
-        if (!start.processingStarted) await this.cleanupStartup(start, startup);
-      }
-    } catch (error) {
-      return this.failStreamStart(start, error);
     }
+
+    return Effect.scoped(
+      Effect.gen({ self: this }, function* () {
+        // Only one start per workspace; released when this scope closes.
+        yield* this.deps.turnRegistry.claimStartLock(workspaceId);
+
+        // DEBUG: Log stream start
+        log.debug(
+          `[STREAM START] workspaceId=${workspaceId} historySequence=${historySequence} model=${modelString}`
+        );
+
+        // Owns this stream's abort controller and Effect-managed resources (temp dir,
+        // debounce fiber) until the stream registers (TurnResources.openStartup).
+        const startup = yield* this.deps.turnResources.startup(abortSignal, (opened) =>
+          start.processingStarted ? Promise.resolve() : this.cleanupStartup(start, opened)
+        );
+        return yield* this.runStreamStartup(start, startup);
+      })
+    ).pipe(
+      // A failed step or a failed release ends the start here, after the lock is released.
+      Effect.catch((error) => this.failStreamStart(start, error)),
+      Effect.catchDefect((defect) => this.failStreamStart(start, defect)),
+      Effect.uninterruptible
+    );
   }
 
   /** Release a start's resources; once registered, the stream owns them (releaseStartup). */
@@ -425,74 +449,82 @@ export class TurnEngine {
   }
 
   /** startStream's steps once the start lock is held; each may end the start as an abort. */
-  private async runStreamStartup(
+  private runStreamStartup(
     start: StreamStart,
     startup: TurnStartup
-  ): Promise<Result<TurnStreamHandle, SendMessageError>> {
-    const prepared = await this.prepareStreamStartup(start, startup);
-    if (!prepared) return this.settleStartupAbort(start);
-    const streamInfo = await this.registerStartingStream(start, startup, prepared);
-    if (!streamInfo) return this.settleStartupAbort(start);
-    if (!(await this.admitRegisteredStream(start, startup, streamInfo))) {
-      return this.settleStartupAbort(start);
-    }
+  ): Effect.Effect<Result<TurnStreamHandle, SendMessageError>, unknown> {
+    return Effect.gen({ self: this }, function* () {
+      const prepared = yield* this.prepareStreamStartup(start, startup);
+      if (!prepared) return this.settleStartupAbort(start);
+      const streamInfo = yield* attempt(() =>
+        this.registerStartingStream(start, startup, prepared)
+      );
+      if (!streamInfo) return this.settleStartupAbort(start);
+      if (!(yield* attempt(() => this.admitRegisteredStream(start, startup, streamInfo)))) {
+        return this.settleStartupAbort(start);
+      }
 
-    // Step 5: Track the processing promise for guaranteed cleanup
-    // This allows cancelStreamSafely to wait for full exit
-    start.processingStarted = true;
-    TurnRegistry.trackProcessing(
-      streamInfo,
-      this.deps
-        .processStreamWithCleanup(start.workspaceId, streamInfo, start.options.historySequence)
-        .catch((error) => {
-          log.error("Unexpected error in stream processing:", error);
-        })
-    );
+      // Step 5: Track the processing promise for guaranteed cleanup
+      // This allows cancelStreamSafely to wait for full exit
+      start.processingStarted = true;
+      TurnRegistry.trackProcessing(
+        streamInfo,
+        this.deps
+          .processStreamWithCleanup(start.workspaceId, streamInfo, start.options.historySequence)
+          .catch((error) => {
+            log.error("Unexpected error in stream processing:", error);
+          })
+      );
 
-    return Ok(start.handle);
+      return Ok(start.handle);
+    });
   }
 
   /**
    * Steps 1 to 3: cancel the workspace's existing stream, pick the token and
    * acquire the temp directory. Undefined when the start was aborted meanwhile.
    */
-  private async prepareStreamStartup(
+  private prepareStreamStartup(
     start: StreamStart,
     startup: TurnStartup
-  ): Promise<{ streamToken: StreamToken; runtimeTempDir: string } | undefined> {
-    const { options } = start;
-    const streamAbortController = startup.abortController;
-    // Step 1: Cancel any existing stream before proceeding
-    // This must happen regardless of whether a token was provided
-    const generatedStreamToken = await this.deps.turnRegistry.ensureStreamSafety(start.workspaceId);
+  ): Effect.Effect<{ streamToken: StreamToken; runtimeTempDir: string } | undefined, unknown> {
+    return Effect.gen({ self: this }, function* () {
+      const { options } = start;
+      const streamAbortController = startup.abortController;
+      // Step 1: Cancel any existing stream before proceeding
+      // This must happen regardless of whether a token was provided
+      const generatedStreamToken = yield* attempt(() =>
+        this.deps.turnRegistry.ensureStreamSafety(start.workspaceId)
+      );
 
-    // Step 2: Use provided stream token or the generated one
-    const streamToken = options.providedStreamToken ?? generatedStreamToken;
+      // Step 2: Use provided stream token or the generated one
+      const streamToken = options.providedStreamToken ?? generatedStreamToken;
 
-    // If the stream was interrupted while we were waiting on async setup (mutex,
-    // temp dir creation, etc), avoid starting the stream entirely.
-    if (streamAbortController.signal.aborted) {
-      await this.cleanupStartup(start, startup);
-      return undefined;
-    }
+      // If the stream was interrupted while we were waiting on async setup (mutex,
+      // temp dir creation, etc), avoid starting the stream entirely.
+      if (streamAbortController.signal.aborted) {
+        yield* attempt(() => this.cleanupStartup(start, startup));
+        return undefined;
+      }
 
-    // Step 3: Acquire the temp directory for this stream as a scoped resource.
-    const runtimeTempDir = await this.deps.turnResources.acquireTempDir(
-      startup.resourceScope,
-      streamToken,
-      options.runtime,
-      options.providedRuntimeTempDir
-    );
+      // Step 3: Acquire the temp directory for this stream as a scoped resource.
+      const runtimeTempDir = yield* this.deps.turnResources.tempDir(
+        startup.resourceScope,
+        streamToken,
+        options.runtime,
+        options.providedRuntimeTempDir
+      );
 
-    if (streamAbortController.signal.aborted) {
-      await this.cleanupStartup(start, startup);
-      return undefined;
-    }
+      if (streamAbortController.signal.aborted) {
+        yield* attempt(() => this.cleanupStartup(start, startup));
+        return undefined;
+      }
 
-    // Construction invokes the provider: validate after every startup resource await.
-    await options.assertAdmissionCurrent?.();
-    if (streamAbortController.signal.aborted) return undefined;
-    return { streamToken, runtimeTempDir };
+      // Construction invokes the provider: validate after every startup resource await.
+      yield* attempt(async () => options.assertAdmissionCurrent?.());
+      if (streamAbortController.signal.aborted) return undefined;
+      return { streamToken, runtimeTempDir };
+    });
   }
 
   /** Construct and register the stream; undefined when a stop fenced the start first. */
@@ -588,7 +620,14 @@ export class TurnEngine {
   }
 
   /** A start that threw: free the slot it may hold and settle its unreturned handle. */
-  private async failStreamStart(
+  private failStreamStart(
+    start: StreamStart,
+    error: unknown
+  ): Effect.Effect<Result<TurnStreamHandle, SendMessageError>> {
+    return Effect.promise(async () => this.settleFailedStart(start, error));
+  }
+
+  private async settleFailedStart(
     start: StreamStart,
     error: unknown
   ): Promise<Result<TurnStreamHandle, SendMessageError>> {
