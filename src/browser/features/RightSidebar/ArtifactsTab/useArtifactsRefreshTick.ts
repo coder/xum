@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
-export const ARTIFACTS_POLL_MS = 3000;
+/** While the window is visible, re-list this often to catch writes no tool event reports. */
+const ARTIFACTS_POLL_MS = 3000;
 
 /**
  * A tick that bumps whenever the workspace's artifacts folder may have changed, for the

@@ -68,8 +68,6 @@ import {
 } from "./artifactSelection";
 import type { ArtifactFrameKey } from "./SandboxedArtifactFrame";
 
-/** While the tab is visible, re-list this often to catch writes no tool event reports. */
-
 interface ReadState {
   /** Identifies what was read (see Selection/readKey), so stale reads are never shown. */
   key: string;

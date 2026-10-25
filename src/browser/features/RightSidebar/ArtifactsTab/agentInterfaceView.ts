@@ -27,6 +27,7 @@ import type {
   ArtifactReadResult,
 } from "@/common/orpc/schemas/artifacts";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isBlankHtmlDocument, parseArtifactHtml } from "./artifactDocument";
 import { useArtifactsRefreshTick } from "./useArtifactsRefreshTick";
 
@@ -67,19 +68,18 @@ function isView(value: unknown): value is AgentInterfaceView {
 }
 
 function choiceFrom(map: unknown, workspaceId: string): AgentInterfaceView | null {
-  if (typeof map !== "object" || map === null || Array.isArray(map)) return null;
-  const value = (map as Record<string, unknown>)[workspaceId];
+  if (!isPlainObject(map)) return null;
+  const value = map[workspaceId];
   return isView(value) ? value : null;
 }
 
 function withChoice(map: unknown, workspaceId: string, view: AgentInterfaceView): ChoiceMap {
-  const kept =
-    typeof map === "object" && map !== null && !Array.isArray(map)
-      ? Object.entries(map as Record<string, unknown>).filter(
-          (entry): entry is [string, AgentInterfaceView] =>
-            entry[0] !== workspaceId && isView(entry[1])
-        )
-      : [];
+  const kept = isPlainObject(map)
+    ? Object.entries(map).filter(
+        (entry): entry is [string, AgentInterfaceView] =>
+          entry[0] !== workspaceId && isView(entry[1])
+      )
+    : [];
   const entries = [...kept, [workspaceId, view] as [string, AgentInterfaceView]];
   const bounded = entries.slice(-AGENT_INTERFACE_VIEW_MAX_WORKSPACES);
   while (
