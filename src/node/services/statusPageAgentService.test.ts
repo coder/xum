@@ -369,6 +369,34 @@ describe("StatusPageAgentService", () => {
     expect(fixture.prompts[1]).toContain("after the mode came back");
   });
 
+  it("treats a pass running during discard as dropped, whether it fails or would write", async () => {
+    for (const behavior of ["fail", "write"] as const) {
+      using fixture = await createFixture();
+      fixture.state.behavior = behavior;
+      let release!: () => void;
+      fixture.state.gate = new Promise((resolve) => (release = resolve));
+      const modelRequested = new Promise<void>(
+        (resolve) => (fixture.state.onModelRequested = resolve)
+      );
+      fixture.enqueue("in-flight update");
+      await modelRequested;
+      fixture.service.discard(WORKSPACE_ID);
+      release();
+      await fixture.whenIdle();
+
+      fixture.state.behavior = "write";
+      fixture.state.gate = null;
+      const result = fixture.enqueue("after the mode came back");
+      await fixture.whenIdle();
+      expect({ behavior, result }).toEqual({
+        behavior,
+        result: { queued: true, discardedUpdates: 1 },
+      });
+      expect(fixture.prompts[1]).not.toContain("in-flight update");
+      expect(await fixture.readPage()).toBe("<p>pass 2</p>");
+    }
+  });
+
   it("writes nothing when the agent leaves the page unchanged", async () => {
     using fixture = await createFixture();
     fixture.state.behavior = "noop";

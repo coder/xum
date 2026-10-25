@@ -135,6 +135,8 @@ export class StatusPageAgentService {
   private readonly failedUpdates = new Map<string, StatusPageUpdate[]>();
   /** Updates dropped without being applied since the last enqueue() reported them. */
   private readonly discarded = new Map<string, number>();
+  /** Bumped by discard(), so a pass that was running then knows its batch went stale. */
+  private readonly discardEpochs = new Map<string, number>();
 
   constructor(private readonly deps: StatusPageAgentServiceDeps) {}
 
@@ -161,8 +163,9 @@ export class StatusPageAgentService {
   /**
    * Drop queued and failed updates and the last error: the main agent owns the page again (the
    * mode is off for its turn), so they are stale once the mode comes back. The drop is counted
-   * so the first update after that says earlier ones were not applied. A running pass is left
-   * alone; it re-checks the gates before it writes.
+   * so the first update after that says earlier ones were not applied. A running pass is not
+   * stopped, but its batch is stale too: it writes nothing and, if it fails, stores no error or
+   * updates to come back with (the gates alone would miss a mode switched on again by then).
    */
   discard(workspaceId: string): void {
     const queued =
@@ -172,6 +175,11 @@ export class StatusPageAgentService {
     this.failedUpdates.delete(workspaceId);
     this.lastError.delete(workspaceId);
     this.countDiscarded(workspaceId, queued);
+    this.discardEpochs.set(workspaceId, this.discardEpoch(workspaceId) + 1);
+  }
+
+  private discardEpoch(workspaceId: string): number {
+    return this.discardEpochs.get(workspaceId) ?? 0;
   }
 
   private countDiscarded(workspaceId: string, count: number): void {
@@ -198,14 +206,20 @@ export class StatusPageAgentService {
     for (;;) {
       const batch = this.takeBatch(workspaceId);
       if (batch === undefined) return;
+      const epoch = this.discardEpoch(workspaceId);
       try {
-        if ((await this.runPass(workspaceId, batch)) === "discarded") {
+        if ((await this.runPass(workspaceId, batch, epoch)) === "discarded") {
           this.countDiscarded(workspaceId, batch.updates.length);
         }
         // A later pass recovered the page (or the gate closed): the main agent must not be told
         // to take over.
         this.lastError.delete(workspaceId);
       } catch (error) {
+        if (this.discardEpoch(workspaceId) !== epoch) {
+          // discard() ran during the pass: this failure is as stale as the batch.
+          this.countDiscarded(workspaceId, batch.updates.length);
+          continue;
+        }
         const message = getErrorMessage(error);
         log.warn("Status page agent pass failed", {
           workspaceId,
@@ -251,9 +265,14 @@ export class StatusPageAgentService {
 
   /**
    * One pass over a batch. Throws on failure; drain() keeps the error for the next enqueue.
-   * "discarded" when a closed gate cut the pass short before its draft was written.
+   * "discarded" when a closed gate or a discard() since `epoch` cut the pass short before its
+   * draft was written.
    */
-  private async runPass(workspaceId: string, batch: PendingBatch): Promise<PassOutcome> {
+  private async runPass(
+    workspaceId: string,
+    batch: PendingBatch,
+    epoch: number
+  ): Promise<PassOutcome> {
     const metadata = await this.writableMetadata(workspaceId);
     if (metadata == null) return "discarded";
 
@@ -286,7 +305,12 @@ export class StatusPageAgentService {
     // The run took a while: the user may have switched the experiments off or archived or
     // removed the workspace meanwhile. The writers also refuse to recreate a deleted scratch or
     // session dir, which covers a removal that finishes between this check and the write.
-    if ((await this.writableMetadata(workspaceId)) == null) return "discarded";
+    if (
+      (await this.writableMetadata(workspaceId)) == null ||
+      this.discardEpoch(workspaceId) !== epoch
+    ) {
+      return "discarded";
+    }
     // Someone (often the main agent, after a failure note) edited the page during the run: keep
     // that edit, and let the next pass apply these updates on top of it. Not a lock: an edit
     // between this read and the write below can still be lost.

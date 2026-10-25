@@ -3048,12 +3048,14 @@ export const TOOL_DEFINITIONS = {
   },
   status_update: {
     // Registered only in status page agent mode (artifacts-status-page-agent); the static
-    // description keeps the tool block cache-stable.
+    // description keeps the tool block cache-stable. Who edits the page belongs in the system
+    // prompt, not here: a tool policy that denies this tool keeps the description on a refusal
+    // stub (#5253) while the prompt tells the agent to edit the page itself.
     description:
       "Send the status page agent an update for the status page the user sees instead of this chat. " +
       "It edits the page with its own model in the background, and this call returns at once. " +
       "Send a short, self-contained update when you start, at each milestone and before you finish: what you are doing, progress, results, and anything that needs the user. " +
-      "Say what to replace or remove. Do not edit status.html yourself.",
+      "Say what to replace or remove.",
     schema: z
       .object({
         update: z
