@@ -64,9 +64,22 @@ function allowedPath(rule: DiskRule, api: string, target: string): boolean {
   return (
     (isInside(rule.configRoot, target) && !rule.layered.some((dir) => isInside(dir, target))) ||
     (api === "fs.lstatSync" && isInside(target, rule.configRoot)) ||
-    isInside(rule.logsDir, target)
+    isLogSinkPath(rule.logsDir, target)
   );
 }
+
+/** The log sink's own paths: its dir, mux.log and the rotated mux.<n>.log. Nothing else in the dir. */
+function isLogSinkPath(logsDir: string, target: string): boolean {
+  const resolved = path.resolve(target);
+  if (resolved === path.resolve(logsDir)) return true;
+  return (
+    path.dirname(resolved) === path.resolve(logsDir) &&
+    /^mux(\.\d+)?\.log$/.test(path.basename(resolved))
+  );
+}
+
+/** Calls that may write stdout or stderr by fd: the console sink. Not net.connect(1). */
+const STD_FD_APIS = /^(fs\.|Bun\.(file|write)$)/;
 
 /**
  * The disk rule of claim 4.3: Config's calls under its root and the log file. Nothing else.
@@ -88,7 +101,7 @@ function allowedOnDisk(configRoot: string): (row: HostTrapRow) => boolean {
     // A two-path call (rename, copyFile, ...) does host I/O at both paths.
     if (row.arg2 !== undefined && !allowedPath(rule, row.api, row.arg2)) return false;
     if (!/^fd\/\d+$/.test(row.arg)) return allowedPath(rule, row.api, row.arg);
-    if (row.arg === "fd/1" || row.arg === "fd/2") return true;
+    if (row.arg === "fd/1" || row.arg === "fd/2") return STD_FD_APIS.test(row.api);
     return row.fdPath !== undefined && allowedPath(rule, row.api, row.fdPath);
   };
 }
