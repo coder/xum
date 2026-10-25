@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { Scope } from "effect";
 
 import type { StreamAbortReason } from "@/common/types/stream";
 import { closeScopeBounded } from "@/node/services/di/appRuntime";
+import { log } from "@/node/services/log";
 import { defaultEffectRunner } from "@/node/services/di/effectRunner";
 import type {
   ActiveStreamInfo,
@@ -303,6 +304,52 @@ describe("TurnRegistry", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(finalizerCount(engineScope)).toBe(0);
+  });
+
+  test("launchProcessing runs the loop's synchronous start before it returns", async () => {
+    for (const engineScope of [Scope.makeUnsafe(), undefined]) {
+      const { registry } = createRegistry({ engineScope });
+      const info = streamFixture();
+      registry.superviseEngine(WS, info);
+      const finished = Promise.withResolvers<void>();
+      let started = false;
+
+      registry.launchProcessing(WS, info, () => {
+        started = true;
+        return finished.promise;
+      });
+
+      // stream-start and the STREAMING state come from this synchronous start, and a
+      // stop right after startStream waits for this promise.
+      expect(started).toBe(true);
+      let processed = false;
+      const processing = info.processingPromise.then(() => {
+        processed = true;
+      });
+      await Promise.resolve();
+      expect(processed).toBe(false);
+      finished.resolve();
+      await processing;
+    }
+  });
+
+  test("a rejected attempt loop is logged and its processing promise still resolves", async () => {
+    const { registry } = createRegistry({ engineScope: Scope.makeUnsafe() });
+    const info = streamFixture();
+    registry.superviseEngine(WS, info);
+    const logged = spyOn(log, "error").mockImplementation(() => undefined);
+    try {
+      registry.launchProcessing(WS, info, () => Promise.reject(new Error("loop bug")));
+      await info.processingPromise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(logged).toHaveBeenCalledWith(
+        "Unexpected error in stream processing:",
+        expect.anything()
+      );
+    } finally {
+      logged.mockRestore();
+    }
   });
 
   test("without an engine scope a turn is not supervised", () => {
