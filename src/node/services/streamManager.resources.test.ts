@@ -12,6 +12,8 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 import { shellQuote } from "@/common/utils/shell";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
 import {
   createStreamManagerForTests,
   engineInternals,
@@ -181,6 +183,69 @@ describe("StreamManager - stream resource scope", () => {
     expect(execCalls.map((call) => call.command)).toEqual([
       `rm -rf ${shellQuote("phase10-scope-tempdir")}`,
     ]);
+  });
+
+  test("holds the workspace's MCP lease while the stream runs", async () => {
+    const { streamManager } = createLifecycleStreamManagerForTests([
+      { type: "text-delta", text: "hello" },
+      { type: "finish", finishReason: "stop" },
+    ]);
+    const leases: string[] = [];
+    const leaseManager: Pick<MCPServerManager, "acquireLease" | "releaseLease"> = {
+      acquireLease: (workspaceId) => void leases.push(`acquire:${workspaceId}`),
+      releaseLease: (workspaceId) => void leases.push(`release:${workspaceId}`),
+    };
+    // Set after construction, as the core graph does.
+    streamManager.setMCPServerManager(leaseManager as MCPServerManager);
+
+    await runLifecycleStreamForTests(streamManager, "mcp-lease-workspace");
+
+    expect(leases).toEqual(["acquire:mcp-lease-workspace", "release:mcp-lease-workspace"]);
+  });
+
+  test("closes the stream's tool-call display scope when the stream ends", async () => {
+    const registry = new ToolCallDisplayRegistry();
+    const streamManager = createStreamManagerForTests(historyService, {
+      toolCallDisplayRegistry: registry,
+      streamText: fakeStreamText(() =>
+        createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            yield { type: "text-delta", text: "hello" };
+            yield { type: "finish", finishReason: "stop" };
+          })()
+        )
+      ),
+    });
+    const workspaceId = "display-scope-workspace";
+    const messageId = `${workspaceId}-msg`;
+    const executionScope = { workspaceId, messageId, token: "display1" };
+    const snapshot = {
+      connection: { key: "echo", transport: "stdio" as const },
+      identity: { name: "n", version: "1" },
+      source: "connection" as const,
+    };
+    registry.open(executionScope);
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId,
+        model: createTestLanguageModel(),
+        tools: {},
+        runtime: LOCAL_TEST_RUNTIME,
+        providedRuntimeTempDir: "",
+        providedStreamToken: "display1" as ReturnType<StreamManager["generateStreamToken"]>,
+        executionScope,
+      })
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected stream to start");
+    expect((await result.data.completion).status).toBe("completed");
+
+    // A closed scope refuses late writers.
+    expect(registry.set(executionScope, "late-call", snapshot)).toBe(false);
   });
 
   /** Virtual time far past the partial-write throttle window. */
