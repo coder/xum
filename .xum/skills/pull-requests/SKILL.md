@@ -43,6 +43,7 @@ _Automated by the `<workflow-name>` workflow (GitHub Actions)._
 ## CI & Validation
 
 - Prefer local validation first (e.g., `make static-check` or a targeted test subset) because CI waiting can take 10+ minutes.
+- Before the first push of a fix, find every other code path that reads the same input or makes the same decision. Search for the function, the constant, the file name and the error text. Make each one agree with the fix and cover it with a test, or say in the PR body why it does not need the change. For a CI path filter, list every file that the job reads (configs, `Makefile`, `package.json`, `bun.lock`, the workflow file) and check that a change to each one triggers the job.
 - Use `./scripts/wait_pr_ready.sh <pr_number>` as the default last-step helper when there's no more useful local work left.
 - `wait_pr_ready.sh` polls the Codex, CI checks, and (when requested) `coder-agents-review` gates together and fails fast on the first terminal failure.
 - Use `./scripts/wait_pr_checks.sh <pr_number>` and `./scripts/wait_pr_codex.sh <pr_number>` directly only when you need to debug a specific gate.
