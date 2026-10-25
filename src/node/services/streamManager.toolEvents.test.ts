@@ -5,7 +5,12 @@ import { ToolCallStartEventSchema } from "@/common/orpc/schemas/stream";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
-import { createLiveStreamHarness, eventsOfType } from "./streamManager.liveStream.testHarness";
+import {
+  createLiveStreamHarness,
+  eventsOfType,
+  toolCallChunk,
+  toolResultChunk,
+} from "./streamManager.liveStream.testHarness";
 import {
   installStreamManagerTestHistory,
   historyService,
@@ -666,5 +671,68 @@ describe("StreamManager - step effects", () => {
     expect(eventsOfType(events, "tool-call-delta")).toMatchObject([
       { toolCallId: "t1", toolName: "bash", delta: '{"a":1}', tokens: 7 },
     ]);
+  });
+
+  test("a result without a tool-call part takes the workflow run that attached before it", async () => {
+    // The run attached while no part existed for the call, so it waits as pending;
+    // the result's fallback part is the first part that can carry it.
+    const workspaceId = "step-effects-orphan-attachment";
+    const messageId = `${workspaceId}-message`;
+    const timestamp = Date.now();
+    let partialAfterResult: Awaited<ReturnType<typeof historyService.readPartial>> | undefined;
+    const { events, streamManager } = recordingManager({
+      chunks: [
+        async () => {
+          const attached = await streamManager.attachWorkflowRunToToolCall({
+            type: "workflow-run-attached",
+            workspaceId,
+            messageId,
+            toolCallId: "wf-1",
+            runId: "wfr_orphan",
+            timestamp,
+          });
+          expect(attached).toBe(true);
+        },
+        toolResultChunk("wf-1", "workflow_run"),
+        async () => {
+          partialAfterResult = await historyService.readPartial(workspaceId);
+        },
+        STOP_FINISH,
+      ],
+    });
+    await runTurnForTests(streamManager, { workspaceId, messageId });
+    expect(eventsOfType(events, "workflow-run-attached")).toEqual([
+      {
+        type: "workflow-run-attached",
+        workspaceId,
+        messageId,
+        toolCallId: "wf-1",
+        runId: "wfr_orphan",
+        timestamp,
+      },
+    ]);
+    expect(partialAfterResult?.parts).toMatchObject([
+      { type: "dynamic-tool", toolCallId: "wf-1", workflowRun: { runId: "wfr_orphan", timestamp } },
+    ]);
+  });
+
+  test("a soft stop during a tool call ends the stream when the tool finishes", async () => {
+    const workspaceId = "step-effects-soft-stop-after-tool";
+    const { events, streamManager } = recordingManager({
+      chunks: [
+        toolCallChunk("t1"),
+        async () => {
+          const stopped = await streamManager.stopStream(workspaceId, { soft: true });
+          expect(stopped.success).toBe(true);
+        },
+        toolResultChunk("t1"),
+        { type: "text-delta", text: "after the tool" },
+        STOP_FINISH,
+      ],
+    });
+    const { completion } = await runTurnForTests(streamManager, { workspaceId });
+    expect(completion.status).toBe("aborted");
+    expect(eventsOfType(events, "tool-call-end")).toMatchObject([{ toolCallId: "t1" }]);
+    expect(eventsOfType(events, "stream-delta")).toEqual([]);
   });
 });
