@@ -9223,8 +9223,7 @@ export class AgentSession {
         return await fail(createUnknownSendMessageError(getErrorMessage(error)));
       }
       if (isStreamStartAborted()) return Ok(undefined);
-      const stopFence = () =>
-        !this.isStopInProgress() && this.getStopEpoch() === admissionStopEpoch;
+      const stopFence = () => !this.stoppedSince(admissionStopEpoch);
       const streamResult = await startRequest({
         assertAdmissionCurrent,
         withAdmissionCurrent,
