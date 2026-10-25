@@ -336,6 +336,26 @@ describe("StreamManager - empty stream completions", () => {
     expect(partial?.metadata?.providerMetadata).toEqual({ openai: { cached_tokens: 2 } });
   });
 
+  test("an empty-output retry forgets the empty attempt's finish", async () => {
+    // The empty attempt ended with a finish event. The retried attempt closes
+    // without one, so it must still fail as truncated, not complete.
+    const usage = { inputTokens: 3, outputTokens: 0, totalTokens: 3 };
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([
+        { chunks: [STOP_FINISH], usage },
+        { chunks: [{ type: "text-delta", text: "partial answer" }], usage },
+      ]),
+    });
+    const workspaceId = "empty-retry-truncated-workspace";
+
+    const { completion } = await runTurnForTests(streamManager, { workspaceId });
+
+    expect(completion.status).toBe("failed");
+    const partial = await historyService.readPartial(workspaceId);
+    expect(partial?.metadata?.errorType).toBe("stream_truncated");
+    expect(partial?.parts).toMatchObject([{ type: "text", text: "partial answer" }]);
+  });
+
   test("persists retryable partial error when a non-empty stream closes before finish", async () => {
     const turnStream = () =>
       createStreamResultForTests(
