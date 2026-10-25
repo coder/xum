@@ -787,6 +787,10 @@ const localPlugin = {
         };
       },
     },
+    // Limits: this rule catches direct spellings (Date.now(), globalThis.setTimeout,
+    // timers imports, require("timers")) and skips locals that shadow those names.
+    // It does not follow aliases through variables, destructuring, Reflect, eval or
+    // other dynamic access, so `const d = Date; d.now()` passes. Review catches those.
     "no-raw-clock": {
       meta: {
         type: "problem",
