@@ -27,9 +27,9 @@ import type {
   ToolCallDisplayRegistry,
 } from "@/node/services/toolCallDisplayRegistry";
 import { PartialJournal } from "@/node/services/turnEngine/PartialJournal";
-import type {
+import {
   ProviderRequest,
-  StreamRequestOptions,
+  type StreamRequestOptions,
 } from "@/node/services/turnEngine/ProviderRequest";
 import { convertToSendMessageError } from "@/node/services/turnEngine/streamErrors";
 import { TurnRegistry } from "@/node/services/turnEngine/TurnRegistry";
@@ -287,7 +287,7 @@ export function wireThinkingOverride(
   if (request.thinkingOverrideState) {
     const holder = request.thinkingOverrideState;
     holder.onApplied = (level) => {
-      streamInfo.thinkingLevel = level;
+      ProviderRequest.setThinkingLevel(streamInfo, level);
       const autoModelRouting = streamInfo.initialMetadata?.autoModelRouting;
       if (holder.manual && autoModelRouting != null) {
         streamInfo.initialMetadata = {
@@ -298,7 +298,7 @@ export function wireThinkingOverride(
       publishLiveRouting(streamInfo);
     };
     if (holder.applied) {
-      streamInfo.thinkingLevel = holder.applied;
+      ProviderRequest.setThinkingLevel(streamInfo, holder.applied);
     }
     wireAutoThinkingEscalation(streamInfo, initialMetadata);
   }
