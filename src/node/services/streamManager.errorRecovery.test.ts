@@ -1137,6 +1137,17 @@ describe("StreamManager - stream error classification", () => {
       }),
       expected: "rate_limit",
     },
+    {
+      // 500 is the lowest status that counts as a provider outage.
+      name: "classifies HTTP 500 as server_error",
+      error: createApiCallErrorForTests({
+        message: "Internal server error",
+        statusCode: 500,
+        responseBody: '{"error":{"message":"Internal server error"}}',
+        isRetryable: true,
+      }),
+      expected: "server_error",
+    },
   ];
 
   for (const categorizeCase of categorizeCases) {

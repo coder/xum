@@ -259,6 +259,262 @@ function getProviderRetryAfterMs(error: unknown): number | null {
   return Number.isFinite(ms) && ms >= 0 ? ms : null;
 }
 
+type StreamErrorClass = Pick<StreamErrorPayload, "error" | "contextBudgetExceeded"> & {
+  errorType: StreamErrorType;
+};
+
+/**
+ * The attempt loop's own failures (streamErrors.ts): each class names its
+ * stream error type, and its message is already user-facing.
+ */
+export function getSelfClassifiedStreamError(error: unknown): StreamErrorClass | null {
+  if (error instanceof EmptyStreamOutputError) {
+    return { error: error.message, errorType: "empty_output" };
+  }
+  if (error instanceof ModelRefusalError) {
+    return { error: error.message, errorType: "model_refusal" };
+  }
+  if (error instanceof StreamTruncatedError) {
+    return { error: error.message, errorType: "stream_truncated" };
+  }
+  return null;
+}
+
+/** Context-budget refusals keep their own message; an exceeded budget also reports its details. */
+export function getContextBudgetStreamError(error: unknown): StreamErrorClass | null {
+  if (error instanceof ContextBudgetBlockedError) {
+    return { error: error.message, errorType: "context_budget_blocked" };
+  }
+  if (error instanceof ContextBudgetExceededError) {
+    return {
+      error: error.message,
+      errorType: "context_budget_blocked",
+      contextBudgetExceeded: error.details,
+    };
+  }
+  return null;
+}
+
+/**
+ * Rewrites a provider error's message into user-facing text, and maps an
+ * Anthropic overload to `server_error`. Runs after categorizeError.
+ */
+export function describeProviderStreamError(input: {
+  errorMessage: string;
+  errorType: StreamErrorType;
+  actualError: unknown;
+  model: string;
+  routeProvider: string;
+}): { errorMessage: string; errorType: StreamErrorType } {
+  const { actualError, model } = input;
+  let { errorMessage, errorType } = input;
+
+  // Enhance previous-response and model-not-found error messages
+  if (extractPreviousResponseIdFromError(actualError)) {
+    errorMessage = "OpenAI lost the previous response state while streaming. Retry to continue.";
+  }
+  if (errorType === "model_not_found") {
+    // Extract model name from model string (e.g., "anthropic:sonnet-1m" -> "sonnet-1m")
+    const [, modelName] = model.split(":");
+    errorMessage = `Model '${modelName || model}' does not exist or is not available. Please check your model selection.`;
+  }
+  const accessProgramError = getOpenAIAccessProgramError(actualError);
+  if (accessProgramError != null) {
+    errorMessage = `${OPENAI_ACCESS_PROGRAM_ERROR_HINTS[accessProgramError.code]} OpenAI: ${accessProgramError.message}`;
+  }
+
+  // Normalize Anthropic overload errors (HTTP 529 / overloaded_error) into a stable,
+  // user-friendly message. Keep errorType = server_error so the frontend's auto-retry
+  // behavior remains unchanged.
+  const isAnthropic = normalizeToCanonical(model).startsWith("anthropic:");
+  if (isAnthropic && isAnthropicOverloadError(actualError)) {
+    errorMessage = "Anthropic is temporarily overloaded (HTTP 529). Please try again later.";
+    errorType = "server_error";
+  }
+
+  const openAIResponsesBaseUrlHint = getOpenAIResponsesBaseUrlHint({
+    providerId: input.routeProvider,
+    error: actualError,
+  });
+  // An access-program rejection proves the endpoint speaks Responses.
+  if (openAIResponsesBaseUrlHint && accessProgramError == null) {
+    errorMessage = `${errorMessage}\n\n${openAIResponsesBaseUrlHint}`;
+  }
+  return { errorMessage, errorType };
+}
+
+function hasStructuredErrorProperty(
+  data: unknown
+): data is { error: { code?: string; type?: string } } {
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    "error" in data &&
+    typeof data.error === "object" &&
+    data.error !== null
+  );
+}
+
+function isAPICallModelNotFound(error: APICallError): boolean {
+  if (!hasStructuredErrorProperty(error.data)) return false;
+  // OpenAI: error.code === 'model_not_found'. The status has flipped between 400 and
+  // 404 over time, so key on the code rather than the status.
+  if (error.data.error.code === "model_not_found") return true;
+  // Anthropic: 404 with error.type === 'not_found_error'
+  return error.statusCode === 404 && error.data.error.type === "not_found_error";
+}
+
+/** Context exceeded errors (Anthropic + OpenAI-compatible / Copilot). */
+function isAPICallContextExceeded(error: APICallError): boolean {
+  const msgLower = error.message.toLowerCase();
+  // Anthropic: "prompt is too long" / "input is too long"
+  // Copilot / OpenAI-compatible: "prompt token count of X exceeds the limit of Y"
+  return (
+    msgLower.includes("prompt is too long") ||
+    msgLower.includes("input is too long") ||
+    (msgLower.includes("token") && msgLower.includes("exceeds") && msgLower.includes("limit"))
+  );
+}
+
+export function categorizeAPICallError(error: APICallError): StreamErrorType {
+  if (error.statusCode === 401) return "authentication";
+  // Daybreak access-program rejections are deterministic: a retry resends
+  // the same program. Like a bad key, the user must change provider config
+  // or turn Cyber off, so reuse the non-retryable authentication class.
+  if (getOpenAIAccessProgramError(error) != null) return "authentication";
+  // 402 (Payment Required) signals a billing problem on the provider account.
+  // Treat as non-retryable quota. Some providers also encode quota failures as
+  // 429, so classify 429 by payload intent instead of status code alone.
+  if (error.statusCode === 402) return "quota";
+  if (error.statusCode === 429) {
+    return classify429Capacity({
+      message: error.message,
+      data: error.data,
+      responseBody: error.responseBody,
+    });
+  }
+  if (error.statusCode && error.statusCode >= 500) return "server_error";
+  // Check for model_not_found errors (OpenAI and Anthropic)
+  if (isAPICallModelNotFound(error)) return "model_not_found";
+  if (isAPICallContextExceeded(error)) return "context_exceeded";
+  return "api";
+}
+
+function categorizeRetryError(error: RetryError): StreamErrorType {
+  // The AI SDK wraps the underlying error(s) in RetryError when it exhausts its internal retries.
+  // If the underlying error is deterministically non-retryable (e.g. model_not_found), we should
+  // surface that classification so the frontend auto-retry loop stops.
+  //
+  // Keep returning retry_failed for generic/transient failures so the UI still communicates that
+  // the SDK already retried and gave up.
+  const underlyingType = error.lastError ? categorizeError(error.lastError) : "unknown";
+  if (
+    underlyingType !== "unknown" &&
+    underlyingType !== "api" &&
+    underlyingType !== "retry_failed"
+  ) {
+    return underlyingType;
+  }
+  return "retry_failed";
+}
+
+/**
+ * OpenAI/Anthropic structured error format (from error.cause), or null when
+ * the error has none of the known codes.
+ * Structure: { error: { code: 'context_length_exceeded', type: '...', message: '...' } }
+ */
+export function categorizeStructuredError(error: unknown): StreamErrorType | null {
+  if (!hasStructuredErrorProperty(error)) return null;
+  const structuredError = error.error;
+  // Model not found
+  if (structuredError.code === "model_not_found" || structuredError.type === "not_found_error") {
+    return "model_not_found";
+  }
+  // OpenAI context length errors have code: 'context_length_exceeded'
+  if (structuredError.code === "context_length_exceeded") return "context_exceeded";
+  // Check for other specific error codes/types
+  if (structuredError.code === "rate_limit_exceeded") return "rate_limit";
+  return null;
+}
+
+function isNetworkErrorMessage(message: string): boolean {
+  return (
+    message.includes("network") ||
+    message.includes("fetch") ||
+    // node-fetch's text for a failed connection, which google-auth-library's HTTP client
+    // (gaxios) keeps. Its URL can be Google's OAuth token endpoint, and the "token" rule
+    // below would read that as a context window error.
+    (message.startsWith("request to ") && message.includes(" failed, reason: "))
+  );
+}
+
+function isModelNotFoundMessage(message: string): boolean {
+  return (
+    message.includes("model") &&
+    (message.includes("does not exist") ||
+      message.includes("doesn't exist") ||
+      message.includes("not found") ||
+      message.includes("do not have access") ||
+      message.includes("don't have access") ||
+      message.includes("no access"))
+  );
+}
+
+function isContextExceededMessage(message: string): boolean {
+  return (
+    message.includes("token") ||
+    message.includes("context") ||
+    message.includes("too long") ||
+    message.includes("maximum")
+  );
+}
+
+function isQuotaMessage(message: string): boolean {
+  return (
+    message.includes("quota") ||
+    message.includes("limit") ||
+    message.includes("insufficient balance") ||
+    message.includes("add credits") ||
+    message.includes("payment required")
+  );
+}
+
+/** Fall back to string matching for other errors. Rule order matters: the first match wins. */
+export function categorizeErrorMessage(error: Error): StreamErrorType {
+  const message = error.message.toLowerCase();
+  if (isStreamTruncatedMessage(message)) return "stream_truncated";
+  // google-auth-library could not turn the GOOGLE_APPLICATION_CREDENTIALS file into
+  // a credential (Google Vertex AI). It reads the file locally, so a retry fails the
+  // same way, and the keyword rules below misread its text ("refresh_token").
+  if (message.startsWith(GOOGLE_ADC_ENV_FILE_ERROR_PREFIX)) return "authentication";
+  if (error.name === "AbortError" || message.includes("abort")) return "aborted";
+  if (isNetworkErrorMessage(message)) return "network";
+  if (isModelNotFoundMessage(message)) return "model_not_found";
+  if (isContextExceededMessage(message)) return "context_exceeded";
+  if (isQuotaMessage(message)) return "quota";
+  if (message.includes("auth") || message.includes("key")) return "authentication";
+  return "api";
+}
+
+/**
+ * Categorizes errors for better error handling (used for event emission)
+ */
+export function categorizeError(error: unknown): StreamErrorType {
+  if (error instanceof ContextBudgetExceededError || error instanceof ContextBudgetBlockedError)
+    return "context_budget_blocked";
+  if (error instanceof StreamTruncatedError) {
+    return "stream_truncated";
+  }
+  // Use AI SDK error type guards first
+  if (LoadAPIKeyError.isInstance(error)) return "authentication";
+  if (APICallError.isInstance(error)) return categorizeAPICallError(error);
+  if (RetryError.isInstance(error)) return categorizeRetryError(error);
+  const structuredType = categorizeStructuredError(error);
+  if (structuredType != null) return structuredType;
+  if (error instanceof Error) return categorizeErrorMessage(error);
+  return "unknown";
+}
+
 // Use the resolved SDK model, not the requested prefix: OpenAI Responses can
 // arrive through direct, custom, or Coder routes. xAI Responses and OpenRouter
 // chat-completions models must not enter this recovery path.
@@ -2094,62 +2350,22 @@ export class StreamManager {
     streamInfo: WorkspaceStreamInfo,
     error: unknown
   ): StreamErrorPayload & { errorType: StreamErrorType } {
-    if (error instanceof EmptyStreamOutputError) {
-      return {
-        messageId: streamInfo.messageId,
-        error: error.message,
-        errorType: "empty_output",
-        acpPromptId: streamInfo.initialMetadata?.acpPromptId,
-      };
+    const messageId = streamInfo.messageId;
+    const acpPromptId = streamInfo.initialMetadata?.acpPromptId;
+    const selfClassified = getSelfClassifiedStreamError(error);
+    if (selfClassified != null) {
+      return { messageId, ...selfClassified, acpPromptId };
     }
-
-    if (error instanceof ModelRefusalError) {
-      return {
-        messageId: streamInfo.messageId,
-        error: error.message,
-        errorType: "model_refusal",
-        acpPromptId: streamInfo.initialMetadata?.acpPromptId,
-      };
-    }
-
-    if (error instanceof StreamTruncatedError) {
-      return {
-        messageId: streamInfo.messageId,
-        error: error.message,
-        errorType: "stream_truncated",
-        acpPromptId: streamInfo.initialMetadata?.acpPromptId,
-      };
-    }
-
-    // Extract error message (errors thrown from 'error' parts already have the correct message)
-    // Apply prefix stripping to remove noisy "undefined: " prefixes from provider errors
-    let errorMessage: string = stripNoisyErrorPrefix(getErrorMessage(error));
-    let actualError: unknown = error;
 
     // For categorization, use the cause if available (preserves the original error structure)
-    if (error instanceof Error && error.cause) {
-      actualError = error.cause;
+    const actualError: unknown = error instanceof Error && error.cause ? error.cause : error;
+
+    const contextBudget = getContextBudgetStreamError(actualError);
+    if (contextBudget != null) {
+      return { messageId, ...contextBudget, acpPromptId };
     }
 
-    if (actualError instanceof ContextBudgetBlockedError) {
-      return {
-        messageId: streamInfo.messageId,
-        error: actualError.message,
-        errorType: "context_budget_blocked",
-        acpPromptId: streamInfo.initialMetadata?.acpPromptId,
-      };
-    }
-    if (actualError instanceof ContextBudgetExceededError) {
-      return {
-        messageId: streamInfo.messageId,
-        error: actualError.message,
-        errorType: "context_budget_blocked",
-        contextBudgetExceeded: actualError.details,
-        acpPromptId: streamInfo.initialMetadata?.acpPromptId,
-      };
-    }
-
-    let errorType = this.categorizeError(actualError);
+    let errorType = categorizeError(actualError);
 
     // A matching rejection that reaches failure handling is final: the one-shot
     // repair (retryStreamWithoutReasoningReplay) already ran, or was
@@ -2160,55 +2376,29 @@ export class StreamManager {
       errorType = "reasoning_rejected";
     }
 
-    // Enhance previous-response and model-not-found error messages
-
-    const previousResponseId = extractPreviousResponseIdFromError(actualError);
-    if (previousResponseId) {
-      errorMessage = "OpenAI lost the previous response state while streaming. Retry to continue.";
-    }
-    if (errorType === "model_not_found") {
-      // Extract model name from model string (e.g., "anthropic:sonnet-1m" -> "sonnet-1m")
-      const [, modelName] = streamInfo.model.split(":");
-      errorMessage = `Model '${modelName || streamInfo.model}' does not exist or is not available. Please check your model selection.`;
-    }
-    const accessProgramError = getOpenAIAccessProgramError(actualError);
-    if (accessProgramError != null) {
-      errorMessage = `${OPENAI_ACCESS_PROGRAM_ERROR_HINTS[accessProgramError.code]} OpenAI: ${accessProgramError.message}`;
-    }
-
-    // Normalize Anthropic overload errors (HTTP 529 / overloaded_error) into a stable,
-    // user-friendly message. Keep errorType = server_error so the frontend's auto-retry
-    // behavior remains unchanged.
-    const canonicalModel = normalizeToCanonical(streamInfo.model);
-    const isAnthropic = canonicalModel.startsWith("anthropic:");
-
-    if (isAnthropic && isAnthropicOverloadError(actualError)) {
-      errorMessage = "Anthropic is temporarily overloaded (HTTP 529). Please try again later.";
-      errorType = "server_error";
-    }
-
-    const openAIResponsesBaseUrlHint = getOpenAIResponsesBaseUrlHint({
+    const described = describeProviderStreamError({
+      // Extract error message (errors thrown from 'error' parts already have the correct message)
+      // Apply prefix stripping to remove noisy "undefined: " prefixes from provider errors
+      errorMessage: stripNoisyErrorPrefix(getErrorMessage(error)),
+      errorType,
+      actualError,
+      model: streamInfo.model,
       // The route provider identifies whose config served the request. The
       // canonical model would misattribute gateway routes: openrouter:openai/x
       // canonicalizes to openai:x but never uses the openai base URL.
-      providerId: streamInfo.initialMetadata?.routeProvider ?? "",
-      error: actualError,
+      routeProvider: streamInfo.initialMetadata?.routeProvider ?? "",
     });
-    // An access-program rejection proves the endpoint speaks Responses.
-    if (openAIResponsesBaseUrlHint && accessProgramError == null) {
-      errorMessage = `${errorMessage}\n\n${openAIResponsesBaseUrlHint}`;
-    }
 
-    errorType = coerceStreamErrorTypeForMessage(errorType, errorMessage);
+    errorType = coerceStreamErrorTypeForMessage(described.errorType, described.errorMessage);
     // The AI SDK honors Retry-After only for its own short in-request retries; once they are
     // exhausted, Xum's auto-retry must not come back sooner than the provider asked.
     const retryAfterMs = errorType === "rate_limit" ? getProviderRetryAfterMs(actualError) : null;
 
     return {
-      messageId: streamInfo.messageId,
-      error: errorMessage,
+      messageId,
+      error: described.errorMessage,
       errorType,
-      acpPromptId: streamInfo.initialMetadata?.acpPromptId,
+      acpPromptId,
       ...(retryAfterMs != null ? { retryAfterMs } : {}),
     };
   }
@@ -2679,193 +2869,6 @@ export class StreamManager {
     // Fallback for unknown errors
     const message = getErrorMessage(error);
     return { type: "unknown", raw: message };
-  }
-
-  /**
-   * Categorizes errors for better error handling (used for event emission)
-   */
-  private categorizeError(error: unknown): StreamErrorType {
-    if (error instanceof ContextBudgetExceededError || error instanceof ContextBudgetBlockedError)
-      return "context_budget_blocked";
-    if (error instanceof StreamTruncatedError) {
-      return "stream_truncated";
-    }
-
-    // Use AI SDK error type guards first
-    if (LoadAPIKeyError.isInstance(error)) {
-      return "authentication";
-    }
-    if (APICallError.isInstance(error)) {
-      if (error.statusCode === 401) return "authentication";
-      // Daybreak access-program rejections are deterministic: a retry resends
-      // the same program. Like a bad key, the user must change provider config
-      // or turn Cyber off, so reuse the non-retryable authentication class.
-      if (getOpenAIAccessProgramError(error) != null) return "authentication";
-      // 402 (Payment Required) signals a billing problem on the provider account.
-      // Treat as non-retryable quota. Some providers also encode quota failures as
-      // 429, so classify 429 by payload intent instead of status code alone.
-      if (error.statusCode === 402) return "quota";
-      if (error.statusCode === 429) {
-        return classify429Capacity({
-          message: error.message,
-          data: error.data,
-          responseBody: error.responseBody,
-        });
-      }
-      if (error.statusCode && error.statusCode >= 500) return "server_error";
-
-      // Check for model_not_found errors (OpenAI and Anthropic)
-      // Type guard for error data structure
-      const hasErrorProperty = (
-        data: unknown
-      ): data is { error: { code?: string; type?: string } } => {
-        return (
-          typeof data === "object" &&
-          data !== null &&
-          "error" in data &&
-          typeof data.error === "object" &&
-          data.error !== null
-        );
-      };
-
-      // OpenAI: error.code === 'model_not_found'. The status has flipped between 400 and
-      // 404 over time, so key on the code rather than the status.
-      const isOpenAIModelError =
-        hasErrorProperty(error.data) && error.data.error.code === "model_not_found";
-
-      // Anthropic: 404 with error.type === 'not_found_error'
-      const isAnthropicModelError =
-        error.statusCode === 404 &&
-        hasErrorProperty(error.data) &&
-        error.data.error.type === "not_found_error";
-
-      if (isOpenAIModelError || isAnthropicModelError) {
-        return "model_not_found";
-      }
-
-      // Check for context exceeded errors (Anthropic + OpenAI-compatible / Copilot)
-      const msgLower = error.message.toLowerCase();
-
-      // Anthropic: "prompt is too long" / "input is too long"
-      // Copilot / OpenAI-compatible: "prompt token count of X exceeds the limit of Y"
-      const isContextExceeded =
-        msgLower.includes("prompt is too long") ||
-        msgLower.includes("input is too long") ||
-        (msgLower.includes("token") && msgLower.includes("exceeds") && msgLower.includes("limit"));
-
-      if (isContextExceeded) {
-        return "context_exceeded";
-      }
-
-      return "api";
-    }
-    if (RetryError.isInstance(error)) {
-      // The AI SDK wraps the underlying error(s) in RetryError when it exhausts its internal retries.
-      // If the underlying error is deterministically non-retryable (e.g. model_not_found), we should
-      // surface that classification so the frontend auto-retry loop stops.
-      //
-      // Keep returning retry_failed for generic/transient failures so the UI still communicates that
-      // the SDK already retried and gave up.
-      const underlyingType = error.lastError ? this.categorizeError(error.lastError) : "unknown";
-      if (
-        underlyingType !== "unknown" &&
-        underlyingType !== "api" &&
-        underlyingType !== "retry_failed"
-      ) {
-        return underlyingType;
-      }
-      return "retry_failed";
-    }
-
-    // Check for OpenAI/Anthropic structured error format (from error.cause)
-    // Structure: { error: { code: 'context_length_exceeded', type: '...', message: '...' } }
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "error" in error &&
-      typeof error.error === "object" &&
-      error.error !== null
-    ) {
-      const structuredError = error.error as { code?: string; type?: string };
-
-      // Model not found
-      if (
-        structuredError.code === "model_not_found" ||
-        structuredError.type === "not_found_error"
-      ) {
-        return "model_not_found";
-      }
-
-      // OpenAI context length errors have code: 'context_length_exceeded'
-      if (structuredError.code === "context_length_exceeded") {
-        return "context_exceeded";
-      }
-
-      // Check for other specific error codes/types
-      if (structuredError.code === "rate_limit_exceeded") {
-        return "rate_limit";
-      }
-    }
-
-    // Fall back to string matching for other errors
-    if (error instanceof Error) {
-      const message = error.message.toLowerCase();
-
-      if (isStreamTruncatedMessage(message)) {
-        return "stream_truncated";
-      }
-
-      // google-auth-library could not turn the GOOGLE_APPLICATION_CREDENTIALS file into
-      // a credential (Google Vertex AI). It reads the file locally, so a retry fails the
-      // same way, and the keyword rules below misread its text ("refresh_token").
-      if (message.startsWith(GOOGLE_ADC_ENV_FILE_ERROR_PREFIX)) {
-        return "authentication";
-      }
-
-      if (error.name === "AbortError" || message.includes("abort")) {
-        return "aborted";
-      } else if (
-        message.includes("network") ||
-        message.includes("fetch") ||
-        // node-fetch's text for a failed connection, which google-auth-library's HTTP client
-        // (gaxios) keeps. Its URL can be Google's OAuth token endpoint, and the "token" rule
-        // below would read that as a context window error.
-        (message.startsWith("request to ") && message.includes(" failed, reason: "))
-      ) {
-        return "network";
-      } else if (
-        message.includes("model") &&
-        (message.includes("does not exist") ||
-          message.includes("doesn't exist") ||
-          message.includes("not found") ||
-          message.includes("do not have access") ||
-          message.includes("don't have access") ||
-          message.includes("no access"))
-      ) {
-        return "model_not_found";
-      } else if (
-        message.includes("token") ||
-        message.includes("context") ||
-        message.includes("too long") ||
-        message.includes("maximum")
-      ) {
-        return "context_exceeded";
-      } else if (
-        message.includes("quota") ||
-        message.includes("limit") ||
-        message.includes("insufficient balance") ||
-        message.includes("add credits") ||
-        message.includes("payment required")
-      ) {
-        return "quota";
-      } else if (message.includes("auth") || message.includes("key")) {
-        return "authentication";
-      } else {
-        return "api";
-      }
-    }
-
-    return "unknown";
   }
 
   /**
