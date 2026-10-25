@@ -115,8 +115,7 @@ export const createTodoWriteTool: ToolFactory = (config) => {
         config.workspaceId,
         config.workspaceSessionDir,
         todos,
-        // mutation-equivalent: sessionLocks is a SessionLocks object or undefined, so ?? and || agree
-        config.sessionLocks ?? nodeSessionLocks,
+        config.sessionLocks,
         toolSessionFiles(config)
       );
       return {

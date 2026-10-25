@@ -38,6 +38,7 @@ import {
   SPAWN_NAME_LOCK_FILENAME,
 } from "@/node/services/backgroundProcessManager";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 // Unique workspace IDs per run (#7256): spawn records live in the shared
 // /tmp/mux-bashes/<workspaceId>, and the loop-test runner runs several test files at once. A fixed
@@ -668,6 +669,7 @@ describe("bash tool", () => {
   it("should reject single overlong line before storing it (IPC mode)", async () => {
     const tempDir = new TestTempDir("test-bash-overlong-line");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -705,6 +707,7 @@ describe("bash tool", () => {
   it("should reject overlong line at boundary (IPC mode)", async () => {
     const tempDir = new TestTempDir("test-bash-boundary");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -746,6 +749,7 @@ describe("bash tool", () => {
   it("should use tmpfile policy by default when overflow_policy not specified", async () => {
     const tempDir = new TestTempDir("test-bash-default");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -784,6 +788,7 @@ describe("bash tool", () => {
   it("should preserve up to 100KB in temp file even after 16KB display limit", async () => {
     const tempDir = new TestTempDir("test-bash-100kb");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -841,6 +846,7 @@ describe("bash tool", () => {
   it("should stop collection at 100KB file limit", async () => {
     const tempDir = new TestTempDir("test-bash-100kb-limit");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -889,6 +895,7 @@ describe("bash tool", () => {
   it("should NOT kill process at display limit (16KB) - verify command completes naturally", async () => {
     const tempDir = new TestTempDir("test-bash-no-kill-display");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -935,6 +942,7 @@ describe("bash tool", () => {
   it("should kill process immediately when single line exceeds per-line limit", async () => {
     const tempDir = new TestTempDir("test-bash-per-line-kill");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -980,6 +988,7 @@ describe("bash tool", () => {
   it("should handle output just under 16KB without truncation", async () => {
     const tempDir = new TestTempDir("test-bash-under-limit");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -1013,6 +1022,7 @@ describe("bash tool", () => {
   it("should trigger display truncation at exactly 300 lines", async () => {
     const tempDir = new TestTempDir("test-bash-exact-limit");
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: process.cwd(),
       runtime: new LocalRuntime(process.cwd()),
@@ -2118,6 +2128,7 @@ describe("SSH runtime redundant cd detection", () => {
     sshConnectionPool.markHealthy(sshConfig);
 
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd,
       runtime: sshRuntime,

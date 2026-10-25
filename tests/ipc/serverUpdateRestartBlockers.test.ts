@@ -21,6 +21,7 @@ import {
   createWorkspace,
   waitForInitComplete,
 } from "./helpers";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 function monitorInternals(service: WorkspaceService) {
   return service as unknown as {
@@ -120,6 +121,7 @@ describeIntegration("Server update restart blockers", () => {
 
   async function spawnQuietMonitor() {
     const tool = createBashTool({
+      sessionLocks: nodeSessionLocks,
       cwd: workspacePath,
       runtime: new LocalRuntime(workspacePath),
       secrets: {},

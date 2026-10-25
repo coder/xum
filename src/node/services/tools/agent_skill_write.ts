@@ -276,7 +276,8 @@ function makeAgentSkillWriteTool(
             await withTargetMutationLock(
               config.xumScope.xumHome,
               path.resolve(projectSkillDirs[0], ".."),
-              () => migrateLegacyProjectSkill(skillCtx, parsedName.data)
+              () => migrateLegacyProjectSkill(skillCtx, parsedName.data),
+              config.sessionLocks
             );
           }
         }
@@ -593,7 +594,8 @@ function makeAgentSkillWriteTool(
               });
             }
             return { ok: true, originalContent };
-          }
+          },
+          config.sessionLocks
         );
         if ("success" in outcome) {
           return outcome;

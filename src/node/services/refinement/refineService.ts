@@ -1468,6 +1468,7 @@ export class RefineService {
         runtimeTempDir: os.tmpdir(),
         workspaceSessionDir: sessionDir,
         workspaceId,
+        sessionLocks: this.historyService.locks,
         xumScope: {
           type: "project",
           xumHome: this.config.rootDir,

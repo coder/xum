@@ -5456,8 +5456,10 @@ export class AgentSession {
       this.workspaceId,
       // Session dir enables the cross-process pending-marker wait (r48): a
       // fork registered in another backend has no entry in this process.
-      path.join(this.config.sessionsDir, this.workspaceId),
-      this.historyService.locks
+      {
+        sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
+        locks: this.historyService.locks,
+      }
     );
     // Workspace removal disposes the session and cancels the summary writer
     // while this send is parked on the await above; every append between here

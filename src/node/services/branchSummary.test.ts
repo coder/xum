@@ -1395,7 +1395,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         historyService,
         aiService: fakeAiService(gatedModel),
         workspaceId: ws,
-        sessionDir,
+        marker: { sessionDir, locks: historyService.locks },
         abandonedMessages: [
           createMuxMessage("xp-abandoned-user", "user", `Fix this: ${filler}`, { timestamp: 2 }),
           createMuxMessage("xp-abandoned-assistant", "assistant", `Findings: ${filler}`, {
@@ -1404,7 +1404,6 @@ describe("branch summary placement on fork/truncate flows", () => {
         ],
         isExperimentEnabled: RLM_ON,
         guardTailMessageId: "xp-1",
-        locks: historyService.locks,
       });
 
       // r55: the starter resolves only after the marker is stat-visible —
@@ -1416,11 +1415,10 @@ describe("branch summary placement on fork/truncate flows", () => {
 
       // Foreign send: no local registration under this id, marker exists —
       // it must BLOCK until the writer settles, not return immediately.
-      const foreignWait = awaitPendingBranchSummary(
-        "ws-foreign-process",
+      const foreignWait = awaitPendingBranchSummary("ws-foreign-process", {
         sessionDir,
-        historyService.locks
-      );
+        locks: historyService.locks,
+      });
       const sentinel = Symbol("still-pending");
       expect(
         await Promise.race([
