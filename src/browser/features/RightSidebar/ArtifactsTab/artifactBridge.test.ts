@@ -8,6 +8,7 @@ import {
 } from "@/common/constants/artifactInteractions";
 import {
   acceptArtifactFrameMessage,
+  ARTIFACT_BACKDROP_COLOR_MAX_CHARS,
   ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND,
   ARTIFACT_STATE_POST_INTERVAL_MS,
   ARTIFACT_WORKSPACE_ID_MAX_CHARS,
@@ -1244,5 +1245,105 @@ describe("annotate messages", () => {
     ]) {
       expect(acceptArtifactFrameMessage({ source: frame, data }, frame, allow)).toBeNull();
     }
+  });
+});
+
+describe("backdrop messages", () => {
+  const allow = () => true;
+  const backdrop = { xumArtifact: 1, type: "backdrop", color: "rgb(16, 15, 15)" } as const;
+
+  test("accepts a reported color or null, and nothing else", () => {
+    expect(acceptArtifactFrameMessage({ source: frame, data: backdrop }, frame, allow)).toEqual(
+      backdrop
+    );
+    const none = { ...backdrop, color: null };
+    expect(acceptArtifactFrameMessage({ source: frame, data: none }, frame, allow)).toEqual(none);
+    for (const data of [
+      { ...backdrop, color: "#".repeat(ARTIFACT_BACKDROP_COLOR_MAX_CHARS + 1) },
+      { ...backdrop, color: 0 },
+      { ...backdrop, color: undefined },
+      { ...backdrop, extra: "x" },
+    ]) {
+      expect(acceptArtifactFrameMessage({ source: frame, data }, frame, allow)).toBeNull();
+    }
+  });
+});
+
+describe("bridge backdrop", () => {
+  /**
+   * Run the shim in a real DOM window holding `html`, fire window load and let its timers run.
+   * Returns the backdrop messages it posted and a way to send it a theme message.
+   */
+  async function runWithPage(html: string) {
+    const win = new HappyWindow({ url: "http://localhost" });
+    win.document.write(html);
+    const posts: unknown[] = [];
+    // Top-level window: `window.parent` is the window itself, so its postMessage is the host's.
+    win.postMessage = ((message: { type?: unknown }) => {
+      if (message.type === "backdrop") posts.push(message);
+    }) as typeof win.postMessage;
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
+    const run = new Function(
+      "window",
+      "document",
+      "CustomEvent",
+      buildArtifactBridgeScript("dark", null, {
+        themeName: "dark",
+        variables: { "--xum-bg": "#100f0f" },
+      })
+    ) as (window: unknown, document: unknown, customEvent: unknown) => void;
+    run(win, win.document, win.CustomEvent);
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
+    win.dispatchEvent(new win.Event("load"));
+    await settle();
+    const sendTheme = async (bg: string) => {
+      win.dispatchEvent(
+        new win.MessageEvent("message", {
+          data: { xumArtifact: 1, type: "theme", theme: "light", variables: { "--xum-bg": bg } },
+          source: win as never,
+        })
+      );
+      await settle();
+    };
+    return { win, posts, sendTheme, close: () => win.happyDOM.close() };
+  }
+  const posted = (color: string | null) => ({ xumArtifact: 1, type: "backdrop", color });
+
+  test("reports the root background, else the body's, else null", async () => {
+    for (const [html, color] of [
+      ["<style>html { background: #123456 } body { background: red }</style>", "#123456"],
+      ['<body style="background-color: red"><p>hi</p></body>', "red"],
+      ['<style>html { background: rgba(0, 0, 0, 0) }</style><body style="background: red">', "red"],
+      // A root image keeps the body's background off the canvas (CSS background propagation).
+      [
+        "<style>html { background-image: linear-gradient(transparent, blue) } body { background: red }</style>",
+        null,
+      ],
+      ["<p>no background</p>", null],
+    ] as const) {
+      const page = await runWithPage(html);
+      expect(page.posts).toEqual([posted(color)]);
+      await page.close();
+    }
+  });
+
+  test("follows a theme change, posting only when the color changed", async () => {
+    const page = await runWithPage("<style>html { background: var(--xum-bg) }</style>");
+    await page.sendTheme("#fffcf0");
+    await page.sendTheme("#fffcf0");
+    expect(page.posts).toEqual([posted("#100f0f"), posted("#fffcf0")]);
+    await page.close();
+  });
+
+  test("reads the color again after a theme listener's deferred restyling", async () => {
+    const page = await runWithPage("<style>html { background: var(--xum-bg) }</style>");
+    const root = page.win.document.documentElement;
+    // A theme listener that restyles in a microtask, after the shim's synchronous read.
+    page.win.addEventListener("xumthemechange", () => {
+      void Promise.resolve().then(() => root.style.setProperty("background", "#223344"));
+    });
+    await page.sendTheme("#fffcf0");
+    expect(page.posts.at(-1)).toEqual(posted("#223344"));
+    await page.close();
   });
 });

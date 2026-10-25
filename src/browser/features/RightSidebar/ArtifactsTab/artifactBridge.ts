@@ -52,6 +52,14 @@ import {
  *   the user clicked or typed inside this frame, and only for an active workspace
  *   (SandboxedArtifactFrame.tsx). The frame never gets a reply, so no workspace list or title
  *   reaches it.
+ * - Frame -> host: `{ type: "backdrop", color }`, the color the page's canvas paints (the root
+ *   element's computed background color, else the body's when the root has no background image;
+ *   null when neither applies), posted
+ *   after load and after each theme message (and the page's deferred restyling of either),
+ *   only when it changed. The host paints it behind the
+ *   frame (SandboxedArtifactFrame.tsx), since WebKit shows the iframe element's own background
+ *   wherever the canvas is not painted yet (overscroll, a frame that just grew). The host accepts
+ *   only a bounded, plain, opaque computed color that CSS.supports (artifactBackdropColor).
  * - Host -> frame: `{ type: "theme", theme: "dark" | "light", themeName?, variables? }`, sent
  *   after load and on theme change; the artifact may read it. Besides the SVG wrapper's layout,
  *   the only host style sheet is the zero-specificity text-size-adjust rule
@@ -198,6 +206,39 @@ const ArtifactOpenWorkspaceMessageSchema = z
   })
   .strict();
 
+/** Longest canvas color the bridge carries; computed colors are far shorter. */
+export const ARTIFACT_BACKDROP_COLOR_MAX_CHARS = 64;
+
+/**
+ * A computed color with no paint: `transparent`, or a zero alpha in the legacy four-argument
+ * rgba() form or the modern `/ alpha` form. The frame's shim skips such a root color for the
+ * body's (unless the root has a background image), as CSS background propagation does.
+ */
+const TRANSPARENT_COLOR_PATTERN =
+  /^(?:transparent|rgba?\((?:[^,]*,){3}\s*0(?:\.0*)?%?\s*\)|.*\/\s*0(?:\.0*)?%?\s*\))$/i;
+
+/**
+ * A color with an alpha component: a modern `/ alpha` or a fourth legacy rgba() argument.
+ * Computed colors leave out an alpha of 1, so this is every color that is not opaque.
+ */
+const ALPHA_COLOR_PATTERN = /\/|(?:,[^,]*){3}/;
+
+/**
+ * The shape of a computed color (what getComputedStyle reports): one color function holding
+ * only numbers, units, separators and `none` (color() adds its color space name). No nested
+ * function, so no var(), url(), calc() or light-dark(), and no keyword such as inherit.
+ */
+const COMPUTED_COLOR_PATTERN =
+  /^(?:(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch)\((?:[-+\d.e%,/\s]|none)*\)|color\([a-z\d-]+(?:[-+\d.e%,/\s]|none)*\))$/i;
+
+const ArtifactBackdropMessageSchema = z
+  .object({
+    ...bridgeEnvelope,
+    type: z.literal("backdrop"),
+    color: z.string().max(ARTIFACT_BACKDROP_COLOR_MAX_CHARS).nullable(),
+  })
+  .strict();
+
 export const ArtifactFrameToHostMessageSchema = z.discriminatedUnion("type", [
   ArtifactKeyMessageSchema,
   ArtifactSidebarKeyMessageSchema,
@@ -206,6 +247,7 @@ export const ArtifactFrameToHostMessageSchema = z.discriminatedUnion("type", [
   ArtifactSendMessageSchema,
   ArtifactSetStateMessageSchema,
   ArtifactAnnotateMessageSchema,
+  ArtifactBackdropMessageSchema,
 ]);
 export type ArtifactFrameToHostMessage = z.infer<typeof ArtifactFrameToHostMessageSchema>;
 
@@ -251,6 +293,21 @@ export const ArtifactHostToFrameMessageSchema = z.discriminatedUnion("type", [
   ArtifactAnnotateModeMessageSchema,
 ]);
 export type ArtifactHostToFrameMessage = z.infer<typeof ArtifactHostToFrameMessageSchema>;
+
+/**
+ * The backdrop color the host may paint behind a frame, or null for the fallback. Only an opaque
+ * color: the page paints a translucent canvas over the backdrop, so the same color there would
+ * double its alpha; such a page keeps the fallback, as a browser tab gives it white. SECURITY: the
+ * frame's script chooses the string, so only a plain computed color (COMPUTED_COLOR_PATTERN)
+ * that the browser parses passes; it reaches nothing but a CSS property (React's style object).
+ */
+export function artifactBackdropColor(color: string | null): string | null {
+  if (color == null || ALPHA_COLOR_PATTERN.test(color)) return null;
+  // CSS.supports alone also passes var(), light-dark(), currentcolor and CSS-wide keywords.
+  if (!COMPUTED_COLOR_PATTERN.test(color)) return null;
+  if (typeof window.CSS === "undefined" || typeof window.CSS.supports !== "function") return null;
+  return window.CSS.supports("color", color) ? color : null;
+}
 
 /**
  * Fixed-window limiter: allows `maxPerWindow` calls per `windowMs`. Every message from the
@@ -768,6 +825,43 @@ export function buildArtifactBridgeScript(
   }
   var initialAppearance = JSON.parse(${inlineScriptJson(JSON.stringify(initialAppearance))});
   if (initialAppearance) applyAppearance(initialAppearance.themeName, initialAppearance.variables);
+  // The color the page's canvas paints, picked as CSS background propagation does: the root
+  // element's background color, else the body's, but only when the root has no background
+  // image either. The host paints it behind the frame.
+  var transparentColorPattern = ${TRANSPARENT_COLOR_PATTERN.toString()};
+  var postedBackdrop;
+  function paintedBackground(element) {
+    if (!element) return null;
+    var color = window.getComputedStyle(element).backgroundColor;
+    if (typeof color !== "string" || !color || transparentColorPattern.test(color)) return null;
+    return color.length > ${ARTIFACT_BACKDROP_COLOR_MAX_CHARS} ? null : color;
+  }
+  // Every image in a computed background-image is a function (url(), a gradient); none is not.
+  function hasBackgroundImage(element) {
+    var image = element ? window.getComputedStyle(element).backgroundImage : null;
+    return typeof image === "string" && image.indexOf("(") !== -1;
+  }
+  function postBackdrop() {
+    if (typeof window.getComputedStyle !== "function") return;
+    var root = document.documentElement;
+    var color = paintedBackground(root);
+    if (!color && !hasBackgroundImage(root)) color = paintedBackground(document.body);
+    if (color === postedBackdrop) return;
+    postedBackdrop = color;
+    host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "backdrop", color: color }, "*");
+  }
+  // Read again after the page's own deferred restyling: a listener that restyles in a
+  // microtask, a timer or the next frame (each queued before ours runs).
+  function settleBackdrop() {
+    postBackdrop();
+    setTimeout(postBackdrop, 0);
+    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(postBackdrop);
+  }
+  // Only after load and theme messages: reading on scroll or resize let a page whose background
+  // follows them flood the bridge's rate limit, which then drops its other messages too. A page
+  // that restyles its background later on its own keeps the old backdrop until the next theme
+  // message. A task after load, so the artifact's own load handlers have styled the page.
+  window.addEventListener("load", function () { setTimeout(settleBackdrop, 0); }, { once: true });
   window.addEventListener("message", function (event) {
     if (event.source !== host) return;
     var data = event.data;
@@ -777,6 +871,7 @@ export function buildArtifactBridgeScript(
       applyThemeAttribute();
       applyAppearance(data.themeName, data.variables);
       window.dispatchEvent(new CustomEvent("xumthemechange", { detail: { theme: theme } }));
+      settleBackdrop();
     } else if (data.type === "annotate") {
       annotating = data.enabled === true;
     }

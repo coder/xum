@@ -273,6 +273,66 @@ describe("ArtifactViewer renderers", () => {
     expect(await view.findByTestId("artifact-frame")).toBeTruthy();
   });
 
+  test("a styled page's reported canvas color replaces the white backdrop", async () => {
+    const html = "<style>body { background: #100f0f }</style><p>hi</p>";
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", html) });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const postBackdrop = (target: HTMLIFrameElement, color: string | null) =>
+      act(() => {
+        const event = new window.Event("message");
+        Object.defineProperty(event, "data", {
+          value: { xumArtifact: 1, type: "backdrop", color },
+        });
+        Object.defineProperty(event, "source", { value: target.contentWindow });
+        window.dispatchEvent(event);
+      });
+    // Until the page reports, the pane shows through: no white flash while a dark page loads.
+    expect(frame.className).not.toContain("bg-white");
+    expect(frame.style.backgroundColor).toBe("");
+
+    postBackdrop(frame, "rgb(16, 15, 15)");
+    expect(frame.style.backgroundColor).toBe("rgb(16, 15, 15)");
+    // A canvas that is not opaque (legacy or modern alpha syntax), or none, falls back to white.
+    // The page paints a translucent canvas over that backing, so the same color there would
+    // double its alpha.
+    for (const notOpaque of [
+      "rgba(0, 0, 0, 0)",
+      "rgb(16 15 15 / 0)",
+      "rgba(255, 0, 0, 0.5)",
+      "color(srgb 1 0 0 / 0.5)",
+    ]) {
+      postBackdrop(frame, "rgb(16, 15, 15)");
+      postBackdrop(frame, notOpaque);
+      expect(frame.style.backgroundColor).toBe("");
+      expect(frame.className).toContain("bg-white");
+    }
+    postBackdrop(frame, "rgb(16, 15, 15)");
+    postBackdrop(frame, null);
+    expect(frame.style.backgroundColor).toBe("");
+    expect(frame.className).toContain("bg-white");
+
+    // Only a plain computed color passes: CSS.supports alone also takes these.
+    for (const color of [
+      "var(--color-danger)",
+      "inherit",
+      "currentcolor",
+      "light-dark(red, blue)",
+    ]) {
+      postBackdrop(frame, color);
+      expect(frame.style.backgroundColor).toBe("");
+    }
+
+    // A reloaded frame keeps the last color until its new document reports, so no white flash.
+    postBackdrop(frame, "rgb(16, 15, 15)");
+    fireEvent.load(frame);
+    fireEvent.load(frame);
+    fireEvent.click(await view.findByRole("button", { name: "Reload" }));
+    const reloaded = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    expect(reloaded.style.backgroundColor).toBe("rgb(16, 15, 15)");
+    postBackdrop(reloaded, null);
+    expect(reloaded.style.backgroundColor).toBe("");
+  });
+
   test("a frame's own messages can exit fullscreen but never enter it", async () => {
     const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
     const panel = view.getByTestId("artifacts-panel");
