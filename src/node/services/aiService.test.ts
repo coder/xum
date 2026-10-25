@@ -3107,7 +3107,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(discarded).toEqual([workspaceId]);
   });
 
-  it("gives no status page agent mode with the Status Page switch off, and a side chat leaves the main chat's queue alone", async () => {
+  it("gives no status page agent mode with the Status Page switch off, and a compaction turn keeps the queued updates", async () => {
     using xumHome = new DisposableTempDir("ai-service-status-page-mode-gates");
     const projectPath = path.join(xumHome.path, "project");
     await fs.mkdir(projectPath, { recursive: true });
@@ -3116,24 +3116,31 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
       EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT,
     ]);
+    const main = createLocalWorkspaceMetadata("status-page-main", projectPath);
     const discarded: string[] = [];
-    const startWith = async (metadata: WorkspaceMetadata) => {
-      const harness = createHarness(xumHome.path, metadata, { experimentsService });
+    const startWith = async (message = createMuxMessage("latest-user", "user", "continue")) => {
+      const harness = createHarness(xumHome.path, main, { experimentsService });
       harness.service.turnRequestBuilderBindings.statusPageAgent = {
         enqueue: () => ({ queued: true }),
         discard: (id) => discarded.push(id),
       };
-      await startTestStream(harness, metadata.id);
+      const result = await harness.service.streamMessage({
+        messages: [message],
+        workspaceId: main.id,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+      });
+      expect(result.success).toBe(true);
       // The spy outlives each harness, so read this turn's (the latest) tool configuration.
       const toolConfig = harness.getToolsForModelSpy.mock.calls.at(-1)?.[1];
       return { harness, active: toolConfig?.statusPageAgentActive };
     };
 
-    // The real seeding gives a side chat no Agent interface turn; the queue it shares with its
-    // main chat must keep the main chat's updates.
+    // The real seeding gives a compaction turn no Agent interface turn, so it has no mode, but it
+    // runs mid-work in the main chat and must keep the main agent's queued updates.
     await startWith(
-      createLocalWorkspaceMetadata("status-page-side-chat", projectPath, {
-        sideChatParentWorkspaceId: "status-page-main",
+      createMuxMessage("compact", "user", "Summarize.", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
       })
     );
     expect(discarded).toEqual([]);
@@ -3144,8 +3151,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       resolveLocation: () => Promise.resolve({ kind: "host", dir: artifactsDir }),
       startFingerprint: null,
     });
-    const main = createLocalWorkspaceMetadata("status-page-main", projectPath);
-    const on = await startWith(main);
+    const on = await startWith();
     expect(on.active).toBe(true);
     expect(discarded).toEqual([]);
 
@@ -3155,7 +3161,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       ...cfg,
       agentAiDefaults: { status_page: { enabled: false } },
     }));
-    expect((await startWith(main)).active).toBe(false);
+    expect((await startWith()).active).toBe(false);
     expect(discarded).toEqual([main.id]);
   });
 
