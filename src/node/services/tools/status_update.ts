@@ -39,10 +39,12 @@ function createStatusUpdateTool(config: ToolConfiguration, fallbackModel: string
         fallbackModel,
       });
       if (result.previousError === undefined) return { success: true, queued: true };
+      // Provider messages often end with a period already.
+      const error = result.previousError.replace(/[\s.]+$/, "");
       return {
         success: true,
         queued: true,
-        note: `The status page agent's last update failed: ${result.previousError}. The page may be out of date; edit it yourself if this keeps happening.`,
+        note: `The status page agent's last update failed: ${error}. Its updates are retried with this one, but the page may be out of date; edit it yourself if this keeps happening.`,
       };
     },
   });

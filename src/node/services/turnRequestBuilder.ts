@@ -78,6 +78,7 @@ import type { InitStateManager } from "./initStateManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
 import { isStatusPageAgentMode, prepareAgentInterfaceStatusPage } from "./agentInterfaceStatusPage";
+import { isStatusPageAgentEnabledInSettings } from "./statusPageAgentService";
 import { resolveArtifactsLocation } from "./artifactsOperations";
 import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
 import type { StreamManager } from "./streamManager";
@@ -2425,6 +2426,7 @@ export class TurnRequestBuilder {
     const statusPageAgentActive = isStatusPageAgentMode({
       agentInterfaceView: agentInterfaceViewActive,
       statusPageAgentEnabled: isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT),
+      enabledInSettings: isStatusPageAgentEnabledInSettings(cfg),
       queueAvailable: this.dependencies.bindings.statusPageAgent !== undefined,
     });
     // Filled by the first build: later rebuilds in this turn (tool policy,

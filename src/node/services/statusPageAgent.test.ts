@@ -154,4 +154,20 @@ describe("runStatusPageAgent", () => {
     expect(result.page).toBeNull();
     expect(recorded).toHaveLength(0);
   });
+
+  it("keeps the provider's message when the request itself fails", async () => {
+    const model = new MockLanguageModelV3({
+      doStream: () => Promise.reject(new Error("Internal Server Error: overloaded")),
+    });
+
+    const result = await runStatusPageAgent({
+      model,
+      agentBody: "Keep the page current.",
+      currentPage: PAGE,
+      updates: [{ text: "Started", atMs: 0 }],
+    });
+
+    expect(result.streamError).toContain("overloaded");
+    expect(result.page).toBeNull();
+  });
 });

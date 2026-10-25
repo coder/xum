@@ -196,22 +196,31 @@ describe("StatusPageAgentService", () => {
   });
 
   it("makes no model call and no write while a gate is closed", async () => {
-    const gates: Array<[string, (fixture: Awaited<ReturnType<typeof createFixture>>) => void]> = [
+    const gates: Array<[string, (fixture: Awaited<ReturnType<typeof createFixture>>) => unknown]> =
       [
-        "status page agent off",
-        (f) => f.state.enabled.delete(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT),
-      ],
-      [
-        "agent interface view off",
-        (f) => f.state.enabled.delete(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
-      ],
-      ["artifacts off", (f) => f.state.enabled.delete(EXPERIMENT_IDS.ARTIFACTS)],
-      ["workspace removing", (f) => (f.state.removing = true)],
-      ["workspace archived", (f) => (f.metadata.archivedAt = new Date().toISOString())],
-    ];
+        [
+          "status page agent off",
+          (f) => f.state.enabled.delete(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT),
+        ],
+        [
+          "agent interface view off",
+          (f) => f.state.enabled.delete(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
+        ],
+        ["artifacts off", (f) => f.state.enabled.delete(EXPERIMENT_IDS.ARTIFACTS)],
+        ["workspace removing", (f) => (f.state.removing = true)],
+        ["workspace archived", (f) => (f.metadata.archivedAt = new Date().toISOString())],
+        [
+          "switched off in Settings > Agents",
+          (f) =>
+            f.config.editConfig((cfg) => ({
+              ...cfg,
+              agentAiDefaults: { status_page: { enabled: false } },
+            })),
+        ],
+      ];
     for (const [label, closeGate] of gates) {
       using fixture = await createFixture();
-      closeGate(fixture);
+      await closeGate(fixture);
       fixture.enqueue("an update");
       await fixture.whenIdle();
       expect({ label, calls: fixture.modelStrings.length }).toEqual({ label, calls: 0 });
@@ -250,6 +259,27 @@ describe("StatusPageAgentService", () => {
     expect(fixture.enqueue("next update").previousError).toContain("provider exploded");
     await fixture.whenIdle();
     expect(fixture.enqueue("later update").previousError).toBeUndefined();
+    await fixture.whenIdle();
+  });
+
+  it("retries a failed pass's updates with the next pass and drops the note once it succeeds", async () => {
+    using fixture = await createFixture();
+    fixture.state.behavior = "fail";
+    let passes = 0;
+    fixture.state.onModelRequested = () => {
+      if (++passes === 2) fixture.state.behavior = "write";
+    };
+
+    fixture.enqueue("first update");
+    // Lands while the first pass runs, so it is batched into the second one.
+    fixture.enqueue("second update");
+    await fixture.whenIdle();
+
+    expect(fixture.prompts[0]).not.toContain("second update");
+    expect(fixture.prompts[1]).toContain("first update");
+    expect(fixture.prompts[1]).toContain("second update");
+    expect(await fixture.readPage()).toBe("<p>pass 2</p>");
+    expect(fixture.enqueue("third update").previousError).toBeUndefined();
     await fixture.whenIdle();
   });
 

@@ -64,6 +64,8 @@ const OFFLINE_SAVE_MESSAGE =
 // that cannot affect requests. Compact stays eligible: compaction goes through
 // the send path, which threads reasoningMode.
 const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace", "status_page"]);
+/** The status page agent runs with thinking off (raw streamText, no provider options). */
+const NO_REASONING_AGENT_IDS = new Set(["status_page"]);
 
 /**
  * The status page agent only runs when Artifacts, Agent interface view and Status page agent are
@@ -320,6 +322,8 @@ interface AiDefaultsControlsProps {
   modelCapabilitiesDeferred?: boolean;
   /** Forwarded to the picker; false hides the Pro and Cyber toggles (e.g. Dream, whose requests never apply reasoningMode). */
   allowReasoningModes?: boolean;
+  /** False hides the Reasoning control for agents whose runs never apply a thinking level. */
+  showReasoning?: boolean;
   effectiveModel: string | undefined;
   models: string[];
   hiddenModelsForSelector: string[];
@@ -365,43 +369,45 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
         </div>
       </div>
 
-      <div className="space-y-1">
-        <div className="text-muted text-xs">Reasoning</div>
-        <div className="flex items-center gap-2">
-          {/* Reasoning defaults share the composer picker; speed remains a per-chat choice. */}
-          <ThinkingSelectorControl
-            modelString={props.effectiveModel}
-            modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
-            thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
-            onThinkingLevelChange={(level) => props.onThinkingChange(level)}
-            reasoningMode={props.reasoningModeValue}
-            reasoningModeInherited={props.reasoningModeInherited}
-            onReasoningModeChange={props.onReasoningModeChange}
-            allowReasoningModes={props.allowReasoningModes}
-            allowFastMode={false}
-            variant="box"
-            inheritOption={{
-              label: inheritLabel,
-              // Inherit remains the fallback, but only Auto reads as selected.
-              selected:
-                props.thinkingValue === INHERIT && props.thinkingAutoRouting?.active !== true,
-              onSelect: () => props.onThinkingChange(INHERIT),
-            }}
-            autoRouting={props.thinkingAutoRouting}
-          />
-          {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-9 px-2"
-              onClick={() => props.onThinkingChange(INHERIT)}
-            >
-              Reset
-            </Button>
-          ) : null}
+      {props.showReasoning === false ? null : (
+        <div className="space-y-1">
+          <div className="text-muted text-xs">Reasoning</div>
+          <div className="flex items-center gap-2">
+            {/* Reasoning defaults share the composer picker; speed remains a per-chat choice. */}
+            <ThinkingSelectorControl
+              modelString={props.effectiveModel}
+              modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
+              thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
+              onThinkingLevelChange={(level) => props.onThinkingChange(level)}
+              reasoningMode={props.reasoningModeValue}
+              reasoningModeInherited={props.reasoningModeInherited}
+              onReasoningModeChange={props.onReasoningModeChange}
+              allowReasoningModes={props.allowReasoningModes}
+              allowFastMode={false}
+              variant="box"
+              inheritOption={{
+                label: inheritLabel,
+                // Inherit remains the fallback, but only Auto reads as selected.
+                selected:
+                  props.thinkingValue === INHERIT && props.thinkingAutoRouting?.active !== true,
+                onSelect: () => props.onThinkingChange(INHERIT),
+              }}
+              autoRouting={props.thinkingAutoRouting}
+            />
+            {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-9 px-2"
+                onClick={() => props.onThinkingChange(INHERIT)}
+              >
+                Reset
+              </Button>
+            ) : null}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
@@ -1046,6 +1052,7 @@ export function TasksSection() {
           thinkingValue={thinkingValue}
           reasoningModeValue={entry?.reasoningMode ?? inheritedDefaults.reasoningMode ?? "standard"}
           allowReasoningModes={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
+          showReasoning={!NO_REASONING_AGENT_IDS.has(agent.id)}
           effectiveModel={effectiveModel}
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}

@@ -25,9 +25,11 @@ import {
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { ProjectsConfig } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
+import { resolveAgentEnabledOverride } from "./agentDefinitions/agentEnablement";
 import { AGENT_INTERFACE_STATUS_TEMPLATE } from "./agentInterfaceStatusPage";
 import {
   type AvailableArtifactsLocation,
@@ -93,6 +95,11 @@ interface PendingBatch {
   fallbackModel: string;
 }
 
+/** The Enabled switch on the Settings > Agents > Status Page card (on unless switched off). */
+export function isStatusPageAgentEnabledInSettings(cfg: ProjectsConfig): boolean {
+  return resolveAgentEnabledOverride(cfg, STATUS_PAGE_AGENT_ID) !== false;
+}
+
 function isGone(metadata: StatusPageWorkspaceMetadata | null): boolean {
   // Archived workspaces stay listed; a write must not restart a stopped dedicated workspace.
   return metadata == null || isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt);
@@ -114,6 +121,8 @@ export class StatusPageAgentService {
   private readonly pending = new Map<string, PendingBatch>();
   private readonly running = new Map<string, Promise<void>>();
   private readonly lastError = new Map<string, string>();
+  /** Updates of the last failed pass, applied with the next update instead of being lost. */
+  private readonly failedUpdates = new Map<string, StatusPageUpdate[]>();
 
   constructor(private readonly deps: StatusPageAgentServiceDeps) {}
 
@@ -151,11 +160,12 @@ export class StatusPageAgentService {
 
   private async drain(workspaceId: string): Promise<void> {
     for (;;) {
-      const batch = this.pending.get(workspaceId);
+      const batch = this.takeBatch(workspaceId);
       if (batch === undefined) return;
-      this.pending.delete(workspaceId);
       try {
         await this.runPass(workspaceId, batch);
+        // A later pass recovered the page: the main agent must not be told to take over.
+        this.lastError.delete(workspaceId);
       } catch (error) {
         const message = getErrorMessage(error);
         log.warn("Status page agent pass failed", {
@@ -164,15 +174,32 @@ export class StatusPageAgentService {
           error: message,
         });
         this.lastError.set(workspaceId, message);
+        // Not retried at once (a broken model would loop); they ride along with the next update.
+        this.failedUpdates.set(workspaceId, batch.updates);
       }
     }
+  }
+
+  /** The pending batch, preceded by the updates of a failed pass, within the queue caps. */
+  private takeBatch(workspaceId: string): PendingBatch | undefined {
+    const batch = this.pending.get(workspaceId);
+    if (batch === undefined) return undefined;
+    this.pending.delete(workspaceId);
+    const carried = this.failedUpdates.get(workspaceId);
+    if (carried !== undefined) {
+      this.failedUpdates.delete(workspaceId);
+      batch.updates.unshift(...carried);
+      trimPending(batch.updates);
+    }
+    return batch;
   }
 
   private isActive(): boolean {
     return (
       this.deps.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS) &&
       this.deps.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE) &&
-      this.deps.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT)
+      this.deps.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT) &&
+      isStatusPageAgentEnabledInSettings(this.deps.config.loadConfigOrDefault())
     );
   }
 

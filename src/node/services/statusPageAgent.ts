@@ -121,6 +121,19 @@ function buildPrompt(currentPage: string, updates: readonly StatusPageUpdate[]):
   ].join("\n");
 }
 
+/** The closing text, or "" with the error recorded when the run produced no output. */
+async function readSummary(
+  stream: { text: PromiseLike<string> },
+  recordError: (error: unknown) => void
+): Promise<string> {
+  try {
+    return (await stream.text).trim();
+  } catch (error) {
+    recordError(error);
+    return "";
+  }
+}
+
 /**
  * Run one headless status page pass. The caller resolves the model and the status_page agent
  * body so this module stays independent of agent resolution and artifact storage.
@@ -147,6 +160,11 @@ export async function runStatusPageAgent(args: {
   assert(args.agentBody.trim().length > 0, "status_page agent body must not be empty");
   assert(args.updates.length > 0, "a status page pass needs at least one update");
   const draft: PageDraft = { current: args.currentPage };
+  // Array (not a string flag) because TS cannot track assignments inside callbacks for narrowing.
+  const streamErrors: string[] = [];
+  const recordStreamError = (error: unknown) => {
+    streamErrors.push(getErrorMessage(error));
+  };
 
   const stream = streamText({
     model: args.model,
@@ -155,16 +173,15 @@ export async function runStatusPageAgent(args: {
     tools: createStatusPageTools(draft),
     stopWhen: stepCountIs(STATUS_PAGE_AGENT_MAX_STEPS),
     abortSignal: args.abortSignal,
+    // A provider failure (for example a 500 after the SDK's retries) arrives as an error part,
+    // not a thrown read error, so consumeStream's onError never sees it and stream.text later
+    // rejects with a generic "No output generated". This keeps the provider's own message.
+    onError: ({ error }) => recordStreamError(error),
   });
 
-  // consumeStream surfaces mid-stream errors via onError instead of throwing per part. Array
-  // (not a string flag) because TS cannot track assignments inside the callback for narrowing.
-  const streamErrors: string[] = [];
-  await stream.consumeStream({
-    onError: (error) => {
-      streamErrors.push(getErrorMessage(error));
-    },
-  });
+  // consumeStream surfaces errors thrown while reading the stream via onError.
+  await stream.consumeStream({ onError: recordStreamError });
+  const summary = streamErrors.length === 0 ? await readSummary(stream, recordStreamError) : "";
   if (streamErrors.length > 0) {
     return {
       page: null,
@@ -173,7 +190,6 @@ export async function runStatusPageAgent(args: {
     };
   }
 
-  const summary = (await stream.text).trim();
   // Only awaited on clean streams: after a mid-flight error, usage can stay pending forever.
   let usage: StatusPageAgentResult["usage"];
   try {

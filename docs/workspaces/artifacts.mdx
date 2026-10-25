@@ -169,7 +169,8 @@ When the workspace has an active goal, Xum keeps `goal.status.html` up to date i
 - Pick the status page agent's model in **Settings > Agents > Status Page**. When you pick none, it uses the workspace's model. A small, fast model is usually enough.
 - The status page agent can change only `status.html`. It does not write to an archived or removed workspace, or after you turn the experiment off.
 - Its spend shows in the workspace's costs, like other background agents.
-- When a run fails (for example the model is unavailable), the main agent's turn goes on. The result of its next `status_update` call says that the last update failed, and the agent can then edit the page itself.
+- When a run fails (for example the model is unavailable), the main agent's turn goes on. The result of its next `status_update` call says that the last update failed, and the agent can then edit the page itself. The updates of the failed run are applied again with the next update.
+- To stop the status page agent without turning off the experiment, switch off **Enabled** on its card in **Settings > Agents**. The main agent then edits the page itself.
 
 ## Apps from MCP servers
 

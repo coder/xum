@@ -734,6 +734,11 @@ export function ExperimentsSection() {
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const agentInterfaceEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE);
+  // Status page agent does nothing without Agent interface view, so it shows only under it.
+  const artifactsSubExperimentIds = ARTIFACTS_SUB_EXPERIMENT_IDS.filter(
+    (id) => id !== EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT || agentInterfaceEnabled
+  );
   // Only show user-overridable experiments (non-overridable ones are hidden since users can't
   // change them). Sub-experiments render nested under their parent row instead.
   const experiments = useMemo(
@@ -802,7 +807,7 @@ export function ExperimentsSection() {
                 <>
                   <ArtifactsExperimentConfig />
                   <ExperimentSettingsPanel>
-                    <SubExperimentRows experimentIds={ARTIFACTS_SUB_EXPERIMENT_IDS} />
+                    <SubExperimentRows experimentIds={artifactsSubExperimentIds} />
                   </ExperimentSettingsPanel>
                 </>
               )}
