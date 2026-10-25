@@ -3668,7 +3668,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     className={variant === "creation" ? "min-h-36" : "min-h-9 placeholder:truncate"}
                   />
                   {/* Shortcut hints only show in creation, which has room below the prompt. */}
-                  {variant === "creation" && input.trim() === "" && !editingMessageForUi && (
+                  {variant === "creation" && input.trim() === "" && (
                     <div className="mobile-hide-shortcut-hints text-muted @container pointer-events-none absolute right-2 bottom-3 left-2 flex flex-nowrap items-center gap-4 overflow-hidden text-[11px] whitespace-nowrap">
                       <span className="shrink-0">
                         <span className="font-mono">{formatKeybind(KEYBINDS.FOCUS_CHAT)}</span>
