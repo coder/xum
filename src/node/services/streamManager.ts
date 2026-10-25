@@ -8,11 +8,9 @@ import {
 import { getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { type ContinuousPrefixSwap } from "./continuousCompactionJournal";
 import type { Scope } from "effect";
-import { eventSpine } from "@/node/services/events/eventSpine";
 import {
   type streamText,
   type stepCountIs,
-  type ModelMessage,
   type LanguageModel,
   LoadAPIKeyError,
   APICallError,
@@ -24,7 +22,6 @@ import type { Result } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { log, type Logger } from "./log";
 import type {
-  StreamEndEvent,
   StreamAbortEvent,
   StreamAbortReason,
   ToolCallEndEvent,
@@ -142,7 +139,19 @@ import {
   type PendingStreamStartHandle,
   type StreamToken,
 } from "@/node/services/turnEngine/TurnRegistry";
+import {
+  AttemptLoop,
+  type PartLoopState,
+  type PreviousResponseIdRetryPlan,
+  type ReasoningReplayRetryPlan,
+  type ToolCallMap,
+} from "@/node/services/turnEngine/AttemptLoop";
 import { RefusalFallback } from "@/node/services/turnEngine/RefusalFallback";
+import {
+  EmptyStreamOutputError,
+  ModelRefusalError,
+  StreamTruncatedError,
+} from "@/node/services/turnEngine/streamErrors";
 import { TurnResources } from "@/node/services/turnEngine/TurnResources";
 import { TurnEngine, type TurnExecutionOptions } from "@/node/services/turnEngine/TurnEngine";
 export {
@@ -150,96 +159,12 @@ export {
   type TurnExecutionOptions,
 } from "@/node/services/turnEngine/TurnEngine";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
-import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { getOpenAIResponsesBaseUrlHint } from "@/node/services/utils/openAIResponsesBaseUrlHint";
-import {
-  MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS,
-  recoveryPolicy,
-  type AttemptHistory,
-  type AttemptOutcome,
-} from "@/node/services/turnEngine/recoveryPolicy";
-import {
-  partFold,
-  type FoldablePart,
-  type FoldIntent,
-  type FoldStep,
-  type FoldView,
-} from "@/node/services/turnEngine/partFold";
+import type { FoldIntent, FoldStep, FoldView } from "@/node/services/turnEngine/partFold";
 
 // Disable noisy AI SDK warning logging.
 globalThis.AI_SDK_LOG_WARNINGS = false;
-
-const EMPTY_STREAM_OUTPUT_ERROR_MESSAGE =
-  "The model ended the stream before producing any assistant-visible output. This usually means the upstream stream was dropped rather than completed normally. Xum will retry automatically when possible, and if retries keep failing you should try again or switch models.";
-
-/** What planPreviousResponseIdRetry found; its executor consumes it unchanged. */
-interface PreviousResponseIdRetryPlan {
-  /** Retry the current step only (keep parts and usage) instead of the whole stream. */
-  hasParts: boolean;
-  previousResponseId: string;
-  stepMessages: WorkspaceStreamInfo["stepTracker"]["latestMessages"];
-  /** The request's provider options without previousResponseId. */
-  providerOptions: Record<string, unknown> | undefined;
-  errorCode: string | undefined;
-  statusCode: number | undefined;
-}
-
-/** What planReasoningReplayRetry found; its executor consumes it unchanged. */
-interface ReasoningReplayRetryPlan {
-  /** Retry the current step only (keep parts and usage) instead of the whole stream. */
-  hasParts: boolean;
-  rejectedNamespace: "openai" | "anthropic";
-  /** The request transcript without the rejected namespace's reasoning. */
-  messages: ModelMessage[];
-}
-
-const STREAM_TRUNCATED_MESSAGE_SUFFIX =
-  "stream closed unexpectedly before the response completed. Xum will retry automatically when possible, and if retries keep failing you should try again or switch models.";
-
-class EmptyStreamOutputError extends Error {
-  constructor() {
-    super(EMPTY_STREAM_OUTPUT_ERROR_MESSAGE);
-    this.name = "EmptyStreamOutputError";
-  }
-}
-
-/**
- * Terminal provider refusal: the model declined to continue the turn. Unlike
- * EmptyStreamOutputError (a transport drop), retrying the same request will
- * likely refuse again, so this maps to the non-retryable "model_refusal" stream
- * error type.
- */
-class ModelRefusalError extends Error {
-  constructor(model: string, finishReason: string, fallbackNote?: string) {
-    super(
-      `The model refused to continue (finishReason: ${finishReason}): ${model}. ` +
-        "Retrying the same request is unlikely to help; try rephrasing or a different model." +
-        (fallbackNote ? ` ${fallbackNote}` : "")
-    );
-    this.name = "ModelRefusalError";
-  }
-}
-
-class StreamTruncatedError extends Error {
-  readonly providerDisplayName: string;
-
-  constructor(providerDisplayName: string) {
-    super(`${providerDisplayName} ${STREAM_TRUNCATED_MESSAGE_SUFFIX}`);
-    this.name = "StreamTruncatedError";
-    this.providerDisplayName = providerDisplayName;
-  }
-}
-
-// Tool-call tracking + branded types
-interface ToolCallState {
-  toolCallId: string;
-  toolName: string;
-  input: unknown;
-  output?: unknown;
-}
-
-type ToolCallMap = Map<string, ToolCallState>;
 
 function recordTerminalFinish(
   streamInfo: WorkspaceStreamInfo,
@@ -252,31 +177,6 @@ function recordTerminalFinish(
   if (intent.rawFinishReason !== undefined) {
     streamInfo.terminalRawFinishReason = intent.rawFinishReason;
   }
-}
-
-/** Stream-loop state of one processStreamWithCleanup turn that applyStep reads and updates. */
-interface PartLoopState {
-  readonly workspaceLog: Logger;
-  /** Per attempt: processStreamWithCleanup replaces it before each attempt. */
-  toolCalls: ToolCallMap;
-  /** Per turn: counts orphan tool results for log suppression. */
-  orphanToolResultCount: number;
-}
-
-function isKnownProviderName(provider: string): provider is keyof typeof PROVIDER_DEFINITIONS {
-  return Object.hasOwn(PROVIDER_DEFINITIONS, provider);
-}
-
-function getStreamProviderDisplayName(model: string): string {
-  const canonicalModel = normalizeToCanonical(model);
-  const providerSeparatorIndex = canonicalModel.indexOf(":");
-  const provider =
-    providerSeparatorIndex > 0 ? canonicalModel.slice(0, providerSeparatorIndex) : undefined;
-  if (provider && isKnownProviderName(provider)) {
-    return PROVIDER_DEFINITIONS[provider].displayName;
-  }
-
-  return "The model";
 }
 
 function isStreamTruncatedMessage(message: string): boolean {
@@ -659,98 +559,6 @@ async function estimateNextRequestTokens(
   return nextRequest?.estimate;
 }
 
-/** The request's stop cause, as the stream-end helpers read it. */
-interface StopCauseHolder {
-  readonly request: Pick<StreamRequestConfig, "stopCause">;
-}
-
-/** The stream-end event of a completed stream, with its final metadata and parts. */
-export function buildStreamEndEvent(
-  workspaceId: WorkspaceId,
-  streamInfo: Pick<
-    WorkspaceStreamInfo,
-    | "messageId"
-    | "model"
-    | "metadataModel"
-    | "thinkingLevel"
-    | "initialMetadata"
-    | "toolModelUsages"
-    | "historySequence"
-    | "parts"
-  > &
-    StopCauseHolder,
-  end: {
-    totalUsage: StreamEndEvent["metadata"]["usage"];
-    contextUsage: StreamEndEvent["metadata"]["contextUsage"];
-    providerMetadata: StreamEndEvent["metadata"]["providerMetadata"];
-    contextProviderMetadata: StreamEndEvent["metadata"]["contextProviderMetadata"];
-    finishReason: StreamEndEvent["metadata"]["finishReason"];
-    duration: number;
-    ttftMs: number | undefined;
-  }
-): StreamEndEvent {
-  const {
-    totalUsage,
-    contextUsage,
-    providerMetadata,
-    contextProviderMetadata,
-    finishReason,
-    duration,
-    ttftMs,
-  } = end;
-  const canonicalModel = metadataModelIdentity(streamInfo.model);
-  const toolModelUsages =
-    streamInfo.toolModelUsages.length > 0
-      ? streamInfo.toolModelUsages.map(clonePersistedToolModelUsage)
-      : undefined;
-
-  // Emit stream end event with parts preserved in temporal order
-  const streamEndEvent: StreamEndEvent = {
-    type: "stream-end",
-    workspaceId: workspaceId as string,
-    messageId: streamInfo.messageId,
-    ...(streamInfo.initialMetadata?.acpPromptId != null
-      ? { acpPromptId: streamInfo.initialMetadata.acpPromptId }
-      : {}),
-    metadata: {
-      ...streamInfo.initialMetadata, // TurnRequestBuilder-provided metadata (systemMessageTokens, etc)
-      model: canonicalModel,
-      metadataModel: streamInfo.metadataModel,
-      ...(streamInfo.thinkingLevel && {
-        thinkingLevel: streamInfo.thinkingLevel as ThinkingLevel,
-      }),
-      usage: totalUsage, // Total across all steps (for cost calculation)
-      contextUsage, // Last step only (for context window display)
-      providerMetadata, // Aggregated (for cost calculation)
-      contextProviderMetadata, // Last step (for context window display)
-      ...(toolModelUsages != null ? { toolModelUsages } : {}),
-      ...(finishReason !== undefined && { finishReason }),
-      ...(streamInfo.request.stopCause != null && {
-        stopCause: streamInfo.request.stopCause,
-      }),
-      historySequence: streamInfo.historySequence,
-      duration,
-      ...(ttftMs !== undefined && { ttftMs }),
-    },
-    parts: streamInfo.parts, // Parts array with temporal ordering (includes reasoning)
-  };
-  return streamEndEvent;
-}
-
-/**
- * The finish reason a completed stream persists. Required-tool completion must remain
- * successful after downgrade or crash recovery: keep the internal stop cause, but persist
- * the legacy-compatible terminal signal.
- */
-export function resolveStreamEndFinishReason(
-  streamInfo: Pick<WorkspaceStreamInfo, "terminalFinishReason"> & StopCauseHolder,
-  providerFinishReason: StreamEndEvent["metadata"]["finishReason"]
-): StreamEndEvent["metadata"]["finishReason"] {
-  return streamInfo.request.stopCause?.kind === "required-tool"
-    ? "stop"
-    : (streamInfo.terminalFinishReason ?? providerFinishReason);
-}
-
 /**
  * StreamManager - Handles all streaming operations with type safety and atomic operations
  *
@@ -770,6 +578,7 @@ export class StreamManager {
   // Starts turns: slot, resources, registration, envelope (turnEngine/TurnEngine.ts).
   private readonly turnEngine: TurnEngine;
   private readonly refusalFallback: RefusalFallback;
+  private readonly attemptLoop: AttemptLoop;
   // Read by TurnResources at call time; coreServicesRoot.test.ts reads this field.
   private mcpServerManager?: MCPServerManager;
   private mockStreamLifecycle?: MockStreamLifecycle;
@@ -906,6 +715,56 @@ export class StreamManager {
       getAggregatedProviderMetadata: (streamInfo) => this.getAggregatedProviderMetadata(streamInfo),
       buildPartialAssistantMessage: (streamInfo, options) =>
         this.buildPartialAssistantMessage(streamInfo, options),
+    });
+    this.attemptLoop = new AttemptLoop({
+      turnResources: this.turnResources,
+      partialJournal: this.partialJournal,
+      usageLedger: this.usageLedger,
+      providerRequest: this.providerRequest,
+      turnEvents: this.turnEvents,
+      refusalFallback: this.refusalFallback,
+      workspaceStreams: this.workspaceStreams,
+      // Forward at call time: these methods stay in StreamManager, and whitebox
+      // tests replace createStreamResult and tokenTracker on it.
+      tokenTracker: {
+        setModel: (model, metadataModel) => this.tokenTracker.setModel(model, metadataModel),
+      },
+      getWorkspaceLogger: (workspaceId, streamInfo) =>
+        this.getWorkspaceLogger(workspaceId, streamInfo),
+      getStreamMetadata: (streamInfo) => this.getStreamMetadata(streamInfo),
+      endUsage: (streamInfo, totalUsage) => this.endUsage(streamInfo, totalUsage),
+      backfillReasoningTokensFromParts: (streamInfo, usage) =>
+        this.backfillReasoningTokensFromParts(streamInfo, usage),
+      resolveTtftMsForStreamEnd: (streamInfo) => this.resolveTtftMsForStreamEnd(streamInfo),
+      resolveProviderMetadataForStreamEnd: (streamInfo) =>
+        this.resolveProviderMetadataForStreamEnd(streamInfo),
+      getOpenAIPreviousResponseId: (providerOptions) =>
+        this.getOpenAIPreviousResponseId(providerOptions),
+      resetStreamStateForRetry: (workspaceId, streamInfo, options) =>
+        this.resetStreamStateForRetry(workspaceId, streamInfo, options),
+      createStreamResult: (request, abortController, stepTracker) =>
+        this.createStreamResult(request, abortController, stepTracker),
+      emitStreamStart: (workspaceId, streamInfo, historySequence) =>
+        this.emitStreamStart(workspaceId, streamInfo, historySequence),
+      flushPartialWrite: (workspaceId, streamInfo) =>
+        this.flushPartialWrite(workspaceId, streamInfo),
+      foldView: (workspaceId, streamInfo, loop) => this.foldView(workspaceId, streamInfo, loop),
+      applyStep: (workspaceId, streamInfo, step, loop) =>
+        this.applyStep(workspaceId, streamInfo, step, loop),
+      planPreviousResponseIdRetry: (streamInfo, error) =>
+        this.planPreviousResponseIdRetry(streamInfo, error),
+      planReasoningReplayRetry: (streamInfo, error) =>
+        this.planReasoningReplayRetry(streamInfo, error),
+      retryStreamWithoutPreviousResponseId: (workspaceId, streamInfo, error, plan) =>
+        this.retryStreamWithoutPreviousResponseId(workspaceId, streamInfo, error, plan),
+      retryStreamWithoutReasoningReplay: (workspaceId, streamInfo, error, plan) =>
+        this.retryStreamWithoutReasoningReplay(workspaceId, streamInfo, error, plan),
+      buildStreamErrorPayload: (streamInfo, error) =>
+        this.buildStreamErrorPayload(streamInfo, error),
+      persistStreamError: (workspaceId, streamInfo, payload) =>
+        this.persistStreamError(workspaceId, streamInfo, payload),
+      discardUnsettledSessionUsage: (workspaceId, streamInfo) =>
+        this.discardUnsettledSessionUsage(workspaceId, streamInfo),
     });
     this.streamTextOverride = options.streamText;
     this.stepPreparation = new StepPreparation({
@@ -2194,58 +2053,6 @@ export class StreamManager {
     this.turnEventEmitter.emitStreamStart(workspaceId, streamInfo, historySequence, options);
   }
 
-  private async handleEmptyStreamCompletion(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo
-  ): Promise<void> {
-    const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-    const streamMeta = await this.getStreamMetadata(streamInfo);
-    const totalUsage = this.endUsage(streamInfo, streamMeta.totalUsage);
-    const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
-    const previousResponseId = this.getOpenAIPreviousResponseId(streamInfo.request.providerOptions);
-
-    // Surface silent provider drops instead of leaving an empty assistant placeholder behind.
-    // Recent gpt-5.4-pro stalls only logged stream startup, so future occurrences need an
-    // explicit backend breadcrumb and a user-visible retryable error.
-    workspaceLog.error("Stream ended without emitting text, reasoning, or tool events", {
-      messageId: streamInfo.messageId,
-      model: streamInfo.model,
-      durationMs: streamMeta.duration,
-      totalUsage,
-      contextUsage,
-      cumulativeUsage: streamInfo.cumulativeUsage,
-      previousResponseId,
-    });
-
-    await this.handleStreamFailure(workspaceId, streamInfo, new EmptyStreamOutputError());
-  }
-
-  private async handleModelRefusalCompletion(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    refusalFinishReason: string,
-    fallbackNote?: string
-  ): Promise<void> {
-    const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-    const streamMeta = await this.getStreamMetadata(streamInfo);
-
-    workspaceLog.error("Stream ended with a terminal refusal", {
-      messageId: streamInfo.messageId,
-      model: streamInfo.model,
-      finishReason: streamInfo.terminalFinishReason,
-      rawFinishReason: streamInfo.terminalRawFinishReason,
-      durationMs: streamMeta.duration,
-      partsCount: streamInfo.parts.length,
-      fallbackNote,
-    });
-
-    await this.handleStreamFailure(
-      workspaceId,
-      streamInfo,
-      new ModelRefusalError(streamInfo.model, refusalFinishReason, fallbackNote)
-    );
-  }
-
   private buildPartialAssistantMessage(
     streamInfo: WorkspaceStreamInfo,
     options: { metadata?: Partial<MuxMetadata>; parts?: MuxMessage["parts"] } = {}
@@ -2274,492 +2081,13 @@ export class StreamManager {
     };
   }
 
-  private async handleTruncatedStreamCompletion(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo
-  ): Promise<void> {
-    const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-    const streamMeta = await this.getStreamMetadata(streamInfo);
-    const totalUsage = this.endUsage(streamInfo, streamMeta.totalUsage);
-    const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
-    const previousResponseId = this.getOpenAIPreviousResponseId(streamInfo.request.providerOptions);
-    const providerDisplayName = getStreamProviderDisplayName(streamInfo.model);
-
-    // Do not treat iterator EOF as success. Anthropic and OpenAI Responses both
-    // have semantic terminal events; without the SDK finish part, this may be a
-    // clean proxy/provider drop after partial text was already streamed.
-    workspaceLog.error("Stream ended without a terminal finish event", {
-      messageId: streamInfo.messageId,
-      model: streamInfo.model,
-      providerDisplayName,
-      durationMs: streamMeta.duration,
-      totalUsage,
-      contextUsage,
-      cumulativeUsage: streamInfo.cumulativeUsage,
-      previousResponseId,
-      partsCount: streamInfo.parts.length,
-    });
-
-    await this.handleStreamFailure(
-      workspaceId,
-      streamInfo,
-      new StreamTruncatedError(providerDisplayName)
-    );
-  }
-
-  /** Executes recoveryPolicy's empty-output retry; the policy owns eligibility. */
-  private async retryEmptyStream(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    emptyStreamRecoveryAttempts: number
-  ): Promise<void> {
-    const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-    workspaceLog.warn("Retrying stream after empty-output completion", {
-      messageId: streamInfo.messageId,
-      model: streamInfo.model,
-      nextAttempt: emptyStreamRecoveryAttempts + 1,
-      maxAttempts: MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS,
-      previousResponseId: this.getOpenAIPreviousResponseId(streamInfo.request.providerOptions),
-    });
-
-    streamInfo.didRetryAfterEmptyOutput = true;
-    await this.resetStreamStateForRetry(workspaceId, streamInfo, {
-      preserveUsage: true,
-      workspaceLog,
-    });
-    streamInfo.streamResult = this.createStreamResult(
-      streamInfo.request,
-      streamInfo.abortController,
-      streamInfo.stepTracker
-    );
-  }
-
-  /** Facts for recoveryPolicy about an attempt whose stream closed without throwing. */
-  private finishedAttemptOutcome(streamInfo: WorkspaceStreamInfo): AttemptOutcome {
-    // A refusal is a deliberate provider outcome, not a transport drop, so
-    // recoveryPolicy checks it before the empty-output and truncation paths.
-    // With partial output, a configured fallback must continue from the
-    // partial transcript rather than replay the original turn and re-run tools.
-    const refusal = streamInfo.receivedTerminalEvent
-      ? ([streamInfo.terminalFinishReason, streamInfo.terminalRawFinishReason].find(
-          isRefusalFinishReason
-        ) ?? null)
-      : null;
-    return {
-      _tag: "Finished",
-      aborted: streamInfo.abortController.signal.aborted,
-      interruptPending: streamInfo.softInterrupt.pending,
-      partCount: streamInfo.parts.length,
-      terminal: streamInfo.receivedTerminalEvent,
-      refusal,
-    };
-  }
-
-  /**
-   * Chooses and runs what follows an attempt whose stream closed without
-   * throwing. "retry" starts the next attempt and "complete" lets the caller
-   * finalize the turn. "stop" ends the turn: the executor already settled it,
-   * or after an abort the canceller owns the terminal bookkeeping
-   * (cleanupAbortedStream).
-   */
-  private async recoverFinishedAttempt(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    history: AttemptHistory
-  ): Promise<"retry" | "complete" | "stop"> {
-    const decision = recoveryPolicy(this.finishedAttemptOutcome(streamInfo), history);
-    switch (decision._tag) {
-      case "Aborted":
-        return "stop";
-      case "Complete":
-        return "complete";
-      case "Fallback":
-        return this.recoverRefusedAttempt(workspaceId, streamInfo, decision.refusal);
-      case "Retry":
-        assert(decision.change === "empty", "finished attempts only retry empty output");
-        await this.retryEmptyStream(workspaceId, streamInfo, history.emptyRetries);
-        history.emptyRetries += 1;
-        return "retry";
-      case "Empty":
-        await this.handleEmptyStreamCompletion(workspaceId, streamInfo);
-        return "stop";
-      case "Truncated":
-        await this.handleTruncatedStreamCompletion(workspaceId, streamInfo);
-        return "stop";
-      default:
-        assert(false, `recoveryPolicy returned ${decision._tag} for a finished attempt`);
-    }
-  }
-
-  private async recoverRefusedAttempt(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    refusal: string
-  ): Promise<"retry" | "stop"> {
-    // A configured fallback chain may swap models in place of the
-    // terminal failure. The swap happens before any error event is
-    // emitted, so task settlement can never race a pending fallback.
-    const fallback = await this.refusalFallback.tryModelFallbackAfterRefusal(
-      workspaceId,
-      streamInfo,
-      refusal,
-      {
-        preserveParts: streamInfo.parts.length > 0,
-      }
-    );
-    if (fallback.kind === "swapped") {
-      return "retry";
-    }
-
-    await this.handleModelRefusalCompletion(
-      workspaceId,
-      streamInfo,
-      refusal,
-      fallback.terminalNote
-    );
-    return "stop";
-  }
-
-  /**
-   * Chooses and runs what follows an attempt whose stream threw. "retry" starts
-   * the next attempt, "fail" asks the caller to fail the turn with `error`, and
-   * "aborted" asks the caller to flush the partial and leave the turn for the
-   * canceller to settle. Only "retry" runs side effects here.
-   */
-  private async recoverErroredAttempt(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown,
-    history: AttemptHistory
-  ): Promise<{ kind: "retry" } | { kind: "aborted" } | { kind: "fail"; error: unknown }> {
-    // A throw from a check or an executor fails the turn with the thrown error,
-    // as when the checks lived in the retry helpers.
-    try {
-      // The plans are read-only checks over the error and stream state.
-      // After an abort they are skipped, as before: the policy ignores them.
-      const aborted = streamInfo.abortController.signal.aborted;
-      const previousResponseIdPlan = aborted
-        ? null
-        : this.planPreviousResponseIdRetry(streamInfo, error);
-      const reasoningReplayPlan = aborted ? null : this.planReasoningReplayRetry(streamInfo, error);
-      const decision = recoveryPolicy(
-        {
-          _tag: "Errored",
-          aborted,
-          interruptPending: streamInfo.softInterrupt.pending,
-          previousResponseIdRetryable: previousResponseIdPlan != null,
-          reasoningReplayRetryable: reasoningReplayPlan != null,
-        },
-        history
-      );
-      if (decision._tag === "Aborted") {
-        return { kind: "aborted" };
-      }
-      if (decision._tag !== "Retry") {
-        assert(decision._tag === "Fail", `recoveryPolicy returned ${decision._tag} for an error`);
-        return { kind: "fail", error };
-      }
-      if (decision.change === "dropPreviousResponseId") {
-        assert(previousResponseIdPlan != null, "policy retried without a plan");
-        await this.retryStreamWithoutPreviousResponseId(
-          workspaceId,
-          streamInfo,
-          error,
-          previousResponseIdPlan
-        );
-        history.retriedPreviousResponseId = true;
-      } else {
-        assert(decision.change === "dropReasoningReplay", "errors never retry as empty output");
-        assert(reasoningReplayPlan != null, "policy retried without a plan");
-        await this.retryStreamWithoutReasoningReplay(
-          workspaceId,
-          streamInfo,
-          error,
-          reasoningReplayPlan
-        );
-        history.retriedReasoningReplay = true;
-      }
-      return { kind: "retry" };
-    } catch (retryError) {
-      return { kind: "fail", error: retryError };
-    }
-  }
-
-  /** Fold one attempt's provider stream into the turn, part by part, until it ends or aborts. */
-  private async consumeAttemptStream(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    loop: PartLoopState
-  ): Promise<void> {
-    for await (const part of streamInfo.streamResult.fullStream) {
-      // Check if stream was cancelled BEFORE processing any parts
-      // This improves interruption responsiveness by catching aborts earlier
-      if (streamInfo.abortController.signal.aborted) {
-        break;
-      }
-
-      // Log all stream parts to debug reasoning (commented out - too spammy)
-      // console.log("[DEBUG streamManager]: Stream part", {
-      //   type: part.type,
-      //   hasText: "text" in part,
-      //   preview: "text" in part ? (part as StreamPartWithText).text?.substring(0, 50) : undefined,
-      // });
-
-      const step = partFold(
-        this.foldView(workspaceId, streamInfo, loop),
-        part as FoldablePart,
-        nodeClock.nowMs()
-      );
-      await this.applyStep(workspaceId, streamInfo, step, loop);
-    }
-  }
-
-  /**
-   * Finish a completed stream: read its final metadata, commit the final message and settle
-   * its usage, then mark it completed and emit stream-end (in that order, see below).
-   */
-  private async completeStream(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    workspaceLog: Logger
-  ): Promise<void> {
-    // Get all metadata from stream result in one call
-    // - totalUsage: sum of all steps (for cost calculation)
-    // - contextUsage: last step only (for context window display)
-    // - contextProviderMetadata: last step (for context window cache tokens)
-    // Falls back to tracked values when step retries invalidate totalUsage
-    // or streamResult metadata fails/times out.
-    const streamMeta = await this.getStreamMetadata(streamInfo);
-    const totalUsage = this.endUsage(streamInfo, streamMeta.totalUsage);
-    await this.backfillReasoningTokensFromParts(streamInfo, totalUsage);
-    const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
-    const contextProviderMetadata =
-      streamMeta.contextProviderMetadata ?? streamInfo.lastStepProviderMetadata;
-    const finishReason = resolveStreamEndFinishReason(streamInfo, streamMeta.finishReason);
-    if (finishReason === "tool-calls" && streamInfo.request.stopCause == null) {
-      workspaceLog.warn("Tool-calls stream ended without a recorded stop cause", {
-        messageId: streamInfo.messageId,
-        muxMetadata: streamInfo.initialMetadata?.muxMetadata,
-      });
-    }
-    const duration = streamMeta.duration;
-    const ttftMs = this.resolveTtftMsForStreamEnd(streamInfo);
-    // Aggregated provider metadata across all steps (for cost calculation with cache tokens)
-    const providerMetadata = markProviderMetadataCostsIncluded(
-      await this.resolveProviderMetadataForStreamEnd(streamInfo),
-      streamInfo.initialMetadata?.costsIncluded
-    );
-    const streamEndEvent = buildStreamEndEvent(workspaceId, streamInfo, {
-      totalUsage,
-      contextUsage,
-      providerMetadata,
-      contextProviderMetadata,
-      finishReason,
-      duration,
-      ttftMs,
-    });
-
-    // Update history with final message BEFORE emitting stream-end
-    // This prevents a race condition where compaction (triggered by stream-end)
-    // clears history while updateHistory is still running, causing old messages
-    // to be written back after compaction completes.
-    if (streamInfo.parts && streamInfo.parts.length > 0) {
-      const finalAssistantMessage: MuxMessage = {
-        id: streamInfo.messageId,
-        role: "assistant",
-        metadata: {
-          ...streamEndEvent.metadata,
-          historySequence: streamInfo.historySequence,
-          stepStartPartIndices: streamInfo.stepStartIndices.filter(
-            (index) => index < streamInfo.parts.length
-          ),
-        },
-        parts: streamInfo.parts,
-      };
-
-      await this.partialJournal.commitFinal(
-        workspaceId,
-        streamInfo,
-        finalAssistantMessage,
-        workspaceLog
-      );
-
-      // Update cumulative session usage (if service is available)
-      // Wrapped in try-catch: usage recording is non-critical and shouldn't block stream completion
-      await this.usageLedger.settle(
-        workspaceId,
-        streamInfo,
-        totalUsage,
-        providerMetadata,
-        "Failed to record session usage (stream completion unaffected)",
-        "warn"
-      );
-    }
-
-    // Mark as completed right before emitting stream-end.
-    // This must happen AFTER async I/O (deletePartial, updateHistory) completes.
-    // If we set COMPLETED earlier, isStreaming() returns false during cleanup,
-    // allowing new messages (e.g., force-compaction) to bypass queuing and write
-    // to history before stream-end fires - causing compaction to use wrong parts.
-    streamInfo.state = StreamState.COMPLETED;
-
-    // Emit stream-end AFTER history is updated to prevent race with compaction
-    // Compaction handler listens to this event and clears history - if we emit
-    // before updateHistory completes, compaction can clear the file and then
-    // updateHistory writes stale data back.
-    this.turnEvents.emitTurnEvent(streamEndEvent);
-    streamInfo.terminalCompletion = { status: "completed", streamEnd: streamEndEvent };
-  }
-
-  /**
-   * Processes a stream with guaranteed cleanup, regardless of success or failure
-   */
-  private async processStreamWithCleanup(
+  /** The attempt loop (AttemptLoop); TurnEngine and whitebox tests call it here. */
+  private processStreamWithCleanup(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
     historySequence: number
   ): Promise<void> {
-    this.turnResources.acquireMcpLease(workspaceId);
-
-    try {
-      // Update state to streaming
-      streamInfo.state = StreamState.STREAMING;
-
-      // Emit stream start event (include mode from initialMetadata if available)
-      this.emitStreamStart(workspaceId, streamInfo, historySequence);
-
-      // Initialize token tracker for this model
-      await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
-
-      // Recovery spent in this turn. The recovery helpers update it after each retry.
-      const attemptHistory: AttemptHistory = {
-        emptyRetries: 0,
-        retriedPreviousResponseId: false,
-        retriedReasoningReplay: false,
-      };
-      const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-      const loop: PartLoopState = { workspaceLog, toolCalls: new Map(), orphanToolResultCount: 0 };
-
-      while (true) {
-        // Use fullStream to capture all events including tool calls
-        loop.toolCalls = new Map();
-
-        try {
-          await this.consumeAttemptStream(workspaceId, streamInfo, loop);
-
-          // No need to save remaining text - text-delta handler already maintains parts array
-          // (Removed duplicate push that was causing double text parts)
-
-          // Flush final state to partial.json for crash resilience
-          // This happens regardless of abort status to ensure the final state is persisted to disk
-          // On abort: second flush after cancelStreamSafely, ensures all streamed content is saved
-          // On normal completion: provides crash resilience before AIService writes to chat.jsonl
-          await this.flushPartialWrite(workspaceId, streamInfo);
-
-          const next = await this.recoverFinishedAttempt(workspaceId, streamInfo, attemptHistory);
-          if (next === "retry") {
-            continue;
-          }
-          if (next === "complete") {
-            await this.completeStream(workspaceId, streamInfo, workspaceLog);
-          }
-          break;
-        } catch (error) {
-          // A cancellation may surface as an iterator rejection instead of a
-          // clean close (provider/transport dependent). The canceller that
-          // aborted the signal owns the terminal bookkeeping (cleanupAbortedStream
-          // after processingPromise resolves: stream-abort, partial commit,
-          // settle), so recording this as a provider failure would turn a user
-          // stop or a shutdown abort into an error event and — via the
-          // lost-race guard in cleanupAbortedStream — suppress the abort. Take
-          // the same exit as the clean-close abort path instead.
-          const recovery = await this.recoverErroredAttempt(
-            workspaceId,
-            streamInfo,
-            error,
-            attemptHistory
-          );
-          if (recovery.kind === "retry") {
-            continue;
-          }
-          if (recovery.kind === "aborted") {
-            workspaceLog.debug("Stream iterator rejected after abort; treating as cancellation", {
-              error: getErrorMessage(error),
-            });
-            await this.flushPartialWrite(workspaceId, streamInfo);
-          } else {
-            await this.handleStreamFailure(workspaceId, streamInfo, recovery.error);
-          }
-          break;
-        }
-      }
-    } catch (error) {
-      await this.handleStreamFailure(workspaceId, streamInfo, error);
-    } finally {
-      await this.settleStreamProcessing(workspaceId, streamInfo);
-    }
-  }
-
-  /** The guaranteed cleanup of processStreamWithCleanup, for every terminal outcome. */
-  private async settleStreamProcessing(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo
-  ): Promise<void> {
-    this.turnResources.releaseMcpLease(workspaceId);
-
-    await this.turnResources.closeStreamResources(streamInfo);
-
-    // Aborts keep their registration until cleanupAbortedStream completes its disk
-    // transaction and raw delivery. A stale finally must never remove a replacement.
-    if (
-      streamInfo.terminalCompletion != null &&
-      this.workspaceStreams.get(workspaceId) === streamInfo
-    ) {
-      this.workspaceStreams.delete(workspaceId);
-    }
-    await this.discardUnsettledSessionUsage(workspaceId, streamInfo);
-
-    // Lifecycle spine event: emitted from the guaranteed-cleanup path so
-    // EVERY terminal outcome (completion, abort/Escape, provider failure)
-    // closes the stream.start emitted at the top of this method — observers
-    // tracking active streams must never retain stale entries.
-    eventSpine.emit("stream.end", {
-      workspaceId: workspaceId as string,
-      messageId: streamInfo.messageId,
-    });
-
-    if (streamInfo.terminalCompletion != null) {
-      // Optional-chained: whitebox test fixtures register stream infos without a controller.
-      streamInfo.completionController?.settle(streamInfo.terminalCompletion);
-    }
-  }
-
-  /**
-   * Persist error state and emit error events for failed streams.
-   */
-  private async handleStreamFailure(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown
-  ): Promise<void> {
-    streamInfo.state = StreamState.ERROR;
-
-    const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-
-    // Log the actual error for debugging
-    workspaceLog.error("Stream processing error:", error);
-
-    // Record lost previousResponseId so future requests can filter it out
-    this.providerRequest.recordLostResponseIdIfApplicable(
-      workspaceId,
-      error,
-      streamInfo,
-      workspaceLog
-    );
-
-    const errorPayload = this.buildStreamErrorPayload(streamInfo, error);
-    const persistedPayload = await this.persistStreamError(workspaceId, streamInfo, errorPayload);
-    streamInfo.terminalCompletion = { status: "failed", streamError: persistedPayload };
+    return this.attemptLoop.processStreamWithCleanup(workspaceId, streamInfo, historySequence);
   }
 
   private buildStreamErrorPayload(

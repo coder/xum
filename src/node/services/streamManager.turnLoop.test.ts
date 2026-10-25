@@ -7,12 +7,11 @@ import { installStreamManagerTestHistory } from "./streamManager.suite.testHarne
 
 import {
   applyContextBudgetDecision,
-  buildStreamEndEvent,
   hasSuccessfulRequiredToolResult,
   isSuccessfulToolOutput,
-  resolveStreamEndFinishReason,
   type WorkspaceId,
 } from "./streamManager";
+import { buildStreamEndEvent, resolveStreamEndFinishReason } from "./turnEngine/AttemptLoop";
 
 installStreamManagerTestHistory();
 
