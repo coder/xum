@@ -341,18 +341,23 @@ export async function readArtifactBytesOnRuntime(
   return parseArtifactReadBytes(stdout, maxBytes);
 }
 
-const REPLACE_LEAF_SCRIPT = String.raw`xum_tmp=".$xum_leaf.$$.tmp"
+const WRITE_TEMP_SCRIPT = String.raw`xum_tmp=".$xum_leaf.$$.tmp"
 rm -f -- "$xum_tmp"
 set -C
-(umask 022; cat > "$xum_tmp") || { rm -f -- "$xum_tmp"; exit 1; }
+(umask 022; cat > "$xum_tmp") || { rm -f -- "$xum_tmp"; exit 1; }`;
+
+const REPLACE_LEAF_SCRIPT = String.raw`${WRITE_TEMP_SCRIPT}
 mv -f -- "$xum_tmp" "$xum_leaf" || { rm -f -- "$xum_tmp"; exit 1; }`;
 
-// A leaf that exists by the time noclobber opens it is left alone; stdin is drained so the
-// writer does not see a broken pipe.
-const CREATE_LEAF_SCRIPT = String.raw`set -C
-if ! (umask 022; cat > "$xum_leaf") 2>/dev/null; then
-  if [ ! -e "$xum_leaf" ] && [ ! -L "$xum_leaf" ]; then exit 1; fi
-  cat >/dev/null
+// A hard link fails on a name that exists (-n: even a symlink to a folder), so the finished temp
+// file becomes the leaf only if nothing wrote one meanwhile. An existing leaf skips the write;
+// stdin is drained so the writer does not see a broken pipe.
+const CREATE_LEAF_SCRIPT = String.raw`if [ -e "$xum_leaf" ]; then cat >/dev/null; else
+${WRITE_TEMP_SCRIPT}
+if ! ln -n -- "$xum_tmp" "$xum_leaf" && [ ! -e "$xum_leaf" ] && [ ! -L "$xum_leaf" ]; then
+  rm -f -- "$xum_tmp"; exit 1
+fi
+rm -f -- "$xum_tmp"
 fi`;
 
 /**
@@ -363,8 +368,8 @@ fi`;
  * folders, the final cwd must stay under the root's real path, and an existing leaf must be a
  * regular file. Content arrives on stdin into a hidden temp file (noclobber) that is renamed
  * over the leaf, so readers never see a partial board. `createOnly` (see ArtifactWriteOptions)
- * creates the leaf itself under noclobber instead, which is atomic (O_EXCL), and leaves an
- * existing leaf as it is. Runtime.writeFile is not used: on SSH it deliberately writes through
+ * hard-links the finished temp file to the leaf instead, which fails on a leaf that exists, so
+ * it never replaces one. Runtime.writeFile is not used: on SSH it deliberately writes through
  * symlinks, which would let the agent redirect a host write.
  * Prints `MAGIC ok` or `MAGIC refused reason`.
  */

@@ -8,6 +8,7 @@ import {
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { useAppConfig, useUserPreferences } from "@/browser/stores/AppConfigStore";
+import type { Keybind } from "@/common/types/keybind";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
@@ -17,6 +18,7 @@ import { cn } from "@/common/lib/utils";
 import { createArtifactAssetLoader, type ArtifactAssetReader } from "./artifactAssets";
 import {
   ARTIFACT_FRAME_CHORDS,
+  ARTIFACT_FRAME_INTERRUPT_KEYS,
   acceptArtifactFrameMessage,
   buildArtifactBridgeScript,
   createBridgeRateLimiter,
@@ -24,6 +26,7 @@ import {
   postArtifactTheme,
   type ArtifactAppearance,
   type ArtifactFrameChord,
+  type ArtifactFrameInterruptKey,
   type ArtifactFrameToHostMessage,
   type ArtifactTheme,
 } from "./artifactBridge";
@@ -109,13 +112,47 @@ function replayFrameSidebarKey(
   frame: HTMLIFrameElement | null,
   message: { chord: ArtifactFrameChord; ctrlKey: boolean; metaKey: boolean }
 ): void {
-  if (!hasLiveUserGesture(frame) || frame == null) return;
-  const keybind = ARTIFACT_FRAME_CHORDS[message.chord];
-  const event = new KeyboardEvent("keydown", {
-    key: keybind.key,
+  replayKeybindOnFrame(frame, ARTIFACT_FRAME_CHORDS[message.chord], {
     shiftKey: true,
     ctrlKey: message.ctrlKey,
     metaKey: message.metaKey,
+  });
+}
+
+/**
+ * Replays a stream-interrupt key pressed inside `frame` as a keydown on the frame element, so
+ * the chat's interrupt handler (useAIViewKeybinds) applies its own rules (compaction, a pending
+ * question). Only for the active keybind (`active`, from the Vim setting).
+ *
+ * SECURITY AUDIT: the artifact's script can post the message at any time, and a page that did
+ * so on a timer would stop every turn while its frame shows. So, as for chords, the host honours
+ * it only during the user's own gesture in the visible frame (hasLiveUserGesture). Escape grants
+ * no user activation (HTML), so a lone Escape interrupts only shortly after the user's last
+ * click or key in the page; Ctrl+C grants it itself.
+ */
+function replayFrameInterruptKey(
+  frame: HTMLIFrameElement | null,
+  keybind: ArtifactFrameInterruptKey,
+  active: ArtifactFrameInterruptKey | undefined
+): void {
+  if (keybind !== active) return;
+  const target: Keybind = ARTIFACT_FRAME_INTERRUPT_KEYS[keybind];
+  replayKeybindOnFrame(frame, target, {
+    shiftKey: false,
+    ctrlKey: target.ctrl === true,
+    metaKey: false,
+  });
+}
+
+function replayKeybindOnFrame(
+  frame: HTMLIFrameElement | null,
+  keybind: Keybind,
+  modifiers: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean }
+): void {
+  if (!hasLiveUserGesture(frame) || frame == null) return;
+  const event = new KeyboardEvent("keydown", {
+    key: keybind.key,
+    ...modifiers,
     bubbles: true,
     cancelable: true,
   });
@@ -143,19 +180,27 @@ function takeFrameSendOrigin(
 
 type ArtifactFrameKeyMessage = Extract<
   ArtifactFrameToHostMessage,
-  { type: "key" } | { type: "sidebarKey" }
+  { type: "key" } | { type: "sidebarKey" } | { type: "interruptKey" }
 >;
 
 /** The host side of the keys a frame forwards: keys typed in the frame never reach the app. */
 function handleFrameKeyMessage(
   message: ArtifactFrameKeyMessage,
   frame: HTMLIFrameElement | null,
-  onFrameKey: ((key: ArtifactFrameKey) => void) | undefined
+  handlers: {
+    onFrameKey: ((key: ArtifactFrameKey) => void) | undefined;
+    interruptKey: ArtifactFrameInterruptKey | undefined;
+  }
 ): void {
   if (message.type === "sidebarKey") {
     replayFrameSidebarKey(frame, message);
     return;
   }
+  if (message.type === "interruptKey") {
+    replayFrameInterruptKey(frame, message.keybind, handlers.interruptKey);
+    return;
+  }
+  const { onFrameKey } = handlers;
   // "C" (the annotate shortcut) can turn annotate mode on, so, like openWorkspace, it needs the
   // user's own key press in this frame: the artifact's script could post it at any time.
   // "Escape" and "F" only ever exit, so they need no gesture.
@@ -276,6 +321,11 @@ export function SandboxedArtifactFrame(props: {
   kind: "html" | "svg";
   content: string;
   onFrameKey?: (key: ArtifactFrameKey) => void;
+  /**
+   * The stream-interrupt keybind to replay from the frame (replayFrameInterruptKey); only the
+   * main pane's status page sets it, since there the frame takes the chat's place.
+   */
+  interruptKey?: ArtifactFrameInterruptKey;
   /** send/setState from the artifact (M5b); without it both are ignored. */
   interactions?: ArtifactInteractionHandlers;
   /** Set only while annotate mode is on: pins clicked inside the frame (M5b). */
@@ -351,6 +401,7 @@ export function SandboxedArtifactFrame(props: {
 
   // Bridge, host side: only messages from this frame's window, rate limited, schema-valid.
   const onFrameKey = props.onFrameKey;
+  const interruptKey = props.interruptKey;
   const interactions = props.interactions;
   const onAnnotate = props.onAnnotate;
   useEffect(() => {
@@ -364,7 +415,8 @@ export function SandboxedArtifactFrame(props: {
       switch (message.type) {
         case "key":
         case "sidebarKey":
-          handleFrameKeyMessage(message, frameRef.current, onFrameKey);
+        case "interruptKey":
+          handleFrameKeyMessage(message, frameRef.current, { onFrameKey, interruptKey });
           break;
         case "send":
           // A live click or key in this frame sends at once, one message per click; any other
@@ -397,7 +449,15 @@ export function SandboxedArtifactFrame(props: {
     };
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
-  }, [allowMessage, onFrameKey, interactions, onAnnotate, navigatedRef, openWorkspace]);
+  }, [
+    allowMessage,
+    onFrameKey,
+    interruptKey,
+    interactions,
+    onAnnotate,
+    navigatedRef,
+    openWorkspace,
+  ]);
 
   const annotating = onAnnotate != null;
   useEffect(() => {

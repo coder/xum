@@ -1,11 +1,12 @@
 import { useEffect, useRef, useSyncExternalStore } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { type APIClient, useAPI } from "@/browser/contexts/API";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
   readPersistedState,
   updatePersistedState,
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import {
   isDesktopViewportFocused,
@@ -200,16 +201,89 @@ function findStatusEntry(listing: ArtifactListing): ArtifactEntry | null | undef
   return entry ?? (listing.truncated ? undefined : null);
 }
 
-// Called after each successful listing, so a status page read that failed or may be stale
-// retries on the next one.
-const listingListeners = new Set<(workspaceId: string) => void>();
+// Called after each successful listing with whether a file-modifying tool call ended since the
+// last one, so a status page read that failed or may be stale retries then: remote runtimes list
+// whole-second mtimes, so a same-size rewrite can keep the listed version.
+const listingListeners = new Set<(workspaceId: string, afterToolWrite: boolean) => void>();
 
-export function subscribeStatusListings(workspaceId: string, listener: () => void): () => void {
-  const onListing = (listedId: string) => {
-    if (listedId === workspaceId) listener();
+export function subscribeStatusListings(
+  workspaceId: string,
+  listener: (afterToolWrite: boolean) => void
+): () => void {
+  const onListing = (listedId: string, afterToolWrite: boolean) => {
+    if (listedId === workspaceId) listener(afterToolWrite);
   };
   listingListeners.add(onListing);
   return () => listingListeners.delete(onListing);
+}
+
+/** Reads the status page; neither callback runs once `signal` aborts. Failures are logged. */
+export function readStatusPage(
+  api: APIClient,
+  workspaceId: string,
+  signal: AbortSignal,
+  callbacks: { onRead: (read: ArtifactReadResult) => void; onFailure: () => void }
+): void {
+  const failed = (error: string) => {
+    console.debug("[Agent interface] status page read failed:", error);
+    callbacks.onFailure();
+  };
+  api.artifacts
+    .read({ workspaceId, path: AGENT_INTERFACE_STATUS_ARTIFACT }, { signal })
+    .then((result) => {
+      if (signal.aborted) return;
+      if (result.success) callbacks.onRead(result.data);
+      else failed(result.error);
+    })
+    .catch((error: unknown) => {
+      if (isAbortError(error) || signal.aborted) return;
+      failed(getErrorMessage(error));
+    });
+}
+
+/**
+ * Reads a status page that read as unshowable again after a tool call that may have rewritten
+ * it. The status view is unmounted then, and a same-size rewrite within the second keeps the
+ * listed version, so nothing else would look at the file again.
+ */
+function useUnshowableStatusRecheck(workspaceId: string, enabled: boolean) {
+  const { api } = useAPI();
+  useEffect(() => {
+    if (!api || !enabled) return;
+    const controller = new AbortController();
+    // A tool call, or a failed recheck, that no read has followed yet.
+    let due = false;
+    let reading = false;
+    const unsubscribe = subscribeStatusListings(workspaceId, (afterToolWrite) => {
+      const unshowable = unshowableStatusVersions.get(workspaceId);
+      // A changed version is no longer hidden: the status view mounts and reads it.
+      if (
+        unshowable == null ||
+        !sameVersion(statusEntries.get(workspaceId) ?? undefined, unshowable)
+      ) {
+        due = false;
+        return;
+      }
+      due ||= afterToolWrite;
+      if (!due || reading) return;
+      due = false;
+      reading = true;
+      readStatusPage(api, workspaceId, controller.signal, {
+        onRead: (read) => {
+          reading = false;
+          recordStatusPageRead(workspaceId, read);
+        },
+        onFailure: () => {
+          reading = false;
+          due = true;
+        },
+      });
+    });
+    return () => {
+      unsubscribe();
+      controller.abort();
+    };
+  }, [api, workspaceId, enabled]);
 }
 
 /**
@@ -220,11 +294,18 @@ export function subscribeStatusListings(workspaceId: string, listener: () => voi
 function useStatusArtifactPoll(workspaceId: string, enabled: boolean) {
   const { api } = useAPI();
   const listInFlightRef = useRef(false);
+  const toolWroteRef = useRef(false);
   const [refreshTick] = useArtifactsRefreshTick(workspaceId, {
     online: api != null,
     listInFlightRef,
     enabled,
   });
+  useEffect(() => {
+    if (!enabled) return;
+    return workspaceStore.subscribeFileModifyingTool(() => {
+      toolWroteRef.current = true;
+    }, workspaceId);
+  }, [workspaceId, enabled]);
   useEffect(() => {
     if (!api || !enabled) return;
     const controller = new AbortController();
@@ -240,9 +321,11 @@ function useStatusArtifactPoll(workspaceId: string, enabled: boolean) {
           console.debug("[Agent interface] status page listing failed:", result.error);
           return;
         }
+        const afterToolWrite = toolWroteRef.current;
+        toolWroteRef.current = false;
         const entry = findStatusEntry(result.data);
         if (entry !== undefined) publishStatusEntry(workspaceId, entry);
-        for (const listener of listingListeners) listener(workspaceId);
+        for (const listener of listingListeners) listener(workspaceId, afterToolWrite);
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
@@ -310,6 +393,7 @@ export function toggledAgentInterfaceView(
 export function useMainPaneAgentInterfaceView(workspaceId: string): AgentInterfaceView | null {
   const enabled = useAgentInterfaceEnabled();
   useStatusArtifactPoll(workspaceId, enabled);
+  useUnshowableStatusRecheck(workspaceId, enabled);
   const { available, view } = useAgentInterfaceView(workspaceId);
   useEffect(() => {
     if (!available) return;

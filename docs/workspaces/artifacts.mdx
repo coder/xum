@@ -156,6 +156,7 @@ When the workspace has an active goal, Xum keeps `goal.status.html` up to date i
 
 - At the start of each turn, if `status.html` does not exist, Xum writes a starter page that uses the [theme variables](#theme-variables). Xum never replaces a page that exists. The agent is told to keep the page current. Side chats get no starter page, so they show their chat.
 - Switch between the status page and the chat with the **Status** and **Chat** buttons in the workspace header, `Ctrl+Shift+S` (`Cmd+Shift+S` on macOS), or **Switch Status Page / Chat** in the command palette. With focus inside the status page, the shortcut only switches to the chat.
+- With focus inside the status page, `Esc` (`Ctrl+C` in Vim mode) stops the agent, as in the chat. `Esc` in a text field on the page, or a key the page handles itself, does not. So that a page cannot stop the agent by itself, `Esc` works there only shortly after you click or press another key in the page.
 - Xum remembers your choice for each workspace. A workspace where you made no choice shows the status page.
 - When the workspace has no status page, or the page is empty or cannot be shown (for example a binary file), the main pane shows the chat transcript.
 - Buttons on the status page that call `window.xum.send` work as they do in the Artifacts tab.

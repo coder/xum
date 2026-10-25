@@ -117,12 +117,15 @@ function runBridgeScript() {
       repeat?: boolean;
       defaultPrevented?: boolean;
       composedPath?: unknown[];
+      /** False for a key the page's own script dispatched. */
+      isTrusted?: boolean;
     } = {}
   ) => {
     const event = {
       key,
       target,
       shiftKey,
+      isTrusted: extra.isTrusted ?? true,
       ctrlKey: extra.ctrlKey ?? false,
       repeat: extra.repeat ?? false,
       metaKey: extra.metaKey ?? false,
@@ -164,6 +167,9 @@ describe("bridge script keys", () => {
     // The keybind's own key: a keybind the shim cannot forward fails here, not at startup.
     const key = KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE.key.toLowerCase();
     const bridge = runBridgeScript();
+    // Ctrl+C below is also the Vim interrupt key, posted as its own message.
+    const keys = () =>
+      bridge.posted.filter((message) => (message as { type?: unknown }).type === "key");
     bridge.keydown(key, input);
     bridge.keydown(key.toUpperCase(), div, true);
     bridge.keydown(key, div, false, { ctrlKey: true });
@@ -171,12 +177,12 @@ describe("bridge script keys", () => {
     bridge.keydown(key, div, false, { defaultPrevented: true });
     // Typed in an input inside a web component: window sees the (non-editable) shadow host.
     bridge.keydown(key, div, false, { composedPath: [input, div] });
-    expect(bridge.posted).toEqual([]);
+    expect(keys()).toEqual([]);
     bridge.keydown(key, div);
     // Caps Lock gives the upper case without Shift.
     bridge.keydown(key.toUpperCase(), div);
     const c = { xumArtifact: 1, type: "key", key: "C", shiftKey: false };
-    expect(bridge.posted).toEqual([c, c]);
+    expect(keys()).toEqual([c, c]);
   });
 
   test("the right-sidebar chord is posted with Ctrl, even from an input, and claimed", () => {
@@ -255,6 +261,66 @@ describe("bridge script keys", () => {
       expect(bridge.prevented()).toBe(2);
     } finally {
       global.window = saved;
+    }
+  });
+});
+
+describe("bridge script interrupt keys", () => {
+  const input = { nodeType: 1, tagName: "INPUT", isContentEditable: false };
+  const div = { nodeType: 1, tagName: "DIV", isContentEditable: false };
+  const interrupts = (posted: unknown[]) =>
+    posted.filter((message) => (message as { type?: unknown }).type === "interruptKey");
+
+  test("the chat's interrupt keys are posted by name: Escape outside text fields, Ctrl+C anywhere", () => {
+    // The keybinds' own keys: a keybind the shim cannot forward fails here.
+    const escape = KEYBINDS.INTERRUPT_STREAM_NORMAL.key;
+    const vimKey = KEYBINDS.INTERRUPT_STREAM_VIM.key;
+    const bridge = runBridgeScript();
+    bridge.keydown(escape, input);
+    expect(interrupts(bridge.posted)).toEqual([]);
+    bridge.keydown(escape, div);
+    bridge.keydown(vimKey, input, false, { ctrlKey: true });
+    // Caps Lock gives the upper case without Shift.
+    bridge.keydown(vimKey.toUpperCase(), div, false, { ctrlKey: true });
+    expect(interrupts(bridge.posted)).toEqual([
+      { xumArtifact: 1, type: "interruptKey", keybind: "normal" },
+      { xumArtifact: 1, type: "interruptKey", keybind: "vim" },
+      { xumArtifact: 1, type: "interruptKey", keybind: "vim" },
+    ]);
+  });
+
+  test("a key the artifact kept, dispatched itself, repeated or chorded is not posted", () => {
+    const escape = KEYBINDS.INTERRUPT_STREAM_NORMAL.key;
+    const vimKey = KEYBINDS.INTERRUPT_STREAM_VIM.key;
+    const bridge = runBridgeScript();
+    bridge.keydown(escape, div, false, { defaultPrevented: true });
+    bridge.keydown(escape, div, false, { isTrusted: false });
+    bridge.keydown(escape, div, false, { repeat: true });
+    bridge.keydown(escape, div, true);
+    bridge.keydown(escape, div, false, { ctrlKey: true });
+    bridge.keydown(vimKey, div);
+    bridge.keydown(vimKey, div, false, { ctrlKey: true, metaKey: true });
+    bridge.keydown(vimKey, div, false, { ctrlKey: true, altKey: true });
+    // Typed in an input inside a web component: window sees the (non-editable) shadow host.
+    bridge.keydown(escape, div, false, { composedPath: [input, div] });
+    expect(interrupts(bridge.posted)).toEqual([]);
+  });
+});
+
+describe("interruptKey messages", () => {
+  test("accepts a known keybind name only", () => {
+    const accept = (data: unknown) =>
+      acceptArtifactFrameMessage({ source: frame, data }, frame, () => true);
+    for (const keybind of ["normal", "vim"] as const) {
+      const message = { xumArtifact: 1, type: "interruptKey", keybind } as const;
+      expect(accept(message)).toEqual(message);
+    }
+    for (const data of [
+      { xumArtifact: 1, type: "interruptKey" },
+      { xumArtifact: 1, type: "interruptKey", keybind: "stop" },
+      { xumArtifact: 1, type: "interruptKey", keybind: "normal", ctrlKey: true },
+    ]) {
+      expect(accept(data)).toBeNull();
     }
   });
 });

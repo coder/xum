@@ -14,6 +14,7 @@ import { DiffArtifact } from "./DiffArtifact";
 import { ImageArtifact } from "./ImageArtifact";
 import { JsonArtifact } from "./JsonArtifact";
 import { MarkdownArtifact } from "./MarkdownArtifact";
+import type { ArtifactFrameInterruptKey } from "./artifactBridge";
 import { SandboxedArtifactFrame, type ArtifactFrameKey } from "./SandboxedArtifactFrame";
 import { Notice, NoteBar } from "./SourceText";
 import type { ArtifactAnnotationPick } from "./artifactAnnotation";
@@ -128,6 +129,8 @@ export function ArtifactViewer(props: {
   artifactsDir?: string | null;
   /** Escape / Shift+F pressed inside a sandboxed HTML/SVG frame. */
   onFrameKey?: (key: ArtifactFrameKey) => void;
+  /** The stream-interrupt keybind an HTML/SVG frame replays (the main pane's status page). */
+  frameInterruptKey?: ArtifactFrameInterruptKey;
   /**
    * Resolve relative images/assets through the artifacts folder (default). Off for pinned
    * checkout files, whose neighbours live in the checkout, not the artifacts folder.
@@ -193,6 +196,7 @@ export function ArtifactViewer(props: {
           kind={result.kind}
           content={result.content}
           onFrameKey={props.onFrameKey}
+          interruptKey={props.frameInterruptKey}
           interactions={props.interactions}
           onAnnotate={props.onFrameAnnotate}
         />

@@ -1,13 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
 import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
-import { getErrorMessage } from "@/common/utils/errors";
 import type { ChatInputAPI } from "@/browser/features/ChatInput/types";
-import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   type AgentInterfaceView,
+  readStatusPage,
   recordStatusPageRead,
   subscribeStatusListings,
   useStatusArtifactEntry,
@@ -53,15 +52,8 @@ function useStatusArtifactRead(workspaceId: string): ArtifactReadResult | null {
 
   useEffect(
     () =>
-      workspaceStore.subscribeFileModifyingTool(() => {
-        staleRef.current = true;
-      }, workspaceId),
-    [workspaceId]
-  );
-  useEffect(
-    () =>
-      subscribeStatusListings(workspaceId, () => {
-        if (!staleRef.current) return;
+      subscribeStatusListings(workspaceId, (afterToolWrite) => {
+        if (!afterToolWrite && !staleRef.current) return;
         staleRef.current = false;
         setRetryTick((tick) => tick + 1);
       }),
@@ -71,26 +63,16 @@ function useStatusArtifactRead(workspaceId: string): ArtifactReadResult | null {
   useEffect(() => {
     if (!api || readKey == null) return;
     const controller = new AbortController();
-    // A failed read keeps the last good page on screen until the retry.
-    const failed = (error: string) => {
-      staleRef.current = true;
-      console.debug("[Agent interface] status page read failed:", error);
-    };
-    api.artifacts
-      .read({ workspaceId, path: AGENT_INTERFACE_STATUS_ARTIFACT }, { signal: controller.signal })
-      .then((result) => {
-        if (controller.signal.aborted) return;
-        if (!result.success) {
-          failed(result.error);
-          return;
-        }
-        setRead(result.data);
-        recordStatusPageRead(workspaceId, result.data);
-      })
-      .catch((error: unknown) => {
-        if (isAbortError(error) || controller.signal.aborted) return;
-        failed(getErrorMessage(error));
-      });
+    readStatusPage(api, workspaceId, controller.signal, {
+      onRead: (result) => {
+        setRead(result);
+        recordStatusPageRead(workspaceId, result);
+      },
+      // A failed read keeps the last good page on screen until the retry.
+      onFailure: () => {
+        staleRef.current = true;
+      },
+    });
     return () => controller.abort();
   }, [api, workspaceId, readKey, retryTick]);
 
@@ -150,6 +132,9 @@ function StatusPage(props: StatusViewProps) {
   // window.xum.send / setState, as in the Artifacts tab.
   const interactions = useArtifactInteractions(workspaceId, STATUS_TARGET);
   const sectionRef = useComposerFocusOnUnmount(props.composerApiRef);
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
 
   return (
     <section
@@ -177,6 +162,8 @@ function StatusPage(props: StatusViewProps) {
             result={read}
             workspaceId={workspaceId}
             interactions={interactions.handlers}
+            // The page takes the chat's place, so its interrupt key works with focus in the page.
+            frameInterruptKey={vimEnabled ? "vim" : "normal"}
           />
         )}
       </div>

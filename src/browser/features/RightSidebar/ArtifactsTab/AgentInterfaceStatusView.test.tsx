@@ -156,6 +156,68 @@ describe("Agent interface status view", () => {
     await waitFor(() => expect(shownPage(view)).toContain("<p>BBBB</p>"));
   });
 
+  test("a blank page rewritten at the same size and second shows after the tool call", async () => {
+    // A comment only: nothing to show, so the pane falls back to the chat.
+    current = page("<!-- xx -->");
+    const view = render(<MainPane workspaceId="ws-unshowable" />, { wrapper: Wrapper });
+    await waitFor(() => expect(reads).toBe(1));
+    await waitFor(() => expect(view.queryByTestId("agent-interface-status-view")).toBeNull());
+
+    // Same size and listed mtime: only the tool call tells the pane to look again.
+    current = page("<p>AAAA</p>");
+    act(() => workspaceStore.simulateFileModifyingToolEnd("ws-unshowable"));
+    await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+  });
+
+  test("the interrupt key pressed in the page reaches the chat's handler only during the user's gesture", async () => {
+    let activation = { isActive: false };
+    Object.defineProperty(window.navigator, "userActivation", {
+      configurable: true,
+      get: () => activation,
+    });
+    // The host builds the replayed event with the global constructor, which the DOM harness lacks.
+    const globalKeyboardEvent = globalThis.KeyboardEvent;
+    globalThis.KeyboardEvent = window.KeyboardEvent;
+    let interrupts = 0;
+    let frame: HTMLIFrameElement | null = null;
+    // Where useAIViewKeybinds listens: window, bubble phase.
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.target === frame && event.key === "Escape") interrupts++;
+    };
+    window.addEventListener("keydown", onKeyDown);
+    try {
+      const view = render(<MainPane workspaceId="ws-interrupt" />, { wrapper: Wrapper });
+      await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+      frame = view.getByTestId("artifact-frame") as HTMLIFrameElement;
+      const post = (keybind: "normal" | "vim") =>
+        act(() => {
+          const event = new window.Event("message");
+          Object.defineProperty(event, "data", {
+            value: { xumArtifact: 1, type: "interruptKey", keybind },
+          });
+          Object.defineProperty(event, "source", { value: frame?.contentWindow });
+          window.dispatchEvent(event);
+        });
+
+      // The page's script posting it by itself, even after taking focus with window.focus().
+      post("normal");
+      act(() => frame?.focus());
+      post("normal");
+      expect(interrupts).toBe(0);
+
+      // The user's key press in the page; only the keybind for the Vim setting (off) counts.
+      activation = { isActive: true };
+      post("vim");
+      expect(interrupts).toBe(0);
+      post("normal");
+      expect(interrupts).toBe(1);
+    } finally {
+      window.removeEventListener("keydown", onKeyDown);
+      globalThis.KeyboardEvent = globalKeyboardEvent;
+      Reflect.deleteProperty(window.navigator, "userActivation");
+    }
+  });
+
   test("only a complete listing without the page switches the pane back to the chat", async () => {
     const view = render(<MainPane workspaceId="ws-truncated" />, { wrapper: Wrapper });
     await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));

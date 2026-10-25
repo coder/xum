@@ -33,6 +33,10 @@ import {
  *   (ARTIFACT_FRAME_CHORDS: KEYBINDS.TOGGLE_RIGHT_SIDEBAR or KEYBINDS.OPEN_ARTIFACTS_TAB), which a
  *   click into the frame also made unreachable: keys in the frame never reach the app's window
  *   listener. The host honours it only while the frame holds focus (SandboxedArtifactFrame.tsx).
+ * - Frame -> host: `{ type: "interruptKey", keybind }`, a stream-interrupt key pressed in the
+ *   frame (ARTIFACT_FRAME_INTERRUPT_KEYS: Escape outside a text field, or Ctrl+C). Only the main
+ *   pane's status page replays it, and only during a live user gesture in the frame, since a
+ *   script that posted it at will could stop every turn (SandboxedArtifactFrame.tsx).
  * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) sends at once only
  *   during a live user click or key in this frame, one message per click; any other send fills
  *   the host-owned confirm strip (SandboxedArtifactFrame.tsx); `{ type: "setState", state }`
@@ -162,6 +166,25 @@ const ArtifactSidebarKeyMessageSchema = z
   })
   .strict();
 
+/**
+ * The chat's stream-interrupt keybinds, by the name the frame forwards them with. The main pane's
+ * status page takes the chat's place, so with focus in it these keys should still stop the stream.
+ */
+export const ARTIFACT_FRAME_INTERRUPT_KEYS = {
+  normal: KEYBINDS.INTERRUPT_STREAM_NORMAL,
+  vim: KEYBINDS.INTERRUPT_STREAM_VIM,
+} as const satisfies Record<string, Keybind>;
+export type ArtifactFrameInterruptKey = keyof typeof ARTIFACT_FRAME_INTERRUPT_KEYS;
+
+const ArtifactInterruptKeyMessageSchema = z
+  .object({
+    ...bridgeEnvelope,
+    type: z.literal("interruptKey"),
+    // The host indexes ARTIFACT_FRAME_INTERRUPT_KEYS with it, so a name without a keybind fails typecheck.
+    keybind: z.enum(["normal", "vim"]),
+  })
+  .strict();
+
 const ArtifactOpenWorkspaceMessageSchema = z
   .object({
     ...bridgeEnvelope,
@@ -173,6 +196,7 @@ const ArtifactOpenWorkspaceMessageSchema = z
 export const ArtifactFrameToHostMessageSchema = z.discriminatedUnion("type", [
   ArtifactKeyMessageSchema,
   ArtifactSidebarKeyMessageSchema,
+  ArtifactInterruptKeyMessageSchema,
   ArtifactOpenWorkspaceMessageSchema,
   ArtifactSendMessageSchema,
   ArtifactSetStateMessageSchema,
@@ -524,6 +548,30 @@ const ANNOTATE_KEY_LISTENER =
   });`;
 
 /**
+ * The stream-interrupt keys (ARTIFACT_FRAME_INTERRUPT_KEYS), forwarded by name like the annotate
+ * key: once every handler in the artifact has run, so a page that uses the key (a dialog closing
+ * on Escape) keeps it. Escape typed in a text field stays the field's, as in the chat; Ctrl+C
+ * (Vim mode) interrupts from anywhere, as in the chat. Keys the page's script dispatched itself
+ * are not forwarded.
+ */
+const INTERRUPT_KEY_LISTENER = `
+  window.addEventListener("keydown", function (event) {
+    if (!event.isTrusted || event.repeat || event.metaKey || event.altKey || event.shiftKey) return;
+    if (typeof event.key !== "string") return;
+    var keybind = null;
+    if (!event.ctrlKey && event.key === ${JSON.stringify(KEYBINDS.INTERRUPT_STREAM_NORMAL.key)}) {
+      if (!isEditable(keyTarget(event))) keybind = "normal";
+    } else if (event.ctrlKey && event.key.toLowerCase() === ${JSON.stringify(KEYBINDS.INTERRUPT_STREAM_VIM.key)}) {
+      keybind = "vim";
+    }
+    if (keybind === null) return;
+    window.setTimeout(function () {
+      if (event.defaultPrevented) return;
+      host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "interruptKey", keybind: keybind }, "*");
+    }, 0);
+  });`;
+
+/**
  * A forwarded chord's key, lowercased. The shim checks only a Ctrl (Cmd on macOS) plus Shift chord
  * of one key, so another keybind shape turns forwarding off (null), like plainSingleKey. The shim
  * tests send the keybind's key.
@@ -756,6 +804,7 @@ export function buildArtifactBridgeScript(
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: key, shiftKey: event.shiftKey }, "*");
   }, true);
   ${ANNOTATE_KEY_LISTENER}
+  ${INTERRUPT_KEY_LISTENER}
   ${sidebarKeyListener()}
   ${ARTIFACT_IN_PAGE_LINK_SCRIPT}
 })();`;
