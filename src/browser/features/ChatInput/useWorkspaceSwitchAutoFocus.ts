@@ -3,6 +3,19 @@ import { isPhoneTouchScreen } from "@/browser/utils/env";
 
 const MAX_FOCUS_FRAMES = 10;
 
+/** Something outside the composer holds focus (the user moved it), so autofocus must yield. */
+function focusMovedOutside(input: HTMLElement | null, section: HTMLElement | null): boolean {
+  const active = document.activeElement;
+  if (
+    !(active instanceof HTMLElement) ||
+    active === document.body ||
+    active === document.documentElement
+  ) {
+    return false;
+  }
+  return active !== input && !section?.contains(active);
+}
+
 /**
  * Focus the composer when the workspace changes, retrying for a few frames while it mounts, and
  * yield to anything else the user focused meanwhile. `workspaceId` is null for inputs that are
@@ -23,7 +36,7 @@ export function useWorkspaceSwitchAutoFocus(params: {
     setAutoFocusState("pending");
 
     let cancelled = false;
-    let rafId: number | null = null;
+    let rafId = 0;
     let attempts = 0;
 
     const step = () => {
@@ -32,19 +45,9 @@ export function useWorkspaceSwitchAutoFocus(params: {
       attempts += 1;
 
       const input = inputRef.current;
-      const active = document.activeElement;
-
-      if (
-        active instanceof HTMLElement &&
-        active !== document.body &&
-        active !== document.documentElement
-      ) {
-        const isWithinChatInput = !!sectionRef.current?.contains(active);
-        const isInput = !!input && active === input;
-        if (!isWithinChatInput && !isInput) {
-          setAutoFocusState("done");
-          return;
-        }
+      if (focusMovedOutside(input, sectionRef.current)) {
+        setAutoFocusState("done");
+        return;
       }
 
       focusInput();
@@ -64,9 +67,7 @@ export function useWorkspaceSwitchAutoFocus(params: {
 
     return () => {
       cancelled = true;
-      if (rafId !== null) {
-        cancelAnimationFrame(rafId);
-      }
+      cancelAnimationFrame(rafId);
       setAutoFocusState("done");
     };
   }, [workspaceId, inputRef, sectionRef, focusInput, setAutoFocusState]);

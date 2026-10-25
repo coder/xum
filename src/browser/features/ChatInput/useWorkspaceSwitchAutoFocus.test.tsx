@@ -54,6 +54,17 @@ describe("useWorkspaceSwitchAutoFocus", () => {
     expect(states.at(-1)).toBe("done");
   });
 
+  test("yields to a control the user focused while the composer mounted", async () => {
+    const other = document.createElement("button");
+    document.body.appendChild(other);
+    other.focus();
+
+    renderFocus();
+    await nextFrames(3);
+    expect(document.activeElement).toBe(other);
+    expect(states.at(-1)).toBe("done");
+  });
+
   test("leaves the composer unfocused on a phone, so the keyboard stays closed", async () => {
     const original = window.matchMedia.bind(window);
     window.matchMedia = (query: string) => {
