@@ -22,6 +22,7 @@ import { ConfiguredProvidersBar } from "@/browser/components/ConfiguredProviders
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { ArchivedWorkspaces } from "@/browser/components/ArchivedWorkspaces/ArchivedWorkspaces";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
+import { autoFocusUnlessPhone } from "@/browser/utils/env";
 
 interface ScratchPageProps {
   leftSidebarCollapsed: boolean;
@@ -79,7 +80,7 @@ export function ScratchPage(props: ScratchPageProps) {
   function handleChatReady(api: ChatInputAPI) {
     if (didAutoFocusRef.current) return;
     didAutoFocusRef.current = true;
-    api.focus();
+    autoFocusUnlessPhone(() => api.focus());
   }
 
   return (
