@@ -11,7 +11,7 @@ import { createDaytonaTestRig } from "@/node/services/daytona/daytona.testHarnes
 import { createSshForwardTarget, isXumRootShared } from "./sshForwardTarget";
 
 describe("createSshForwardTarget", () => {
-  test("never restores a forward at startup for a Daytona sandbox (it would start a billed box)", async () => {
+  test("gives a Daytona sandbox no forward (its gateway refuses remote port forwarding)", async () => {
     const rig = await createDaytonaTestRig();
     try {
       const plain = { host: "box", srcBaseDir: "~/src" };
@@ -22,8 +22,8 @@ describe("createSshForwardTarget", () => {
       const daytonaTarget = createSshForwardTarget(
         new DaytonaSSHRuntime(daytona, createSSHTransport(daytona, false), rig.service)
       );
-      expect(sshTarget?.restoreAtStartup).toBe(true);
-      expect(daytonaTarget?.restoreAtStartup).toBe(false);
+      expect(sshTarget).toBeDefined();
+      expect(daytonaTarget).toBeUndefined();
     } finally {
       await rig.cleanup();
     }

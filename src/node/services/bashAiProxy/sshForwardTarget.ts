@@ -29,11 +29,13 @@ export function remoteHealthScript(remotePort: number, nonce: string): string {
 export function createSshForwardTarget(runtime: Runtime): ForwardTarget | undefined {
   // MultiProjectRuntime, Docker and devcontainer are not SSH runtimes: no forward.
   if (!(runtime instanceof SSHRuntime)) return undefined;
+  // Daytona's ssh gateway refuses remote port forwarding (checked live with OpenSSH and ssh2), so
+  // each try would only hold up the command that waits for it.
+  if (runtime instanceof DaytonaSSHRuntime) return undefined;
   const config = runtime.getConfig();
   return {
     hostKey: [config.host, config.port ?? 22, config.identityFile ?? ""].join("|"),
-    // Managed boxes: restoring a forward at startup would start a stopped (billed) box.
-    restoreAtStartup: !(runtime instanceof CoderSSHRuntime || runtime instanceof DaytonaSSHRuntime),
+    restoreAtStartup: !(runtime instanceof CoderSSHRuntime),
     openReverseForward: (remotePort, localPort) =>
       runtime.openReverseForward(remotePort, localPort),
     remoteHealth: async (remotePort, nonce) => {
