@@ -10864,35 +10864,39 @@ export class AgentSession {
         model: stopHookModel(payload, provenance),
       }
     )) ?? { kind: "none" };
-    const nudges: string[] = [];
-    const nudgeable =
-      hookOutcome.kind !== "halted" &&
-      this.stopHookContinuations === 0 &&
-      options != null &&
-      options.agentId !== "plan";
-    if (
-      nudgeable &&
-      (await needsTodoTurnEndNudge({
-        sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
-        parts: payload.parts,
-        files: this.historyService.files,
-      }))
-    ) {
-      nudges.push(TODO_TURN_END_NUDGE);
-    }
-    if (
-      nudgeable &&
-      (await this.aiService.needsStatusPageTurnEndNudge?.(this.workspaceId, {
-        messageId: payload.messageId,
-        parts: payload.parts,
-      })) === true
-    ) {
-      nudges.push(STATUS_PAGE_TURN_END_NUDGE);
-    }
     return mergeTurnStopContinuation({
       hookPrompt: hookOutcome.kind === "continue" ? hookOutcome.prompt : null,
-      nudges,
+      nudges: await this.readTurnEndNudges(hookOutcome, options, payload),
     });
+  }
+
+  /** Xum's turn-end nudges for the continuation, TODO first (see readTurnStopContinuation). */
+  private async readTurnEndNudges(
+    hookOutcome: TurnStopHookOutcome,
+    options: SendMessageOptions | undefined,
+    payload: StreamEndEvent
+  ): Promise<string[]> {
+    if (
+      hookOutcome.kind === "halted" ||
+      this.stopHookContinuations > 0 ||
+      options == null ||
+      options.agentId === "plan"
+    ) {
+      return [];
+    }
+    const nudges: string[] = [];
+    const todoNudge = await needsTodoTurnEndNudge({
+      sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
+      parts: payload.parts,
+      files: this.historyService.files,
+    });
+    if (todoNudge) nudges.push(TODO_TURN_END_NUDGE);
+    const statusPageNudge = await this.aiService.needsStatusPageTurnEndNudge?.(this.workspaceId, {
+      messageId: payload.messageId,
+      parts: payload.parts,
+    });
+    if (statusPageNudge === true) nudges.push(STATUS_PAGE_TURN_END_NUDGE);
+    return nudges;
   }
 
   /** The ending stream's provenance for a turn.stop continuation (read before its reset). */

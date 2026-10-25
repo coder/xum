@@ -1085,6 +1085,7 @@ export class TurnRequestBuilder {
   }
 
   /** Drop a removed or archived workspace's in-memory request state, so it does not grow the map. */
+  // dry-duplicate-ok: two map deletes; the browser token-state reset shares only the shape
   forgetWorkspace(workspaceId: string): void {
     this.toolCatalogOverviews.delete(workspaceId);
     this.agentInterfaceTurns.delete(workspaceId);
@@ -1102,6 +1103,20 @@ export class TurnRequestBuilder {
     if (entry?.messageId !== messageId) return undefined;
     this.agentInterfaceTurns.delete(workspaceId);
     return entry.turn;
+  }
+
+  private recordAgentInterfaceTurn(
+    workspaceId: string,
+    messageId: string,
+    turn: AgentInterfaceStatusPageTurn | null,
+    subagentWorkspace: boolean
+  ): void {
+    // Only root workspaces get the turn-end status page nudge (AgentSession.runTurnStopHooks).
+    if (turn != null && !subagentWorkspace) {
+      this.agentInterfaceTurns.set(workspaceId, { messageId, turn });
+    } else {
+      this.agentInterfaceTurns.delete(workspaceId);
+    }
   }
 
   /**
@@ -2839,15 +2854,12 @@ export class TurnRequestBuilder {
     // assistant turn. The placeholder is appended to history below
     // (after the abort check).
     const assistantMessageId = createAssistantMessageId();
-    // Only root workspaces get the turn-end status page nudge (AgentSession.runTurnStopHooks).
-    if (agentInterfaceTurn != null && !isSubagentWorkspace) {
-      this.agentInterfaceTurns.set(workspaceId, {
-        messageId: assistantMessageId,
-        turn: agentInterfaceTurn,
-      });
-    } else {
-      this.agentInterfaceTurns.delete(workspaceId);
-    }
+    this.recordAgentInterfaceTurn(
+      workspaceId,
+      assistantMessageId,
+      agentInterfaceTurn,
+      isSubagentWorkspace
+    );
     // Bind ownership before cached MCP tools are captured by the PTC bridge.
     // A queued invocation must keep this turn's identity after a replacement starts.
     const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };
