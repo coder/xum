@@ -653,7 +653,7 @@ export class StreamManager {
     if (!this.applyToolExecutionStart(workspaceId, streamInfo, toolCallId, timestamp)) {
       // execute() won the race against the fullStream consumer; the "tool-call" case
       // consumes this entry right after storing the part.
-      (streamInfo.pendingToolExecutionStarts ??= new Map()).set(toolCallId, timestamp);
+      streamInfo.pendingToolExecutionStarts.set(toolCallId, timestamp);
     }
   }
 
