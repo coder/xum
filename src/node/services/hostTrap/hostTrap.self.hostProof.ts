@@ -195,6 +195,48 @@ test("fs callbacks and fs streams", async () => {
     expect(apis).toContain(api);
 });
 
+test("an fd row carries the path of an fd opened while armed, and none before arm()", async () => {
+  const before = fsNs.openSync(FILE, "r");
+  try {
+    await within(async () => {
+      fsNs.readSync(before, Buffer.alloc(1));
+      const syncFd = fsNs.openSync(FILE, "r");
+      fsNs.closeSync(syncFd);
+      const callbackFd = await new Promise<number>((resolve, reject) =>
+        fsNs.open(FILE, "r", (error, fd) => (error ? reject(error) : resolve(fd)))
+      );
+      fsNs.closeSync(callbackFd);
+      const handle = await fsp.open(FILE, "r");
+      await handle.read(Buffer.alloc(1), 0, 1, 0);
+      await handle.close();
+    });
+  } finally {
+    fsNs.closeSync(before);
+  }
+  const fdRows = trap
+    .rows()
+    .filter((row) => row.api === "fs.readSync" || row.api === "fs.closeSync");
+  expect(fdRows.map((row) => row.fdPath)).toEqual([undefined, FILE, FILE]);
+});
+
+test("a two-path fs call records its second path too", async () => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "host-trap-two-paths-"));
+  try {
+    await within(async () => {
+      await fsp.copyFile(FILE, path.join(dir, "a"));
+      fsNs.renameSync(path.join(dir, "a"), path.join(dir, "b"));
+      statSync(path.join(dir, "b"));
+    });
+  } finally {
+    await fsp.rm(dir, { recursive: true, force: true });
+  }
+  expect(trap.rows().map((row) => [row.api, row.arg2])).toEqual([
+    ["fsp.copyFile", path.join(dir, "a")],
+    ["fs.renameSync", path.join(dir, "b")],
+    ["fs.statSync", undefined],
+  ]);
+});
+
 test("child_process, Bun.spawn, Bun.spawnSync and fetch", async () => {
   const apis = await within(async () => {
     await new Promise<void>((resolve) => execFile("true", () => resolve()));
@@ -285,6 +327,26 @@ test("an open FileHandle fails drain() until close()", async () => {
     await handle.close();
     await trap.drain(200);
     expect(failure).toContain("FileHandle");
+  } finally {
+    trap.disarm();
+  }
+});
+
+test("an fs.watch fails drain() until close(), whatever its listener does", async () => {
+  // Config and ProviderService watch with a listener that runs on events only: the watcher,
+  // not the listener, is the open work.
+  trap.arm();
+  try {
+    const watcher = fsNs.watch(os.tmpdir(), { persistent: false }, () => undefined);
+    let failure = "";
+    try {
+      await trap.drain(200);
+    } catch (error) {
+      failure = String(error);
+    }
+    watcher.close();
+    await trap.drain(200);
+    expect(failure).toContain("fs.watch");
   } finally {
     trap.disarm();
   }

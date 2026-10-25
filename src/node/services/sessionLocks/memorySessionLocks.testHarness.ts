@@ -106,7 +106,9 @@ export class MemoryLockTable {
   tryTake(lockPath: string): Entry | null {
     const entry = this.held.get(lockPath);
     if (entry !== undefined && !entry.dead) return null;
-    const own: Entry = { pid: process.pid, identity: getSelfIdentity(), dead: false };
+    // No identity yet: getSelfIdentity reads /proc and the hostname, and only a blocker text
+    // needs it (blockerOf). So a turn on memory locks makes no host call (5b PR 9 proof).
+    const own: Entry = { pid: process.pid, dead: false };
     this.held.set(lockPath, own);
     return own;
   }
@@ -140,7 +142,7 @@ export class MemoryLockTable {
 /** The Node locks' reason for a holder (processLiveness.judgeHolder). */
 function blockerOf(entry: Entry): Blocker {
   if (entry.pid === process.pid) {
-    return { pid: entry.pid, identity: entry.identity, why: "it is held by this process" };
+    return { pid: entry.pid, identity: getSelfIdentity(), why: "it is held by this process" };
   }
   const { holder, why } = liveBlocker(entry.pid, entry.identity);
   assert(holder !== undefined);
