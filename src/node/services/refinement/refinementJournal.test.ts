@@ -8,6 +8,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createMuxMessage } from "@/common/types/message";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { removeSessionDirUnderMemoryLocks } from "@/node/services/workspaceRemoval";
 import {
@@ -201,7 +203,12 @@ describe("appendRefinementEvent after workspace removal (#7474)", () => {
       // The journal call of agent_skill_write (agent_skill_write.ts).
       const skillWrite = (content: string) =>
         appendRefinementEventFromTool(
-          { workspaceSessionDir: sessionDir, workspaceId },
+          {
+            workspaceSessionDir: sessionDir,
+            workspaceId,
+            sessionLocks: historyService.locks,
+            sessionFiles: historyService.files,
+          },
           {
             kind: "skill",
             action: { op: "write", skillName: "demo", filePath: "SKILL.md" },
@@ -234,5 +241,29 @@ describe("appendRefinementEvent after workspace removal (#7474)", () => {
     } finally {
       await cleanup();
     }
+  });
+});
+
+describe("appendRefinementEventFromTool layers (#7326)", () => {
+  test("a tool row takes its journal locks from the tool config's session locks", async () => {
+    using tmp = new DisposableTempDir("refinement-tool-layers");
+    // A copy of the Node locks whose file lock records its calls.
+    const locks = { ...nodeSessionLocks };
+    const acquire = spyOn(locks, "acquireProcessFileLock");
+    await appendRefinementEventFromTool(
+      { workspaceSessionDir: tmp.path, workspaceId: "ws-layers", sessionLocks: locks },
+      {
+        kind: "skill",
+        action: { op: "write", skillName: "demo", filePath: "SKILL.md" },
+        inverse: { op: "delete-files", paths: ["/skills/demo/SKILL.md"] },
+        evidence: { toolName: "agent_skill_write", toolCallId: "call-1" },
+      }
+    );
+    expect(acquire).toHaveBeenCalled();
+    const rows = await sharedDurableEventJournal(tmp.path, {
+      files: nodeSessionFiles,
+      locks,
+    }).read();
+    expect(rows.map((row) => row.kind)).toEqual(["refinement"]);
   });
 });

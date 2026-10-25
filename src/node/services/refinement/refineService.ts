@@ -95,6 +95,8 @@ import {
   resolveProjectSkillWriteTargetPath,
 } from "@/node/services/tools/agent_skill_write";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { createRefineSummaryMessageId } from "@/node/services/utils/messageIds";
 
 // Types derive from the oRPC schemas (z.infer single source) so node-side
@@ -1240,9 +1242,17 @@ export class RefineService {
     }
   }
 
+  /**
+   * The history's file and lock layers: the journal that the turn (aiService) and this service's
+   * skill-write tool write, so the seq baseline and the staged rows come from one journal (#7326).
+   */
+  private journalLayers(): { files: SessionFiles; locks: SessionLocks } {
+    return { files: this.historyService.files, locks: this.historyService.locks };
+  }
+
   /** Newest journal seq, or -1 for a fresh/absent journal. */
   private async readMaxJournalSeq(sessionDir: string): Promise<number> {
-    const events = await sharedDurableEventJournal(sessionDir).read();
+    const events = await sharedDurableEventJournal(sessionDir, this.journalLayers()).read();
     return events.reduce((max, event) => Math.max(max, event.seq), -1);
   }
 
@@ -1259,7 +1269,7 @@ export class RefineService {
   ): Promise<Array<{ row: RefinementEvent; toolCallId: string }>> {
     if (toolCallIds.length === 0) return [];
     const callIds = new Set(toolCallIds);
-    const rows = await listRefinements(sessionDir);
+    const rows = await listRefinements(sessionDir, this.journalLayers());
     const matched: Array<{ row: RefinementEvent; toolCallId: string }> = [];
     for (const row of rows) {
       if (row.seq <= baselineSeq || row.workspaceId !== workspaceId) continue;
@@ -1469,6 +1479,7 @@ export class RefineService {
         workspaceSessionDir: sessionDir,
         workspaceId,
         sessionLocks: this.historyService.locks,
+        sessionFiles: this.historyService.files,
         xumScope: {
           type: "project",
           xumHome: this.config.rootDir,

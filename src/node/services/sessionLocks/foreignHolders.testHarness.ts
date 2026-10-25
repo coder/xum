@@ -144,6 +144,13 @@ export function wrapWithForeignHolders(inner: SessionLocks, holders: ForeignHold
   return {
     workspaceFiles: inner.workspaceFiles,
     acquireProcessFileLock: async (options) => {
+      // Without createParentDir, the Node lock fails with ENOENT once the parent is gone, before
+      // it meets any holder (#7485, #7326). The inner lock answers for the folder in its own
+      // layer: it rejects for a missing parent, and a lock that it takes is released at once.
+      if (options.createParentDir === false && table.has(options.lockPath)) {
+        const probe = await inner.acquireProcessFileLock(options);
+        await probe[Symbol.asyncDispose]();
+      }
       const holder = liveHolder(options.lockPath);
       if (holder !== undefined) {
         throw new Error(

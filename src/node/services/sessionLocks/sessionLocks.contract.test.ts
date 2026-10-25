@@ -437,6 +437,36 @@ test("foreign: a missing parent wins over a live holder when createParentDirecto
   }
 });
 
+test("foreign: a missing parent wins over a live holder for a file lock without createParentDir", async () => {
+  const t = await nodeLocks();
+  try {
+    const holders = makeForeignHolders();
+    const locks = buildSessionLocks(withForeignHolders(t.layer, holders));
+    const lockPath = path.join(t.dir, "removed-session", "blobs.lock");
+    holders.hold(lockPath, "live");
+    const acquire = () =>
+      locks
+        .acquireProcessFileLock({
+          lockPath,
+          createParentDir: false,
+          timeoutMs: 200,
+          label: "contract lock",
+        })
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+    expect(await acquire()).toMatchObject({ code: "ENOENT" });
+    // With the parent back, the live holder refuses again.
+    await fs.mkdir(path.dirname(lockPath));
+    expect(((await acquire()) as Error).message).toBe(
+      fileLockTimeoutMessage("contract lock", lockPath, 200, liveBlocker(foreignPid()))
+    );
+  } finally {
+    await t.cleanup();
+  }
+});
+
 test("foreign: hold() publishes its lease before it probes the gate", async () => {
   const t = await nodeLocks();
   try {
