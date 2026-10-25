@@ -81,9 +81,13 @@ function resolveVariable(sourceCode, identifier) {
   return null;
 }
 
-/** True when a parameter, import or local declares the identifier's name in its scope chain. */
+/**
+ * True when a parameter, import or local declares the identifier's name as a value in its scope
+ * chain. A type-only declaration (`interface Date`, `type AbortSignal = ...`) does not count:
+ * TypeScript keeps types and values apart, so `Date.now()` still reads the host global.
+ */
 function isDeclaredLocally(sourceCode, identifier) {
-  return (resolveVariable(sourceCode, identifier)?.defs.length ?? 0) > 0;
+  return resolveVariable(sourceCode, identifier)?.defs.some((def) => def.type !== "Type") ?? false;
 }
 
 /** The property name of `a.b` or of the static `a["b"]`; null for any other member. */
@@ -836,8 +840,8 @@ const localPlugin = {
         // `require("node:timers")` or `await import("node:timers")`.
         const loadsTimers = (node) =>
           (node?.type === "CallExpression" &&
+            isHostGlobal(context.sourceCode, node.callee, "require") &&
             node.callee.type === "Identifier" &&
-            node.callee.name === "require" &&
             isTimerModule(node.arguments[0])) ||
           (node?.type === "AwaitExpression" &&
             node.argument.type === "ImportExpression" &&

@@ -126,6 +126,24 @@ test("passes locals named Date or AbortSignal", () => {
   expect(patch(`function fake(Date: D) {\n  Date.now = () => 1;\n}`)).toEqual([]);
 });
 
+test("reports host clock reads next to a type-only declaration of the same name", () => {
+  // TypeScript keeps types and values apart: `interface Date` does not shadow the value `Date`.
+  expect(rawClock(`interface Date {\n  x: number;\n}\nconst t = Date.now();`)).toEqual(["raw"]);
+  expect(rawClock(`type AbortSignal = number;\nconst s = AbortSignal.timeout(10);`)).toEqual([
+    "raw",
+  ]);
+  const patch = (code: string) => ids("no-global-clock-patch", code);
+  expect(patch(`interface Date {\n  x: number;\n}\nDate.now = () => 1;`)).toEqual(["patch"]);
+});
+
+test("passes a local named require", () => {
+  expect(
+    rawClock(
+      `function f(require: (id: string) => T) {\n  const timers = require("node:timers");\n  return timers.setTimeout(fire, 10);\n}`
+    )
+  ).toEqual([]);
+});
+
 test("reports timers loaded by await import() and static computed members", () => {
   expect(
     rawClock(`const timers = await import("node:timers");\ntimers.setTimeout(fire, 10);`)
