@@ -159,22 +159,14 @@ const DAYTONA_API_KEY_PLACEHOLDER = "<daytona-api-key>";
 
 type Redact = (text: string) => string;
 
-/** A secret as an echo may carry it: raw, or encoded as a path or query component. */
-function encodedForms(secret: string): string[] {
-  const queryForm = new URLSearchParams({ s: secret }).toString().slice("s=".length);
-  // Encoded forms first: raw text left in one would otherwise survive as a partial match.
-  return [...new Set([queryForm, encodeURIComponent(secret), secret])];
-}
-
+// Daytona's API keys (dtn_ + hex) and SSH tokens (nanoid without _ and -) are URL-safe, so a
+// query or path echo carries them as written: no encoded form to redact.
 function createRedactor(apiKey: string | undefined, secrets: string[]): Redact {
   const replacements: Array<[string, string]> = [];
   for (const secret of secrets) {
-    if (!secret) continue;
-    for (const form of encodedForms(secret)) replacements.push([form, DAYTONA_TOKEN_PLACEHOLDER]);
+    if (secret) replacements.push([secret, DAYTONA_TOKEN_PLACEHOLDER]);
   }
-  if (apiKey) {
-    for (const form of encodedForms(apiKey)) replacements.push([form, DAYTONA_API_KEY_PLACEHOLDER]);
-  }
+  if (apiKey) replacements.push([apiKey, DAYTONA_API_KEY_PLACEHOLDER]);
   return (text) => {
     let redacted = text;
     for (const [secret, placeholder] of replacements) {
@@ -191,17 +183,10 @@ const PAGE_LIMIT = 100;
 
 const MAX_SERVER_MESSAGE_CHARS = 200;
 
-/**
- * Error text ends up in toasts and turn errors: a proxy or a non-Daytona URL can answer with a
- * whole HTML page, so drop tags, collapse whitespace and keep a short excerpt.
- */
+/** Error text ends up in toasts and turn errors, so keep a short excerpt. */
 function toPlainExcerpt(text: string, redact: Redact): string | undefined {
   // Redacted before the cut, so a truncated secret cannot survive as a prefix.
-  const plain = redact(text)
-    .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const plain = redact(text).trim();
   if (!plain) return undefined;
   return plain.length > MAX_SERVER_MESSAGE_CHARS
     ? `${plain.slice(0, MAX_SERVER_MESSAGE_CHARS)}...`
@@ -227,24 +212,17 @@ function extractServerMessage(bodyText: string, redact: Redact): string | undefi
   return undefined;
 }
 
-function kindForStatus(status: number): DaytonaErrorKind {
-  if (status === 401 || status === 403) return "unauthorized";
-  if (status === 404) return "not_found";
-  if (status === 400) return "bad_request";
-  return "server";
-}
-
-function describeStatus(kind: DaytonaErrorKind, status: number): string {
-  switch (kind) {
-    case "unauthorized":
-      return `Daytona rejected the API key (HTTP ${status})`;
-    case "not_found":
-      return "Daytona resource not found (HTTP 404)";
-    case "bad_request":
-      return "Daytona rejected the request (HTTP 400)";
-    default:
-      return `Daytona request failed (HTTP ${status})`;
+function describeStatus(status: number): { kind: DaytonaErrorKind; description: string } {
+  if (status === 401 || status === 403) {
+    return { kind: "unauthorized", description: `Daytona rejected the API key (HTTP ${status})` };
   }
+  if (status === 404) {
+    return { kind: "not_found", description: "Daytona resource not found (HTTP 404)" };
+  }
+  if (status === 400) {
+    return { kind: "bad_request", description: "Daytona rejected the request (HTTP 400)" };
+  }
+  return { kind: "server", description: `Daytona request failed (HTTP ${status})` };
 }
 
 function buildUrl(apiUrl: string, pathName: string, query: RequestOptions["query"] = {}): URL {
@@ -261,9 +239,9 @@ function httpError(
   label: string,
   redact: Redact
 ): DaytonaApiError {
-  const kind = kindForStatus(status);
+  const { kind, description } = describeStatus(status);
   const serverMessage = extractServerMessage(bodyText, redact);
-  const base = `${describeStatus(kind, status)} for ${label}`;
+  const base = `${description} for ${label}`;
   return new DaytonaApiError(
     kind,
     serverMessage ? `${base}: ${serverMessage}` : base,
@@ -519,26 +497,15 @@ export class DaytonaClient {
 
   async listSnapshots(signal?: AbortSignal): Promise<DaytonaSnapshot[]> {
     const snapshots: DaytonaSnapshot[] = [];
-    const seen = new Set<string>();
     for (let page = 1; page <= MAX_PAGES; page++) {
       const raw = await this.request("GET", "/snapshots", {
         query: { page, limit: PAGE_LIMIT },
         signal,
       });
       const parsed = this.parse(SnapshotPageSchema, raw, "GET /snapshots");
-      // A page with nothing new ends the walk: a server that ignores `page` repeats page 1.
-      const fresh = parsed.items.map(toSnapshot).filter((snapshot) => !seen.has(snapshot.name));
-      for (const snapshot of fresh) seen.add(snapshot.name);
-      snapshots.push(...fresh);
-      if (fresh.length === 0 || isLastPage(parsed, page)) return snapshots;
+      snapshots.push(...parsed.items.map(toSnapshot));
+      if (parsed.items.length < PAGE_LIMIT || page >= (parsed.totalPages ?? Infinity)) break;
     }
     return snapshots;
   }
-}
-
-/** totalPages is optional: without it, a page shorter than the limit is the last one. */
-function isLastPage(parsed: { items: unknown[]; totalPages?: number }, page: number): boolean {
-  return parsed.totalPages === undefined
-    ? parsed.items.length < PAGE_LIMIT
-    : page >= parsed.totalPages;
 }
