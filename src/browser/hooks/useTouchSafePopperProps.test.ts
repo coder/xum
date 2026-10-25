@@ -6,9 +6,8 @@ import { useTouchSafePopperProps } from "./useTouchSafePopperProps";
 
 describe("useTouchSafePopperProps", () => {
   let domWindow: Window & typeof globalThis;
-  // happy-dom neither resolves env() nor lays out, so the tests stand in for the browser: the
-  // probes' computed padding reports these insets, and reportInsets plays the ResizeObserver
-  // that the probes' boxes trigger when the insets change, then the next animation frame.
+  // happy-dom neither resolves env() nor lays out, so the tests stand in for the browser. The
+  // probe's outer element is padded by the top and left insets and its child by the right one.
   let insets = { top: 0, right: 0, left: 0 };
   let insetReads = 0;
   let coarsePointer = false;
@@ -27,14 +26,32 @@ describe("useTouchSafePopperProps", () => {
     }
   }
 
-  function reportInsets(next: typeof insets) {
-    insets = next;
+  function probePadding(element: Element) {
+    const outer = element.firstElementChild != null;
+    return {
+      paddingTop: `${outer ? insets.top : 0}px`,
+      paddingRight: `${outer ? 0 : insets.right}px`,
+      paddingLeft: `${outer ? insets.left : 0}px`,
+    };
+  }
+
+  // Plays the ResizeObserver callbacks for the observed boxes that `resized` picks, then the
+  // next animation frame.
+  function runObservers(resized: (target: Element) => boolean) {
     act(() => {
       for (const observer of observers) {
-        if (observer.targets.length > 0) observer.callback();
+        if (observer.targets.some(resized)) observer.callback();
       }
       for (const frame of frames.splice(0)) frame(0);
     });
+  }
+
+  // A browser reports the probe boxes whose padding the new insets change.
+  function reportInsets(next: typeof insets) {
+    const box = (target: Element) => JSON.stringify(probePadding(target));
+    const before = new Map(observers.flatMap((o) => o.targets).map((t) => [t, box(t)]));
+    insets = next;
+    runObservers((target) => box(target) !== before.get(target));
   }
 
   beforeEach(() => {
@@ -57,13 +74,9 @@ describe("useTouchSafePopperProps", () => {
     });
     Object.defineProperty(domWindow, "getComputedStyle", {
       configurable: true,
-      value: () => {
+      value: (element: Element) => {
         insetReads += 1;
-        return {
-          paddingTop: `${insets.top}px`,
-          paddingRight: `${insets.right}px`,
-          paddingLeft: `${insets.left}px`,
-        };
+        return probePadding(element);
       },
     });
     Object.defineProperty(domWindow, "matchMedia", {
@@ -148,17 +161,36 @@ describe("useTouchSafePopperProps", () => {
     });
   });
 
-  it("notices a change to any one inset", () => {
+  it("follows a change to any one inset and a swap of the side insets", () => {
     const menu = renderHook(() => useTouchSafePopperProps());
 
     for (const next of [
       { top: 21, right: 0, left: 0 },
+      // Only the right inset changes when the iPhone Duo moves between its displays.
       { top: 21, right: 84, left: 0 },
       { top: 21, right: 84, left: 6 },
+      // A half turn of a landscape phone swaps the side insets.
+      { top: 21, right: 6, left: 84 },
     ]) {
       reportInsets(next);
       expect(menu.result.current.collisionPadding).toEqual({ ...next, bottom: 0 });
     }
+  });
+
+  it("tells mounted menus in the next frame, not inside the observer callback", () => {
+    const menu = renderHook(() => useTouchSafePopperProps());
+    insets = { top: 21, right: 84, left: 0 };
+
+    // A menu that re-renders inside the callback resizes during the browser's observer loop.
+    act(() => {
+      for (const observer of observers) observer.callback();
+    });
+    expect(menu.result.current.collisionPadding.top).toBe(0);
+
+    act(() => {
+      for (const frame of frames.splice(0)) frame(0);
+    });
+    expect(menu.result.current.collisionPadding.top).toBe(21);
   });
 
   it("does not re-render menus when a report keeps the insets", () => {
@@ -170,7 +202,7 @@ describe("useTouchSafePopperProps", () => {
     });
 
     // A ResizeObserver reports each box that has a size once when it starts observing it.
-    reportInsets({ ...insets });
+    runObservers(() => true);
 
     expect(renders).toBe(1);
   });
