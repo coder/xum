@@ -76,8 +76,11 @@ describe("acceptArtifactFrameMessage", () => {
 /**
  * Run the bridge script against a minimal window; returns its keydown handler and posts.
  * `querySelectorAll`: the page's document.querySelectorAll (default: finds nothing).
+ * `forwardsViewSwitch`: the frame is the main pane's status page.
  */
-function runBridgeScript(options: { querySelectorAll?: (selector: string) => unknown[] } = {}) {
+function runBridgeScript(
+  options: { querySelectorAll?: (selector: string) => unknown[]; forwardsViewSwitch?: boolean } = {}
+) {
   // Every listener, in registration order: keys use capture listeners and bubble ones.
   const listeners: Array<{ type: string; capture: boolean; listener: (event: unknown) => void }> =
     [];
@@ -104,7 +107,7 @@ function runBridgeScript(options: { querySelectorAll?: (selector: string) => unk
     "window",
     "document",
     "CustomEvent",
-    buildArtifactBridgeScript("dark")
+    buildArtifactBridgeScript("dark", null, null, false, options.forwardsViewSwitch)
   ) as (window: unknown, document: unknown, customEvent: unknown) => void;
   run(fakeWindow, fakeDocument, class {});
   /**
@@ -241,7 +244,7 @@ describe("bridge script keys", () => {
     expect(bridge.prevented()).toBe(2);
   });
 
-  test("the Artifacts tab and Agent interface chords are posted by name, and other Ctrl+Shift keys stay the artifact's", () => {
+  test("the Artifacts tab chord is posted by name, and other Ctrl+Shift keys stay the artifact's", () => {
     // The keybinds' own keys, so a keybind the shim cannot forward fails here.
     const key = KEYBINDS.OPEN_ARTIFACTS_TAB.key;
     const bridge = runBridgeScript();
@@ -252,10 +255,24 @@ describe("bridge script keys", () => {
     expect(bridge.posted).toEqual([]);
     expect(bridge.prevented()).toBe(0);
     bridge.keydown(key, div, true, { ctrlKey: true });
-    // The main pane's status page is a frame too: its view switch must work after a click in it.
-    bridge.keydown(KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW.key, div, true, { ctrlKey: true });
     expect(bridge.posted).toEqual([
       { xumArtifact: 1, type: "sidebarKey", chord: "artifacts", ctrlKey: true, metaKey: false },
+    ]);
+    expect(bridge.prevented()).toBe(1);
+  });
+
+  test("only the main pane's status page claims the view switch chord", () => {
+    const key = KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW.key;
+    // Any other frame may show while no switch exists: the chord stays the artifact's.
+    const elsewhere = runBridgeScript();
+    elsewhere.keydown(key, div, true, { ctrlKey: true });
+    expect(elsewhere.posted).toEqual([]);
+    expect(elsewhere.prevented()).toBe(0);
+
+    // The status page shows only while the switch exists: it must work after a click in it.
+    const statusPage = runBridgeScript({ forwardsViewSwitch: true });
+    statusPage.keydown(key, div, true, { ctrlKey: true });
+    expect(statusPage.posted).toEqual([
       {
         xumArtifact: 1,
         type: "sidebarKey",
@@ -264,7 +281,7 @@ describe("bridge script keys", () => {
         metaKey: false,
       },
     ]);
-    expect(bridge.prevented()).toBe(2);
+    expect(statusPage.prevented()).toBe(1);
   });
 
   test("on macOS the right-sidebar chord is Cmd, and Ctrl stays the artifact's", () => {

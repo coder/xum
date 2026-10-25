@@ -99,8 +99,9 @@ function hasLiveUserGesture(frame: HTMLIFrameElement | null): boolean {
  * Replays a chord pressed inside `frame` as a keydown on the frame element, so the app's one
  * handler for it applies its own rules: WorkspaceShell's useRightSidebarToggleKey for
  * TOGGLE_RIGHT_SIDEBAR, useArtifactsTabKey for OPEN_ARTIFACTS_TAB, the main pane's Agent interface
- * view handler for TOGGLE_AGENT_INTERFACE_VIEW. All keep the dialog block (Artifacts fullscreen is
- * a modal dialog); the sidebar ones also move focus to the toggle after a collapse.
+ * view handler for TOGGLE_AGENT_INTERFACE_VIEW (from the main pane's status page only, the one
+ * frame that forwards it). All keep the dialog block (Artifacts fullscreen is a modal dialog); the
+ * sidebar ones also move focus to the toggle after a collapse.
  *
  * SECURITY AUDIT: the artifact's script can post the message without a key press, and can move
  * focus into its own frame with window.focus(). The host honours it only during the user's own
@@ -189,15 +190,18 @@ function handleFrameKeyMessage(
   frame: HTMLIFrameElement | null,
   handlers: {
     onFrameKey: ((key: ArtifactFrameKey) => void) | undefined;
-    interruptKey: ArtifactFrameInterruptKey | undefined;
+    /** Set only for the main pane's status page (SandboxedArtifactFrame's mainPaneInterruptKey). */
+    mainPaneInterruptKey: ArtifactFrameInterruptKey | undefined;
   }
 ): void {
   if (message.type === "sidebarKey") {
+    // Any other frame's shim never forwards the view switch: its page's own script posted it.
+    if (message.chord === "agentInterface" && handlers.mainPaneInterruptKey === undefined) return;
     replayFrameSidebarKey(frame, message);
     return;
   }
   if (message.type === "interruptKey") {
-    replayFrameInterruptKey(frame, message.keybind, handlers.interruptKey);
+    replayFrameInterruptKey(frame, message.keybind, handlers.mainPaneInterruptKey);
     return;
   }
   const { onFrameKey } = handlers;
@@ -322,10 +326,11 @@ export function SandboxedArtifactFrame(props: {
   content: string;
   onFrameKey?: (key: ArtifactFrameKey) => void;
   /**
-   * The stream-interrupt keybind to replay from the frame (replayFrameInterruptKey); only the
-   * main pane's status page sets it, since there the frame takes the chat's place.
+   * Set only for the main pane's status page, which takes the chat's place: the chat's
+   * stream-interrupt keybind, which the frame replays (replayFrameInterruptKey). That frame also
+   * forwards the view switch chord, since it shows only while the switch exists.
    */
-  interruptKey?: ArtifactFrameInterruptKey;
+  mainPaneInterruptKey?: ArtifactFrameInterruptKey;
   /** send/setState from the artifact (M5b); without it both are ignored. */
   interactions?: ArtifactInteractionHandlers;
   /** Set only while annotate mode is on: pins clicked inside the frame (M5b). */
@@ -350,7 +355,8 @@ export function SandboxedArtifactFrame(props: {
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   // When this frame last sent without the strip (see ARTIFACT_CLICK_SEND_WINDOW_MS).
   const lastClickSendAtRef = useRef<number | null>(null);
-  const { kind, content, path } = props;
+  const { kind, content, path, mainPaneInterruptKey } = props;
+  const forwardsViewSwitch = mainPaneInterruptKey !== undefined;
   // SECURITY AUDIT: the persisted state goes into the srcdoc, never through postMessage (which
   // must target "*" and could reach a page the frame navigated to). So an interactive artifact
   // is built only once its state is known; `undefined` means it is still loading.
@@ -376,7 +382,13 @@ export function SandboxedArtifactFrame(props: {
       allowCdn,
       read,
       bridgeScript: (followsColorScheme) =>
-        buildArtifactBridgeScript(initialTheme, state, initialAppearance, followsColorScheme),
+        buildArtifactBridgeScript(
+          initialTheme,
+          state,
+          initialAppearance,
+          followsColorScheme,
+          forwardsViewSwitch
+        ),
     })
       .then((frameDocument) => {
         if (!cancelled) setBuilt({ content, allowCdn, state, ...frameDocument });
@@ -397,11 +409,11 @@ export function SandboxedArtifactFrame(props: {
     read,
     waitingForState,
     state,
+    forwardsViewSwitch,
   ]);
 
   // Bridge, host side: only messages from this frame's window, rate limited, schema-valid.
   const onFrameKey = props.onFrameKey;
-  const interruptKey = props.interruptKey;
   const interactions = props.interactions;
   const onAnnotate = props.onAnnotate;
   useEffect(() => {
@@ -416,7 +428,7 @@ export function SandboxedArtifactFrame(props: {
         case "key":
         case "sidebarKey":
         case "interruptKey":
-          handleFrameKeyMessage(message, frameRef.current, { onFrameKey, interruptKey });
+          handleFrameKeyMessage(message, frameRef.current, { onFrameKey, mainPaneInterruptKey });
           break;
         case "send":
           // A live click or key in this frame sends at once, one message per click; any other
@@ -452,7 +464,7 @@ export function SandboxedArtifactFrame(props: {
   }, [
     allowMessage,
     onFrameKey,
-    interruptKey,
+    mainPaneInterruptKey,
     interactions,
     onAnnotate,
     navigatedRef,

@@ -129,8 +129,8 @@ export function ArtifactViewer(props: {
   artifactsDir?: string | null;
   /** Escape / Shift+F pressed inside a sandboxed HTML/SVG frame. */
   onFrameKey?: (key: ArtifactFrameKey) => void;
-  /** The stream-interrupt keybind an HTML/SVG frame replays (the main pane's status page). */
-  frameInterruptKey?: ArtifactFrameInterruptKey;
+  /** Set only for the main pane's status page: see SandboxedArtifactFrame's prop. */
+  mainPaneInterruptKey?: ArtifactFrameInterruptKey;
   /**
    * Resolve relative images/assets through the artifacts folder (default). Off for pinned
    * checkout files, whose neighbours live in the checkout, not the artifacts folder.
@@ -196,7 +196,7 @@ export function ArtifactViewer(props: {
           kind={result.kind}
           content={result.content}
           onFrameKey={props.onFrameKey}
-          interruptKey={props.frameInterruptKey}
+          mainPaneInterruptKey={props.mainPaneInterruptKey}
           interactions={props.interactions}
           onAnnotate={props.onFrameAnnotate}
         />

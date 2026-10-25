@@ -219,6 +219,40 @@ describe("Agent interface status view", () => {
     }
   });
 
+  test("the view switch chord pressed in the page leaves it for the chat", async () => {
+    Object.defineProperty(window.navigator, "userActivation", {
+      configurable: true,
+      get: () => ({ isActive: true }),
+    });
+    // The host builds the replayed event with the global constructor, which the DOM harness lacks.
+    const globalKeyboardEvent = globalThis.KeyboardEvent;
+    globalThis.KeyboardEvent = window.KeyboardEvent;
+    try {
+      const view = render(<MainPane workspaceId="ws-switch-chord" />, { wrapper: Wrapper });
+      await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+      const frame = view.getByTestId("artifact-frame") as HTMLIFrameElement;
+      act(() => frame.focus());
+      act(() => {
+        const event = new window.Event("message");
+        Object.defineProperty(event, "data", {
+          value: {
+            xumArtifact: 1,
+            type: "sidebarKey",
+            chord: "agentInterface",
+            ctrlKey: true,
+            metaKey: false,
+          },
+        });
+        Object.defineProperty(event, "source", { value: frame.contentWindow });
+        window.dispatchEvent(event);
+      });
+      await waitFor(() => expect(view.queryByTestId("agent-interface-status-view")).toBeNull());
+    } finally {
+      globalThis.KeyboardEvent = globalKeyboardEvent;
+      Reflect.deleteProperty(window.navigator, "userActivation");
+    }
+  });
+
   test("only a complete listing without the page switches the pane back to the chat", async () => {
     const view = render(<MainPane workspaceId="ws-truncated" />, { wrapper: Wrapper });
     await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));

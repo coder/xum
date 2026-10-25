@@ -162,8 +162,9 @@ function StatusPage(props: StatusViewProps) {
             result={read}
             workspaceId={workspaceId}
             interactions={interactions.handlers}
-            // The page takes the chat's place, so its interrupt key works with focus in the page.
-            frameInterruptKey={vimEnabled ? "vim" : "normal"}
+            // The page takes the chat's place, so the chat's interrupt key and the view switch
+            // work with focus in the page.
+            mainPaneInterruptKey={vimEnabled ? "vim" : "normal"}
           />
         )}
       </div>

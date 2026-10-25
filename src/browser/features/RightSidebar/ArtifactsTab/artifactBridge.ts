@@ -30,9 +30,10 @@ import {
  *   on, so the host honours it only during a live user gesture in this frame
  *   (hasLiveUserGesture, SandboxedArtifactFrame.tsx).
  * - Frame -> host: `{ type: "sidebarKey", chord, ctrlKey, metaKey }`, a right-sidebar chord
- *   (ARTIFACT_FRAME_CHORDS: KEYBINDS.TOGGLE_RIGHT_SIDEBAR or KEYBINDS.OPEN_ARTIFACTS_TAB), which a
- *   click into the frame also made unreachable: keys in the frame never reach the app's window
- *   listener. The host honours it only while the frame holds focus (SandboxedArtifactFrame.tsx).
+ *   (ARTIFACT_FRAME_CHORDS: KEYBINDS.TOGGLE_RIGHT_SIDEBAR or KEYBINDS.OPEN_ARTIFACTS_TAB, and from
+ *   the main pane's status page only, KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW), which a click into
+ *   the frame also made unreachable: keys in the frame never reach the app's window listener.
+ *   The host honours it only while the frame holds focus (SandboxedArtifactFrame.tsx).
  * - Frame -> host: `{ type: "interruptKey", keybind }`, a stream-interrupt key pressed in the
  *   frame (ARTIFACT_FRAME_INTERRUPT_KEYS: Escape outside a text field, or Ctrl+C). Only the main
  *   pane's status page replays it, and only during a live user gesture in the frame, since a
@@ -141,7 +142,9 @@ const ArtifactAnnotateMessageSchema = z
  * only holds focus while the Artifacts tab shows (user request: that key toggles the tab, from
  * anywhere in it). TOGGLE_AGENT_INTERFACE_VIEW switches the main pane between the status page
  * (a frame too) and the chat, so the advertised chord also leaves the page after a click in it;
- * from a frame it only ever switches to the chat (useMainPaneAgentInterfaceView).
+ * from a frame it only ever switches to the chat (useMainPaneAgentInterfaceView). Only the status
+ * page claims it (`forwardsViewSwitch`): it shows only while the switch exists, and in any other
+ * frame a claimed chord could do nothing yet still keep the key from the page.
  */
 export const ARTIFACT_FRAME_CHORDS = {
   sidebar: KEYBINDS.TOGGLE_RIGHT_SIDEBAR,
@@ -627,16 +630,16 @@ function ctrlShiftKey(keybind: Keybind): string | null {
   return chord ? keybind.key.toLowerCase() : null;
 }
 
-/** Lowercased key -> chord name, for the chords the shim can forward. */
-function frameChordKeys(): Record<string, ArtifactFrameChord> {
+/** Lowercased key -> chord name, for the chords this frame forwards. */
+function frameChordKeys(forwardsViewSwitch: boolean): Record<string, ArtifactFrameChord> {
   const keys: Record<string, ArtifactFrameChord> = {};
   for (const chord of Object.keys(ARTIFACT_FRAME_CHORDS) as ArtifactFrameChord[]) {
+    if (chord === "agentInterface" && !forwardsViewSwitch) continue;
     const key = ctrlShiftKey(ARTIFACT_FRAME_CHORDS[chord]);
     if (key != null) keys[key] = chord;
   }
   return keys;
 }
-const FRAME_CHORD_KEYS = frameChordKeys();
 
 /**
  * The right-sidebar chords, with this platform's modifier as matchesKeybind reads the keybind: on
@@ -646,11 +649,12 @@ const FRAME_CHORD_KEYS = frameChordKeys();
  * decides). No editable exclusion: the chords type nothing, and the host's own handlers work from
  * the chat input too. Built per frame: isMac() needs the window.
  */
-function sidebarKeyListener(): string {
-  if (Object.keys(FRAME_CHORD_KEYS).length === 0) return "";
+function sidebarKeyListener(forwardsViewSwitch: boolean): string {
+  const chordKeys = frameChordKeys(forwardsViewSwitch);
+  if (Object.keys(chordKeys).length === 0) return "";
   const modifier = isMac() ? "event.metaKey" : "event.ctrlKey && !event.metaKey";
   return `
-  var chordKeys = ${JSON.stringify(FRAME_CHORD_KEYS)};
+  var chordKeys = ${JSON.stringify(chordKeys)};
   window.addEventListener("keydown", function (event) {
     // A held key would flip the sidebar on every repeat and spend the frame's message budget.
     if (event.repeat || event.altKey || !event.shiftKey || !(${modifier})) return;
@@ -669,7 +673,9 @@ export function buildArtifactBridgeScript(
   initialState: unknown = null,
   initialAppearance: ArtifactAppearance | null = null,
   /** The page has no styles of its own (isUnstyledHtmlDocument): it takes the theme's scheme. */
-  followColorScheme = false
+  followColorScheme = false,
+  /** The main pane's status page: it also forwards the view switch (ARTIFACT_FRAME_CHORDS). */
+  forwardsViewSwitch = false
 ): string {
   return `(function () {
   "use strict";
@@ -844,7 +850,7 @@ export function buildArtifactBridgeScript(
   }, true);
   ${ANNOTATE_KEY_LISTENER}
   ${INTERRUPT_KEY_LISTENER}
-  ${sidebarKeyListener()}
+  ${sidebarKeyListener(forwardsViewSwitch)}
   ${ARTIFACT_IN_PAGE_LINK_SCRIPT}
 })();`;
 }
