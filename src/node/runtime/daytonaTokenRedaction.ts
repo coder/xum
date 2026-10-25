@@ -49,38 +49,90 @@ export function redactDaytonaError(error: unknown): unknown {
   return error;
 }
 
+/** Length of the longest end of `text` that is the start of a remembered token. */
+function tokenStartAtEnd(text: string): number {
+  let held = 0;
+  for (const token of rememberedTokens.keys()) {
+    for (let n = Math.min(token.length - 1, text.length); n > held; n--) {
+      if (text.endsWith(token.slice(0, n))) {
+        held = n;
+        break;
+      }
+    }
+  }
+  return held;
+}
+
 /**
- * Redact a byte stream chunk by chunk. A token split across two chunks is not caught: ssh writes
- * each message (`<token>@host: Permission denied`) in one write.
+ * Pipes and PTYs can split one ssh message inside the token, so each piece is redacted with the
+ * text held from the previous one, and an end that could start a token waits for the next piece.
  */
+function createTokenRedactor() {
+  let held = "";
+  return {
+    push(text: string): string {
+      const redacted = redactDaytonaTokens(held + text);
+      held = redacted.slice(redacted.length - tokenStartAtEnd(redacted));
+      return redacted.slice(0, redacted.length - held.length);
+    },
+    end(): string {
+      const rest = held;
+      held = "";
+      return rest;
+    },
+    holding: () => held.length > 0,
+  };
+}
+
+/** Redact a byte stream, including a token split across chunks. */
 export function createDaytonaRedactingStream(): Transform {
   const decoder = new StringDecoder("utf8");
+  const redactor = createTokenRedactor();
   const emit = (stream: Transform, text: string) => {
-    if (text) stream.push(Buffer.from(redactDaytonaTokens(text), "utf8"));
+    if (text) stream.push(Buffer.from(text, "utf8"));
   };
   return new Transform({
     transform(chunk: Buffer, _encoding, callback) {
-      emit(this, decoder.write(chunk));
+      emit(this, redactor.push(decoder.write(chunk)));
       callback();
     },
     flush(callback) {
-      emit(this, decoder.end());
+      emit(this, redactor.push(decoder.end()) + redactor.end());
       callback();
     },
   });
 }
 
+// A held PTY tail (possibly a prompt that only looks like a token start) is shown after this
+// long without more output.
+const PTY_HOLD_MS = 50;
+
 /**
- * Redact a PTY's output chunk by chunk: OpenSSH can print `<token>@gateway: Permission denied`
- * into the terminal, which clients replay. The host block turns off password and
- * keyboard-interactive auth, so no prompt names the token.
+ * Redact a PTY's output: OpenSSH can print `<token>@gateway: Permission denied` into the
+ * terminal, which clients replay. The host block turns off password and keyboard-interactive
+ * auth, so no prompt names the token.
  */
 export function redactDaytonaPty(pty: PtyHandle): PtyHandle {
   return {
     write: (data) => pty.write(data),
     resize: (cols, rows) => pty.resize(cols, rows),
     kill: () => pty.kill(),
-    onData: (handler) => pty.onData((data) => handler(redactDaytonaTokens(data))),
+    onData: (handler) => {
+      const redactor = createTokenRedactor();
+      let flushTimer: ReturnType<typeof setTimeout> | undefined;
+      const subscription = pty.onData((data) => {
+        clearTimeout(flushTimer);
+        const ready = redactor.push(data);
+        if (ready) handler(ready);
+        if (redactor.holding()) flushTimer = setTimeout(() => handler(redactor.end()), PTY_HOLD_MS);
+      });
+      return {
+        dispose: () => {
+          clearTimeout(flushTimer);
+          subscription.dispose();
+        },
+      };
+    },
     onExit: (handler) => pty.onExit(handler),
   };
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { PtyHandle } from "./transports";
 import {
+  createDaytonaRedactingStream,
   DAYTONA_TOKEN_PLACEHOLDER,
   redactDaytonaPty,
   redactDaytonaTokens,
@@ -25,6 +26,21 @@ describe("Daytona token redaction", () => {
 
     expect(redactDaytonaTokens("aged-out-token-k3v fresh-token-k3v")).toBe(
       `aged-out-token-k3v ${DAYTONA_TOKEN_PLACEHOLDER}`
+    );
+  });
+
+  it("redacts a token that a stream splits across chunks", async () => {
+    rememberDaytonaToken("split-stream-token-q8r");
+    const stream = createDaytonaRedactingStream();
+    const out: Buffer[] = [];
+    stream.on("data", (chunk: Buffer) => out.push(chunk));
+    const done = new Promise((resolve) => stream.on("end", resolve));
+    stream.write("split-stream-");
+    stream.end("token-q8r@gateway: Permission denied\r\n");
+    await done;
+
+    expect(Buffer.concat(out).toString()).toBe(
+      `${DAYTONA_TOKEN_PLACEHOLDER}@gateway: Permission denied\r\n`
     );
   });
 });
@@ -65,6 +81,16 @@ describe("redactDaytonaPty", () => {
     const pty = setup();
     pty.emit(`${TOKEN}@gateway: Permission denied\r\n`);
     expect(pty.output.join("")).toBe(`${DAYTONA_TOKEN_PLACEHOLDER}@gateway: Permission denied\r\n`);
+  });
+
+  it("redacts a token split across chunks, and shows a held end that was not one", async () => {
+    const pty = setup();
+    pty.emit(`denied for ${TOKEN.slice(0, 5)}`);
+    pty.emit(`${TOKEN.slice(5)}@gateway\r\n$ pty-`);
+    expect(pty.output.join("")).toBe(`denied for ${DAYTONA_TOKEN_PLACEHOLDER}@gateway\r\n$ `);
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(pty.output.join("")).toEndWith("\r\n$ pty-");
   });
 
   it("passes other output through and kills the underlying pty", () => {
