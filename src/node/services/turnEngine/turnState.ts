@@ -220,7 +220,7 @@ export interface UsageLedgerState {
 export interface WorkspaceStreamInfo
   extends
     TurnState,
-    TurnSlot,
+    Readonly<TurnSlot>,
     AttemptRequest,
     Readonly<TurnHandles>,
     Readonly<PartialJournalState>,

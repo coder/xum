@@ -46,9 +46,9 @@ import {
   StreamTruncatedError,
 } from "./streamErrors";
 import { metadataModelIdentity, type TurnEvents } from "./TurnEvents";
-import { StreamState } from "./TurnRegistry";
+import { StreamState, TurnRegistry } from "./TurnRegistry";
 import type { TurnResources } from "./TurnResources";
-import type { StreamManagerTokenTracker, WorkspaceId } from "./types";
+import type { StreamManagerTokenTracker, TurnCompletion, WorkspaceId } from "./types";
 import type { WorkspaceStreamInfo } from "./turnState";
 import {
   clonePersistedToolModelUsage,
@@ -690,14 +690,17 @@ export class AttemptLoop {
     // If we set COMPLETED earlier, isStreaming() returns false during cleanup,
     // allowing new messages (e.g., force-compaction) to bypass queuing and write
     // to history before stream-end fires - causing compaction to use wrong parts.
-    streamInfo.state = StreamState.COMPLETED;
+    TurnRegistry.setState(streamInfo, StreamState.COMPLETED);
 
     // Emit stream-end AFTER history is updated to prevent race with compaction
     // Compaction handler listens to this event and clears history - if we emit
     // before updateHistory completes, compaction can clear the file and then
     // updateHistory writes stale data back.
     this.deps.turnEvents.emitTurnEvent(streamEndEvent);
-    streamInfo.terminalCompletion = { status: "completed", streamEnd: streamEndEvent };
+    TurnRegistry.recordTerminal(streamInfo, {
+      status: "completed",
+      streamEnd: streamEndEvent,
+    });
   }
 
   /**
@@ -712,7 +715,7 @@ export class AttemptLoop {
 
     try {
       // Update state to streaming
-      streamInfo.state = StreamState.STREAMING;
+      TurnRegistry.setState(streamInfo, StreamState.STREAMING);
 
       // Emit stream start event (include mode from initialMetadata if available)
       this.deps.emitStreamStart(workspaceId, streamInfo, historySequence);
@@ -831,7 +834,7 @@ export class AttemptLoop {
     streamInfo: WorkspaceStreamInfo,
     error: unknown
   ): Promise<void> {
-    streamInfo.state = StreamState.ERROR;
+    TurnRegistry.setState(streamInfo, StreamState.ERROR);
 
     const workspaceLog = this.deps.getWorkspaceLogger(workspaceId, streamInfo);
 
@@ -848,7 +851,10 @@ export class AttemptLoop {
 
     const errorPayload = buildStreamErrorPayload(streamInfo, error);
     const persistedPayload = await this.persistStreamError(workspaceId, streamInfo, errorPayload);
-    streamInfo.terminalCompletion = { status: "failed", streamError: persistedPayload };
+    TurnRegistry.recordTerminal(streamInfo, {
+      status: "failed",
+      streamError: persistedPayload,
+    });
   }
 
   /**
@@ -1160,15 +1166,16 @@ export class AttemptLoop {
       if (this.deps.workspaceStreams.get(workspaceId) === streamInfo) {
         this.deps.workspaceStreams.delete(workspaceId);
       }
-      streamInfo.terminalCompletion = {
+      const terminalCompletion: TurnCompletion = {
         status: "aborted",
         abortReason,
         streamAbort,
         systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens,
       };
+      TurnRegistry.recordTerminal(streamInfo, terminalCompletion);
       // Session policy consumes this promise separately. It may start a replacement,
       // so neither this fence nor the raw sink may join that policy.
-      streamInfo.completionController?.settle(streamInfo.terminalCompletion);
+      streamInfo.completionController?.settle(terminalCompletion);
     }
   }
 }
