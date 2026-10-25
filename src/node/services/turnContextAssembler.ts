@@ -1064,6 +1064,8 @@ export interface BuildStreamSystemContextOptions {
   scratchDirSet?: boolean;
   /** Agent interface view is on and XUM_SCRATCH_DIR is set: the prompt describes the page. */
   agentInterfaceView?: boolean;
+  /** The final toolset has status_update: the prompt points at it instead of page edits. */
+  statusPageAgent?: boolean;
   xumScope?: XumToolScope;
   loadDesktopCapability?: () => Promise<DesktopCapability>;
   /**
@@ -1553,6 +1555,7 @@ export async function buildStreamSystemContext(
       modes: [effectiveMode, agentDefinition.id],
       scratchDirSet: opts.scratchDirSet,
       agentInterfaceView: opts.agentInterfaceView,
+      statusPageAgent: opts.statusPageAgent,
     }
   );
   const systemMessage = built.systemMessage;

@@ -910,6 +910,8 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   workspaceTurnManager?: ToolConfiguration["workspaceTurnManager"];
   memoryService?: MemoryService;
   timelineService?: ToolConfiguration["timelineService"];
+  /** Status page agent queue behind the status_update tool (artifacts-status-page-agent). */
+  statusPageAgent?: ToolConfiguration["statusPageAgent"];
   extraTools?: Record<string, Tool>;
   onWorkflowRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
   workflowResultContinuationSender?: WorkflowResultContinuationSender;
@@ -2393,12 +2395,20 @@ export class TurnRequestBuilder {
         ),
       abortSignal: combinedAbortSignal,
     });
+    // Status page agent mode: the main agent sends status_update calls and a host-run agent
+    // edits the page. Eligibility mirrors status_update registration; tool policy may still
+    // strip the tool, which forces a rebuild below so the prompt keeps the classic guidance.
+    const statusPageAgentActive =
+      agentInterfaceViewActive && isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT);
+    const statusUpdateToolEligible =
+      statusPageAgentActive && this.dependencies.bindings.statusPageAgent !== undefined;
     // Filled by the first build: later rebuilds in this turn (tool policy,
     // model fallback) reuse the same instruction snapshot instead of re-reading.
     const turnInstructionSources: { current?: InstructionSources } = {};
     const buildStreamSystemContextForToolset = (
       toolset: {
         memoryToolAvailable: boolean;
+        statusUpdateToolAvailable: boolean;
       },
       modelStringForSystem: string = modelString
     ) =>
@@ -2434,6 +2444,7 @@ export class TurnRequestBuilder {
         agentDefinitionCache,
         scratchDirSet: scratchDir !== undefined,
         agentInterfaceView: agentInterfaceViewActive,
+        statusPageAgent: toolset.statusUpdateToolAvailable,
       });
 
     // Build provisional agent context before tool policy finalizes the toolset.
@@ -2441,6 +2452,7 @@ export class TurnRequestBuilder {
     const buildStreamSystemContextStartedAt = this.hostClock.nowMs();
     const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset({
       memoryToolAvailable: memoryToolEligible,
+      statusUpdateToolAvailable: statusUpdateToolEligible,
     });
     // The MCP inventory the pre-policy context was built with; a later
     // rebuild from the validated serve makes that context stale.
@@ -2869,6 +2881,8 @@ export class TurnRequestBuilder {
       strictAgentResolution,
       xumScope,
       timelineService: this.dependencies.bindings.timelineService,
+      statusPageAgent: this.dependencies.bindings.statusPageAgent,
+      statusPageAgentActive,
       desktopNotifications: this.dependencies.hostServices.desktopNotifications,
       sessionLocks: this.dependencies.historyService.locks,
       sessionFiles: this.dependencies.historyService.files,
@@ -3156,14 +3170,19 @@ export class TurnRequestBuilder {
         }
 
         const memoryToolAvailable = attemptTools.memory !== undefined;
+        const statusUpdateToolAvailable = attemptTools.status_update !== undefined;
         const canReuseSystemContext =
           options.reusePrePolicySystemContext &&
           mcpServers === mcpServersAtPrePolicy &&
-          memoryToolAvailable === memoryToolEligible;
+          memoryToolAvailable === memoryToolEligible &&
+          statusUpdateToolAvailable === statusUpdateToolEligible;
         const rebuildSystemStartedAt = this.hostClock.nowMs();
         const systemContext = canReuseSystemContext
           ? prePolicyStreamSystemContext
-          : await buildStreamSystemContextForToolset({ memoryToolAvailable }, seed.rawModelString);
+          : await buildStreamSystemContextForToolset(
+              { memoryToolAvailable, statusUpdateToolAvailable },
+              seed.rawModelString
+            );
         if (options.recordTimings && !canReuseSystemContext) {
           recordStartupPhaseTiming("rebuildStreamSystemContextMs", rebuildSystemStartedAt);
         }

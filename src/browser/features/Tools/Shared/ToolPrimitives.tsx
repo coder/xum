@@ -23,6 +23,7 @@ import {
   Keyboard,
   Layers,
   LayoutGrid,
+  LayoutPanelTop,
   MessageCircleQuestion,
   Monitor,
   Move,
@@ -305,6 +306,8 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   // Sparkles matches the icon the Timeline tab feed renders on agent.event rows, which is
   // exactly where a timeline_event call lands.
   timeline_event: Sparkles,
+  // A page with a header panel: the update lands on the status page the main pane shows.
+  status_update: LayoutPanelTop,
 };
 
 export const ToolIcon: React.FC<ToolIconProps> = ({ toolName, emoji, emojiSpin, className }) => {

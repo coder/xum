@@ -59,11 +59,11 @@ const OFFLINE_SAVE_MESSAGE =
   "Not connected to the Xum server. Your changes save after it reconnects.";
 
 // Agents whose requests run outside the send path (raw streamText: Dream in
-// memoryConsolidation, Name Workspace in workspaceTitleGenerator) and never
-// apply reasoningMode. Never offer a Pro/Cyber toggle that cannot affect requests.
-// Compact stays eligible: compaction goes through the send path, which
-// threads reasoningMode.
-const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace"]);
+// memoryConsolidation, Name Workspace in workspaceTitleGenerator, Status Page in
+// statusPageAgent) and never apply reasoningMode. Never offer a Pro/Cyber toggle
+// that cannot affect requests. Compact stays eligible: compaction goes through
+// the send path, which threads reasoningMode.
+const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace", "status_page"]);
 
 function getAgentDefinitionPath(agent: AgentDefinitionDescriptor): string | null {
   switch (agent.scope) {
@@ -438,6 +438,12 @@ export function TasksSection() {
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationFlag = useExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION);
   const memoryConsolidationEnabled = memoryEnabled && memoryConsolidationFlag;
+  // The status page agent only runs when Artifacts, Agent interface view and Status page agent
+  // are all on (see statusPageAgentService); mirror that gate for its Settings card.
+  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const agentInterfaceEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE);
+  const statusPageAgentFlag = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT);
+  const statusPageAgentEnabled = artifactsEnabled && agentInterfaceEnabled && statusPageAgentFlag;
 
   // Resolve the workspace's active model so that when a sub-agent's model is
   // "Inherit", we show thinking levels for the workspace model (falling back to
@@ -863,8 +869,15 @@ export function TasksSection() {
         agentAiDefaults,
         portableDesktopEnabled,
         memoryConsolidationEnabled,
+        statusPageAgentEnabled,
       }),
-    [agentAiDefaults, listedAgents, portableDesktopEnabled, memoryConsolidationEnabled]
+    [
+      agentAiDefaults,
+      listedAgents,
+      portableDesktopEnabled,
+      memoryConsolidationEnabled,
+      statusPageAgentEnabled,
+    ]
   );
   const execSubagentAgent = listedAgents.find(
     (agent) => agent.id === "exec" && agent.subagentRunnable && agent.uiSelectable

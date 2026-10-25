@@ -166,6 +166,7 @@ import { SshPromptService } from "@/node/services/sshPromptService";
 import { TelemetryService } from "@/node/services/telemetryService";
 import { TerminalService } from "@/node/services/terminalService";
 import { TimelineService } from "@/node/services/timelineService";
+import { StatusPageAgentService } from "@/node/services/statusPageAgentService";
 import { TokenizerService } from "@/node/services/tokenizerService";
 import { UpdateService } from "@/node/services/updateService";
 import { VoiceService } from "@/node/services/voiceService";
@@ -730,6 +731,21 @@ export const DesktopWiringLive: Layer.Layer<
     workspaceService.setOnTodosChanged((workspaceId) =>
       goalStatusBoard.handleTodosChanged(workspaceId)
     );
+    // Status page agent (artifacts-status-page-agent): status_update queues the main agent's
+    // updates and a host-run headless agent applies them to status.html in the background.
+    turnRequestBuilderBindings.statusPageAgent = new StatusPageAgentService({
+      config,
+      isExperimentEnabled: (experimentId) => experimentsService.isExperimentEnabled(experimentId),
+      getWorkspaceMetadata: (workspaceId) => workspaceService.getInfo(workspaceId),
+      // Archiving stops a dedicated Coder workspace; a late page write would restart it.
+      isWorkspaceRemoving: (workspaceId) =>
+        workspaceService.isRemoving(workspaceId) || workspaceService.isArchiving(workspaceId),
+      modelFactory: aiService,
+      sessionUsageService: yield* SessionUsage,
+      requestAnalyticsIngest: (workspaceId) => {
+        workspaceService.emit("analyticsIngest", { workspaceId });
+      },
+    });
     turnRequestBuilderBindings.timelineService = timelineService;
     timelineService.subscribeToWorkspace(workspaceService);
 

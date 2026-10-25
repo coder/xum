@@ -383,6 +383,30 @@ Use clear examples.
     expect(await agentInterfaceFor(undefined)).toBeNull();
   });
 
+  test("points the agent at status_update only when the status page agent has the page", async () => {
+    const metadata: WorkspaceMetadata = {
+      id: "test-workspace",
+      name: "test-workspace",
+      projectName: "test-project",
+      projectPath: projectDir,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const agentInterfaceFor = async (agentInterfaceView: boolean, statusPageAgent: boolean) =>
+      extractTagContent(
+        await buildSystemMessage(metadata, runtime, workspaceDir, undefined, undefined, undefined, {
+          scratchDirSet: true,
+          agentInterfaceView,
+          statusPageAgent,
+        }),
+        "agent-interface"
+      );
+
+    expect(await agentInterfaceFor(true, true)).toContain("status_update");
+    expect(await agentInterfaceFor(true, false)).not.toContain("status_update");
+    // The tool alone never adds the section: the Agent interface view gates it.
+    expect(await agentInterfaceFor(false, true)).toBeNull();
+  });
+
   describe("Claude global instruction compatibility", () => {
     const metadata = (): WorkspaceMetadata => ({
       id: "test-workspace",

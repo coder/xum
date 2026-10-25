@@ -246,8 +246,17 @@ Manage servers in Settings → MCP.
  * The Agent interface view's guidance. Static text (it names $XUM_SCRATCH_DIR, not the path), so
  * the cached prompt stays the same across turns and sibling workspaces.
  */
-function buildAgentInterfaceContext(options: { agentInterfaceView?: boolean } | undefined): string {
+function buildAgentInterfaceContext(
+  options: { agentInterfaceView?: boolean; statusPageAgent?: boolean } | undefined
+): string {
   if (options?.agentInterfaceView !== true) return "";
+  if (options.statusPageAgent === true) {
+    return `
+
+<agent-interface>
+The user sees $XUM_SCRATCH_DIR/artifacts/${AGENT_INTERFACE_STATUS_ARTIFACT} in the main pane instead of this chat transcript by default, and can switch to the transcript at any time. A status page agent keeps the page current with its own model, so do not edit the page yourself. Call status_update with a short, self-contained update when you start, at each milestone, and before you finish; the call returns at once. If a status_update result reports that the status page agent failed, edit the page yourself. Still answer in chat as usual.
+</agent-interface>`;
+  }
   return `
 
 <agent-interface>
@@ -664,6 +673,11 @@ export interface BuildSystemMessageFromSourcesOptions {
    * sees the status page instead of the transcript, so the agent is told to keep it current.
    */
   agentInterfaceView?: boolean;
+  /**
+   * With agentInterfaceView: the status_update tool is in the final toolset (status page agent
+   * sub-experiment), so the agent sends updates instead of editing the page.
+   */
+  statusPageAgent?: boolean;
 }
 
 /**

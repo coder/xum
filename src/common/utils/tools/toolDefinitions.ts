@@ -71,6 +71,7 @@ import {
   WEB_FETCH_MAX_OUTPUT_BYTES,
 } from "@/common/constants/toolLimits";
 import { SESSION_MEMORY_VIRTUAL_DIR } from "@/common/constants/memory";
+import { STATUS_PAGE_AGENT_MAX_UPDATE_CHARS } from "@/common/constants/artifacts";
 import {
   ConfigMutationPathSchema,
   ConfigOperationsSchema,
@@ -3045,6 +3046,24 @@ export const TOOL_DEFINITIONS = {
       })
       .strict(),
   },
+  status_update: {
+    // Registered only in status page agent mode (artifacts-status-page-agent); the static
+    // description keeps the tool block cache-stable.
+    description:
+      "Send the status page agent an update for the status page the user sees instead of this chat. " +
+      "It edits the page with its own model in the background, and this call returns at once. " +
+      "Send a short, self-contained update when you start, at each milestone and before you finish: what you are doing, progress, results, and anything that needs the user. " +
+      "Say what to replace or remove. Do not edit status.html yourself.",
+    schema: z
+      .object({
+        update: z
+          .string()
+          .min(1)
+          .max(STATUS_PAGE_AGENT_MAX_UPDATE_CHARS)
+          .describe("The update, in plain words."),
+      })
+      .strict(),
+  },
   artifact_list: {
     // The guidance lives in this static description (not a prompt section) so it is
     // cache-stable and appears exactly when the tool does.
@@ -3414,6 +3433,8 @@ export function getAvailableTools(
     enableSessionHistory?: boolean;
     enableTimelineEvent?: boolean;
     enableArtifacts?: boolean;
+    /** Whether status_update is available (status page agent mode active this turn). */
+    enableStatusUpdate?: boolean;
     /** Whether tool_catalog_search is available (tool-search experiment + deferred MCP tools present). */
     enableToolSearch?: boolean;
     /** Whether mcp_prompt_get is available (connected MCP servers advertise prompts). */
@@ -3439,6 +3460,7 @@ export function getAvailableTools(
   const enableMemory = options.enableMemory ?? false;
   const enableTimelineEvent = options.enableTimelineEvent ?? false;
   const enableArtifacts = options.enableArtifacts ?? false;
+  const enableStatusUpdate = options.enableStatusUpdate ?? false;
   const enableToolSearch = options.enableToolSearch ?? false;
   const enableMcpPromptGet = options.enableMcpPromptGet ?? false;
   const enableReviewPane = options.enableReviewPane ?? true;
@@ -3477,6 +3499,7 @@ export function getAvailableTools(
     ...(enableMemory ? ["memory"] : []),
     ...(enableTimelineEvent ? ["timeline_event"] : []),
     ...(enableArtifacts ? ["artifact_list", "artifact", "artifact_read"] : []),
+    ...(enableStatusUpdate ? ["status_update"] : []),
     ...(enableToolSearch ? ["tool_catalog_search"] : []),
     ...(enableMcpPromptGet ? ["mcp_prompt_get"] : []),
     "ask_user_question",

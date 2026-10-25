@@ -42,6 +42,7 @@ const PTC_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [EXPERIMENT_IDS.RLM];
 // while Artifacts is off.
 const ARTIFACTS_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
   EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
+  EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT,
 ];
 
 // Every sub-experiment: hidden from the flat list, since each renders under its parent row.

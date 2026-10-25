@@ -21,6 +21,7 @@ export const EXPERIMENT_IDS = {
   SKILL_DYNAMIC_CONTEXT: "skill-dynamic-context",
   ARTIFACTS: "artifacts",
   ARTIFACTS_AGENT_INTERFACE: "artifacts-agent-interface",
+  ARTIFACTS_STATUS_PAGE_AGENT: "artifacts-status-page-agent",
   MCP_APPS: "mcp-apps",
   CONTINUOUS_COMPACTION: "continuous-compaction",
   TOKEN_BUDGET: "tokenBudget",
@@ -194,6 +195,17 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Agent interface view",
     description:
       "Show the agent's status page (status.html) instead of the chat transcript by default. Switch back to the chat at any time; the message box stays at the bottom.",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  // Sub-experiment of Artifacts (flat flag, gated on Artifacts and Agent interface view at call
+  // sites; Settings nests it under the Artifacts toggle): a host-run status page agent keeps
+  // status.html current from the main agent's status_update calls.
+  [EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT]: {
+    id: EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT,
+    name: "Status page agent",
+    description:
+      "A dedicated status page agent keeps status.html current with the model you pick under Settings > Agents > Status Page; the main agent only sends it short updates. Needs Agent interface view.",
     enabledByDefault: false,
     showInSettings: true,
   },
