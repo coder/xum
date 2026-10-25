@@ -12,7 +12,9 @@ const ASKPASS_SCRIPT = `#!/bin/sh
 req_id="$$.$(date +%s%N)"
 prompt_file="$MUX_ASKPASS_DIR/prompt.$req_id.txt"
 response_file="$MUX_ASKPASS_DIR/response.$req_id.txt"
-printf '%s' "$1" > "$prompt_file"
+# Write to a temp name, then mv: Xum's watcher must never read a half-written
+# prompt (#7498). The watcher ignores names that do not end in .txt.
+printf '%s' "$1" > "$prompt_file.tmp" && mv "$prompt_file.tmp" "$prompt_file" || exit 1
 # Poll for response file (60s timeout = 1200 × 50ms)
 i=0
 while [ "$i" -lt 1200 ]; do
@@ -32,6 +34,22 @@ let askpassPath: string | undefined;
 function extractRequestId(filename: string): string | undefined {
   const match = /^prompt\.(.+)\.txt$/.exec(filename);
   return match?.[1];
+}
+
+/**
+ * Write the askpass answer under a temp name, then rename it into place.
+ *
+ * writeFile creates the file empty before it writes the text. The script polls
+ * for the file and then cats and deletes it, so a poll inside that window read
+ * an empty answer and deleted the real one: SSH got "" for a host-key or
+ * passphrase prompt (#7498). A rename is atomic, so the script sees either no
+ * file or the whole answer. The session cleanup removes a temp file left by a
+ * failed rename along with the rest of the directory.
+ */
+async function writeResponseFile(responseFile: string, text: string): Promise<void> {
+  const tempFile = `${responseFile}.tmp`;
+  await fs.promises.writeFile(tempFile, text);
+  await fs.promises.rename(tempFile, responseFile);
 }
 
 async function ensureAskpassScript(): Promise<string> {
@@ -109,12 +127,12 @@ export async function createAskpassSession(
     try {
       const promptText = await fs.promises.readFile(promptFile, "utf-8");
       const response = await onPrompt(promptText);
-      await fs.promises.writeFile(responseFile, response + "\n");
+      await writeResponseFile(responseFile, response + "\n");
     } catch (err) {
       log.debug("Askpass prompt handling failed:", err);
       // Write rejection to unblock askpass (best-effort)
       try {
-        await fs.promises.writeFile(responseFile, "no\n");
+        await writeResponseFile(responseFile, "no\n");
       } catch {
         /* askpass may already be gone */
       }
@@ -130,7 +148,10 @@ export async function createAskpassSession(
 
       void (async () => {
         let candidateFilenames: string[];
-        if (typeof filename === "string") {
+        // The script renames each prompt into place. Linux reports the rename
+        // under the final name. If a platform reports only the temp name (or no
+        // name), rescan the directory so the prompt is not missed.
+        if (typeof filename === "string" && extractRequestId(filename) !== undefined) {
           candidateFilenames = [filename];
         } else {
           try {
