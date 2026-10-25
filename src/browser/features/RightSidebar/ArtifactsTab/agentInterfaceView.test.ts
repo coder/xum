@@ -104,6 +104,15 @@ describe("status page fallback to the transcript", () => {
       },
       true,
     ],
+    [
+      "a page its stylesheet draws shows",
+      {
+        ...html,
+        content:
+          '<!doctype html><html><head><style>body::before{content:"Working"}</style></head><body></body></html>',
+      },
+      true,
+    ],
     ["a binary file does not", { ...meta, status: "binary" }, false],
     ["a file over the read cap does not", { ...meta, status: "too_large", maxBytes: 1 }, false],
   ])("%s", (_name, read, expected) => {
