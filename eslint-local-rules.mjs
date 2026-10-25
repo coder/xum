@@ -81,6 +81,38 @@ function resolveVariable(sourceCode, identifier) {
   return null;
 }
 
+/**
+ * True when a parameter, import or local declares the identifier's name as a value in its scope
+ * chain. A type-only declaration (`interface Date`, `type AbortSignal = ...`) does not count:
+ * TypeScript keeps types and values apart, so `Date.now()` still reads the host global.
+ */
+function isDeclaredLocally(sourceCode, identifier) {
+  return resolveVariable(sourceCode, identifier)?.defs.some((def) => def.type !== "Type") ?? false;
+}
+
+/** The property name of `a.b` or of the static `a["b"]`; null for any other member. */
+function memberName(node) {
+  if (node.type !== "MemberExpression") return null;
+  if (!node.computed) return node.property.name ?? null;
+  return node.property.type === "Literal" && typeof node.property.value === "string"
+    ? node.property.value
+    : null;
+}
+
+/**
+ * The built-in global `name`: the bare name when no parameter, import or local declares it, or
+ * a member of the global object (`globalThis.name`, Node's `global.name`, or `global["name"]`).
+ */
+function isHostGlobal(sourceCode, node, name) {
+  if (node.type === "Identifier") return node.name === name && !isDeclaredLocally(sourceCode, node);
+  return (
+    memberName(node) === name &&
+    node.object.type === "Identifier" &&
+    (node.object.name === "globalThis" || node.object.name === "global") &&
+    !isDeclaredLocally(sourceCode, node.object)
+  );
+}
+
 function variableDeclarator(variable) {
   if (variable.defs.length !== 1) {
     return null;
@@ -759,12 +791,16 @@ const localPlugin = {
         };
       },
     },
+    // Limits: this rule catches direct spellings (Date.now(), globalThis.setTimeout,
+    // timers imports, require("timers")) and skips locals that shadow those names.
+    // It does not follow aliases through variables, destructuring, Reflect, eval or
+    // other dynamic access, so `const d = Date; d.now()` passes. Review catches those.
     "no-raw-clock": {
       meta: {
         type: "problem",
         docs: {
           description:
-            "Disallow raw clock reads (Date.now(), new Date(), setTimeout(), setInterval()) in agent-loop code",
+            "Disallow raw clock reads (Date.now(), Date(), new Date(), setTimeout(), setInterval(), AbortSignal.timeout()) in agent-loop code",
         },
         schema: [
           {
@@ -789,49 +825,117 @@ const localPlugin = {
         const relFile = path.relative(context.cwd, context.filename).split(path.sep).join("/");
         const allowed = context.options[0]?.allow?.[relFile] ?? 0;
         const found = [];
-        const isTimer = (node) =>
-          node.type === "Identifier" && (node.name === "setTimeout" || node.name === "setInterval");
-        const memberOf = (node, object) =>
-          node.type === "MemberExpression" &&
-          !node.computed &&
-          node.object.type === "Identifier" &&
-          node.object.name === object;
-        // `Date` or `globalThis.Date`: both name the host clock.
-        const isDate = (node) =>
-          (node.type === "Identifier" && node.name === "Date") ||
-          (memberOf(node, "globalThis") && node.property.name === "Date");
+        const TIMERS = new Set(["setTimeout", "setInterval"]);
+        const TIMER_MODULES = new Set(["timers", "timers/promises"]);
+        // Declaring identifiers of the bindings that the "timers" and "timers/promises" modules
+        // give: a timer under any name (`import { setTimeout as delay }`,
+        // `const { setTimeout: delay } = require(...)`), or the module itself (`import * as
+        // timers`, `import timers = require(...)`, `const timers = require(...)`).
+        const timerBindings = new Set();
+        const moduleBindings = new Set();
+        const isTimerModule = (source) =>
+          source?.type === "Literal" &&
+          typeof source.value === "string" &&
+          TIMER_MODULES.has(source.value.replace(/^node:/, ""));
+        // `require("node:timers")` or `await import("node:timers")`.
+        const loadsTimers = (node) =>
+          (node?.type === "CallExpression" &&
+            isHostGlobal(context.sourceCode, node.callee, "require") &&
+            node.callee.type === "Identifier" &&
+            isTimerModule(node.arguments[0])) ||
+          (node?.type === "AwaitExpression" &&
+            node.argument.type === "ImportExpression" &&
+            isTimerModule(node.argument.source));
+        const hostGlobal = (node, name) => isHostGlobal(context.sourceCode, node, name);
+        // A call whose callee needs its binding checked at the end: `id` must resolve to one of
+        // `bindings`, so a parameter or local that shadows the import is not a timer.
+        const viaBinding = (node, what, id, bindings) =>
+          found.push({ node, what, check: { id, bindings } });
+        const resolvesTo = ({ id, bindings }) =>
+          resolveVariable(context.sourceCode, id)?.identifiers.some((def) => bindings.has(def)) ??
+          false;
         return {
+          ImportDeclaration(node) {
+            if (node.importKind === "type" || !isTimerModule(node.source)) return;
+            for (const specifier of node.specifiers) {
+              const imported =
+                specifier.type === "ImportSpecifier"
+                  ? (specifier.imported.name ?? specifier.imported.value)
+                  : null;
+              // A namespace or default import, or `import { default as timers }`.
+              if (imported === null || imported === "default") {
+                if (specifier.importKind !== "type") moduleBindings.add(specifier.local);
+              } else if (specifier.importKind !== "type" && TIMERS.has(imported)) {
+                timerBindings.add(specifier.local);
+              }
+            }
+          },
+          // `import timers = require("node:timers")` (TypeScript import assignment).
+          TSImportEqualsDeclaration(node) {
+            if (
+              node.importKind !== "type" &&
+              node.moduleReference.type === "TSExternalModuleReference" &&
+              isTimerModule(node.moduleReference.expression)
+            ) {
+              moduleBindings.add(node.id);
+            }
+          },
+          VariableDeclarator(node) {
+            if (!loadsTimers(node.init)) return;
+            if (node.id.type === "Identifier") {
+              moduleBindings.add(node.id);
+              return;
+            }
+            if (node.id.type !== "ObjectPattern") return;
+            for (const property of node.id.properties) {
+              if (
+                property.type === "Property" &&
+                !property.computed &&
+                TIMERS.has(property.key.name ?? property.key.value) &&
+                property.value.type === "Identifier"
+              ) {
+                timerBindings.add(property.value);
+              }
+            }
+          },
           CallExpression(node) {
             const callee = node.callee;
-            if (
-              callee.type === "MemberExpression" &&
-              !callee.computed &&
-              isDate(callee.object) &&
-              callee.property.name === "now"
-            ) {
+            const member = memberName(callee);
+            const hostTimer = [...TIMERS].find((timer) => hostGlobal(callee, timer));
+            if (member === "now" && hostGlobal(callee.object, "Date")) {
               found.push({ node, what: "Date.now()" });
-            } else if (isTimer(callee)) {
-              found.push({ node, what: `${callee.name}()` });
-            } else if (memberOf(callee, "globalThis") && isTimer(callee.property)) {
-              found.push({ node, what: `globalThis.${callee.property.name}()` });
+            } else if (hostGlobal(callee, "Date")) {
+              // `Date()` without `new` returns the current time as a string.
+              found.push({ node, what: "Date()" });
+            } else if (hostTimer !== undefined) {
+              found.push({ node, what: `${hostTimer}()` });
+            } else if (callee.type === "Identifier") {
+              viaBinding(node, `${callee.name}()`, callee, timerBindings);
+            } else if (TIMERS.has(member) && callee.object.type === "Identifier") {
+              viaBinding(node, `${callee.object.name}.${member}()`, callee.object, moduleBindings);
+            } else if (member === "timeout" && hostGlobal(callee.object, "AbortSignal")) {
+              // A host timer that aborts the signal: the TestClock cannot reach it.
+              found.push({ node, what: "AbortSignal.timeout()" });
             }
           },
           NewExpression(node) {
-            if (isDate(node.callee) && node.arguments.length === 0) {
+            if (hostGlobal(node.callee, "Date") && node.arguments.length === 0) {
               found.push({ node, what: "new Date()" });
             }
           },
           "Program:exit"(program) {
             // The allow entry is an exact count, so it can only go down: a move PR that
             // removes reads must lower its entry, and a new read fails.
-            for (const { node, what } of found.slice(allowed)) {
+            // Bindings are known only now: an import or require can follow the call.
+            const reads = found.filter(({ check }) => check === undefined || resolvesTo(check));
+            for (const { node, what } of reads.slice(allowed)) {
               context.report({ node, messageId: "raw", data: { what } });
             }
-            if (found.length < allowed) {
+            if (reads.length < allowed) {
               context.report({
                 node: program,
                 messageId: "lowerAllow",
-                data: { found: String(found.length), allowed: String(allowed) },
+                data: { found: String(reads.length), allowed: String(allowed) },
               });
             }
           },
@@ -877,6 +981,17 @@ const localPlugin = {
               method.value === "now"
             ) {
               context.report({ node, messageId: "patch", data: { what: 'spyOn(Date, "now")' } });
+            }
+          },
+          // `Date.now = () => t` (or `globalThis.Date.now = ...`) replaces the clock directly.
+          AssignmentExpression(node) {
+            const left = node.left;
+            // `Date`, `globalThis.Date` or Node's `global.Date`: one process-wide clock.
+            if (
+              memberName(left) === "now" &&
+              isHostGlobal(context.sourceCode, left.object, "Date")
+            ) {
+              context.report({ node, messageId: "patch", data: { what: "Date.now = ..." } });
             }
           },
         };

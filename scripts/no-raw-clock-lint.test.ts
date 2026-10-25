@@ -55,6 +55,130 @@ test("reports raw clock reads and global timers", () => {
   expect(rawClock(`const d = new globalThis.Date();`)).toEqual(["raw"]);
 });
 
+// #7282: forms the first version of the rule missed, one test per gap.
+test("reports a Date() call", () => {
+  expect(rawClock(`const s = Date();`)).toEqual(["raw"]);
+  expect(rawClock(`const s = globalThis.Date();`)).toEqual(["raw"]);
+});
+
+test("reports AbortSignal.timeout()", () => {
+  expect(rawClock(`const signal = AbortSignal.timeout(10);`)).toEqual(["raw"]);
+  expect(rawClock(`const signal = globalThis.AbortSignal.timeout(10);`)).toEqual(["raw"]);
+});
+
+test("reports timers imported from the timers modules under another name", () => {
+  expect(
+    rawClock(`import { setTimeout as delay } from "node:timers/promises";\nawait delay(10);`)
+  ).toEqual(["raw"]);
+  expect(rawClock(`import { setInterval as every } from "timers";\nevery(tick, 10);`)).toEqual([
+    "raw",
+  ]);
+  expect(rawClock(`import * as timers from "node:timers";\ntimers.setTimeout(fire, 10);`)).toEqual([
+    "raw",
+  ]);
+  // A call above the import still counts, and an unaliased import counts once.
+  expect(
+    rawClock(`await delay(10);\nimport { setTimeout as delay } from "timers/promises";`)
+  ).toEqual(["raw"]);
+  expect(rawClock(`import { setTimeout } from "timers/promises";\nawait setTimeout(10);`)).toEqual([
+    "raw",
+  ]);
+});
+
+test("reports timers that CommonJS forms load from the timers modules", () => {
+  expect(rawClock(`import timers = require("node:timers");\ntimers.setTimeout(fire, 10);`)).toEqual(
+    ["raw"]
+  );
+  expect(rawClock(`const timers = require("timers");\ntimers.setInterval(tick, 10);`)).toEqual([
+    "raw",
+  ]);
+  expect(
+    rawClock(`const { setTimeout: delay } = require("node:timers/promises");\nawait delay(10);`)
+  ).toEqual(["raw"]);
+});
+
+test("passes a local name that shadows an imported timer", () => {
+  const imported = `import { setTimeout as delay } from "node:timers/promises";\n`;
+  expect(rawClock(`${imported}function run(delay: () => void) {\n  delay();\n}`)).toEqual([]);
+  expect(rawClock(`${imported}{\n  const delay = () => 1;\n  delay();\n}`)).toEqual([]);
+  const namespace = `import * as timers from "node:timers";\n`;
+  expect(rawClock(`${namespace}function run(timers: T) {\n  timers.setTimeout(f, 1);\n}`)).toEqual(
+    []
+  );
+});
+
+test("passes a local named global or globalThis", () => {
+  expect(rawClock(`function read(global: G) {\n  return global.Date.now();\n}`)).toEqual([]);
+  expect(rawClock(`function arm(globalThis: G) {\n  globalThis.setTimeout(f, 1);\n}`)).toEqual([]);
+  const patch = (code: string) => ids("no-global-clock-patch", code);
+  expect(patch(`function fake(global: G) {\n  global.Date.now = () => 1;\n}`)).toEqual([]);
+});
+
+test("passes locals named Date or AbortSignal", () => {
+  expect(rawClock(`function render(Date: () => string) {\n  return Date();\n}`)).toEqual([]);
+  expect(rawClock(`function f(Date: D) {\n  return Date.now() + new Date().getTime();\n}`)).toEqual(
+    []
+  );
+  expect(rawClock(`function f(AbortSignal: S) {\n  return AbortSignal.timeout(10);\n}`)).toEqual(
+    []
+  );
+  const patch = (code: string) => ids("no-global-clock-patch", code);
+  expect(patch(`function fake(Date: D) {\n  Date.now = () => 1;\n}`)).toEqual([]);
+});
+
+test("reports host clock reads next to a type-only declaration of the same name", () => {
+  // TypeScript keeps types and values apart: `interface Date` does not shadow the value `Date`.
+  expect(rawClock(`interface Date {\n  x: number;\n}\nconst t = Date.now();`)).toEqual(["raw"]);
+  expect(rawClock(`type AbortSignal = number;\nconst s = AbortSignal.timeout(10);`)).toEqual([
+    "raw",
+  ]);
+  const patch = (code: string) => ids("no-global-clock-patch", code);
+  expect(patch(`interface Date {\n  x: number;\n}\nDate.now = () => 1;`)).toEqual(["patch"]);
+});
+
+test("passes a local named require", () => {
+  expect(
+    rawClock(
+      `function f(require: (id: string) => T) {\n  const timers = require("node:timers");\n  return timers.setTimeout(fire, 10);\n}`
+    )
+  ).toEqual([]);
+});
+
+test("reports timers loaded by await import() and static computed members", () => {
+  expect(
+    rawClock(`const timers = await import("node:timers");\ntimers.setTimeout(fire, 10);`)
+  ).toEqual(["raw"]);
+  expect(
+    rawClock(`const { setTimeout: delay } = await import("timers/promises");\nawait delay(10);`)
+  ).toEqual(["raw"]);
+  expect(
+    rawClock(`import * as timers from "node:timers";\ntimers["setTimeout"](fire, 10);`)
+  ).toEqual(["raw"]);
+  expect(rawClock(`globalThis["setTimeout"](fire, 10);`)).toEqual(["raw"]);
+  expect(rawClock(`const t = global["Date"].now();`)).toEqual(["raw"]);
+});
+
+test("reports timers from a named default import of a timers module", () => {
+  expect(
+    rawClock(`import { default as timers } from "node:timers";\ntimers.setTimeout(fire, 10);`)
+  ).toEqual(["raw"]);
+});
+
+test("reports Node's global object like globalThis", () => {
+  expect(rawClock(`const t = global.Date.now();`)).toEqual(["raw"]);
+  expect(rawClock(`global.setTimeout(() => undefined, 10);`)).toEqual(["raw"]);
+  expect(rawClock(`const signal = global.AbortSignal.timeout(10);`)).toEqual(["raw"]);
+});
+
+test("passes non-timer imports from the timers modules and other abort signals", () => {
+  expect(
+    rawClock(`import { setImmediate as yieldNow } from "node:timers/promises";\nawait yieldNow();`)
+  ).toEqual([]);
+  expect(rawClock(`import { setTimeout as delay } from "./delay";\nawait delay(10);`)).toEqual([]);
+  expect(rawClock(`const signal = AbortSignal.any([a, b]);`)).toEqual([]);
+  expect(rawClock(`const signal = clock.timeout(10);`)).toEqual([]);
+});
+
 test("passes HostClock reads, monotonic durations and date parsing", () => {
   expect(rawClock(`const t = clock.nowMs();`)).toEqual([]);
   expect(rawClock(`const cancel = clock.setTimer(fire, 10);`)).toEqual([]);
@@ -88,6 +212,17 @@ test("reports global time patches in tests that moved to the TestClock", () => {
   expect(patch(`await clock.adjust(1000);`)).toEqual([]);
 });
 
+// #7282: direct assignment replaces the clock too.
+test("reports a direct Date.now assignment in tests that moved to the TestClock", () => {
+  const patch = (code: string) => ids("no-global-clock-patch", code);
+  expect(patch(`Date.now = () => 1;`)).toEqual(["patch"]);
+  expect(patch(`globalThis.Date.now = () => 1;`)).toEqual(["patch"]);
+  expect(patch(`global.Date.now = () => 1;`)).toEqual(["patch"]);
+  expect(patch(`Date["now"] = () => 1;`)).toEqual(["patch"]);
+  expect(patch(`const now = Date.now;`)).toEqual([]);
+  expect(patch(`clock.now = () => 1;`)).toEqual([]);
+});
+
 // The raw reads of each loop file when the ratchet landed. Entries only go down: a later PR
 // lowers or removes a file's entry when it moves that file onto the HostClock service.
 const RAW_CLOCK_CEILING: Record<string, number> = {
@@ -102,6 +237,9 @@ const RAW_CLOCK_CEILING: Record<string, number> = {
   "src/node/services/tools/bash_background_list.ts": 1,
   "src/node/services/tools/code_execution.ts": 3,
   "src/node/services/tools/skills_catalog_read.ts": 1,
+  // Its AbortSignal.timeout() was there when the ratchet landed, but the rule counted it only
+  // from #7282 on.
+  "src/node/services/tools/skillsCatalogFetch.ts": 1,
   "src/node/services/tools/task.ts": 1,
   "src/node/services/tools/task_await.ts": 7,
   "src/node/services/tools/toolUtils.ts": 1,
