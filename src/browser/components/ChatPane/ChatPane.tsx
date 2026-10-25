@@ -71,7 +71,7 @@ import {
 import { WorkspaceMenuBar } from "../WorkspaceMenuBar/WorkspaceMenuBar";
 import { useMainPaneAgentInterfaceView } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceView";
 import type { AgentInterfaceView } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceViewState";
-import { AgentInterfaceStatusView } from "@/browser/features/RightSidebar/ArtifactsTab/AgentInterfaceStatusView";
+import { LazyFeature } from "../LazyFeature/LazyFeature";
 import { WorkspaceFooterBar } from "./WorkspaceFooterBar";
 import type { DisplayedMessage, QueuedMessage as QueuedMessageData } from "@/common/types/message";
 import type { HeldInput as HeldInputData } from "@/common/orpc/types";
@@ -137,6 +137,13 @@ import {
   type CustomEventType,
   type CustomEventPayloads,
 } from "@/common/constants/events";
+
+// The status page loads with the Agent interface view only (#7510): through ArtifactViewer it
+// pulls the artifact frame, which the workspace page must not download while the view is off.
+const AgentInterfaceStatusView = React.lazy(async () => ({
+  default: (await import("@/browser/features/RightSidebar/ArtifactsTab/AgentInterfaceStatusView"))
+    .AgentInterfaceStatusView,
+}));
 
 const TRANSCRIPT_ONLY_NOTICE =
   "This workspace's worktree is no longer available. This is a read-only chat transcript kept for historical and usage-tracking reasons.";
@@ -1657,13 +1664,17 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         >
           {/* Before the scrollport, which holds the composer dock, so Tab reaches the page
               before the composer below it. */}
-          <AgentInterfaceStatusView
-            key={workspaceId}
-            workspaceId={workspaceId}
-            view={props.agentInterfaceView}
-            dockRef={composerDockRef}
-            composerApiRef={chatInputAPI}
-          />
+          {showStatusView && (
+            <LazyFeature name="Status page">
+              <AgentInterfaceStatusView
+                key={workspaceId}
+                workspaceId={workspaceId}
+                view={props.agentInterfaceView}
+                dockRef={composerDockRef}
+                composerApiRef={chatInputAPI}
+              />
+            </LazyFeature>
+          )}
           <div
             ref={contentRef}
             onWheel={handleTranscriptWheel}
