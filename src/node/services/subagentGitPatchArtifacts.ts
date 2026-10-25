@@ -8,7 +8,6 @@ import type {
   SubagentGitProjectPatchArtifact,
 } from "@/common/utils/tools/toolDefinitions";
 import { log } from "@/node/services/log";
-import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 export interface SubagentGitPatchArtifactsFile {
@@ -349,11 +348,10 @@ export async function updateSubagentGitPatchArtifactsFile(params: {
   workspaceId: string;
   workspaceSessionDir: string;
   update: (file: SubagentGitPatchArtifactsFile) => void;
-  /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
-  locks?: SessionLocks;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }): Promise<SubagentGitPatchArtifactsFile> {
-  // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
-  const fileLocks = (params.locks ?? nodeSessionLocks).workspaceFiles;
+  const fileLocks = params.locks.workspaceFiles;
   return fileLocks.withLock(params.workspaceId, async () => {
     const file = await readSubagentGitPatchArtifactsFile(params.workspaceSessionDir);
     params.update(file);
@@ -380,8 +378,8 @@ export async function upsertSubagentGitPatchArtifact(params: {
   workspaceSessionDir: string;
   childTaskId: string;
   updater: (existing: SubagentGitPatchArtifact | null) => SubagentGitPatchArtifact;
-  /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
-  locks?: SessionLocks;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }): Promise<SubagentGitPatchArtifact> {
   let updated: SubagentGitPatchArtifact | null = null;
 
@@ -409,8 +407,8 @@ export async function markSubagentGitPatchArtifactApplied(params: {
   childTaskId: string;
   projectPath: string;
   appliedAtMs: number;
-  /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
-  locks?: SessionLocks;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
 }): Promise<SubagentGitPatchArtifact | null> {
   let updated: SubagentGitPatchArtifact | null = null;
 

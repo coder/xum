@@ -26,6 +26,7 @@ import {
   workspaceRemovalTombstonePath,
 } from "@/node/services/workspaceRemoval";
 import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 /** Collect all messages via iterateFullHistory (replaces removed getFullHistory). */
 async function collectFullHistory(service: HistoryService, workspaceId: string) {
@@ -4645,6 +4646,7 @@ describe("HistoryService", () => {
       if (chatLines) await fs.writeFile(chatPath, chatLines.join("\n") + "\n");
       await fs.writeFile(partialPath, JSON.stringify(partial));
       await updateSubagentTranscriptArtifactsFile({
+        locks: nodeSessionLocks,
         workspaceId: ownerId,
         workspaceSessionDir: ownerDir,
         update: (file) => {
@@ -4713,6 +4715,7 @@ describe("HistoryService", () => {
         await memory.files.promises.mkdir(transcriptDir, { recursive: true });
         await memory.files.promises.writeFile(chatPath, JSON.stringify(message) + "\n");
         await updateSubagentTranscriptArtifactsFile({
+          locks: nodeSessionLocks,
           workspaceId: ownerId,
           workspaceSessionDir: ownerDir,
           files: memory.files,

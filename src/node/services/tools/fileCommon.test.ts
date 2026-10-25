@@ -11,6 +11,7 @@ import {
 // A static import, not a require("...?real=1") copy: Bun's LCOV keeps only the last-loaded copy of
 // a file, so a copy would replace runtimeFactory.test.ts's coverage of runtimeFactory.ts.
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("fileCommon", () => {
   describe("validateFileSize", () => {
@@ -218,6 +219,7 @@ describe("fileCommon", () => {
     } as unknown as Runtime;
 
     const planModeConfig: ToolConfiguration = {
+      sessionLocks: nodeSessionLocks,
       cwd: "/home/user/project",
       runtime: mockRuntime,
       runtimeTempDir: "/tmp",

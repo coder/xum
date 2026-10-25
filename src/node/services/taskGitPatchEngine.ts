@@ -1255,8 +1255,8 @@ async function applyProjectPatch(params: {
   expectedHeadSha?: string;
   isReplay: boolean;
   abortSignal?: AbortSignal;
-  /** The artifact workspace's FIFO for the applied watermark write. Absent: the Node layer. */
-  locks?: SessionLocks;
+  /** The artifact workspace's FIFO for the applied watermark write. */
+  locks: SessionLocks;
 }): Promise<{ success: boolean; projectResult: TaskApplyGitPatchProjectResult }> {
   const taskIdError = validatePatchRuntimePathComponent(params.taskId, "task_id");
   const storageKeyError = validatePatchRuntimePathComponent(

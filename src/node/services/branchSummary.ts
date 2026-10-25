@@ -33,7 +33,6 @@ import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { pluginHookContextTexts } from "@/common/utils/messages/pluginHookContext";
-import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import {
   BRANCH_SUMMARY_MAX_ACCUMULATED_CHARS,
@@ -942,6 +941,15 @@ export async function runInlineAbandonedBranchSummary(
 }
 
 /**
+ * The cross-process pending marker of a fork's session dir. The locks are part of it, with no
+ * Node default: a caller that names the marker also names its session's locks (#7326).
+ */
+export interface BranchSummaryMarker {
+  sessionDir: string;
+  locks: SessionLocks;
+}
+
+/**
  * Start abandoned-branch summarization without blocking the caller on
  * GENERATION. Used by fork: awaiting generation synchronously stalls the
  * user-facing fork for seconds even when it ultimately produces nothing.
@@ -955,9 +963,7 @@ export async function runInlineAbandonedBranchSummary(
 export async function startAbandonedBranchSummaryInBackground(
   input: AbandonedBranchSummaryInput & {
     guardTailMessageId: string;
-    sessionDir?: string;
-    /** The pending marker's lock (phase 4: SessionLocks). Absent: the Node layer. */
-    locks?: SessionLocks;
+    marker?: BranchSummaryMarker;
   }
 ): Promise<void> {
   const controller = new AbortController();
@@ -983,11 +989,10 @@ export async function startAbandonedBranchSummaryInBackground(
     // awaitPendingBranchSummary). Best-effort like the summary itself —
     // acquisition failure degrades to process-local coordination.
     let lock: AsyncDisposable | null = null;
-    if (input.sessionDir !== undefined) {
+    if (input.marker !== undefined) {
       try {
-        // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
-        lock = await (input.locks ?? nodeSessionLocks).acquireProcessFileLock({
-          lockPath: path.join(input.sessionDir, BRANCH_SUMMARY_LOCK_FILENAME),
+        lock = await input.marker.locks.acquireProcessFileLock({
+          lockPath: path.join(input.marker.sessionDir, BRANCH_SUMMARY_LOCK_FILENAME),
           timeoutMs: BRANCH_SUMMARY_LOCK_ACQUIRE_TIMEOUT_MS,
           label: "branch summary pending marker",
         });
@@ -1039,9 +1044,7 @@ export async function startAbandonedBranchSummaryInBackground(
  */
 export async function awaitPendingBranchSummary(
   workspaceId: string,
-  sessionDir?: string,
-  /** The pending marker's lock (phase 4: SessionLocks). */
-  locks: SessionLocks = nodeSessionLocks
+  marker?: BranchSummaryMarker
 ): Promise<MuxMessage | null> {
   const entry = pendingBranchSummaries.get(workspaceId);
   if (!entry) {
@@ -1057,11 +1060,11 @@ export async function awaitPendingBranchSummary(
     // emit it to its renderer. The ENOENT fast path keeps ordinary sends at
     // one stat of a nonexistent file. The probe comes from the same locks as
     // the writer's acquire: a memory layer leaves no lock file to stat.
-    if (sessionDir !== undefined) {
-      const lockPath = path.join(sessionDir, BRANCH_SUMMARY_LOCK_FILENAME);
-      if (await locks.processFileLockExists(lockPath)) {
+    if (marker !== undefined) {
+      const lockPath = path.join(marker.sessionDir, BRANCH_SUMMARY_LOCK_FILENAME);
+      if (await marker.locks.processFileLockExists(lockPath)) {
         try {
-          const lock = await locks.acquireProcessFileLock({
+          const lock = await marker.locks.acquireProcessFileLock({
             lockPath,
             timeoutMs: BRANCH_SUMMARY_LOCK_WAIT_TIMEOUT_MS,
             label: "branch summary pending marker",
