@@ -2993,12 +2993,15 @@ describe("BackgroundProcessManager", () => {
 
     it("should deliver SIGTERM to the bash process (TERM trap executes)", async () => {
       const sentinelPath = path.join(bgOutputDir, `term-sentinel-${Date.now()}`);
+      const readyPath = path.join(bgOutputDir, `term-ready-${Date.now()}`);
       const displayName = `test-term-trap-${Date.now()}`;
 
+      // The script marks the trap as installed: spawn() returns once the process starts, and a
+      // SIGTERM that lands before the `trap` line runs kills bash without the trap (#7256).
       const spawnResult = await manager.spawn(
         runtime,
         testWorkspaceId,
-        `trap "echo term > '${sentinelPath}'; exit 0" TERM; sleep 60`,
+        `trap "echo term > '${sentinelPath}'; exit 0" TERM; : > '${readyPath}'; sleep 60`,
         {
           cwd: process.cwd(),
           displayName,
@@ -3007,26 +3010,24 @@ describe("BackgroundProcessManager", () => {
 
       expect(spawnResult.success).toBe(true);
       if (!spawnResult.success) return;
+      while (!(await fs.stat(readyPath).catch(() => null))) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
 
       const terminateResult = await manager.terminate(spawnResult.processId, {
         monitorDisposition: "discard",
       });
       expect(terminateResult.success).toBe(true);
 
-      // Wait briefly for the trap to write the sentinel file.
+      // The trap writes the sentinel before bash exits. Wait for it without a deadline of our
+      // own: a trap that never runs fails on the test timeout.
       let sentinel: string | null = null;
-      for (let attempt = 0; attempt < 20; attempt++) {
-        try {
-          sentinel = await fs.readFile(sentinelPath, "utf-8");
-          break;
-        } catch {
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
+      while (sentinel === null) {
+        sentinel = await fs.readFile(sentinelPath, "utf-8").catch(() => null);
+        if (sentinel === null) await new Promise((resolve) => setTimeout(resolve, 25));
       }
-
-      expect(sentinel).not.toBeNull();
-      expect(sentinel!).toContain("term");
-    });
+      expect(sentinel).toContain("term");
+    }, 20_000);
   });
 
   describe("cleanup", () => {
