@@ -248,6 +248,56 @@ describe("StreamManager - stream resource scope", () => {
     expect(registry.set(executionScope, "late-call", snapshot)).toBe(false);
   });
 
+  test("a stop closes the tool-call display scope before the stream exits", async () => {
+    // Tool wrappers that are still running while the stop waits for the
+    // provider loop must not publish into the aborted turn.
+    const registry = new ToolCallDisplayRegistry();
+    const workspaceId = "display-scope-stop-workspace";
+    const messageId = `${workspaceId}-msg`;
+    const executionScope = { workspaceId, messageId, token: "display2" };
+    const snapshot = {
+      connection: { key: "echo", transport: "stdio" as const },
+      identity: { name: "n", version: "1" },
+      source: "connection" as const,
+    };
+    let lateSetDuringStop: boolean | undefined;
+    const streamManager = createStreamManagerForTests(historyService, {
+      toolCallDisplayRegistry: registry,
+      streamText: fakeStreamText(({ abortSignal }) =>
+        createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            yield { type: "text-delta", text: "hello" };
+            await new Promise<void>((resolve) =>
+              abortSignal!.addEventListener("abort", () => resolve(), { once: true })
+            );
+            // The stop has aborted the signal; the loop has not exited yet.
+            lateSetDuringStop = registry.set(executionScope, "late-call", snapshot);
+          })()
+        )
+      ),
+    });
+    registry.open(executionScope);
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId,
+        model: createTestLanguageModel(),
+        tools: {},
+        runtime: LOCAL_TEST_RUNTIME,
+        providedRuntimeTempDir: "",
+        providedStreamToken: "display2" as ReturnType<StreamManager["generateStreamToken"]>,
+        executionScope,
+      })
+    );
+    if (!result.success) throw new Error("Expected stream to start");
+
+    expect((await streamManager.stopStream(workspaceId)).success).toBe(true);
+    expect((await result.data.completion).status).toBe("aborted");
+    expect(lateSetDuringStop).toBe(false);
+  });
+
   /** Virtual time far past the partial-write throttle window. */
   const PAST_THROTTLE_WINDOW_MS = 60_000;
 
@@ -859,6 +909,30 @@ describe("StreamManager - language model cleanup", () => {
     expect(streams.get(workspaceId)).toBe(replacementSentinel);
     // The never-processed stream's model still gets cleaned up.
     expect(getCleanupCalls()).toBe(1);
+  });
+
+  test("a stop during onStreamConstructed releases the stream's model before stream-abort", async () => {
+    const { model, getCleanupCalls } = createCleanupModel("constructed-abort-order-model");
+    let cleanupCallsAtAbort: number | undefined;
+    const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
+      if (event.type === "stream-abort") cleanupCallsAtAbort = getCleanupCalls();
+    });
+    const workspaceId = "constructed-abort-order-workspace";
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId: "constructed-abort-order-message",
+        model,
+        onStreamConstructed: async () => {
+          await streamManager.stopStream(workspaceId);
+        },
+      })
+    );
+
+    expect(result.success).toBe(true);
+    // The STARTING stream never ran processing, so the stop itself retires its resources.
+    expect(cleanupCallsAtAbort).toBe(1);
   });
 
   test("returning the startup envelope cannot bypass a held abort fence or emit a second startup abort", async () => {
