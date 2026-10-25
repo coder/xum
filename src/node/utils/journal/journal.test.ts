@@ -213,6 +213,33 @@ describe("Journal option bounds and append sizes", () => {
     expect(() => new Journal<Row>(options("j", 1))).not.toThrow();
   });
 
+  // #7474: a late append into a removed session dir must fail and must not recreate it.
+  test("createParentDir false fails with ENOENT and leaves a removed folder removed", async () => {
+    using tmp = new DisposableTempDir("journal-test");
+    const dir = path.join(tmp.path, "session");
+    const journal = new Journal<Row>(options(path.join(dir, "test.jsonl")));
+    await journal.append((seq) => ({ seq, id: "a", value: "first" }));
+    // Workspace removal deletes the session dir under a slow writer.
+    await fs.rm(dir, { recursive: true, force: true });
+    const failure = await journal
+      .append((seq) => ({ seq, id: "b", value: "late" }), { createParentDir: false })
+      .then(
+        () => "resolved",
+        (error: unknown) => (error as NodeJS.ErrnoException).code
+      );
+    expect(failure).toBe("ENOENT");
+    expect(
+      await fs.stat(dir).then(
+        () => "exists",
+        () => "missing"
+      )
+    ).toBe("missing");
+    // The default still creates the folder.
+    const row = await journal.append((seq) => ({ seq, id: "c", value: "again" }));
+    expect(row.seq).toBe(0);
+    expect((await fs.stat(dir)).isDirectory()).toBe(true);
+  });
+
   test("onAppended reports the file size after each append", async () => {
     using tmp = new DisposableTempDir("journal-test");
     const filePath = path.join(tmp.path, "test.jsonl");
