@@ -15,6 +15,7 @@ import {
 } from "../sshConnectionPool";
 import type { SpawnResult } from "../RemoteRuntime";
 import { RuntimeError } from "../Runtime";
+import { isXumDaytonaHost } from "@/common/constants/daytona";
 import { assert } from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
@@ -146,7 +147,12 @@ export class OpenSSHTransport implements SSHTransport {
   async createPtySession(params: PtySessionParams): Promise<PtyHandle> {
     await this.acquireConnection({ maxWaitMs: 0 });
 
-    const args: string[] = [...this.buildBaseSSHArgs()];
+    // Daytona's gateway takes the access token as the ssh user name, and OpenSSH's fatal
+    // `<user>@<host>: Permission denied` would print it into the terminal, which clients
+    // replay. QUIET also silences fatal messages, so a Daytona terminal shows no ssh messages
+    // (ensureReady reports connection problems before it opens).
+    const logLevel = isXumDaytonaHost(this.config.host) ? "QUIET" : "FATAL";
+    const args: string[] = [...this.buildBaseSSHArgs(logLevel)];
     args.push("-o", "ControlMaster=no");
     args.push("-o", "ConnectTimeout=15");
     args.push("-o", "ServerAliveInterval=5");
@@ -272,7 +278,7 @@ export class OpenSSHTransport implements SSHTransport {
     return { closed, close };
   }
 
-  private buildBaseSSHArgs(): string[] {
+  private buildBaseSSHArgs(logLevel: "FATAL" | "QUIET" = "FATAL"): string[] {
     const args: string[] = [];
 
     if (this.config.port) {
@@ -283,7 +289,7 @@ export class OpenSSHTransport implements SSHTransport {
       args.push("-i", this.config.identityFile);
     }
 
-    args.push("-o", "LogLevel=FATAL");
+    args.push("-o", `LogLevel=${logLevel}`);
     return args;
   }
 }

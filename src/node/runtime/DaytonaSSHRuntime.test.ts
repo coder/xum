@@ -213,43 +213,6 @@ describe("DaytonaSSHRuntime integrated terminals", () => {
     ).rejects.toThrow("no longer exists");
     expect(opened).toBe(false);
   });
-
-  it("keep the token out of what the terminal prints", async () => {
-    rig.plane.addSandbox({ id: "sb-term-tok" });
-    await rig.service.ssh.ensureSshAccess("sb-term-tok");
-    const token = rig.writer.tokens.get("sb-term-tok");
-    if (!token) throw new Error("expected a minted token");
-    let emit: (data: string) => void = () => undefined;
-    const runtime = makeRuntime({ sandboxId: "sb-term-tok" }, rig, {
-      transport: {
-        ...localShellTransport(rig.rootDir),
-        createPtySession: () =>
-          Promise.resolve({
-            write: () => undefined,
-            resize: () => undefined,
-            kill: () => undefined,
-            onData: (handler: (data: string) => void) => {
-              emit = handler;
-              return { dispose: () => undefined };
-            },
-            onExit: () => ({ dispose: () => undefined }),
-          }),
-      },
-    });
-
-    const pty = await runtime.createPtySession({
-      workspacePath: "~/src/project/feature",
-      cols: 80,
-      rows: 24,
-    });
-    const printed: string[] = [];
-    pty.onData((data) => printed.push(data));
-    emit(`${token}@gateway: Permission denied (publickey).\r\n`);
-
-    expect(printed.join("")).toBe(
-      `${DAYTONA_TOKEN_PLACEHOLDER}@gateway: Permission denied (publickey).\r\n`
-    );
-  });
 });
 
 describe("DaytonaSSHRuntime.finalizeConfig and validateBeforePersist", () => {
@@ -355,13 +318,20 @@ describe("DaytonaSSHRuntime Windows and GPU sandboxes", () => {
 });
 
 describe("DaytonaSSHRuntime.postCreateSetup", () => {
-  it("keeps a setup on the account it started with when the settings change during the create", async () => {
+  // The save finishes (and drops the old account's ssh access) while the create is in flight.
+  it("fails a setup, and undoes it in the old account, when the settings change during the create", async () => {
     rig.plane.onRequest.set("POST /sandbox", () =>
       rig.service.account.setConfig({ apiKey: "key-b" })
     );
 
-    await makeRuntime({ sandboxId: "xum-switch", ...SMALL }).postCreateSetup(initParams());
+    const failure = await makeRuntime({ sandboxId: "xum-switch", ...SMALL })
+      .postCreateSetup(initParams())
+      .then(
+        () => undefined,
+        (error: unknown) => error
+      );
 
+    expect(String(failure)).toContain("settings changed during setup");
     const createAt = rig.plane.authorizedCalls.findIndex((call) =>
       call.startsWith("POST /sandbox ")
     );
@@ -369,9 +339,30 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     const afterCreate = rig.plane.authorizedCalls
       .slice(createAt)
       .filter((c) => c.includes("Bearer"));
-    expect(afterCreate.length).toBeGreaterThan(1);
     expect(afterCreate.filter((call) => !call.endsWith("Bearer test-key"))).toEqual([]);
+    expect(rig.plane.find("xum-switch")).toBeUndefined();
+    expect(rig.writer.tokens.get("xum-switch")).toBeUndefined();
     expect((await rig.service.account.getClient()).credentials.apiKey).toBe("key-b");
+  });
+
+  it("fails a fork's setup, and drops the ssh access it wrote, when the settings change during it", async () => {
+    rig.plane.addSandbox({ id: "sb-src" });
+    rig.plane.onRequest.set("GET /sandbox/sb-src", () => {
+      rig.plane.onRequest.delete("GET /sandbox/sb-src");
+      return rig.service.account.setConfig({ apiKey: "key-b" });
+    });
+
+    const failure = await makeRuntime({ sandboxId: "sb-src", forked: true, ...SMALL })
+      .postCreateSetup(initParams())
+      .then(
+        () => undefined,
+        (error: unknown) => error
+      );
+
+    expect(String(failure)).toContain("settings changed during setup");
+    expect(rig.plane.find("sb-src")).toBeDefined();
+    expect(rig.writer.tokens.get("sb-src")).toBeUndefined();
+    expect(rig.plane.revokedTokens).toHaveLength(1);
   });
 
   it("creates the sandbox with preset resources, labels and lifecycle intervals", async () => {

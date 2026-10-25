@@ -1,9 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import type { PtyHandle } from "./transports";
 import {
   createDaytonaRedactingStream,
   DAYTONA_TOKEN_PLACEHOLDER,
-  redactDaytonaPty,
   redactDaytonaTokens,
   rememberDaytonaToken,
 } from "./daytonaTokenRedaction";
@@ -42,62 +40,5 @@ describe("Daytona token redaction", () => {
     expect(Buffer.concat(out).toString()).toBe(
       `${DAYTONA_TOKEN_PLACEHOLDER}@gateway: Permission denied\r\n`
     );
-  });
-});
-
-describe("redactDaytonaPty", () => {
-  const TOKEN = "pty-token-z7w";
-  rememberDaytonaToken(TOKEN);
-
-  function setup() {
-    const dataHandlers = new Set<(data: string) => void>();
-    let killed = false;
-    const pty: PtyHandle = {
-      write: () => undefined,
-      resize: () => undefined,
-      kill: () => {
-        killed = true;
-      },
-      onData: (handler) => {
-        dataHandlers.add(handler);
-        return { dispose: () => dataHandlers.delete(handler) };
-      },
-      onExit: () => ({ dispose: () => undefined }),
-    };
-    const redacted = redactDaytonaPty(pty);
-    const output: string[] = [];
-    redacted.onData((data) => output.push(data));
-    return {
-      redacted,
-      output,
-      emit: (data: string) => {
-        for (const handler of dataHandlers) handler(data);
-      },
-      wasKilled: () => killed,
-    };
-  }
-
-  it("redacts a token within one chunk", () => {
-    const pty = setup();
-    pty.emit(`${TOKEN}@gateway: Permission denied\r\n`);
-    expect(pty.output.join("")).toBe(`${DAYTONA_TOKEN_PLACEHOLDER}@gateway: Permission denied\r\n`);
-  });
-
-  it("redacts a token split across chunks, and shows a held end that was not one", async () => {
-    const pty = setup();
-    pty.emit(`denied for ${TOKEN.slice(0, 5)}`);
-    pty.emit(`${TOKEN.slice(5)}@gateway\r\n$ pty-`);
-    expect(pty.output.join("")).toBe(`denied for ${DAYTONA_TOKEN_PLACEHOLDER}@gateway\r\n$ `);
-
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(pty.output.join("")).toEndWith("\r\n$ pty-");
-  });
-
-  it("passes other output through and kills the underlying pty", () => {
-    const pty = setup();
-    pty.emit("hello world\r\n");
-    expect(pty.output).toEqual(["hello world\r\n"]);
-    pty.redacted.kill();
-    expect(pty.wasKilled()).toBe(true);
   });
 });

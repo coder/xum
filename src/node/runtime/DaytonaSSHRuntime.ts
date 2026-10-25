@@ -56,7 +56,6 @@ import { log } from "@/node/services/log";
 import {
   redactChildStderr,
   redactDaytonaError,
-  redactDaytonaPty,
   redactDaytonaTokens,
 } from "./daytonaTokenRedaction";
 
@@ -64,7 +63,11 @@ import {
 export interface DaytonaRuntimeService {
   account: Pick<
     DaytonaAccount,
-    "checkAvailability" | "getDefaultTarget" | "findSnapshot" | "withPinnedAccount"
+    | "checkAvailability"
+    | "getDefaultTarget"
+    | "findSnapshot"
+    | "withPinnedAccount"
+    | "pinnedAccountChanged"
   >;
   readiness: Pick<
     DaytonaReadiness,
@@ -444,7 +447,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   override async createPtySession(params: PtySessionParams): Promise<PtyHandle> {
     const ready = await this.ensureReady();
     if (!ready.ready) throw new Error(ready.error);
-    return redactDaytonaPty(await super.createPtySession(params));
+    return super.createPtySession(params);
   }
 
   /** Init output (sync, git push, hook) can quote ssh's stderr, so it is redacted too. */
@@ -682,6 +685,13 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       }
       await this.connect(sandboxId, params);
       await this.prepareWorkspaceParentDirectory(params);
+      // After a settings save during the setup, the workspace would sit in an account Xum no
+      // longer uses, with ssh access the save's cleanup did not see: undo both, as for any
+      // failure.
+      if (await this.daytonaService.account.pinnedAccountChanged()) {
+        await this.daytonaService.ssh.releaseSshAccess(sandboxId);
+        throw new Error("the Daytona settings changed during setup; create the workspace again");
+      }
     } catch (error) {
       const errorMsg = redactDaytonaTokens(getErrorMessage(error));
       log.error("Daytona sandbox setup failed", { sandboxId, error: errorMsg });

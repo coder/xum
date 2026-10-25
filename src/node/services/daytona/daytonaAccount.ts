@@ -139,6 +139,19 @@ export class DaytonaAccount {
     return this.pinnedClient.run({}, operation);
   }
 
+  /**
+   * Whether a settings save stored another account (API URL or key) after the pinned
+   * operation took its own. That save has already dropped the old account's ssh access, so
+   * what the operation made since then would outlive it.
+   */
+  async pinnedAccountChanged(): Promise<boolean> {
+    const pinned = this.pinnedClient.getStore()?.client;
+    if (!pinned) return false;
+    const { credentials } = await pinned;
+    const current = await this.resolveCredentials();
+    return current?.apiUrl !== credentials.apiUrl || current.apiKey !== credentials.apiKey;
+  }
+
   /** Throws a `not_configured` DaytonaApiError when no API key is set. */
   getClient(): Promise<DaytonaAccountClient> {
     const pin = this.pinnedClient.getStore();
