@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { Window as HappyWindow } from "happy-dom";
 import * as vm from "node:vm";
 import {
@@ -74,7 +74,8 @@ describe("acceptArtifactFrameMessage", () => {
 });
 
 /** Run the bridge script against a minimal window; returns its keydown handler and posts. */
-function runBridgeScript() {
+/** `querySelector`: the page's document.querySelector (default: matches nothing). */
+function runBridgeScript(options: { querySelector?: (selector: string) => unknown } = {}) {
   // Every listener, in registration order: keys use a capture listener and a bubble one.
   const listeners: Array<{ type: string; listener: (event: unknown) => void }> = [];
   const posted: unknown[] = [];
@@ -93,6 +94,7 @@ function runBridgeScript() {
   const fakeDocument = {
     documentElement: { setAttribute: () => undefined },
     addEventListener: () => undefined,
+    querySelector: options.querySelector ?? (() => null),
   };
   // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
   const run = new Function(
@@ -304,6 +306,39 @@ describe("bridge script interrupt keys", () => {
     // Typed in an input inside a web component: window sees the (non-editable) shadow host.
     bridge.keydown(escape, div, false, { composedPath: [input, div] });
     expect(interrupts(bridge.posted)).toEqual([]);
+  });
+
+  test("Escape that closes the page's own modal dialog or popover stays the page's", () => {
+    const escape = KEYBINDS.INTERRUPT_STREAM_NORMAL.key;
+    const vimKey = KEYBINDS.INTERRUPT_STREAM_VIM.key;
+    // happy-dom matches neither pseudo-class, so the page's open layer is what its
+    // document.querySelector reports during the press.
+    for (const layer of [":modal", ":popover-open"]) {
+      const bridge = runBridgeScript({
+        querySelector: (selector) => (selector.includes(layer) ? div : null),
+      });
+      bridge.keydown(escape, div);
+      // Ctrl+C closes no layer.
+      bridge.keydown(vimKey, div, false, { ctrlKey: true });
+      expect(interrupts(bridge.posted)).toEqual([
+        { xumArtifact: 1, type: "interruptKey", keybind: "vim" },
+      ]);
+    }
+    // A browser without these selectors has no such layer open, so Escape still interrupts.
+    const debug = spyOn(console, "debug").mockImplementation(() => undefined);
+    try {
+      const bridge = runBridgeScript({
+        querySelector: () => {
+          throw new SyntaxError("unsupported selector");
+        },
+      });
+      bridge.keydown(escape, div);
+      expect(interrupts(bridge.posted)).toEqual([
+        { xumArtifact: 1, type: "interruptKey", keybind: "normal" },
+      ]);
+    } finally {
+      debug.mockRestore();
+    }
   });
 });
 
