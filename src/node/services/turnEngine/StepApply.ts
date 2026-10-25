@@ -19,11 +19,8 @@ import {
   type TurnEvents,
 } from "@/node/services/turnEngine/TurnEvents";
 import type { TurnRegistry } from "@/node/services/turnEngine/TurnRegistry";
-import type {
-  StreamManagerTokenTracker,
-  WorkspaceId,
-  WorkspaceStreamInfo,
-} from "@/node/services/turnEngine/types";
+import type { StreamManagerTokenTracker, WorkspaceId } from "@/node/services/turnEngine/types";
+import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import type { UsageLedger } from "@/node/services/turnEngine/UsageLedger";
 import { nodeClock } from "@/node/utils/hostClock";
 import {

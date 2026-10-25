@@ -35,8 +35,8 @@ import type { Logger } from "@/node/services/log";
 import { nodeClock } from "@/node/utils/hostClock";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
-import type { UsageLedgerState } from "@/node/services/turnEngine/types";
-export type { UsageLedgerState } from "@/node/services/turnEngine/types";
+import type { UsageLedgerState } from "@/node/services/turnEngine/turnState";
+export type { UsageLedgerState } from "@/node/services/turnEngine/turnState";
 
 /** The turn fields the ledger prices and keys usage with (all on WorkspaceStreamInfo). */
 export interface UsageTurn extends UsageLedgerState {

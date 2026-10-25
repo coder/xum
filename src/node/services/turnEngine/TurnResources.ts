@@ -16,11 +16,8 @@ import type { EffectRunner } from "@/node/services/di/effectRunner";
 import { runLanguageModelCleanup } from "@/node/services/languageModelCleanup";
 import { log } from "@/node/services/log";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import type {
-  StreamToken,
-  WorkspaceId,
-  WorkspaceStreamInfo,
-} from "@/node/services/turnEngine/types";
+import type { StreamToken, WorkspaceId } from "@/node/services/turnEngine/types";
+import type { TurnHandles, WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import type { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry";
 import type { PartialJournal } from "@/node/services/turnEngine/PartialJournal";
 import { linkAbortSignal } from "@/node/utils/abort";
@@ -189,7 +186,7 @@ export class TurnResources {
       });
   }
 
-  closeStreamResources(streamInfo: WorkspaceStreamInfo): Promise<void> {
+  closeStreamResources(streamInfo: WorkspaceStreamInfo & TurnHandles): Promise<void> {
     if (streamInfo.executionScope)
       this.deps.toolCallDisplayRegistry.close(streamInfo.executionScope);
     if (streamInfo.resourceCleanup) return streamInfo.resourceCleanup;
