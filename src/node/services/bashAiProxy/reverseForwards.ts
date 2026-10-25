@@ -26,17 +26,6 @@ export interface ForwardTarget {
   remoteHealth(remotePort: number, nonce: string): Promise<string | undefined>;
 }
 
-const HOST_KEY_SEPARATOR = "|";
-
-/** ForwardTarget.hostKey of an SSH host; the host comes first so closeHost() can find it. */
-export function sshForwardHostKey(config: {
-  host: string;
-  port?: number;
-  identityFile?: string;
-}): string {
-  return [config.host, config.port ?? 22, config.identityFile ?? ""].join(HOST_KEY_SEPARATOR);
-}
-
 export interface ReverseForwardManagerOptions {
   /** Seeds the remote port candidates (the Xum root dir). */
   seed: string;
@@ -128,33 +117,17 @@ export class ReverseForwardManager {
     await Promise.allSettled(this.cancelAll());
   }
 
-  /**
-   * Closes the forwards to `host` (its ssh connections were retired), as closeOwned() does for
-   * every host: a forward rides its own connection, which would still reach the old machine.
-   */
-  closeHost(host: string): void {
-    for (const [hostKey, state] of this.hosts) {
-      if (hostKey.split(HOST_KEY_SEPARATOR)[0] !== host) continue;
-      this.cancel(state);
-      this.hosts.delete(hostKey);
-    }
-  }
-
   /** Closes owned forwards and cancels setups in flight; returns those setups. */
   private cancelAll(): Array<Promise<number | undefined>> {
     const pending: Array<Promise<number | undefined>> = [];
     for (const state of this.hosts.values()) {
-      this.cancel(state);
+      state.cancelled = true;
+      state.owned?.close();
       if (state.establishing) pending.push(state.establishing);
     }
     // A setup in flight keeps its detached state; the next ensure() starts a fresh one.
     this.hosts.clear();
     return pending;
-  }
-
-  private cancel(state: HostState): void {
-    state.cancelled = true;
-    state.owned?.close();
   }
 
   private stopped(state: HostState): boolean {

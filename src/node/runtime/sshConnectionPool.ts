@@ -683,22 +683,7 @@ export const sshConnectionPool = new SSHConnectionPool();
 export function getControlPath(config: SSHConnectionConfig): string {
   const key = makeConnectionKey(config);
   const hash = hashKey(key);
-  const retirements = controlPathRetirements.get(key) ?? 0;
-  return path.join(os.tmpdir(), `mux-ssh-${hash}${retirements > 0 ? `-r${retirements}` : ""}`);
-}
-
-/** Per connection key: how often its ControlPaths were retired in this process. */
-const controlPathRetirements = new Map<string, number>();
-
-/**
- * Move the host's later commands to new ControlPaths (credentials or gateway changed). A
- * ControlMaster still connecting at an old path when its host was retired listens there once
- * it is up, after the retirement stopped the masters it could see; no command uses it, and it
- * exits after ControlPersist.
- */
-export function retireControlPath(config: SSHConnectionConfig): void {
-  const key = makeConnectionKey(config);
-  controlPathRetirements.set(key, (controlPathRetirements.get(key) ?? 0) + 1);
+  return path.join(os.tmpdir(), `mux-ssh-${hash}`);
 }
 
 /**

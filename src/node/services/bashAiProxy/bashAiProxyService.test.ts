@@ -11,11 +11,7 @@ import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
 import { log } from "@/node/services/log";
 import type { ProviderConfigRaw } from "@/node/utils/providerRequirements";
 
-import {
-  ReverseForwardRefusedError,
-  retireSshConnections,
-  type ReverseForward,
-} from "@/node/runtime/transports";
+import { ReverseForwardRefusedError, type ReverseForward } from "@/node/runtime/transports";
 
 import { BashAiProxyService } from "./bashAiProxyService";
 import type { ForwardTarget } from "./reverseForwards";
@@ -714,26 +710,6 @@ describe("BashAiProxyService", () => {
       });
       expect(res.status).toBe(200);
       await res.text();
-    });
-
-    test("retiring a host's ssh connections closes its forward, and the next turn opens one", async () => {
-      // Daytona retires a sandbox alias when its account or gateway changes: the forward's own
-      // connection would still end in the old sandbox.
-      const retired = fakeSshHost("sb-1.xum--daytona|22|");
-      const other = fakeSshHost("sb-2.xum--daytona|22|");
-      sshTargets.set("ws-1", retired.target);
-      sshTargets.set("ws-2", other.target);
-      await proxy.envFor("ws-1", "ssh", []);
-      await proxy.envFor("ws-2", "ssh", []);
-
-      await retireSshConnections({ host: "sb-1.xum--daytona" });
-
-      expect(retired.closes()).toBe(1);
-      expect(other.closes()).toBe(0);
-      await proxy.envFor("ws-1", "ssh", []);
-      expect(retired.opened).toHaveLength(2);
-      await proxy.envFor("ws-2", "ssh", []);
-      expect(other.opened).toHaveLength(1);
     });
 
     test("a forward that outlived a restart is adopted, not replaced", async () => {

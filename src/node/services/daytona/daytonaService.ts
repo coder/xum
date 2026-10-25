@@ -1,7 +1,5 @@
-import { toXumDaytonaHost } from "@/common/constants/daytona";
 import type { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
-import { retireSshConnections } from "@/node/runtime/transports";
 import { sleepWithAbort } from "@/node/utils/abort";
 import { DaytonaAccount } from "./daytonaAccount";
 import type { DaytonaClient } from "./daytonaClient";
@@ -18,8 +16,6 @@ export interface DaytonaServiceOptions {
   fetch?: typeof fetch;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
-  /** Defaults to retiring the pooled OpenSSH and ssh2 connections of the sandbox's alias. */
-  retireSshConnections?: (sandboxId: string) => Promise<void>;
 }
 
 /**
@@ -45,9 +41,6 @@ export class DaytonaService {
       readiness: this.readiness,
       sshConfigWriter:
         options.sshConfigWriter ?? new DaytonaSshConfigWriter({ xumHome: options.rootDir }),
-      retireSshConnections:
-        options.retireSshConnections ??
-        ((sandboxId) => retireSshConnections({ host: toXumDaytonaHost(sandboxId) })),
       now,
     });
     this.sandboxes = new DaytonaSandboxes({

@@ -32,7 +32,6 @@ export interface DaytonaSshOptions {
   account: Pick<DaytonaAccount, "getClient" | "withAccountLease">;
   readiness: DaytonaReadiness;
   sshConfigWriter: DaytonaSshWriter;
-  retireSshConnections: (sandboxId: string) => Promise<void>;
   now: () => number;
 }
 
@@ -85,10 +84,7 @@ export class DaytonaSsh {
   private readonly tokenGenerations = new Map<string, number>();
   private lastTokenGeneration = 0;
   private readonly tokenRequests = new Map<string, Promise<DaytonaSshAccess>>();
-  /** Per sandbox: bumped by every release of its SSH access, so a mint that spans one can tell. */
-  private readonly accessReleases = new Map<string, number>();
   private readonly sshConfigWriter: DaytonaSshWriter;
-  private readonly retireSshConnections: DaytonaSshOptions["retireSshConnections"];
   /** Sandboxes whose include block and `~/.ssh/config` block this process has written. */
   private readonly sshConfigured = new Set<string>();
   /** Whether the include file was read once, seeding the tokens an earlier process left. */
@@ -99,7 +95,6 @@ export class DaytonaSsh {
     this.readiness = options.readiness;
     this.now = options.now;
     this.sshConfigWriter = options.sshConfigWriter;
-    this.retireSshConnections = options.retireSshConnections;
   }
 
   /**
@@ -245,14 +240,10 @@ export class DaytonaSsh {
   /**
    * Daytona moved its gateway or rotated its host keys: every include block and the
    * known_hosts pins are stale. Each sandbox's next ssh access mints a token, which rewrites
-   * its whole ssh setup and revokes the old token.
-   *
-   * Install first, retire last: a command connecting while the old connections are retired
-   * then reads the new files and caches, so no connection to the old gateway outlives this.
-   * Retiring first left a window in which a turn reconnected from the stale setup.
+   * its whole ssh setup and revokes the old token. Pooled connections opened before keep
+   * their old gateway until they close; new ones read the new files.
    */
   private async retireSshSetup(config: DaytonaGatewayConfig): Promise<void> {
-    const sandboxIds = this.sandboxesWithSsh();
     this.sshConfigured.clear();
     this.readiness.invalidateAll();
     for (const [sandboxId, access] of this.tokens) {
@@ -266,30 +257,6 @@ export class DaytonaSsh {
         error: getErrorMessage(error),
       });
     }
-    await this.retirePooledSsh(sandboxIds);
-  }
-
-  private sandboxesWithSsh(): string[] {
-    return [...new Set([...this.tokens.keys(), ...this.sshConfigured])];
-  }
-
-  /**
-   * Pooled ssh connections (OpenSSH ControlMasters, ssh2 clients) outlive the include file
-   * they were opened with: without this, later commands keep reaching the old deployment.
-   */
-  private async retirePooledSsh(sandboxIds: string[]): Promise<void> {
-    await Promise.all(
-      sandboxIds.map(async (sandboxId) => {
-        try {
-          await this.retireSshConnections(sandboxId);
-        } catch (error) {
-          log.warn("Could not retire the pooled ssh connections of a Daytona sandbox", {
-            sandboxId,
-            error: getErrorMessage(error),
-          });
-        }
-      })
-    );
   }
 
   /**
@@ -355,16 +322,10 @@ export class DaytonaSsh {
   /** Revoke the token and remove the sandbox's include block. */
   async releaseSshAccess(sandboxId: string): Promise<void> {
     await this.readiness.waitForSandboxReadiness(sandboxId);
-    // A mint in flight sees the bump and drops its token instead of writing it back.
-    this.accessReleases.set(sandboxId, this.releaseCount(sandboxId) + 1);
     this.sshConfigured.delete(sandboxId);
     this.readiness.invalidateSandboxReady(sandboxId);
     await this.forgetSshToken(sandboxId);
     await this.sshConfigWriter.removeSandbox(sandboxId);
-    // A revoked token does not end sessions it opened: pooled connections and the bash AI
-    // proxy's reverse forward would keep reaching the sandbox. Retired only once the include
-    // block is gone, so nothing reconnects from it.
-    await this.retirePooledSsh([sandboxId]);
   }
 
   tokenNeedsRefresh(sandboxId: string): boolean {
@@ -404,25 +365,15 @@ export class DaytonaSsh {
     previous: DaytonaSshAccess | undefined,
     options: DaytonaSshTokenOptions
   ): Promise<DaytonaSshAccess> {
-    const release = this.releaseCount(sandboxId);
-    const released = () => this.releaseCount(sandboxId) !== release;
     const { client } = await this.account.getClient();
     const access = await client.createSshAccess(sandboxId, DAYTONA_SSH_TOKEN_TTL_MINUTES);
     rememberDaytonaToken(access.token);
-    // A mint that spans a release of the sandbox's access is never cached or kept in the
-    // include file: the caller's access was taken away.
-    if (released()) return this.discardReleasedMint(client, sandboxId, access, false);
     await this.announceNewToken(client, sandboxId, access, options);
-    if (released()) return this.discardReleasedMint(client, sandboxId, access, true);
     this.cacheNewToken(sandboxId, access);
     if (previous && previous.token !== access.token) {
       await this.revokeQuietly(client, sandboxId, previous.token);
     }
     return access;
-  }
-
-  private releaseCount(sandboxId: string): number {
-    return this.accessReleases.get(sandboxId) ?? 0;
   }
 
   private async announceNewToken(
@@ -438,19 +389,6 @@ export class DaytonaSsh {
       await this.revokeQuietly(client, sandboxId, access.token);
       throw error;
     }
-  }
-
-  private async discardReleasedMint(
-    client: DaytonaClient,
-    sandboxId: string,
-    access: DaytonaSshAccess,
-    wroteIncludeFile: boolean
-  ): Promise<never> {
-    await this.revokeQuietly(client, sandboxId, access.token);
-    if (wroteIncludeFile) await this.sshConfigWriter.removeSandbox(sandboxId);
-    throw new Error(
-      `Xum released its SSH access to Daytona sandbox "${sandboxId}" while a token was minted`
-    );
   }
 
   /** Revoke and forget the cached token (workspace deleted or sandbox detached). */

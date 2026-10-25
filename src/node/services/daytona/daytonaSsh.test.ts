@@ -94,7 +94,7 @@ describe("DaytonaSsh", () => {
     }
   });
 
-  /** A service whose first token mint waits until `releaseMint`; `includeFile` is its writer. */
+  /** A service whose first token mint waits until `releaseMint`. */
   function serviceWithHeldMint() {
     let mintStarted!: () => void;
     const started = new Promise<void>((resolve) => (mintStarted = resolve));
@@ -111,10 +111,8 @@ describe("DaytonaSsh", () => {
       return plane.fetch(input, init);
     }) as typeof fetch;
     const written: string[] = [];
-    const includeFile = new Map<string, string>();
-    const store = (input: { sandboxId: string; token: string }) => {
+    const store = (input: { token: string }) => {
       written.push(input.token);
-      includeFile.set(input.sandboxId, input.token);
       return Promise.resolve();
     };
     const heldService = new DaytonaService({
@@ -128,15 +126,11 @@ describe("DaytonaSsh", () => {
         restoreGatewayPins: () => Promise.resolve(false),
         updateToken: store,
         repointGateway: () => Promise.resolve(),
-        removeSandbox: (sandboxId: string) => {
-          includeFile.delete(sandboxId);
-          return Promise.resolve();
-        },
-
+        removeSandbox: () => Promise.resolve(),
         readTokens: () => Promise.resolve([]),
       },
     });
-    return { service: heldService, started, releaseMint, written, includeFile };
+    return { service: heldService, started, releaseMint, written };
   }
 
   it("refuses a settings change while a token is minted, and takes it afterwards", async () => {
@@ -161,12 +155,6 @@ describe("DaytonaSsh", () => {
   /** A service whose ssh setup writes are recorded as `token@host keys`. */
   function serviceRecordingWrites(fetchImpl: typeof fetch = plane.fetch) {
     const writes: string[] = [];
-    /** Sandboxes whose pooled ssh connections were retired. */
-    const retired: string[] = [];
-    /** Include block removals, gateway repoints and retirements, in order. */
-    const order: string[] = [];
-    /** Per retirement: whether the sandbox's next ssh access would set it up again. */
-    const staleAtRetire: boolean[] = [];
     /** The include file: what ensureSshAccess reads back before it trusts its cache. */
     const includeFile = new Map<string, string>();
     const record = (input: {
@@ -190,25 +178,15 @@ describe("DaytonaSsh", () => {
         updateToken: record,
         removeSandbox: (sandboxId) => {
           includeFile.delete(sandboxId);
-          order.push(`remove ${sandboxId}`);
           return Promise.resolve();
         },
-        repointGateway: (gateway) => {
-          order.push(`repoint ${gateway.host} ${gateway.hostKeys.join(",")}`);
-          return Promise.resolve();
-        },
+        repointGateway: () => Promise.resolve(),
 
         readTokens: () =>
           Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
       },
-      retireSshConnections: (sandboxId) => {
-        retired.push(sandboxId);
-        order.push(`retire ${sandboxId}`);
-        staleAtRetire.push(recording.ssh.tokenNeedsRefresh(sandboxId));
-        return Promise.resolve();
-      },
     });
-    return { service: recording, writes, retired, order, staleAtRetire };
+    return { service: recording, writes };
   }
 
   it("refuses a settings change while it looks up the gateway for a token", async () => {
@@ -244,7 +222,7 @@ describe("DaytonaSsh", () => {
   });
 
   it("rewrites a sandbox's ssh setup once Daytona moves its gateway keys", async () => {
-    const { service: watching, writes, retired } = serviceRecordingWrites();
+    const { service: watching, writes } = serviceRecordingWrites();
     const configFetches = () => plane.calls.filter((call) => call === "GET /config").length;
 
     await watching.ssh.ensureSshAccess("sb-1");
@@ -261,8 +239,6 @@ describe("DaytonaSsh", () => {
       "tok2@ssh.test ssh-rsa CCCC,ssh-ed25519 BBBB",
     ]);
     expect(plane.revoked).toEqual(["tok1"]);
-    // A pooled connection to the old gateway must not carry later commands.
-    expect(retired).toEqual(["sb-1"]);
 
     // A refetch that finds the same gateway, keys reordered, rewrites nothing.
     plane.gatewayHostKeys = ["ssh-ed25519 BBBB", "ssh-rsa CCCC"];
@@ -270,7 +246,6 @@ describe("DaytonaSsh", () => {
     await watching.ssh.ensureSshAccess("sb-1");
     expect(configFetches()).toBe(3);
     expect(writes).toHaveLength(2);
-    expect(retired).toEqual(["sb-1"]);
   });
 
   it("shares one gateway refresh between concurrent lookups, so a stale reply cannot win", async () => {
@@ -283,7 +258,7 @@ describe("DaytonaSsh", () => {
         held.push({ run: () => plane.fetch(input, init), resolve });
       });
     }) as typeof fetch;
-    const { service: watching, retired } = serviceRecordingWrites(fetchImpl);
+    const { service: watching } = serviceRecordingWrites(fetchImpl);
     await watching.ssh.ensureSshAccess("sb-1");
 
     clock += 6 * 60_000;
@@ -305,48 +280,6 @@ describe("DaytonaSsh", () => {
       ["ssh-ed25519 NEW"],
     ]);
     expect((await watching.ssh.getGatewayConfig()).sshGatewayHostKeys).toEqual(["ssh-ed25519 NEW"]);
-    expect(retired).toEqual(["sb-1"]);
-  });
-
-  it("installs a moved gateway before retiring the connections to the old one", async () => {
-    const { service: watching, order, staleAtRetire } = serviceRecordingWrites();
-    await watching.ssh.ensureSshAccess("sb-1");
-
-    plane.gatewayHostKeys = ["ssh-ed25519 BBBB"];
-    clock += 6 * 60_000;
-    await watching.ssh.getGatewayConfig();
-
-    // A connection opened while the old ones are retired reads the new files, and the next
-    // access sets the sandbox up again: nothing reaches the old gateway afterwards.
-    expect(order).toEqual(["repoint ssh.test ssh-ed25519 BBBB", "retire sb-1"]);
-    expect(staleAtRetire).toEqual([true]);
-  });
-
-  it("retires a released sandbox's ssh connections once its include block is gone", async () => {
-    const { service: releasing, order } = serviceRecordingWrites();
-    await releasing.ssh.ensureSshAccess("sb-1");
-
-    await releasing.ssh.releaseSshAccess("sb-1");
-
-    // Pooled sessions and reverse forwards stay authenticated after the token is revoked; a
-    // retirement before the block is gone could reconnect from it.
-    expect(order).toEqual(["remove sb-1", "retire sb-1"]);
-  });
-
-  it("revokes a token minted across a release, keeping the access released", async () => {
-    const held = serviceWithHeldMint();
-
-    const access = held.service.ssh.ensureSshAccess("sb-1").catch((error: unknown) => error);
-    await held.started;
-    await held.service.ssh.releaseSshAccess("sb-1");
-    held.releaseMint();
-
-    // The caller asked for access the release took away: it fails instead of minting again.
-    expect(String(await access)).toContain("released");
-    expect(plane.revoked).toEqual(["tok1"]);
-    expect(held.includeFile.has("sb-1")).toBe(false);
-    expect(held.service.ssh.hasExpiringSshToken("sb-1")).toBe(false);
-    expect(plane.calls.filter((call) => call === "POST /sandbox/sb-1/ssh-access")).toHaveLength(1);
   });
 
   it("removes the old account's aliases from the include file when the settings change", async () => {
