@@ -12,7 +12,6 @@ import { log, type Logger } from "@/node/services/log";
 import type { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry";
 import type { FoldIntent, FoldStep, FoldView } from "@/node/services/turnEngine/partFold";
 import { isAnthropicMessagesModel } from "@/node/services/turnEngine/StepPreparation";
-import { recordStepStart } from "@/node/services/turnEngine/StreamRetries";
 import {
   buildUsageDeltaEvent,
   type TurnEventEmitter,
@@ -20,7 +19,7 @@ import {
 } from "@/node/services/turnEngine/TurnEvents";
 import type { TurnRegistry } from "@/node/services/turnEngine/TurnRegistry";
 import type { StreamManagerTokenTracker, WorkspaceId } from "@/node/services/turnEngine/types";
-import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
+import type { TurnState, WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import type { UsageLedger } from "@/node/services/turnEngine/UsageLedger";
 import { nodeClock } from "@/node/utils/hostClock";
 import {
@@ -47,8 +46,22 @@ export interface PartLoopState {
   orphanToolResultCount: number;
 }
 
+/**
+ * The stream record with TurnState writable. WorkspaceStreamInfo makes TurnState
+ * read-only, so only StepApply, its owner, takes this type and writes it.
+ */
+type StepStream = WorkspaceStreamInfo & TurnState;
+
+function recordStepStart(streamInfo: StepStream): void {
+  const start = streamInfo.parts.length;
+  // Retries may discard parts. Drop stale/duplicate starts before reseeding.
+  streamInfo.stepStartIndices = streamInfo.stepStartIndices.filter((index) => index < start);
+  streamInfo.stepStartIndices.push(start);
+  streamInfo.currentStepStartIndex = start;
+}
+
 function recordTerminalFinish(
-  streamInfo: WorkspaceStreamInfo,
+  streamInfo: StepStream,
   intent: Extract<FoldIntent, { _tag: "RecordTerminalFinish" }>
 ): void {
   streamInfo.receivedTerminalEvent = true;
@@ -87,7 +100,7 @@ export function foldView(
  * never moves back. It rides on the partial write that stores this reasoning part (every
  * reasoning append schedules one).
  */
-export function turnReplayOffAfterServerTool(streamInfo: WorkspaceStreamInfo): void {
+export function turnReplayOffAfterServerTool(streamInfo: StepStream): void {
   const serverToolIds = streamInfo.anthropicServerToolCallIds;
   if (
     serverToolIds == null ||
@@ -120,7 +133,7 @@ export function turnReplayOffAfterServerTool(streamInfo: WorkspaceStreamInfo): v
  * caller persists it.
  */
 export function moveAnthropicThinkingReplayPoint(
-  streamInfo: WorkspaceStreamInfo,
+  streamInfo: StepStream,
   point: AnthropicThinkingReplayPoint
 ): boolean {
   const current = streamInfo.initialMetadata;
@@ -218,7 +231,7 @@ export function summarizeToolResultForLog(output: unknown): Record<string, unkno
 //
 // Part timestamps are record times (stored in history, shown and replayed), so they read the
 // wall clock until #7282 moves their consumers to HostClock.
-export function nextPartTimestamp(streamInfo: WorkspaceStreamInfo): number {
+export function nextPartTimestamp(streamInfo: StepStream): number {
   const now = nodeClock.nowMs();
   const last = streamInfo.lastPartTimestamp;
   const timestamp = now <= last ? last + 1 : now;
@@ -249,6 +262,43 @@ export interface StepApplyDeps {
 export class StepApply {
   constructor(private readonly deps: StepApplyDeps) {}
 
+  /** Sets the turn's row metadata. Stream-end metadata spreads it. */
+  static setInitialMetadata(streamInfo: StepStream, metadata: TurnState["initialMetadata"]): void {
+    streamInfo.initialMetadata = metadata;
+  }
+
+  /** The next streamText call numbers its steps from 0 again. */
+  static restartStepNumbering(streamInfo: StepStream): void {
+    streamInfo.streamStepOrdinals = [];
+  }
+
+  /**
+   * Resets the step state a retried attempt starts from. With preserveParts, the
+   * parts so far (and the reasoning backfill start) stay.
+   */
+  static resetForRetry(streamInfo: StepStream, options: { preserveParts: boolean }): void {
+    if (!options.preserveParts) {
+      streamInfo.parts = [];
+    }
+    if (!options.preserveParts) {
+      streamInfo.reasoningBackfillStartIndex = undefined;
+    }
+    // A retried attempt starts with no open reasoning block.
+    streamInfo.currentReasoningBlock = undefined;
+    recordStepStart(streamInfo);
+    streamInfo.receivedTerminalEvent = false;
+    streamInfo.terminalFinishReason = undefined;
+    streamInfo.terminalRawFinishReason = undefined;
+  }
+
+  /**
+   * Marks where the answering attempt's reasoning starts. Reasoning before it
+   * belongs to refused attempts whose usage was already attributed.
+   */
+  static setReasoningBackfillStart(streamInfo: StepStream, index: number | undefined): void {
+    streamInfo.reasoningBackfillStartIndex = index;
+  }
+
   /**
    * Runs partFold's intents in order with the existing helpers. Synchronous
    * intents run without a yield between them, awaited helpers stay awaited, and
@@ -256,7 +306,7 @@ export class StepApply {
    */
   async applyStep(
     workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
+    streamInfo: StepStream,
     step: FoldStep,
     loop: PartLoopState
   ): Promise<void> {
@@ -281,7 +331,7 @@ export class StepApply {
   /** Returns the helper's promise for intents the stream loop must await (its value is unused). */
   private applyIntent(
     workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
+    streamInfo: StepStream,
     intent: FoldIntent,
     loop: PartLoopState
   ): Promise<unknown> | undefined {
@@ -310,7 +360,7 @@ export class StepApply {
 
   private applyToolIntent(
     workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
+    streamInfo: StepStream,
     intent: FoldIntent,
     loop: PartLoopState
   ): Promise<unknown> | undefined {
@@ -440,7 +490,7 @@ export class StepApply {
   /** Adds one finish-step's usage to the stream totals, then emits usage-delta. */
   private recordStepUsage(
     workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
+    streamInfo: StepStream,
     stepUsage: LanguageModelV2Usage,
     stepProviderMetadata: Record<string, unknown> | undefined
   ): void {
@@ -548,7 +598,7 @@ export class StepApply {
    */
   private async completeToolCall(
     workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
+    streamInfo: StepStream,
     toolCalls: ToolCallMap,
     toolCallId: string,
     toolName: string,

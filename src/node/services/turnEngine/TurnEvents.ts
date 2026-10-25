@@ -861,7 +861,7 @@ export class TurnEventEmitter {
       // execute() can win the race against the fullStream consumer (same window as
       // pendingToolExecutionStarts): buffer the nested record and merge it when the
       // parent part lands, instead of silently dropping it from persistence.
-      const pendingNestedCalls = (streamInfo.pendingNestedCalls ??= new Map());
+      const pendingNestedCalls = streamInfo.pendingNestedCalls;
       const buffered = pendingNestedCalls.get(event.parentToolCallId) ?? [];
       applyNestedToolEvent(buffered, event, args, mcpServer);
       pendingNestedCalls.set(event.parentToolCallId, buffered);

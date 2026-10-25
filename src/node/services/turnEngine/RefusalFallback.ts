@@ -29,6 +29,7 @@ import type { Logger } from "@/node/services/log";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { AnthropicThinkingReplayPoint } from "@/node/utils/messages/anthropicThinkingReplay";
 import { ProviderRequest, type StreamRequestConfig } from "./ProviderRequest";
+import { StepApply } from "./StepApply";
 import { applyTurnReplayReceipt, type StepMessageTracker } from "./StepPreparation";
 import { publishLiveRouting, withAutoThinkingClaim } from "./TurnEngine";
 import type { TurnEvents } from "./TurnEvents";
@@ -358,7 +359,10 @@ export class RefusalFallback {
     }
 
     fallbackState.refusedModels.push(refusedModel);
-    streamInfo.initialMetadata = withModelFallbackRecord(streamInfo.initialMetadata, fallbackState);
+    StepApply.setInitialMetadata(
+      streamInfo,
+      withModelFallbackRecord(streamInfo.initialMetadata, fallbackState)
+    );
 
     if (streamInfo.abortController.signal.aborted || streamInfo.softInterrupt.pending) {
       await this.recordRefusedAttemptUsage(workspaceId, streamInfo, refusedModelForUsage);
@@ -635,10 +639,10 @@ export class RefusalFallback {
     // Before any await: the stream may already be preparing its first step, and a step-0
     // thinking rebuild there records a newer volatile-tail plan (recordSystemSections),
     // which must win over the patch's baseline. That rebuild always runs after an await.
-    streamInfo.initialMetadata = {
+    StepApply.setInitialMetadata(streamInfo, {
       ...streamInfo.initialMetadata,
       ...prepared.initialMetadataPatch,
-    };
+    });
 
     // The fallback stream exists now; durable side effects describing this
     // request identity (superseding turn envelope) may be recorded.
@@ -665,7 +669,10 @@ export class RefusalFallback {
       preserveParts,
       workspaceLog,
     });
-    streamInfo.reasoningBackfillStartIndex = preserveParts ? streamInfo.parts.length : undefined;
+    StepApply.setReasoningBackfillStart(
+      streamInfo,
+      preserveParts ? streamInfo.parts.length : undefined
+    );
     // The receipt strip also removed this row's preserved thinking, so the receipt's point
     // moves to the fallback's first step. It rides on the fallback's first partial write.
     if (started.fallbackMessages !== prepared.messages) {
@@ -702,7 +709,7 @@ export class RefusalFallback {
     });
     // Final stream-end metadata spreads initialMetadata, so route attribution
     // corrections (the patch, applied above) and the fallback record propagate automatically.
-    streamInfo.initialMetadata = {
+    StepApply.setInitialMetadata(streamInfo, {
       ...withModelFallbackRecord(streamInfo.initialMetadata, fallbackState),
       // The routing record names the model that actually answered, not the refused tier model,
       // and (when Auto set it) the thinking level the fallback preparation clamped to.
@@ -713,12 +720,12 @@ export class RefusalFallback {
           overrideHolder?.manual
         ),
       }),
-    };
+    });
     // Escalation climbs from the level the stream runs at now: the fallback model's ladder
     // may have clamped Auto's claim, and a raise proposed from the refused model's level
     // would be a no-op here and retire escalation for the rest of the turn.
     const escalationState = streamInfo.stepTracker.autoThinkingEscalation;
-    const claimedLevel = streamInfo.initialMetadata.autoModelRouting?.thinkingLevel;
+    const claimedLevel = streamInfo.initialMetadata?.autoModelRouting?.thinkingLevel;
     if (escalationState && claimedLevel != null) {
       rebaseAutoThinkingEscalation(escalationState, claimedLevel);
     }
