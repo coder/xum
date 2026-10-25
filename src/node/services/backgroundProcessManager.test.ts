@@ -1721,15 +1721,20 @@ describe("BackgroundProcessManager", () => {
         expect(result.success).toBe(true);
         if (!result.success) return;
 
-        // Filtered read consumes both complete lines (cursor advances to 14) but shows only "DONE".
-        // The read returns as soon as "DONE" arrives. Its budget only has to outlast a slow spawn:
+        // Filtered reads consume both complete lines (cursor advances to 14) but show only "DONE".
+        // A read returns as soon as "DONE" arrives. Its budget only has to outlast a slow spawn:
         // 2 s was too short on a loaded CI runner, and the read came back empty.
-        const filtered = await manager.getOutput(result.processId, "DONE", false, 20);
-        expect(filtered.success).toBe(true);
-        if (filtered.success) {
-          expect(filtered.output).toContain("DONE");
-          expect(filtered.output).not.toContain("ERR boom");
+        // bash line-buffers stdout, so printf writes the two lines separately. A filtered read
+        // that lands between the writes returns as soon as it consumed "ERR boom", with an empty
+        // page, so read again until "DONE" arrives (#7256).
+        let filteredOutput = "";
+        while (!filteredOutput.includes("DONE")) {
+          const filtered = await manager.getOutput(result.processId, "DONE", false, 20);
+          expect(filtered.success).toBe(true);
+          if (!filtered.success) return;
+          filteredOutput += filtered.output;
         }
+        expect(filteredOutput).not.toContain("ERR boom");
         let proc = await manager.getProcess(result.processId);
         expect(proc?.outputBytesRead ?? 0).toBeGreaterThanOrEqual(14);
         expect(proc?.shownThroughOffset ?? -1).toBe(0);
