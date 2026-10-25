@@ -228,6 +228,74 @@ async function assertClearsRightInset(page: StoryPage, target: { sheet: string }
   }
 }
 
+const MENU_INSET_STORY = "components-projectpage--create-workspace-many-projects";
+// The iPhone Duo cover display draws its 21 px top inset as an opaque status band. A short
+// viewport (as when the software keyboard is up) leaves the project switcher too little room
+// below, so its list opens upward and Radix fits it to the top edge.
+const MENU_INSETS = { top: 21, right: SIDE_INSET_PX, bottom: 0, left: 0 };
+const MENU_INSET_VIEWPORT = { width: SIDE_INSET_VIEWPORT.width, height: 220 };
+
+/**
+ * Radix fits a menu to the viewport edge, but menus portal out of the app shell that pads the
+ * safe areas, so a list fitted to the edge drew rows under the top band and the right column.
+ */
+async function assertMenuClearsSafeArea(page: StoryPage) {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    await client.send("Emulation.setSafeAreaInsetsOverride", { insets: MENU_INSETS });
+    await page.setViewportSize(MENU_INSET_VIEWPORT);
+    await page.waitForFunction(
+      (size) =>
+        matchMedia("(pointer: coarse)").matches &&
+        innerWidth === size.width &&
+        innerHeight === size.height,
+      MENU_INSET_VIEWPORT,
+      { timeout: 5000 }
+    );
+    // A touch tap opens Radix Select on click; a hidden copy of the trigger can exist.
+    await page.locator("[data-testid=project-selector]:visible").evaluate((el) => {
+      (el as HTMLElement).click();
+    });
+    const listbox = page.getByRole("listbox");
+    await listbox.waitFor({ timeout: 5000 });
+    // Radix positions the list a frame after it mounts; wait until it stops moving.
+    const box = await listbox.evaluate(async (element) => {
+      const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+      let last = "";
+      for (let i = 0; i < 60; i++) {
+        await frame();
+        const r = element.getBoundingClientRect();
+        const next = `${r.top},${r.right},${r.bottom}`;
+        if (next === last && r.height > 0) break;
+        last = next;
+      }
+      const r = element.getBoundingClientRect();
+      return { top: r.top, right: r.right, side: element.getAttribute("data-side") };
+    });
+    // Below the heading the list has room to start below any inset, so only the upward case checks.
+    assert.equal(box.side, "top", "The project list must open above its trigger on a short phone");
+    const limit = MENU_INSET_VIEWPORT.width - MENU_INSETS.right;
+    const problems: string[] = [];
+    if (box.top < MENU_INSETS.top - 0.5) problems.push(`list starts at ${Math.round(box.top)}px`);
+    if (box.right > limit + 0.5) problems.push(`list ends at ${Math.round(box.right)}px`);
+    assert.equal(
+      problems.join("; "),
+      "",
+      `The project list must clear a ${MENU_INSETS.top}px top and ${MENU_INSETS.right}px right inset`
+    );
+  } finally {
+    await page.keyboard.press("Escape");
+    await client.send("Emulation.setSafeAreaInsetsOverride", {
+      insets: { top: 0, right: 0, bottom: 0, left: 0 },
+    });
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+  }
+}
+
 const config: TestRunnerConfig = {
   async preVisit(page, context) {
     // exposeFunction throws on a second registration, so register once per Playwright page.
@@ -241,6 +309,12 @@ const config: TestRunnerConfig = {
     if (insetTarget) {
       if (page.context().browser()?.browserType().name() === "chromium") {
         await assertClearsRightInset(page, insetTarget);
+      }
+      return;
+    }
+    if (context.id === MENU_INSET_STORY) {
+      if (page.context().browser()?.browserType().name() === "chromium") {
+        await assertMenuClearsSafeArea(page);
       }
       return;
     }

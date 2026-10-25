@@ -5,7 +5,13 @@
 import { within, userEvent, waitFor, expect } from "storybook/test";
 
 import { expandProjects } from "@/browser/stories/helpers/uiState";
-import { PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
+import {
+  PIXEL_DISABLED,
+  PIXEL_DUAL_THEME,
+  appMeta,
+  AppWithMocks,
+  type AppStory,
+} from "@/browser/stories/meta.js";
 import { createMockORPCClient, type MockSessionUsage } from "@/browser/stories/mocks/orpc";
 import { createArchivedWorkspace, NOW } from "@/browser/stories/mocks/workspaces";
 import { openLeftSidebar } from "@/browser/stories/storyPlayHelpers";
@@ -114,6 +120,44 @@ export const CreateWorkspaceMultipleProjects: AppStory = {
       }}
     />
   ),
+};
+
+/**
+ * Project switcher with more projects than fit. `.storybook/test-runner.ts` opens it on a short
+ * phone with safe-area insets, where the list opens above the heading and must stay clear of
+ * the insets. No Pixel capture: the snapshot budget is full.
+ */
+export const CreateWorkspaceManyProjects: AppStory = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const paths = Array.from({ length: 14 }, (_, i) => `/Users/dev/service-${i + 1}`);
+        expandProjects([paths[0]]);
+        localStorage.setItem(LEFT_SIDEBAR_COLLAPSED_KEY, JSON.stringify(false));
+        return createMockORPCClient({
+          projects: new Map(paths.map(projectWithNoWorkspaces)),
+          workspaces: [],
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    try {
+      await openFirstProjectCreationView(storyRoot);
+      await waitFor(
+        () => {
+          if (!storyRoot.querySelector("[data-testid='project-selector']")) {
+            throw new Error("Project switcher not found");
+          }
+        },
+        { timeout: 10_000 }
+      );
+    } finally {
+      localStorage.removeItem(LEFT_SIDEBAR_COLLAPSED_KEY);
+    }
+  },
 };
 
 /**
