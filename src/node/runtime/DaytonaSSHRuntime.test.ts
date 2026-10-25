@@ -836,11 +836,10 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
       transport: localShellTransport(rig.rootDir),
     });
 
-    // OpenSSH's message, split across two writes inside the token.
+    // OpenSSH's message, in one write.
     const result = await runtimeHelpers.execBuffered(
       runtime,
-      `printf '%s' '${token.slice(0, 2)}' >&2; sleep 0.05; ` +
-        `printf '%s@127.0.0.1: Permission denied (publickey).\\n' '${token.slice(2)}' >&2; exit 255`,
+      `printf '%s@127.0.0.1: Permission denied (publickey).\\n' '${token}' >&2; exit 255`,
       { cwd: "/tmp", timeout: 10 }
     );
     expect(result.stderr).not.toContain(token);

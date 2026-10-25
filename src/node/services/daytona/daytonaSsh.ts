@@ -154,11 +154,18 @@ export class DaytonaSsh {
     }
   }
 
-  /** `force` refetches a cached `/config` that is still fresh (an in-flight fetch is shared). */
-  async getGatewayConfig(options: { force?: boolean } = {}): Promise<DaytonaGatewayConfig> {
+  /**
+   * `unlessMovedSince` refetches a cached `/config` that is still fresh, unless the gateway moved
+   * since that generation (checked after the credentials read, so a failure that arrives as a
+   * concurrent one's refetch ends reuses it). An in-flight fetch is shared.
+   */
+  async getGatewayConfig(
+    options: { unlessMovedSince?: number } = {}
+  ): Promise<DaytonaGatewayConfig> {
     const { client, credentials } = await this.account.getClient();
     const cached = this.cachedGateway(credentials.apiUrl);
-    if (cached && !options.force && this.now() - cached.fetchedAt < DAYTONA_GATEWAY_CONFIG_TTL_MS) {
+    const force = options.unlessMovedSince === this.gatewayMoves;
+    if (cached && !force && this.now() - cached.fetchedAt < DAYTONA_GATEWAY_CONFIG_TTL_MS) {
       return cached.config;
     }
     return this.sharedGatewayRefresh(client, credentials.apiUrl, cached);
@@ -214,7 +221,7 @@ export class DaytonaSsh {
     attemptGeneration: number
   ): Promise<boolean> {
     if (this.gatewayMoves === attemptGeneration) {
-      const config = await this.getGatewayConfig({ force: true });
+      const config = await this.getGatewayConfig({ unlessMovedSince: attemptGeneration });
       if (this.gatewayMoves === attemptGeneration) return this.restoreGatewayPins(config);
     }
     await this.ensureSshAccess(sandboxId);
