@@ -179,6 +179,8 @@ export function renderDaytonaHostBlock(input: {
   // ignores a later ProxyJump too. KnownHostsCommand is left alone: OpenSSH before 8.5 rejects it
   // unless an `IgnoreUnknown` covers it, and ours would replace the user's own `IgnoreUnknown`
   // (first value wins). `Tunnel no` keeps a user's `Tunnel` from giving the sandbox a tun device.
+  // The gateway authenticates with "none" (the token is the user name), so password and
+  // keyboard-interactive auth are off: their prompts would print the token.
   // Forwards are not first-value-wins (see hasInheritedRemoteForward), and those an editor asks
   // for on its command line are left alone.
   return [
@@ -188,6 +190,8 @@ export function renderDaytonaHostBlock(input: {
     "  ForwardX11 no",
     "  PermitLocalCommand no",
     "  Tunnel no",
+    "  PasswordAuthentication no",
+    "  KbdInteractiveAuthentication no",
     `  HostName ${input.gateway.host}`,
     `  Port ${input.gateway.port}`,
     `  User ${input.token}`,

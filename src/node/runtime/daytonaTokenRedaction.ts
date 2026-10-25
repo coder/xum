@@ -49,162 +49,39 @@ export function redactDaytonaError(error: unknown): unknown {
   return error;
 }
 
-/** How many trailing chars of `text` could be the start of a remembered token. */
-function tokenPrefixSuffixLength(text: string): number {
-  let held = 0;
-  for (const token of rememberedTokens.keys()) {
-    for (let length = Math.min(token.length - 1, text.length); length > held; length--) {
-      if (text.endsWith(token.slice(0, length))) {
-        held = length;
-        break;
-      }
-    }
-  }
-  return held;
-}
-
-export interface DaytonaTextRedactor {
-  /** Redacted text that is safe to publish now; a possible token start stays held. */
-  push(text: string): string;
-  /** Everything still held, redacted. */
-  flush(): string;
-  /** The held text, only while the whole possible token start is shorter than the bound. */
-  releaseShortTail(): string;
-  holding(): boolean;
-}
-
-// An accidental match of a token's first chars this short is negligible, and a leaked prefix
-// this short is useless, so it may echo; a longer possible token start waits for more text.
-const RELEASABLE_TAIL_LENGTH = 4;
-
-function commonPrefixLength(a: string, b: string): number {
-  let length = 0;
-  while (length < a.length && a[length] === b[length]) length++;
-  return length;
-}
-
 /**
- * Redact text that arrives in pieces. A token split across pieces is caught by keeping the tail
- * that could start one: its held part waits for the next piece (or the end), and its released
- * part (already published) is redacted again with what follows, so a token whose start was
- * released is still masked from there on. The text is redacted before the tail is chosen, so a
- * whole token whose last chars also start a token is not split.
+ * Redact a byte stream chunk by chunk. A token split across two chunks is not caught: ssh writes
+ * each message (`<token>@host: Permission denied`) in one write.
  */
-export function createDaytonaTextRedactor(): DaytonaTextRedactor {
-  let released = "";
-  let held = "";
-  return {
-    push(text) {
-      const redacted = redactDaytonaTokens(released + held + text);
-      const published = commonPrefixLength(released, redacted);
-      const tailStart = redacted.length - tokenPrefixSuffixLength(redacted);
-      const cut = Math.max(published, tailStart);
-      released = redacted.slice(tailStart, cut);
-      held = redacted.slice(cut);
-      return redacted.slice(published, cut);
-    },
-    flush() {
-      const rest = held;
-      released = "";
-      held = "";
-      return rest;
-    },
-    releaseShortTail() {
-      if (released.length + held.length >= RELEASABLE_TAIL_LENGTH) return "";
-      const rest = held;
-      released += held;
-      held = "";
-      return rest;
-    },
-    holding: () => held !== "",
-  };
-}
-
-/** Redact a byte stream with createDaytonaTextRedactor. */
 export function createDaytonaRedactingStream(): Transform {
   const decoder = new StringDecoder("utf8");
-  const redactor = createDaytonaTextRedactor();
   const emit = (stream: Transform, text: string) => {
-    if (text) stream.push(Buffer.from(text, "utf8"));
+    if (text) stream.push(Buffer.from(redactDaytonaTokens(text), "utf8"));
   };
   return new Transform({
     transform(chunk: Buffer, _encoding, callback) {
-      emit(this, redactor.push(decoder.write(chunk)));
+      emit(this, decoder.write(chunk));
       callback();
     },
     flush(callback) {
-      emit(this, redactor.push(decoder.end()) + redactor.flush());
+      emit(this, decoder.end());
       callback();
     },
   });
 }
 
-// A PTY gives no signal that more output is coming, so a short held tail is published after
-// this quiet period. Otherwise a typed char that happens to start a token would not echo until
-// the next output.
-const PTY_HOLD_MS = 50;
-
-type CancelTimer = () => void;
-
-function scheduleHoldFlush(run: () => void): CancelTimer {
-  const timer = setTimeout(run, PTY_HOLD_MS);
-  timer.unref?.();
-  return () => clearTimeout(timer);
-}
-
 /**
- * Redact a PTY's output: without BatchMode OpenSSH can print `<token>@gateway: Permission
- * denied` or a password prompt naming the token into the terminal, which clients replay.
+ * Redact a PTY's output chunk by chunk: OpenSSH can print `<token>@gateway: Permission denied`
+ * into the terminal, which clients replay. The host block turns off password and
+ * keyboard-interactive auth, so no prompt names the token.
  */
-export function redactDaytonaPty(
-  pty: PtyHandle,
-  schedule: (run: () => void) => CancelTimer = scheduleHoldFlush
-): PtyHandle {
-  const redactor = createDaytonaTextRedactor();
-  const handlers = new Set<(data: string) => void>();
-  let subscribed = false;
-  let cancelTimer: CancelTimer | undefined;
-  const stopTimer = () => {
-    cancelTimer?.();
-    cancelTimer = undefined;
-  };
-  const publish = (text: string) => {
-    if (!text) return;
-    for (const handler of handlers) handler(text);
-  };
-  const flushHeld = () => {
-    stopTimer();
-    publish(redactor.flush());
-  };
-  const releaseShortTail = () => {
-    cancelTimer = undefined;
-    publish(redactor.releaseShortTail());
-  };
-  const onRawData = (data: string) => {
-    stopTimer();
-    publish(redactor.push(data));
-    if (redactor.holding()) cancelTimer = schedule(releaseShortTail);
-  };
+export function redactDaytonaPty(pty: PtyHandle): PtyHandle {
   return {
     write: (data) => pty.write(data),
     resize: (cols, rows) => pty.resize(cols, rows),
-    kill: () => {
-      stopTimer();
-      pty.kill();
-    },
-    onData(handler) {
-      handlers.add(handler);
-      if (!subscribed) {
-        subscribed = true;
-        pty.onData(onRawData);
-      }
-      return { dispose: () => handlers.delete(handler) };
-    },
-    onExit: (handler) =>
-      pty.onExit((event) => {
-        flushHeld();
-        handler(event);
-      }),
+    kill: () => pty.kill(),
+    onData: (handler) => pty.onData((data) => handler(redactDaytonaTokens(data))),
+    onExit: (handler) => pty.onExit(handler),
   };
 }
 

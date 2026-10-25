@@ -68,6 +68,8 @@ describe("DaytonaSshConfigWriter", () => {
         "  ForwardX11 no",
         "  PermitLocalCommand no",
         "  Tunnel no",
+        "  PasswordAuthentication no",
+        "  KbdInteractiveAuthentication no",
         "  HostName ssh.daytona.test",
         "  Port 22",
         "  User tokenA",
@@ -409,6 +411,7 @@ describe("DaytonaSshConfigWriter", () => {
             "  ForwardAgent yes",
             "  ForwardX11 yes",
             "  PermitLocalCommand yes",
+            "  PasswordAuthentication yes",
             "  ProxyCommand nc -X connect -x gateway.example.com:3128 %h %p",
             "  User me",
             "",
@@ -424,6 +427,7 @@ describe("DaytonaSshConfigWriter", () => {
         expect(daytona).toContain("\nforwardagent no\n");
         expect(daytona).toContain("\nforwardx11 no\n");
         expect(daytona).toContain("\npermitlocalcommand no\n");
+        expect(daytona).toContain("\npasswordauthentication no\n");
         expect(daytona).not.toMatch(/\nproxy(command|jump) /);
 
         const other = resolveFromUserConfig("other.example.com");
@@ -432,6 +436,7 @@ describe("DaytonaSshConfigWriter", () => {
         expect(other).toContain("\nuserknownhostsfile /dev/null\n");
         expect(other).toContain("\nforwardagent yes\n");
         expect(other).toContain("\nforwardx11 yes\n");
+        expect(other).toContain("\npasswordauthentication yes\n");
         expect(other).toContain("\nproxycommand nc -X connect -x gateway.example.com:3128 %h %p\n");
       }
     );
