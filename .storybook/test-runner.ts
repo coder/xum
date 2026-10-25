@@ -104,7 +104,8 @@ async function assertAgentInterfaceToggleTouchTargets(page: StoryPage) {
     await page.evaluate(async () => {
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       const transitions = document.getAnimations().filter((a) => a instanceof CSSTransition);
-      await Promise.all(transitions.map((transition) => transition.finished));
+      // allSettled: a transition the resize cancels rejects `finished` with an AbortError.
+      await Promise.allSettled(transitions.map((transition) => transition.finished));
     });
     const geometry = await toggle.evaluate((group) => {
       const groupBox = group.getBoundingClientRect();
