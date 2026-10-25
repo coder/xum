@@ -418,4 +418,35 @@ describe("the script on a fixture repo", () => {
     expect(fs.readdirSync(tmp)).toEqual([]);
     expect(sh("worktree", "list").split("\n")).toHaveLength(1);
   }, 30_000);
+
+  test("a second SIGTERM kills a child that ignores SIGTERM, and the cleanup still runs", async () => {
+    const pidFile = path.join(root, "child.pid");
+    const termFile = path.join(root, "child.term");
+    repo(
+      'import * as fs from "node:fs";\n' +
+        // The child ignores SIGTERM and notes that it got one, so the test knows when the
+        // runner's first handler has run.
+        `process.on("SIGTERM", () => fs.writeFileSync(${JSON.stringify(termFile)}, ""));\n` +
+        `test("waits", async () => { fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); await Bun.sleep(60_000); }, 120_000);\n`
+    );
+    const child = start(["--base", "HEAD", "--runs", "2"]);
+    while (!fs.existsSync(pidFile)) await Bun.sleep(20);
+    const pid = Number(fs.readFileSync(pidFile, "utf8"));
+    try {
+      child.kill("SIGTERM");
+      while (!fs.existsSync(termFile)) await Bun.sleep(20);
+      child.kill("SIGTERM");
+      const result = await finish(child);
+      expect(result.exitCode).toBe(143);
+      expect(() => process.kill(pid, 0)).toThrow();
+      expect(fs.readdirSync(tmp)).toEqual([]);
+      expect(sh("worktree", "list").split("\n")).toHaveLength(1);
+    } finally {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+  }, 30_000);
 });
