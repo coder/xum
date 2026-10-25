@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { existsSync } from "fs";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -49,7 +50,7 @@ describe("prepareAgentInterfaceStatusPage", () => {
     "is inactive and writes nothing unless both flags are on and the scratch dir is set (%o)",
     async (flags) => {
       expect(await prepare(flags)).toBe(false);
-      await expect(fs.stat(statusPath())).rejects.toThrow();
+      expect(existsSync(statusPath())).toBe(false);
     }
   );
 
