@@ -1654,6 +1654,15 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             props.embedded !== true && "mobile-header-spacer"
           )}
         >
+          {/* Before the scrollport, which holds the composer dock, so Tab reaches the page
+              before the composer below it. */}
+          <AgentInterfaceStatusView
+            key={workspaceId}
+            workspaceId={workspaceId}
+            view={props.agentInterfaceView}
+            dockRef={composerDockRef}
+            composerApiRef={chatInputAPI}
+          />
           <div
             ref={contentRef}
             onWheel={handleTranscriptWheel}
@@ -1664,7 +1673,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             onKeyDown={handleTranscriptKeyDown}
             onScroll={handleTranscriptScroll}
             onContextMenu={transcriptContextMenu.onContextMenu}
-            tabIndex={0}
+            // The status page covers the transcript: Tab skips it (the composer stays reachable).
+            tabIndex={showStatusView ? -1 : 0}
             data-testid="message-window"
             // Settled marker for perf tests and story play helpers: includes
             // decoration data readiness AND the tail-first reveal having settled
@@ -1923,13 +1933,6 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               </ChatDockColumnProvider>
             </PerfRenderMarker>
           </div>
-          <AgentInterfaceStatusView
-            key={workspaceId}
-            workspaceId={workspaceId}
-            view={props.agentInterfaceView}
-            dockRef={composerDockRef}
-            composerApiRef={chatInputAPI}
-          />
           {transcriptContextMenu.menu}
         </div>
       </PerfRenderMarker>
