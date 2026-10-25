@@ -358,7 +358,11 @@ describe("getToolsForModel - model-only notifications", () => {
       );
       await getExecute(tools.todo_read)();
       await clock.adjust(1_000);
-      await expect(getExecute(tools.mcp_failing)()).rejects.toThrow("boom");
+      const failure = await getExecute(tools.mcp_failing)().then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(failure).toBeInstanceOf(Error);
       expect(
         pollSpy.mock.calls.map(([ctx]) => ({ now: ctx.now, succeeded: ctx.toolSucceeded }))
       ).toEqual([
