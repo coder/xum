@@ -79,8 +79,13 @@ import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
 import {
   type AgentInterfaceStatusPageTurn,
+  isStatusPageAgentMode,
   prepareAgentInterfaceStatusPage,
 } from "./agentInterfaceStatusPage";
+import {
+  isStatusPageAgentEnabledInSettings,
+  type StatusPageAgentService,
+} from "./statusPageAgentService";
 import { resolveArtifactsLocation } from "./artifactsOperations";
 import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
 import type { StreamManager } from "./streamManager";
@@ -116,7 +121,7 @@ import type { SessionUsageService } from "./sessionUsageService";
 import { sideChatCapabilityGrants, withSideChatInstructions } from "./sideChat";
 import type { EvaluationService } from "./evaluation/evaluationService";
 import type { InstructionSources } from "@/common/types/instructions";
-import { extractToolInstructionsFromSources } from "./systemMessage";
+import { extractToolInstructionsFromSources, removeStatusPageAgentGuidance } from "./systemMessage";
 import { createAssistantMessageId } from "./utils/messageIds";
 import { createErrorEvent, formatSendMessageError } from "./utils/sendMessageError";
 
@@ -301,7 +306,7 @@ export function resolveXumToolScope(
 
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ErrorEvent } from "@/common/types/stream";
-import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { applyToolPolicyToNames, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -907,12 +912,72 @@ type PreparedTurnRequestOutcome =
   | Extract<TurnRequestBuildOutcome, { type: "finished" }>
   | { type: "prepared"; request: PreparedTurnRequest };
 
+/**
+ * Toolset facts the system prompt describes (hot memories, the status page guidance). Tool
+ * policy may strip a tool after the provisional prompt was built; a different toolset forces a
+ * rebuild so the prompt never advertises an absent tool.
+ */
+interface SystemPromptToolset {
+  memoryToolAvailable: boolean;
+  statusUpdateToolAvailable: boolean;
+}
+
+/**
+ * `activeToolPolicy` matters because the advertised union keeps a tool the active agent or the
+ * caller denies as a refusal stub (#5253): presence alone does not mean the turn may call it.
+ * Memory is never stubbed (toolAssembly canRefuseAtExecution), so its presence is enough.
+ */
+function systemPromptToolsetOf(
+  tools: Record<string, Tool>,
+  activeToolPolicy: ToolPolicy | undefined
+): SystemPromptToolset {
+  return {
+    memoryToolAvailable: tools.memory !== undefined,
+    statusUpdateToolAvailable: statusUpdateUsable(
+      tools.status_update !== undefined,
+      activeToolPolicy
+    ),
+  };
+}
+
+/** Whether a registered status_update survives the active tool policy (see above). */
+function statusUpdateUsable(
+  registered: boolean,
+  activeToolPolicy: ToolPolicy | undefined
+): boolean {
+  return registered && applyToolPolicyToNames(["status_update"], activeToolPolicy).length > 0;
+}
+
+/**
+ * A main-chat turn without status page agent mode hands the page back to the main agent, so
+ * updates still queued (or carried from a failed run) and the last failure are stale: without
+ * this they would be applied, and reported, once the mode comes back. Side chats and compaction
+ * never get the mode, so they leave the main chat's queue alone.
+ */
+function discardStatusUpdatesWithoutMode(
+  queue: TurnRequestBuilderBindings["statusPageAgent"],
+  workspaceId: string,
+  turn: { statusPageAgentActive: boolean; sideChat: boolean; compaction: boolean }
+): void {
+  if (turn.statusPageAgentActive || turn.sideChat || turn.compaction) return;
+  queue?.discard(workspaceId);
+}
+
+function sameSystemPromptToolset(a: SystemPromptToolset, b: SystemPromptToolset): boolean {
+  return (
+    a.memoryToolAvailable === b.memoryToolAvailable &&
+    a.statusUpdateToolAvailable === b.statusUpdateToolAvailable
+  );
+}
+
 export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   mcpServerManager?: MCPServerManager;
   taskService?: TaskService;
   workspaceTurnManager?: ToolConfiguration["workspaceTurnManager"];
   memoryService?: MemoryService;
   timelineService?: ToolConfiguration["timelineService"];
+  /** Status page agent queue behind the status_update tool (artifacts-status-page-agent). */
+  statusPageAgent?: Pick<StatusPageAgentService, "enqueue" | "discard">;
   extraTools?: Record<string, Tool>;
   onWorkflowRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
   workflowResultContinuationSender?: WorkflowResultContinuationSender;
@@ -1109,15 +1174,40 @@ export class TurnRequestBuilder {
     workspaceId: string,
     messageId: string,
     turn: AgentInterfaceStatusPageTurn | null,
-    agent: { subagentWorkspace: boolean; planLike: boolean }
+    agent: { subagentWorkspace: boolean; planLike: boolean; statusPageAgent: boolean }
   ): void {
     // Only root workspaces get the turn-end status page nudge (AgentSession.runTurnStopHooks), and
     // no plan-like agent (a custom one included): it may edit only its plan file.
     if (turn != null && !agent.subagentWorkspace && !agent.planLike) {
-      this.agentInterfaceTurns.set(workspaceId, { messageId, turn });
+      this.agentInterfaceTurns.set(workspaceId, {
+        messageId,
+        turn: { ...turn, statusPageAgent: agent.statusPageAgent },
+      });
     } else {
       this.agentInterfaceTurns.delete(workspaceId);
     }
+  }
+
+  /**
+   * request.assemble middleware may filter status_update after the prompt was built. Then the
+   * page goes back to the main agent: the classic guidance replaces the status page agent's, and
+   * the turn-end nudge asks for a page edit, not a status_update call. Each attempt (a model
+   * fallback reruns the middleware) sets the nudge from its own prompt.
+   */
+  private followStatusUpdateAfterMiddleware(
+    workspaceId: string,
+    messageId: string,
+    systemMessage: string,
+    statusUpdate: { prompted: boolean; present: boolean }
+  ): string {
+    const entry = this.agentInterfaceTurns.get(workspaceId);
+    if (entry?.messageId === messageId) {
+      this.agentInterfaceTurns.set(workspaceId, {
+        messageId,
+        turn: { ...entry.turn, statusPageAgent: statusUpdate.prompted && statusUpdate.present },
+      });
+    }
+    return statusUpdate.present ? systemMessage : removeStatusPageAgentGuidance(systemMessage);
   }
 
   /**
@@ -2438,13 +2528,25 @@ export class TurnRequestBuilder {
       abortSignal: combinedAbortSignal,
     });
     const agentInterfaceViewActive = agentInterfaceTurn != null;
+    // Status page agent mode: the main agent sends status_update calls and a host-run agent
+    // edits the page. Eligibility mirrors status_update registration; tool policy may still
+    // strip the tool, which forces a rebuild below so the prompt keeps the classic guidance.
+    const statusPageAgentActive = isStatusPageAgentMode({
+      agentInterfaceView: agentInterfaceViewActive,
+      statusPageAgentEnabled: isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT),
+      enabledInSettings: isStatusPageAgentEnabledInSettings(cfg),
+      queueAvailable: this.dependencies.bindings.statusPageAgent !== undefined,
+    });
+    discardStatusUpdatesWithoutMode(this.dependencies.bindings.statusPageAgent, workspaceId, {
+      statusPageAgentActive,
+      sideChat: isSideChat,
+      compaction: isCompactionRequest,
+    });
     // Filled by the first build: later rebuilds in this turn (tool policy,
     // model fallback) reuse the same instruction snapshot instead of re-reading.
     const turnInstructionSources: { current?: InstructionSources } = {};
     const buildStreamSystemContextForToolset = (
-      toolset: {
-        memoryToolAvailable: boolean;
-      },
+      toolset: SystemPromptToolset,
       modelStringForSystem: string = modelString
     ) =>
       buildStreamSystemContext({
@@ -2479,14 +2581,17 @@ export class TurnRequestBuilder {
         agentDefinitionCache,
         scratchDirSet: scratchDir !== undefined,
         agentInterfaceView: agentInterfaceViewActive,
+        statusPageAgent: toolset.statusUpdateToolAvailable,
       });
 
     // Build provisional agent context before tool policy finalizes the toolset.
     // Rebuild after policy application so guidance only describes available tools.
     const buildStreamSystemContextStartedAt = this.hostClock.nowMs();
-    const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset({
+    const prePolicyToolset: SystemPromptToolset = {
       memoryToolAvailable: memoryToolEligible,
-    });
+      statusUpdateToolAvailable: statusPageAgentActive,
+    };
+    const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset(prePolicyToolset);
     // The MCP inventory the pre-policy context was built with; a later
     // rebuild from the validated serve makes that context stale.
     const mcpServersAtPrePolicy = mcpServers;
@@ -2858,6 +2963,8 @@ export class TurnRequestBuilder {
     this.recordAgentInterfaceTurn(workspaceId, assistantMessageId, agentInterfaceTurn, {
       subagentWorkspace: isSubagentWorkspace,
       planLike: agentIsPlanLike,
+      // The same rule the prompt follows, so the nudge asks for what the prompt told the agent.
+      statusPageAgent: statusUpdateUsable(statusPageAgentActive, effectiveToolPolicy),
     });
     // Bind ownership before cached MCP tools are captured by the PTC bridge.
     // A queued invocation must keep this turn's identity after a replacement starts.
@@ -2918,6 +3025,8 @@ export class TurnRequestBuilder {
       strictAgentResolution,
       xumScope,
       timelineService: this.dependencies.bindings.timelineService,
+      statusPageAgent: this.dependencies.bindings.statusPageAgent,
+      statusPageAgentActive,
       desktopNotifications: this.dependencies.hostServices.desktopNotifications,
       sessionLocks: this.dependencies.historyService.locks,
       sessionFiles: this.dependencies.historyService.files,
@@ -2933,6 +3042,7 @@ export class TurnRequestBuilder {
       goalService: workspaceGoalService,
       goalDefaults: effectiveGoalDefaults,
       goalKickoffModel: modelString,
+      statusUpdateFallbackModel: modelString,
       goalToolContext,
       // Only child workspaces (tasks) can report to a parent.
       enableAgentReport: Boolean(metadata.parentWorkspaceId),
@@ -3100,6 +3210,7 @@ export class TurnRequestBuilder {
             // Per attempt: a fallback model that calls set_goal must price and
             // kick off the goal on itself, not on the primary it replaced.
             goalKickoffModel: seed.rawModelString,
+            statusUpdateFallbackModel: seed.rawModelString,
             openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
             xaiNativeToolsEnabled: seed.routeProvider === "xai",
             anthropicNativeWebFetchEnabled: anthropicNativeWebFetchRouteAvailable(
@@ -3204,15 +3315,15 @@ export class TurnRequestBuilder {
           }
         }
 
-        const memoryToolAvailable = attemptTools.memory !== undefined;
+        const attemptToolset = systemPromptToolsetOf(attemptTools, effectiveToolPolicy);
         const canReuseSystemContext =
           options.reusePrePolicySystemContext &&
           mcpServers === mcpServersAtPrePolicy &&
-          memoryToolAvailable === memoryToolEligible;
+          sameSystemPromptToolset(attemptToolset, prePolicyToolset);
         const rebuildSystemStartedAt = this.hostClock.nowMs();
         const systemContext = canReuseSystemContext
           ? prePolicyStreamSystemContext
-          : await buildStreamSystemContextForToolset({ memoryToolAvailable }, seed.rawModelString);
+          : await buildStreamSystemContextForToolset(attemptToolset, seed.rawModelString);
         if (options.recordTimings && !canReuseSystemContext) {
           recordStartupPhaseTiming("rebuildStreamSystemContextMs", rebuildSystemStartedAt);
         }
@@ -3256,6 +3367,15 @@ export class TurnRequestBuilder {
           assembleCtx.systemMessage = removeMemoryGuidance(
             assembleCtx.systemMessage,
             attemptTools.memory !== undefined
+          );
+          assembleCtx.systemMessage = this.followStatusUpdateAfterMiddleware(
+            workspaceId,
+            assistantMessageId,
+            assembleCtx.systemMessage,
+            {
+              prompted: attemptToolset.statusUpdateToolAvailable,
+              present: attemptTools.status_update !== undefined,
+            }
           );
           if (assembleCtx.systemMessage !== attemptSystem) {
             attemptSystem = assembleCtx.systemMessage;

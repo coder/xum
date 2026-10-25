@@ -107,6 +107,11 @@ export interface AgentInterfaceStatusPageTurn {
   resolveLocation: (abortSignal?: AbortSignal) => Promise<ArtifactsLocation>;
   /** The page's fingerprint after seeding, or null when it could not be read. */
   startFingerprint: string | null;
+  /**
+   * Status page agent mode gave this turn a usable status_update (set when the turn is recorded,
+   * after tool policy): the nudge then asks for a status update, and none follows one.
+   */
+  statusPageAgent?: boolean;
 }
 
 /**
@@ -158,6 +163,9 @@ export async function needsStatusPageTurnEndNudge(input: {
   parts: readonly CompletedMessagePart[];
 }): Promise<boolean> {
   if (input.turn == null || !input.viewEnabled) return false;
+  // The status page agent applies an update after the call returns, maybe after this turn ends,
+  // so the page can still look untouched: a sent update is enough.
+  if (input.turn.statusPageAgent === true && sentStatusUpdate(input.parts)) return false;
   const abortSignal = AbortSignal.timeout(STATUS_PAGE_TURN_END_READ_TIMEOUT_MS);
   const location = await resolveStatusPageLocation(input.turn.resolveLocation, abortSignal);
   if (location == null) return false;
@@ -186,14 +194,23 @@ function isSuccessfulToolCall(call: { state: string; output?: unknown }): boolea
   );
 }
 
-function madeSuccessfulToolCall(parts: readonly CompletedMessagePart[]): boolean {
+function madeSuccessfulToolCall(
+  parts: readonly CompletedMessagePart[],
+  isWanted: (call: { toolName: string }) => boolean = () => true
+): boolean {
+  const succeeded = (call: { toolName: string; state: string; output?: unknown }) =>
+    isWanted(call) && isSuccessfulToolCall(call);
   return parts.some(
     (part) =>
       part.type === "dynamic-tool" &&
-      (isSuccessfulToolCall(part) ||
+      (succeeded(part) ||
         // Programmatic tool calling runs tools inside code_execution.
-        part.nestedCalls?.some(isSuccessfulToolCall) === true)
+        part.nestedCalls?.some(succeeded) === true)
   );
+}
+
+function sentStatusUpdate(parts: readonly CompletedMessagePart[]): boolean {
+  return madeSuccessfulToolCall(parts, (call) => call.toolName === "status_update");
 }
 
 async function resolveStatusPageLocation(
@@ -227,6 +244,27 @@ async function seedStatusPage(
   } catch (error) {
     log.debug("Seeding the agent interface status page failed", { error });
   }
+}
+
+/**
+ * Status page agent mode (artifacts-status-page-agent) for a turn: the Agent interface view is
+ * active (which already excludes side chats, compactions and turns without a scratch dir), the
+ * sub-experiment is on, the Settings > Agents > Status Page card is not switched off, and the host
+ * has the status page agent queue. In this mode the main agent gets status_update and the prompt
+ * tells it to send updates instead of editing the page.
+ */
+export function isStatusPageAgentMode(args: {
+  agentInterfaceView: boolean;
+  statusPageAgentEnabled: boolean;
+  enabledInSettings: boolean;
+  queueAvailable: boolean;
+}): boolean {
+  return (
+    args.agentInterfaceView &&
+    args.statusPageAgentEnabled &&
+    args.enabledInSettings &&
+    args.queueAvailable
+  );
 }
 
 type StatusPageRead =

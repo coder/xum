@@ -80,21 +80,36 @@ export const STATUS_PAGE_TURN_END_NUDGE = `<notification>
 You ended your turn, but the status page the user sees instead of this chat is blank, still shows Xum's placeholder, or did not change this turn. Update $XUM_SCRATCH_DIR/artifacts/status.html in place now so it shows the current status, progress and results, and anything that waits on the user. Do not redo work you already did.
 </notification>`;
 
+/**
+ * The same nudge in status page agent mode (artifacts-status-page-agent): the status page agent
+ * owns the page, so the main agent is asked for a status_update call instead of an edit. Sent
+ * only when the turn sent no status_update: the page lags those calls, so an unchanged page alone
+ * does not mean the agent skipped its update.
+ */
+export const STATUS_PAGE_AGENT_TURN_END_NUDGE = `<notification>
+You ended your turn without a status update, and the status page the user sees instead of this chat is blank, still shows Xum's placeholder, or did not change this turn. Call status_update now with the current status, progress and results, and anything that waits on the user. Do not redo work you already did.
+</notification>`;
+
+const STATUS_PAGE_TURN_END_NUDGES = [STATUS_PAGE_TURN_END_NUDGE, STATUS_PAGE_AGENT_TURN_END_NUDGE];
+
 /** Joins Xum's turn-end nudges (TODO first, then the status page) into one continuation. */
 export const TURN_END_NUDGE_SEPARATOR = "\n\n";
 
 /**
- * Which turn-end status page nudge `text` is exactly: "status-page" alone, "todo-and-status-page"
- * when it follows the TODO nudge in one continuation, or null for any other text.
+ * Which turn-end status page nudge (either variant) `text` is exactly: "status-page" alone,
+ * "todo-and-status-page" when it follows the TODO nudge in one continuation, or null for any
+ * other text.
  */
 export function classifyStatusPageTurnEndNudgePrompt(
   text: string
 ): "status-page" | "todo-and-status-page" | null {
-  if (text === STATUS_PAGE_TURN_END_NUDGE) return "status-page";
+  if (STATUS_PAGE_TURN_END_NUDGES.includes(text)) return "status-page";
   // Any current TODO nudge text, earlier ones included: joined rows stored before the TODO
   // prompt's last change must keep their compact row.
-  const statusSuffix = `${TURN_END_NUDGE_SEPARATOR}${STATUS_PAGE_TURN_END_NUDGE}`;
-  return text.endsWith(statusSuffix) &&
+  const statusSuffix = STATUS_PAGE_TURN_END_NUDGES.map(
+    (nudge) => `${TURN_END_NUDGE_SEPARATOR}${nudge}`
+  ).find((suffix) => text.endsWith(suffix));
+  return statusSuffix != null &&
     classifyTodoTurnEndNudgePrompt(text.slice(0, -statusSuffix.length)) === "current"
     ? "todo-and-status-page"
     : null;

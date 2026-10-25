@@ -8,6 +8,7 @@ import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvel
 import { formatAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import {
   BACKGROUND_WORK_WAKE_OPENINGS,
+  STATUS_PAGE_AGENT_TURN_END_NUDGE,
   STATUS_PAGE_TURN_END_NUDGE,
   TODO_TURN_END_NUDGE,
 } from "@/common/utils/machineTurnPrompts";
@@ -774,17 +775,20 @@ describe("MessageRenderer TODO nudge rows", () => {
     expect(both.getByText("Asked the agent to update its TODO list and status page")).toBeDefined();
   });
 
-  test("collapses the status page nudge, alone or after the TODO nudge, but not a typed copy", () => {
-    const alone = renderNudge(STATUS_PAGE_TURN_END_NUDGE, true);
-    expect(alone.container.querySelector("[data-status-page-turn-end-nudge]")).not.toBeNull();
-    cleanup();
-    const both = renderNudge(`${TODO_TURN_END_NUDGE}\n\n${STATUS_PAGE_TURN_END_NUDGE}`, true);
-    expect(both.container.querySelector("[data-status-page-turn-end-nudge]")).not.toBeNull();
-    expect(both.queryByText(/status\.html/)).toBeNull();
-    cleanup();
-    const typed = renderNudge(STATUS_PAGE_TURN_END_NUDGE, false);
-    expect(typed.container.querySelector("[data-status-page-turn-end-nudge]")).toBeNull();
-  });
+  test.each([STATUS_PAGE_TURN_END_NUDGE, STATUS_PAGE_AGENT_TURN_END_NUDGE])(
+    "collapses a status page nudge, alone or after the TODO nudge, but not a typed copy",
+    (nudge) => {
+      const alone = renderNudge(nudge, true);
+      expect(alone.container.querySelector("[data-status-page-turn-end-nudge]")).not.toBeNull();
+      cleanup();
+      const both = renderNudge(`${TODO_TURN_END_NUDGE}\n\n${nudge}`, true);
+      expect(both.container.querySelector("[data-status-page-turn-end-nudge]")).not.toBeNull();
+      expect(both.queryByText(/status page the user sees/)).toBeNull();
+      cleanup();
+      const typed = renderNudge(nudge, false);
+      expect(typed.container.querySelector("[data-status-page-turn-end-nudge]")).toBeNull();
+    }
+  );
 });
 
 describe("MessageRenderer bash monitor wake rows", () => {

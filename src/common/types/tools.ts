@@ -186,6 +186,12 @@ export type HeartbeatToolResult = z.infer<typeof HeartbeatToolResultSchema>;
 export type TimelineEventToolArgs = z.infer<typeof TOOL_DEFINITIONS.timeline_event.schema>;
 export type TimelineEventToolResult = z.infer<typeof TimelineEventToolResultSchema>;
 
+// Status-update tool types (status page agent mode)
+export type StatusUpdateToolArgs = z.infer<typeof TOOL_DEFINITIONS.status_update.schema>;
+export type StatusUpdateToolResult =
+  | { success: true; queued: true; note?: string }
+  | { success: false; error: string };
+
 // Session-history tool types, derived from schema (avoid drift)
 export type SessionHistoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.session_history.schema>;
 export type SessionHistoryToolResult = z.infer<

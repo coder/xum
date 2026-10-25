@@ -129,7 +129,6 @@ import {
   streamStartedByUserMessage,
   type TurnStopContinuation,
 } from "@/node/services/agentNotifications/todoTurnEndNudge";
-import { STATUS_PAGE_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
 import { resolveLegacyTodoNudgeToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
@@ -1107,11 +1106,11 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     workspaceId: string,
     input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "model">
   ): Promise<TurnStopHookOutcome>;
-  /** Whether the turn earns the Agent interface view's status page nudge. Absent: never. */
-  needsStatusPageTurnEndNudge?(
+  /** The Agent interface view's status page nudge the turn earns, or null. Absent: never. */
+  statusPageTurnEndNudge?(
     workspaceId: string,
     input: { messageId: string; parts: readonly CompletedMessagePart[] }
-  ): Promise<boolean>;
+  ): Promise<string | null>;
   resolveXumToolScopeForWorkspace?(
     metadata: WorkspaceMetadata,
     runtime: Runtime,
@@ -10769,7 +10768,7 @@ export class AgentSession {
    * Run the turn.stop prompt hooks (Codex Stop) for a turn that ended normally. A continuation
    * (Codex `decision: "block"`) queues its prompt as a new synthetic user row, at most
    * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Xum's own nudges (needsTodoTurnEndNudge,
-   * needsStatusPageTurnEndNudge) ride the same continuation and gates. Sub-agent turns skip the
+   * statusPageTurnEndNudge) ride the same continuation and gates. Sub-agent turns skip the
    * hooks: TaskService owns their stream end (Codex has SubagentStop for them). A delegated
    * workspace turn (`workspace-turn-task`) skips them for the same reason: WorkspaceTurnManager
    * settles its handle from this stream end, and can remove a disposable workspace, while a slow
@@ -10925,11 +10924,11 @@ export class AgentSession {
         files: this.historyService.files,
       }));
     if (todoNudge) nudges.push(TODO_TURN_END_NUDGE);
-    const statusPageNudge = await this.aiService.needsStatusPageTurnEndNudge?.(this.workspaceId, {
+    const statusPageNudge = await this.aiService.statusPageTurnEndNudge?.(this.workspaceId, {
       messageId: payload.messageId,
       parts: payload.parts,
     });
-    if (statusPageNudge === true) nudges.push(STATUS_PAGE_TURN_END_NUDGE);
+    if (statusPageNudge != null) nudges.push(statusPageNudge);
     return nudges;
   }
 

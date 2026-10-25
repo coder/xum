@@ -18,7 +18,7 @@ import {
 import { createTestHistoryService } from "./testHistoryService";
 import { createMemoryHost } from "@/node/services/hostFiles/memoryHostFiles.testHarness";
 import { fakeRuntimeFactory } from "@/node/services/runtimeFactory/fakeRuntimeFactory.testHarness";
-import { buildRequiredToolPatterns } from "@/common/utils/tools/toolPolicy";
+import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { HistoryService } from "./historyService";
 import { CompactionCancellation } from "./compactionCancellation";
 import { InitStateManager } from "./initStateManager";
@@ -103,6 +103,12 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import { buildReplayRequest } from "@/node/services/replay/replayRequestBuilder";
 import { MemoryService, projectMemoryDirName } from "@/node/services/memoryService";
 import * as toolAssembly from "./toolAssembly";
+import * as agentInterfaceStatusPage from "./agentInterfaceStatusPage";
+import {
+  STATUS_PAGE_AGENT_TURN_END_NUDGE,
+  STATUS_PAGE_TURN_END_NUDGE,
+} from "@/common/utils/machineTurnPrompts";
+import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import type { WorkspaceHeartbeatToolService } from "@/common/utils/tools/tools";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import * as toolsModule from "@/common/utils/tools/tools";
@@ -821,9 +827,14 @@ describe("AIService status page turn-end nudge", () => {
   // The turn start (TurnRequestBuilder) and the turn end (AgentSession) meet only here: keyed by
   // the streamed messageId, taken once, and read under the flags at turn end.
   it.each([
-    { name: "the view still on", viewOnAtEnd: true, planLike: false, nudge: true },
-    { name: "the view switched off", viewOnAtEnd: false, planLike: false, nudge: false },
-    { name: "a custom plan-like agent", viewOnAtEnd: true, planLike: true, nudge: false },
+    {
+      name: "the view still on",
+      viewOnAtEnd: true,
+      planLike: false,
+      nudge: STATUS_PAGE_TURN_END_NUDGE,
+    },
+    { name: "the view switched off", viewOnAtEnd: false, planLike: false, nudge: null },
+    { name: "a custom plan-like agent", viewOnAtEnd: true, planLike: true, nudge: null },
   ])("a placeholder page at turn end with $name", async (row) => {
     const testHistory = await createTestHistoryService();
     try {
@@ -859,11 +870,11 @@ describe("AIService status page turn-end nudge", () => {
         await experimentsService.setOverride(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE, false);
       }
       const nudge = (id: string) =>
-        harness.service.needsStatusPageTurnEndNudge(metadata.id, { messageId: id, parts: [] });
+        harness.service.statusPageTurnEndNudge(metadata.id, { messageId: id, parts: [] });
 
-      expect(await nudge("another-turn")).toBe(false);
+      expect(await nudge("another-turn")).toBeNull();
       expect(await nudge(messageId)).toBe(row.nudge);
-      expect(await nudge(messageId)).toBe(false);
+      expect(await nudge(messageId)).toBeNull();
     } finally {
       await testHistory.cleanup();
     }
@@ -1369,6 +1380,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     preparedToolNamesForSentinel: string[][];
     streamSystemContextMuxScopes: XumToolScope[];
     streamSystemContextMemoryToolFlags: Array<boolean | undefined>;
+    streamSystemContextStatusPageFlags: Array<boolean | undefined>;
     /** Snapshot passed into each system-context build (undefined = load from disk). */
     streamSystemContextInstructionInputs: Array<InstructionSources | undefined>;
     /** Snapshot each system-context build returned. */
@@ -1420,6 +1432,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const preparedToolNamesForSentinel: string[][] = [];
     const streamSystemContextMuxScopes: XumToolScope[] = [];
     const streamSystemContextMemoryToolFlags: Array<boolean | undefined> = [];
+    const streamSystemContextStatusPageFlags: Array<boolean | undefined> = [];
     const streamSystemContextInstructionInputs: Array<InstructionSources | undefined> = [];
     const streamSystemContextInstructionOutputs: InstructionSources[] = [];
     const toolInstructionSources: InstructionSources[] = [];
@@ -1451,6 +1464,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         }
         streamSystemContextMuxScopes.push(contextArgs.xumScope);
         streamSystemContextMemoryToolFlags.push(contextArgs.memoryToolAvailable);
+        streamSystemContextStatusPageFlags.push(contextArgs.statusPageAgent);
       },
       onPrepareMessagesForProvider: (pipelineArgs) => {
         preparedPayloadMessageIds.push(
@@ -1476,6 +1490,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       preparedToolNamesForSentinel,
       streamSystemContextMuxScopes,
       streamSystemContextMemoryToolFlags,
+      streamSystemContextStatusPageFlags,
       streamSystemContextInstructionInputs,
       streamSystemContextInstructionOutputs,
       toolInstructionSources,
@@ -3020,6 +3035,171 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(result.success).toBe(true);
     expect(harness.streamSystemContextMemoryToolFlags).toEqual([true, false]);
     expect(memoryCalls).toEqual(["openai:gpt-5.2"]);
+  });
+
+  it("keeps the classic status page guidance and nudge when the active policy or middleware drops status_update, and drops queued updates once the mode is off", async () => {
+    using xumHome = new DisposableTempDir("ai-service-status-update-policy");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "workspace-status-update-policy";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- stub for status_update gating
+    const stubTool: Tool = {} as never;
+    // The scratch dir and status.html seeding are not under test: the view is on for the turn,
+    // and its page still shows the placeholder at turn end, which earns the nudge.
+    const artifactsDir = path.join(xumHome.path, "artifacts");
+    await fs.mkdir(artifactsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(artifactsDir, AGENT_INTERFACE_STATUS_ARTIFACT),
+      agentInterfaceStatusPage.AGENT_INTERFACE_STATUS_TEMPLATE
+    );
+    spyOn(agentInterfaceStatusPage, "prepareAgentInterfaceStatusPage").mockResolvedValue({
+      resolveLocation: () => Promise.resolve({ kind: "host", dir: artifactsDir }),
+      startFingerprint: null,
+    });
+    const nudgeFor = async (stream: Promise<Awaited<ReturnType<AIService["streamMessage"]>>>) => {
+      const result = await stream;
+      if (!result.success) throw new Error(JSON.stringify(result.error));
+      return harness.service.statusPageTurnEndNudge(workspaceId, {
+        messageId: result.data.messageId,
+        parts: [],
+      });
+    };
+    const experimentsService = await experimentsServiceWith(xumHome.path, [
+      EXPERIMENT_IDS.ARTIFACTS,
+      EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
+      EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT,
+    ]);
+    const harness = createHarness(xumHome.path, metadata, {
+      experimentsService,
+      allTools: { status_update: stubTool },
+      // A denied status_update stays in the advertised union as a refusal stub (#5253).
+      postPolicyTools: { status_update: stubTool },
+    });
+    // The active agent's policy (a custom agent's tools.remove, or a caller's disable rule).
+    const active: { policy?: ToolPolicy } = {};
+    spyOn(agentResolution, "resolveAgentForStream").mockImplementation(() => {
+      const resolved = resolvedAgentResultFor(metadata);
+      if (resolved.success) resolved.data.effectiveToolPolicy = active.policy;
+      return Promise.resolve(resolved);
+    });
+    const discarded: string[] = [];
+    harness.service.turnRequestBuilderBindings.statusPageAgent = {
+      enqueue: () => ({ queued: true }),
+      discard: (id) => discarded.push(id),
+    };
+
+    expect(await nudgeFor(startTestStream(harness, workspaceId))).toBe(
+      STATUS_PAGE_AGENT_TURN_END_NUDGE
+    );
+    expect(harness.streamSystemContextStatusPageFlags).toEqual([true]);
+
+    // Switched off before the turn ended: the update it sent is dropped, so it gets no pass.
+    const sent = await startTestStream(harness, workspaceId);
+    if (!sent.success) throw new Error(JSON.stringify(sent.error));
+    await experimentsService.setOverride(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT, false);
+    expect(
+      await harness.service.statusPageTurnEndNudge(workspaceId, {
+        messageId: sent.data.messageId,
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "status-1",
+            toolName: "status_update",
+            input: { update: "Fixing the build" },
+            state: "output-available",
+            output: { success: true, queued: true },
+          },
+        ],
+      })
+    ).toBe(STATUS_PAGE_TURN_END_NUDGE);
+    await experimentsService.setOverride(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT, true);
+
+    harness.streamSystemContextStatusPageFlags.length = 0;
+    active.policy = [{ regex_match: "status_update", action: "disable" }];
+    expect(await nudgeFor(startTestStream(harness, workspaceId))).toBe(STATUS_PAGE_TURN_END_NUDGE);
+    expect(harness.streamSystemContextStatusPageFlags).toEqual([true, false]);
+    // The mode itself stayed on, so the queue keeps the main chat's updates.
+    expect(discarded).toEqual([]);
+
+    // request.assemble middleware drops status_update after the prompt was built: the main
+    // agent owns the page for that turn, so it gets the classic nudge too.
+    active.policy = undefined;
+    const removeHook = eventSpine.useBefore("request.assemble", (ctx) => {
+      if (ctx.workspaceId !== workspaceId) return;
+      const { status_update: _dropped, ...rest } = ctx.tools;
+      ctx.tools = rest;
+    });
+    try {
+      expect(await nudgeFor(startTestStream(harness, workspaceId))).toBe(
+        STATUS_PAGE_TURN_END_NUDGE
+      );
+    } finally {
+      removeHook();
+    }
+
+    // The mode is off for a main-chat turn: the main agent owns the page again.
+    await experimentsService.setOverride(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT, false);
+    await startTestStream(harness, workspaceId);
+    expect(discarded).toEqual([workspaceId]);
+  });
+
+  it("gives no status page agent mode with the Status Page switch off, and a compaction turn keeps the queued updates", async () => {
+    using xumHome = new DisposableTempDir("ai-service-status-page-mode-gates");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const experimentsService = await experimentsServiceWith(xumHome.path, [
+      EXPERIMENT_IDS.ARTIFACTS,
+      EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
+      EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT,
+    ]);
+    const main = createLocalWorkspaceMetadata("status-page-main", projectPath);
+    const discarded: string[] = [];
+    const startWith = async (message = createMuxMessage("latest-user", "user", "continue")) => {
+      const harness = createHarness(xumHome.path, main, { experimentsService });
+      harness.service.turnRequestBuilderBindings.statusPageAgent = {
+        enqueue: () => ({ queued: true }),
+        discard: (id) => discarded.push(id),
+      };
+      const result = await harness.service.streamMessage({
+        messages: [message],
+        workspaceId: main.id,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+      });
+      expect(result.success).toBe(true);
+      // The spy outlives each harness, so read this turn's (the latest) tool configuration.
+      const toolConfig = harness.getToolsForModelSpy.mock.calls.at(-1)?.[1];
+      return { harness, active: toolConfig?.statusPageAgentActive };
+    };
+
+    // The real seeding gives a compaction turn no Agent interface turn, so it has no mode, but it
+    // runs mid-work in the main chat and must keep the main agent's queued updates.
+    await startWith(
+      createMuxMessage("compact", "user", "Summarize.", {
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      })
+    );
+    expect(discarded).toEqual([]);
+
+    const artifactsDir = path.join(xumHome.path, "artifacts");
+    await fs.mkdir(artifactsDir, { recursive: true });
+    spyOn(agentInterfaceStatusPage, "prepareAgentInterfaceStatusPage").mockResolvedValue({
+      resolveLocation: () => Promise.resolve({ kind: "host", dir: artifactsDir }),
+      startFingerprint: null,
+    });
+    const on = await startWith();
+    expect(on.active).toBe(true);
+    expect(discarded).toEqual([]);
+
+    // Settings > Agents > Status Page switched off: no status_update, and the main agent owns
+    // the page again, so its queued updates are stale.
+    await on.harness.config.editConfig((cfg) => ({
+      ...cfg,
+      agentAiDefaults: { status_page: { enabled: false } },
+    }));
+    expect((await startWith()).active).toBe(false);
+    expect(discarded).toEqual([main.id]);
   });
 
   it("sends MCP Apps model context at the start of the newest user message, not in the system prompt", async () => {

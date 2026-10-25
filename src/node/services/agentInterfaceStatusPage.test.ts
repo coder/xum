@@ -95,6 +95,14 @@ describe("needsStatusPageTurnEndNudge", () => {
     state: "output-available",
     output,
   });
+  const statusUpdate = (output: unknown): CompletedMessagePart & { toolName: string } => ({
+    type: "dynamic-tool",
+    toolCallId: "status-1",
+    toolName: "status_update",
+    input: { update: "Fixing the build" },
+    state: "output-available",
+    output,
+  });
   const ranTools: CompletedMessagePart[] = [
     toolCall({ success: true }),
     { type: "text", text: "Done." },
@@ -210,6 +218,40 @@ describe("needsStatusPageTurnEndNudge", () => {
         parts: ranTools,
       })
     ).toBe(false);
+  });
+
+  test("in status page agent mode, a turn that sent status_update gets no nudge", async () => {
+    // The placeholder at turn end: the status page agent may not have applied the update yet.
+    const turn = await startTurn();
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn == null ? undefined : { ...turn, statusPageAgent: true },
+        parts: [...ranTools, statusUpdate({ success: true, queued: true })],
+      })
+    ).toBe(false);
+  });
+
+  test.each([
+    { name: "a refused status_update", agentPage: false, statusPageAgent: true },
+    {
+      name: "a status_update outside status page agent mode",
+      agentPage: true,
+      statusPageAgent: false,
+    },
+  ])("a turn that ran tools and made $name is nudged", async (row) => {
+    if (row.agentPage) await writePage("<p>Fixing the build</p>");
+    const turn = await startTurn();
+    const sent = statusUpdate(
+      row.statusPageAgent ? { success: false, error: "disabled" } : { success: true }
+    );
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn == null ? undefined : { ...turn, statusPageAgent: row.statusPageAgent },
+        parts: [...ranTools, sent],
+      })
+    ).toBe(true);
   });
 
   test.each([

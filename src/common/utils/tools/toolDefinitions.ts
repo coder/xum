@@ -71,6 +71,7 @@ import {
   WEB_FETCH_MAX_OUTPUT_BYTES,
 } from "@/common/constants/toolLimits";
 import { SESSION_MEMORY_VIRTUAL_DIR } from "@/common/constants/memory";
+import { STATUS_PAGE_AGENT_MAX_UPDATE_CHARS } from "@/common/constants/artifacts";
 import {
   ConfigMutationPathSchema,
   ConfigOperationsSchema,
@@ -3045,6 +3046,27 @@ export const TOOL_DEFINITIONS = {
       })
       .strict(),
   },
+  status_update: {
+    // Registered only in status page agent mode (artifacts-status-page-agent); the static
+    // description keeps the tool block cache-stable. Who edits the page belongs in the system
+    // prompt, not here: a tool policy that denies this tool keeps the description on a refusal
+    // stub (#5253) while the prompt tells the agent to edit the page itself.
+    ptcExcluded: "Top-level presence selects the status page agent guidance",
+    description:
+      "Send the status page agent an update for the status page the user sees instead of this chat. " +
+      "It edits the page with its own model in the background, and this call returns at once. " +
+      "Send a short, self-contained update when you start, at each milestone and before you finish: what you are doing, progress, results, and anything that needs the user. " +
+      "Say what to replace or remove.",
+    schema: z
+      .object({
+        update: z
+          .string()
+          .min(1)
+          .max(STATUS_PAGE_AGENT_MAX_UPDATE_CHARS)
+          .describe("The update, in plain words."),
+      })
+      .strict(),
+  },
   artifact_list: {
     // The guidance lives in this static description (not a prompt section) so it is
     // cache-stable and appears exactly when the tool does.
@@ -3392,6 +3414,11 @@ export function getToolSchemas(): Record<string, ToolSchema> {
   );
 }
 
+/** Opt-in tool groups: absent flags mean off. */
+function whenEnabled(enabled: boolean | undefined, toolNames: string[]): string[] {
+  return enabled === true ? toolNames : [];
+}
+
 /**
  * Get which tools are available for a given model
  * @param modelString The model string (e.g., "anthropic:claude-opus-4-1")
@@ -3414,6 +3441,8 @@ export function getAvailableTools(
     enableSessionHistory?: boolean;
     enableTimelineEvent?: boolean;
     enableArtifacts?: boolean;
+    /** Whether status_update is available (status page agent mode active this turn). */
+    enableStatusUpdate?: boolean;
     /** Whether tool_catalog_search is available (tool-search experiment + deferred MCP tools present). */
     enableToolSearch?: boolean;
     /** Whether mcp_prompt_get is available (connected MCP servers advertise prompts). */
@@ -3433,14 +3462,7 @@ export function getAvailableTools(
 ): string[] {
   const [provider] = modelString.split(":");
   const enableAgentReport = options.enableAgentReport ?? true;
-  const enableFamilyMessaging = options.enableFamilyMessaging ?? false;
   const enableAnalyticsQuery = options.enableAnalyticsQuery ?? true;
-  const enableDynamicWorkflows = options.enableDynamicWorkflows ?? false;
-  const enableMemory = options.enableMemory ?? false;
-  const enableTimelineEvent = options.enableTimelineEvent ?? false;
-  const enableArtifacts = options.enableArtifacts ?? false;
-  const enableToolSearch = options.enableToolSearch ?? false;
-  const enableMcpPromptGet = options.enableMcpPromptGet ?? false;
   const enableReviewPane = options.enableReviewPane ?? true;
   const enableGitPatches = options.enableGitPatches ?? true;
 
@@ -3473,12 +3495,13 @@ export function getAvailableTools(
     "file_edit_replace_string",
     // "file_edit_replace_lines", // DISABLED: causes models to break repo state
     "file_edit_insert",
-    ...(options.enableSessionHistory ? ["session_history", "new_context"] : []),
-    ...(enableMemory ? ["memory"] : []),
-    ...(enableTimelineEvent ? ["timeline_event"] : []),
-    ...(enableArtifacts ? ["artifact_list", "artifact", "artifact_read"] : []),
-    ...(enableToolSearch ? ["tool_catalog_search"] : []),
-    ...(enableMcpPromptGet ? ["mcp_prompt_get"] : []),
+    ...whenEnabled(options.enableSessionHistory, ["session_history", "new_context"]),
+    ...whenEnabled(options.enableMemory, ["memory"]),
+    ...whenEnabled(options.enableTimelineEvent, ["timeline_event"]),
+    ...whenEnabled(options.enableArtifacts, ["artifact_list", "artifact", "artifact_read"]),
+    ...whenEnabled(options.enableStatusUpdate, ["status_update"]),
+    ...whenEnabled(options.enableToolSearch, ["tool_catalog_search"]),
+    ...whenEnabled(options.enableMcpPromptGet, ["mcp_prompt_get"]),
     "ask_user_question",
     "propose_plan",
     "bash",
@@ -3491,9 +3514,9 @@ export function getAvailableTools(
     "task_remove",
     "task_workspace_lifecycle",
     "task_list",
-    ...(enableDynamicWorkflows ? ["workflow_run", "workflow_resume"] : []),
+    ...whenEnabled(options.enableDynamicWorkflows, ["workflow_run", "workflow_resume"]),
     ...(enableAgentReport ? ["agent_report"] : []),
-    ...(enableFamilyMessaging ? ["task_message_parent", "task_message_sibling"] : []),
+    ...whenEnabled(options.enableFamilyMessaging, ["task_message_parent", "task_message_sibling"]),
     "set_goal",
     "get_goal",
     "complete_goal",

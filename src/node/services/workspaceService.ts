@@ -3708,6 +3708,10 @@ export class WorkspaceService
   };
   /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */
   private refinePassCanceller?: { cancelInFlightRefinePass(workspaceId: string): Promise<void> };
+  /** Aborts a running status page agent pass before removal deletes the session dir; wired post-construction. */
+  private statusPageAgentCanceller: { cancelInFlightPass(workspaceId: string): Promise<void> } = {
+    cancelInFlightPass: () => Promise.resolve(),
+  };
   /** Narrow overrides-cleanup surface; wired by ServiceContainer for stale plugin-key sanitization. */
   private workspaceMcpOverridesService?: WorkspaceServiceMcpOverridesPort;
 
@@ -4476,6 +4480,13 @@ export class WorkspaceService
     cancelInFlightRefinePass(workspaceId: string): Promise<void>;
   }): void {
     this.refinePassCanceller = service;
+  }
+
+  /** Status page agent pass cancellation on remove; wired by the service container. */
+  setStatusPageAgentCanceller(service: {
+    cancelInFlightPass(workspaceId: string): Promise<void>;
+  }): void {
+    this.statusPageAgentCanceller = service;
   }
 
   /**
@@ -8271,6 +8282,7 @@ export class WorkspaceService
         await this.memoryConsolidationService?.cancelInFlightConsolidation(workspaceId);
         await clearPendingBranchSummary(workspaceId);
         await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
+        await this.statusPageAgentCanceller.cancelInFlightPass(workspaceId);
 
         // Shared workspace memory, BEFORE any destructive step — so a failure
         // leaves a fully intact, retryable workspace: fold this workspace's
@@ -8707,6 +8719,8 @@ export class WorkspaceService
       // tool-driven memory/skill writes and summary-row append cannot land
       // after the session directory is deleted.
       await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
+      // A status page agent pass writes status.html and session usage; abort it too.
+      await this.statusPageAgentCanceller.cancelInFlightPass(workspaceId);
 
       // Drop any persistent sandbox mount BEFORE deleting the session
       // directory: dropScope disposes the runtime without disk writes and

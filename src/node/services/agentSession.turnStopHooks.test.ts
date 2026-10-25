@@ -98,7 +98,7 @@ async function setup(
     aiEmitter: emitter,
     aiServiceOverrides: {
       ...(input.statusPageNeedsNudge === true
-        ? { needsStatusPageTurnEndNudge: () => Promise.resolve(true) }
+        ? { statusPageTurnEndNudge: () => Promise.resolve(STATUS_PAGE_TURN_END_NUDGE) }
         : {}),
       streamMessage: mock<AgentSessionAIService["streamMessage"]>((request) => {
         requests.push(request);

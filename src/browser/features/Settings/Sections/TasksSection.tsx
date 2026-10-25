@@ -64,6 +64,19 @@ const OFFLINE_SAVE_MESSAGE =
 // Compact stays eligible: compaction goes through the send path, which
 // threads reasoningMode.
 const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace"]);
+/** The status page agent runs with thinking off (raw streamText, no provider options). */
+const NO_REASONING_AGENT_IDS = new Set(["status_page"]);
+
+/**
+ * The status page agent only runs when Artifacts, Agent interface view and Status page agent are
+ * all on (see statusPageAgentService); its Settings card mirrors that gate.
+ */
+function useStatusPageAgentEnabled(): boolean {
+  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const agentInterfaceEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE);
+  const statusPageAgentFlag = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT);
+  return artifactsEnabled && agentInterfaceEnabled && statusPageAgentFlag;
+}
 
 function getAgentDefinitionPath(agent: AgentDefinitionDescriptor): string | null {
   switch (agent.scope) {
@@ -309,6 +322,8 @@ interface AiDefaultsControlsProps {
   modelCapabilitiesDeferred?: boolean;
   /** Forwarded to the picker; false hides the Pro and Cyber toggles (e.g. Dream, whose requests never apply reasoningMode). */
   allowReasoningModes?: boolean;
+  /** False hides the Reasoning control for agents whose runs never apply a thinking level. */
+  showReasoning?: boolean;
   effectiveModel: string | undefined;
   models: string[];
   hiddenModelsForSelector: string[];
@@ -319,6 +334,48 @@ interface AiDefaultsControlsProps {
   onModelChange: (value: string) => void;
   onThinkingChange: (value: string) => void;
   onReasoningModeChange: (mode: OpenAIReasoningMode) => void;
+}
+
+/** The Reasoning half of AiDefaultsControls. */
+function ReasoningDefaultsControl(props: AiDefaultsControlsProps & { inheritLabel: string }) {
+  return (
+    <div className="space-y-1">
+      <div className="text-muted text-xs">Reasoning</div>
+      <div className="flex items-center gap-2">
+        {/* Reasoning defaults share the composer picker; speed remains a per-chat choice. */}
+        <ThinkingSelectorControl
+          modelString={props.effectiveModel}
+          modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
+          thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
+          onThinkingLevelChange={(level) => props.onThinkingChange(level)}
+          reasoningMode={props.reasoningModeValue}
+          reasoningModeInherited={props.reasoningModeInherited}
+          onReasoningModeChange={props.onReasoningModeChange}
+          allowReasoningModes={props.allowReasoningModes}
+          allowFastMode={false}
+          variant="box"
+          inheritOption={{
+            label: props.inheritLabel,
+            // Inherit remains the fallback, but only Auto reads as selected.
+            selected: props.thinkingValue === INHERIT && props.thinkingAutoRouting?.active !== true,
+            onSelect: () => props.onThinkingChange(INHERIT),
+          }}
+          autoRouting={props.thinkingAutoRouting}
+        />
+        {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-9 px-2"
+            onClick={() => props.onThinkingChange(INHERIT)}
+          >
+            Reset
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 function AiDefaultsControls(props: AiDefaultsControlsProps) {
@@ -354,43 +411,9 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
         </div>
       </div>
 
-      <div className="space-y-1">
-        <div className="text-muted text-xs">Reasoning</div>
-        <div className="flex items-center gap-2">
-          {/* Reasoning defaults share the composer picker; speed remains a per-chat choice. */}
-          <ThinkingSelectorControl
-            modelString={props.effectiveModel}
-            modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
-            thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
-            onThinkingLevelChange={(level) => props.onThinkingChange(level)}
-            reasoningMode={props.reasoningModeValue}
-            reasoningModeInherited={props.reasoningModeInherited}
-            onReasoningModeChange={props.onReasoningModeChange}
-            allowReasoningModes={props.allowReasoningModes}
-            allowFastMode={false}
-            variant="box"
-            inheritOption={{
-              label: inheritLabel,
-              // Inherit remains the fallback, but only Auto reads as selected.
-              selected:
-                props.thinkingValue === INHERIT && props.thinkingAutoRouting?.active !== true,
-              onSelect: () => props.onThinkingChange(INHERIT),
-            }}
-            autoRouting={props.thinkingAutoRouting}
-          />
-          {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-9 px-2"
-              onClick={() => props.onThinkingChange(INHERIT)}
-            >
-              Reset
-            </Button>
-          ) : null}
-        </div>
-      </div>
+      {props.showReasoning === false ? null : (
+        <ReasoningDefaultsControl {...props} inheritLabel={inheritLabel} />
+      )}
     </div>
   );
 }
@@ -438,6 +461,7 @@ export function TasksSection() {
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationFlag = useExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION);
   const memoryConsolidationEnabled = memoryEnabled && memoryConsolidationFlag;
+  const statusPageAgentEnabled = useStatusPageAgentEnabled();
 
   // Resolve the workspace's active model so that when a sub-agent's model is
   // "Inherit", we show thinking levels for the workspace model (falling back to
@@ -863,8 +887,15 @@ export function TasksSection() {
         agentAiDefaults,
         portableDesktopEnabled,
         memoryConsolidationEnabled,
+        statusPageAgentEnabled,
       }),
-    [agentAiDefaults, listedAgents, portableDesktopEnabled, memoryConsolidationEnabled]
+    [
+      agentAiDefaults,
+      listedAgents,
+      portableDesktopEnabled,
+      memoryConsolidationEnabled,
+      statusPageAgentEnabled,
+    ]
   );
   const execSubagentAgent = listedAgents.find(
     (agent) => agent.id === "exec" && agent.subagentRunnable && agent.uiSelectable
@@ -1027,6 +1058,7 @@ export function TasksSection() {
           thinkingValue={thinkingValue}
           reasoningModeValue={entry?.reasoningMode ?? inheritedDefaults.reasoningMode ?? "standard"}
           allowReasoningModes={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
+          showReasoning={!NO_REASONING_AGENT_IDS.has(agent.id)}
           effectiveModel={effectiveModel}
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}
