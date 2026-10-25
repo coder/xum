@@ -2994,10 +2994,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       postPolicyTools: { status_update: stubTool },
     });
     // The active agent's policy (a custom agent's tools.remove, or a caller's disable rule).
-    let activePolicy: ToolPolicy | undefined;
+    const active: { policy?: ToolPolicy } = {};
     spyOn(agentResolution, "resolveAgentForStream").mockImplementation(() => {
       const resolved = resolvedAgentResultFor(metadata);
-      if (resolved.success) resolved.data.effectiveToolPolicy = activePolicy;
+      if (resolved.success) resolved.data.effectiveToolPolicy = active.policy;
       return Promise.resolve(resolved);
     });
     const discarded: string[] = [];
@@ -3010,7 +3010,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(harness.streamSystemContextStatusPageFlags).toEqual([true]);
 
     harness.streamSystemContextStatusPageFlags.length = 0;
-    activePolicy = [{ regex_match: "status_update", action: "disable" }];
+    active.policy = [{ regex_match: "status_update", action: "disable" }];
     await startTestStream(harness, workspaceId);
     expect(harness.streamSystemContextStatusPageFlags).toEqual([true, false]);
     // The mode itself stayed on, so the queue keeps the main chat's updates.
