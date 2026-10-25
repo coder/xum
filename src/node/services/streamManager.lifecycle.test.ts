@@ -229,6 +229,26 @@ describe("StreamManager lifecycle - stop and start", () => {
       await sameWorkspace[Symbol.asyncDispose]();
     });
   }
+  test("a start whose envelope and teardown both throw still returns an error", async () => {
+    // The registered stream's teardown closes the display scope; a close that throws
+    // must not turn the failed start into a rejected startStream.
+    const registry = new ToolCallDisplayRegistry();
+    registry.close = () => {
+      throw new Error("display scope close failed");
+    };
+    const { streamManager, events } = recordingManager({ toolCallDisplayRegistry: registry });
+    const workspaceId = "lifecycle-start-teardown-failure";
+
+    const started = await startTurn(streamManager, {
+      workspaceId,
+      model: providerModel(textChunks("unused"), "finish"),
+      onStreamConstructed: () => Promise.reject(new Error("envelope write failed")),
+    });
+
+    expect(started.success).toBe(false);
+    expect(events).toEqual([]);
+    expect(streamManager.isStreaming(workspaceId)).toBe(false);
+  });
 });
 
 describe("StreamManager lifecycle - tools and cleanup", () => {
