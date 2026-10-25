@@ -480,6 +480,56 @@ describe("StreamManager - stream resource scope", () => {
   });
 });
 
+describe("StreamManager - startup outcomes", () => {
+  test("a stream that cannot be constructed returns a typed send error", async () => {
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: fakeStreamText(() => {
+        throw new aiSdk.LoadAPIKeyError({ message: "missing key" });
+      }),
+    });
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: "startup-api-key-workspace",
+        messageId: "startup-api-key-msg",
+        model: createTestLanguageModel(),
+        runtime: LOCAL_TEST_RUNTIME,
+        providedRuntimeTempDir: "",
+      })
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: { type: "api_key_not_found", provider: "anthropic" },
+    });
+  });
+
+  test("a start the caller already stopped settles with the caller's abort reason", async () => {
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: fakeStreamText(() => {
+        throw new Error("a stopped start must not reach the provider");
+      }),
+    });
+    const caller = new AbortController();
+    caller.abort("user");
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: "startup-user-abort-workspace",
+        messageId: "startup-user-abort-msg",
+        model: createTestLanguageModel(),
+        runtime: LOCAL_TEST_RUNTIME,
+        providedRuntimeTempDir: "",
+        abortSignal: caller.signal,
+      })
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected a startup-abort handle");
+    expect(await result.data.completion).toEqual({ status: "aborted", abortReason: "user" });
+  });
+});
+
 describe("StreamManager - language model cleanup", () => {
   afterEach(() => mock.restore());
 
