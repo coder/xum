@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { Tool } from "ai";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -13,6 +13,9 @@ import {
   createMemoryHost,
   MEMORY_USER_HOME,
 } from "@/node/services/hostFiles/memoryHostFiles.testHarness";
+
+import { makeTestEffectRunner, TEST_CLOCK_START_MS } from "@/node/services/di/testEffectRunner";
+import { NotificationEngine } from "@/node/services/agentNotifications/NotificationEngine";
 
 import { MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD } from "./internalToolResultFields";
 import { getToolsForModel } from "./tools";
@@ -319,5 +322,56 @@ describe("getToolsForModel - model-only notifications", () => {
     expect(String((next[MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD] as unknown[])[0])).toContain(
       "`~/helper.sh`"
     );
+  });
+
+  test("a tool call polls the notification sources with the session clock's time", async () => {
+    // The sources stamp and compare times on the session's HostClock, so the poll's `now` must
+    // come from that clock too, not from Date.now() (#7282). The TestClock starts months before
+    // wall time, so a wall-clock `now` fails here.
+    const clock = makeTestEffectRunner();
+    const pollSpy = spyOn(NotificationEngine.prototype, "pollAfterToolCall");
+    const failingTool = {
+      // eslint-disable-next-line @typescript-eslint/require-await
+      execute: async () => {
+        throw new Error("boom");
+      },
+    } as unknown as Tool;
+    try {
+      const initStateManager = {
+        waitForInit: () => Promise.resolve(),
+      } as unknown as InitStateManager;
+      const tools = await getToolsForModel(
+        "noop:model",
+        {
+          cwd: process.cwd(),
+          runtime: new LocalRuntime(process.cwd()),
+          runtimeTempDir: "/tmp",
+          workspaceId: "ws-1",
+          workspaceSessionDir: "/sessions/ws-1",
+          sessionFiles: buildSessionFiles(SessionFilesMemory),
+          clock: clock.hostClock,
+        },
+        "ws-1",
+        initStateManager,
+        undefined,
+        { mcp_failing: failingTool }
+      );
+      await getExecute(tools.todo_read)();
+      await clock.adjust(1_000);
+      const failure = await getExecute(tools.mcp_failing)().then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(failure).toBeInstanceOf(Error);
+      expect(
+        pollSpy.mock.calls.map(([ctx]) => ({ now: ctx.now, succeeded: ctx.toolSucceeded }))
+      ).toEqual([
+        { now: TEST_CLOCK_START_MS, succeeded: true },
+        { now: TEST_CLOCK_START_MS + 1_000, succeeded: false },
+      ]);
+    } finally {
+      pollSpy.mockRestore();
+      await clock.dispose();
+    }
   });
 });
