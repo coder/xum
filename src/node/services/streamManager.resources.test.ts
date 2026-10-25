@@ -1,5 +1,6 @@
 import { describe, test, expect, afterEach, mock, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
+import assert from "@/common/utils/assert";
 import { createMuxMessage } from "@/common/types/message";
 import { StreamManager, type TurnEngineEvent } from "./streamManager";
 import * as aiSdk from "ai";
@@ -261,6 +262,12 @@ describe("StreamManager - stream resource scope", () => {
       source: "connection" as const,
     };
     let lateSetDuringStop: boolean | undefined;
+    // The stop must come after the generator listens for the abort: startStream
+    // resolves before the generator runs, and an AbortSignal does not replay.
+    let markListening!: () => void;
+    const listening = new Promise<void>((resolve) => {
+      markListening = resolve;
+    });
     const streamManager = createStreamManagerForTests(historyService, {
       toolCallDisplayRegistry: registry,
       streamText: fakeStreamText(({ abortSignal }) =>
@@ -268,9 +275,15 @@ describe("StreamManager - stream resource scope", () => {
           (async function* () {
             await Promise.resolve();
             yield { type: "text-delta", text: "hello" };
-            await new Promise<void>((resolve) =>
-              abortSignal!.addEventListener("abort", () => resolve(), { once: true })
-            );
+            await new Promise<void>((resolve) => {
+              assert(abortSignal, "streamText must receive the stream's abort signal");
+              if (abortSignal.aborted) {
+                resolve();
+              } else {
+                abortSignal.addEventListener("abort", () => resolve(), { once: true });
+              }
+              markListening();
+            });
             // The stop has aborted the signal; the loop has not exited yet.
             lateSetDuringStop = registry.set(executionScope, "late-call", snapshot);
           })()
@@ -293,6 +306,7 @@ describe("StreamManager - stream resource scope", () => {
     );
     if (!result.success) throw new Error("Expected stream to start");
 
+    await listening;
     expect((await streamManager.stopStream(workspaceId)).success).toBe(true);
     expect((await result.data.completion).status).toBe("aborted");
     expect(lateSetDuringStop).toBe(false);
