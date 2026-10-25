@@ -815,6 +815,50 @@ describe("AIService workspace metadata lookup", () => {
   });
 });
 
+describe("AIService status page turn-end nudge", () => {
+  afterEach(() => mock.restore());
+
+  // The turn start (TurnRequestBuilder) and the turn end (AgentSession) meet only here: keyed by
+  // the streamed messageId, taken once, and read under the flags at turn end.
+  it.each([
+    { name: "the view still on", viewOnAtEnd: true },
+    { name: "the view switched off", viewOnAtEnd: false },
+  ])("a placeholder page at turn end with $name", async (row) => {
+    const testHistory = await createTestHistoryService();
+    try {
+      const metadata = createLocalWorkspaceMetadata("status-page", testHistory.tempDir);
+      const experimentsService = await experimentsServiceWith(testHistory.tempDir, [
+        EXPERIMENT_IDS.ARTIFACTS,
+        EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
+      ]);
+      const harness = createBasicAIService(testHistory.tempDir, {
+        historyService: testHistory.historyService,
+        experimentsService,
+      });
+      stubCommonStreamMessageDependencies({ ...harness, metadata });
+      const result = await harness.service.streamMessage({
+        messages: [createMuxMessage("user", "user", "Fix the build")],
+        workspaceId: metadata.id,
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "off",
+      });
+      if (!result.success) throw new Error(JSON.stringify(result.error));
+      const { messageId } = result.data;
+      if (!row.viewOnAtEnd) {
+        await experimentsService.setOverride(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE, false);
+      }
+      const nudge = (id: string) =>
+        harness.service.needsStatusPageTurnEndNudge(metadata.id, { messageId: id, parts: [] });
+
+      expect(await nudge("another-turn")).toBe(false);
+      expect(await nudge(messageId)).toBe(row.viewOnAtEnd);
+      expect(await nudge(messageId)).toBe(false);
+    } finally {
+      await testHistory.cleanup();
+    }
+  });
+});
+
 describe("AIService turn engine events", () => {
   const workspaceId = "workspace-1";
 
