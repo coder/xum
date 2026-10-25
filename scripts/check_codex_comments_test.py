@@ -250,6 +250,25 @@ else:
             with self.subTest(body=body):
                 self.assert_gate(expected, snapshot([comment(body)]))
 
+    def test_clean_code_review_receipt_does_not_hide_findings(self):
+        # The clean verdict is one sentence, a one-line flourish and an optional
+        # Reviewed commit line (coder/xum#7504). Text after it, a flourish that
+        # carries a finding badge, or text before it blocks.
+        clean = FIXTURES["code_review_no_findings"]["body"]
+        flourish = "More of your lovely PRs please."
+        help_start = "\n\n<details>"
+        account = FIXTURES["account_setup_notice"]["body"]
+        for body, expected in (
+            (clean, 0),
+            (clean.replace(help_start, "\n\n[P1] Fix authorization." + help_start, 1), 1),
+            (clean.replace(flourish, "[P1] Fix authorization."), 1),
+            (clean.replace(flourish, "![P1 Badge](https://img.shields.io/badge/P1-orange)"), 1),
+            (clean.replace("Codex Review:", "[P1] Fix authorization.\n\nCodex Review:"), 1),
+            (account + "\n\n[P1] Fix authorization.", 1),
+        ):
+            with self.subTest(body=body):
+                self.assert_gate(expected, snapshot([comment(body)]))
+
     def test_review_state_line_is_fail_closed(self):
         # Codex added a review-state line to its board on 2026-10-15. Only the
         # observed keys and statuses count; has_any_findings stays true after
