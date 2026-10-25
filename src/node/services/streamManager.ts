@@ -164,7 +164,7 @@ import {
   type PendingStreamStartHandle,
   type StreamToken,
 } from "@/node/services/turnEngine/TurnRegistry";
-import { TurnResources } from "@/node/services/turnEngine/TurnResources";
+import { TurnResources, type TurnStartup } from "@/node/services/turnEngine/TurnResources";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
@@ -366,6 +366,195 @@ function withRebuiltSystemMetadata(
   // Every record follows the rebuild, an absent one included (it replaces an older one).
   for (const field of SYSTEM_SECTION_RECORD_FIELDS) next[field] = rebuilt.systemRecords?.[field];
   return next;
+}
+
+/** One startStream call's state, shared by its startup steps. */
+interface StreamStart {
+  readonly options: TurnExecutionOptions;
+  readonly workspaceId: WorkspaceId;
+  readonly completionController: TurnCompletionController;
+  readonly handle: TurnStreamHandle;
+  /** Set once construct() registered the stream; the stream then owns the startup resources. */
+  registeredStream?: WorkspaceStreamInfo;
+  /** Set when processing launched; startStream's finally then leaves the resources alone. */
+  processingStarted: boolean;
+}
+
+/** Per-registration inputs startStream hands to createStreamAtomically. */
+interface StreamRegistration {
+  streamToken: StreamToken;
+  runtimeTempDir: string;
+  resourceScope: Scope.Closeable;
+  abortController: AbortController;
+  completionController: TurnCompletionController;
+}
+
+/** The stream's MCP execution scope: the caller's, which must belong to this stream, or a new one. */
+export function resolveExecutionScope(
+  options: Pick<TurnExecutionOptions, "workspaceId" | "messageId" | "executionScope">,
+  streamToken: StreamToken
+): ExecutionScope {
+  const { messageId } = options;
+  const executionScope = options.executionScope ?? {
+    workspaceId: options.workspaceId,
+    messageId,
+    token: streamToken,
+  };
+  assert(
+    executionScope.workspaceId === options.workspaceId &&
+      executionScope.messageId === messageId &&
+      executionScope.token === streamToken,
+    "MCP execution scope must belong to the stream being registered"
+  );
+  return executionScope;
+}
+
+/** A new stream's record in STARTING state, before its hooks are wired. */
+export function createStreamInfo(
+  options: TurnExecutionOptions,
+  ctx: StreamRegistration & {
+    executionScope: ExecutionScope;
+    streamResult: WorkspaceStreamInfo["streamResult"];
+    request: StreamRequestConfig;
+    stepTracker: StepMessageTracker;
+    metadataModel: string;
+  }
+): WorkspaceStreamInfo {
+  const {
+    messageId,
+    modelString,
+    historySequence,
+    workspaceName,
+    thinkingLevel,
+    initialMetadata,
+    modelFallback,
+    maxOutputTokens,
+    runtime,
+  } = options;
+  const { executionScope, streamResult, request, stepTracker, metadataModel } = ctx;
+  // Record time: wall clock until #7282 moves its consumers to HostClock.
+  const startTime = nodeClock.nowMs();
+  const streamInfo: WorkspaceStreamInfo = {
+    state: StreamState.STARTING,
+    streamResult,
+    workspaceName,
+    abortController: ctx.abortController,
+    messageId,
+    token: ctx.streamToken,
+    executionScope,
+    startTime,
+    lastPartTimestamp: startTime,
+    toolCompletionTimestamps: new Map(),
+    pendingWorkflowRunAttachments: new Map(),
+    pendingNestedCalls: new Map(),
+    pendingToolExecutionStarts: new Map(),
+    model: modelString,
+    metadataModel,
+    thinkingLevel,
+    initialMetadata,
+    didRetryPreviousResponseIdAtStep: false,
+    didRetryAfterEmptyOutput: false,
+    ...(modelFallback && modelFallback.chain.length > 0
+      ? {
+          modelFallback: {
+            options: modelFallback,
+            requestedModel: normalizeToCanonical(modelString),
+            refusedModels: [],
+            // Pre-wrap inputs (NOT request.maxOutputTokens, which may already
+            // carry call-settings overrides for the original model).
+            original: { maxOutputTokens },
+          },
+        }
+      : {}),
+    stepTracker,
+    receivedTerminalEvent: false,
+    currentStepStartIndex: 0,
+    stepStartIndices: [0],
+    streamStepOrdinals: [],
+    request,
+    historySequence,
+    parts: [], // Initialize empty parts array
+    ...PartialJournal.initialState(), // Never written: the first write is immediate
+    processingPromise: Promise.resolve(), // Placeholder, overwritten in startStream
+    softInterrupt: { pending: false },
+    completionController: ctx.completionController,
+    runtimeTempDir: ctx.runtimeTempDir, // Stream-scoped temp directory for tool outputs
+    runtime, // Runtime for temp directory cleanup
+    resourceScope: ctx.resourceScope, // Owns temp-dir release + debounce fiber
+    // Initialize cumulative tracking for multi-step streams
+    ...UsageLedger.initialState(),
+  };
+  return streamInfo;
+}
+
+/** Route the step tracker's same-turn rebuild hooks to the stream's row metadata. */
+export function wireStepTrackerHooks(streamInfo: WorkspaceStreamInfo): void {
+  const { stepTracker } = streamInfo;
+  // Single source for same-turn rebuilds: the receipt lives on initialMetadata (#5886).
+  stepTracker.hasAnthropicReplayReceipt = () =>
+    streamInfo.initialMetadata?.anthropicThinkingReplay === "off";
+  stepTracker.recordSystemSections = (rebuilt) => {
+    streamInfo.initialMetadata = withRebuiltSystemMetadata(streamInfo.initialMetadata, rebuilt);
+  };
+}
+
+/**
+ * Route a mid-turn thinking override's applied levels into the stream. `initialMetadata`
+ * is the turn's metadata as the caller passed it (its routing record seeds the raises).
+ */
+export function wireThinkingOverride(
+  streamInfo: WorkspaceStreamInfo,
+  initialMetadata: Partial<MuxMetadata> | undefined
+): void {
+  const { request } = streamInfo;
+  // Mid-turn thinking override: route applied levels into this stream's
+  // metadata (partials, stream-end, final assistant message). Wired before
+  // any step can run; the catch-up sync covers a holder that already applied
+  // a level (e.g. re-attachment on retry paths).
+  if (request.thinkingOverrideState) {
+    const holder = request.thinkingOverrideState;
+    holder.onApplied = (level) => {
+      streamInfo.thinkingLevel = level;
+      const autoModelRouting = streamInfo.initialMetadata?.autoModelRouting;
+      if (holder.manual && autoModelRouting != null) {
+        streamInfo.initialMetadata = {
+          ...streamInfo.initialMetadata,
+          autoModelRouting: withAutoThinkingClaim(autoModelRouting, undefined, true),
+        };
+      }
+      publishLiveRouting(streamInfo);
+    };
+    if (holder.applied) {
+      streamInfo.thinkingLevel = holder.applied;
+    }
+    wireAutoThinkingEscalation(streamInfo, initialMetadata);
+  }
+}
+
+/** Let a thinking level Auto chose raise itself mid-turn (see autoThinkingEscalation.ts). */
+function wireAutoThinkingEscalation(
+  streamInfo: WorkspaceStreamInfo,
+  initialMetadata: Partial<MuxMetadata> | undefined
+): void {
+  const { stepTracker } = streamInfo;
+  // A thinking level Auto chose may raise itself mid-turn (see autoThinkingEscalation.ts);
+  // the raises land on the routing record the stream-end metadata spreads.
+  const routedThinkingLevel = initialMetadata?.autoModelRouting?.thinkingLevel;
+  if (routedThinkingLevel != null) {
+    stepTracker.autoThinkingEscalation = createAutoThinkingEscalationState(
+      routedThinkingLevel,
+      initialMetadata?.autoModelRouting?.escalations ?? [],
+      (escalations) => {
+        const autoModelRouting = streamInfo.initialMetadata?.autoModelRouting;
+        if (autoModelRouting == null) return;
+        streamInfo.initialMetadata = {
+          ...streamInfo.initialMetadata,
+          autoModelRouting: { ...autoModelRouting, escalations },
+        };
+        publishLiveRouting(streamInfo);
+      }
+    );
+  }
 }
 
 function isKnownProviderName(provider: string): provider is keyof typeof PROVIDER_DEFINITIONS {
@@ -2095,27 +2284,11 @@ export class StreamManager {
    */
   private createStreamAtomically(
     options: TurnExecutionOptions,
-    ctx: {
-      streamToken: StreamToken;
-      runtimeTempDir: string;
-      resourceScope: Scope.Closeable;
-      abortController: AbortController;
-      completionController: TurnCompletionController;
-    }
+    ctx: StreamRegistration
   ): WorkspaceStreamInfo {
     // ctx.abortController is created and linked to the caller-provided abortSignal in startStream().
     const workspaceId = options.workspaceId as WorkspaceId;
-    const {
-      messageId,
-      modelString,
-      historySequence,
-      workspaceName,
-      thinkingLevel,
-      initialMetadata,
-      modelFallback,
-      maxOutputTokens,
-      runtime,
-    } = options;
+    const { messageId, modelString } = options;
     // The tail hook is wired to streamInfo below, once it exists.
     const stepTracker: StepMessageTracker = {
       workspaceId: options.workspaceId,
@@ -2128,17 +2301,7 @@ export class StreamManager {
         this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
     });
 
-    const executionScope = options.executionScope ?? {
-      workspaceId: options.workspaceId,
-      messageId,
-      token: ctx.streamToken,
-    };
-    assert(
-      executionScope.workspaceId === options.workspaceId &&
-        executionScope.messageId === messageId &&
-        executionScope.token === ctx.streamToken,
-      "MCP execution scope must belong to the stream being registered"
-    );
+    const executionScope = resolveExecutionScope(options, ctx.streamToken);
     this.toolCallDisplayRegistry.open(executionScope);
     // Start streaming - this can throw immediately if API key is missing
     let streamResult;
@@ -2152,104 +2315,16 @@ export class StreamManager {
       throw error;
     }
 
-    // Record time: wall clock until #7282 moves its consumers to HostClock.
-    const startTime = nodeClock.nowMs();
-    const streamInfo: WorkspaceStreamInfo = {
-      state: StreamState.STARTING,
-      streamResult,
-      workspaceName,
-      abortController: ctx.abortController,
-      messageId,
-      token: ctx.streamToken,
+    const streamInfo = createStreamInfo(options, {
+      ...ctx,
       executionScope,
-      startTime,
-      lastPartTimestamp: startTime,
-      toolCompletionTimestamps: new Map(),
-      pendingWorkflowRunAttachments: new Map(),
-      pendingNestedCalls: new Map(),
-      pendingToolExecutionStarts: new Map(),
-      model: modelString,
-      metadataModel,
-      thinkingLevel,
-      initialMetadata,
-      didRetryPreviousResponseIdAtStep: false,
-      didRetryAfterEmptyOutput: false,
-      ...(modelFallback && modelFallback.chain.length > 0
-        ? {
-            modelFallback: {
-              options: modelFallback,
-              requestedModel: normalizeToCanonical(modelString),
-              refusedModels: [],
-              // Pre-wrap inputs (NOT request.maxOutputTokens, which may already
-              // carry call-settings overrides for the original model).
-              original: { maxOutputTokens },
-            },
-          }
-        : {}),
-      stepTracker,
-      receivedTerminalEvent: false,
-      currentStepStartIndex: 0,
-      stepStartIndices: [0],
-      streamStepOrdinals: [],
+      streamResult,
       request,
-      historySequence,
-      parts: [], // Initialize empty parts array
-      ...PartialJournal.initialState(), // Never written: the first write is immediate
-      processingPromise: Promise.resolve(), // Placeholder, overwritten in startStream
-      softInterrupt: { pending: false },
-      completionController: ctx.completionController,
-      runtimeTempDir: ctx.runtimeTempDir, // Stream-scoped temp directory for tool outputs
-      runtime, // Runtime for temp directory cleanup
-      resourceScope: ctx.resourceScope, // Owns temp-dir release + debounce fiber
-      // Initialize cumulative tracking for multi-step streams
-      ...UsageLedger.initialState(),
-    };
-    // Single source for same-turn rebuilds: the receipt lives on initialMetadata (#5886).
-    stepTracker.hasAnthropicReplayReceipt = () =>
-      streamInfo.initialMetadata?.anthropicThinkingReplay === "off";
-    stepTracker.recordSystemSections = (rebuilt) => {
-      streamInfo.initialMetadata = withRebuiltSystemMetadata(streamInfo.initialMetadata, rebuilt);
-    };
-
-    // Mid-turn thinking override: route applied levels into this stream's
-    // metadata (partials, stream-end, final assistant message). Wired before
-    // any step can run; the catch-up sync covers a holder that already applied
-    // a level (e.g. re-attachment on retry paths).
-    if (request.thinkingOverrideState) {
-      const holder = request.thinkingOverrideState;
-      holder.onApplied = (level) => {
-        streamInfo.thinkingLevel = level;
-        const autoModelRouting = streamInfo.initialMetadata?.autoModelRouting;
-        if (holder.manual && autoModelRouting != null) {
-          streamInfo.initialMetadata = {
-            ...streamInfo.initialMetadata,
-            autoModelRouting: withAutoThinkingClaim(autoModelRouting, undefined, true),
-          };
-        }
-        publishLiveRouting(streamInfo);
-      };
-      if (holder.applied) {
-        streamInfo.thinkingLevel = holder.applied;
-      }
-      // A thinking level Auto chose may raise itself mid-turn (see autoThinkingEscalation.ts);
-      // the raises land on the routing record the stream-end metadata spreads.
-      const routedThinkingLevel = initialMetadata?.autoModelRouting?.thinkingLevel;
-      if (routedThinkingLevel != null) {
-        stepTracker.autoThinkingEscalation = createAutoThinkingEscalationState(
-          routedThinkingLevel,
-          initialMetadata?.autoModelRouting?.escalations ?? [],
-          (escalations) => {
-            const autoModelRouting = streamInfo.initialMetadata?.autoModelRouting;
-            if (autoModelRouting == null) return;
-            streamInfo.initialMetadata = {
-              ...streamInfo.initialMetadata,
-              autoModelRouting: { ...autoModelRouting, escalations },
-            };
-            publishLiveRouting(streamInfo);
-          }
-        );
-      }
-    }
+      stepTracker,
+      metadataModel,
+    });
+    wireStepTrackerHooks(streamInfo);
+    wireThinkingOverride(streamInfo, options.initialMetadata);
 
     // Atomically register the stream
     this.workspaceStreams.set(workspaceId, streamInfo);
@@ -4207,30 +4282,15 @@ export class StreamManager {
   async startStream(
     options: TurnExecutionOptions
   ): Promise<Result<TurnStreamHandle, SendMessageError>> {
-    const {
-      workspaceId,
-      messages,
-      model,
-      modelString,
-      historySequence,
-      runtime,
-      messageId,
-      abortSignal,
-      providedStreamToken,
-      providedRuntimeTempDir,
-      onStreamConstructed,
-    } = options;
+    const { workspaceId, messages, modelString, historySequence, messageId, abortSignal } = options;
     const completionController = createTurnCompletionController();
-    const handle: TurnStreamHandle = { messageId, completion: completionController.promise };
-    const settleStartupAbort = (): Result<TurnStreamHandle, SendMessageError> => {
-      completionController.settle({
-        status: "aborted",
-        abortReason: this.getStartupAbortReason(abortSignal),
-      });
-      return Ok(handle);
+    const start: StreamStart = {
+      options,
+      workspaceId: workspaceId as WorkspaceId,
+      completionController,
+      handle: { messageId, completion: completionController.promise },
+      processingStarted: false,
     };
-
-    const typedWorkspaceId = workspaceId as WorkspaceId;
 
     if (messages.length === 0) {
       return Err({
@@ -4239,7 +4299,6 @@ export class StreamManager {
       });
     }
 
-    let registeredStream: WorkspaceStreamInfo | undefined;
     try {
       // Acquire lock - guarantees only one startStream per workspace
       // Lock is automatically released when scope exits via Symbol.asyncDispose
@@ -4253,145 +4312,213 @@ export class StreamManager {
       // Owns this stream's abort controller and Effect-managed resources (temp dir,
       // debounce fiber) until the stream registers (TurnResources.openStartup).
       const startup = this.turnResources.openStartup(abortSignal);
-      const { abortController: streamAbortController, unlinkAbortSignal, resourceScope } = startup;
-      let processingStarted = false;
-      // Reads registeredStream when called: once registered, the stream owns the resources.
-      const cleanupStartup = (): Promise<void> =>
-        this.turnResources.releaseStartup(startup, model, registeredStream);
-
       try {
-        // Step 1: Cancel any existing stream before proceeding
-        // This must happen regardless of whether a token was provided
-        const generatedStreamToken = await this.turnRegistry.ensureStreamSafety(typedWorkspaceId);
-
-        // Step 2: Use provided stream token or the generated one
-        const streamToken = providedStreamToken ?? generatedStreamToken;
-
-        // If the stream was interrupted while we were waiting on async setup (mutex,
-        // temp dir creation, etc), avoid starting the stream entirely.
-        if (streamAbortController.signal.aborted) {
-          await cleanupStartup();
-          return settleStartupAbort();
-        }
-
-        // Step 3: Acquire the temp directory for this stream as a scoped resource.
-        const runtimeTempDir = await this.turnResources.acquireTempDir(
-          resourceScope,
-          streamToken,
-          runtime,
-          providedRuntimeTempDir
-        );
-
-        if (streamAbortController.signal.aborted) {
-          await cleanupStartup();
-          return settleStartupAbort();
-        }
-
-        // Construction invokes the provider: validate after every startup resource await.
-        await options.assertAdmissionCurrent?.();
-        if (streamAbortController.signal.aborted) return settleStartupAbort();
-
-        // The persisted comparison and synchronous provider registration share one lock.
-        // Record cleanup ownership inside the callback, even if releasing the lock fails.
-        const construct = () => {
-          if (streamAbortController.signal.aborted) return;
-          // Final synchronous gate before the provider is invoked: a stop that latched after
-          // the earlier checks settles this start as a startup abort instead of a request.
-          if (options.stopFence?.() === false) {
-            streamAbortController.abort("startup");
-            return;
-          }
-          registeredStream = this.createStreamAtomically(options, {
-            streamToken,
-            runtimeTempDir,
-            resourceScope,
-            abortController: streamAbortController,
-            completionController,
-          });
-          registeredStream.unlinkAbortSignal = unlinkAbortSignal;
-          // Scope close must own STARTING streams before the fence's release can await.
-          this.turnRegistry.superviseEngine(typedWorkspaceId, registeredStream);
-        };
-        if (options.withAdmissionCurrent) await options.withAdmissionCurrent(construct);
-        else construct();
-        const streamInfo = registeredStream;
-        if (!streamInfo) return settleStartupAbort();
-
-        // Guard against a narrow race:
-        // - stopStream() may abort while we're between the last aborted-check and stream registration.
-        // - If we start processStreamWithCleanup anyway, it would emit stream-start, but no one would
-        //   subsequently call stopStream() again (it already ran), so we'd never emit stream-abort/end.
-        // In that case, immediately drop the registered stream and rely on the caller to handle UI.
-        if (streamAbortController.signal.aborted) {
-          if (this.workspaceStreams.get(typedWorkspaceId) === streamInfo)
-            this.workspaceStreams.delete(typedWorkspaceId);
-          await cleanupStartup();
-          return settleStartupAbort();
-        }
-
-        // Stream constructed + registered: durable request-describing side
-        // effects (turn envelope) may be recorded now.
-        await onStreamConstructed?.();
-        // The envelope may wait on storage after construction; do not begin processing a
-        // superseded request. Existing failure cleanup owns its registered stream and handle.
-        if (
-          !streamAbortController.signal.aborted &&
-          this.workspaceStreams.get(typedWorkspaceId) === streamInfo
-        )
-          await options.assertAdmissionCurrent?.();
-
-        // A hard interrupt during the awaited envelope write finds the
-        // registered STARTING stream, aborts it, awaits its placeholder
-        // processingPromise, and deletes the registration — a replacement
-        // stream may already occupy this workspace's slot. Launching
-        // processing now would emit stream-start after the abort and its
-        // cleanup would later delete that replacement. Bail out; the finally
-        // block releases this never-processed stream's resources.
-        if (
-          streamAbortController.signal.aborted ||
-          this.workspaceStreams.get(typedWorkspaceId) !== streamInfo
-        ) {
-          // The envelope may return while abort persistence/raw delivery is still held.
-          // Joining its existing fence preserves the first reason and attempt registration.
-          await streamInfo.cancelPromise;
-          await cleanupStartup();
-          if (this.workspaceStreams.get(typedWorkspaceId) === streamInfo)
-            this.workspaceStreams.delete(typedWorkspaceId);
-          return settleStartupAbort();
-        }
-
-        // Step 5: Track the processing promise for guaranteed cleanup
-        // This allows cancelStreamSafely to wait for full exit
-        processingStarted = true;
-        streamInfo.processingPromise = this.processStreamWithCleanup(
-          typedWorkspaceId,
-          streamInfo,
-          historySequence
-        ).catch((error) => {
-          log.error("Unexpected error in stream processing:", error);
-        });
-
-        return Ok(handle);
+        return await this.runStreamStartup(start, startup);
       } finally {
-        if (!processingStarted) await cleanupStartup();
+        if (!start.processingStarted) await this.cleanupStartup(start, startup);
       }
     } catch (error) {
-      // An envelope failure may arrive after an old stop and replacement registration.
-      // Preserve both the captured cancellation fence and the replacement's map entry.
-      await registeredStream?.cancelPromise;
-      if (registeredStream && this.workspaceStreams.get(typedWorkspaceId) === registeredStream) {
-        this.workspaceStreams.delete(typedWorkspaceId);
-      }
-      // No handle is handed out on this path, so the completion is observed only
-      // by a supervisor forked at registration: settle it so that fiber exits
-      // instead of cancelling this never-started stream at shutdown.
-      completionController.settle({
-        status: "aborted",
-        abortReason: this.getStartupAbortReason(abortSignal),
-      });
-      // Convert to strongly-typed error
-      return Err(this.convertToSendMessageError(error));
+      return this.failStreamStart(start, error);
     }
+  }
+
+  /** Release a start's resources; once registered, the stream owns them (releaseStartup). */
+  private cleanupStartup(start: StreamStart, startup: TurnStartup): Promise<void> {
+    return this.turnResources.releaseStartup(startup, start.options.model, start.registeredStream);
+  }
+
+  /** Settle a start that ends before processing as a startup abort; its handle still returns. */
+  private settleStartupAbort(start: StreamStart): Result<TurnStreamHandle, SendMessageError> {
+    start.completionController.settle({
+      status: "aborted",
+      abortReason: this.getStartupAbortReason(start.options.abortSignal),
+    });
+    return Ok(start.handle);
+  }
+
+  /** startStream's steps once the start lock is held; each may end the start as an abort. */
+  private async runStreamStartup(
+    start: StreamStart,
+    startup: TurnStartup
+  ): Promise<Result<TurnStreamHandle, SendMessageError>> {
+    const prepared = await this.prepareStreamStartup(start, startup);
+    if (!prepared) return this.settleStartupAbort(start);
+    const streamInfo = await this.registerStartingStream(start, startup, prepared);
+    if (!streamInfo) return this.settleStartupAbort(start);
+    if (!(await this.admitRegisteredStream(start, startup, streamInfo))) {
+      return this.settleStartupAbort(start);
+    }
+
+    // Step 5: Track the processing promise for guaranteed cleanup
+    // This allows cancelStreamSafely to wait for full exit
+    start.processingStarted = true;
+    streamInfo.processingPromise = this.processStreamWithCleanup(
+      start.workspaceId,
+      streamInfo,
+      start.options.historySequence
+    ).catch((error) => {
+      log.error("Unexpected error in stream processing:", error);
+    });
+
+    return Ok(start.handle);
+  }
+
+  /**
+   * Steps 1 to 3: cancel the workspace's existing stream, pick the token and
+   * acquire the temp directory. Undefined when the start was aborted meanwhile.
+   */
+  private async prepareStreamStartup(
+    start: StreamStart,
+    startup: TurnStartup
+  ): Promise<{ streamToken: StreamToken; runtimeTempDir: string } | undefined> {
+    const { options } = start;
+    const streamAbortController = startup.abortController;
+    // Step 1: Cancel any existing stream before proceeding
+    // This must happen regardless of whether a token was provided
+    const generatedStreamToken = await this.turnRegistry.ensureStreamSafety(start.workspaceId);
+
+    // Step 2: Use provided stream token or the generated one
+    const streamToken = options.providedStreamToken ?? generatedStreamToken;
+
+    // If the stream was interrupted while we were waiting on async setup (mutex,
+    // temp dir creation, etc), avoid starting the stream entirely.
+    if (streamAbortController.signal.aborted) {
+      await this.cleanupStartup(start, startup);
+      return undefined;
+    }
+
+    // Step 3: Acquire the temp directory for this stream as a scoped resource.
+    const runtimeTempDir = await this.turnResources.acquireTempDir(
+      startup.resourceScope,
+      streamToken,
+      options.runtime,
+      options.providedRuntimeTempDir
+    );
+
+    if (streamAbortController.signal.aborted) {
+      await this.cleanupStartup(start, startup);
+      return undefined;
+    }
+
+    // Construction invokes the provider: validate after every startup resource await.
+    await options.assertAdmissionCurrent?.();
+    if (streamAbortController.signal.aborted) return undefined;
+    return { streamToken, runtimeTempDir };
+  }
+
+  /** Construct and register the stream; undefined when a stop fenced the start first. */
+  private async registerStartingStream(
+    start: StreamStart,
+    startup: TurnStartup,
+    prepared: { streamToken: StreamToken; runtimeTempDir: string }
+  ): Promise<WorkspaceStreamInfo | undefined> {
+    const { options } = start;
+    const streamAbortController = startup.abortController;
+    // The persisted comparison and synchronous provider registration share one lock.
+    // Record cleanup ownership inside the callback, even if releasing the lock fails.
+    const construct = () => {
+      if (streamAbortController.signal.aborted) return;
+      // Final synchronous gate before the provider is invoked: a stop that latched after
+      // the earlier checks settles this start as a startup abort instead of a request.
+      if (options.stopFence?.() === false) {
+        streamAbortController.abort("startup");
+        return;
+      }
+      const registeredStream = this.createStreamAtomically(options, {
+        streamToken: prepared.streamToken,
+        runtimeTempDir: prepared.runtimeTempDir,
+        resourceScope: startup.resourceScope,
+        abortController: streamAbortController,
+        completionController: start.completionController,
+      });
+      start.registeredStream = registeredStream;
+      registeredStream.unlinkAbortSignal = startup.unlinkAbortSignal;
+      // Scope close must own STARTING streams before the fence's release can await.
+      this.turnRegistry.superviseEngine(start.workspaceId, registeredStream);
+    };
+    if (options.withAdmissionCurrent) await options.withAdmissionCurrent(construct);
+    else construct();
+    return start.registeredStream;
+  }
+
+  /**
+   * Record the turn envelope and re-check admission for a registered stream.
+   * False when a stop or a replacement superseded it; its resources are released then.
+   */
+  private async admitRegisteredStream(
+    start: StreamStart,
+    startup: TurnStartup,
+    streamInfo: WorkspaceStreamInfo
+  ): Promise<boolean> {
+    const { workspaceId, options } = start;
+    const { onStreamConstructed } = options;
+    const streamAbortController = startup.abortController;
+    // Guard against a narrow race:
+    // - stopStream() may abort while we're between the last aborted-check and stream registration.
+    // - If we start processStreamWithCleanup anyway, it would emit stream-start, but no one would
+    //   subsequently call stopStream() again (it already ran), so we'd never emit stream-abort/end.
+    // In that case, immediately drop the registered stream and rely on the caller to handle UI.
+    if (streamAbortController.signal.aborted) {
+      if (this.workspaceStreams.get(workspaceId) === streamInfo)
+        this.workspaceStreams.delete(workspaceId);
+      await this.cleanupStartup(start, startup);
+      return false;
+    }
+
+    // Stream constructed + registered: durable request-describing side
+    // effects (turn envelope) may be recorded now.
+    await onStreamConstructed?.();
+    // The envelope may wait on storage after construction; do not begin processing a
+    // superseded request. Existing failure cleanup owns its registered stream and handle.
+    if (
+      !streamAbortController.signal.aborted &&
+      this.workspaceStreams.get(workspaceId) === streamInfo
+    )
+      await options.assertAdmissionCurrent?.();
+
+    // A hard interrupt during the awaited envelope write finds the
+    // registered STARTING stream, aborts it, awaits its placeholder
+    // processingPromise, and deletes the registration — a replacement
+    // stream may already occupy this workspace's slot. Launching
+    // processing now would emit stream-start after the abort and its
+    // cleanup would later delete that replacement. Bail out; startStream's
+    // finally releases this never-processed stream's resources.
+    if (
+      streamAbortController.signal.aborted ||
+      this.workspaceStreams.get(workspaceId) !== streamInfo
+    ) {
+      // The envelope may return while abort persistence/raw delivery is still held.
+      // Joining its existing fence preserves the first reason and attempt registration.
+      await streamInfo.cancelPromise;
+      await this.cleanupStartup(start, startup);
+      if (this.workspaceStreams.get(workspaceId) === streamInfo)
+        this.workspaceStreams.delete(workspaceId);
+      return false;
+    }
+    return true;
+  }
+
+  /** A start that threw: free the slot it may hold and settle its unreturned handle. */
+  private async failStreamStart(
+    start: StreamStart,
+    error: unknown
+  ): Promise<Result<TurnStreamHandle, SendMessageError>> {
+    const { registeredStream } = start;
+    // An envelope failure may arrive after an old stop and replacement registration.
+    // Preserve both the captured cancellation fence and the replacement's map entry.
+    await registeredStream?.cancelPromise;
+    if (registeredStream && this.workspaceStreams.get(start.workspaceId) === registeredStream) {
+      this.workspaceStreams.delete(start.workspaceId);
+    }
+    // No handle is handed out on this path, so the completion is observed only
+    // by a supervisor forked at registration: settle it so that fiber exits
+    // instead of cancelling this never-started stream at shutdown.
+    start.completionController.settle({
+      status: "aborted",
+      abortReason: this.getStartupAbortReason(start.options.abortSignal),
+    });
+    // Convert to strongly-typed error
+    return Err(this.convertToSendMessageError(error));
   }
 
   /**
