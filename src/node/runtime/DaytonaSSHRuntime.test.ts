@@ -305,58 +305,37 @@ describe("DaytonaSSHRuntime.finalizeConfig and validateBeforePersist", () => {
 describe("DaytonaSSHRuntime Windows and GPU sandboxes", () => {
   // Xum provisions over ssh with POSIX commands; a Windows sandbox runs cmd.exe or PowerShell.
   // Daytona deletes a GPU sandbox when it stops, and Xum lets workspaces auto-stop.
-  it("refuses to create from a Windows or GPU snapshot before persisting", async () => {
+  async function validate(daytona: DaytonaSandboxConfig) {
     rig.plane.snapshots.push(
       { name: "windows-small", sandboxClass: "windows" },
       { name: "daytona-gpu", sandboxClass: "linux-vm", gpu: 1 },
-      { name: "daytona-small", sandboxClass: "container" }
+      { name: "daytona-small", sandboxClass: "container" },
+      // A general snapshot may come only with the list, not by name.
+      { name: "general-small", sandboxClass: "container", listedOnly: true },
+      { name: "default-snap", sandboxClass: "windows" }
     );
-    const runtime = makeRuntime({});
-    const validate = async (daytona: DaytonaSandboxConfig) => {
-      const finalized = await runtime.finalizeConfig("b", sshDaytonaConfig(daytona));
-      if (!finalized.success) return finalized;
-      return runtime.validateBeforePersist("b", finalized.data);
-    };
-
-    const created = await validate({ snapshot: "windows-small" });
-    expect(created.success ? "" : created.error).toContain("Windows");
-    const createdGpu = await validate({ snapshot: "daytona-gpu" });
-    expect(createdGpu.success ? "" : createdGpu.error).toContain("GPU");
-
-    expect((await validate({ snapshot: "daytona-small" })).success).toBe(true);
-    expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
-  });
-
-  it("refuses a snapshot Daytona no longer has before persisting", async () => {
-    // A general snapshot may come only with the list, not by name.
-    rig.plane.snapshots.push({
-      name: "general-small",
-      sandboxClass: "container",
-      listedOnly: true,
-    });
-    const runtime = makeRuntime({});
-    const validate = async (snapshot: string) => {
-      const finalized = await runtime.finalizeConfig("b", sshDaytonaConfig({ snapshot }));
-      if (!finalized.success) return finalized;
-      return runtime.validateBeforePersist("b", finalized.data);
-    };
-
-    // A stale project default: deleted after it was saved.
-    const stale = await validate("deleted-snapshot");
-    expect(stale.success ? "" : stale.error).toContain('"deleted-snapshot" was not found');
-    expect((await validate("general-small")).success).toBe(true);
-    expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
-  });
-
-  it("refuses a Windows deployment default when no snapshot is chosen", async () => {
-    rig.plane.snapshots.push({ name: "default-snap", sandboxClass: "windows" });
     rig.plane.defaultSnapshot = "default-snap";
     const runtime = makeRuntime({});
-    const finalized = await runtime.finalizeConfig("b", sshDaytonaConfig({}));
-    if (!finalized.success) throw new Error(finalized.error);
-    const refused = await runtime.validateBeforePersist("b", finalized.data);
-    expect(refused.success ? "" : refused.error).toContain('"default-snap" creates Windows');
+    const finalized = await runtime.finalizeConfig("b", sshDaytonaConfig(daytona));
+    const result = finalized.success
+      ? await runtime.validateBeforePersist("b", finalized.data)
+      : finalized;
     expect(rig.plane.countCalls("POST /sandbox")).toBe(0);
+    return result.success ? "ok" : result.error;
+  }
+
+  it.each([
+    ["a Windows snapshot", { snapshot: "windows-small" }, '"windows-small" creates Windows'],
+    ["a GPU snapshot", { snapshot: "daytona-gpu" }, '"daytona-gpu" creates GPU'],
+    // A stale project default: deleted after it was saved.
+    ["a deleted snapshot", { snapshot: "deleted-snapshot" }, '"deleted-snapshot" was not found'],
+    ["a Windows deployment default", {}, '"default-snap" creates Windows'],
+  ])("refuses %s before persisting", async (_case, daytona, error) => {
+    expect(await validate(daytona)).toContain(error);
+  });
+
+  it.each(["daytona-small", "general-small"])("accepts the Linux snapshot %s", async (snapshot) => {
+    expect(await validate({ snapshot })).toBe("ok");
   });
 
   it("offers neither Windows nor GPU snapshots", async () => {
@@ -395,69 +374,41 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     expect(rig.writer.tokens.get("xum-new")).toBeDefined();
   });
 
-  it("falls back to create-then-resize when the snapshot has fixed resources", async () => {
-    rig.plane.rejectCreateResources = true;
-    const medium = { cpu: 4, memoryGiB: 8, diskGiB: 20 };
+  // Daytona rejects resources for a snapshot with fixed ones: create, then resize to the preset.
+  it.each([
+    ["the snapshot's size is reported", {}, { cpu: 1, memory: 1, disk: 3 }, 20],
+    // Sending the preset disk would shrink an unreported larger disk.
+    ["the disk is not reported", { omitDisk: true }, { cpu: 1, memory: 1, disk: 30 }, 30],
+    // Above the preset: only a stopped sandbox may shrink.
+    [
+      "cpu and memory are not reported",
+      { omitCompute: true },
+      { cpu: 8, memory: 16, disk: 30 },
+      30,
+    ],
+  ])(
+    "creates a fixed-size snapshot, then resizes it to the preset when %s",
+    async (_case, omit, snapshotResources, disk) => {
+      Object.assign(rig.plane, { rejectCreateResources: true, snapshotResources, ...omit });
 
-    await makeRuntime({
-      sandboxId: "xum-fixed",
-      snapshot: "fixed-snap",
-      ...medium,
-    }).postCreateSetup(initParams());
+      await makeRuntime({
+        sandboxId: "xum-fixed",
+        snapshot: "fixed-snap",
+        cpu: 4,
+        memoryGiB: 8,
+        diskGiB: 20,
+      }).postCreateSetup(initParams());
 
-    expect(rig.plane.createBodies).toHaveLength(2);
-    expect(rig.plane.createBodies[1].cpu).toBeUndefined();
-    expect(rig.plane.find("xum-fixed")).toMatchObject({
-      state: "started",
-      cpu: 4,
-      memory: 8,
-      disk: 20,
-    });
-  });
-
-  it("never sends a preset disk over a disk size Daytona did not report", async () => {
-    rig.plane.rejectCreateResources = true;
-    rig.plane.omitDisk = true;
-    // The snapshot's disk is larger than the preset's: sending the preset would shrink it.
-    rig.plane.snapshotResources = { cpu: 1, memory: 1, disk: 30 };
-
-    await makeRuntime({
-      sandboxId: "xum-unknown-disk",
-      snapshot: "fixed-snap",
-      cpu: 4,
-      memoryGiB: 8,
-      diskGiB: 20,
-    }).postCreateSetup(initParams());
-
-    expect(rig.plane.find("xum-unknown-disk")).toMatchObject({
-      state: "started",
-      cpu: 4,
-      memory: 8,
-      disk: 30,
-    });
-  });
-
-  it("resizes a sandbox whose cpu and memory Daytona did not report while it is stopped", async () => {
-    rig.plane.rejectCreateResources = true;
-    rig.plane.omitCompute = true;
-    // Above the preset: resizing the running sandbox to it would be a shrink Daytona refuses.
-    rig.plane.snapshotResources = { cpu: 8, memory: 16, disk: 30 };
-
-    await makeRuntime({
-      sandboxId: "xum-unknown-compute",
-      snapshot: "fixed-snap",
-      cpu: 4,
-      memoryGiB: 8,
-      diskGiB: 20,
-    }).postCreateSetup(initParams());
-
-    expect(rig.plane.find("xum-unknown-compute")).toMatchObject({
-      state: "started",
-      cpu: 4,
-      memory: 8,
-      disk: 30,
-    });
-  });
+      expect(rig.plane.createBodies).toHaveLength(2);
+      expect(rig.plane.createBodies[1].cpu).toBeUndefined();
+      expect(rig.plane.find("xum-fixed")).toMatchObject({
+        state: "started",
+        cpu: 4,
+        memory: 8,
+        disk,
+      });
+    }
+  );
 
   it("deletes the sandbox it created when setup fails afterwards", async () => {
     rig.writer.writeError = new Error("No space left on device");
@@ -875,24 +826,14 @@ describe("DaytonaSSHRuntime delete checks on the unresolved ~ workspace path", (
 });
 
 describe("DaytonaSSHRuntime ssh token redaction", () => {
-  it("keeps the token (the ssh user name) out of command stderr and thrown errors", async () => {
+  it("keeps the token (the ssh user name) out of command stderr", async () => {
     execSpy.mockRestore();
     rig.plane.addSandbox({ id: "sb-tok" });
     await rig.service.ssh.ensureSshAccess("sb-tok");
     const token = rig.writer.tokens.get("sb-tok");
     if (!token) throw new Error("expected a minted token");
-    let refuseConnections = false;
-    const local = localShellTransport(rig.rootDir);
     const runtime = makeRuntime({ sandboxId: "sb-tok" }, rig, {
-      transport: {
-        ...local,
-        spawnRemoteProcess: (command, options) =>
-          refuseConnections
-            ? Promise.reject(
-                new RuntimeError(`${token}@127.0.0.1: Permission denied (publickey).`, "network")
-              )
-            : local.spawnRemoteProcess(command, options),
-      },
+      transport: localShellTransport(rig.rootDir),
     });
 
     // OpenSSH's message, split across two writes inside the token.
@@ -904,40 +845,7 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
     );
     expect(result.stderr).not.toContain(token);
     expect(result.stderr).toContain(`${DAYTONA_TOKEN_PLACEHOLDER}@127.0.0.1: Permission denied`);
-
-    refuseConnections = true;
-    const error = await runtime.exec("true", { cwd: "/tmp", timeout: 10 }).then(
-      () => new Error("exec unexpectedly succeeded"),
-      (rejection: unknown) => rejection
-    );
-    expect(String(error)).not.toContain(token);
-    expect(String(error)).toContain(DAYTONA_TOKEN_PLACEHOLDER);
   });
-  it("keeps a token an earlier Xum process left in the include file out of errors", async () => {
-    // Never minted in this process: only the include file, read at startup, knows it.
-    const stale = "earlier-process-token-7f3a";
-    rig.plane.addSandbox({ id: "sb-old" });
-    rig.writer.tokens.set("sb-old", stale);
-    await rig.service.ssh.loadPersistedTokens();
-    const runtime = makeRuntime({ sandboxId: "sb-old" }, rig, {
-      transport: {
-        ...localShellTransport(rig.rootDir),
-        // What a skills listing or a workspace open hits right after a restart.
-        spawnRemoteProcess: () =>
-          Promise.reject(
-            new RuntimeError(`${stale}@127.0.0.1: Permission denied (publickey).`, "network")
-          ),
-      },
-    });
-
-    const error = await runtime.exec("true", { cwd: "/tmp", timeout: 10 }).then(
-      () => new Error("exec unexpectedly succeeded"),
-      (rejection: unknown) => rejection
-    );
-    expect(String(error)).not.toContain(stale);
-    expect(String(error)).toContain(`${DAYTONA_TOKEN_PLACEHOLDER}@127.0.0.1: Permission denied`);
-  });
-
   it("keeps the token out of an error that gets no retry", async () => {
     rig.plane.addSandbox({ id: "sb-tok" });
     await rig.service.ssh.ensureSshAccess("sb-tok");

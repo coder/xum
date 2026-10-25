@@ -26,8 +26,11 @@ export interface FakeSandbox {
   memory: number;
   disk: number;
   labels: Record<string, string>;
-  /** GETs left before a transitional state settles (creating/starting -> started, deleting -> gone). */
+  /** GETs left before a transitional state settles (creating/starting -> started). */
   pendingPolls: number;
+  /** States successive GETs observe instead (the last one repeats); start and stop keep to it. */
+  stateScript?: string[];
+  errorReason?: string;
   /** Daytona's sandboxClass ("linux-vm", "container", "windows"); unset like an older API. */
   sandboxClass?: string;
   /** GPU units; Daytona's GPU sandboxes carry a positive count. */
@@ -77,6 +80,10 @@ export class FakeDaytonaControlPlane {
   private nextToken = 1;
   /** Minted tokens are `<prefix><n>`: real tokens never repeat across accounts. */
   tokenPrefix = "tok";
+  /** When set, a sandbox list without this API key is refused with 401. */
+  apiKey?: string;
+  /** A proxy that echoes the request URI and its Authorization header in a failed revoke. */
+  revokeEchoesRequest = false;
 
   constructor(private readonly now: () => number) {}
 
@@ -123,6 +130,11 @@ export class FakeDaytonaControlPlane {
       new Response(body === undefined ? "" : JSON.stringify(body), { status });
     const fail = (status: number, message: string) => json(status, { statusCode: status, message });
     if (this.failingRoutes.has(route)) return fail(500, "Internal error");
+    const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
+    // Only the sandbox list checks it: that is the request a connection test makes.
+    if (route === "GET /sandbox" && this.apiKey !== undefined && auth !== `Bearer ${this.apiKey}`) {
+      return fail(401, "Invalid credentials");
+    }
 
     if (route === "GET /config") {
       return json(200, {
@@ -191,12 +203,10 @@ export class FakeDaytonaControlPlane {
     if (!sandbox) return fail(404, "Sandbox not found");
 
     if (method === "GET" && !action) {
-      const goingAway = sandbox.state === "deleting" || sandbox.state === "destroying";
-      if (goingAway && sandbox.pendingPolls === 0) {
-        this.sandboxes.delete(sandbox.id);
-        return fail(404, "Sandbox not found");
-      }
-      if (sandbox.pendingPolls > 0) {
+      const script = sandbox.stateScript;
+      if (script?.length) {
+        sandbox.state = (script.length > 1 ? script.shift() : script[0]) ?? sandbox.state;
+      } else if (sandbox.pendingPolls > 0) {
         sandbox.pendingPolls -= 1;
       } else if (sandbox.state === "creating" || sandbox.state === "starting") {
         sandbox.state = "started";
@@ -209,10 +219,10 @@ export class FakeDaytonaControlPlane {
     }
     switch (`${method} ${action}`) {
       case "POST start":
-        sandbox.state = "starting";
+        if (!sandbox.stateScript) sandbox.state = "starting";
         return json(200, {});
       case "POST stop":
-        sandbox.state = "stopped";
+        if (!sandbox.stateScript) sandbox.state = "stopped";
         return json(200, {});
       case "POST resize":
         return this.resize(sandbox, JSON.parse(requestBody(init)) as Record<string, number>);
@@ -224,15 +234,13 @@ export class FakeDaytonaControlPlane {
         });
       }
       case "DELETE ssh-access":
+        if (this.revokeEchoesRequest) {
+          return json(500, { message: `Revoke failed for ${url.toString()} (${auth})` });
+        }
         this.revokedTokens.push(url.searchParams.get("token") ?? "");
         return json(200, {});
       case "POST last-activity":
         return json(200, {});
-      case "PUT labels": {
-        const body = JSON.parse(requestBody(init)) as { labels: Record<string, string> };
-        sandbox.labels = body.labels;
-        return json(200, { labels: sandbox.labels });
-      }
       default:
         return fail(500, `unexpected ${route}`);
     }
@@ -269,6 +277,7 @@ export class FakeDaytonaControlPlane {
       labels: sandbox.labels,
       ...(sandbox.sandboxClass ? { sandboxClass: sandbox.sandboxClass } : {}),
       ...(sandbox.gpu !== undefined ? { gpu: sandbox.gpu } : {}),
+      ...(sandbox.errorReason ? { errorReason: sandbox.errorReason } : {}),
     };
   }
 }
@@ -438,66 +447,24 @@ export function localShellTransport(home: string): SSHTransport {
   };
 }
 
-/** In-memory control plane: one sandbox whose `state` follows a script of observations. */
-export class ScriptedSandboxControlPlane {
-  states: string[] = [];
-  exists = true;
-  errorReason?: string;
-  /** A proxy that echoes the request URI and its Authorization header in a failed revoke. */
-  revokeEchoesRequest = false;
-  readonly calls: string[] = [];
-  private tokenCounter = 0;
-  readonly revoked: string[] = [];
-  gatewayHost = "ssh.test";
-  gatewayHostKeys = ["ssh-ed25519 AAAA"];
+/** The fake control plane with one sandbox, "sb-1", for tests below the runtime; API key "k". */
+export class ScriptedSandboxControlPlane extends FakeDaytonaControlPlane {
+  constructor(now: () => number) {
+    super(now);
+    this.apiKey = "k";
+    this.gateway = { host: "ssh.test", port: 22, hostKeys: ["ssh-ed25519 AAAA"] };
+    this.addSandbox({ id: "sb-1" });
+  }
 
-  constructor(private readonly now: () => number) {}
+  get revoked(): string[] {
+    return this.revokedTokens;
+  }
 
-  readonly fetch = ((input: string | URL | Request, init?: RequestInit) =>
-    Promise.resolve(this.handle(input, init))) as typeof fetch;
+  get gatewayHostKeys(): string[] {
+    return this.gateway.hostKeys;
+  }
 
-  private handle(input: string | URL | Request, init?: RequestInit): Response {
-    const url = new URL(input instanceof Request ? input.url : input.toString());
-    const method = init?.method ?? "GET";
-    const route = `${method} ${url.pathname.replace(/^\/api/, "")}`;
-    this.calls.push(route);
-    const json = (status: number, body?: unknown) =>
-      new Response(body === undefined ? "" : JSON.stringify(body), { status });
-
-    if (route === "GET /config") {
-      return json(200, {
-        sshGatewayHost: this.gatewayHost,
-        sshGatewayHostKeys: this.gatewayHostKeys,
-      });
-    }
-    if (route === "GET /sandbox") {
-      if (init?.headers && (init.headers as Record<string, string>).Authorization !== "Bearer k") {
-        return json(401, { statusCode: 401, message: "Invalid credentials" });
-      }
-      return json(200, { items: [], nextCursor: null });
-    }
-    if (!this.exists) return json(404, { statusCode: 404, message: "Sandbox not found" });
-    if (route === "GET /sandbox/sb-1") {
-      const state = this.states.length > 1 ? this.states.shift() : this.states[0];
-      return json(200, { id: "sb-1", name: "sb-1", state, errorReason: this.errorReason });
-    }
-    if (route === "POST /sandbox/sb-1/start") return json(200, {});
-    if (route === "POST /sandbox/sb-1/ssh-access") {
-      this.tokenCounter += 1;
-      const minutes = Number(url.searchParams.get("expiresInMinutes"));
-      return json(200, {
-        token: `tok${this.tokenCounter}`,
-        expiresAt: new Date(this.now() + minutes * 60_000).toISOString(),
-      });
-    }
-    if (route === "DELETE /sandbox/sb-1/ssh-access") {
-      if (this.revokeEchoesRequest) {
-        const auth = (init?.headers as Record<string, string> | undefined)?.Authorization ?? "";
-        return json(500, { message: `Revoke failed for ${url.toString()} (${auth})` });
-      }
-      this.revoked.push(url.searchParams.get("token") ?? "");
-      return json(200, {});
-    }
-    return json(500, { message: `unexpected ${route}` });
+  set gatewayHostKeys(hostKeys: string[]) {
+    this.gateway = { ...this.gateway, hostKeys };
   }
 }
