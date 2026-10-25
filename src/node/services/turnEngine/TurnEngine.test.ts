@@ -20,7 +20,7 @@ import {
   wireStepTrackerHooks,
   wireThinkingOverride,
   type TurnExecutionOptions,
-} from "./streamManager";
+} from "./TurnEngine";
 
 const TOKEN = "tok12345" as StreamToken;
 
