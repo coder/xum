@@ -91,6 +91,25 @@ export function sharedDurableEventJournal(
 }
 
 /**
+ * Per-call write options. createSessionDir (default true) false: the write
+ * never creates the session directory, and a missing one fails it with
+ * ENOENT. Writers that can finish after workspace removal (a tool call the
+ * aborted turn left running, #7474) pass false, so a late row is dropped
+ * instead of recreating the deleted directory. Per call, not per instance:
+ * every writer of a session dir shares one journal (sharedDurableEventJournal).
+ */
+export interface DurableEventWriteOptions {
+  createSessionDir?: boolean;
+}
+
+/** The lower layers' (lock, Journal, BlobStore) parent is the session dir. */
+function createParentDirOption(options: DurableEventWriteOptions | undefined): {
+  createParentDir?: boolean;
+} {
+  return options?.createSessionDir === false ? { createParentDir: false } : {};
+}
+
+/**
  * Which events mention a blob ref, summarized for reclamation decisions.
  * `kinds` answers "which event kinds reference this blob"; snapshot
  * reclamation is additionally per-scope, so sandbox-vars-snapshot mentions
@@ -208,7 +227,10 @@ export class DurableEventJournal {
   }
 
   /** Append a draft; the journal assigns v/seq/ts (and id unless provided). */
-  async append(draft: DurableEventDraft): Promise<DurableEvent> {
+  async append(
+    draft: DurableEventDraft,
+    options?: DurableEventWriteOptions
+  ): Promise<DurableEvent> {
     return await this.journal.append((seq) => {
       const built = {
         ...draft,
@@ -220,7 +242,7 @@ export class DurableEventJournal {
       // The spread of a distributive draft union does not re-narrow to the
       // discriminated union; the journal schema-validates the row on append.
       return built as DurableEvent;
-    });
+    }, createParentDirOption(options));
   }
 
   /** Read all events (self-healed: malformed/duplicate rows dropped, seq order). */
@@ -247,12 +269,13 @@ export class DurableEventJournal {
    * Lock order is blob → append (fn's appends take the append lock);
    * nothing acquires them in the opposite order, so no deadlock.
    */
-  async withBlobLock<T>(fn: () => Promise<T>): Promise<T> {
+  async withBlobLock<T>(fn: () => Promise<T>, options?: DurableEventWriteOptions): Promise<T> {
     await using _mutex = await this.blobLock.acquire();
     await using fileLock = await this.locks.acquireProcessFileLock({
       lockPath: this.blobLockPath,
       timeoutMs: BLOB_LOCK_TIMEOUT_MS,
       label: "blob lock",
+      ...createParentDirOption(options),
     });
     this.activeBlobFileLock = fileLock;
     try {
@@ -303,18 +326,19 @@ export class DurableEventJournal {
   async publishWithBlob(
     content: string | Uint8Array,
     buildDraft: (ref: BlobRef, size: number) => DurableEventDraft,
-    options?: { precondition?: () => Promise<void> }
+    options?: { precondition?: () => Promise<void> } & DurableEventWriteOptions
   ): Promise<{ event: DurableEvent; ref: BlobRef; size: number }> {
+    const writeOptions = createParentDirOption(options);
     return await this.withBlobLock(async () => {
       await options?.precondition?.();
-      const { ref, size, created } = await this.blobs.put(content);
+      const { ref, size, created } = await this.blobs.put(content, writeOptions);
       try {
         // Ownership re-check between put and append (round 11 defense in
         // depth): if this holder was wrongfully displaced, a reclaimer may
         // have deleted the just-put blob — appending would then create a row
         // permanently referencing a missing payload. Abort instead.
         await this.assertBlobLockOwned();
-        const event = await this.append(buildDraft(ref, size));
+        const event = await this.append(buildDraft(ref, size), options);
         return { event, ref, size };
       } catch (error) {
         // A blob whose row never landed would leak forever: reclamation
@@ -337,7 +361,7 @@ export class DurableEventJournal {
         }
         throw error;
       }
-    });
+    }, options);
   }
 
   /**

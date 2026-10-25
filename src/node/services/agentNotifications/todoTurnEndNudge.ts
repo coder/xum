@@ -3,7 +3,7 @@ import { TURN_STOP_PROMPT_MAX_CHARS } from "@/node/services/agentPlugins/promptH
 import { isSuccessfulToolResult } from "@/node/services/aiServiceEventGuards";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
-import { TODO_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
+import { TODO_TURN_END_NUDGE, TURN_END_NUDGE_SEPARATOR } from "@/common/utils/machineTurnPrompts";
 
 // The prompt text lives in common code so the transcript can render it as a compact row.
 export { TODO_TURN_END_NUDGE };
@@ -45,20 +45,26 @@ export interface TurnStopContinuation {
   prompt: string;
 }
 
-/** The turn.stop continuation from the plugin hooks' prompt and the nudge, or null for none. */
+/**
+ * The turn.stop continuation from the plugin hooks' prompt and Xum's nudges (TODO first, then the
+ * status page), or null for none.
+ */
 export function mergeTurnStopContinuation(input: {
   hookPrompt: string | null;
-  todoNudge: boolean;
+  nudges: readonly string[];
 }): TurnStopContinuation | null {
-  if (!input.todoNudge) return input.hookPrompt == null ? null : { prompt: input.hookPrompt };
-  // Every continuation, the nudge included, keeps the turn's tools: a nudge limited to todo_write
+  if (input.nudges.length === 0) {
+    return input.hookPrompt == null ? null : { prompt: input.hookPrompt };
+  }
+  // Every continuation, a nudge included, keeps the turn's tools: a nudge limited to todo_write
   // left work the model could do open until the next user message ("Gating and pushing needs
   // bash, and this turn has only todo_write"), so the nudged turn may continue normally.
-  if (input.hookPrompt == null) return { prompt: TODO_TURN_END_NUDGE };
-  // The joined prompt keeps the cap: the plugin's part is cut, so the nudge always arrives whole.
-  const separator = "\n\n";
-  const hookRoom = TURN_STOP_PROMPT_MAX_CHARS - separator.length - TODO_TURN_END_NUDGE.length;
+  const nudgePrompt = input.nudges.join(TURN_END_NUDGE_SEPARATOR);
+  if (input.hookPrompt == null) return { prompt: nudgePrompt };
+  // The joined prompt keeps the cap: the plugin's part is cut, so the nudges always arrive whole.
+  const hookRoom =
+    TURN_STOP_PROMPT_MAX_CHARS - TURN_END_NUDGE_SEPARATOR.length - nudgePrompt.length;
   return {
-    prompt: `${input.hookPrompt.slice(0, hookRoom)}${separator}${TODO_TURN_END_NUDGE}`,
+    prompt: `${input.hookPrompt.slice(0, hookRoom)}${TURN_END_NUDGE_SEPARATOR}${nudgePrompt}`,
   };
 }

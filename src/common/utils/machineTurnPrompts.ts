@@ -55,6 +55,48 @@ export function classifyTodoTurnEndNudgePrompt(text: string): "current" | "legac
   return LEGACY_TODO_TURN_END_NUDGES.includes(text) ? "legacy" : null;
 }
 
+/**
+ * The turn-end status page nudge of the Agent interface view. The user sees the agent's
+ * status.html instead of the transcript, but agents often end whole turns without replacing the
+ * seeded placeholder or updating the page, so AgentSession sends this prompt as a turn.stop
+ * continuation, at most once per user turn, when the page is blank or still shows the placeholder,
+ * or a turn that ran tools left it unchanged. Constant, like the TODO nudge: no model-written text.
+ */
+export const STATUS_PAGE_TURN_END_NUDGE = `<notification>
+You ended your turn, but the status page the user sees instead of this chat is blank, still shows Xum's placeholder, or did not change this turn. Update $XUM_SCRATCH_DIR/artifacts/status.html in place now so it shows the current status, progress and results, and anything that waits on the user. Do not redo work you already did.
+</notification>`;
+
+/**
+ * The same nudge in status page agent mode (artifacts-status-page-agent): the status page agent
+ * owns the page, so the main agent is asked for a status_update call instead of an edit. Sent
+ * only when the turn sent no status_update: the page lags those calls, so an unchanged page alone
+ * does not mean the agent skipped its update.
+ */
+export const STATUS_PAGE_AGENT_TURN_END_NUDGE = `<notification>
+You ended your turn without a status update, and the status page the user sees instead of this chat is blank, still shows Xum's placeholder, or did not change this turn. Call status_update now with the current status, progress and results, and anything that waits on the user. Do not redo work you already did.
+</notification>`;
+
+const STATUS_PAGE_TURN_END_NUDGES = [STATUS_PAGE_TURN_END_NUDGE, STATUS_PAGE_AGENT_TURN_END_NUDGE];
+
+/** Joins Xum's turn-end nudges (TODO first, then the status page) into one continuation. */
+export const TURN_END_NUDGE_SEPARATOR = "\n\n";
+
+/**
+ * Which turn-end status page nudge (either variant) `text` is exactly: "status-page" alone,
+ * "todo-and-status-page" when it follows the TODO nudge in one continuation, or null for any
+ * other text.
+ */
+export function classifyStatusPageTurnEndNudgePrompt(
+  text: string
+): "status-page" | "todo-and-status-page" | null {
+  if (STATUS_PAGE_TURN_END_NUDGES.includes(text)) return "status-page";
+  const todoPrefix = `${TODO_TURN_END_NUDGE}${TURN_END_NUDGE_SEPARATOR}`;
+  return text.startsWith(todoPrefix) &&
+    STATUS_PAGE_TURN_END_NUDGES.includes(text.slice(todoPrefix.length))
+    ? "todo-and-status-page"
+    : null;
+}
+
 const PROMPT_OPENINGS_BY_KIND: ReadonlyArray<{
   kind: TimelineEventKind;
   openings: readonly string[];

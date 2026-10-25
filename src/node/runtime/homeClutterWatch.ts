@@ -101,12 +101,16 @@ export class ClutterScanner {
     this.readDir = readDir;
   }
 
-  /** The in-flight scan, or a new one when none is running. */
-  scan(now = Date.now()): Promise<ClutterSnapshot> {
+  /**
+   * The in-flight scan, or a new one when none is running. `now` comes from the caller's
+   * clock (no Date.now() default), so `busyForMs` compares times of one clock (#7282).
+   */
+  scan(now: number): Promise<ClutterSnapshot> {
     if (this.inFlight != null) return this.inFlight.scan;
     const scan = snapshotClutterRoots(this.roots, this.readDir)
       .then((fresh) => {
         const merged = new Map(fresh);
+        // mutation-equivalent: last is a Map or null, and a Map is truthy, so ?? and || agree
         for (const [dir, names] of this.last ?? []) {
           if (!merged.has(dir)) merged.set(dir, names);
         }
@@ -114,6 +118,8 @@ export class ClutterScanner {
         return merged as ClutterSnapshot;
       })
       .finally(() => {
+        // mutation-equivalent: inFlight is set before this promise can settle and only this
+        // callback clears it, so it is never null here and ?. and . agree
         if (this.inFlight?.scan === scan) this.inFlight = null;
       });
     this.inFlight = { scan, startedAt: now };
@@ -121,7 +127,7 @@ export class ClutterScanner {
   }
 
   /** How long the current scan has been running (0 when idle). */
-  busyForMs(now = Date.now()): number {
+  busyForMs(now: number): number {
     return this.inFlight == null ? 0 : now - this.inFlight.startedAt;
   }
 }

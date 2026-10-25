@@ -4,12 +4,21 @@ import {
   REFINEMENT_INVERSE_BLOB_QUOTA_BYTES,
   REFINEMENT_INVERSE_QUOTA_MIN_CHARGE_BYTES,
 } from "@/common/types/refinement";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { createMuxMessage } from "@/common/types/message";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { createTestHistoryService } from "@/node/services/testHistoryService";
+import { removeSessionDirUnderMemoryLocks } from "@/node/services/workspaceRemoval";
 import {
   DurableEventJournal,
   sharedDurableEventJournal,
 } from "@/node/utils/journal/durableEventJournal";
-import { appendRefinementEvent, reclaimExcessRefinementInverseBlobs } from "./refinementJournal";
+import {
+  appendRefinementEvent,
+  appendRefinementEventFromTool,
+  reclaimExcessRefinementInverseBlobs,
+} from "./refinementJournal";
 
 /** Append one blob-backed restore-files refinement row (put+append locked). */
 async function publishInverseRow(
@@ -180,5 +189,50 @@ describe("reclaimExcessRefinementInverseBlobs", () => {
     await reclaimExcessRefinementInverseBlobs(journal2, []);
     expect(await journal2.blobs.has(older.ref)).toBe(false);
     expect(await journal2.blobs.has(newer.ref)).toBe(true);
+  });
+});
+
+describe("appendRefinementEvent after workspace removal (#7474)", () => {
+  test("a late row from a tool that outlived its turn does not recreate the removed session dir", async () => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "ws-removed";
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
+      // The journal call of agent_skill_write (agent_skill_write.ts).
+      const skillWrite = (content: string) =>
+        appendRefinementEventFromTool(
+          { workspaceSessionDir: sessionDir, workspaceId },
+          {
+            kind: "skill",
+            action: { op: "write", skillName: "demo", filePath: "SKILL.md" },
+            // restore-files stores the prior content as a blob: covers blob dirs too.
+            inverse: { op: "restore-files", files: [{ path: "/skills/demo/SKILL.md", content }] },
+            evidence: { toolName: "agent_skill_write", toolCallId: "skill" },
+          }
+        );
+      await historyService.appendToHistory(workspaceId, createMuxMessage("u1", "user", "go"));
+      // A live session still journals.
+      await skillWrite("live prior content");
+      const liveRows = await sharedDurableEventJournal(sessionDir).read();
+      expect(liveRows.filter((e) => e.kind === "refinement")).toHaveLength(1);
+
+      await removeSessionDirUnderMemoryLocks({
+        rootDir: config.rootDir,
+        sessionDir,
+        workspaceId,
+        attemptId: "removal",
+      });
+      // The slow skill write finishes after removal and journals its row.
+      await skillWrite("late prior content");
+
+      expect(
+        await fs.stat(sessionDir).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    } finally {
+      await cleanup();
+    }
   });
 });

@@ -516,6 +516,65 @@ describe("BackgroundProcessManager", () => {
       }
     });
 
+    it("gives two backends distinct directories when the runtime's mkdir exits 0 for an existing directory", async () => {
+      // uutils coreutils mkdir before 0.11.0 (Ubuntu 25.10, 26.04) can exit 0 for both of two
+      // concurrent creates of one directory (uutils/coreutils#13970, #7256). This fake mkdir
+      // always behaves that way: it waits until both claims reached it, then runs `mkdir -p`.
+      // So mkdir cannot pick the winner, and only the exclusive marker create can.
+      const realMkdir = Bun.which("mkdir");
+      if (realMkdir == null) throw new Error("the test needs a mkdir on PATH");
+      const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "bgpm-fake-mkdir-"));
+      const arrivals = path.join(fakeBin, "arrivals");
+      await fs.mkdir(arrivals);
+      await fs.writeFile(
+        path.join(fakeBin, "mkdir"),
+        [
+          "#!/bin/sh",
+          `case "$1" in -*) exec ${realMkdir} "$@" ;; esac`,
+          `: > ${arrivals}/$$`,
+          "i=0",
+          `while [ "$(ls ${arrivals} | wc -l)" -lt 2 ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i + 1)); done`,
+          `exec ${realMkdir} -p "$@"`,
+        ].join("\n"),
+        { mode: 0o755 }
+      );
+      const base = new LocalRuntime(process.cwd());
+      const remote = new Proxy({} as Runtime, {
+        get(_target, prop) {
+          if (prop === "exec") {
+            return (command: string, opts: never) =>
+              base.exec(
+                command.includes("__MUX_SPAWN_NAME_CLAIMED__")
+                  ? `PATH=${fakeBin}:$PATH\n${command}`
+                  : command,
+                opts
+              );
+          }
+          const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(base)
+            : value;
+        },
+      });
+      const other = new BackgroundProcessManager(bgOutputDir);
+      try {
+        const results = await Promise.all(
+          [manager, other].map((m) =>
+            m.spawn(remote, testWorkspaceId, "sleep 5", {
+              cwd: process.cwd(),
+              displayName: "uutils-race-job",
+            })
+          )
+        );
+        const dirs = results.map((r) => (r.success ? r.outputDir : r.error));
+        expect(results.every((r) => r.success)).toBe(true);
+        expect(new Set(dirs).size).toBe(2);
+      } finally {
+        await other.cleanup(testWorkspaceId);
+        await fs.rm(fakeBin, { recursive: true, force: true });
+      }
+    });
+
     it("removes the claimed record directory when a seal refuses a non-host spawn", async () => {
       // A cleanup, archive or removal that seals the workspace while the remote claim runs
       // refuses the spawn after its mkdir; the empty claimed directory must not stay behind.
@@ -1684,13 +1743,17 @@ describe("BackgroundProcessManager", () => {
       }
       expect(proc?.monitor?.pendingLines ?? []).toEqual(["ERR boom"]);
 
-      // Agent reads with a filter that excludes the error line: it sees only "DONE".
-      const filtered = await manager.getOutput(result.processId, "DONE", false, 1);
-      expect(filtered.success).toBe(true);
-      if (filtered.success) {
-        expect(filtered.output).toContain("DONE");
-        expect(filtered.output).not.toContain("ERR boom");
+      // Agent reads with a filter that excludes the error line: it sees only "DONE". printf writes
+      // the two lines separately (bash line-buffers stdout), and a filtered read that consumed only
+      // "ERR boom" returns an empty page, so read again until "DONE" arrives (#7256).
+      let filteredOutput = "";
+      while (!filteredOutput.includes("DONE")) {
+        const filtered = await manager.getOutput(result.processId, "DONE", false, 1);
+        expect(filtered.success).toBe(true);
+        if (!filtered.success) return;
+        filteredOutput += filtered.output;
       }
+      expect(filteredOutput).not.toContain("ERR boom");
       // The filtered read must not have advanced the shown mark.
       proc = await manager.getProcess(result.processId);
       expect(proc?.shownThroughOffset ?? -1).toBe(0);
@@ -1721,15 +1784,20 @@ describe("BackgroundProcessManager", () => {
         expect(result.success).toBe(true);
         if (!result.success) return;
 
-        // Filtered read consumes both complete lines (cursor advances to 14) but shows only "DONE".
-        // The read returns as soon as "DONE" arrives. Its budget only has to outlast a slow spawn:
+        // Filtered reads consume both complete lines (cursor advances to 14) but show only "DONE".
+        // A read returns as soon as "DONE" arrives. Its budget only has to outlast a slow spawn:
         // 2 s was too short on a loaded CI runner, and the read came back empty.
-        const filtered = await manager.getOutput(result.processId, "DONE", false, 20);
-        expect(filtered.success).toBe(true);
-        if (filtered.success) {
-          expect(filtered.output).toContain("DONE");
-          expect(filtered.output).not.toContain("ERR boom");
+        // bash line-buffers stdout, so printf writes the two lines separately. A filtered read
+        // that lands between the writes returns as soon as it consumed "ERR boom", with an empty
+        // page, so read again until "DONE" arrives (#7256).
+        let filteredOutput = "";
+        while (!filteredOutput.includes("DONE")) {
+          const filtered = await manager.getOutput(result.processId, "DONE", false, 20);
+          expect(filtered.success).toBe(true);
+          if (!filtered.success) return;
+          filteredOutput += filtered.output;
         }
+        expect(filteredOutput).not.toContain("ERR boom");
         let proc = await manager.getProcess(result.processId);
         expect(proc?.outputBytesRead ?? 0).toBeGreaterThanOrEqual(14);
         expect(proc?.shownThroughOffset ?? -1).toBe(0);
@@ -2993,12 +3061,15 @@ describe("BackgroundProcessManager", () => {
 
     it("should deliver SIGTERM to the bash process (TERM trap executes)", async () => {
       const sentinelPath = path.join(bgOutputDir, `term-sentinel-${Date.now()}`);
+      const readyPath = path.join(bgOutputDir, `term-ready-${Date.now()}`);
       const displayName = `test-term-trap-${Date.now()}`;
 
+      // The script marks the trap as installed: spawn() returns once the process starts, and a
+      // SIGTERM that lands before the `trap` line runs kills bash without the trap (#7256).
       const spawnResult = await manager.spawn(
         runtime,
         testWorkspaceId,
-        `trap "echo term > '${sentinelPath}'; exit 0" TERM; sleep 60`,
+        `trap "echo term > '${sentinelPath}'; exit 0" TERM; : > '${readyPath}'; sleep 60`,
         {
           cwd: process.cwd(),
           displayName,
@@ -3007,26 +3078,24 @@ describe("BackgroundProcessManager", () => {
 
       expect(spawnResult.success).toBe(true);
       if (!spawnResult.success) return;
+      while (!(await fs.stat(readyPath).catch(() => null))) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
 
       const terminateResult = await manager.terminate(spawnResult.processId, {
         monitorDisposition: "discard",
       });
       expect(terminateResult.success).toBe(true);
 
-      // Wait briefly for the trap to write the sentinel file.
+      // The trap writes the sentinel before bash exits. Wait for it without a deadline of our
+      // own: a trap that never runs fails on the test timeout.
       let sentinel: string | null = null;
-      for (let attempt = 0; attempt < 20; attempt++) {
-        try {
-          sentinel = await fs.readFile(sentinelPath, "utf-8");
-          break;
-        } catch {
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
+      while (sentinel === null) {
+        sentinel = await fs.readFile(sentinelPath, "utf-8").catch(() => null);
+        if (sentinel === null) await new Promise((resolve) => setTimeout(resolve, 25));
       }
-
-      expect(sentinel).not.toBeNull();
-      expect(sentinel!).toContain("term");
-    });
+      expect(sentinel).toContain("term");
+    }, 20_000);
   });
 
   describe("cleanup", () => {

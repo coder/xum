@@ -1,5 +1,5 @@
 import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
-import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
+import { ContextBudgetBlockedError } from "./contextBudgetError";
 import {
   createContextBudgetAnchor,
   estimateAnchoredRequestTokensForModel,
@@ -8,15 +8,7 @@ import {
 import { getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { type ContinuousPrefixSwap } from "./continuousCompactionJournal";
 import type { Scope } from "effect";
-import {
-  type streamText,
-  type stepCountIs,
-  type LanguageModel,
-  LoadAPIKeyError,
-  APICallError,
-  RetryError,
-  StreamProviderError,
-} from "ai";
+import { type streamText, type stepCountIs } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { Result } from "@/common/types/result";
 import assert from "@/common/utils/assert";
@@ -24,35 +16,22 @@ import { log, type Logger } from "./log";
 import type {
   StreamAbortEvent,
   StreamAbortReason,
-  ToolCallEndEvent,
   ToolCallExecutionStartEvent,
   CompletedMessagePart,
   WorkflowRunAttachedEvent,
 } from "@/common/types/stream";
 
-import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
+import type { SendMessageError } from "@/common/types/errors";
 import type { MuxMetadata, MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
 import { hasTokenUsage } from "@/common/types/message";
-import { stripReasoningReplay } from "@/node/utils/messages/reasoningProviderOptions";
-import {
-  laterAnthropicThinkingReplayPoint,
-  type AnthropicThinkingReplayPoint,
-} from "@/node/utils/messages/anthropicThinkingReplay";
 import { ThinkingLevelSchema, type ThinkingLevel } from "@/common/types/thinking";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import {
-  coerceStreamErrorTypeForMessage,
-  createErrorEvent,
-  stripNoisyErrorPrefix,
-  type StreamErrorPayload,
-} from "@/node/services/utils/sendMessageError";
 import { hasCommitWorthyParts, type HistoryService } from "./historyService";
 import {
   accumulateStepsProviderMetadata,
   normalizeUsage,
   withCacheWriteMetadata,
 } from "@/common/utils/tokens/usageHelpers";
-import { modelOnlyNotificationsField } from "@/common/utils/tools/internalToolResultFields";
 import { buildRequiredToolPatterns } from "@/common/utils/tools/toolPolicy";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 import {
@@ -67,9 +46,8 @@ import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { ToolCallDisplayRegistry, type ExecutionScope } from "./toolCallDisplayRegistry";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { SessionUsageService } from "./sessionUsageService";
-import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
-import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
+import { getErrorMessage } from "@/common/utils/errors";
 import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import { hostClockFor } from "./di/hostClockLive";
 import {
@@ -84,18 +62,11 @@ import {
   type StreamRequestConfig,
 } from "@/node/services/turnEngine/ProviderRequest";
 import {
-  extractErrorCode,
-  extractPreviousResponseIdFromError,
-  extractStatusCode,
-} from "@/node/services/turnEngine/providerWire";
-import {
-  isAnthropicMessagesModel,
   StepPreparation,
   transformStepMessages,
   type StepMessageTracker,
 } from "@/node/services/turnEngine/StepPreparation";
 import {
-  buildUsageDeltaEvent,
   metadataModelIdentity,
   TurnEventEmitter,
   TurnEvents,
@@ -139,467 +110,24 @@ import {
   type PendingStreamStartHandle,
   type StreamToken,
 } from "@/node/services/turnEngine/TurnRegistry";
-import {
-  AttemptLoop,
-  type PartLoopState,
-  type PreviousResponseIdRetryPlan,
-  type ReasoningReplayRetryPlan,
-  type ToolCallMap,
-} from "@/node/services/turnEngine/AttemptLoop";
+import { AttemptLoop } from "@/node/services/turnEngine/AttemptLoop";
 import { RefusalFallback } from "@/node/services/turnEngine/RefusalFallback";
+import { StreamRetries } from "@/node/services/turnEngine/StreamRetries";
 import {
-  EmptyStreamOutputError,
-  ModelRefusalError,
-  StreamTruncatedError,
-} from "@/node/services/turnEngine/streamErrors";
+  moveAnthropicThinkingReplayPoint,
+  nextPartTimestamp,
+  StepApply,
+  turnReplayOffAfterServerTool,
+} from "@/node/services/turnEngine/StepApply";
 import { TurnResources } from "@/node/services/turnEngine/TurnResources";
 import { TurnEngine, type TurnExecutionOptions } from "@/node/services/turnEngine/TurnEngine";
 export {
   createTurnCompletionController,
   type TurnExecutionOptions,
 } from "@/node/services/turnEngine/TurnEngine";
-import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
-import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
-import { getOpenAIResponsesBaseUrlHint } from "@/node/services/utils/openAIResponsesBaseUrlHint";
-import type { FoldIntent, FoldStep, FoldView } from "@/node/services/turnEngine/partFold";
 
 // Disable noisy AI SDK warning logging.
 globalThis.AI_SDK_LOG_WARNINGS = false;
-
-function recordTerminalFinish(
-  streamInfo: WorkspaceStreamInfo,
-  intent: Extract<FoldIntent, { _tag: "RecordTerminalFinish" }>
-): void {
-  streamInfo.receivedTerminalEvent = true;
-  if (intent.finishReason !== undefined) {
-    streamInfo.terminalFinishReason = intent.finishReason;
-  }
-  if (intent.rawFinishReason !== undefined) {
-    streamInfo.terminalRawFinishReason = intent.rawFinishReason;
-  }
-}
-
-function isStreamTruncatedMessage(message: string): boolean {
-  const lowerMessage = message.toLowerCase();
-  return (
-    lowerMessage.includes("stream closed before message_stop") ||
-    lowerMessage.includes("stream closed before terminal event") ||
-    lowerMessage.includes("stream closed unexpectedly before the response completed")
-  );
-}
-
-// Lowercased prefix that google-auth-library puts on every failure to read or parse
-// the GOOGLE_APPLICATION_CREDENTIALS file.
-const GOOGLE_ADC_ENV_FILE_ERROR_PREFIX =
-  "unable to read the credential file specified by the google_application_credentials environment variable";
-
-// OpenAI rejections of Cyber mode's access_programs.cyber value
-// (https://developers.openai.com/api/docs/guides/daybreak). OpenAI's own
-// message names the required program or approval level, so it is kept.
-const OPENAI_ACCESS_PROGRAM_ERROR_HINTS: Record<string, string> = {
-  invalid_access_program: "This model needs a different OpenAI Daybreak access program.",
-  // OpenAI also returns this for Daybreak models whose reduced refusals need
-  // approval the project lacks, so do not claim the model has no Daybreak.
-  unsupported_access_program:
-    "OpenAI did not accept Cyber mode for this model. Turn off Cyber in the thinking menu to use standard safeguards.",
-  access_program_not_enabled:
-    "The OpenAI API key's project does not have this Daybreak program enabled. Ask your OpenAI organization admin, or turn off Cyber in the thinking menu to use standard safeguards.",
-};
-
-function getOpenAIAccessProgramError(error: unknown): { code: string; message: string } | null {
-  const apiError =
-    RetryError.isInstance(error) && error.lastError != null ? error.lastError : error;
-  if (!APICallError.isInstance(apiError)) return null;
-  const data = apiError.data as { error?: { code?: unknown; message?: unknown } } | undefined;
-  const code = data?.error?.code;
-  if (typeof code !== "string" || !Object.hasOwn(OPENAI_ACCESS_PROGRAM_ERROR_HINTS, code)) {
-    return null;
-  }
-  const message = data?.error?.message;
-  return { code, message: typeof message === "string" ? message : apiError.message };
-}
-
-// OpenAI Responses rejecting replayed reasoning. Exact item type on purpose:
-// `rs_` is a reasoning item; message/tool items use other prefixes.
-const OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN = /Item with id 'rs_[A-Za-z0-9_-]+' not found/;
-// "The encrypted content [for item rs_…] <blob> could not be verified. Reason: …"
-const OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN =
-  /encrypted content\b[\s\S]*?\bcould not be verified/;
-// Anthropic rejecting a replayed thinking signature, e.g. Opus 5.5 binding the
-// block to a system prompt or tool list that has since changed (the memory
-// index lives there). Routes without the drop_block control
-// (Coder gateway, custom providers) otherwise fail every retry identically.
-const ANTHROPIC_THINKING_SIGNATURE_INVALID_PATTERN = /Invalid `signature` in `thinking` block/;
-
-/**
- * The provider's Retry-After in ms from a failed request's response headers, or null when it
- * sent none (or an unusable value). Parsed like the AI SDK's own retry loop
- * (`getRetryDelayInMs` in `ai`): `retry-after-ms` first, then `retry-after` as seconds or an
- * HTTP date. A RetryError (the SDK exhausted its retries) reports its last attempt's headers.
- */
-function getProviderRetryAfterMs(error: unknown): number | null {
-  const apiError = RetryError.isInstance(error) ? error.lastError : error;
-  if (!APICallError.isInstance(apiError)) return null;
-  // Header names are lowercase: the SDK collects them from a fetch Headers object.
-  const headers = apiError.responseHeaders;
-  if (!headers) return null;
-  const parse = (): number => {
-    const retryAfterMs = headers["retry-after-ms"];
-    if (retryAfterMs) {
-      const ms = Number.parseFloat(retryAfterMs);
-      if (!Number.isNaN(ms)) return ms;
-    }
-    const retryAfter = headers["retry-after"];
-    if (!retryAfter) return Number.NaN;
-    const seconds = Number.parseFloat(retryAfter);
-    // Wall clock: the header is an HTTP date (#7282).
-    return Number.isNaN(seconds) ? Date.parse(retryAfter) - nodeClock.nowMs() : seconds * 1000;
-  };
-  const ms = parse();
-  return Number.isFinite(ms) && ms >= 0 ? ms : null;
-}
-
-type StreamErrorClass = Pick<StreamErrorPayload, "error" | "contextBudgetExceeded"> & {
-  errorType: StreamErrorType;
-};
-
-/**
- * The attempt loop's own failures (streamErrors.ts): each class names its
- * stream error type, and its message is already user-facing.
- */
-export function getSelfClassifiedStreamError(error: unknown): StreamErrorClass | null {
-  if (error instanceof EmptyStreamOutputError) {
-    return { error: error.message, errorType: "empty_output" };
-  }
-  if (error instanceof ModelRefusalError) {
-    return { error: error.message, errorType: "model_refusal" };
-  }
-  if (error instanceof StreamTruncatedError) {
-    return { error: error.message, errorType: "stream_truncated" };
-  }
-  return null;
-}
-
-/** Context-budget refusals keep their own message; an exceeded budget also reports its details. */
-export function getContextBudgetStreamError(error: unknown): StreamErrorClass | null {
-  if (error instanceof ContextBudgetBlockedError) {
-    return { error: error.message, errorType: "context_budget_blocked" };
-  }
-  if (error instanceof ContextBudgetExceededError) {
-    return {
-      error: error.message,
-      errorType: "context_budget_blocked",
-      contextBudgetExceeded: error.details,
-    };
-  }
-  return null;
-}
-
-/**
- * Rewrites a provider error's message into user-facing text, and maps an
- * Anthropic overload to `server_error`. Runs after categorizeError.
- */
-export function describeProviderStreamError(input: {
-  errorMessage: string;
-  errorType: StreamErrorType;
-  actualError: unknown;
-  model: string;
-  routeProvider: string;
-}): { errorMessage: string; errorType: StreamErrorType } {
-  const { actualError, model } = input;
-  let { errorMessage, errorType } = input;
-
-  // Enhance previous-response and model-not-found error messages
-  if (extractPreviousResponseIdFromError(actualError)) {
-    errorMessage = "OpenAI lost the previous response state while streaming. Retry to continue.";
-  }
-  if (errorType === "model_not_found") {
-    // Extract model name from model string (e.g., "anthropic:sonnet-1m" -> "sonnet-1m")
-    const [, modelName] = model.split(":");
-    errorMessage = `Model '${modelName || model}' does not exist or is not available. Please check your model selection.`;
-  }
-  const accessProgramError = getOpenAIAccessProgramError(actualError);
-  if (accessProgramError != null) {
-    errorMessage = `${OPENAI_ACCESS_PROGRAM_ERROR_HINTS[accessProgramError.code]} OpenAI: ${accessProgramError.message}`;
-  }
-
-  // Normalize Anthropic overload errors (HTTP 529 / overloaded_error) into a stable,
-  // user-friendly message. Keep errorType = server_error so the frontend's auto-retry
-  // behavior remains unchanged.
-  const isAnthropic = normalizeToCanonical(model).startsWith("anthropic:");
-  if (isAnthropic && isAnthropicOverloadError(actualError)) {
-    errorMessage = "Anthropic is temporarily overloaded (HTTP 529). Please try again later.";
-    errorType = "server_error";
-  }
-
-  const openAIResponsesBaseUrlHint = getOpenAIResponsesBaseUrlHint({
-    providerId: input.routeProvider,
-    error: actualError,
-  });
-  // An access-program rejection proves the endpoint speaks Responses.
-  if (openAIResponsesBaseUrlHint && accessProgramError == null) {
-    errorMessage = `${errorMessage}\n\n${openAIResponsesBaseUrlHint}`;
-  }
-  return { errorMessage, errorType };
-}
-
-function hasStructuredErrorProperty(
-  data: unknown
-): data is { error: { code?: string; type?: string } } {
-  return (
-    typeof data === "object" &&
-    data !== null &&
-    "error" in data &&
-    typeof data.error === "object" &&
-    data.error !== null
-  );
-}
-
-function isAPICallModelNotFound(error: APICallError): boolean {
-  if (!hasStructuredErrorProperty(error.data)) return false;
-  // OpenAI: error.code === 'model_not_found'. The status has flipped between 400 and
-  // 404 over time, so key on the code rather than the status.
-  if (error.data.error.code === "model_not_found") return true;
-  // Anthropic: 404 with error.type === 'not_found_error'
-  return error.statusCode === 404 && error.data.error.type === "not_found_error";
-}
-
-/** Context exceeded errors (Anthropic + OpenAI-compatible / Copilot). */
-function isAPICallContextExceeded(error: APICallError): boolean {
-  const msgLower = error.message.toLowerCase();
-  // Anthropic: "prompt is too long" / "input is too long"
-  // Copilot / OpenAI-compatible: "prompt token count of X exceeds the limit of Y"
-  return (
-    msgLower.includes("prompt is too long") ||
-    msgLower.includes("input is too long") ||
-    (msgLower.includes("token") && msgLower.includes("exceeds") && msgLower.includes("limit"))
-  );
-}
-
-export function categorizeAPICallError(error: APICallError): StreamErrorType {
-  if (error.statusCode === 401) return "authentication";
-  // Daybreak access-program rejections are deterministic: a retry resends
-  // the same program. Like a bad key, the user must change provider config
-  // or turn Cyber off, so reuse the non-retryable authentication class.
-  if (getOpenAIAccessProgramError(error) != null) return "authentication";
-  // 402 (Payment Required) signals a billing problem on the provider account.
-  // Treat as non-retryable quota. Some providers also encode quota failures as
-  // 429, so classify 429 by payload intent instead of status code alone.
-  if (error.statusCode === 402) return "quota";
-  if (error.statusCode === 429) {
-    return classify429Capacity({
-      message: error.message,
-      data: error.data,
-      responseBody: error.responseBody,
-    });
-  }
-  if (error.statusCode && error.statusCode >= 500) return "server_error";
-  // Check for model_not_found errors (OpenAI and Anthropic)
-  if (isAPICallModelNotFound(error)) return "model_not_found";
-  if (isAPICallContextExceeded(error)) return "context_exceeded";
-  return "api";
-}
-
-function categorizeRetryError(error: RetryError): StreamErrorType {
-  // The AI SDK wraps the underlying error(s) in RetryError when it exhausts its internal retries.
-  // If the underlying error is deterministically non-retryable (e.g. model_not_found), we should
-  // surface that classification so the frontend auto-retry loop stops.
-  //
-  // Keep returning retry_failed for generic/transient failures so the UI still communicates that
-  // the SDK already retried and gave up.
-  const underlyingType = error.lastError ? categorizeError(error.lastError) : "unknown";
-  if (
-    underlyingType !== "unknown" &&
-    underlyingType !== "api" &&
-    underlyingType !== "retry_failed"
-  ) {
-    return underlyingType;
-  }
-  return "retry_failed";
-}
-
-/**
- * OpenAI/Anthropic structured error format (from error.cause), or null when
- * the error has none of the known codes.
- * Structure: { error: { code: 'context_length_exceeded', type: '...', message: '...' } }
- */
-export function categorizeStructuredError(error: unknown): StreamErrorType | null {
-  if (!hasStructuredErrorProperty(error)) return null;
-  const structuredError = error.error;
-  // Model not found
-  if (structuredError.code === "model_not_found" || structuredError.type === "not_found_error") {
-    return "model_not_found";
-  }
-  // OpenAI context length errors have code: 'context_length_exceeded'
-  if (structuredError.code === "context_length_exceeded") return "context_exceeded";
-  // Check for other specific error codes/types
-  if (structuredError.code === "rate_limit_exceeded") return "rate_limit";
-  return null;
-}
-
-function isNetworkErrorMessage(message: string): boolean {
-  return (
-    message.includes("network") ||
-    message.includes("fetch") ||
-    // node-fetch's text for a failed connection, which google-auth-library's HTTP client
-    // (gaxios) keeps. Its URL can be Google's OAuth token endpoint, and the "token" rule
-    // below would read that as a context window error.
-    (message.startsWith("request to ") && message.includes(" failed, reason: "))
-  );
-}
-
-function isModelNotFoundMessage(message: string): boolean {
-  return (
-    message.includes("model") &&
-    (message.includes("does not exist") ||
-      message.includes("doesn't exist") ||
-      message.includes("not found") ||
-      message.includes("do not have access") ||
-      message.includes("don't have access") ||
-      message.includes("no access"))
-  );
-}
-
-function isContextExceededMessage(message: string): boolean {
-  return (
-    message.includes("token") ||
-    message.includes("context") ||
-    message.includes("too long") ||
-    message.includes("maximum")
-  );
-}
-
-function isQuotaMessage(message: string): boolean {
-  return (
-    message.includes("quota") ||
-    message.includes("limit") ||
-    message.includes("insufficient balance") ||
-    message.includes("add credits") ||
-    message.includes("payment required")
-  );
-}
-
-/** Fall back to string matching for other errors. Rule order matters: the first match wins. */
-export function categorizeErrorMessage(error: Error): StreamErrorType {
-  const message = error.message.toLowerCase();
-  if (isStreamTruncatedMessage(message)) return "stream_truncated";
-  // google-auth-library could not turn the GOOGLE_APPLICATION_CREDENTIALS file into
-  // a credential (Google Vertex AI). It reads the file locally, so a retry fails the
-  // same way, and the keyword rules below misread its text ("refresh_token").
-  if (message.startsWith(GOOGLE_ADC_ENV_FILE_ERROR_PREFIX)) return "authentication";
-  if (error.name === "AbortError" || message.includes("abort")) return "aborted";
-  if (isNetworkErrorMessage(message)) return "network";
-  if (isModelNotFoundMessage(message)) return "model_not_found";
-  if (isContextExceededMessage(message)) return "context_exceeded";
-  if (isQuotaMessage(message)) return "quota";
-  if (message.includes("auth") || message.includes("key")) return "authentication";
-  return "api";
-}
-
-/**
- * Categorizes errors for better error handling (used for event emission)
- */
-export function categorizeError(error: unknown): StreamErrorType {
-  if (error instanceof ContextBudgetExceededError || error instanceof ContextBudgetBlockedError)
-    return "context_budget_blocked";
-  if (error instanceof StreamTruncatedError) {
-    return "stream_truncated";
-  }
-  // Use AI SDK error type guards first
-  if (LoadAPIKeyError.isInstance(error)) return "authentication";
-  if (APICallError.isInstance(error)) return categorizeAPICallError(error);
-  if (RetryError.isInstance(error)) return categorizeRetryError(error);
-  const structuredType = categorizeStructuredError(error);
-  if (structuredType != null) return structuredType;
-  if (error instanceof Error) return categorizeErrorMessage(error);
-  return "unknown";
-}
-
-// Use the resolved SDK model, not the requested prefix: OpenAI Responses can
-// arrive through direct, custom, or Coder routes. xAI Responses and OpenRouter
-// chat-completions models must not enter this recovery path.
-function isOpenAIResponsesModel(model: LanguageModel): boolean {
-  if (typeof model === "string") return false;
-  return model.provider === "openai.responses";
-}
-
-const MAX_ORPHAN_TOOL_RESULT_WARNINGS_PER_STREAM = 3;
-const ORPHAN_TOOL_RESULT_PREVIEW_CHARS = 160;
-const ORPHAN_TOOL_RESULT_MAX_KEYS = 8;
-
-function summarizeToolResultForLog(output: unknown): Record<string, unknown> {
-  if (output === null) {
-    return { outputType: "null" };
-  }
-
-  if (typeof output === "string") {
-    return {
-      outputType: "string",
-      outputLength: output.length,
-      outputPreview: output.slice(0, ORPHAN_TOOL_RESULT_PREVIEW_CHARS),
-    };
-  }
-
-  if (typeof output === "number" || typeof output === "boolean") {
-    return {
-      outputType: typeof output,
-      outputPreview: String(output),
-    };
-  }
-
-  if (Array.isArray(output)) {
-    return {
-      outputType: "array",
-      outputLength: output.length,
-      firstItemType:
-        output.length > 0 && output[0] !== null
-          ? typeof output[0]
-          : output.length > 0
-            ? "null"
-            : undefined,
-    };
-  }
-
-  if (typeof output === "object") {
-    const outputRecord = output as Record<string, unknown>;
-    const keys = Object.keys(outputRecord);
-    const summary: Record<string, unknown> = {
-      outputType: "object",
-      outputKeyCount: keys.length,
-      outputKeys: keys.slice(0, ORPHAN_TOOL_RESULT_MAX_KEYS),
-    };
-
-    if (typeof outputRecord.type === "string") {
-      summary.outputFormat = outputRecord.type;
-    }
-
-    if (Array.isArray(outputRecord.value)) {
-      summary.outputValueLength = outputRecord.value.length;
-    }
-
-    return summary;
-  }
-
-  return {
-    outputType: typeof output,
-    outputPreview: JSON.stringify(output),
-  };
-}
-
-// Ensure per-stream part timestamps are strictly monotonic.
-//
-// Date.now() is millisecond-granularity, so two distinct chunks with identical text emitted in the
-// same millisecond can otherwise collide on (timestamp, delta) during reconnect replay buffering.
-//
-// Part timestamps are record times (stored in history, shown and replayed), so they read the
-// wall clock until #7282 moves their consumers to HostClock.
-function nextPartTimestamp(streamInfo: WorkspaceStreamInfo): number {
-  const now = nodeClock.nowMs();
-  const last = streamInfo.lastPartTimestamp;
-  const timestamp = now <= last ? last + 1 : now;
-  streamInfo.lastPartTimestamp = timestamp;
-  return timestamp;
-}
 
 /**
  * Optional collaborators for StreamManager. Production omits both; tests
@@ -611,60 +139,6 @@ export interface StreamManagerOptions {
   tokenTracker?: StreamManagerTokenTracker;
   /** StreamManagerLive passes the HostClock service. Default: the clock of `runner`. */
   hostClock?: HostClock;
-}
-
-/** `{ error: { type } }`, the error body shape of Anthropic's API. */
-function hasErrorType(data: unknown): data is { error: { type?: string } } {
-  return (
-    typeof data === "object" &&
-    data !== null &&
-    "error" in data &&
-    typeof data.error === "object" &&
-    data.error !== null
-  );
-}
-
-/**
- * The error type of an Anthropic error body embedded in a generic stream error's text. A proxy
- * in front of Anthropic can wrap the provider's error event in a generic one (`type: "error"`),
- * as in `unknown stream error: received error while streaming: {"type":"error","error":{...}}`.
- * Only that wrapper counts: a typed error (an invalid_request_error) can echo request text,
- * such as a tool description, that holds an overload body.
- */
-function wrappedAnthropicErrorType(error: StreamProviderError): string | undefined {
-  if (error.type !== "error") return undefined;
-  const message = error.message;
-  const start = message.indexOf("{");
-  if (start < 0) return undefined;
-  try {
-    const body: unknown = JSON.parse(message.slice(start));
-    return hasErrorType(body) ? body.error.type : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function isOverloadedApiCallError(error: APICallError): boolean {
-  return (
-    error.statusCode === 529 ||
-    (hasErrorType(error.data) && error.data.error.type === "overloaded_error")
-  );
-}
-
-/** An Anthropic overload (HTTP 529 / overloaded_error), before the request or mid-stream. */
-function isAnthropicOverloadError(error: unknown): boolean {
-  if (APICallError.isInstance(error)) return isOverloadedApiCallError(error);
-  if (RetryError.isInstance(error)) {
-    return APICallError.isInstance(error.lastError) && isOverloadedApiCallError(error.lastError);
-  }
-  if (StreamProviderError.isInstance(error)) {
-    return (
-      error.statusCode === 529 ||
-      error.type === "overloaded_error" ||
-      wrappedAnthropicErrorType(error) === "overloaded_error"
-    );
-  }
-  return false;
 }
 
 /** The request fields the stop conditions read, and the stop cause they record. */
@@ -835,6 +309,8 @@ export class StreamManager {
   private readonly turnEngine: TurnEngine;
   private readonly refusalFallback: RefusalFallback;
   private readonly attemptLoop: AttemptLoop;
+  private readonly streamRetries: StreamRetries;
+  private readonly stepApply: StepApply;
   // Read by TurnResources at call time; coreServicesRoot.test.ts reads this field.
   private mcpServerManager?: MCPServerManager;
   private mockStreamLifecycle?: MockStreamLifecycle;
@@ -940,9 +416,22 @@ export class StreamManager {
         this.createStreamResult(request, abortController, stepTracker),
       processStreamWithCleanup: (workspaceId, streamInfo, historySequence) =>
         this.processStreamWithCleanup(workspaceId, streamInfo, historySequence),
-      convertToSendMessageError: (error) => this.convertToSendMessageError(error),
     });
     this.tokenTracker = options.tokenTracker ?? new StreamingTokenTracker();
+    this.streamRetries = new StreamRetries({
+      partialJournal: this.partialJournal,
+      usageLedger: this.usageLedger,
+      providerRequest: this.providerRequest,
+      // Forward at call time: these methods stay in StreamManager, and whitebox
+      // tests replace createStreamResult on it.
+      getWorkspaceLogger: (workspaceId, streamInfo) =>
+        this.getWorkspaceLogger(workspaceId, streamInfo),
+      createStreamResult: (request, abortController, stepTracker) =>
+        this.createStreamResult(request, abortController, stepTracker),
+      moveAnthropicThinkingReplayPoint,
+      flushPartialWrite: (workspaceId, streamInfo) =>
+        this.flushPartialWrite(workspaceId, streamInfo),
+    });
     this.refusalFallback = new RefusalFallback({
       usageLedger: this.usageLedger,
       providerRequest: this.providerRequest,
@@ -963,8 +452,7 @@ export class StreamManager {
         this.createStreamResult(request, abortController, stepTracker),
       resetStreamStateForRetry: (workspaceId, streamInfo, options) =>
         this.resetStreamStateForRetry(workspaceId, streamInfo, options),
-      moveAnthropicThinkingReplayPoint: (streamInfo, point) =>
-        this.moveAnthropicThinkingReplayPoint(streamInfo, point),
+      moveAnthropicThinkingReplayPoint,
       getStreamMetadata: (streamInfo) => this.getStreamMetadata(streamInfo),
       backfillReasoningTokensFromParts: (streamInfo, usage) =>
         this.backfillReasoningTokensFromParts(streamInfo, usage),
@@ -994,31 +482,17 @@ export class StreamManager {
       resolveTtftMsForStreamEnd: (streamInfo) => this.resolveTtftMsForStreamEnd(streamInfo),
       resolveProviderMetadataForStreamEnd: (streamInfo) =>
         this.resolveProviderMetadataForStreamEnd(streamInfo),
-      getOpenAIPreviousResponseId: (providerOptions) =>
-        this.getOpenAIPreviousResponseId(providerOptions),
-      resetStreamStateForRetry: (workspaceId, streamInfo, options) =>
-        this.resetStreamStateForRetry(workspaceId, streamInfo, options),
+      streamRetries: this.streamRetries,
       createStreamResult: (request, abortController, stepTracker) =>
         this.createStreamResult(request, abortController, stepTracker),
       emitStreamStart: (workspaceId, streamInfo, historySequence) =>
         this.emitStreamStart(workspaceId, streamInfo, historySequence),
-      flushPartialWrite: (workspaceId, streamInfo) =>
-        this.flushPartialWrite(workspaceId, streamInfo),
-      foldView: (workspaceId, streamInfo, loop) => this.foldView(workspaceId, streamInfo, loop),
+      flushPartialWrite: (workspaceId, streamInfo, terminalPartial) =>
+        this.flushPartialWrite(workspaceId, streamInfo, terminalPartial),
       applyStep: (workspaceId, streamInfo, step, loop) =>
-        this.applyStep(workspaceId, streamInfo, step, loop),
-      planPreviousResponseIdRetry: (streamInfo, error) =>
-        this.planPreviousResponseIdRetry(streamInfo, error),
-      planReasoningReplayRetry: (streamInfo, error) =>
-        this.planReasoningReplayRetry(streamInfo, error),
-      retryStreamWithoutPreviousResponseId: (workspaceId, streamInfo, error, plan) =>
-        this.retryStreamWithoutPreviousResponseId(workspaceId, streamInfo, error, plan),
-      retryStreamWithoutReasoningReplay: (workspaceId, streamInfo, error, plan) =>
-        this.retryStreamWithoutReasoningReplay(workspaceId, streamInfo, error, plan),
-      buildStreamErrorPayload: (streamInfo, error) =>
-        this.buildStreamErrorPayload(streamInfo, error),
-      persistStreamError: (workspaceId, streamInfo, payload) =>
-        this.persistStreamError(workspaceId, streamInfo, payload),
+        this.stepApply.applyStep(workspaceId, streamInfo, step, loop),
+      buildPartialAssistantMessage: (streamInfo, options) =>
+        this.buildPartialAssistantMessage(streamInfo, options),
       discardUnsettledSessionUsage: (workspaceId, streamInfo) =>
         this.discardUnsettledSessionUsage(workspaceId, streamInfo),
     });
@@ -1041,7 +515,21 @@ export class StreamManager {
       getStream: (id) => this.workspaceStreams.get(id),
       flushPartialWrite: (id, info) => this.flushPartialWrite(id, info),
       schedulePartialWrite: (id, info) => this.schedulePartialWrite(id, info),
-      turnReplayOffAfterServerTool: (info) => this.turnReplayOffAfterServerTool(info),
+      turnReplayOffAfterServerTool,
+    });
+    this.stepApply = new StepApply({
+      turnEvents: this.turnEvents,
+      turnRegistry: this.turnRegistry,
+      usageLedger: this.usageLedger,
+      turnEventEmitter: this.turnEventEmitter,
+      toolCallDisplayRegistry: this.toolCallDisplayRegistry,
+      // Forward at call time: whitebox tests replace tokenTracker after construction
+      // (Reflect.set).
+      tokenTracker: { countTokens: (text) => this.tokenTracker.countTokens(text) },
+      schedulePartialWrite: (workspaceId, streamInfo) =>
+        this.schedulePartialWrite(workspaceId, streamInfo),
+      flushPartialWrite: (workspaceId, streamInfo) =>
+        this.flushPartialWrite(workspaceId, streamInfo),
     });
   }
 
@@ -1223,45 +711,6 @@ export class StreamManager {
    * Usage is only available after stream completes naturally.
    * On abort, the usage promise may hang - we use a timeout to return quickly.
    */
-  private async emitToolCallDeltaIfPresent(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    part: unknown
-  ): Promise<boolean> {
-    const maybeDelta = part as { type?: string } | undefined;
-    if (maybeDelta?.type !== "tool-call-delta") {
-      return false;
-    }
-
-    const toolDelta = part as {
-      toolCallId: string;
-      toolName: string;
-      argsTextDelta: string;
-    };
-
-    const deltaText = String(toolDelta.argsTextDelta ?? "");
-    if (deltaText.length === 0) {
-      return true;
-    }
-
-    const tokens = await this.tokenTracker.countTokens(deltaText);
-    // Record time: wall clock until #7282 moves its consumers to HostClock.
-    const timestamp = nodeClock.nowMs();
-
-    this.turnEvents.emitTurnEvent({
-      type: "tool-call-delta",
-      workspaceId: workspaceId as string,
-      messageId: streamInfo.messageId,
-      toolCallId: toolDelta.toolCallId,
-      toolName: toolDelta.toolName,
-      delta: toolDelta.argsTextDelta,
-      tokens,
-      timestamp,
-    });
-
-    return true;
-  }
-
   private async getStreamMetadata(
     streamInfo: WorkspaceStreamInfo,
     timeoutMs = 1000
@@ -1458,345 +907,6 @@ export class StreamManager {
    * This ensures the old stream fully exits before a new stream can start,
    * preventing concurrent streams and race conditions.
    */
-  /** Read-only snapshot of the stream state that partFold reads. */
-  private foldView(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    loop: PartLoopState
-  ): FoldView {
-    return {
-      workspaceId: workspaceId as string,
-      messageId: streamInfo.messageId,
-      parts: streamInfo.parts,
-      currentReasoningBlock: streamInfo.currentReasoningBlock,
-      lastPartTimestamp: streamInfo.lastPartTimestamp,
-      model: streamInfo.model,
-      anthropicMessagesWire: isAnthropicMessagesModel(streamInfo.request.model),
-      toolCalls: loop.toolCalls,
-    };
-  }
-
-  /**
-   * Runs partFold's intents in order with the existing helpers. Synchronous
-   * intents run without a yield between them, awaited helpers stay awaited, and
-   * schedulePartialWrite stays fire-and-forget, as when the fold was inline.
-   */
-  private async applyStep(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    step: FoldStep,
-    loop: PartLoopState
-  ): Promise<void> {
-    // Store before the first await: tool execution starts stamp parts while
-    // the intents below await, and part timestamps must stay monotonic.
-    streamInfo.lastPartTimestamp = step.lastPartTimestamp;
-    if (step.ignoredTextDelta) {
-      log.debug("[streamManager] Ignoring non-string text-delta payload", {
-        workspaceId,
-        model: streamInfo.model,
-        ...step.ignoredTextDelta,
-      });
-    }
-    for (const intent of step.intents) {
-      const pending = this.applyIntent(workspaceId, streamInfo, intent, loop);
-      if (pending !== undefined) {
-        await pending;
-      }
-    }
-  }
-
-  /** Returns the helper's promise for intents the stream loop must await (its value is unused). */
-  private applyIntent(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    intent: FoldIntent,
-    loop: PartLoopState
-  ): Promise<unknown> | undefined {
-    switch (intent._tag) {
-      case "StartStep":
-        this.recordStepStart(streamInfo);
-        streamInfo.streamStepOrdinals.push(streamInfo.stepStartIndices.length - 1);
-        return this.writeInTurnThinkingStripReceipt(workspaceId, streamInfo);
-      case "OpenReasoningBlock":
-        streamInfo.currentReasoningBlock = {};
-        return undefined;
-      case "Append":
-        return this.appendFoldedPart(workspaceId, streamInfo, intent);
-      case "UpdateReasoningPart":
-        this.updateReasoningPart(streamInfo, intent);
-        return undefined;
-      case "Emit":
-        this.turnEvents.emitTurnEvent(intent.event);
-        return undefined;
-      case "CheckSoftCancel":
-        return this.turnRegistry.checkSoftCancelStream(workspaceId, streamInfo);
-      default:
-        return this.applyToolIntent(workspaceId, streamInfo, intent, loop);
-    }
-  }
-
-  private applyToolIntent(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    intent: FoldIntent,
-    loop: PartLoopState
-  ): Promise<unknown> | undefined {
-    switch (intent._tag) {
-      case "RecordToolCall":
-        // Tool call started - store in map for later lookup
-        loop.toolCalls.set(intent.toolCallId, {
-          toolCallId: intent.toolCallId,
-          toolName: intent.toolName,
-          input: intent.input,
-        });
-        if (intent.anthropicServerTool) {
-          (streamInfo.anthropicServerToolCallIds ??= new Set()).add(intent.toolCallId);
-        }
-        return undefined;
-      case "SetToolCallOutput": {
-        const toolCall = loop.toolCalls.get(intent.toolCallId);
-        assert(toolCall != null, "partFold sets output only on a tracked tool call");
-        toolCall.output = intent.output;
-        return undefined;
-      }
-      case "FinishToolCall":
-        // Use shared completion logic (await to ensure partial is flushed before event)
-        return this.finishToolCall(
-          workspaceId,
-          streamInfo,
-          loop.toolCalls,
-          intent.toolCallId,
-          intent.toolName,
-          intent.output,
-          intent.providerExecuted,
-          intent.modelOnlyNotifications
-        );
-      case "EmitToolCallDelta":
-        return this.emitToolCallDeltaIfPresent(workspaceId, streamInfo, intent.part);
-      case "SchedulePartialWrite":
-        void this.schedulePartialWrite(workspaceId, streamInfo);
-        return undefined;
-      default:
-        return this.applyTurnIntent(workspaceId, streamInfo, intent, loop);
-    }
-  }
-
-  private applyTurnIntent(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    intent: FoldIntent,
-    loop: PartLoopState
-  ): Promise<unknown> | undefined {
-    switch (intent._tag) {
-      case "RecordTerminalFinish":
-        recordTerminalFinish(streamInfo, intent);
-        return undefined;
-      case "RecordStepUsage":
-        this.recordStepUsage(workspaceId, streamInfo, intent.usage, intent.providerMetadata);
-        return undefined;
-      case "RecordInFlightUsage":
-        return this.usageLedger.recordInFlight(workspaceId, streamInfo);
-      case "FlushPartialWrite":
-        return this.flushPartialWrite(workspaceId, streamInfo);
-      case "Fail":
-        // Capture the error and immediately throw to trigger error handling
-        throw intent.error;
-      default:
-        this.applyLogIntent(streamInfo, intent, loop);
-        return undefined;
-    }
-  }
-
-  private applyLogIntent(
-    streamInfo: WorkspaceStreamInfo,
-    intent: FoldIntent,
-    loop: PartLoopState
-  ): void {
-    switch (intent._tag) {
-      case "Log":
-        loop.workspaceLog[intent.level](intent.message, intent.fields);
-        return;
-      case "LogToolCall": {
-        const inputText = JSON.stringify(intent.input);
-        log.debug(
-          `[StreamManager] tool-call: toolName=${intent.toolName}, input length=${inputText.length}`
-        );
-        return;
-      }
-      case "LogOrphanToolResult":
-        loop.orphanToolResultCount += 1;
-        this.logOrphanToolResult(
-          loop.workspaceLog,
-          streamInfo,
-          { toolCallId: intent.toolCallId, toolName: intent.toolName },
-          intent.output,
-          loop.orphanToolResultCount,
-          loop.toolCalls.size
-        );
-        return;
-      case "LogToolError": {
-        const logLevel = streamInfo.abortController.signal.aborted ? log.debug : log.error;
-        logLevel(`Tool execution error for '${intent.toolName}'`, {
-          toolCallId: intent.toolCallId,
-          error: intent.error,
-        });
-        return;
-      }
-      default:
-        assert(false, `applyStep has no handler for ${intent._tag}`);
-    }
-  }
-
-  private async appendFoldedPart(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    intent: Extract<FoldIntent, { _tag: "Append" }>
-  ): Promise<void> {
-    await this.turnEventEmitter.appendPartAndEmit(
-      workspaceId,
-      streamInfo,
-      intent.part,
-      intent.skipPartialWrite !== true
-    );
-    // The same object appendPartAndEmit pushed: signature deltas compare by reference.
-    if (intent.trackInBlock && streamInfo.currentReasoningBlock) {
-      streamInfo.currentReasoningBlock.lastPart = intent.part;
-    }
-  }
-
-  /** Adds one finish-step's usage to the stream totals, then emits usage-delta. */
-  private recordStepUsage(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    stepUsage: LanguageModelV2Usage,
-    stepProviderMetadata: Record<string, unknown> | undefined
-  ): void {
-    // Update cumulative totals for this stream. The emit below runs with
-    // zero suspension after the mutation (emitTurnEvent invokes
-    // the sink synchronously), so downstream Effect queue bridges
-    // (SubscriptionEmit's offerUnsafe) observe usage-delta events
-    // in mutation order.
-    this.usageLedger.recordStep(streamInfo, stepUsage, stepProviderMetadata);
-
-    const usageEvent = buildUsageDeltaEvent({
-      workspaceId: workspaceId as string,
-      messageId: streamInfo.messageId,
-      // Step-level (for context window display)
-      usage: stepUsage,
-      providerMetadata: stepProviderMetadata,
-      // Cumulative (for live cost display)
-      cumulativeUsage: streamInfo.cumulativeUsage,
-      cumulativeProviderMetadata: streamInfo.cumulativeProviderMetadata,
-      // Preserve costs-included zero-cost behavior throughout the stream.
-      costsIncluded: streamInfo.initialMetadata?.costsIncluded,
-    });
-    streamInfo.currentStepStartIndex = streamInfo.parts.length;
-    this.turnEvents.emitTurnEvent(usageEvent);
-  }
-
-  private updateReasoningPart(
-    streamInfo: WorkspaceStreamInfo,
-    intent: Extract<FoldIntent, { _tag: "UpdateReasoningPart" }>
-  ): void {
-    const target = streamInfo.parts[intent.index];
-    // partFold read the index from this array in the same synchronous turn.
-    assert(target?.type === "reasoning", "partFold updates only reasoning parts");
-    if (intent.signature) {
-      target.signature = intent.signature;
-    }
-    target.providerOptions = intent.providerOptions;
-    if (intent.trackInBlock && streamInfo.currentReasoningBlock) {
-      streamInfo.currentReasoningBlock.lastPart = target;
-    }
-  }
-
-  /**
-   * #5887 containment: thinking that follows an Anthropic server tool in this row cannot
-   * replay as the API returned it (see anthropicServerToolCallIds). Write the receipt with
-   * the point at the row's end, so later requests in the context segment send no thinking
-   * up to and including this row (removing every thinking block is valid; a gap or a
-   * put-back block is not). Rows after it replay theirs. It wins over a step point and
-   * never moves back. It rides on the partial write that stores this reasoning part (every
-   * reasoning append schedules one).
-   */
-  private turnReplayOffAfterServerTool(streamInfo: WorkspaceStreamInfo): void {
-    const serverToolIds = streamInfo.anthropicServerToolCallIds;
-    if (
-      serverToolIds == null ||
-      streamInfo.initialMetadata?.anthropicThinkingReplayFromStep === "end"
-    ) {
-      return;
-    }
-    // Only Anthropic reasoning is bound to the native prefix: a refusal fallback to another
-    // provider keeps the parts (and the IDs) but its reasoning replays nothing Anthropic.
-    if (!isAnthropicMessagesModel(streamInfo.request.model)) return;
-    // Read the parts, not only the ID set: a retry that drops parts drops the server tool too.
-    const followsServerTool = streamInfo.parts.some(
-      (part) => part.type === "dynamic-tool" && serverToolIds.has(part.toolCallId)
-    );
-    if (!followsServerTool) {
-      // Every recorded server tool's part is gone. The tool-call case records an ID and
-      // stores its part before any later reasoning, so the IDs are stale: drop them, or
-      // every later reasoning delta would scan all parts again (perf).
-      streamInfo.anthropicServerToolCallIds = undefined;
-      return;
-    }
-    this.moveAnthropicThinkingReplayPoint(streamInfo, "end");
-  }
-
-  /**
-   * Preserved thinking: once the step whose request stripped earlier Anthropic thinking
-   * (stepTracker.anthropicThinkingStripStep) has started, write the receipt with that step as
-   * the point, or the next turn replays the removed blocks and gets a 400. Persisted with the
-   * next partial write; a crash before it only costs one repair (fail-safe).
-   */
-  private async writeInTurnThinkingStripReceipt(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo
-  ): Promise<void> {
-    const stripStep = streamInfo.stepTracker.anthropicThinkingStripStep;
-    // prepareStep may already have prepared a later step: wait until that step started.
-    if (stripStep == null || stripStep >= streamInfo.streamStepOrdinals.length) return;
-    streamInfo.stepTracker.anthropicThinkingStripStep = undefined;
-    if (
-      this.moveAnthropicThinkingReplayPoint(streamInfo, streamInfo.streamStepOrdinals[stripStep])
-    ) {
-      await this.schedulePartialWrite(workspaceId, streamInfo);
-    }
-  }
-
-  /**
-   * Write or move this row's thinking-replay receipt (MuxMetadata.anthropicThinkingReplay).
-   * A second strip in the same turn moves the point forward: it removed everything the
-   * earlier one did, and its later blocks are bound to the new prefix. initialMetadata feeds
-   * the partial, error partial and final row alike. Returns whether anything changed; the
-   * caller persists it.
-   */
-  private moveAnthropicThinkingReplayPoint(
-    streamInfo: WorkspaceStreamInfo,
-    point: AnthropicThinkingReplayPoint
-  ): boolean {
-    const current = streamInfo.initialMetadata;
-    const next = laterAnthropicThinkingReplayPoint(
-      current?.anthropicThinkingReplay === "off"
-        ? current.anthropicThinkingReplayFromStep
-        : undefined,
-      point
-    );
-    if (
-      current?.anthropicThinkingReplay === "off" &&
-      current.anthropicThinkingReplayFromStep === next
-    ) {
-      return false;
-    }
-    streamInfo.initialMetadata = {
-      ...current,
-      anthropicThinkingReplay: "off",
-      anthropicThinkingReplayFromStep: next,
-    };
-    return true;
-  }
-
   private async cleanupAbortedStream(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
@@ -2145,156 +1255,6 @@ export class StreamManager {
     return this.stepPreparation.createStreamResult(request, abortController, stepTracker);
   }
 
-  /**
-   * Complete a tool call by updating its part and emitting tool-call-end event.
-   * CRITICAL: Flushes partial to disk BEFORE emitting event to prevent race conditions
-   * where listeners (e.g., sendQueuedMessages) read stale partial data.
-   */
-  private async completeToolCall(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    toolCalls: ToolCallMap,
-    toolCallId: string,
-    toolName: string,
-    output: unknown,
-    providerExecuted?: boolean,
-    modelOnlyNotifications?: string[]
-  ): Promise<void> {
-    // Find and update the existing tool part
-    const existingPartIndex = streamInfo.parts.findIndex(
-      (p) => p.type === "dynamic-tool" && p.toolCallId === toolCallId
-    );
-    const pendingAttachment = this.turnEvents.takePendingWorkflowRunAttachment(
-      streamInfo,
-      toolCallId
-    );
-    const mcpServer = streamInfo.executionScope
-      ? this.toolCallDisplayRegistry.take(streamInfo.executionScope, toolCallId)
-      : undefined;
-
-    if (existingPartIndex !== -1) {
-      const existingPart = streamInfo.parts[existingPartIndex];
-      if (existingPart.type === "dynamic-tool") {
-        streamInfo.parts[existingPartIndex] = {
-          ...existingPart,
-          ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
-          ...(mcpServer ? { mcpServer } : {}),
-          state: "output-available" as const,
-          output,
-          // Set even when undefined: an earlier completion's notes must not outlive it (#6665).
-          modelOnlyNotifications,
-        };
-      }
-    } else {
-      // Fallback: if the matching tool-call part is missing, still persist output so the UI
-      // does not stay stuck in input-available. Input may be missing for provider-native tools.
-      const toolCall = toolCalls.get(toolCallId);
-      streamInfo.parts.push({
-        type: "dynamic-tool" as const,
-        toolCallId,
-        toolName,
-        state: "output-available" as const,
-        input: toolCall?.input ?? null,
-        output,
-        ...modelOnlyNotificationsField(modelOnlyNotifications),
-        ...(mcpServer ? { mcpServer } : {}),
-        timestamp: nextPartTimestamp(streamInfo),
-        ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
-      });
-    }
-
-    // CRITICAL: Flush partial to disk BEFORE emitting event
-    // This ensures listeners (like sendQueuedMessages) see the tool result when they
-    // read partial.json via commitPartial. Without this await, there's a race condition
-    // where the partial is read before the tool result is written, causing "amnesia".
-    await this.flushPartialWrite(workspaceId, streamInfo);
-    if (pendingAttachment != null) {
-      this.turnEvents.emitWorkflowRunAttachedFromAttachment({
-        workspaceId,
-        messageId: streamInfo.messageId,
-        toolCallId,
-        attachment: pendingAttachment,
-      });
-    }
-
-    // Emit tool-call-end event (listeners can now safely read partial)
-    const completionTimestamp = nextPartTimestamp(streamInfo);
-    streamInfo.toolCompletionTimestamps ??= new Map();
-    streamInfo.toolCompletionTimestamps.set(toolCallId, completionTimestamp);
-    this.turnEvents.emitTurnEvent({
-      type: "tool-call-end",
-      workspaceId: workspaceId as string,
-      messageId: streamInfo.messageId,
-      toolCallId,
-      toolName,
-      result: output,
-      ...(mcpServer ? { mcpServer } : {}),
-      ...(providerExecuted === true ? { providerExecuted: true } : {}),
-      timestamp: completionTimestamp,
-    } as ToolCallEndEvent);
-  }
-
-  private async finishToolCall(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    toolCalls: ToolCallMap,
-    toolCallId: string,
-    toolName: string,
-    output: unknown,
-    providerExecuted?: boolean,
-    modelOnlyNotifications?: string[]
-  ): Promise<void> {
-    await this.completeToolCall(
-      workspaceId,
-      streamInfo,
-      toolCalls,
-      toolCallId,
-      toolName,
-      output,
-      providerExecuted,
-      modelOnlyNotifications
-    );
-    await this.turnRegistry.checkSoftCancelStream(workspaceId, streamInfo);
-  }
-
-  private logOrphanToolResult(
-    workspaceLog: Logger,
-    streamInfo: WorkspaceStreamInfo,
-    part: { toolCallId: string; toolName: string },
-    output: unknown,
-    orphanCount: number,
-    trackedToolCallCount: number
-  ): void {
-    if (orphanCount > MAX_ORPHAN_TOOL_RESULT_WARNINGS_PER_STREAM) {
-      return;
-    }
-
-    workspaceLog.warn(
-      "[streamManager] Received tool-result without matching tool-call map entry; persisting fallback output",
-      {
-        messageId: streamInfo.messageId,
-        model: streamInfo.model,
-        toolCallId: part.toolCallId,
-        toolName: part.toolName,
-        orphanCount,
-        trackedToolCallCount,
-        isWebSearch: part.toolName === "web_search",
-        ...summarizeToolResultForLog(output),
-      }
-    );
-
-    if (orphanCount === MAX_ORPHAN_TOOL_RESULT_WARNINGS_PER_STREAM) {
-      workspaceLog.warn(
-        "[streamManager] Suppressing additional orphan tool-result warnings for this stream",
-        {
-          messageId: streamInfo.messageId,
-          model: streamInfo.model,
-          suppressedAfter: orphanCount,
-        }
-      );
-    }
-  }
-
   /** Emit a PTC code_execution nested tool event (TurnEventEmitter.emitNestedToolEvent). */
   emitNestedToolEvent(scope: ExecutionScope, event: NestedToolEvent): void {
     this.turnEventEmitter.emitNestedToolEvent(scope, event);
@@ -2346,529 +1306,13 @@ export class StreamManager {
     return this.attemptLoop.processStreamWithCleanup(workspaceId, streamInfo, historySequence);
   }
 
-  private buildStreamErrorPayload(
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown
-  ): StreamErrorPayload & { errorType: StreamErrorType } {
-    const messageId = streamInfo.messageId;
-    const acpPromptId = streamInfo.initialMetadata?.acpPromptId;
-    const selfClassified = getSelfClassifiedStreamError(error);
-    if (selfClassified != null) {
-      return { messageId, ...selfClassified, acpPromptId };
-    }
-
-    // For categorization, use the cause if available (preserves the original error structure)
-    const actualError: unknown = error instanceof Error && error.cause ? error.cause : error;
-
-    const contextBudget = getContextBudgetStreamError(actualError);
-    if (contextBudget != null) {
-      return { messageId, ...contextBudget, acpPromptId };
-    }
-
-    let errorType = categorizeError(actualError);
-
-    // A matching rejection that reaches failure handling is final: the one-shot
-    // repair (retryStreamWithoutReasoningReplay) already ran, or was
-    // unsafe/no-op. Its generic `api` class is auto-retryable, and every outer
-    // retry would resend the same rejected input, so classify it terminal.
-    // Only this exact shape is reclassified; a later 503/401/429 keeps its own.
-    if (this.getReasoningReplayRejection(error, streamInfo.request.model) != null) {
-      errorType = "reasoning_rejected";
-    }
-
-    const described = describeProviderStreamError({
-      // Extract error message (errors thrown from 'error' parts already have the correct message)
-      // Apply prefix stripping to remove noisy "undefined: " prefixes from provider errors
-      errorMessage: stripNoisyErrorPrefix(getErrorMessage(error)),
-      errorType,
-      actualError,
-      model: streamInfo.model,
-      // The route provider identifies whose config served the request. The
-      // canonical model would misattribute gateway routes: openrouter:openai/x
-      // canonicalizes to openai:x but never uses the openai base URL.
-      routeProvider: streamInfo.initialMetadata?.routeProvider ?? "",
-    });
-
-    errorType = coerceStreamErrorTypeForMessage(described.errorType, described.errorMessage);
-    // The AI SDK honors Retry-After only for its own short in-request retries; once they are
-    // exhausted, Xum's auto-retry must not come back sooner than the provider asked.
-    const retryAfterMs = errorType === "rate_limit" ? getProviderRetryAfterMs(actualError) : null;
-
-    return {
-      messageId,
-      error: described.errorMessage,
-      errorType,
-      acpPromptId,
-      ...(retryAfterMs != null ? { retryAfterMs } : {}),
-    };
-  }
-
-  /**
-   * Write error metadata to partial.json and emit the corresponding error event.
-   */
-  private async persistStreamError(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    payload: StreamErrorPayload & { errorType: StreamErrorType }
-  ): Promise<StreamErrorPayload & { errorType: StreamErrorType }> {
-    // Clamp at the single choke point every stream error payload passes
-    // through before persist/emit, including buildStreamErrorPayload's
-    // early-return branches (e.g. ModelRefusalError, whose fallbackNote can
-    // embed another error's message). Some SDK errors embed the entire
-    // serialized prompt in their message (AI_TypeValidationError via the
-    // cause walk); unbounded, that would be persisted to history metadata,
-    // shipped over IPC, and rendered in the chat.
-    payload = { ...payload, error: clampErrorMessage(payload.error), model: streamInfo.model };
-    const refusalFinishReason =
-      payload.errorType === "model_refusal"
-        ? ([streamInfo.terminalFinishReason, streamInfo.terminalRawFinishReason].find(
-            isRefusalFinishReason
-          ) ?? streamInfo.terminalFinishReason)
-        : undefined;
-    const terminalRefusalUsage = streamInfo.terminalRefusalUsage;
-    const terminalRefusalProviderMetadata = streamInfo.terminalRefusalProviderMetadata;
-
-    // Errored turns still billed every completed step. Capture the
-    // live-tracked cumulative usage for the sidecar below and mirror it into
-    // session-usage.json — the error path previously skipped both, ingesting
-    // failed turns as $0. Refusal errors are excluded entirely: the refusal
-    // paths already attributed the refusing attempt's tokens (terminal
-    // refusals via terminalRefusalUsage, fallback hops — including the FINAL
-    // hop on chain exhaustion — via recordRefusedAttemptUsage into
-    // toolModelUsages + the ledger), so re-recording the cumulative counters
-    // here would double-count the last refusing attempt.
-    let cumulativeErrorUsage: LanguageModelV2Usage | undefined;
-    let cumulativeErrorProviderMetadata: Record<string, unknown> | undefined;
-    if (payload.errorType !== "model_refusal" && hasTokenUsage(streamInfo.cumulativeUsage)) {
-      cumulativeErrorUsage = cloneUsage(streamInfo.cumulativeUsage);
-      await this.backfillReasoningTokensFromParts(streamInfo, cumulativeErrorUsage);
-      cumulativeErrorProviderMetadata = markProviderMetadataCostsIncluded(
-        streamInfo.cumulativeProviderMetadata
-          ? { ...streamInfo.cumulativeProviderMetadata }
-          : undefined,
-        streamInfo.initialMetadata?.costsIncluded
-      );
-      await this.usageLedger.settle(
-        workspaceId,
-        streamInfo,
-        cumulativeErrorUsage,
-        cumulativeErrorProviderMetadata,
-        "Failed to record session usage for errored stream",
-        "warn"
-      );
-    } else {
-      // Refusals recorded their own usage above: drop any in-flight copy.
-      await this.usageLedger.discardInFlight(workspaceId, streamInfo);
-    }
-    const errorUsage = terminalRefusalUsage ?? cumulativeErrorUsage;
-    const errorProviderMetadata =
-      terminalRefusalProviderMetadata ?? cumulativeErrorProviderMetadata;
-
-    const errorPartialMessage = this.buildPartialAssistantMessage(streamInfo, {
-      metadata: {
-        error: payload.error,
-        errorType: payload.errorType,
-        ...(refusalFinishReason !== undefined ? { finishReason: refusalFinishReason } : {}),
-        ...(errorProviderMetadata !== undefined ? { providerMetadata: errorProviderMetadata } : {}),
-        // INVARIANT: usage / toolModelUsages are deliberately NOT stamped on
-        // the error partial. Errored turns are sidecar-canonical: unlike
-        // aborts, nothing commits the partial at error time (AIService
-        // forwards "error" without commitPartial), so usage stamped here
-        // would strand in partial.json until an unrelated send — or die
-        // entirely when a retry overwrites the partial. The sidecar rows
-        // below are ingested immediately by the error listener, and the
-        // eventually committed row carries no usage, so exactly one source
-        // ever reaches the events table.
-      },
-    });
-
-    // Write error state to disk through the tracked partial write: it waits for any in-flight
-    // flush, cancels a scheduled one, and retires later flushes, so a concurrent cancel cannot
-    // land a pre-error snapshot after it (#5344). Awaited so the state is on disk before any
-    // resume.
-    await this.flushPartialWrite(workspaceId, streamInfo, errorPartialMessage);
-
-    try {
-      await this.usageLedger.recordDroppedPartialUsage(
-        workspaceId,
-        streamInfo,
-        errorUsage,
-        errorProviderMetadata,
-        "errored_stream",
-        // A model_refusal error's stream usage row is terminalRefusalUsage
-        // (only set for terminal no-fallback refusals); label it as a refusal
-        // so analytics can distinguish refusals from generic stream errors.
-        payload.errorType === "model_refusal" ? "refused_stream" : "errored_stream"
-      );
-    } catch (error) {
-      log.error("Failed to record errored-stream usage in headless sidecar", { error });
-    }
-
-    // Emit error event before completion settles so recovery bookkeeping is ready for waiters.
-    this.turnEvents.emitTurnEvent(createErrorEvent(workspaceId as string, payload));
-    return payload;
-  }
-
-  private getOpenAIPreviousResponseId(
-    providerOptions?: Record<string, unknown>
-  ): string | undefined {
-    if (!providerOptions || typeof providerOptions !== "object" || !("openai" in providerOptions)) {
-      return undefined;
-    }
-
-    const openaiOptions = providerOptions.openai;
-    if (!openaiOptions || typeof openaiOptions !== "object") {
-      return undefined;
-    }
-
-    const previousResponseId = (openaiOptions as Record<string, unknown>).previousResponseId;
-    return typeof previousResponseId === "string" ? previousResponseId : undefined;
-  }
-
-  private clearOpenAIPreviousResponseId(
-    providerOptions?: Record<string, unknown>
-  ): Record<string, unknown> | undefined {
-    if (!providerOptions || typeof providerOptions !== "object" || !("openai" in providerOptions)) {
-      return providerOptions;
-    }
-
-    const openaiOptions = providerOptions.openai;
-    if (!openaiOptions || typeof openaiOptions !== "object") {
-      return providerOptions;
-    }
-
-    if (!("previousResponseId" in openaiOptions)) {
-      return providerOptions;
-    }
-
-    const { previousResponseId: _prev, ...rest } = openaiOptions as Record<string, unknown>;
-    return {
-      ...providerOptions,
-      openai: rest,
-    };
-  }
-
-  private recordStepStart(streamInfo: WorkspaceStreamInfo): void {
-    const start = streamInfo.parts.length;
-    // Retries may discard parts. Drop stale/duplicate starts before reseeding.
-    streamInfo.stepStartIndices = streamInfo.stepStartIndices.filter((index) => index < start);
-    streamInfo.stepStartIndices.push(start);
-    streamInfo.currentStepStartIndex = start;
-  }
-
-  private async resetStreamStateForRetry(
+  /** StreamRetries.resetStreamStateForRetry; whitebox tests (engineInternals) call it here. */
+  private resetStreamStateForRetry(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
     options?: { preserveParts?: boolean; preserveUsage?: boolean; workspaceLog?: Logger }
   ): Promise<void> {
-    streamInfo.stepTracker.pendingPrefixSwap = undefined;
-    // The next streamText call numbers its steps from 0 again.
-    streamInfo.stepTracker.anthropicThinkingStripStep = undefined;
-    streamInfo.streamStepOrdinals = [];
-    const preserveParts = options?.preserveParts ?? false;
-    const preserveUsage = options?.preserveUsage ?? false;
-
-    await this.partialJournal.resetForRetry(streamInfo);
-
-    if (!preserveParts) {
-      streamInfo.parts = [];
-    }
-    if (!preserveParts) {
-      streamInfo.reasoningBackfillStartIndex = undefined;
-    }
-    // A retried attempt starts with no open reasoning block.
-    streamInfo.currentReasoningBlock = undefined;
-    this.recordStepStart(streamInfo);
-    streamInfo.receivedTerminalEvent = false;
-    streamInfo.terminalFinishReason = undefined;
-    streamInfo.terminalRawFinishReason = undefined;
-
-    if (!preserveUsage) {
-      await this.usageLedger.resetForRetry(workspaceId, streamInfo);
-    }
-
-    if (!preserveParts) {
-      try {
-        await this.partialJournal.deleteForRetry(workspaceId as string);
-      } catch (deleteError) {
-        const logger = options?.workspaceLog ?? this.getWorkspaceLogger(workspaceId, streamInfo);
-        logger.warn("Failed to clear partial state before retry", { error: deleteError });
-      }
-    }
-  }
-
-  /**
-   * Read-only eligibility check for recoveryPolicy: returns what a retry without
-   * an invalid previousResponseId needs, or null when the error is not that case
-   * or a retry here would duplicate output. Interrupts and the once-per-turn
-   * budget belong to the policy.
-   */
-  private planPreviousResponseIdRetry(
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown
-  ): PreviousResponseIdRetryPlan | null {
-    const hasParts = streamInfo.parts.length > 0;
-    const currentStepStartIndex = streamInfo.currentStepStartIndex;
-    // If the current step already emitted parts, retrying would duplicate output/tool calls.
-    if (hasParts && currentStepStartIndex !== streamInfo.parts.length) {
-      return null;
-    }
-
-    const lost = this.matchLostPreviousResponseId(
-      error,
-      this.getOpenAIPreviousResponseId(streamInfo.request.providerOptions)
-    );
-    if (lost == null) {
-      return null;
-    }
-
-    const stepMessages = streamInfo.stepTracker.latestMessages;
-    if (hasParts && !stepMessages) {
-      return null;
-    }
-
-    const providerOptions = this.clearOpenAIPreviousResponseId(streamInfo.request.providerOptions);
-    if (providerOptions === streamInfo.request.providerOptions) {
-      return null;
-    }
-
-    return { hasParts, stepMessages, providerOptions, ...lost };
-  }
-
-  /**
-   * Pure error check: the error says the request's previousResponseId is gone.
-   * Returns the lost ID with the error's code and status for logging, or null.
-   */
-  private matchLostPreviousResponseId(
-    error: unknown,
-    previousResponseId: string | undefined
-  ): Pick<PreviousResponseIdRetryPlan, "previousResponseId" | "errorCode" | "statusCode"> | null {
-    const responseId = extractPreviousResponseIdFromError(error);
-    if (!responseId || responseId !== previousResponseId) {
-      return null;
-    }
-
-    const errorCode = extractErrorCode(error);
-    const statusCode = extractStatusCode(error);
-    // Retry if: we have the specific error code, OR a likely status code,
-    // OR we successfully extracted a response ID from the error message
-    // (the message match is strong evidence this is a "not found" error regardless of status code)
-    const shouldRetry =
-      errorCode === "previous_response_not_found" ||
-      statusCode === 404 ||
-      statusCode === 500 ||
-      statusCode === 400;
-    return shouldRetry ? { previousResponseId: responseId, errorCode, statusCode } : null;
-  }
-
-  /** Executes recoveryPolicy's dropPreviousResponseId retry with a plan from the check above. */
-  private async retryStreamWithoutPreviousResponseId(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown,
-    plan: PreviousResponseIdRetryPlan
-  ): Promise<void> {
-    const { hasParts, previousResponseId, stepMessages, providerOptions, errorCode, statusCode } =
-      plan;
-    const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-    this.providerRequest.recordLostResponseIdIfApplicable(
-      workspaceId,
-      error,
-      streamInfo,
-      workspaceLog
-    );
-
-    // Step-boundary retries restart the SDK stream, so totalUsage only reflects
-    // the retried step. Track this to prefer cumulativeUsage at stream end.
-    if (hasParts) {
-      streamInfo.didRetryPreviousResponseIdAtStep = true;
-    }
-
-    workspaceLog.info("Retrying stream without invalid previousResponseId", {
-      messageId: streamInfo.messageId,
-      model: streamInfo.model,
-      retryScope: hasParts ? "step" : "stream",
-      previousResponseId,
-      errorCode,
-      statusCode,
-    });
-
-    await this.resetStreamStateForRetry(workspaceId, streamInfo, {
-      preserveParts: hasParts,
-      preserveUsage: hasParts,
-      workspaceLog,
-    });
-
-    streamInfo.request = {
-      ...streamInfo.request,
-      ...(stepMessages ? { messages: stepMessages } : {}),
-      providerOptions,
-    };
-    streamInfo.streamResult = this.createStreamResult(
-      streamInfo.request,
-      streamInfo.abortController,
-      streamInfo.stepTracker
-    );
-  }
-
-  // These deterministic rejections survive encrypted-only replay: cross-org
-  // blobs and same-turn reasoning references from a flapping route. Keep the
-  // match narrow so unrelated provider errors retain their normal retry policy.
-  // Returns the providerOptions namespace whose replayed reasoning was rejected.
-  private getReasoningReplayRejection(
-    error: unknown,
-    model: LanguageModel
-  ): "openai" | "anthropic" | null {
-    // The SDK can exhaust its own retries on a synthetic stream-error 500.
-    // Classify only the final cause; earlier failures must not taint a later one.
-    if (RetryError.isInstance(error)) {
-      error = error.lastError;
-    }
-    const statusCode = extractStatusCode(error);
-    // Gateways can drop the structured code and forward only the message.
-    const texts = [
-      APICallError.isInstance(error) ? error.responseBody : undefined,
-      error instanceof Error ? error.message : undefined,
-    ];
-    const mentions = (pattern: RegExp) =>
-      texts.some((text) => typeof text === "string" && pattern.test(text));
-    if (isAnthropicMessagesModel(model)) {
-      return statusCode === 400 && mentions(ANTHROPIC_THINKING_SIGNATURE_INVALID_PATTERN)
-        ? "anthropic"
-        : null;
-    }
-    // WebSocket/SSE validation errors have no HTTP failure status. The SDK
-    // assigns 500 to code-less frames, including missing reasoning references.
-    const isStreamError =
-      StreamProviderError.isInstance(error) ||
-      (APICallError.isInstance(error) &&
-        error.responseHeaders?.["content-type"]?.startsWith("text/event-stream") &&
-        typeof error.data === "object" &&
-        error.data !== null &&
-        "type" in error.data &&
-        (error.data.type === "error" || error.data.type === "response.failed"));
-    if (statusCode !== 400 && statusCode !== 404 && !(statusCode === 500 && isStreamError)) {
-      return null;
-    }
-    if (!isOpenAIResponsesModel(model)) {
-      return null;
-    }
-    return extractErrorCode(error) === "invalid_encrypted_content" ||
-      mentions(OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN) ||
-      mentions(OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN)
-      ? "openai"
-      : null;
-  }
-
-  // Mirror previousResponseId recovery without repeating emitted output or
-  // completed tools. The repair budget belongs to this attempt, so a manual
-  // continuation may try again after the user changes route or credentials.
-  /**
-   * Read-only eligibility check for recoveryPolicy: returns the stripped request
-   * for a retry without rejected reasoning replay, or null when the error is not
-   * that case or a retry here would duplicate output or change nothing.
-   * Interrupts and the once-per-turn budget belong to the policy.
-   */
-  private planReasoningReplayRetry(
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown
-  ): ReasoningReplayRetryPlan | null {
-    const hasParts = streamInfo.parts.length > 0;
-    // If the current step already emitted parts, retrying would duplicate output/tool calls.
-    if (hasParts && streamInfo.currentStepStartIndex !== streamInfo.parts.length) {
-      return null;
-    }
-
-    const rejectedNamespace = this.getReasoningReplayRejection(error, streamInfo.request.model);
-    if (rejectedNamespace == null) {
-      return null;
-    }
-
-    // Even step 0 can be compacted or rebuilt before output. Retry the prepared
-    // transcript so recovery cannot restore context that preparation discarded.
-    const stepMessages = streamInfo.stepTracker.latestMessages;
-    if (hasParts && !stepMessages) {
-      return null;
-    }
-    const sourceMessages = stepMessages ?? streamInfo.request.messages;
-    // Strip every block of the namespace, not just the one the error names:
-    // removing one changes the prefix later blocks were bound to.
-    const messages = stripReasoningReplay(sourceMessages, rejectedNamespace);
-    if (messages === sourceMessages) {
-      return null;
-    }
-
-    return { hasParts, rejectedNamespace, messages };
-  }
-
-  /** Executes recoveryPolicy's dropReasoningReplay retry with a plan from the check above. */
-  private async retryStreamWithoutReasoningReplay(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown,
-    plan: ReasoningReplayRetryPlan
-  ): Promise<void> {
-    const { hasParts, rejectedNamespace, messages } = plan;
-    const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-    const errorCode = extractErrorCode(error);
-    const statusCode = extractStatusCode(error);
-
-    // Step-boundary retries restart the SDK stream, so totalUsage only reflects
-    // the retried step. Track this to prefer cumulativeUsage at stream end.
-    if (hasParts) {
-      streamInfo.didRetryReasoningReplayAtStep = true;
-    }
-
-    workspaceLog.info("Retrying stream without rejected reasoning replay", {
-      messageId: streamInfo.messageId,
-      model: streamInfo.model,
-      rejectedNamespace,
-      retryScope: hasParts ? "step" : "stream",
-      errorCode,
-      statusCode,
-    });
-
-    await this.resetStreamStateForRetry(workspaceId, streamInfo, {
-      preserveParts: hasParts,
-      preserveUsage: hasParts,
-      workspaceLog,
-    });
-
-    if (rejectedNamespace === "anthropic") {
-      // Preserved thinking: once thinking is removed, putting it back invalidates every
-      // later block, so the next turns must keep it out (messagePipeline reads this
-      // receipt). The retry sends every earlier row and this row's earlier steps without
-      // thinking, so the point is the retried step (the reset above recorded its start):
-      // step 0 for a repair at the turn start. Persist before the retry request goes out
-      // so a crash mid-retry cannot forget the strip. A step-0 repair has no parts yet:
-      // commitPartial keeps the receipt on the empty row (#5886).
-      this.moveAnthropicThinkingReplayPoint(streamInfo, streamInfo.stepStartIndices.length - 1);
-      await this.flushPartialWrite(workspaceId, streamInfo);
-    }
-
-    streamInfo.request = { ...streamInfo.request, messages };
-    streamInfo.streamResult = this.createStreamResult(
-      streamInfo.request,
-      streamInfo.abortController,
-      streamInfo.stepTracker
-    );
-  }
-
-  /**
-   * Converts errors to strongly-typed SendMessageError
-   */
-  private convertToSendMessageError(error: unknown): SendMessageError {
-    // Check for specific AI SDK errors using type guards
-    if (LoadAPIKeyError.isInstance(error)) {
-      return {
-        type: "api_key_not_found",
-        provider: "anthropic", // We can infer this from LoadAPIKeyError context
-      };
-    }
-
-    // Fallback for unknown errors
-    const message = getErrorMessage(error);
-    return { type: "unknown", raw: message };
+    return this.streamRetries.resetStreamStateForRetry(workspaceId, streamInfo, options);
   }
 
   /**

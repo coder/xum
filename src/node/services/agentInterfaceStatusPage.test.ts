@@ -4,11 +4,14 @@ import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
+import type { CompletedMessagePart } from "@/common/types/stream";
 import {
   AGENT_INTERFACE_STATUS_TEMPLATE,
+  needsStatusPageTurnEndNudge,
   prepareAgentInterfaceStatusPage,
 } from "./agentInterfaceStatusPage";
 import type { ArtifactsLocation } from "./artifactsOperations";
+import { transformMCPResult } from "./mcpResultTransform";
 
 const ALL_ON = {
   scratchDirSet: true,
@@ -37,14 +40,14 @@ describe("prepareAgentInterfaceStatusPage", () => {
   });
 
   test("writes the template when the status page is missing", async () => {
-    expect(await prepare(ALL_ON)).toBe(true);
+    expect(await prepare(ALL_ON)).not.toBeNull();
     expect(await fs.readFile(statusPath(), "utf8")).toBe(AGENT_INTERFACE_STATUS_TEMPLATE);
   });
 
   test("never overwrites a page the agent wrote", async () => {
     await fs.mkdir(artifactsDir);
     await fs.writeFile(statusPath(), "<p>agent status</p>");
-    expect(await prepare(ALL_ON)).toBe(true);
+    expect(await prepare(ALL_ON)).not.toBeNull();
     expect(await fs.readFile(statusPath(), "utf8")).toBe("<p>agent status</p>");
   });
 
@@ -57,7 +60,7 @@ describe("prepareAgentInterfaceStatusPage", () => {
   ])(
     "is inactive and writes nothing unless both flags are on in a main chat turn that is not a compaction, with a scratch dir (%o)",
     async (flags) => {
-      expect(await prepare(flags)).toBe(false);
+      expect(await prepare(flags)).toBeNull();
       expect(existsSync(statusPath())).toBe(false);
     }
   );
@@ -67,6 +70,334 @@ describe("prepareAgentInterfaceStatusPage", () => {
       ...ALL_ON,
       resolveLocation: () => Promise.reject(new Error("runtime unreachable")),
     });
-    expect(await active).toBe(true);
+    expect(await active).not.toBeNull();
+  });
+});
+
+describe("needsStatusPageTurnEndNudge", () => {
+  let scratchDir: string;
+  let artifactsDir: string;
+  const statusPath = () => path.join(artifactsDir, AGENT_INTERFACE_STATUS_ARTIFACT);
+  const startTurn = () =>
+    prepareAgentInterfaceStatusPage({
+      ...ALL_ON,
+      resolveLocation: () => Promise.resolve({ kind: "host", dir: artifactsDir }),
+    });
+  const writePage = async (content: string) => {
+    await fs.mkdir(artifactsDir, { recursive: true });
+    await fs.writeFile(statusPath(), content);
+  };
+  const toolCall = (output: unknown): CompletedMessagePart => ({
+    type: "dynamic-tool",
+    toolCallId: "bash-1",
+    toolName: "bash",
+    input: { script: "make test" },
+    state: "output-available",
+    output,
+  });
+  const statusUpdate = (output: unknown): CompletedMessagePart & { toolName: string } => ({
+    type: "dynamic-tool",
+    toolCallId: "status-1",
+    toolName: "status_update",
+    input: { update: "Fixing the build" },
+    state: "output-available",
+    output,
+  });
+  const ranTools: CompletedMessagePart[] = [
+    toolCall({ success: true }),
+    { type: "text", text: "Done." },
+  ];
+  const nestedTools: CompletedMessagePart[] = [
+    {
+      type: "dynamic-tool",
+      toolCallId: "code-1",
+      toolName: "code_execution",
+      input: { code: "" },
+      state: "output-available",
+      // The code failed after its nested call succeeded: the nested call alone counts.
+      output: { success: false, error: "TypeError" },
+      nestedCalls: [
+        {
+          toolCallId: "bash-1",
+          toolName: "bash",
+          input: { script: "make test" },
+          state: "output-available",
+          output: { success: true },
+        },
+      ],
+    },
+  ];
+  const failedTools: CompletedMessagePart[] = [toolCall({ success: false, error: "exit 2" })];
+  const screenshot = { type: "image", data: "aGVsbG8=", mimeType: "image/png" };
+  const textOnly: CompletedMessagePart[] = [{ type: "text", text: "Hello." }];
+
+  beforeEach(async () => {
+    scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-interface-nudge-"));
+    artifactsDir = path.join(scratchDir, "artifacts");
+  });
+
+  afterEach(async () => {
+    await fs.rm(scratchDir, { recursive: true, force: true });
+  });
+
+  test.each([
+    {
+      name: "a tool-free turn left the placeholder",
+      agentPage: false,
+      parts: textOnly,
+      nudge: true,
+    },
+    {
+      name: "a turn that ran tools left the page unchanged",
+      agentPage: true,
+      parts: ranTools,
+      nudge: true,
+    },
+    {
+      name: "a nested tool call left the page unchanged",
+      agentPage: true,
+      parts: nestedTools,
+      nudge: true,
+    },
+    {
+      name: "a tool call with an MCP-shaped result (no success marker) left the page unchanged",
+      agentPage: true,
+      parts: [toolCall({ content: [{ type: "text", text: "Created CODAGT-12" }] })],
+      nudge: true,
+    },
+    {
+      name: "an MCP call with an image result left the page unchanged",
+      agentPage: true,
+      parts: [toolCall(transformMCPResult({ content: [screenshot] }))],
+      nudge: true,
+    },
+    {
+      name: "a failed MCP call with an image result left the page unchanged",
+      agentPage: true,
+      parts: [
+        toolCall(
+          transformMCPResult({
+            content: [{ type: "text", text: "capture failed" }, screenshot],
+            isError: true,
+          })
+        ),
+      ],
+      nudge: false,
+    },
+    {
+      name: "a tool-free turn left the agent's page unchanged",
+      agentPage: true,
+      parts: textOnly,
+      nudge: false,
+    },
+    {
+      name: "a failed tool call left the page unchanged",
+      agentPage: true,
+      parts: failedTools,
+      nudge: false,
+    },
+  ])("$name: nudge $nudge", async (row) => {
+    if (row.agentPage) await writePage("<p>Fixing the build</p>");
+    const turn = await startTurn();
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: row.parts,
+      })
+    ).toBe(row.nudge);
+  });
+
+  test("a turn that updated the page gets no nudge", async () => {
+    const turn = await startTurn();
+    await writePage("<p>Build fixed</p>");
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: ranTools,
+      })
+    ).toBe(false);
+  });
+
+  test.each([
+    { name: "sent status_update", parts: [statusUpdate({ success: true, queued: true })] },
+    {
+      name: "sent status_update from code_execution",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "code-1",
+          toolName: "code_execution",
+          input: { code: "" },
+          state: "output-available",
+          output: { success: true },
+          nestedCalls: [
+            {
+              toolCallId: "status-1",
+              toolName: "status_update",
+              input: { update: "Fixing the build" },
+              state: "output-available",
+              output: { success: true, queued: true },
+            },
+          ],
+        } satisfies CompletedMessagePart,
+      ],
+    },
+  ])("in status page agent mode, a turn that $name gets no nudge", async (row) => {
+    // The placeholder at turn end: the status page agent may not have applied the update yet.
+    const turn = await startTurn();
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn == null ? undefined : { ...turn, statusPageAgent: true },
+        parts: [...ranTools, ...row.parts],
+      })
+    ).toBe(false);
+  });
+
+  test.each([
+    { name: "a refused status_update", agentPage: false, statusPageAgent: true },
+    {
+      name: "a status_update outside status page agent mode",
+      agentPage: true,
+      statusPageAgent: false,
+    },
+  ])("a turn that ran tools and made $name is nudged", async (row) => {
+    if (row.agentPage) await writePage("<p>Fixing the build</p>");
+    const turn = await startTurn();
+    const sent = statusUpdate(
+      row.statusPageAgent ? { success: false, error: "disabled" } : { success: true }
+    );
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn == null ? undefined : { ...turn, statusPageAgent: row.statusPageAgent },
+        parts: [...ranTools, sent],
+      })
+    ).toBe(true);
+  });
+
+  test.each([
+    {
+      name: "the placeholder an earlier release seeded with another comment",
+      page: AGENT_INTERFACE_STATUS_TEMPLATE.replace(/<!--[\s\S]*?-->/, "<!-- Older guidance -->"),
+      nudge: true,
+    },
+    { name: "a blank page", page: " \n\t\n", nudge: true },
+    { name: "a page with only a comment", page: "<!-- status -->\n", nudge: true },
+    {
+      name: "the placeholder plus a card the agent added",
+      page: AGENT_INTERFACE_STATUS_TEMPLATE.replace(
+        "</main>",
+        '  <p class="card">Fixing the build</p>\n</main>'
+      ),
+      nudge: false,
+    },
+    { name: "an oversize page", page: `<p>${"x".repeat(1024 * 1024 + 1)}</p>`, nudge: false },
+  ])("a tool-free turn that left $name: nudge $nudge", async (row) => {
+    await writePage(row.page);
+    const turn = await startTurn();
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: textOnly,
+      })
+    ).toBe(row.nudge);
+  });
+
+  test("a page that is one unclosed comment at the size limit gets the nudge without a stall", async () => {
+    // A lazy comment regex takes minutes on this page instead of milliseconds.
+    await writePage("<!--".repeat(256 * 1024));
+    const turn = await startTurn();
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: textOnly,
+      })
+    ).toBe(true);
+  }, 5_000);
+
+  test("a page emptied during the turn gets the nudge", async () => {
+    await writePage("<p>Fixing the build</p>");
+    const turn = await startTurn();
+    await writePage("");
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: textOnly,
+      })
+    ).toBe(true);
+  });
+
+  test.each([
+    { name: "is seeded again and gets the nudge", viewEnabled: true },
+    { name: "after the view was switched off gets neither", viewEnabled: false },
+  ])("a page the agent deleted $name", async (row) => {
+    const turn = await startTurn();
+    await fs.rm(statusPath());
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: row.viewEnabled,
+        turn: turn ?? undefined,
+        parts: textOnly,
+      })
+    ).toBe(row.viewEnabled);
+    if (row.viewEnabled) {
+      expect(await fs.readFile(statusPath(), "utf8")).toBe(AGENT_INTERFACE_STATUS_TEMPLATE);
+    } else {
+      expect(existsSync(statusPath())).toBe(false);
+    }
+  });
+
+  test("a folder at the page's path gets no nudge", async () => {
+    const turn = await startTurn();
+    await fs.rm(statusPath());
+    await fs.mkdir(statusPath());
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: ranTools,
+      })
+    ).toBe(false);
+  });
+
+  test.each([
+    { name: "a small page", bytes: 64 },
+    { name: "an oversize page", bytes: 1024 * 1024 + 1 },
+  ])("a turn that only touched $name gets the nudge", async (row) => {
+    await writePage(`<p>${"x".repeat(row.bytes)}</p>`);
+    const turn = await startTurn();
+    const later = new Date(Date.now() + 60_000);
+    await fs.utimes(statusPath(), later, later);
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: ranTools,
+      })
+    ).toBe(true);
+  });
+
+  test("an inactive view gets no nudge", async () => {
+    expect(
+      await needsStatusPageTurnEndNudge({ viewEnabled: true, turn: undefined, parts: ranTools })
+    ).toBe(false);
+  });
+
+  test("a location that fails at turn end gets no nudge and does not throw", async () => {
+    const turn = await startTurn();
+    expect(turn).not.toBeNull();
+    const failing = {
+      startFingerprint: turn?.startFingerprint ?? null,
+      resolveLocation: () => Promise.reject(new Error("runtime unreachable")),
+    };
+    expect(
+      await needsStatusPageTurnEndNudge({ viewEnabled: true, turn: failing, parts: ranTools })
+    ).toBe(false);
   });
 });

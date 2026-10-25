@@ -105,6 +105,12 @@ import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset"
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
+import type { CompletedMessagePart } from "@/common/types/stream";
+import { needsStatusPageTurnEndNudge } from "./agentInterfaceStatusPage";
+import {
+  STATUS_PAGE_AGENT_TURN_END_NUDGE,
+  STATUS_PAGE_TURN_END_NUDGE,
+} from "@/common/utils/machineTurnPrompts";
 import { isMockAiMode } from "./mock/mockAiMode";
 import { ProviderModelFactory } from "./providerModelFactory";
 
@@ -606,6 +612,32 @@ export class AIService extends EventEmitter {
       ? await this.resolvePromptHookCwd(workspaceId)
       : undefined;
     return runTurnStopHooks(eventSpine, workspaceId, { ...input, cwd });
+  }
+
+  /**
+   * The Agent interface view's turn-end status page nudge that the turn that streamed `messageId`
+   * earns (needsStatusPageTurnEndNudge), or null. In status page agent mode it asks for a
+   * status_update call instead of an edit. Consumes the turn's state, so a second call is null.
+   */
+  async statusPageTurnEndNudge(
+    workspaceId: string,
+    input: { messageId: string; parts: readonly CompletedMessagePart[] }
+  ): Promise<string | null> {
+    const turn = this.turnRequestBuilder.takeAgentInterfaceStatusPageTurn(
+      workspaceId,
+      input.messageId
+    );
+    const needed = await needsStatusPageTurnEndNudge({
+      turn,
+      viewEnabled:
+        this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS) &&
+        this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
+      parts: input.parts,
+    });
+    if (!needed) return null;
+    return turn?.statusPageAgent === true
+      ? STATUS_PAGE_AGENT_TURN_END_NUDGE
+      : STATUS_PAGE_TURN_END_NUDGE;
   }
 
   /** The lazy hook setup of request building, fail-soft: the hooks already loaded still run. */

@@ -6,21 +6,20 @@
  * through StreamManager.processStreamWithCleanup.
  */
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
-import type { ModelMessage } from "ai";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import type { StreamErrorType } from "@/common/types/errors";
-import type { MuxMessage } from "@/common/types/message";
+import { hasTokenUsage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
 import type { StreamEndEvent } from "@/common/types/stream";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import assert from "@/common/utils/assert";
-import { getErrorMessage } from "@/common/utils/errors";
+import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { eventSpine } from "@/node/services/events/eventSpine";
-import type { Logger } from "@/node/services/log";
-import type { StreamErrorPayload } from "@/node/services/utils/sendMessageError";
+import { log, type Logger } from "@/node/services/log";
+import { createErrorEvent, type StreamErrorPayload } from "@/node/services/utils/sendMessageError";
 import { nodeClock } from "@/node/utils/hostClock";
-import { partFold, type FoldablePart, type FoldStep, type FoldView } from "./partFold";
+import { partFold, type FoldablePart, type FoldStep } from "./partFold";
 import type { PartialJournal } from "./PartialJournal";
 import type { ProviderRequest, StreamRequestConfig } from "./ProviderRequest";
 import {
@@ -30,57 +29,30 @@ import {
   type AttemptOutcome,
 } from "./recoveryPolicy";
 import type { RefusalFallback } from "./RefusalFallback";
+import { foldView, type PartLoopState } from "./StepApply";
 import type { StepMessageTracker } from "./StepPreparation";
-import { EmptyStreamOutputError, ModelRefusalError, StreamTruncatedError } from "./streamErrors";
+import {
+  getOpenAIPreviousResponseId,
+  planPreviousResponseIdRetry,
+  planReasoningReplayRetry,
+  type StreamRetries,
+} from "./StreamRetries";
+import {
+  buildStreamErrorPayload,
+  EmptyStreamOutputError,
+  ModelRefusalError,
+  StreamTruncatedError,
+} from "./streamErrors";
 import { metadataModelIdentity, type TurnEvents } from "./TurnEvents";
 import { StreamState } from "./TurnRegistry";
 import type { TurnResources } from "./TurnResources";
 import type { StreamManagerTokenTracker, WorkspaceId, WorkspaceStreamInfo } from "./types";
 import {
   clonePersistedToolModelUsage,
+  cloneUsage,
   markProviderMetadataCostsIncluded,
   type UsageLedger,
 } from "./UsageLedger";
-
-/** What planPreviousResponseIdRetry found; its executor consumes it unchanged. */
-export interface PreviousResponseIdRetryPlan {
-  /** Retry the current step only (keep parts and usage) instead of the whole stream. */
-  hasParts: boolean;
-  previousResponseId: string;
-  stepMessages: WorkspaceStreamInfo["stepTracker"]["latestMessages"];
-  /** The request's provider options without previousResponseId. */
-  providerOptions: Record<string, unknown> | undefined;
-  errorCode: string | undefined;
-  statusCode: number | undefined;
-}
-
-/** What planReasoningReplayRetry found; its executor consumes it unchanged. */
-export interface ReasoningReplayRetryPlan {
-  /** Retry the current step only (keep parts and usage) instead of the whole stream. */
-  hasParts: boolean;
-  rejectedNamespace: "openai" | "anthropic";
-  /** The request transcript without the rejected namespace's reasoning. */
-  messages: ModelMessage[];
-}
-
-// Tool-call tracking + branded types
-export interface ToolCallState {
-  toolCallId: string;
-  toolName: string;
-  input: unknown;
-  output?: unknown;
-}
-
-export type ToolCallMap = Map<string, ToolCallState>;
-
-/** Stream-loop state of one processStreamWithCleanup turn that applyStep reads and updates. */
-export interface PartLoopState {
-  readonly workspaceLog: Logger;
-  /** Per attempt: processStreamWithCleanup replaces it before each attempt. */
-  toolCalls: ToolCallMap;
-  /** Per turn: counts orphan tool results for log suppression. */
-  orphanToolResultCount: number;
-}
 
 function isKnownProviderName(provider: string): provider is keyof typeof PROVIDER_DEFINITIONS {
   return Object.hasOwn(PROVIDER_DEFINITIONS, provider);
@@ -196,7 +168,10 @@ export interface AttemptLoopDeps {
     "acquireMcpLease" | "releaseMcpLease" | "closeStreamResources"
   >;
   readonly partialJournal: Pick<PartialJournal, "commitFinal">;
-  readonly usageLedger: Pick<UsageLedger, "settle">;
+  readonly usageLedger: Pick<
+    UsageLedger,
+    "settle" | "discardInFlight" | "recordDroppedPartialUsage"
+  >;
   readonly providerRequest: Pick<ProviderRequest, "recordLostResponseIdIfApplicable">;
   readonly turnEvents: Pick<TurnEvents<WorkspaceStreamInfo>, "emitTurnEvent">;
   readonly refusalFallback: Pick<RefusalFallback, "tryModelFallbackAfterRefusal">;
@@ -227,14 +202,8 @@ export interface AttemptLoopDeps {
   readonly resolveProviderMetadataForStreamEnd: (
     streamInfo: WorkspaceStreamInfo
   ) => Promise<Record<string, unknown> | undefined>;
-  readonly getOpenAIPreviousResponseId: (
-    providerOptions?: Record<string, unknown>
-  ) => string | undefined;
-  readonly resetStreamStateForRetry: (
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    options?: { preserveParts?: boolean; preserveUsage?: boolean; workspaceLog?: Logger }
-  ) => Promise<void>;
+  /** The retry state reset and recoveryPolicy's retry executors. */
+  readonly streamRetries: StreamRetries;
   /** StreamManager.createStreamResult, read at call time (whitebox tests replace it). */
   readonly createStreamResult: (
     request: StreamRequestConfig,
@@ -248,51 +217,21 @@ export interface AttemptLoopDeps {
   ) => void;
   readonly flushPartialWrite: (
     workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo
-  ) => Promise<void>;
-  /** StreamManager's part fold view and step application (applyStep). */
-  readonly foldView: (
-    workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
-    loop: PartLoopState
-  ) => FoldView;
+    terminalPartial?: MuxMessage
+  ) => Promise<void>;
+  /** StepApply.applyStep: runs the fold's intents against the stream state. */
   readonly applyStep: (
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
     step: FoldStep,
     loop: PartLoopState
   ) => Promise<void>;
-  /** StreamManager's retry plans and their executors; recoveryPolicy picks one. */
-  readonly planPreviousResponseIdRetry: (
+  /** StreamManager's partial snapshot, which the error partial extends. */
+  readonly buildPartialAssistantMessage: (
     streamInfo: WorkspaceStreamInfo,
-    error: unknown
-  ) => PreviousResponseIdRetryPlan | null;
-  readonly planReasoningReplayRetry: (
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown
-  ) => ReasoningReplayRetryPlan | null;
-  readonly retryStreamWithoutPreviousResponseId: (
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown,
-    plan: PreviousResponseIdRetryPlan
-  ) => Promise<void>;
-  readonly retryStreamWithoutReasoningReplay: (
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown,
-    plan: ReasoningReplayRetryPlan
-  ) => Promise<void>;
-  /** StreamManager's error payload and its persistence (the error partial and event). */
-  readonly buildStreamErrorPayload: (
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown
-  ) => StreamErrorPayload & { errorType: StreamErrorType };
-  readonly persistStreamError: (
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    payload: StreamErrorPayload & { errorType: StreamErrorType }
-  ) => Promise<StreamErrorPayload & { errorType: StreamErrorType }>;
+    options?: { metadata?: Partial<MuxMetadata>; parts?: MuxMessage["parts"] }
+  ) => MuxMessage;
   readonly discardUnsettledSessionUsage: (
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo
@@ -310,9 +249,7 @@ export class AttemptLoop {
     const streamMeta = await this.deps.getStreamMetadata(streamInfo);
     const totalUsage = this.deps.endUsage(streamInfo, streamMeta.totalUsage);
     const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
-    const previousResponseId = this.deps.getOpenAIPreviousResponseId(
-      streamInfo.request.providerOptions
-    );
+    const previousResponseId = getOpenAIPreviousResponseId(streamInfo.request.providerOptions);
 
     // Surface silent provider drops instead of leaving an empty assistant placeholder behind.
     // Recent gpt-5.4-pro stalls only logged stream startup, so future occurrences need an
@@ -364,9 +301,7 @@ export class AttemptLoop {
     const streamMeta = await this.deps.getStreamMetadata(streamInfo);
     const totalUsage = this.deps.endUsage(streamInfo, streamMeta.totalUsage);
     const contextUsage = streamMeta.contextUsage ?? streamInfo.lastStepUsage;
-    const previousResponseId = this.deps.getOpenAIPreviousResponseId(
-      streamInfo.request.providerOptions
-    );
+    const previousResponseId = getOpenAIPreviousResponseId(streamInfo.request.providerOptions);
     const providerDisplayName = getStreamProviderDisplayName(streamInfo.model);
 
     // Do not treat iterator EOF as success. Anthropic and OpenAI Responses both
@@ -403,11 +338,11 @@ export class AttemptLoop {
       model: streamInfo.model,
       nextAttempt: emptyStreamRecoveryAttempts + 1,
       maxAttempts: MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS,
-      previousResponseId: this.deps.getOpenAIPreviousResponseId(streamInfo.request.providerOptions),
+      previousResponseId: getOpenAIPreviousResponseId(streamInfo.request.providerOptions),
     });
 
     streamInfo.didRetryAfterEmptyOutput = true;
-    await this.deps.resetStreamStateForRetry(workspaceId, streamInfo, {
+    await this.deps.streamRetries.resetStreamStateForRetry(workspaceId, streamInfo, {
       preserveUsage: true,
       workspaceLog,
     });
@@ -524,10 +459,8 @@ export class AttemptLoop {
       const aborted = streamInfo.abortController.signal.aborted;
       const previousResponseIdPlan = aborted
         ? null
-        : this.deps.planPreviousResponseIdRetry(streamInfo, error);
-      const reasoningReplayPlan = aborted
-        ? null
-        : this.deps.planReasoningReplayRetry(streamInfo, error);
+        : planPreviousResponseIdRetry(streamInfo, error);
+      const reasoningReplayPlan = aborted ? null : planReasoningReplayRetry(streamInfo, error);
       const decision = recoveryPolicy(
         {
           _tag: "Errored",
@@ -547,7 +480,7 @@ export class AttemptLoop {
       }
       if (decision.change === "dropPreviousResponseId") {
         assert(previousResponseIdPlan != null, "policy retried without a plan");
-        await this.deps.retryStreamWithoutPreviousResponseId(
+        await this.deps.streamRetries.retryStreamWithoutPreviousResponseId(
           workspaceId,
           streamInfo,
           error,
@@ -557,7 +490,7 @@ export class AttemptLoop {
       } else {
         assert(decision.change === "dropReasoningReplay", "errors never retry as empty output");
         assert(reasoningReplayPlan != null, "policy retried without a plan");
-        await this.deps.retryStreamWithoutReasoningReplay(
+        await this.deps.streamRetries.retryStreamWithoutReasoningReplay(
           workspaceId,
           streamInfo,
           error,
@@ -592,7 +525,7 @@ export class AttemptLoop {
       // });
 
       const step = partFold(
-        this.deps.foldView(workspaceId, streamInfo, loop),
+        foldView(workspaceId, streamInfo, loop),
         part as FoldablePart,
         nodeClock.nowMs()
       );
@@ -843,12 +776,114 @@ export class AttemptLoop {
       workspaceLog
     );
 
-    const errorPayload = this.deps.buildStreamErrorPayload(streamInfo, error);
-    const persistedPayload = await this.deps.persistStreamError(
-      workspaceId,
-      streamInfo,
-      errorPayload
-    );
+    const errorPayload = buildStreamErrorPayload(streamInfo, error);
+    const persistedPayload = await this.persistStreamError(workspaceId, streamInfo, errorPayload);
     streamInfo.terminalCompletion = { status: "failed", streamError: persistedPayload };
+  }
+
+  /**
+   * Write error metadata to partial.json and emit the corresponding error event.
+   */
+  private async persistStreamError(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    payload: StreamErrorPayload & { errorType: StreamErrorType }
+  ): Promise<StreamErrorPayload & { errorType: StreamErrorType }> {
+    // Clamp at the single choke point every stream error payload passes
+    // through before persist/emit, including buildStreamErrorPayload's
+    // early-return branches (e.g. ModelRefusalError, whose fallbackNote can
+    // embed another error's message). Some SDK errors embed the entire
+    // serialized prompt in their message (AI_TypeValidationError via the
+    // cause walk); unbounded, that would be persisted to history metadata,
+    // shipped over IPC, and rendered in the chat.
+    payload = { ...payload, error: clampErrorMessage(payload.error), model: streamInfo.model };
+    const refusalFinishReason =
+      payload.errorType === "model_refusal"
+        ? ([streamInfo.terminalFinishReason, streamInfo.terminalRawFinishReason].find(
+            isRefusalFinishReason
+          ) ?? streamInfo.terminalFinishReason)
+        : undefined;
+    const terminalRefusalUsage = streamInfo.terminalRefusalUsage;
+    const terminalRefusalProviderMetadata = streamInfo.terminalRefusalProviderMetadata;
+
+    // Errored turns still billed every completed step. Capture the
+    // live-tracked cumulative usage for the sidecar below and mirror it into
+    // session-usage.json — the error path previously skipped both, ingesting
+    // failed turns as $0. Refusal errors are excluded entirely: the refusal
+    // paths already attributed the refusing attempt's tokens (terminal
+    // refusals via terminalRefusalUsage, fallback hops — including the FINAL
+    // hop on chain exhaustion — via recordRefusedAttemptUsage into
+    // toolModelUsages + the ledger), so re-recording the cumulative counters
+    // here would double-count the last refusing attempt.
+    let cumulativeErrorUsage: LanguageModelV2Usage | undefined;
+    let cumulativeErrorProviderMetadata: Record<string, unknown> | undefined;
+    if (payload.errorType !== "model_refusal" && hasTokenUsage(streamInfo.cumulativeUsage)) {
+      cumulativeErrorUsage = cloneUsage(streamInfo.cumulativeUsage);
+      await this.deps.backfillReasoningTokensFromParts(streamInfo, cumulativeErrorUsage);
+      cumulativeErrorProviderMetadata = markProviderMetadataCostsIncluded(
+        streamInfo.cumulativeProviderMetadata
+          ? { ...streamInfo.cumulativeProviderMetadata }
+          : undefined,
+        streamInfo.initialMetadata?.costsIncluded
+      );
+      await this.deps.usageLedger.settle(
+        workspaceId,
+        streamInfo,
+        cumulativeErrorUsage,
+        cumulativeErrorProviderMetadata,
+        "Failed to record session usage for errored stream",
+        "warn"
+      );
+    } else {
+      // Refusals recorded their own usage above: drop any in-flight copy.
+      await this.deps.usageLedger.discardInFlight(workspaceId, streamInfo);
+    }
+    const errorUsage = terminalRefusalUsage ?? cumulativeErrorUsage;
+    const errorProviderMetadata =
+      terminalRefusalProviderMetadata ?? cumulativeErrorProviderMetadata;
+
+    const errorPartialMessage = this.deps.buildPartialAssistantMessage(streamInfo, {
+      metadata: {
+        error: payload.error,
+        errorType: payload.errorType,
+        ...(refusalFinishReason !== undefined ? { finishReason: refusalFinishReason } : {}),
+        ...(errorProviderMetadata !== undefined ? { providerMetadata: errorProviderMetadata } : {}),
+        // INVARIANT: usage / toolModelUsages are deliberately NOT stamped on
+        // the error partial. Errored turns are sidecar-canonical: unlike
+        // aborts, nothing commits the partial at error time (AIService
+        // forwards "error" without commitPartial), so usage stamped here
+        // would strand in partial.json until an unrelated send — or die
+        // entirely when a retry overwrites the partial. The sidecar rows
+        // below are ingested immediately by the error listener, and the
+        // eventually committed row carries no usage, so exactly one source
+        // ever reaches the events table.
+      },
+    });
+
+    // Write error state to disk through the tracked partial write: it waits for any in-flight
+    // flush, cancels a scheduled one, and retires later flushes, so a concurrent cancel cannot
+    // land a pre-error snapshot after it (#5344). Awaited so the state is on disk before any
+    // resume.
+    await this.deps.flushPartialWrite(workspaceId, streamInfo, errorPartialMessage);
+
+    try {
+      await this.deps.usageLedger.recordDroppedPartialUsage(
+        workspaceId,
+        streamInfo,
+        errorUsage,
+        errorProviderMetadata,
+        "errored_stream",
+        // A model_refusal error's stream usage row is terminalRefusalUsage
+        // (only set for terminal no-fallback refusals); label it as a refusal
+        // so analytics can distinguish refusals from generic stream errors.
+        payload.errorType === "model_refusal" ? "refused_stream" : "errored_stream"
+      );
+    } catch (error) {
+      log.error("Failed to record errored-stream usage in headless sidecar", { error });
+    }
+
+    // Emit error event before completion settles so recovery bookkeeping is ready for waiters.
+    this.deps.turnEvents.emitTurnEvent(createErrorEvent(workspaceId as string, payload));
+    return payload;
   }
 }

@@ -15,6 +15,7 @@ import {
   workspaceMutationLockPath,
 } from "@/node/services/workspaceUseLeases";
 import { fileLockTimeoutMessage } from "@/node/utils/concurrency/fileLock";
+import { CrossProcessLockTimeoutError } from "@/node/utils/concurrency/lockErrors";
 import type { ProcessIdentity } from "@/node/utils/concurrency/processLiveness";
 import {
   foreignIdentity,
@@ -402,6 +403,35 @@ test("foreign: dead holders are reclaimed in order, and a probe reclaims none", 
     expect(holders.reclaimed).toEqual([file, record]);
     await lock[Symbol.asyncDispose]();
     await release();
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("foreign: a missing parent wins over a live holder when createParentDirectory is false", async () => {
+  const t = await nodeLocks();
+  try {
+    const holders = makeForeignHolders();
+    const locks = buildSessionLocks(withForeignHolders(t.layer, holders));
+    const lockPath = path.join(t.dir, "removed-run", "run.lock");
+    holders.hold(lockPath, "live");
+    const acquire = () =>
+      locks
+        .acquireCrossProcessLock({
+          lockPath,
+          createParentDirectory: false,
+          acquireTimeoutMs: 0,
+          staleMs: 60_000,
+          timeoutMessage: "held.",
+        })
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+    expect(await acquire()).toMatchObject({ code: "ENOENT" });
+    // With the parent back, the live holder refuses again.
+    await fs.mkdir(path.dirname(lockPath));
+    expect(await acquire()).toBeInstanceOf(CrossProcessLockTimeoutError);
   } finally {
     await t.cleanup();
   }

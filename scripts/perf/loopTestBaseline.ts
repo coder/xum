@@ -470,7 +470,13 @@ async function main(): Promise<number> {
     ["SIGINT", 130],
     ["SIGTERM", 143],
   ] as const) {
-    process.once(signal, () => {
+    process.on(signal, () => {
+      // A second signal (Ctrl-C twice) while the first one waits: SIGKILL the children that
+      // ignore SIGTERM. The first handler still waits for them and runs the cleanup (#7299).
+      if (stopping) {
+        for (const child of children) child.kill("SIGKILL");
+        return;
+      }
       // Stop the `bun test` children first: they write into the scratch dir and run in the base
       // worktree that the cleanup removes.
       void stopChildren().finally(() => {

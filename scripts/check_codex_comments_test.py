@@ -235,6 +235,21 @@ else:
             with self.subTest(body=body):
                 self.assert_gate(expected, snapshot([comment(body)]))
 
+    def test_receipt_without_reviewed_commit_does_not_hide_findings(self):
+        # Codex sometimes omits the Reviewed commit line (coder/xum#7302). That
+        # line is optional, but text in its place or around the receipt blocks.
+        clean = FIXTURES["receipt_security_no_findings_without_commit"]["body"]
+        report = "\n\n[View security finding report]"
+        for body, expected in (
+            (clean, 0),
+            (clean.replace(report, "\n\n[P1] Found an issue." + report), 1),
+            (clean.replace(report, "\n\n**Reviewed commit:** `zzz`" + report), 1),
+            (clean.replace("No security issues were found", "Found a P1 issue"), 1),
+            (clean + "\n\n[P1] A security issue still needs fixing.", 1),
+        ):
+            with self.subTest(body=body):
+                self.assert_gate(expected, snapshot([comment(body)]))
+
     def test_review_state_line_is_fail_closed(self):
         # Codex added a review-state line to its board on 2026-10-15. Only the
         # observed keys and statuses count; has_any_findings stays true after

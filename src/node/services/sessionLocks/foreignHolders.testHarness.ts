@@ -5,6 +5,7 @@
  * Node locks would wait the whole timeout first), so tests need no real wait.
  */
 import assert from "node:assert";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Effect, Layer } from "effect";
 import { SessionLocksTag } from "@/node/services/di/tags";
@@ -108,6 +109,17 @@ export function makeForeignHolders(): ForeignHolders {
   return holders;
 }
 
+/** The record lock's folder is gone (the inner lock reads the same disk for these locks). */
+async function parentMissing(lockPath: string): Promise<boolean> {
+  try {
+    await fs.stat(path.dirname(lockPath));
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
+}
+
 /**
  * The locks that check the foreign holders before each call. A dead holder is
  * reclaimed by the acquire that meets it: it leaves the table, the path goes to
@@ -151,6 +163,11 @@ export function wrapWithForeignHolders(inner: SessionLocks, holders: ForeignHold
     acquireCrossProcessLock: async (options) => {
       // crossProcessLock.ts checks the signal before each attempt: abort wins over a holder.
       if (options.signal?.aborted) throw abortedAcquireError();
+      // Without createParentDirectory, the Node lock's first write fails with ENOENT once the
+      // parent is gone, before it reads any holder: WorkflowRunStore relies on that (#7326).
+      if (options.createParentDirectory === false && (await parentMissing(options.lockPath))) {
+        return await inner.acquireCrossProcessLock(options);
+      }
       const holder = liveHolder(options.lockPath);
       if (holder !== undefined) {
         throw new CrossProcessLockTimeoutError(

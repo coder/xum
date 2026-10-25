@@ -157,8 +157,8 @@ export interface SpawnOptions {
   /** Host-namespace paths to translate before injecting as environment variables. */
   pathEnv?: Record<string, string>;
   /**
-   * The caller created the record directory for this spawn (BackgroundProcessManager's atomic
-   * mkdir claim on non-host runtimes, #4889), so a failure before the spawn may remove it.
+   * The caller created the record directory for this spawn (BackgroundProcessManager's
+   * exclusive claim on non-host runtimes, #4889), so a failure before the spawn may remove it.
    */
   recordDirClaimed?: boolean;
 }

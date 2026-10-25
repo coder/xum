@@ -77,7 +77,11 @@ import { formatMcpAppModelContextSection } from "@/node/services/mcpAppResultSto
 import type { InitStateManager } from "./initStateManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
-import { isStatusPageAgentMode, prepareAgentInterfaceStatusPage } from "./agentInterfaceStatusPage";
+import {
+  type AgentInterfaceStatusPageTurn,
+  isStatusPageAgentMode,
+  prepareAgentInterfaceStatusPage,
+} from "./agentInterfaceStatusPage";
 import {
   isStatusPageAgentEnabledInSettings,
   type StatusPageAgentService,
@@ -929,10 +933,19 @@ function systemPromptToolsetOf(
 ): SystemPromptToolset {
   return {
     memoryToolAvailable: tools.memory !== undefined,
-    statusUpdateToolAvailable:
-      tools.status_update !== undefined &&
-      applyToolPolicyToNames(["status_update"], activeToolPolicy).length > 0,
+    statusUpdateToolAvailable: statusUpdateUsable(
+      tools.status_update !== undefined,
+      activeToolPolicy
+    ),
   };
+}
+
+/** Whether a registered status_update survives the active tool policy (see above). */
+function statusUpdateUsable(
+  registered: boolean,
+  activeToolPolicy: ToolPolicy | undefined
+): boolean {
+  return registered && applyToolPolicyToNames(["status_update"], activeToolPolicy).length > 0;
 }
 
 /**
@@ -1119,6 +1132,15 @@ export class TurnRequestBuilder {
    * removed or archived workspace's entry.
    */
   private readonly toolCatalogOverviews = new Map<string, Map<string, ToolCatalogOverviewMemo>>();
+  /**
+   * The Agent interface view's state of each root workspace's latest prepared turn, keyed by
+   * workspace, for the turn-end status page nudge (takeAgentInterfaceStatusPageTurn). One entry
+   * per workspace: the next prepare replaces or drops it.
+   */
+  private readonly agentInterfaceTurns = new Map<
+    string,
+    { messageId: string; turn: AgentInterfaceStatusPageTurn }
+  >();
 
   constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
 
@@ -1128,8 +1150,42 @@ export class TurnRequestBuilder {
   }
 
   /** Drop a removed or archived workspace's in-memory request state, so it does not grow the map. */
+  // dry-duplicate-ok: two map deletes; the browser token-state reset shares only the shape
   forgetWorkspace(workspaceId: string): void {
     this.toolCatalogOverviews.delete(workspaceId);
+    this.agentInterfaceTurns.delete(workspaceId);
+  }
+
+  /**
+   * The Agent interface view's state of the turn whose assistant message is `messageId`, once:
+   * undefined when the view was inactive for it, or when another turn was prepared since.
+   */
+  takeAgentInterfaceStatusPageTurn(
+    workspaceId: string,
+    messageId: string
+  ): AgentInterfaceStatusPageTurn | undefined {
+    const entry = this.agentInterfaceTurns.get(workspaceId);
+    if (entry?.messageId !== messageId) return undefined;
+    this.agentInterfaceTurns.delete(workspaceId);
+    return entry.turn;
+  }
+
+  private recordAgentInterfaceTurn(
+    workspaceId: string,
+    messageId: string,
+    turn: AgentInterfaceStatusPageTurn | null,
+    agent: { subagentWorkspace: boolean; planLike: boolean; statusPageAgent: boolean }
+  ): void {
+    // Only root workspaces get the turn-end status page nudge (AgentSession.runTurnStopHooks), and
+    // no plan-like agent (a custom one included): it may edit only its plan file.
+    if (turn != null && !agent.subagentWorkspace && !agent.planLike) {
+      this.agentInterfaceTurns.set(workspaceId, {
+        messageId,
+        turn: { ...turn, statusPageAgent: agent.statusPageAgent },
+      });
+    } else {
+      this.agentInterfaceTurns.delete(workspaceId);
+    }
   }
 
   /**
@@ -2433,21 +2489,23 @@ export class TurnRequestBuilder {
     }
     // Agent interface view: seed the status page the main pane shows before the model runs; the
     // prompt tells the agent about the page under the same condition.
-    const agentInterfaceViewActive = await prepareAgentInterfaceStatusPage({
+    const agentInterfaceTurn = await prepareAgentInterfaceStatusPage({
       scratchDirSet: scratchDir !== undefined,
       artifactsEnabled: artifactsExperimentEnabled,
       agentInterfaceEnabled: isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
       sideChat: isSideChat,
       compactionRequest: isCompactionRequest,
-      resolveLocation: () =>
+      // Takes its signal per call: the turn-end nudge reads the page after this turn's signal.
+      resolveLocation: (abortSignal) =>
         resolveArtifactsLocation(
           this.dependencies.config.sessionsDir,
           workspaceId,
           { ...metadata, namedWorkspacePath: workspacePath },
-          { createRuntime: () => runtime, abortSignal: combinedAbortSignal }
+          { createRuntime: () => runtime, abortSignal }
         ),
       abortSignal: combinedAbortSignal,
     });
+    const agentInterfaceViewActive = agentInterfaceTurn != null;
     // Status page agent mode: the main agent sends status_update calls and a host-run agent
     // edits the page. Eligibility mirrors status_update registration; tool policy may still
     // strip the tool, which forces a rebuild below so the prompt keeps the classic guidance.
@@ -2880,6 +2938,12 @@ export class TurnRequestBuilder {
     // assistant turn. The placeholder is appended to history below
     // (after the abort check).
     const assistantMessageId = createAssistantMessageId();
+    this.recordAgentInterfaceTurn(workspaceId, assistantMessageId, agentInterfaceTurn, {
+      subagentWorkspace: isSubagentWorkspace,
+      planLike: agentIsPlanLike,
+      // The same rule the prompt follows, so the nudge asks for what the prompt told the agent.
+      statusPageAgent: statusUpdateUsable(statusPageAgentActive, effectiveToolPolicy),
+    });
     // Bind ownership before cached MCP tools are captured by the PTC bridge.
     // A queued invocation must keep this turn's identity after a replacement starts.
     const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };

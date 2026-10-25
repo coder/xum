@@ -14,6 +14,7 @@ import type { ModelFallbackOptions } from "./streamManager";
 import { SessionUsageService, type SessionUsageFile } from "./sessionUsageService";
 import { createStreamManagerForTests } from "./streamManager.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
+import { countTokens } from "@/node/utils/main/tokenizer";
 import {
   installStreamManagerTestHistory,
   historyService,
@@ -204,6 +205,33 @@ describe("StreamManager - in-flight session usage", () => {
 
     expect(totals(await sessionUsageService.getSessionUsage(workspaceId)).tokens).toBe(940);
     expect(await inFlightFiles(historyConfig.sessionsDir, workspaceId)).toEqual([]);
+  });
+
+  test("an errored turn counts reasoning tokens that the provider did not report", async () => {
+    const workspaceId = "in-flight-error-reasoning";
+    const reasoning = "Thinking about the answer before the stream fails";
+    const sessionUsageService = new SessionUsageService(historyConfig, historyService);
+    const streamManager = createStreamManagerForTests(historyService, {
+      sessionUsageService,
+      streamText: scriptedStreamText([
+        {
+          chunks: [
+            { type: "reasoning-delta", text: reasoning },
+            finishStep({ inputTokens: 900, outputTokens: 40, totalTokens: 940 }),
+            () => Promise.reject(new Error("stream truncated")),
+          ],
+        },
+      ]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      modelString: MODEL,
+    });
+    expect(completion.status).toBe("failed");
+
+    const ledger = await sessionUsageService.getSessionUsage(workspaceId);
+    const total = sumUsageHistory(Object.values(ledger?.byModel ?? {}));
+    expect(total?.reasoning.tokens).toBe(await countTokens(MODEL, reasoning));
   });
 
   for (const ledgerBefore of ["an existing ledger", "no ledger (rebuilt from history)"]) {

@@ -504,6 +504,29 @@ describe("StreamManager - startup outcomes", () => {
     });
   });
 
+  test("any other startup failure returns its message as an unknown send error", async () => {
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: fakeStreamText(() => {
+        throw new Error("provider exploded");
+      }),
+    });
+
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: "startup-unknown-error-workspace",
+        messageId: "startup-unknown-error-msg",
+        model: createTestLanguageModel(),
+        runtime: LOCAL_TEST_RUNTIME,
+        providedRuntimeTempDir: "",
+      })
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: { type: "unknown", raw: "provider exploded" },
+    });
+  });
+
   test("a start the caller already stopped settles with the caller's abort reason", async () => {
     const streamManager = createStreamManagerForTests(historyService, {
       streamText: fakeStreamText(() => {
