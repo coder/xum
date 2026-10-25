@@ -665,18 +665,22 @@ describe("acquireProcessFileLock edges", () => {
       label: "test",
       renewIntervalMs: 20,
     });
-    const realReadFile = fs.readFile;
     const renewing = Promise.withResolvers<void>();
     const unblock = Promise.withResolvers<void>();
     let blocked = false;
-    const spy = spyOn(fs, "readFile").mockImplementation(async (file, options) => {
-      if (!blocked && String(file) === lockPath) {
-        blocked = true;
-        renewing.resolve();
-        await unblock.promise;
-      }
-      return realReadFile(file, options);
-    });
+    const readFile = fs.readFile;
+    const spy = spyOn(fs, "readFile").mockImplementation(
+      new Proxy(readFile, {
+        async apply(target, thisArg, args: Parameters<typeof readFile>) {
+          if (!blocked && String(args[0]) === lockPath) {
+            blocked = true;
+            renewing.resolve();
+            await unblock.promise;
+          }
+          return Reflect.apply(target, thisArg, args);
+        },
+      })
+    );
     try {
       await renewing.promise;
       let released = false;
