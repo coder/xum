@@ -52,6 +52,12 @@ import {
  *   the user clicked or typed inside this frame, and only for an active workspace
  *   (SandboxedArtifactFrame.tsx). The frame never gets a reply, so no workspace list or title
  *   reaches it.
+ * - Frame -> host: `{ type: "backdrop", color }`, the color the page's canvas paints (the root
+ *   element's computed background, else the body's; null when both are transparent), posted
+ *   after load and after each theme message, only when it changed. The host paints it behind the
+ *   frame (SandboxedArtifactFrame.tsx), since WebKit shows the iframe element's own background
+ *   wherever the canvas is not painted yet (overscroll, a frame that just grew). The host accepts
+ *   only a bounded string that CSS.supports as a color (artifactBackdropColor).
  * - Host -> frame: `{ type: "theme", theme: "dark" | "light", themeName?, variables? }`, sent
  *   after load and on theme change; the artifact may read it. Besides the SVG wrapper's layout,
  *   the only host style sheet is the zero-specificity text-size-adjust rule
@@ -198,6 +204,24 @@ const ArtifactOpenWorkspaceMessageSchema = z
   })
   .strict();
 
+/** Longest canvas color the bridge carries; computed colors are far shorter. */
+export const ARTIFACT_BACKDROP_COLOR_MAX_CHARS = 64;
+
+/**
+ * A computed color with no paint: `transparent`, or a zero alpha in the legacy four-argument
+ * rgba() form or the modern `/ alpha` form. The frame's shim and the host share it.
+ */
+const TRANSPARENT_COLOR_PATTERN =
+  /^(?:transparent|rgba?\((?:[^,]*,){3}\s*0(?:\.0*)?%?\s*\)|.*\/\s*0(?:\.0*)?%?\s*\))$/i;
+
+const ArtifactBackdropMessageSchema = z
+  .object({
+    ...bridgeEnvelope,
+    type: z.literal("backdrop"),
+    color: z.string().max(ARTIFACT_BACKDROP_COLOR_MAX_CHARS).nullable(),
+  })
+  .strict();
+
 export const ArtifactFrameToHostMessageSchema = z.discriminatedUnion("type", [
   ArtifactKeyMessageSchema,
   ArtifactSidebarKeyMessageSchema,
@@ -206,6 +230,7 @@ export const ArtifactFrameToHostMessageSchema = z.discriminatedUnion("type", [
   ArtifactSendMessageSchema,
   ArtifactSetStateMessageSchema,
   ArtifactAnnotateMessageSchema,
+  ArtifactBackdropMessageSchema,
 ]);
 export type ArtifactFrameToHostMessage = z.infer<typeof ArtifactFrameToHostMessageSchema>;
 
@@ -251,6 +276,17 @@ export const ArtifactHostToFrameMessageSchema = z.discriminatedUnion("type", [
   ArtifactAnnotateModeMessageSchema,
 ]);
 export type ArtifactHostToFrameMessage = z.infer<typeof ArtifactHostToFrameMessageSchema>;
+
+/**
+ * The backdrop color the host may paint behind a frame, or null for the fallback. SECURITY: the
+ * frame's script chooses the string, so only a value the browser parses as a color, with some
+ * paint, passes; it reaches nothing but a CSS property (React's style object).
+ */
+export function artifactBackdropColor(color: string | null): string | null {
+  if (color == null || TRANSPARENT_COLOR_PATTERN.test(color)) return null;
+  if (typeof window.CSS === "undefined" || typeof window.CSS.supports !== "function") return null;
+  return window.CSS.supports("color", color) ? color : null;
+}
 
 /**
  * Fixed-window limiter: allows `maxPerWindow` calls per `windowMs`. Every message from the
@@ -768,6 +804,25 @@ export function buildArtifactBridgeScript(
   }
   var initialAppearance = JSON.parse(${inlineScriptJson(JSON.stringify(initialAppearance))});
   if (initialAppearance) applyAppearance(initialAppearance.themeName, initialAppearance.variables);
+  // The color the page's canvas paints, picked as CSS background propagation does: the root
+  // element's background, else the body's. The host paints it behind the frame.
+  var transparentColorPattern = ${TRANSPARENT_COLOR_PATTERN.toString()};
+  var postedBackdrop;
+  function paintedBackground(element) {
+    if (!element) return null;
+    var color = window.getComputedStyle(element).backgroundColor;
+    if (typeof color !== "string" || !color || transparentColorPattern.test(color)) return null;
+    return color.length > ${ARTIFACT_BACKDROP_COLOR_MAX_CHARS} ? null : color;
+  }
+  function postBackdrop() {
+    if (typeof window.getComputedStyle !== "function") return;
+    var color = paintedBackground(document.documentElement) || paintedBackground(document.body);
+    if (color === postedBackdrop) return;
+    postedBackdrop = color;
+    host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "backdrop", color: color }, "*");
+  }
+  // A task after load, so the artifact's own load handlers have styled the page.
+  window.addEventListener("load", function () { setTimeout(postBackdrop, 0); }, { once: true });
   window.addEventListener("message", function (event) {
     if (event.source !== host) return;
     var data = event.data;
@@ -777,6 +832,7 @@ export function buildArtifactBridgeScript(
       applyThemeAttribute();
       applyAppearance(data.themeName, data.variables);
       window.dispatchEvent(new CustomEvent("xumthemechange", { detail: { theme: theme } }));
+      postBackdrop();
     } else if (data.type === "annotate") {
       annotating = data.enabled === true;
     }

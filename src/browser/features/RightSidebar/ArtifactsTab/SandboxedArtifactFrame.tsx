@@ -20,6 +20,7 @@ import {
   ARTIFACT_FRAME_CHORDS,
   ARTIFACT_FRAME_INTERRUPT_KEYS,
   acceptArtifactFrameMessage,
+  artifactBackdropColor,
   buildArtifactBridgeScript,
   createBridgeRateLimiter,
   postArtifactAnnotateMode,
@@ -251,7 +252,9 @@ async function buildFrameDocument(input: {
 
 /**
  * A page with the theme's scheme paints no canvas of its own, so the backdrop shows: the pane
- * surface (main pane and right sidebar alike), so the page sits seamlessly in the pane.
+ * surface (main pane and right sidebar alike), so the page sits seamlessly in the pane. Any other
+ * page gets the browser's default white canvas, until it reports the color it paints
+ * (FrameBackdrop).
  */
 function frameClassName(followsColorScheme: boolean, annotating: boolean): string {
   return cn(
@@ -259,6 +262,16 @@ function frameClassName(followsColorScheme: boolean, annotating: boolean): strin
     followsColorScheme ? "bg-surface-primary" : "bg-white",
     annotating && "cursor-crosshair"
   );
+}
+
+/**
+ * The canvas color a frame reported (the bridge's backdrop message), for the document it came
+ * from: a new srcdoc or a reloaded frame starts again from frameClassName's fallback.
+ */
+interface FrameBackdrop {
+  srcDoc: string | null;
+  frameKey: number;
+  color: string;
 }
 
 /**
@@ -367,8 +380,10 @@ export function SandboxedArtifactFrame(props: {
     built?.content === content && built.allowCdn === allowCdn && built.state === state
       ? built
       : null;
-  const guard = useFrameNavigationGuard(current?.srcDoc ?? null);
-  const { navigatedRef } = guard;
+  const srcDoc = current?.srcDoc ?? null;
+  const guard = useFrameNavigationGuard(srcDoc);
+  const { navigatedRef, frameKey } = guard;
+  const [backdrop, setBackdrop] = useState<FrameBackdrop | null>(null);
   // The frame's window while it still shows our srcdoc; null after it navigated away.
   const liveWindow = () => (navigatedRef.current ? null : frameRef.current?.contentWindow);
 
@@ -457,6 +472,11 @@ export function SandboxedArtifactFrame(props: {
           onAnnotate(pickFromFrameAnnotation(message, frame.getBoundingClientRect()));
           break;
         }
+        case "backdrop": {
+          const color = artifactBackdropColor(message.color);
+          setBackdrop(color == null ? null : { srcDoc, frameKey, color });
+          break;
+        }
       }
     };
     window.addEventListener("message", handler);
@@ -469,6 +489,8 @@ export function SandboxedArtifactFrame(props: {
     onAnnotate,
     navigatedRef,
     openWorkspace,
+    srcDoc,
+    frameKey,
   ]);
 
   const annotating = onAnnotate != null;
@@ -493,6 +515,8 @@ export function SandboxedArtifactFrame(props: {
     return <SourceText content={content} note="Not a valid SVG document; showing the source." />;
   }
   if (guard.navigated) return <FrameNavigatedNotice onReload={guard.reload} />;
+  const backdropColor =
+    backdrop?.srcDoc === srcDoc && backdrop.frameKey === frameKey ? backdrop.color : undefined;
   return (
     <div className="flex h-full min-h-0 flex-col">
       {current.notices.length > 0 && (
@@ -530,6 +554,12 @@ export function SandboxedArtifactFrame(props: {
           if (annotating) postArtifactAnnotateMode(liveWindow(), true);
         }}
         className={frameClassName(current.followsColorScheme, annotating)}
+        // SECURITY AUDIT: the frame's script picks this color. It only ever reaches this one CSS
+        // property through React's style object, bounded in length and checked with CSS.supports
+        // (artifactBackdropColor). WebKit shows the iframe element's background wherever the
+        // page's canvas is not painted (overscroll, a frame that just grew), so it must match
+        // the page's own background, not frameClassName's white.
+        style={{ backgroundColor: backdropColor }}
         data-testid="artifact-frame"
       />
     </div>

@@ -273,6 +273,40 @@ describe("ArtifactViewer renderers", () => {
     expect(await view.findByTestId("artifact-frame")).toBeTruthy();
   });
 
+  test("a styled page's reported canvas color replaces the white backdrop, for that frame only", async () => {
+    const html = "<style>body { background: #100f0f }</style><p>hi</p>";
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", html) });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const postBackdrop = (target: HTMLIFrameElement, color: string | null) =>
+      act(() => {
+        const event = new window.Event("message");
+        Object.defineProperty(event, "data", {
+          value: { xumArtifact: 1, type: "backdrop", color },
+        });
+        Object.defineProperty(event, "source", { value: target.contentWindow });
+        window.dispatchEvent(event);
+      });
+    expect(frame.className).toContain("bg-white");
+    expect(frame.style.backgroundColor).toBe("");
+
+    postBackdrop(frame, "rgb(16, 15, 15)");
+    expect(frame.style.backgroundColor).toBe("rgb(16, 15, 15)");
+    // A transparent canvas, or none, falls back to the white backdrop.
+    postBackdrop(frame, "rgba(0, 0, 0, 0)");
+    expect(frame.style.backgroundColor).toBe("");
+    postBackdrop(frame, "rgb(16, 15, 15)");
+    postBackdrop(frame, null);
+    expect(frame.style.backgroundColor).toBe("");
+
+    // A reloaded frame starts again from the fallback until its new document reports.
+    postBackdrop(frame, "rgb(16, 15, 15)");
+    fireEvent.load(frame);
+    fireEvent.load(frame);
+    fireEvent.click(await view.findByRole("button", { name: "Reload" }));
+    const reloaded = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    expect(reloaded.style.backgroundColor).toBe("");
+  });
+
   test("a frame's own messages can exit fullscreen but never enter it", async () => {
     const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
     const panel = view.getByTestId("artifacts-panel");
