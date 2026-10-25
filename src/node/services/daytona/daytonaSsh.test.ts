@@ -93,104 +93,6 @@ describe("DaytonaSsh", () => {
     }
   });
 
-  /** A service whose ssh setup writes are recorded as `token@host keys`. */
-  function serviceRecordingWrites(fetchImpl: typeof fetch = plane.fetch) {
-    const writes: string[] = [];
-    /** The include file: what ensureSshAccess reads back before it trusts its cache. */
-    const includeFile = new Map<string, string>();
-    const record = (input: {
-      sandboxId: string;
-      token: string;
-      gateway: { host: string; hostKeys: string[] };
-    }) => {
-      includeFile.set(input.sandboxId, input.token);
-      writes.push(`${input.token}@${input.gateway.host} ${input.gateway.hostKeys.join(",")}`);
-      return Promise.resolve();
-    };
-    const recording = new DaytonaService({
-      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
-      rootDir,
-      fetch: fetchImpl,
-      now: () => clock,
-      sshConfigWriter: {
-        writeSandbox: record,
-        ensureManagedBlock: () => Promise.resolve(),
-        restoreGatewayPins: () => Promise.resolve(false),
-        updateToken: record,
-        removeSandbox: (sandboxId) => {
-          includeFile.delete(sandboxId);
-          return Promise.resolve();
-        },
-        repointGateway: () => Promise.resolve(),
-
-        readTokens: () =>
-          Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
-      },
-    });
-    return { service: recording, writes };
-  }
-
-  it("rewrites a sandbox's ssh setup once Daytona moves its gateway keys", async () => {
-    const { service: watching, writes } = serviceRecordingWrites();
-    const configFetches = () => plane.calls.filter((call) => call === "GET /config").length;
-
-    await watching.ssh.ensureSshAccess("sb-1");
-    clock += 4 * 60_000;
-    await watching.ssh.ensureSshAccess("sb-1");
-    expect(configFetches()).toBe(1);
-
-    // Rotated (and listed in another order) while Xum runs.
-    plane.gatewayHostKeys = ["ssh-rsa CCCC", "ssh-ed25519 BBBB"];
-    clock += 2 * 60_000;
-    await watching.ssh.ensureSshAccess("sb-1");
-    expect(writes).toEqual([
-      "tok1@ssh.test ssh-ed25519 AAAA",
-      "tok2@ssh.test ssh-rsa CCCC,ssh-ed25519 BBBB",
-    ]);
-    expect(plane.revoked).toEqual(["tok1"]);
-
-    // A refetch that finds the same gateway, keys reordered, rewrites nothing.
-    plane.gatewayHostKeys = ["ssh-ed25519 BBBB", "ssh-rsa CCCC"];
-    clock += 6 * 60_000;
-    await watching.ssh.ensureSshAccess("sb-1");
-    expect(configFetches()).toBe(3);
-    expect(writes).toHaveLength(2);
-  });
-
-  it("shares one gateway refresh between concurrent lookups, so a stale reply cannot win", async () => {
-    const held: Array<{ run: () => Promise<Response>; resolve: (response: Response) => void }> = [];
-    let holdConfig = false;
-    const fetchImpl = ((input: string | URL | Request, init?: RequestInit) => {
-      const url = input instanceof Request ? input.url : input.toString();
-      if (!holdConfig || !url.endsWith("/config")) return plane.fetch(input, init);
-      return new Promise<Response>((resolve) => {
-        held.push({ run: () => plane.fetch(input, init), resolve });
-      });
-    }) as typeof fetch;
-    const { service: watching } = serviceRecordingWrites(fetchImpl);
-    await watching.ssh.ensureSshAccess("sb-1");
-
-    clock += 6 * 60_000;
-    holdConfig = true;
-    const lookups = Promise.all([watching.ssh.getGatewayConfig(), watching.ssh.getGatewayConfig()]);
-    while (held.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    // During a rollout the last request answers first with the new gateway; earlier ones late.
-    for (let i = held.length - 1; i >= 0; i--) {
-      plane.gatewayHostKeys = i === held.length - 1 ? ["ssh-ed25519 NEW"] : ["ssh-ed25519 AAAA"];
-      held[i].resolve(await held[i].run());
-    }
-    const results = await lookups;
-    holdConfig = false;
-
-    expect(held).toHaveLength(1);
-    expect(results.map((config) => config.sshGatewayHostKeys)).toEqual([
-      ["ssh-ed25519 NEW"],
-      ["ssh-ed25519 NEW"],
-    ]);
-    expect((await watching.ssh.getGatewayConfig()).sshGatewayHostKeys).toEqual(["ssh-ed25519 NEW"]);
-  });
-
   it("removes the old account's aliases from the include file when the settings change", async () => {
     const includeFile = new Map<string, string>();
     const store = (input: { sandboxId: string; token: string }) => {
@@ -205,7 +107,6 @@ describe("DaytonaSsh", () => {
       sshConfigWriter: {
         writeSandbox: store,
         ensureManagedBlock: () => Promise.resolve(),
-        restoreGatewayPins: () => Promise.resolve(false),
         updateToken: store,
         removeSandbox: (sandboxId) => {
           includeFile.delete(sandboxId);
@@ -233,7 +134,6 @@ describe("DaytonaSsh", () => {
     const writer = {
       writeSandbox: store,
       ensureManagedBlock: () => Promise.resolve(),
-      restoreGatewayPins: () => Promise.resolve(false),
       updateToken: store,
       removeSandbox: () => Promise.resolve(),
 

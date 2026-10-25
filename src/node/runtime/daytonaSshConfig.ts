@@ -293,7 +293,10 @@ export class DaytonaSshConfigWriter {
     });
   }
 
-  /** Daytona moved its gateway: repoint every sandbox's block (keeping its token) and pins. */
+  /**
+   * After an ssh failure (Daytona may have moved its gateway, or known_hosts was edited): write
+   * the pins again and repoint every sandbox's block, keeping its token.
+   */
   async repointGateway(gateway: DaytonaSshGateway): Promise<void> {
     await this.installGateway(gateway, () => undefined);
   }
@@ -319,23 +322,6 @@ export class DaytonaSshConfigWriter {
     });
   }
 
-  /**
-   * known_hosts was deleted or edited while Xum runs: an unchanged gateway would otherwise fail
-   * every ssh command until a restart. Rewrites the pins (from `/config`, never a key a server
-   * offers) when they differ. True when it wrote.
-   */
-  async restoreGatewayPins(gateway: DaytonaSshGateway): Promise<boolean> {
-    const knownHosts = renderDaytonaKnownHosts(gateway);
-    this.assertPathsReadLiterallyBySsh();
-    let wrote = false;
-    await this.withIncludeFileLock(async () => {
-      if ((await this.readKnownHosts()) === knownHosts) return;
-      await this.writeKnownHosts(knownHosts);
-      wrote = true;
-    });
-    return wrote;
-  }
-
   private async writeKnownHosts(content: string): Promise<void> {
     await writeFileAtomic(this.paths.knownHostsPath, content, { encoding: "utf-8", mode: 0o600 });
   }
@@ -356,15 +342,6 @@ export class DaytonaSshConfigWriter {
       if (!blocks.delete(alias)) return;
       await this.writeBlocks(blocks);
     });
-  }
-
-  private async readKnownHosts(): Promise<string> {
-    try {
-      return await fs.readFile(this.paths.knownHostsPath, "utf-8");
-    } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) return "";
-      throw error;
-    }
   }
 
   /** The sandbox ids and tokens the include file holds (written by this or an earlier process). */

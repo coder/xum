@@ -10,13 +10,6 @@ import type { DaytonaReadiness } from "./daytonaReadiness";
 export const DAYTONA_SSH_TOKEN_TTL_MINUTES = 60;
 export const DAYTONA_SSH_TOKEN_REFRESH_MARGIN_MS = 15 * 60_000;
 
-/**
- * How long Daytona's `/config` (gateway endpoint and host keys) is trusted. Daytona can move
- * its gateway or rotate its keys while Xum runs; a refetch that sees a change rewrites every
- * sandbox's ssh setup on its next use.
- */
-export const DAYTONA_GATEWAY_CONFIG_TTL_MS = 5 * 60_000;
-
 export type DaytonaSshWriter = Pick<
   DaytonaSshConfigWriter,
   | "writeSandbox"
@@ -25,7 +18,6 @@ export type DaytonaSshWriter = Pick<
   | "repointGateway"
   | "removeSandbox"
   | "readTokens"
-  | "restoreGatewayPins"
 >;
 
 export interface DaytonaSshOptions {
@@ -52,12 +44,6 @@ function toSshGateway(config: DaytonaGatewayConfig) {
   };
 }
 
-/** What the ssh setup depends on; key order from Daytona is not significant. */
-function gatewayIdentity(config: DaytonaGatewayConfig): string {
-  const { host, port, hostKeys } = toSshGateway(config);
-  return JSON.stringify([host, port, [...hostKeys].sort()]);
-}
-
 /**
  * Xum's SSH access to sandboxes: the per-sandbox tokens (minted, refreshed, revoked), the
  * include file and `~/.ssh/config` block they are written to, and the gateway `/config` they
@@ -68,21 +54,9 @@ export class DaytonaSsh {
   private readonly account: DaytonaSshOptions["account"];
   private readonly readiness: DaytonaReadiness;
   private readonly now: () => number;
-  /** See gatewayGeneration. */
-  private gatewayMoves = 0;
-  private gatewayCache?: {
-    apiUrl: string;
-    fetchedAt: number;
-    config: DaytonaGatewayConfig;
-  };
-  private gatewayRequest?: {
-    apiUrl: string;
-    promise: Promise<DaytonaGatewayConfig>;
-  };
+  /** Daytona's `/config` of these settings, fetched once; a repair fetches it again. */
+  private gatewayCache?: { apiUrl: string; config: DaytonaGatewayConfig };
   private readonly tokens = new Map<string, DaytonaSshAccess>();
-  /** Bumped (unique per process) whenever a sandbox's cached token becomes another one. */
-  private readonly tokenGenerations = new Map<string, number>();
-  private lastTokenGeneration = 0;
   private readonly tokenRequests = new Map<string, Promise<DaytonaSshAccess>>();
   private readonly sshConfigWriter: DaytonaSshWriter;
   /** Sandboxes whose include block and `~/.ssh/config` block this process has written. */
@@ -118,7 +92,7 @@ export class DaytonaSsh {
       // An earlier run's tokens: holding them lets a replacement, a settings change or an
       // archive revoke them. The file has no expiry, so they are due for refresh at once.
       if (!this.persistedTokensLoaded && !this.tokens.has(sandboxId)) {
-        this.cacheNewToken(sandboxId, { token, expiresAt: new Date(0).toISOString() });
+        this.tokens.set(sandboxId, { token, expiresAt: new Date(0).toISOString() });
       }
     }
     this.persistedTokensLoaded = true;
@@ -154,116 +128,32 @@ export class DaytonaSsh {
     }
   }
 
-  /**
-   * `unlessMovedSince` refetches a cached `/config` that is still fresh, unless the gateway moved
-   * since that generation (checked after the credentials read, so a failure that arrives as a
-   * concurrent one's refetch ends reuses it). An in-flight fetch is shared.
-   */
-  async getGatewayConfig(
-    options: { unlessMovedSince?: number } = {}
-  ): Promise<DaytonaGatewayConfig> {
+  async getGatewayConfig(): Promise<DaytonaGatewayConfig> {
     const { client, credentials } = await this.account.getClient();
-    const cached = this.cachedGateway(credentials.apiUrl);
-    const force = options.unlessMovedSince === this.gatewayMoves;
-    if (cached && !force && this.now() - cached.fetchedAt < DAYTONA_GATEWAY_CONFIG_TTL_MS) {
-      return cached.config;
-    }
-    return this.sharedGatewayRefresh(client, credentials.apiUrl, cached);
-  }
-
-  /**
-   * Concurrent lookups share one refresh: a reply that started earlier and arrived last would
-   * otherwise publish the old gateway over the new one.
-   */
-  private sharedGatewayRefresh(
-    client: DaytonaClient,
-    apiUrl: string,
-    cached: ReturnType<DaytonaSsh["cachedGateway"]>
-  ): Promise<DaytonaGatewayConfig> {
-    const inFlight = this.gatewayRequest;
-    if (inFlight?.apiUrl === apiUrl) return inFlight.promise;
-    const promise = this.refreshGateway(client, apiUrl, cached).finally(() => {
-      if (this.gatewayRequest?.promise === promise) this.gatewayRequest = undefined;
-    });
-    this.gatewayRequest = { apiUrl, promise };
-    return promise;
-  }
-
-  private async refreshGateway(
-    client: DaytonaClient,
-    apiUrl: string,
-    cached: ReturnType<DaytonaSsh["cachedGateway"]>
-  ): Promise<DaytonaGatewayConfig> {
+    const cached = this.gatewayCache;
+    if (cached?.apiUrl === credentials.apiUrl) return cached.config;
     const config = await client.getConfig();
-    const moved = cached && gatewayIdentity(cached.config) !== gatewayIdentity(config);
-    this.gatewayCache = { apiUrl, fetchedAt: this.now(), config };
-    if (moved) {
-      await this.retireSshSetup(config);
-      this.gatewayMoves++;
-    }
+    this.gatewayCache = { apiUrl: credentials.apiUrl, config };
     return config;
   }
 
-  /** Bumped once a moved gateway's ssh setup was rewritten; capture it before an ssh command. */
-  gatewayGeneration(): number {
-    return this.gatewayMoves;
-  }
-
   /**
-   * An ssh command to a started sandbox failed with neither a refused token nor a stop: Daytona
-   * may have moved its gateway or rotated its host keys within the `/config` cache. True when
-   * the gateway changed since `attemptGeneration` (refetching `/config` unless a concurrent
-   * failure already found the move) and the sandbox's ssh setup now points at the new one, or
-   * when the gateway stayed but its pins in known_hosts had to be put back.
+   * An ssh command to a started sandbox failed: the gateway may have refused its token (revoked
+   * outside Xum, or one an earlier run left), Daytona may have moved its gateway or rotated its
+   * host keys, or known_hosts was edited. Refetch `/config`, repoint every sandbox's block and
+   * the pins at it (pins come from `/config`, never from a key a server offered), and replace
+   * this sandbox's token, revoking the old one. Pooled connections opened before keep their old
+   * gateway until they close.
    */
-  async refreshGatewayAfterSshFailure(
-    sandboxId: string,
-    attemptGeneration: number
-  ): Promise<boolean> {
-    if (this.gatewayMoves === attemptGeneration) {
-      const config = await this.getGatewayConfig({ unlessMovedSince: attemptGeneration });
-      if (this.gatewayMoves === attemptGeneration) return this.restoreGatewayPins(config);
-    }
+  async repairSshAccess(sandboxId: string): Promise<void> {
+    const { client, credentials } = await this.account.getClient();
+    const config = await client.getConfig();
+    this.gatewayCache = { apiUrl: credentials.apiUrl, config };
+    await this.sshConfigWriter.repointGateway(toSshGateway(config));
+    const cached = this.tokens.get(sandboxId);
+    // Due at once, so ensureSshAccess mints, writes, and revokes the old one.
+    if (cached) this.tokens.set(sandboxId, { ...cached, expiresAt: new Date(0).toISOString() });
     await this.ensureSshAccess(sandboxId);
-    return true;
-  }
-
-  /**
-   * The pins come from the `/config` just fetched, never from a key a server offered. Only here,
-   * after a fresh fetch: a readiness check reads a cached `/config`.
-   */
-  private async restoreGatewayPins(config: DaytonaGatewayConfig): Promise<boolean> {
-    const restored = await this.sshConfigWriter.restoreGatewayPins(toSshGateway(config));
-    if (restored) log.info("Daytona gateway pins were missing or changed; wrote them again");
-    return restored;
-  }
-
-  /** The cached `/config` of these settings, fresh or not. */
-  private cachedGateway(apiUrl: string) {
-    const cached = this.gatewayCache;
-    return cached?.apiUrl === apiUrl ? cached : undefined;
-  }
-
-  /**
-   * Daytona moved its gateway or rotated its host keys: every include block and the
-   * known_hosts pins are stale. Each sandbox's next ssh access mints a token, which rewrites
-   * its whole ssh setup and revokes the old token. Pooled connections opened before keep
-   * their old gateway until they close; new ones read the new files.
-   */
-  private async retireSshSetup(config: DaytonaGatewayConfig): Promise<void> {
-    this.sshConfigured.clear();
-    this.readiness.invalidateAll();
-    for (const [sandboxId, access] of this.tokens) {
-      this.tokens.set(sandboxId, { ...access, expiresAt: new Date(0).toISOString() });
-    }
-    try {
-      await this.sshConfigWriter.repointGateway(toSshGateway(config));
-    } catch (error) {
-      // Each sandbox's next ssh access rewrites its setup anyway.
-      log.warn("Could not repoint the Daytona ssh setup at the moved gateway", {
-        error: getErrorMessage(error),
-      });
-    }
   }
 
   /**
@@ -288,35 +178,6 @@ export class DaytonaSsh {
     });
     await this.sshConfigWriter.ensureManagedBlock();
     this.sshConfigured.add(sandboxId);
-  }
-
-  /**
-   * Which token the sandbox's ssh commands use now. Capture it before a command: if the gateway
-   * refuses that command's token, pass it to replaceRejectedSshToken.
-   */
-  sshTokenGeneration(sandboxId: string): number {
-    return this.tokenGenerations.get(sandboxId) ?? 0;
-  }
-
-  private cacheNewToken(sandboxId: string, access: DaytonaSshAccess): void {
-    this.tokens.set(sandboxId, access);
-    this.tokenGenerations.set(sandboxId, ++this.lastTokenGeneration);
-  }
-
-  /**
-   * The gateway refused the token of a command that started at `attemptGeneration` (revoked
-   * outside Xum, or one an earlier process left): mint a new one and rewrite the include file.
-   * Nothing to do when the token changed since: a concurrent command already replaced it, and
-   * the current one must stay live. The generation, not the ssh error, decides: the OpenSSH
-   * pool redacts the token from its errors.
-   */
-  async replaceRejectedSshToken(sandboxId: string, attemptGeneration: number): Promise<void> {
-    if (this.sshTokenGeneration(sandboxId) !== attemptGeneration) return;
-    const cached = this.tokens.get(sandboxId);
-    this.readiness.invalidateSandboxReady(sandboxId);
-    // Due at once, so the next ensureSshAccess mints, writes, and revokes the refused one.
-    if (cached) this.tokens.set(sandboxId, { ...cached, expiresAt: new Date(0).toISOString() });
-    await this.ensureSshAccess(sandboxId);
   }
 
   /** Whether this process holds a token for the sandbox that is close to expiry. */
@@ -372,7 +233,7 @@ export class DaytonaSsh {
     const access = await client.createSshAccess(sandboxId, DAYTONA_SSH_TOKEN_TTL_MINUTES);
     rememberDaytonaToken(access.token);
     await this.announceNewToken(client, sandboxId, access, options);
-    this.cacheNewToken(sandboxId, access);
+    this.tokens.set(sandboxId, access);
     if (previous && previous.token !== access.token) {
       await this.revokeQuietly(client, sandboxId, previous.token);
     }

@@ -291,7 +291,6 @@ export class FakeDaytonaSshConfigWriter implements Pick<
   | "repointGateway"
   | "removeSandbox"
   | "readTokens"
-  | "restoreGatewayPins"
 > {
   /** Current token per sandbox alias, as the include file would hold it. */
   readonly tokens = new Map<string, string>();
@@ -303,14 +302,6 @@ export class FakeDaytonaSshConfigWriter implements Pick<
   /** The gateway the include file and known_hosts point at, as last written or repointed. */
   gateway?: DaytonaSshGateway;
   readonly repoints: DaytonaSshGateway[] = [];
-  /** The gateway known_hosts pins. */
-  pins?: DaytonaSshGateway;
-
-  /** Acts as if daytona_known_hosts were deleted. */
-  deletePins(): void {
-    this.pins = undefined;
-  }
-
   writeSandbox(input: {
     sandboxId: string;
     token: string;
@@ -319,7 +310,6 @@ export class FakeDaytonaSshConfigWriter implements Pick<
     if (this.writeError) return Promise.reject(this.writeError);
     this.fullWrites.push(input.sandboxId);
     this.gateway = input.gateway;
-    this.pins = input.gateway;
     this.tokens.set(input.sandboxId, input.token);
     return Promise.resolve();
   }
@@ -345,14 +335,7 @@ export class FakeDaytonaSshConfigWriter implements Pick<
   repointGateway(gateway: DaytonaSshGateway): Promise<void> {
     this.repoints.push(gateway);
     this.gateway = gateway;
-    this.pins = gateway;
     return Promise.resolve();
-  }
-
-  restoreGatewayPins(gateway: DaytonaSshGateway): Promise<boolean> {
-    if (JSON.stringify(this.pins) === JSON.stringify(gateway)) return Promise.resolve(false);
-    this.pins = gateway;
-    return Promise.resolve(true);
   }
 
   removeSandbox(sandboxId: string): Promise<void> {
@@ -442,13 +425,5 @@ export class ScriptedSandboxControlPlane extends FakeDaytonaControlPlane {
 
   get revoked(): string[] {
     return this.revokedTokens;
-  }
-
-  get gatewayHostKeys(): string[] {
-    return this.gateway.hostKeys;
-  }
-
-  set gatewayHostKeys(hostKeys: string[]) {
-    this.gateway = { ...this.gateway, hostKeys };
   }
 }

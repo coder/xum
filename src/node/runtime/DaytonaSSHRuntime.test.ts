@@ -765,13 +765,12 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
     expect(result.stderr).not.toContain(token);
     expect(result.stderr).toContain(`${DAYTONA_TOKEN_PLACEHOLDER}@127.0.0.1: Permission denied`);
   });
-  it("keeps the token out of an error that gets no retry", async () => {
+  it("keeps the token out of the error of a failed retry", async () => {
     rig.plane.addSandbox({ id: "sb-tok" });
     await rig.service.ssh.ensureSshAccess("sb-tok");
     const token = rig.writer.tokens.get("sb-tok");
     if (!token) throw new Error("expected a minted token");
     let spawns = 0;
-    // A UI runtime never restarts the sandbox, so a dropped connection is not retried.
     const runtime = makeRuntime({ sandboxId: "sb-tok" }, rig, {
       transport: {
         ...localShellTransport(rig.rootDir),
@@ -788,7 +787,7 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
       () => new Error("exec unexpectedly succeeded"),
       (rejection: unknown) => rejection
     );
-    expect(spawns).toBe(1);
+    expect(spawns).toBe(2);
     expect(String(error)).not.toContain(token);
     expect(String(error)).toContain(DAYTONA_TOKEN_PLACEHOLDER);
   });
@@ -885,7 +884,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
     expect(rig.plane.countCalls("POST /sandbox/sb-nap3/start")).toBe(1);
   });
 
-  it("refetches a gateway that moved or rotated its keys within the config cache, then retries once", async () => {
+  it("refetches a gateway that moved, sharing one repair between concurrent failures", async () => {
     rig.plane.addSandbox({ id: "sb-moved" });
     const local = localShellTransport(rig.rootDir);
     let attempts = 0;
@@ -901,76 +900,26 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
           : Promise.reject(new RuntimeError("Host key verification failed.", "network"));
       },
     };
-    const turn = () => makeRuntime({ sandboxId: "sb-moved" }, rig, { transport });
-    expect(await turn().ensureReady()).toEqual({ ready: true });
-    const configFetches = () => rig.plane.countCalls("GET /config");
-
-    const moves = [
-      { ...rig.plane.gateway, host: "ssh2.daytona.test", port: 2222 },
-      { ...rig.plane.gateway, hostKeys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIRotated"] },
-    ];
-    for (const gateway of moves) {
-      // Within the five-minute cache: nothing refetches /config on its own.
-      rig.plane.gateway = gateway;
-      const [fetches, tries, resets] = [configFetches(), attempts, healthResets];
-      const runtime = turn();
-      expect(await runtime.ensureReady()).toEqual({ ready: true });
-      // Two commands fail together; they share one refetch.
-      const streams = await Promise.all(
-        [1, 2].map(() => runtime.exec("echo ok", { cwd: "/tmp", timeout: 10 }))
-      );
-      for (const stream of streams) {
-        expect(await new Response(stream.stdout).text()).toBe("ok\n");
-      }
-      expect(attempts - tries).toBe(4);
-      expect(configFetches()).toBe(fetches + 1);
-      expect(rig.writer.repoints.at(-1)).toEqual(gateway);
-      expect(healthResets).toBeGreaterThan(resets);
-    }
-
-    // The gateway did not change: the failure is something else, so no retry.
-    const before = {
-      fetches: configFetches(),
-      tries: attempts,
-      repoints: rig.writer.repoints.length,
+    const runtime = makeRuntime({ sandboxId: "sb-moved" }, rig, { transport });
+    expect(await runtime.ensureReady()).toEqual({ ready: true });
+    const configFetches = rig.plane.countCalls("GET /config");
+    const gateway = {
+      host: "ssh2.daytona.test",
+      port: 2222,
+      hostKeys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIRotated"],
     };
-    const unchanged = turn();
-    expect(await unchanged.ensureReady()).toEqual({ ready: true });
-    rig.writer.gateway = { ...rig.plane.gateway, host: "unreachable.test" };
-    // eslint-disable-next-line @typescript-eslint/await-thenable
-    await expect(unchanged.exec("echo ok", { cwd: "/tmp", timeout: 10 })).rejects.toThrow(
-      "Host key verification failed"
+    rig.plane.gateway = gateway;
+
+    const streams = await Promise.all(
+      [1, 2].map(() => runtime.exec("echo ok", { cwd: "/tmp", timeout: 10 }))
     );
-    expect(attempts - before.tries).toBe(1);
-    expect(configFetches()).toBe(before.fetches + 1);
-    expect(rig.writer.repoints).toHaveLength(before.repoints);
-  });
-
-  it("puts back the gateway's pins after a host key failure when the gateway did not move", async () => {
-    rig.plane.addSandbox({ id: "sb-pins" });
-    const local = localShellTransport(rig.rootDir);
-    let attempts = 0;
-    // OpenSSH (StrictHostKeyChecking yes) refuses the gateway without its pinned key.
-    const transport: SSHTransport = {
-      ...local,
-      spawnRemoteProcess: (command, options) => {
-        attempts++;
-        return JSON.stringify(rig.writer.pins) === JSON.stringify(rig.plane.gateway)
-          ? local.spawnRemoteProcess(command, options)
-          : Promise.reject(new RuntimeError("Host key verification failed.", "network"));
-      },
-    };
-    const turn = makeRuntime({ sandboxId: "sb-pins" }, rig, { transport });
-    expect(await turn.ensureReady()).toEqual({ ready: true });
-    rig.writer.deletePins();
-
-    const stream = await turn.exec("echo ok", { cwd: "/tmp", timeout: 10 });
-
-    expect(await new Response(stream.stdout).text()).toBe("ok\n");
-    expect(attempts).toBe(2);
-    // The keys /config advertises are pinned, never the one a server offers.
-    expect(rig.writer.pins).toEqual(rig.plane.gateway);
-    expect(rig.writer.repoints).toHaveLength(0);
+    for (const stream of streams) {
+      expect(await new Response(stream.stdout).text()).toBe("ok\n");
+    }
+    expect(attempts).toBe(4);
+    expect(rig.plane.countCalls("GET /config")).toBe(configFetches + 1);
+    expect(rig.writer.repoints).toEqual([gateway]);
+    expect(healthResets).toBe(2);
   });
 
   /** The gateway answers a stopped or deleted sandbox with the same refusal as a bad token. */
@@ -990,23 +939,6 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
     };
   }
 
-  it("restarts a stopped sandbox that refuses ssh, keeping its token", async () => {
-    const sandbox = rig.plane.addSandbox({ id: "sb-nap2" });
-    const transport = refusingTransportWhile("sb-nap2", () => sandbox.state !== "started");
-    const turn = makeRuntime({ sandboxId: "sb-nap2" }, rig, { transport });
-    expect(await turn.ensureReady()).toEqual({ ready: true });
-    const token = rig.writer.tokens.get("sb-nap2");
-    // Stopped within the ready cache: the next command goes straight to ssh.
-    sandbox.state = "stopped";
-
-    const stream = await turn.exec("echo ok", { cwd: "/tmp", timeout: 10 });
-    expect(await new Response(stream.stdout).text()).toBe("ok\n");
-    expect(rig.plane.countCalls("POST /sandbox/sb-nap2/start")).toBe(1);
-    expect(rig.plane.countCalls("POST /sandbox/sb-nap2/ssh-access")).toBe(1);
-    expect(rig.writer.tokens.get("sb-nap2")).toBe(token);
-    expect(rig.plane.revokedTokens).toEqual([]);
-  });
-
   it("reports a sandbox that no longer exists instead of the refused token", async () => {
     rig.plane.addSandbox({ id: "sb-gone" });
     await rig.service.ssh.ensureSshAccess("sb-gone");
@@ -1020,49 +952,6 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
       'Daytona sandbox "sb-gone" no longer exists'
     );
     expect(rig.plane.countCalls("POST /sandbox/sb-gone/ssh-access")).toBe(1);
-  });
-
-  it("never replaces a token that a concurrent command already replaced", async () => {
-    rig.plane.addSandbox({ id: "sb-race" });
-    await rig.service.ssh.ensureSshAccess("sb-race");
-    const first = rig.writer.tokens.get("sb-race");
-    if (!first) throw new Error("expected a minted token");
-    const local = localShellTransport(rig.rootDir);
-    const refuse = (user: string) =>
-      Promise.reject(
-        new RuntimeError(`${user}@127.0.0.1: Permission denied (publickey).`, "network")
-      );
-    // Command A: the gateway refuses the first token until the include file holds another.
-    const runtimeA = makeRuntime({ sandboxId: "sb-race" }, rig, {
-      transport: {
-        ...local,
-        spawnRemoteProcess: (command, options) =>
-          rig.writer.tokens.get("sb-race") === first
-            ? refuse(first)
-            : local.spawnRemoteProcess(command, options),
-      },
-    });
-    // Command B ran on the first token too, but its refusal arrives once A has replaced it, with
-    // the token already redacted (as the OpenSSH pool reports a probe failure).
-    let attemptsB = 0;
-    const runtimeB = makeRuntime({ sandboxId: "sb-race" }, rig, {
-      transport: {
-        ...local,
-        spawnRemoteProcess: async (command, options) => {
-          if (attemptsB++ > 0) return local.spawnRemoteProcess(command, options);
-          const streamA = await runtimeA.exec("true", { cwd: "/tmp", timeout: 10 });
-          expect(await streamA.exitCode).toBe(0);
-          return refuse(DAYTONA_TOKEN_PLACEHOLDER);
-        },
-      },
-    });
-
-    const stream = await runtimeB.exec("echo ok", { cwd: "/tmp", timeout: 10 });
-
-    expect(await new Response(stream.stdout).text()).toBe("ok\n");
-    // Only A's refused token was revoked; the one A minted stays live.
-    expect(rig.plane.revokedTokens).toEqual([first]);
-    expect(rig.plane.countCalls("POST /sandbox/sb-race/ssh-access")).toBe(2);
   });
 
   it("replaces a token the gateway refused and retries the command once", async () => {

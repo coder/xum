@@ -8,10 +8,7 @@ import {
   XUM_DAYTONA_SSH_BLOCK_START,
   toXumDaytonaHost,
 } from "@/common/constants/daytona";
-import {
-  DaytonaSshConfigWriter,
-  renderDaytonaKnownHosts,
-} from "./daytonaSshConfig";
+import { DaytonaSshConfigWriter, renderDaytonaKnownHosts } from "./daytonaSshConfig";
 import { resolveSSHConfig } from "./sshConfigParser";
 import { appendOpenSSHHostKeyPolicyArgs } from "./sshConnectionPool";
 
@@ -118,29 +115,6 @@ describe("DaytonaSshConfigWriter", () => {
     await fs.writeFile(sshConfigPath, "Host work\n  User me\n", "utf8");
     await writer.ensureManagedBlock();
     expect(await fs.readFile(sshConfigPath, "utf8")).toBe(`${written}Host work\n  User me\n`);
-  });
-
-  it("puts back the gateway's pins after known_hosts was deleted or changed, else writes nothing", async () => {
-    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
-    const pinned = await fs.readFile(writer.paths.knownHostsPath, "utf8");
-    const { ino } = await fs.stat(writer.paths.knownHostsPath);
-    const include = await fs.readFile(writer.paths.includePath, "utf8");
-
-    expect(await writer.restoreGatewayPins(GATEWAY)).toBe(false);
-    expect((await fs.stat(writer.paths.knownHostsPath)).ino).toBe(ino);
-
-    for (const damaged of [
-      undefined,
-      "",
-      `${pinned}ssh.daytona.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIInjected\n`,
-    ]) {
-      if (damaged === undefined) await fs.rm(writer.paths.knownHostsPath);
-      else await fs.writeFile(writer.paths.knownHostsPath, damaged, "utf8");
-
-      expect(await writer.restoreGatewayPins(GATEWAY)).toBe(true);
-      expect(await fs.readFile(writer.paths.knownHostsPath, "utf8")).toBe(pinned);
-    }
-    expect(await fs.readFile(writer.paths.includePath, "utf8")).toBe(include);
   });
 
   it("repoints every sandbox at a new gateway in the write that replaces its host keys", async () => {

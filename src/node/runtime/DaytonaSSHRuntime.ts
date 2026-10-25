@@ -24,7 +24,7 @@ import type {
   WorkspaceInitParams,
   WorkspaceInitResult,
 } from "./Runtime";
-import { isPermanentSSHFailure, isRuntimeTransportError, RuntimeError } from "./Runtime";
+import { isRuntimeTransportError, RuntimeError } from "./Runtime";
 import type { SpawnResult } from "./RemoteRuntime";
 import { SSHRuntime, type SSHRuntimeConfig } from "./SSHRuntime";
 import type { PtyHandle, PtySessionParams, SSHTransport } from "./transports";
@@ -65,15 +65,12 @@ export interface DaytonaRuntimeService {
   account: Pick<DaytonaAccount, "checkAvailability" | "getDefaultTarget" | "findSnapshot">;
   readiness: Pick<
     DaytonaReadiness,
-    "isSandboxReady" | "markSandboxReady" | "invalidateSandboxReady"
+    "isSandboxReady" | "markSandboxReady" | "invalidateSandboxReady" | "join"
   >;
   ssh: Pick<
     DaytonaSsh,
     | "ensureSshAccess"
-    | "replaceRejectedSshToken"
-    | "sshTokenGeneration"
-    | "gatewayGeneration"
-    | "refreshGatewayAfterSshFailure"
+    | "repairSshAccess"
     | "loadPersistedTokens"
     | "getGatewayConfig"
     | "releaseSshAccess"
@@ -153,41 +150,13 @@ function isBadRequest(error: unknown): boolean {
   return error instanceof DaytonaApiError && error.kind === "bad_request";
 }
 
-/**
- * Captured before an ssh command: a recovery acts only on what changed since. A refusal
- * replaces only the token this command used; a gateway another failure already followed is
- * not refetched again.
- */
-interface SshAttempt {
-  tokenGeneration: number;
-  gatewayGeneration: number;
-}
-
 type DeleteResult =
   | { success: true; deletedPath: string }
   | { success: false; error: string; leftoverPaths?: string[] };
 
 type StatusEmitter = (phase: RuntimeStatusEvent["phase"], detail?: string) => void;
 
-const HOST_KEY_FAILURE = /Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED/;
-
-function errorChainText(error: unknown): string {
-  const parts: string[] = [];
-  for (let current = error, depth = 0; current instanceof Error && depth < 4; depth++) {
-    parts.push(current.message);
-    current = current.cause;
-  }
-  return parts.join("\n");
-}
-
-/** The gateway refused the token (the ssh user name), e.g. one revoked outside Xum. */
-function isTokenRejected(error: unknown): boolean {
-  return (
-    isRuntimeTransportError(error) &&
-    isPermanentSSHFailure(error) &&
-    !HOST_KEY_FAILURE.test(errorChainText(error))
-  );
-}
+class SandboxMissingError extends Error {}
 
 function sandboxMissingMessage(sandboxId: string): string {
   return (
@@ -354,7 +323,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     emitStatus: StatusEmitter
   ): Promise<EnsureReadyResult> {
     // Set before the probe: ensureReady is an explicit action, so a sandbox that stopped
-    // within the cache is started again (recoverForRetry) instead of failing until it expires.
+    // within the cache is started again (repairForRetry) instead of failing until it expires.
     this.restartsStoppedSandbox = true;
     const repoFailure = await this.checkRepo(options, emitStatus);
     if (repoFailure) return repoFailure;
@@ -363,10 +332,8 @@ export class DaytonaSSHRuntime extends SSHRuntime {
 
   /**
    * Every ssh command to the sandbox goes through here: its stderr and errors are redacted
-   * (the token is the ssh user name). A refused token is replaced, and a connection failure on
-   * a turn's runtime whose sandbox stopped within the ready cache starts the sandbox again (or,
-   * when it still runs, follows a gateway Daytona moved); either way the command is retried
-   * once.
+   * (the token is the ssh user name). A transport failure is repaired (repairForRetry) and the
+   * command retried once.
    */
   protected override async spawnRemoteProcess(
     fullCommand: string,
@@ -374,11 +341,13 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   ): Promise<SpawnResult> {
     let result: SpawnResult;
     const sandboxId = this.daytonaConfig.sandboxId;
-    const attempt = await this.prepareSshAttempt(sandboxId);
+    // ssh may send a token an earlier process left in the include file: the redactor must
+    // know it before ssh can quote it. Not every command runs after ensureReady.
+    if (sandboxId) await this.daytonaService.ssh.loadPersistedTokens();
     try {
       result = await super.spawnRemoteProcess(fullCommand, options);
     } catch (error) {
-      if (!(await this.recoverForRetry(error, attempt, options.abortSignal))) {
+      if (!(await this.repairForRetry(error, options.abortSignal))) {
         throw redactDaytonaError(error);
       }
       try {
@@ -401,127 +370,65 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     };
   }
 
-  /** What a recovery from this command's failure must compare against (see SshAttempt). */
-  private async prepareSshAttempt(sandboxId: string | undefined): Promise<SshAttempt> {
-    if (!sandboxId) return { tokenGeneration: 0, gatewayGeneration: 0 };
-    // ssh may send a token an earlier process left in the include file: the redactor must
-    // know it before ssh can quote it. Not every command runs after ensureReady.
-    await this.daytonaService.ssh.loadPersistedTokens();
-    return {
-      tokenGeneration: this.daytonaService.ssh.sshTokenGeneration(sandboxId),
-      gatewayGeneration: this.daytonaService.ssh.gatewayGeneration(),
-    };
-  }
-
   /**
-   * True when the failure was fixed (a new token, or a restarted sandbox) and a retry may pass.
-   * The sandbox state decides, not the error text: a stopped or deleted sandbox also answers
-   * "Permission denied", so only a started sandbox gets a new token. Throws a clear error for
-   * a sandbox deleted outside Xum.
+   * True when the failure was repaired and a retry may pass. Concurrent failures on one
+   * sandbox share a single repair. Throws a clear error for a sandbox deleted outside Xum.
    */
-  private async recoverForRetry(
+  private async repairForRetry(
     error: unknown,
-    attempt: SshAttempt,
     abortSignal: AbortSignal | undefined
   ): Promise<boolean> {
     const sandboxId = this.daytonaConfig.sandboxId;
     if (!sandboxId || !isRuntimeTransportError(error) || abortSignal?.aborted) return false;
-    const tokenRejected = isTokenRejected(error);
-    // A UI or background runtime never starts the sandbox, so only a refused token is worth a look.
-    if (!tokenRejected && !this.restartsStoppedSandbox) return false;
     this.daytonaService.readiness.invalidateSandboxReady(sandboxId);
-    const state = await this.readStateAfterFailure(sandboxId);
-    return this.recoverInState(sandboxId, state, { error, tokenRejected, attempt }, abortSignal);
+    try {
+      await this.daytonaService.readiness.join(sandboxId, { signal: abortSignal }, () =>
+        this.repairSandbox(sandboxId)
+      );
+    } catch (repairError) {
+      if (repairError instanceof SandboxMissingError) {
+        throw new RuntimeError(
+          sandboxMissingMessage(sandboxId),
+          "network",
+          redactDaytonaError(error)
+        );
+      }
+      log.warn("Could not repair ssh access to the Daytona sandbox", {
+        sandboxId,
+        error: getErrorMessage(redactDaytonaError(repairError)),
+      });
+      return false;
+    }
+    // A failure against the old token or gateway may have marked the alias as failing for good.
+    this.sshTransport.resetConnectionHealth?.();
+    return true;
   }
 
-  private recoverInState(
-    sandboxId: string,
-    state: DaytonaSandboxState | undefined,
-    failure: { error: unknown; tokenRejected: boolean; attempt: SshAttempt },
-    abortSignal: AbortSignal | undefined
-  ): Promise<boolean> {
-    const { error, tokenRejected, attempt } = failure;
-    if (state === "missing") {
-      throw new RuntimeError(
-        sandboxMissingMessage(sandboxId),
-        "network",
-        redactDaytonaError(error)
-      );
-    }
+  /**
+   * The sandbox state decides, not the error text: a stopped or deleted sandbox also answers
+   * "Permission denied". A started one gets a fresh token and gateway; a stopped one is started
+   * only by a runtime that may start it. Throws when nothing was repaired.
+   */
+  private async repairSandbox(sandboxId: string): Promise<void> {
+    const { state } = await this.daytonaService.sandboxes.getSandboxState(sandboxId);
+    if (state === "missing") throw new SandboxMissingError();
     if (state === "started") {
-      // Only a runtime that may restart the sandbox gets here without a refused token.
-      return tokenRejected
-        ? this.replaceRejectedToken(sandboxId, attempt.tokenGeneration)
-        : this.followMovedGateway(sandboxId, attempt.gatewayGeneration);
-    }
-    if (state === undefined || !this.restartsStoppedSandbox) return Promise.resolve(false);
-    return this.restartSandbox(sandboxId, abortSignal);
-  }
-
-  private async replaceRejectedToken(sandboxId: string, tokenGeneration: number): Promise<boolean> {
-    log.info("The Daytona gateway refused the ssh token; replacing it and retrying once", {
-      sandboxId,
-    });
-    try {
-      await this.daytonaService.ssh.replaceRejectedSshToken(sandboxId, tokenGeneration);
-    } catch (replaceError) {
-      log.warn("Could not replace the refused Daytona ssh token", {
+      log.info("An ssh command to the Daytona sandbox failed; replacing its token and retrying", {
         sandboxId,
-        error: getErrorMessage(redactDaytonaError(replaceError)),
       });
-      return false;
+      await this.daytonaService.ssh.repairSshAccess(sandboxId);
+      return;
     }
-    this.sshTransport.resetConnectionHealth?.();
-    return true;
-  }
-
-  private async followMovedGateway(sandboxId: string, gatewayGeneration: number): Promise<boolean> {
-    let moved: boolean;
-    try {
-      moved = await this.daytonaService.ssh.refreshGatewayAfterSshFailure(
-        sandboxId,
-        gatewayGeneration
-      );
-    } catch (refreshError) {
-      log.warn("Could not refetch the Daytona gateway after an ssh failure", {
-        sandboxId,
-        error: getErrorMessage(redactDaytonaError(refreshError)),
-      });
-      return false;
-    }
-    if (!moved) return false;
-    log.info("The Daytona gateway moved; retrying the command once", { sandboxId });
-    // A host key failure against the old gateway may have marked the alias as failing for good.
-    this.sshTransport.resetConnectionHealth?.();
-    return true;
-  }
-
-  private async restartSandbox(
-    sandboxId: string,
-    abortSignal: AbortSignal | undefined
-  ): Promise<boolean> {
+    if (!this.restartsStoppedSandbox) throw new Error(`the sandbox is ${state}`);
     log.info("Daytona sandbox is not running; starting it and retrying the command once", {
       sandboxId,
     });
-    const failure = await this.bringSandboxUp(sandboxId, () => undefined, abortSignal);
-    if (failure && !failure.ready) {
-      log.warn("Could not restart the Daytona sandbox", { sandboxId, error: failure.error });
-      return false;
-    }
-    return true;
-  }
-
-  /** Undefined when the state cannot be read (then nothing is retried). */
-  private async readStateAfterFailure(sandboxId: string): Promise<DaytonaSandboxState | undefined> {
-    try {
-      return (await this.daytonaService.sandboxes.getSandboxState(sandboxId)).state;
-    } catch (stateError) {
-      log.warn("Could not read Daytona sandbox state after an ssh failure", {
-        sandboxId,
-        error: getErrorMessage(stateError),
-      });
-      return undefined;
-    }
+    // Not ensureSandboxReady: it would join this repair and wait for itself.
+    await this.daytonaService.sandboxes.startAndWait(
+      sandboxId,
+      Date.now() + DAYTONA_START_TIMEOUT_MS
+    );
+    await this.daytonaService.ssh.ensureSshAccess(sandboxId);
   }
 
   /**
