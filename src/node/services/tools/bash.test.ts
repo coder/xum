@@ -678,8 +678,11 @@ describe("bash tool", () => {
     });
 
     const args: BashToolArgs = {
-      // Generate a single 2MB line (exceeds 1MB total limit)
-      script: 'perl -e \'print "A" x 2000000 . "\\n"\'',
+      // Generate a single 2MB line (exceeds 1MB total limit). LC_ALL=C: perl
+      // prints a multi-line locale warning to stderr when it cannot load an
+      // inherited locale (Python sets LC_CTYPE=C.UTF-8 for its children, PEP 538),
+      // and those lines would count toward totalLines (#7516).
+      script: 'LC_ALL=C perl -e \'print "A" x 2000000 . "\\n"\'',
       timeout_secs: 5,
       run_in_background: false,
       display_name: "test",
@@ -718,7 +721,8 @@ describe("bash tool", () => {
     const args: BashToolArgs = {
       // First line: 500KB (within limit)
       // Second line: 600KB (would exceed 1MB when added)
-      script: 'perl -e \'print "A" x 500000 . "\\n"; print "B" x 600000 . "\\n"\'',
+      // LC_ALL=C keeps perl's locale warning out of the counted lines (#7516).
+      script: 'LC_ALL=C perl -e \'print "A" x 500000 . "\\n"; print "B" x 600000 . "\\n"\'',
       timeout_secs: 5,
       run_in_background: false,
       display_name: "test",
