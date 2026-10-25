@@ -10,7 +10,7 @@ import {
   resolveCoderAvailability,
 } from "@/browser/features/Runtime/CoderControls";
 import { RuntimeConfigInput } from "@/browser/components/RuntimeConfigInput/RuntimeConfigInput";
-import { DaytonaAccessForm } from "./DaytonaSettingsForms";
+import { DaytonaRuntimeSettings } from "./DaytonaSettingsForms";
 import {
   Select,
   SelectContent,
@@ -773,8 +773,8 @@ export function RuntimesSection() {
                         disabled={rowDisabled || coderAvailability.state !== "available"}
                       />
                     ) : null}
-                    {runtime.id === "daytona" && !selectedProjectPath ? (
-                      <DaytonaAccessForm />
+                    {runtime.id === "daytona" ? (
+                      <DaytonaRuntimeSettings projectPath={selectedProjectPath} />
                     ) : null}
                   </div>
                 </div>

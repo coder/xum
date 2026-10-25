@@ -97,6 +97,77 @@ function AccessMessages(props: { test: TestState; error: string | null }) {
   );
 }
 
+function ApiKeyField(props: {
+  config: DaytonaPublicConfig | null;
+  value: string;
+  onChange: (value: string) => void;
+  disabled: boolean;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-baseline justify-between gap-2">
+        <label className="text-muted text-xs" htmlFor="daytona-api-key">
+          API key
+        </label>
+        {/* Beside the label, not inside it, so the field's name stays the label alone. */}
+        <span id="daytona-api-key-status" className="text-foreground text-xs">
+          {describeKey(props.config)}
+        </span>
+      </div>
+      <Input
+        id="daytona-api-key"
+        aria-describedby="daytona-api-key-status"
+        type="password"
+        autoComplete="off"
+        value={props.value}
+        onChange={(event) => props.onChange(event.target.value)}
+        placeholder={
+          props.config?.apiKeySet === true
+            ? "Enter a new key to replace it"
+            : "Paste a Daytona API key"
+        }
+        disabled={props.disabled}
+        className="min-w-0"
+      />
+    </div>
+  );
+}
+
+function AccessActions(props: {
+  disabled: boolean;
+  dirty: boolean;
+  saving: boolean;
+  keySet: boolean;
+  /** Only a key saved in Settings can be removed here; an env key is not Xum's to drop. */
+  canRemoveKey: boolean;
+  testing: boolean;
+  onSave: () => void;
+  onTest: () => void;
+  onRemoveKey: () => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <Button size="sm" onClick={props.onSave} disabled={props.disabled || !props.dirty}>
+        {props.saving ? "Saving..." : "Save"}
+      </Button>
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={props.onTest}
+        disabled={props.disabled || !props.keySet || props.testing}
+      >
+        {props.testing ? <Loader2 className="animate-spin" /> : null}
+        Test connection
+      </Button>
+      {props.canRemoveKey && (
+        <Button size="sm" variant="ghost" onClick={props.onRemoveKey} disabled={props.disabled}>
+          Remove key
+        </Button>
+      )}
+    </div>
+  );
+}
+
 /**
  * Daytona access for this Xum install (global scope). The key is write-only: the backend
  * never returns it, so the field only ever holds a new key the user is typing. Stored in its
@@ -106,7 +177,6 @@ export function DaytonaAccessForm() {
   const access = useDaytonaAccess();
   const [apiKey, setApiKey] = useState("");
   const disabled = !access.config || access.saving || !access.api;
-  const keySet = access.config?.apiKeySet === true;
 
   const save = async (value: string) => {
     if (await access.save(value)) setApiKey("");
@@ -114,52 +184,18 @@ export function DaytonaAccessForm() {
 
   return (
     <div className="mt-3 flex max-w-[360px] flex-col gap-2" data-testid="daytona-access-form">
-      <div className="flex flex-col gap-1">
-        <div className="flex items-baseline justify-between gap-2">
-          <label className="text-muted text-xs" htmlFor="daytona-api-key">
-            API key
-          </label>
-          {/* Beside the label, not inside it, so the field's name stays the label alone. */}
-          <span id="daytona-api-key-status" className="text-foreground text-xs">
-            {describeKey(access.config)}
-          </span>
-        </div>
-        <Input
-          id="daytona-api-key"
-          aria-describedby="daytona-api-key-status"
-          type="password"
-          autoComplete="off"
-          value={apiKey}
-          onChange={(event) => setApiKey(event.target.value)}
-          placeholder={keySet ? "Enter a new key to replace it" : "Paste a Daytona API key"}
-          disabled={disabled}
-          className="min-w-0"
-        />
-      </div>
-      <div className="flex flex-wrap items-center gap-2">
-        <Button
-          size="sm"
-          onClick={() => void save(apiKey.trim())}
-          disabled={disabled || apiKey.trim() === ""}
-        >
-          {access.saving ? "Saving..." : "Save"}
-        </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => void access.runTest()}
-          disabled={disabled || !keySet || access.test.status === "testing"}
-        >
-          {access.test.status === "testing" ? <Loader2 className="animate-spin" /> : null}
-          Test connection
-        </Button>
-        {/* Only a key saved in Settings can be removed here; an env key is not Xum's to drop. */}
-        {access.config?.apiKeySource === "settings" && (
-          <Button size="sm" variant="ghost" onClick={() => void save("")} disabled={disabled}>
-            Remove key
-          </Button>
-        )}
-      </div>
+      <ApiKeyField config={access.config} value={apiKey} onChange={setApiKey} disabled={disabled} />
+      <AccessActions
+        disabled={disabled}
+        keySet={access.config?.apiKeySet === true}
+        canRemoveKey={access.config?.apiKeySource === "settings"}
+        dirty={apiKey.trim() !== ""}
+        saving={access.saving}
+        testing={access.test.status === "testing"}
+        onSave={() => void save(apiKey.trim())}
+        onTest={() => void access.runTest()}
+        onRemoveKey={() => void save("")}
+      />
       <AccessMessages test={access.test} error={access.error} />
       <p className="text-muted/70 text-[11px]">
         Without a key here, Xum uses DAYTONA_API_KEY from its own environment. DAYTONA_API_URL and
@@ -167,4 +203,9 @@ export function DaytonaAccessForm() {
       </p>
     </div>
   );
+}
+
+/** The Daytona row's body: access in the global scope only. */
+export function DaytonaRuntimeSettings(props: { projectPath: string | null }) {
+  return props.projectPath ? null : <DaytonaAccessForm />;
 }

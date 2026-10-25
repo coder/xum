@@ -176,7 +176,7 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
       if (!recorded.success) {
         return { error: recorded.error };
       }
-      return { launchToken, remotePath: recorded.data?.remotePath };
+      return { launchToken, remotePath: resolvedRemotePath(recorded.data) };
     } catch (error) {
       // Ambiguous outcome: the backend may have committed the reservation even though the
       // response was lost, and this open will not launch. Best-effort reconciliation with
@@ -211,7 +211,7 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
     if (isPlaceholderClosed()) {
       return { success: false, error: placeholderClosedError };
     }
-    const admission = await recordOpenBeforeLaunch(remote?.path);
+    const admission = await recordOpenBeforeLaunch(pathToResolve(remote));
     if ("error" in admission) {
       return { success: false, error: admission.error };
     }
@@ -257,6 +257,14 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
 interface RemoteEditorPath {
   path: string;
   deepLinkFor: (resolvedPath: string) => string | null;
+}
+
+function pathToResolve(remote: RemoteEditorPath | undefined): string | undefined {
+  return remote?.path;
+}
+
+function resolvedRemotePath(data: { remotePath: string } | null | undefined): string | undefined {
+  return data?.remotePath;
 }
 
 function remoteDeepLink(
