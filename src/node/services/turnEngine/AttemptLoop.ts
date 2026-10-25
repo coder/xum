@@ -31,7 +31,12 @@ import {
 } from "./recoveryPolicy";
 import type { RefusalFallback } from "./RefusalFallback";
 import type { StepMessageTracker } from "./StepPreparation";
-import { EmptyStreamOutputError, ModelRefusalError, StreamTruncatedError } from "./streamErrors";
+import {
+  buildStreamErrorPayload,
+  EmptyStreamOutputError,
+  ModelRefusalError,
+  StreamTruncatedError,
+} from "./streamErrors";
 import { metadataModelIdentity, type TurnEvents } from "./TurnEvents";
 import { StreamState } from "./TurnRegistry";
 import type { TurnResources } from "./TurnResources";
@@ -283,11 +288,7 @@ export interface AttemptLoopDeps {
     error: unknown,
     plan: ReasoningReplayRetryPlan
   ) => Promise<void>;
-  /** StreamManager's error payload and its persistence (the error partial and event). */
-  readonly buildStreamErrorPayload: (
-    streamInfo: WorkspaceStreamInfo,
-    error: unknown
-  ) => StreamErrorPayload & { errorType: StreamErrorType };
+  /** StreamManager's error persistence (the error partial and event). */
   readonly persistStreamError: (
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
@@ -843,7 +844,7 @@ export class AttemptLoop {
       workspaceLog
     );
 
-    const errorPayload = this.deps.buildStreamErrorPayload(streamInfo, error);
+    const errorPayload = buildStreamErrorPayload(streamInfo, error);
     const persistedPayload = await this.deps.persistStreamError(
       workspaceId,
       streamInfo,
