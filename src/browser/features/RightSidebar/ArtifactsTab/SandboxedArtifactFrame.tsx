@@ -261,9 +261,9 @@ function liveFrameWindow(
 /**
  * A page with the theme's scheme paints no canvas of its own, so the backdrop shows: the pane
  * surface (main pane and right sidebar alike), so the page sits seamlessly in the pane. Any other
- * page gets the color it reports (backdropColor), or the browser's default white canvas once it
- * reports none. Before its first report the frame stays clear and the pane shows through, so a
- * dark page does not load over a white flash.
+ * page gets the opaque color it reports (backdropColor), or the browser's default white canvas
+ * once it reports none or a translucent one. Before its first report the frame stays clear and
+ * the pane shows through, so a dark page does not load over a white flash.
  */
 function frameClassName(
   followsColorScheme: boolean,

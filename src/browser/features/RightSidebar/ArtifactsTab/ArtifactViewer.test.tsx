@@ -292,10 +292,17 @@ describe("ArtifactViewer renderers", () => {
 
     postBackdrop(frame, "rgb(16, 15, 15)");
     expect(frame.style.backgroundColor).toBe("rgb(16, 15, 15)");
-    // A transparent canvas (legacy or modern alpha syntax), or none, falls back to white.
-    for (const transparent of ["rgba(0, 0, 0, 0)", "rgb(16 15 15 / 0)"]) {
+    // A canvas that is not opaque (legacy or modern alpha syntax), or none, falls back to white.
+    // The page paints a translucent canvas over that backing, so the same color there would
+    // double its alpha.
+    for (const notOpaque of [
+      "rgba(0, 0, 0, 0)",
+      "rgb(16 15 15 / 0)",
+      "rgba(255, 0, 0, 0.5)",
+      "color(srgb 1 0 0 / 0.5)",
+    ]) {
       postBackdrop(frame, "rgb(16, 15, 15)");
-      postBackdrop(frame, transparent);
+      postBackdrop(frame, notOpaque);
       expect(frame.style.backgroundColor).toBe("");
       expect(frame.className).toContain("bg-white");
     }

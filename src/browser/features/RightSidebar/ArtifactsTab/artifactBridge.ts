@@ -58,7 +58,7 @@ import {
  *   only when it changed. The host paints it behind the
  *   frame (SandboxedArtifactFrame.tsx), since WebKit shows the iframe element's own background
  *   wherever the canvas is not painted yet (overscroll, a frame that just grew). The host accepts
- *   only a bounded, plain computed color that CSS.supports (artifactBackdropColor).
+ *   only a bounded, plain, opaque computed color that CSS.supports (artifactBackdropColor).
  * - Host -> frame: `{ type: "theme", theme: "dark" | "light", themeName?, variables? }`, sent
  *   after load and on theme change; the artifact may read it. Besides the SVG wrapper's layout,
  *   the only host style sheet is the zero-specificity text-size-adjust rule
@@ -210,10 +210,17 @@ export const ARTIFACT_BACKDROP_COLOR_MAX_CHARS = 64;
 
 /**
  * A computed color with no paint: `transparent`, or a zero alpha in the legacy four-argument
- * rgba() form or the modern `/ alpha` form. The frame's shim and the host share it.
+ * rgba() form or the modern `/ alpha` form. The frame's shim skips such a root background for
+ * the body's, as CSS background propagation does.
  */
 const TRANSPARENT_COLOR_PATTERN =
   /^(?:transparent|rgba?\((?:[^,]*,){3}\s*0(?:\.0*)?%?\s*\)|.*\/\s*0(?:\.0*)?%?\s*\))$/i;
+
+/**
+ * A color with an alpha component: a modern `/ alpha` or a fourth legacy rgba() argument.
+ * Computed colors leave out an alpha of 1, so this is every color that is not opaque.
+ */
+const ALPHA_COLOR_PATTERN = /\/|(?:,[^,]*){3}/;
 
 /**
  * The shape of a computed color (what getComputedStyle reports): one color function holding
@@ -287,13 +294,14 @@ export const ArtifactHostToFrameMessageSchema = z.discriminatedUnion("type", [
 export type ArtifactHostToFrameMessage = z.infer<typeof ArtifactHostToFrameMessageSchema>;
 
 /**
- * The backdrop color the host may paint behind a frame, or null for the fallback. SECURITY: the
+ * The backdrop color the host may paint behind a frame, or null for the fallback. Only an opaque
+ * color: the page paints a translucent canvas over the backdrop, so the same color there would
+ * double its alpha; such a page keeps the fallback, as a browser tab gives it white. SECURITY: the
  * frame's script chooses the string, so only a plain computed color (COMPUTED_COLOR_PATTERN)
- * that the browser parses, with some paint, passes; it reaches nothing but a CSS property
- * (React's style object).
+ * that the browser parses passes; it reaches nothing but a CSS property (React's style object).
  */
 export function artifactBackdropColor(color: string | null): string | null {
-  if (color == null || TRANSPARENT_COLOR_PATTERN.test(color)) return null;
+  if (color == null || ALPHA_COLOR_PATTERN.test(color)) return null;
   // CSS.supports alone also passes var(), light-dark(), currentcolor and CSS-wide keywords.
   if (!COMPUTED_COLOR_PATTERN.test(color)) return null;
   if (typeof window.CSS === "undefined" || typeof window.CSS.supports !== "function") return null;
