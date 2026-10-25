@@ -3660,15 +3660,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       (showSkillSuggestions && skillSuggestions.length > 0) ||
                       (showSymbolSuggestions && symbolSuggestions.length > 0)
                     }
-                    // Creation favors prompt space; workspaces preserve transcript space. Mobile
-                    // hides the shortcut hints the workspace floor exists for, so that room is
-                    // dead space on a screen that has none to spare.
-                    className={
-                      variant === "creation" ? "min-h-36" : isMobileTouch ? "min-h-9" : "min-h-22"
-                    }
+                    // Creation favors prompt space; workspaces keep a one-line floor because the
+                    // user asked for a shorter chat box. Workspaces hide the shortcut hints, so a
+                    // taller floor reserved for them would only be dead space.
+                    className={variant === "creation" ? "min-h-36" : "min-h-9"}
                   />
-                  {/* Keep shortcuts visible in both creation + workspace without bloating the footer or crowding it. */}
-                  {input.trim() === "" && !editingMessageForUi && (
+                  {/* Shortcut hints only show in creation, which has room below the prompt. */}
+                  {variant === "creation" && input.trim() === "" && !editingMessageForUi && (
                     <div className="mobile-hide-shortcut-hints text-muted @container pointer-events-none absolute right-2 bottom-3 left-2 flex flex-nowrap items-center gap-4 overflow-hidden text-[11px] whitespace-nowrap">
                       <span className="shrink-0">
                         <span className="font-mono">{formatKeybind(KEYBINDS.FOCUS_CHAT)}</span>
