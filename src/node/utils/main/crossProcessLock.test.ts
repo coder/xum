@@ -766,7 +766,7 @@ describe("takeover and ownership edges", () => {
     let renewals = 0;
     let renamesAfterRelease = 0;
     const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(async (file, data) => {
-      if (String(file).startsWith(`${lockPath}.tmp-`)) {
+      if (typeof file === "string" && file.startsWith(`${lockPath}.tmp-`)) {
         renewals += 1;
         renewing.resolve();
         await unblock.promise;
@@ -810,8 +810,11 @@ describe("takeover and ownership edges", () => {
   });
 
   test("malformed records read as corrupt; valid edge records read as holders", async () => {
-    // Fresh corrupt content is refused as "unparseable"; a holder record names its pid.
+    // Each record must probe like plain corrupt bytes; a holder record names its pid instead.
     const lockPath = await tempLockPath();
+    await fsPromises.writeFile(lockPath, "not json");
+    const corrupt = await inspectCrossProcessLock(lockPath);
+    expect(corrupt).toMatchObject({ state: "held", holder: "an unknown holder" });
     for (const text of [
       "null",
       '{"pid":1.5,"token":"t","acquiredAt":1}',
@@ -822,19 +825,15 @@ describe("takeover and ownership edges", () => {
       '{"pid":2,"token":"t","acquiredAt":1e999}',
     ]) {
       await fsPromises.writeFile(lockPath, text);
-      expect({ text, ...(await inspectCrossProcessLock(lockPath)) }).toMatchObject({
+      expect({ text, probe: await inspectCrossProcessLock(lockPath) }).toEqual({
         text,
-        state: "held",
-        holder: "an unknown holder",
-        why: expect.stringContaining("unparseable"),
+        probe: corrupt,
       });
     }
     // pid 1 always runs, and a one-character token is valid.
     await fsPromises.writeFile(lockPath, '{"pid":1,"token":"x","acquiredAt":1}');
-    expect(await inspectCrossProcessLock(lockPath)).toMatchObject({
-      state: "held",
-      holder: expect.stringContaining("pid 1 "),
-    });
+    const probe = await inspectCrossProcessLock(lockPath);
+    expect(probe.state === "held" && probe.holder).toContain("pid 1 ");
   });
 
   test("release gives up after 40 failed unlinks and retires the token", async () => {
@@ -861,7 +860,8 @@ describe("takeover and ownership edges", () => {
     const failure = new Error("EIO after the link");
     const spy = afterNext("link", lockPath, () => Promise.reject(failure));
     try {
-      await expect(acquireCrossProcessLock({ lockPath, ...baseOptions })).rejects.toBe(failure);
+      const attempt = acquireCrossProcessLock({ lockPath, ...baseOptions });
+      expect(await attempt.catch((error: unknown) => error)).toBe(failure);
     } finally {
       spy.mockRestore();
     }

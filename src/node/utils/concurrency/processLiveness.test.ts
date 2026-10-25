@@ -30,7 +30,7 @@ describe.skipIf(process.platform !== "linux")("processLiveness on Linux", () => 
       expect(stat).toContain("(a) b)");
       // Fields 3 to 21 follow the last ") ".
       const starttime = /^.*\) (?:\S+ ){19}(\d+) /s.exec(stat)?.[1];
-      expect(probeProcessBirth(pid)).toBe(`linux-ticks:${starttime}`);
+      expect(probeProcessBirth(pid)).toBe(`linux-ticks:${starttime ?? "unparsed"}`);
       expect(probeProcessBirth(pid)).not.toBe(probeProcessBirth(process.pid));
     } finally {
       child.kill("SIGKILL");

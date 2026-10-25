@@ -203,10 +203,9 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
   test("a backend's own lease is not foreign use; another backend's is, with its kind", async () => {
     const lease = await a.hold(workspaceId, "turn");
     expect(await a.findForeignUse(workspaceId)).toBeNull();
-    expect(await b.findForeignUse(workspaceId)).toEqual({
-      kind: "turn",
-      holder: expect.stringContaining(`pid ${process.pid}`),
-    });
+    const foreign = await b.findForeignUse(workspaceId);
+    expect(foreign?.kind).toBe("turn");
+    expect(foreign?.holder).toContain(`pid ${process.pid}`);
     await lease.release();
   });
 
@@ -380,7 +379,7 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
         };
       });
       const release = await a.acquireMutationGate([workspaceId, "ws-b"], idle);
-      await expect(release()).rejects.toBe(failure);
+      expect(await release().catch((error: unknown) => error)).toBe(failure);
       expect(await gateState("ws-b")).toBe("absent");
     });
 

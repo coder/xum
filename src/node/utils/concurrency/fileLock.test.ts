@@ -613,9 +613,12 @@ describe("acquireProcessFileLock edges", () => {
     )[Symbol.asyncDispose]();
     const tooDeep = path.join(tmp.path, "b.lock");
     await plantDeadGuards(tooDeep, 8);
-    await expect(
-      acquireProcessFileLock({ lockPath: tooDeep, timeoutMs: 150, label: "test" })
-    ).rejects.toThrow("nested 8 guards deep");
+    const refusal = await acquireProcessFileLock({
+      lockPath: tooDeep,
+      timeoutMs: 150,
+      label: "test",
+    }).catch((error: unknown) => error);
+    expect(String(refusal)).toContain("nested 8 guards deep");
   });
 
   test("restores a fresh owner's lock that a reclaim displaced after its re-read", async () => {
@@ -672,7 +675,7 @@ describe("acquireProcessFileLock edges", () => {
     const spy = spyOn(fs, "readFile").mockImplementation(
       new Proxy(readFile, {
         async apply(target, thisArg, args: Parameters<typeof readFile>) {
-          if (!blocked && String(args[0]) === lockPath) {
+          if (!blocked && args[0] === lockPath) {
             blocked = true;
             renewing.resolve();
             await unblock.promise;
