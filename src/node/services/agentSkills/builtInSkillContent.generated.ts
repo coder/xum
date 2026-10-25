@@ -10462,7 +10462,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- With focus inside the status page, `Esc` (`Ctrl+C` in Vim mode) stops the agent, as in the chat. It does not when you type `Esc` in a text field, when `Esc` closes a dialog or popover on the page, or when the page's script cancels the key (`preventDefault`). So that a page cannot stop the agent by itself, `Esc` works there only shortly after you click or press another key in the page.",
       "- Xum remembers your choice for each workspace. A workspace where you made no choice shows the status page.",
       "- When the workspace has no status page, or the page is empty or cannot be shown (for example a binary file), the main pane shows the chat transcript.",
-      "- Buttons on the status page that call `window.xum.send` work as they do in the Artifacts tab.",
+      "- On the status page, every `window.xum.send` asks first, also from a click: Xum shows the text above the page with **Send** and **Dismiss**. The page shows without you opening it, so its script could otherwise take a click elsewhere in Xum for a click in the page.",
       "",
       "## Apps from MCP servers",
       "",

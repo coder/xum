@@ -11,6 +11,7 @@ import {
   subscribeStatusListings,
   useStatusArtifactEntry,
 } from "./agentInterfaceView";
+import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { useArtifactInteractions } from "./useArtifactInteractions";
 
@@ -125,11 +126,25 @@ function useComposerFocusOnUnmount(
   return sectionRef;
 }
 
+/**
+ * SECURITY AUDIT: the status page shows without the user opening it, so none of its sends skips
+ * the confirm strip. In the Artifacts tab a send during a live gesture in the frame goes out at
+ * once (SandboxedArtifactFrame's hasLiveUserGesture), but the page's script can take focus with
+ * window.focus() right after the user's click or key elsewhere in Xum, while that activation is
+ * still live, and the gate then takes it for a click in the page.
+ */
+function askBeforeEverySend(
+  handlers: ArtifactInteractionHandlers | undefined
+): ArtifactInteractionHandlers | undefined {
+  if (handlers == null) return undefined;
+  return { ...handlers, requestSend: (text, data) => handlers.requestSend(text, data, "ask") };
+}
+
 function StatusPage(props: StatusViewProps) {
   const { workspaceId } = props;
   const read = useStatusArtifactRead(workspaceId);
   const dockHeight = useElementHeight(props.dockRef);
-  // window.xum.send / setState, as in the Artifacts tab.
+  // window.xum.send / setState, as in the Artifacts tab, except that every send asks first.
   const interactions = useArtifactInteractions(workspaceId, STATUS_TARGET);
   const sectionRef = useComposerFocusOnUnmount(props.composerApiRef);
   const vimEnabled = useUserPreferences(
@@ -161,7 +176,7 @@ function StatusPage(props: StatusViewProps) {
           <ArtifactViewer
             result={read}
             workspaceId={workspaceId}
-            interactions={interactions.handlers}
+            interactions={askBeforeEverySend(interactions.handlers)}
             // The page takes the chat's place, so the chat's interrupt key and the view switch
             // work with focus in the page.
             mainPaneInterruptKey={vimEnabled ? "vim" : "normal"}

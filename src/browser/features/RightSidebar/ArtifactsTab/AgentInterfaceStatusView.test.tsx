@@ -2,7 +2,7 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
-import { act, cleanup, render, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { useRef, useState, type ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -21,6 +21,7 @@ import type { ArtifactListing, ArtifactReadResult } from "@/common/orpc/schemas/
 import { AgentInterfaceStatusView } from "./AgentInterfaceStatusView";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { useMainPaneAgentInterfaceView } from "./agentInterfaceView";
+import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 
 function page(content: string): ArtifactReadResult {
   // One fixed mtime: remote runtimes list whole seconds, so a quick rewrite can keep it.
@@ -45,6 +46,8 @@ let rejectingReads = 0;
 let deleted = false;
 let reads = 0;
 let lists = 0;
+/** Messages the page's `window.xum.send` delivered. */
+let sends: Array<{ path: string; text: string }> = [];
 
 function listing(): ArtifactListing {
   const entry = { path: current.path, kind: current.kind, size: current.size, modifiedMs: 1_000 };
@@ -83,6 +86,10 @@ function Wrapper(props: { children: ReactNode }) {
         return Promise.resolve({ success: true as const, data: current });
       },
       getState: () => Promise.resolve({ success: true as const, data: { state: null } }),
+      sendInteraction: (input: { path: string; text: string }) => {
+        sends.push({ path: input.path, text: input.text });
+        return Promise.resolve({ success: true as const, data: { id: "i1" } });
+      },
       // What the Artifacts panel lists besides the folder: nothing.
       listPinned: () =>
         Promise.resolve({ success: true as const, data: { available: true as const, files: [] } }),
@@ -198,6 +205,7 @@ describe("Agent interface status view", () => {
     deleted = false;
     reads = 0;
     lists = 0;
+    sends = [];
   });
 
   afterEach(() => {
@@ -328,6 +336,43 @@ describe("Agent interface status view", () => {
       await waitFor(() => expect(view.queryByTestId("agent-interface-status-view")).toBeNull());
     } finally {
       globalThis.KeyboardEvent = globalKeyboardEvent;
+      Reflect.deleteProperty(window.navigator, "userActivation");
+    }
+  });
+
+  test("a send from the page asks in the confirm strip, also during the user's gesture", async () => {
+    // Focus on the frame and live activation: what the Artifacts tab takes as a click in the page.
+    Object.defineProperty(window.navigator, "userActivation", {
+      configurable: true,
+      get: () => ({ isActive: true }),
+    });
+    try {
+      const view = render(<MainPane workspaceId="ws-send" />, { wrapper: Wrapper });
+      await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+      const frame = view.getByTestId("artifact-frame") as HTMLIFrameElement;
+      act(() => frame.focus());
+      act(() => {
+        const event = new window.Event("message");
+        Object.defineProperty(event, "data", {
+          value: { xumArtifact: 1, type: "send", text: "Run the tests" },
+        });
+        Object.defineProperty(event, "source", { value: frame.contentWindow });
+        window.dispatchEvent(event);
+      });
+
+      const strip = await view.findByTestId("artifact-send-strip");
+      expect(strip.textContent).toContain("Run the tests");
+      expect(sends).toEqual([]);
+
+      const sendButton = within(strip).getByRole("button", { name: "Send" }) as HTMLButtonElement;
+      await waitFor(() => expect(sendButton.disabled).toBe(false), {
+        timeout: CONFIRM_ARM_DELAY_MS + 1000,
+      });
+      fireEvent.click(sendButton);
+      await waitFor(() =>
+        expect(sends).toEqual([{ path: AGENT_INTERFACE_STATUS_ARTIFACT, text: "Run the tests" }])
+      );
+    } finally {
       Reflect.deleteProperty(window.navigator, "userActivation");
     }
   });
