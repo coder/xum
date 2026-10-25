@@ -145,6 +145,16 @@ const AgentInterfaceStatusView = React.lazy(async () => ({
     .AgentInterfaceStatusView,
 }));
 
+/** The status page, fetched and mounted only while the view shows it (the lazy open condition). */
+function LazyStatusView(props: React.ComponentProps<typeof AgentInterfaceStatusView>) {
+  if (props.view !== "status") return null;
+  return (
+    <LazyFeature name="Status page">
+      <AgentInterfaceStatusView {...props} />
+    </LazyFeature>
+  );
+}
+
 const TRANSCRIPT_ONLY_NOTICE =
   "This workspace's worktree is no longer available. This is a read-only chat transcript kept for historical and usage-tracking reasons.";
 
@@ -1664,17 +1674,13 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         >
           {/* Before the scrollport, which holds the composer dock, so Tab reaches the page
               before the composer below it. */}
-          {showStatusView && (
-            <LazyFeature name="Status page">
-              <AgentInterfaceStatusView
-                key={workspaceId}
-                workspaceId={workspaceId}
-                view={props.agentInterfaceView}
-                dockRef={composerDockRef}
-                composerApiRef={chatInputAPI}
-              />
-            </LazyFeature>
-          )}
+          <LazyStatusView
+            key={workspaceId}
+            workspaceId={workspaceId}
+            view={props.agentInterfaceView}
+            dockRef={composerDockRef}
+            composerApiRef={chatInputAPI}
+          />
           <div
             ref={contentRef}
             onWheel={handleTranscriptWheel}
