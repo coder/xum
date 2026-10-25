@@ -278,7 +278,8 @@ function mcpAppViewDocumentKey(loaded: Loaded | null, grant: McpAppCspGrant | nu
 
 /**
  * The view's srcdoc: its CSP meta first, then the preamble bound to `viewDocument`, then the
- * window.openai shim, then the view. Null until all of them exist.
+ * window.openai shim, then the host text-size-adjust style, then the view. Null until all of
+ * them exist.
  */
 function buildMcpAppViewSrcDoc(
   loaded: Loaded | null,

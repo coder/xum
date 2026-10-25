@@ -23,6 +23,25 @@ function firstHeadChildren(srcdoc: string) {
   return Array.from(doc.head.children);
 }
 
+/** The host's text-size-adjust style precedes every artifact style, so artifact rules win. */
+function expectTextSizeAdjustBeforeArtifactStyles(srcdoc: string) {
+  const doc = new window.DOMParser().parseFromString(srcdoc, "text/html");
+  const [host, ...artifactStyles] = Array.from(
+    doc.querySelectorAll('style, link[rel~="stylesheet"]')
+  );
+  expect(artifactStyles.length).toBeGreaterThan(0);
+  expect(host?.tagName).toBe("STYLE");
+  expect(host?.parentElement).toBe(doc.head);
+  expect(host?.previousElementSibling).not.toBeNull();
+  // Unlayered, it would outrank artifact rules declared inside @layer.
+  expect(host?.textContent).toMatch(/^@layer\s*\{\s*:where\(html\)\s*\{[^}]*\}\s*\}$/);
+  // iOS WebKit, where the autosizing happens, needs the -webkit- prefixed property.
+  expect(host?.textContent).toMatch(/:where\(html\)\s*\{[^}]*-webkit-text-size-adjust:\s*100%/);
+  expect(host?.textContent).toMatch(
+    /:where\(html\)\s*\{[^}]*(?<!-webkit-)text-size-adjust:\s*100%/
+  );
+}
+
 function expectCspFirst(srcdoc: string) {
   const [meta, script] = firstHeadChildren(srcdoc);
   expect(meta?.tagName).toBe("META");
@@ -85,6 +104,18 @@ describe("buildSandboxedHtmlDocument", () => {
     }
   });
 
+  test("adds a text-size-adjust style that artifact styles override", () => {
+    for (const html of [
+      "<head><style>p{color:red}</style></head><p>x</p>",
+      "<style>p{color:red}</style><link rel=stylesheet href='https://unpkg.com/x.css'>",
+      "<p>x</p><style>body{font-size:13px}</style>",
+    ]) {
+      const srcdoc = buildSandboxedHtmlDocument(html, OPTIONS);
+      expectCspFirst(srcdoc);
+      expectTextSizeAdjustBeforeArtifactStyles(srcdoc);
+    }
+  });
+
   test("keeps the artifact's own markup", () => {
     const srcdoc = buildSandboxedHtmlDocument("<h1 id=t>Hello</h1>", OPTIONS);
     const doc = new window.DOMParser().parseFromString(srcdoc, "text/html");
@@ -98,6 +129,7 @@ describe("buildSandboxedHtmlDocument", () => {
     );
     expect(srcdoc).not.toBeNull();
     expectCspFirst(srcdoc!);
+    expectTextSizeAdjustBeforeArtifactStyles(srcdoc!);
     expect(srcdoc).toContain("<circle");
     expect(buildSandboxedSvgDocument("<html><body>nope</body></html>", OPTIONS)).toBeNull();
   });
@@ -268,7 +300,10 @@ describe("inlineArtifactHtmlAssets", () => {
     );
     expect(scripts).toHaveLength(1);
     expect(scripts[0]?.textContent).toContain("window.ok = 1;");
-    expect(reparsed.querySelectorAll("style")).toHaveLength(1);
+    const styles = Array.from(reparsed.querySelectorAll("style")).filter(
+      (s) => !(s.textContent ?? "").includes(":where(html)")
+    );
+    expect(styles).toHaveLength(1);
     expect(reparsed.querySelector("b, i")).toBeNull();
   });
 
