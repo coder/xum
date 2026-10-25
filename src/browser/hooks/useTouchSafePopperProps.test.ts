@@ -6,15 +6,34 @@ import { useTouchSafePopperProps } from "./useTouchSafePopperProps";
 
 describe("useTouchSafePopperProps", () => {
   let domWindow: Window & typeof globalThis;
-  // happy-dom does not resolve env(), so the tests stand in for the safe-area insets that a
-  // browser reports as the probe element's padding.
+  // happy-dom neither resolves env() nor lays out, so the tests stand in for the browser: the
+  // probes' computed padding reports these insets, and reportInsets plays the ResizeObserver
+  // that the probes' boxes trigger when the insets change, then the next animation frame.
   let insets = { top: 0, right: 0, left: 0 };
   let insetReads = 0;
   let coarsePointer = false;
+  let observers: FakeResizeObserver[] = [];
+  let frames: FrameRequestCallback[] = [];
 
-  function resizeWindow() {
+  class FakeResizeObserver {
+    readonly targets: Element[] = [];
+    readonly callback: () => void;
+    constructor(callback: () => void) {
+      this.callback = callback;
+      observers.push(this);
+    }
+    observe(target: Element) {
+      this.targets.push(target);
+    }
+  }
+
+  function reportInsets(next: typeof insets) {
+    insets = next;
     act(() => {
-      domWindow.dispatchEvent(new domWindow.Event("resize"));
+      for (const observer of observers) {
+        if (observer.targets.length > 0) observer.callback();
+      }
+      for (const frame of frames.splice(0)) frame(0);
     });
   }
 
@@ -26,6 +45,16 @@ describe("useTouchSafePopperProps", () => {
     insets = { top: 0, right: 0, left: 0 };
     insetReads = 0;
     coarsePointer = false;
+    observers = [];
+    frames = [];
+    Object.defineProperty(domWindow, "ResizeObserver", {
+      configurable: true,
+      value: FakeResizeObserver,
+    });
+    Object.defineProperty(domWindow, "requestAnimationFrame", {
+      configurable: true,
+      value: (callback: FrameRequestCallback) => frames.push(callback),
+    });
     Object.defineProperty(domWindow, "getComputedStyle", {
       configurable: true,
       value: () => {
@@ -79,15 +108,17 @@ describe("useTouchSafePopperProps", () => {
 
   it("measures the insets once, not on every render", () => {
     const { rerender } = renderHook(() => useTouchSafePopperProps(10));
+    const firstReads = insetReads;
     rerender();
     rerender();
     renderHook(() => useTouchSafePopperProps());
 
-    // Reading the probe forces layout, and every closed menu renders this hook too.
-    expect(insetReads).toBe(1);
+    // Reading the probes forces layout, and every closed menu renders this hook too.
+    expect(firstReads).toBeGreaterThan(0);
+    expect(insetReads).toBe(firstReads);
   });
 
-  it("re-reads the insets after a resize, including one while no menu is mounted", () => {
+  it("re-reads the insets when they change, including while no menu is mounted", () => {
     const menu = renderHook(() => useTouchSafePopperProps(10));
     expect(menu.result.current.collisionPadding).toEqual({
       top: 10,
@@ -96,9 +127,8 @@ describe("useTouchSafePopperProps", () => {
       left: 10,
     });
 
-    // Folding to the iPhone Duo cover display resizes the window and brings in the insets.
-    insets = { top: 21, right: 84, left: 0 };
-    resizeWindow();
+    // Folding to the iPhone Duo cover display brings in the insets, after any window resize.
+    reportInsets({ top: 21, right: 84, left: 0 });
     expect(menu.result.current.collisionPadding).toEqual({
       top: 31,
       right: 94,
@@ -108,8 +138,7 @@ describe("useTouchSafePopperProps", () => {
     menu.unmount();
 
     // Unfolding while every menu is closed and unmounted.
-    insets = { top: 0, right: 0, left: 0 };
-    resizeWindow();
+    reportInsets({ top: 0, right: 0, left: 0 });
     const reopened = renderHook(() => useTouchSafePopperProps(10));
     expect(reopened.result.current.collisionPadding).toEqual({
       top: 10,
@@ -127,24 +156,37 @@ describe("useTouchSafePopperProps", () => {
       { top: 21, right: 84, left: 0 },
       { top: 21, right: 84, left: 6 },
     ]) {
-      insets = next;
-      resizeWindow();
+      reportInsets(next);
       expect(menu.result.current.collisionPadding).toEqual({ ...next, bottom: 0 });
     }
   });
 
-  it("does not re-render menus on a resize that keeps the insets", () => {
+  it("does not re-render menus when a report keeps the insets", () => {
+    insets = { top: 21, right: 84, left: 0 };
     let renders = 0;
     renderHook(() => {
       renders += 1;
       return useTouchSafePopperProps();
     });
 
-    // Dragging a desktop window's edge fires resize events in a stream.
-    resizeWindow();
-    resizeWindow();
+    // A ResizeObserver reports each box that has a size once when it starts observing it.
+    reportInsets({ ...insets });
 
     expect(renders).toBe(1);
+  });
+
+  it("still measures the insets where ResizeObserver is missing", () => {
+    Object.defineProperty(domWindow, "ResizeObserver", { configurable: true, value: undefined });
+    insets = { top: 21, right: 84, left: 6 };
+
+    const menu = renderHook(() => useTouchSafePopperProps());
+
+    expect(menu.result.current.collisionPadding).toEqual({
+      top: 21,
+      right: 84,
+      bottom: 0,
+      left: 6,
+    });
   });
 
   it("re-measures menu positions every frame only on touch screens", () => {

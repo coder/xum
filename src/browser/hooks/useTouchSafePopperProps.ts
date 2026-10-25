@@ -6,36 +6,60 @@ type Insets = Record<"top" | "right" | "left", number>;
 
 const NO_INSETS: Insets = { top: 0, right: 0, left: 0 };
 
-let probe: HTMLElement | null = null;
-let lastInsets = NO_INSETS;
-// Every Popover and Select content renders this hook, open or not, and reading the probe's
-// padding forces layout, so measure only on first use and after the window resizes.
-let insetsStale = true;
-
-function markInsetsStale() {
-  insetsStale = true;
+interface Probes {
+  topLeft: HTMLElement;
+  right: HTMLElement;
 }
 
-// env() only resolves inside CSS, so a hidden fixed element padded by the insets exposes them.
-function createProbe(): HTMLElement {
-  const element = document.createElement("div");
-  element.setAttribute("aria-hidden", "true");
-  element.style.cssText =
+let probes: Probes | null = null;
+let lastInsets = NO_INSETS;
+// Every Popover and Select content renders this hook, open or not, and reading the probes'
+// padding forces layout, so measure only on first use and after the probes change size.
+let insetsStale = true;
+const listeners = new Set<() => void>();
+
+function notifyListeners() {
+  for (const listener of listeners) listener();
+}
+
+// The probes' ResizeObserver callback. Mounted menus hear of the change in the next frame: a menu
+// that re-renders inside this callback resizes during the browser's observer loop, which reports
+// an error. Until then, and while no menu is mounted, the next read measures again.
+function markInsetsChanged() {
+  insetsStale = true;
+  window.requestAnimationFrame(notifyListeners);
+}
+
+// env() only resolves inside CSS, so hidden zero-size elements padded by the insets expose them,
+// and their border boxes resize exactly when an inset changes. A ResizeObserver on them, not the
+// window's resize event, reports the changes: when a folding phone switches displays the window
+// can resize before the insets change, and a half turn of a landscape phone swaps the side insets
+// with no resize at all. That swap keeps the sum of the side insets, so the right one has its own
+// element.
+function createProbes(): Probes {
+  const topLeft = document.createElement("div");
+  topLeft.setAttribute("aria-hidden", "true");
+  topLeft.style.cssText =
     // mutation-equivalent: unit tests cannot see env(); Chromium's assertMenuClearsSafeArea can.
     "position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;" +
-    "padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) 0 env(safe-area-inset-left,0px)";
-  document.body.appendChild(element);
-  // Mounted menus hear resizes through subscribe; this also covers a resize (a fold) while no
-  // menu is mounted. addEventListener ignores a second registration of the same listener.
-  window.addEventListener("resize", markInsetsStale);
-  return element;
+    "padding:env(safe-area-inset-top,0px) 0 0 env(safe-area-inset-left,0px)";
+  const right = document.createElement("div");
+  right.style.cssText = "width:0;height:0;padding-right:env(safe-area-inset-right,0px)";
+  topLeft.appendChild(right);
+  document.body.appendChild(topLeft);
+  if (typeof window.ResizeObserver === "function") {
+    const observer = new window.ResizeObserver(markInsetsChanged);
+    observer.observe(topLeft, { box: "border-box" });
+    observer.observe(right, { box: "border-box" });
+  }
+  return { topLeft, right };
 }
 
-function measureInsets(element: HTMLElement): Insets {
-  const style = window.getComputedStyle(element);
-  const top = parseFloat(style.paddingTop) || 0;
-  const right = parseFloat(style.paddingRight) || 0;
-  const left = parseFloat(style.paddingLeft) || 0;
+function measureInsets(current: Probes): Insets {
+  const topLeft = window.getComputedStyle(current.topLeft);
+  const top = parseFloat(topLeft.paddingTop) || 0;
+  const left = parseFloat(topLeft.paddingLeft) || 0;
+  const right = parseFloat(window.getComputedStyle(current.right).paddingRight) || 0;
   // useSyncExternalStore needs the same snapshot object while the insets are unchanged.
   return top === lastInsets.top && right === lastInsets.right && left === lastInsets.left
     ? lastInsets
@@ -43,24 +67,22 @@ function measureInsets(element: HTMLElement): Insets {
 }
 
 function readInsets(): Insets {
-  if (probe == null || !document.body.contains(probe)) {
-    probe = createProbe();
+  if (probes == null || !document.body.contains(probes.topLeft)) {
+    probes = createProbes();
     insetsStale = true;
   }
   if (insetsStale) {
     insetsStale = false;
-    lastInsets = measureInsets(probe);
+    lastInsets = measureInsets(probes);
   }
   return lastInsets;
 }
 
 function subscribe(onChange: () => void): () => void {
-  if (typeof window === "undefined") return () => undefined;
-  // Insets change with rotation and when a folding phone switches displays; both resize the
-  // window. React reads the snapshot inside onChange; the probe's resize listener runs first
-  // because the first snapshot read, before any subscribe, registered it.
-  window.addEventListener("resize", onChange);
-  return () => window.removeEventListener("resize", onChange);
+  listeners.add(onChange);
+  return () => {
+    listeners.delete(onChange);
+  };
 }
 
 function getServerSnapshot(): Insets {
